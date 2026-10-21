@@ -90,7 +90,7 @@ curl -s http://127.0.0.1:4317/api/health
 - SQLite 连接参数：WAL 日志模式、`synchronous = NORMAL`、外键开启、`busy_timeout = 5000`。
 - 迁移 runner：版本号单调递增，每条迁移在独立事务内执行；已应用迁移记录在 `schema_migrations` 表并校验 checksum，已应用的迁移不可改写。
 - **幂等**：重复启动不会重复执行已应用的迁移；迁移版本与数据目录在重启后保留。
-- F1 只建立迁移版本表 `schema_migrations`，**不建领域表**（项目/群组/消息/成员等属于 F2 #12）。
+- F1 建立迁移版本表 `schema_migrations`；F2（#12）起迁移 `1 init_domain_model` 建立全部领域表（agents/projects/members/groups/group_participants/messages/message_deliveries/member_statuses）及其索引、外键与约束。数据模型、ID 方案与事务说明见 [`docs/architecture/data-model.md`](docs/architecture/data-model.md)。
 
 ## 日志
 
@@ -108,14 +108,14 @@ curl -s http://127.0.0.1:4317/api/health
 
 - 仅绑定 `127.0.0.1`，无认证，不支持公网、多用户或云端部署。
 - WebUI 仅为空壳页面与占位路由；业务页面在后续票实现。
-- 未实现领域表、repository、MCP server 及项目/群组/聊天/状态业务。
-- 迁移版本表在 F1 为空（无业务迁移），`migrations.version` 通常为 `0`。
+- F2 已实现领域表与 repository 数据访问层；MCP server 及项目/群组/聊天/状态业务在后续票实现。
+- 生产迁移当前版本为 `1`（`init_domain_model`）；空库首次启动即全部应用。
 
 ## 目录结构
 
 ```
 src/server/        后端：配置、日志、SQLite、迁移、HTTP、WebSocket、健康检查
-src/server/db/     SQLite 连接与迁移 runner、迁移列表
+src/server/db/     SQLite 连接、迁移 runner 与列表、稳定 ID、领域类型、repository 层
 src/web/           Vue 3 WebUI（Vite 构建，产物输出到 dist/web）
 tests/             自动化测试（node --test）
 docs/              宏观架构与范围文档（详细 spec 见 GitHub Issues）
@@ -128,4 +128,4 @@ npm test          # 全部自动化测试
 npm run typecheck # 类型检查
 ```
 
-测试覆盖：配置加载与覆盖优先级、日志结构化与脱敏、SQLite 连接与迁移幂等/回滚、HTTP 健康检查与静态页、WebSocket welcome/ping-pong/广播/非法帧。
+测试覆盖：配置加载与覆盖优先级、日志结构化与脱敏、SQLite 连接与迁移幂等/回滚、HTTP 健康检查与静态页、WebSocket welcome/ping-pong/广播/非法帧；F2 领域 schema/索引/外键、稳定 ID、各实体 CRUD、项目/群组隔离、每项目唯一 manager、消息稳定 ID 去重、投递去重与至少一次投递、状态按项目成员作用域、写入失败明确错误、事务回滚、重启持久化与 WAL 读写并发。

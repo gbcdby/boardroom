@@ -8,7 +8,8 @@
 docs/
 ├── README.md
 ├── architecture/
-│   └── agent-studio.md       # 产品宏观架构、范围与验收基线
+│   ├── agent-studio.md       # 产品宏观架构、范围与验收基线
+│   └── data-model.md         # 持久化数据模型、ID 方案、迁移与事务
 └── archive/                  # 已取代或废弃的架构文档（按需创建）
 ```
 
