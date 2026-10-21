@@ -1,0 +1,5 @@
+interface:
+  display_name: "测试驱动开发"
+  short_description: "红绿循环，在已确认的 seam 上写测试"
+policy:
+  allow_implicit_invocation: true

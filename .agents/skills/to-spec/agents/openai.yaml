@@ -1,0 +1,5 @@
+interface:
+  display_name: "Spec 编写"
+  short_description: "把已对齐需求固化为正式 spec"
+policy:
+  allow_implicit_invocation: false

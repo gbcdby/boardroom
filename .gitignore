@@ -1,0 +1,70 @@
+# Agent Studio .gitignore
+# 目标：忽略依赖、构建产物、本地运行时数据、密钥与临时草稿；
+# 正式文档（docs/）、项目技能（.agents/）和共享配置必须提交。
+
+# ---------- Node / TypeScript / 构建产物 ----------
+node_modules/
+dist/
+dist-ssr/
+build/
+out/
+coverage/
+.vite/
+.cache/
+.turbo/
+*.tsbuildinfo
+
+# ---------- 包管理器 / 进程调试日志 ----------
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.pid
+*.pid.lock
+
+# ---------- SQLite 运行时数据 ----------
+# 数据库文件与 WAL/SHM/journal 边车文件均为本地运行时状态，不提交。
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db.bak
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite.bak
+
+# 默认运行时数据目录（spec CONFIG-04：数据目录可配置）。
+# 若未来需要提交种子数据，请改用显式的 !规则放行。
+data/
+
+# ---------- 环境变量与密钥 ----------
+.env
+.env.*
+!.env.example
+!.env.template
+
+# ---------- 日志 ----------
+logs/
+*.log
+
+# ---------- 临时草稿与 agent 输出 ----------
+# 依 AGENTS.md：所有临时文件、草稿、调研记录、日志和生成产物统一放这里，不是交付物。
+.agent-output/
+
+# ---------- Claude Code 本地配置 ----------
+# .claude/skills 是指向 .agents/skills 的软链接，属于仓库内容，不能忽略。
+.claude/settings.local.json
+CLAUDE.local.md
+
+# ---------- 编辑器 / IDE ----------
+.idea/
+.vscode/
+
+# ---------- 操作系统 ----------
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini

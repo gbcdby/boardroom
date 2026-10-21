@@ -1,0 +1,3 @@
+interface:
+  display_name: "双轴审查"
+  short_description: "标准轴 + 需求轴审查代码变更"

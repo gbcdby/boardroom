@@ -1,0 +1,5 @@
+interface:
+  display_name: "决策地图"
+  short_description: "为大型未知探索绘制决策票地图"
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,5 @@
+interface:
+  display_name: "会话交接"
+  short_description: "压缩进展，交给全新会话"
+policy:
+  allow_implicit_invocation: false
