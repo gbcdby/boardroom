@@ -60,7 +60,12 @@ test("健康检查返回进程、数据库与迁移版本", async () => {
       assert.equal(body["status"], "ok");
       assert.equal(body["uptimeSeconds"] !== undefined, true);
       assert.deepEqual(body["database"], { status: "ok", writable: true });
-      assert.deepEqual(body["migrations"], { version: 0, applied: 0, pending: 0 });
+      // F2 起生产迁移列表含领域表迁移；新库启动即全部应用，pending 为 0。
+      assert.deepEqual(body["migrations"], {
+        version: migrations.length,
+        applied: migrations.length,
+        pending: 0,
+      });
     } finally {
       await server.close();
     }
@@ -69,10 +74,12 @@ test("健康检查返回进程、数据库与迁移版本", async () => {
 
 test("健康检查反映已应用的迁移版本", async () => {
   await withTempDir(async (dir) => {
-    // 先用一条迁移建表并记录版本，再交给 server 读取。
+    // 先应用全部生产迁移，再追加一条探针迁移建表，交给 server 读取。
     const { db } = openDatabase(dir);
+    const probeVersion = migrations.length + 1;
     runMigrations(db, [
-      { version: 1, name: "probe", up: "CREATE TABLE probe (id INTEGER PRIMARY KEY);" },
+      ...migrations,
+      { version: probeVersion, name: "probe", up: "CREATE TABLE probe (id INTEGER PRIMARY KEY);" },
     ]);
     db.close();
 
@@ -81,8 +88,10 @@ test("健康检查反映已应用的迁移版本", async () => {
       const body = (await (await fetch(`${server.url}/api/health`)).json()) as {
         migrations: { version: number; applied: number; pending: number };
       };
-      assert.equal(body.migrations.version, 1);
-      assert.equal(body.migrations.applied, 1);
+      // 生产迁移 + 探针迁移全部已应用，无 pending。
+      assert.equal(body.migrations.version, probeVersion);
+      assert.equal(body.migrations.applied, probeVersion);
+      assert.equal(body.migrations.pending, 0);
     } finally {
       await server.close();
     }
@@ -201,10 +210,10 @@ test("启动时执行迁移并记录到数据库", async () => {
       const body = (await (await fetch(`${server.url}/api/health`)).json()) as {
         migrations: { version: number };
       };
-      assert.equal(body.migrations.version, 0);
-      assert.equal(server.migrationState.version, 0);
-      // 生产迁移列表在 F1 为空，因此 pending 为 0。
-      assert.equal(migrations.length, 0);
+      // 生产迁移列表（F2 起含领域表）在首次启动时全部应用。
+      assert.equal(body.migrations.version, migrations.length);
+      assert.equal(server.migrationState.version, migrations.length);
+      assert.equal(server.migrationState.applied.length, migrations.length);
     } finally {
       await server.close();
     }
