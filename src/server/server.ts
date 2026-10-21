@@ -10,6 +10,7 @@ import { buildHealthReport } from "./health.ts";
 import type { Logger } from "./logger.ts";
 import { createStaticHandler, isWebUiBuilt } from "./static.ts";
 import { createWebSocketHub, type ServerEvent, type WebSocketHub } from "./ws.ts";
+import { MCP_HTTP_PATH, createMcpSessionsHandler, type McpSessionsHandler } from "./mcp/transport.ts";
 
 /** WebSocket 端点路径。 */
 export const WS_PATH = "/ws";
@@ -35,6 +36,12 @@ export interface RunningServer {
   readonly wsUrl: string;
   readonly database: Database.Database;
   readonly migrationState: MigrationState;
+  /** MCP Streamable HTTP 端点 URL（挂在同一 HTTP server 上）。 */
+  readonly mcpUrl: string;
+  /** 当前 MCP HTTP 会话数（测试与观测）。 */
+  readonly mcpSessionCount: number;
+  /** 当前挂起中的 MCP 等待调用数（测试与观测）。 */
+  readonly mcpPendingWaitCount: number;
   /** 服务端主动广播事件给所有 WebUI 连接。 */
   broadcast(event: ServerEvent): void;
   /** 当前 WebSocket 连接数。 */
@@ -96,6 +103,10 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     });
   }
   const serveStatic = createStaticHandler({ root: webRoot });
+  const mcpHandler: McpSessionsHandler = createMcpSessionsHandler({
+    logger,
+    heartbeat: config.heartbeat,
+  });
 
   const httpServer = createServer((request, response) => {
     void handleRequest(request, response).catch((error: unknown) => {
@@ -130,6 +141,11 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     if (pathname.startsWith("/api/")) {
       writeJson(response, 404, { error: "not_found", path: pathname });
       return;
+    }
+
+    if (pathname === MCP_HTTP_PATH) {
+      const body = request.method === "POST" ? await readJsonBody(request) : undefined;
+      if (await mcpHandler.handle(request, response, body)) return;
     }
 
     if (await serveStatic(request, response)) return;
@@ -198,8 +214,19 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     get clientCount() {
       return hub.clientCount;
     },
+    mcpUrl: `http://${HOST}:${port}${MCP_HTTP_PATH}`,
+    get mcpSessionCount() {
+      return mcpHandler.sessionCount;
+    },
+    get mcpPendingWaitCount() {
+      return mcpHandler.pendingWaitCount;
+    },
     async close() {
+      await mcpHandler.close();
       await hub.close();
+      // 先在途的连接一并断开：Streamable HTTP 的 SSE 响应会持续保持连接，
+      // 仅 close() 不会中断它们；closeAllConnections 让进行中的等待随连接结束。
+      httpServer.closeAllConnections();
       await new Promise<void>((resolve) => {
         httpServer.close(() => resolve());
         httpServer.closeAllConnections();
@@ -208,6 +235,18 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
       log.info("服务已停止");
     },
   };
+}
+
+/** 读取并解析 JSON 请求体；空体或非法 JSON 返回 undefined（由 MCP 层给出协议错误）。 */
+async function readJsonBody(request: IncomingMessage): Promise<unknown> {
+  let raw = "";
+  for await (const chunk of request) raw += chunk;
+  if (raw.trim() === "") return undefined;
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return undefined;
+  }
 }
 
 function writeJson(response: ServerResponse, status: number, body: unknown, headOnly = false): void {

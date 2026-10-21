@@ -1,0 +1,240 @@
+# MCP 工具契约（阶段 1）
+
+状态：草案（随 F3 #13 建立，供 T2–T8 引用）
+日期：2026-10-22
+来源：子 spec #2 §6.1、§8.1、§8.2；决策票 D1 #4、D4 #7、D6 #10；F1 #11 服务骨架
+
+> 本文档固定阶段 1 的 MCP 工具**名字、入参、出参和错误码**，是 T2–T8 的共同基线。
+> 阶段 1 只验收单个项目 / 单个群组；数据按 project/group 作用域建模，但多项目隔离的验收属于阶段 2。
+> 本票只实现**服务端骨架与工具契约**；真实宿主接入（T2/T8）、消息路由/可见性/mention（T3）、
+> 持久化实现（F2/T5）、宿主等待/打断行为（T6/T8）由后续票负责。阶段 1 只记载 D6 已实测的机制。
+
+## 1. 传输选择
+
+| 传输 | 是否提供 | 说明 |
+| --- | --- | --- |
+| **stdio**（默认） | 是 | `src/server/mcp/stdio.ts` 作为独立入口进程；宿主以子进程方式拉起。Claude Code 与 Codex CLI 均实测支持（D6）。 |
+| **Streamable HTTP**（可选） | 是 | 挂在 F1 的同一个 `node:http` 服务上，路径 `/mcp`。两端均实测支持；同一进程可服务多个成员。Codex 会话结束会发 `DELETE` 优雅关闭。 |
+| 旧式 HTTP + SSE | **否** | D6 实测 Codex 不支持该传输；为保证双宿主一致，阶段 1 **不提供** SSE。不要依赖 SSE。 |
+
+**理由**：D6 结论为「stdio 默认、Streamable HTTP 可选、不要依赖 SSE」。stdio 两端都通且不占端口；
+Streamable HTTP 贴合「本地单服务端、多成员」形态，便于在 F1 已启动的 HTTP 服务上复用端口与日志。
+
+- **端口**：Streamable HTTP 复用 F1 的 `AppConfig.port`（默认 4317），路径 `/mcp`，与健康检查
+  `/api/health`、WebSocket `/ws`、WebUI 静态资源共存。stdio 入口不监听端口。
+- **绑定**：仅 `127.0.0.1`；无认证；身份在入群时声明（见 `join`）。
+- **会话**：Streamable HTTP 有状态模式，每个 `initialize` 生成独立 `Mcp-Session-Id`；会话无心跳时按
+  `MCP_SESSION_IDLE_TIMEOUT_MS`（默认 5 分钟）清理（D6：Codex 发 `DELETE`、Claude 不发，需容忍悬挂会话）。
+  连接会话状态与成员运行状态 **分开建模**（D1）：MCP 会话连接 ≠ waiting/working。
+- **共享存储**：每个会话一个 `McpCore` 实例（各自独立 `memberKey`），但它们共用同一个内存 `McpStore`，
+  因此在同一群组内互相可见（A 发送的消息能唤醒等待中的 B）。持久化由 F2/T5 把 `McpStore` 换成
+  SQLite repository，不改工具契约。
+- **观测字段**（供 T4 状态看板与测试）：`mcpSessionCount`（活跃 HTTP 会话数）、
+  `mcpPendingWaitCount`（挂起中的等待调用数）。
+
+## 2. 通用约定
+
+### 2.1 工具返回结构
+
+所有工具返回 MCP `CallToolResult`：
+
+- `content: [{ type: "text", text: <结构化 JSON 的字符串> }]`：便于任何宿主直接读取；
+- `structuredContent: <同一个对象的对象形式>`：便于支持结构化输出的客户端直接取字段；
+- `isError: true` 仅在工具级失败（业务错误码）时设置；框架级参数校验失败由 SDK 以协议错误返回。
+
+业务载荷统一为带 `ok` 字段的可序列化对象：
+
+```jsonc
+// 成功
+{ "ok": true, "...": "工具特有字段" }
+// 失败
+{ "ok": false, "error": { "code": "NOT_IN_GROUP", "message": "可读说明", "details": { } } }
+```
+
+`details` 可选，仅含可序列化的补充信息。错误 `message` 面向用户，不含密钥/正文。
+
+### 2.2 错误码
+
+工具级错误码固定如下（`error.code`），阶段 1 至少覆盖：
+
+| code | 含义 | 典型场景 |
+| --- | --- | --- |
+| `INVALID_ARGUMENT` | 参数无效 | 缺少/类型错误/超出范围（例如 `timeoutMs` 超限）。协议层已校验；业务层再校验语义约束时使用。 |
+| `NOT_IN_GROUP` | 未入群 / 尚未声明身份 | 未调用 `join` 就调用其他工具。 |
+| `FORBIDDEN` | 无权限或不可见 | 读取不在允许范围内的历史（跨群组、未参与的消息）。 |
+| `TIMEOUT` | 超时 | 等待类工具在给定 `timeoutMs` 内无结果（注意：等待超时用 `status:"timeout"` 正常返回更常见，见 §3.2；`TIMEOUT` 保留给其他阻塞型操作）。 |
+| `RATE_LIMITED` | 限流 | 触发每成员 20 次/分钟等阈值（阈值由 T7 落地，本票只定义错误码）。 |
+| `CONFLICT` | 冲突 | 例如重复入群且身份不一致、重复确认的状态冲突。 |
+| `INTERNAL` | 内部错误 | 未预期的服务端异常。 |
+
+HTTP/传输层错误（Streamable HTTP 自身）由 SDK 返回 JSON-RPC 错误，不属于本表。
+
+### 2.3 身份 / 会话
+
+- MCP 会话与成员身份分离：一个会话可能在未 `join` 前调用工具（此时返回 `NOT_IN_GROUP`）。
+- `join` 之后该会话绑定一个 `memberId` + `projectId` + `groupId`；后续工具读取该绑定。
+- 连接层心跳（D4：interval 10s / timeout 30s，可配置）记录在**会话**上，不与成员 `waiting/working` 混同。
+
+## 3. 工具清单
+
+阶段 1 固定注册以下 6 个工具。名字一经固定，后续票不得随意改名。
+
+### 3.1 `join` —— 入群 / 身份声明
+
+声明全局身份、宿主类型并加入（阶段 1 唯一的）群组。
+
+入参：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `displayName` | string | 是 | 显示名（非空，≤ 64 字符）。 |
+| `hostType` | `"claude-code"` \| `"codex-cli"` \| `"other"` | 是 | 宿主类型。 |
+| `projectId` | string | 是 | 项目 ID；阶段 1 由 WebUI 预先创建（T1）。 |
+| `groupId` | string | 是 | 群组 ID。 |
+| `role` | `"manager"` \| `"normal"` | 否（默认 `normal`） | 提示性角色；真正指定 manager 由 WebUI 完成（D2）。 |
+
+出参：
+
+```jsonc
+{
+  "ok": true,
+  "memberId": "m_...",       // 服务端分配的成员 ID（幂等：同会话重复 join 返回同一 memberId）
+  "agentId": "a_...",        // 全局身份 ID
+  "projectId": "...",
+  "groupId": "...",
+  "role": "normal",
+  "heartbeat": { "intervalMs": 10000, "timeoutMs": 30000 } // D4，随入群下发
+}
+```
+
+错误：`INVALID_ARGUMENT`（字段缺失/超长）、`CONFLICT`（重复入群且身份不一致）、`INTERNAL`。
+
+### 3.2 `wait_for_messages` —— 等待或接收消息（**长等待，工具自身挂起**）
+
+由工具自身挂起，在有可投递消息、超时或被取消时 resolve。**这是 D6 证实的唯一可行推送路径**：
+MCP 没有 server→client 工具结果推送，只能让宿主停在工具调用里等待。
+
+入参：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `timeoutMs` | integer | 否（默认 30000，范围 1–300000） | 单次等待上限。D6 建议 25–60s 轮转；上限 300s 对齐实测（297s 仍挂起）。 |
+| `afterCursor` | string | 否 | 断线重连后先拉积压：从该游标之后取；缺省取当前积压。 |
+
+出参：
+
+```jsonc
+{
+  "ok": true,
+  "status": "message" | "timeout" | "cancelled",
+  "messages": [ { "id": "msg_...", "groupId": "...", "senderId": "...", "text": "...", "mentions": ["..."], "createdAt": "..." } ],
+  "cursor": "c_...",        // 下次等待的 afterCursor
+  "drainedBacklog": false   // 本次是否来自积压补投
+}
+```
+
+- `status:"timeout"` 是**正常返回**，不是错误；`status:"cancelled"` 表示宿主取消（`signal` abort）。
+- 未入群：`NOT_IN_GROUP`。超限：`INVALID_ARGUMENT`。
+
+### 3.3 `send_message` —— 发送消息
+
+入参：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `groupId` | string | 否（默认当前入群群组） | 目标群组。 |
+| `text` | string | 是 | 正文（非空，≤ 8000 字符）。 |
+| `mentions` | string[] | 否 | 被 @ 的成员 ID；`@all` 由 T3 解析，本票只透传。 |
+| `clientMessageId` | string | 否 | 客户端幂等键：相同 `clientMessageId` + 发送者只落一条。 |
+
+出参：
+
+```jsonc
+{ "ok": true, "messageId": "msg_...", "createdAt": "...", "duplicate": false }
+```
+
+错误：`INVALID_ARGUMENT`、`NOT_IN_GROUP`、`FORBIDDEN`（不在该群组）、`RATE_LIMITED`、`INTERNAL`。
+
+### 3.4 `acknowledge_message` —— 确认消息（至少一次投递 + 重复确认去重）
+
+确认已处理某条消息；服务端据此推进投递游标。重复确认同一 `(memberId, messageId)` 幂等。
+
+入参：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `messageId` | string | 是 | 待确认消息 ID。 |
+
+出参：
+
+```jsonc
+{ "ok": true, "messageId": "msg_...", "alreadyAcknowledged": false }
+```
+
+错误：`INVALID_ARGUMENT`、`NOT_IN_GROUP`、`FORBIDDEN`（消息不在允许范围）、`CONFLICT`（状态冲突）。
+
+### 3.5 `report_status` —— 状态上报（waiting/working）
+
+上报成员在**当前项目**的运行状态。注意：这是成员运行状态，**不是**连接状态（D1）。
+
+入参：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `status` | `"waiting"` \| `"working"` | 是 | 运行状态。 |
+| `projectId` | string | 否（默认入群项目） | 上下文。 |
+| `memberId` | string | 否（默认当前会话成员） | 上下文；显式传入必须与会话一致，否则 `FORBIDDEN`。 |
+
+出参：
+
+```jsonc
+{ "ok": true, "status": "waiting", "projectId": "...", "memberId": "...", "updatedAt": "..." }
+```
+
+错误：`INVALID_ARGUMENT`、`NOT_IN_GROUP`、`FORBIDDEN`、`INTERNAL`。
+
+### 3.6 `read_history` —— 允许范围内的历史读取
+
+阶段 1 允许范围 = **自己发送 + 被 @**（D3）。任务关联消息留阶段 3。
+
+入参：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `groupId` | string | 否（默认当前群组） | 目标群组。 |
+| `limit` | integer | 否（默认 20，范围 1–100） | 条数。 |
+| `beforeCursor` | string | 否 | 向前翻页游标。 |
+
+出参：
+
+```jsonc
+{ "ok": true, "messages": [ /* 同 wait 的消息结构 */ ], "cursor": "c_...", "hasMore": false }
+```
+
+错误：`INVALID_ARGUMENT`、`NOT_IN_GROUP`、`FORBIDDEN`（跨群组/越权）、`INTERNAL`。
+**本票范围**：只按「自己发送 + 被 @」过滤；mention 解析细节与可见性是 T3。
+
+## 4. 超时、并发与生命周期
+
+- **等待超时**：`wait_for_messages.timeoutMs` 由工具自身 `setTimeout` 控制，超时以 `status:"timeout"` 正常返回。
+- **宿主取消**：监听 `extra.signal`，abort 时以 `status:"cancelled"` resolve，不抛错。
+- **并发限制**（阶段 1 最小实现）：
+  - 单会话同时最多 **1 个**未完成的 `wait_for_messages`；第二个并发等待返回 `CONFLICT`。
+  - 全局并发等待数 = 成员数（阶段 1 单群组，量级很小）；不做额外压测。
+- **优雅关闭**：`close()` 时停止接受新请求 → 以 `status:"cancelled"` 结束挂起等待 → 关闭所有
+  Streamable HTTP 会话 → 关闭 HTTP server 并释放端口。重复 `close()` 幂等。测试验证重启不泄漏端口。
+
+## 5. 与 F1 的集成
+
+- 复用 `AppConfig`（`port` / `dataDir` / `heartbeat`）与 `createLogger`；MCP 相关日志统一 `component: "mcp"`。
+- Streamable HTTP 挂到 F1 `startServer` 的同一个 HTTP server（`/mcp` 路径，方法 `POST`/`GET`/`DELETE`）。
+- stdio 入口（`src/server/mcp/stdio.ts`）只建立 stdio 传输，不监听端口，不启动数据库迁移。
+- 阶段 1 的存储为**内存实现**（`src/server/mcp/store.ts`），用于本票的契约与 fake client 测试；
+  持久化由 F2/T5 替换，repository 集成留给 T2。
+
+## 6. 未做 / 留给后续票
+
+- 真实宿主接入与接入文档（T2/T8）；宿主等待/打断实测记录（T6/T8）。
+- 消息路由、可见性、mention 规则（T3）；限流阈值落地（T7）。
+- 持久化实现（F2/T5）；重连积压持久化。
+- **不承诺**可即时唤醒空闲宿主；**不承诺**打断在途工具调用（D6）。本票只实现工具自身挂起并在有消息时 resolve。
