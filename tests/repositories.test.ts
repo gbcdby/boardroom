@@ -405,3 +405,77 @@ test("事务：批量创建中任一失败则整体回滚", async () => {
     assert.equal(repos.members.getManager(project.id), null);
   });
 });
+
+test("T2：Agent 全局身份键（displayName+hostType）唯一，可按键查找", async () => {
+  await withDb(async ({ db }) => {
+    const repos = createRepositories(db);
+    const a = repos.agents.create({ displayName: "Alice", hostType: "claude-code" });
+    assert.equal(repos.agents.findByIdentity("Alice", "claude-code")?.id, a.id);
+    // 同名不同宿主是不同身份。
+    assert.equal(repos.agents.findByIdentity("Alice", "codex-cli"), null);
+    // 相同身份键再插入被唯一索引拒绝（不静默创建重复身份）。
+    assert.throws(
+      () => repos.agents.create({ displayName: "Alice", hostType: "claude-code" }),
+      (error: unknown) => error instanceof ConflictError,
+    );
+  });
+});
+
+test("T2：Member 可按 (project, agent) 查找，支持幂等入群", async () => {
+  await withDb(async ({ db }) => {
+    const repos = createRepositories(db);
+    const project = repos.projects.create({ name: "P" });
+    const agent = repos.agents.create({ displayName: "Alice", hostType: "claude-code" });
+    const member = repos.members.create({ projectId: project.id, kind: "agent", agentId: agent.id, displayName: "Alice" });
+    assert.equal(repos.members.findByAgent(project.id, agent.id)?.id, member.id);
+    assert.equal(repos.members.findByAgent(project.id, "a_missing"), null);
+  });
+});
+
+test("T2：McpSession 连接/心跳/断开可持久化，active 唯一", async () => {
+  await withDb(async ({ db }) => {
+    const repos = createRepositories(db);
+    const project = repos.projects.create({ name: "P" });
+    const agent = repos.agents.create({ displayName: "Alice", hostType: "claude-code" });
+    const member = repos.members.create({ projectId: project.id, kind: "agent", agentId: agent.id, displayName: "Alice" });
+    const group = repos.groups.create({ projectId: project.id, name: "G", participantMemberIds: [member.id] });
+
+    const s1 = repos.mcpSessions.connect({
+      agentId: agent.id, projectId: project.id, groupId: group.id,
+      memberId: member.id, displayName: "Alice", hostType: "claude-code",
+    });
+    assert.equal(s1.state, "connected");
+    assert.ok(s1.lastHeartbeatAt);
+
+    // 同 agent+project+group 再次 connect 复用同一活跃会话（不新建）。
+    const s2 = repos.mcpSessions.connect({
+      agentId: agent.id, projectId: project.id, groupId: group.id,
+      memberId: member.id, displayName: "Alice", hostType: "claude-code",
+    });
+    assert.equal(s2.id, s1.id);
+
+    const beat = repos.mcpSessions.heartbeat(s1.id, "2030-01-01T00:00:00.000Z");
+    assert.equal(beat.lastHeartbeatAt, "2030-01-01T00:00:00.000Z");
+
+    const disc = repos.mcpSessions.disconnect(s1.id, "2030-01-01T00:01:00.000Z");
+    assert.equal(disc.state, "disconnected");
+    assert.equal(repos.mcpSessions.findActive(agent.id, project.id, group.id), null);
+  });
+});
+
+test("T2：启动时 markAllStale 把遗留 connected 会话标记为断开", async () => {
+  await withDb(async ({ db }) => {
+    const repos = createRepositories(db);
+    const project = repos.projects.create({ name: "P" });
+    const agent = repos.agents.create({ displayName: "Alice", hostType: "claude-code" });
+    const member = repos.members.create({ projectId: project.id, kind: "agent", agentId: agent.id, displayName: "Alice" });
+    const group = repos.groups.create({ projectId: project.id, name: "G", participantMemberIds: [member.id] });
+    repos.mcpSessions.connect({
+      agentId: agent.id, projectId: project.id, groupId: group.id,
+      memberId: member.id, displayName: "Alice", hostType: "claude-code",
+    });
+    const changes = repos.mcpSessions.markAllStale("2030-01-01T00:00:00.000Z");
+    assert.equal(changes, 1);
+    assert.equal(repos.mcpSessions.findActive(agent.id, project.id, group.id), null);
+  });
+});

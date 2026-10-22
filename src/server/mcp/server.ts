@@ -171,6 +171,18 @@ export function createMcpServer(options: CreateMcpServerOptions): McpServer {
   );
 
   server.registerTool(
+    "heartbeat",
+    {
+      title: "连接心跳",
+      description:
+        "刷新本 MCP 会话的连接心跳与全局身份 last_seen_at（连接状态，D1）；不改变成员运行状态（waiting/working 由 report_status 单独上报）。",
+      inputSchema: {},
+    },
+    (_args, extra) =>
+      runTool(log, "heartbeat", () => core.heartbeat(sessionOf(extra)) as unknown as ToolPayload),
+  );
+
+  server.registerTool(
     "read_history",
     {
       title: "读取允许范围内的历史",

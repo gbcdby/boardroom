@@ -63,6 +63,23 @@ async function callTool(client: Client, name: string, args: Record<string, unkno
   return { payload: JSON.parse(textPart.text) as ToolPayload, isError: result.isError === true };
 }
 
+/** 通过 HTTP REST 创建一个项目与一个群组（T1 契约），返回它们 id。 */
+async function seedProjectAndGroup(server: RunningServer): Promise<{ projectId: string; groupId: string }> {
+  const projectRes = await fetch(`${server.url}/api/projects`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "P" }),
+  });
+  const project = (await projectRes.json()) as { project: { id: string } };
+  const groupRes = await fetch(`${server.url}/api/projects/${project.project.id}/groups`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "G" }),
+  });
+  const group = (await groupRes.json()) as { group: { id: string } };
+  return { projectId: project.project.id, groupId: group.group.id };
+}
+
 test("Streamable HTTP /mcp 暴露契约工具列表", async () => {
   await withServer(async (server) => {
     const { client, transport } = await connectClient(server, "http-client");
@@ -71,6 +88,7 @@ test("Streamable HTTP /mcp 暴露契约工具列表", async () => {
       const names = tools.map((tool) => tool.name).sort();
       assert.deepEqual(names, [
         "acknowledge_message",
+        "heartbeat",
         "join",
         "read_history",
         "report_status",
@@ -87,14 +105,15 @@ test("Streamable HTTP /mcp 暴露契约工具列表", async () => {
 
 test("两个 HTTP 会话入同一群组可互相收发（共享 store）", async () => {
   await withServer(async (server) => {
+    const { projectId, groupId } = await seedProjectAndGroup(server);
     const a = await connectClient(server, "A");
     const b = await connectClient(server, "B");
     try {
       const ja = await callTool(a.client, "join", {
-        displayName: "A", hostType: "claude-code", projectId: "p1", groupId: "g1",
+        displayName: "A", hostType: "claude-code", projectId, groupId,
       });
       const jb = await callTool(b.client, "join", {
-        displayName: "B", hostType: "codex-cli", projectId: "p1", groupId: "g1",
+        displayName: "B", hostType: "codex-cli", projectId, groupId,
       });
       assert.equal(ja.payload.ok, true);
       assert.equal(jb.payload.ok, true);
@@ -128,8 +147,9 @@ test("优雅关闭后端口可立即被重新监听（不泄漏）", async () =>
   try {
     const first = await startServer({ config: baseConfig, logger: silentLogger });
     const port = first.port;
+    const { projectId, groupId } = await seedProjectAndGroup(first);
     const { client, transport } = await connectClient(first, "restart-client");
-    await callTool(client, "join", { displayName: "A", hostType: "claude-code", projectId: "p1", groupId: "g1" });
+    await callTool(client, "join", { displayName: "A", hostType: "claude-code", projectId, groupId });
     await client.close();
     await transport.terminateSession().catch(() => {});
     await first.close();
@@ -141,7 +161,7 @@ test("优雅关闭后端口可立即被重新监听（不泄漏）", async () =>
       assert.equal(res.status, 200);
       const probe = await connectClient(second, "restart-client-2");
       const listed = await probe.client.listTools();
-      assert.equal(listed.tools.length, 6);
+      assert.equal(listed.tools.length, 7);
       await probe.client.close();
       await probe.transport.terminateSession().catch(() => {});
     } finally {
@@ -159,8 +179,9 @@ test("优雅关闭会清空挂起的等待并关闭所有 MCP 会话", async () 
     logger: silentLogger,
   });
   try {
+    const { projectId, groupId } = await seedProjectAndGroup(server);
     const { client, transport } = await connectClient(server, "wait-client");
-    await callTool(client, "join", { displayName: "A", hostType: "claude-code", projectId: "p1", groupId: "g1" });
+    await callTool(client, "join", { displayName: "A", hostType: "claude-code", projectId, groupId });
     // 起一个长等待但不 await；随后确认它确实挂起。
     const waitPromise = callTool(client, "wait_for_messages", { timeoutMs: 30_000 });
     // 该 promise 在关闭后可能 resolve 也可能 reject；这里只要求不产生未处理拒绝。
@@ -179,6 +200,51 @@ test("优雅关闭会清空挂起的等待并关闭所有 MCP 会话", async () 
     // 显式关闭客户端传输，避免 SDK 重连计时器/undici 连接把测试进程拖住。
     await client.close().catch(() => {});
     await transport.close().catch(() => {});
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("重启恢复：成员保留、遗留 MCP 会话标记断开、成员状态 offline（不臆造在线）", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-mcp-recover-"));
+  const config = {
+    port: 0,
+    dataDir: dir,
+    heartbeat: { intervalMs: 10_000, timeoutMs: 30_000 },
+    configFile: null,
+  };
+  try {
+    const first = await startServer({ config, logger: silentLogger });
+    const { projectId, groupId } = await seedProjectAndGroup(first);
+    const { client, transport } = await connectClient(first, "recover-client");
+    const joined = await callTool(client, "join", {
+      displayName: "Alice", hostType: "claude-code", projectId, groupId,
+    });
+    const memberId = String(joined.payload["memberId"]);
+    await callTool(client, "report_status", { status: "working" });
+    await client.close();
+    await transport.terminateSession().catch(() => {});
+    // 模拟非优雅退出：直接关闭 HTTP server（不经过会话 disconnect 清理路径）。
+    await first.close();
+
+    // 重启同一数据目录：成员保留；遗留会话被标记断开；成员状态回落 offline。
+    const second = await startServer({ config: { ...config, port: 0 }, logger: silentLogger });
+    try {
+      const membersRes = await fetch(`${second.url}/api/projects/${projectId}/members`);
+      assert.equal(membersRes.status, 200);
+      const { members } = (await membersRes.json()) as { members: Array<{ id: string; kind: string }> };
+      assert.equal(members.length, 1);
+      assert.equal(members[0]!.id, memberId);
+      assert.equal(members[0]!.kind, "agent");
+
+      const statusRes = await fetch(`${second.url}/api/projects/${projectId}/members/${memberId}/status`);
+      assert.equal(statusRes.status, 200);
+      const view = ((await statusRes.json()) as { memberStatus: { connection: string; state: string | null } }).memberStatus;
+      assert.equal(view.connection, "disconnected", "重启后遗留会话应显示断开");
+      assert.equal(view.state, "offline", "重启后成员状态应为 offline，而不是在线");
+    } finally {
+      await second.close();
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

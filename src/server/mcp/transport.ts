@@ -1,10 +1,11 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import type { Database } from "better-sqlite3";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Logger } from "../logger.ts";
-import { createMcpCore, createMcpStore, type Heartbeat, type McpStore } from "./core.ts";
+import { createMcpCore, type Heartbeat } from "./core.ts";
 import { createMcpServer } from "./server.ts";
 
 /** MCP Streamable HTTP 端点路径（挂在 F1 的同一 HTTP server 上）。 */
@@ -16,8 +17,8 @@ export const MCP_SESSION_IDLE_TIMEOUT_MS = 5 * 60_000;
 export interface McpTransportOptions {
   readonly logger: Logger;
   readonly heartbeat: Heartbeat;
-  /** 共享 store；缺省新建（测试可注入）。 */
-  readonly store?: McpStore;
+  /** 持久化数据库；MCP 工具直接落 F2 repository（T2）。 */
+  readonly db: Database;
 }
 
 export interface McpSessionsHandler {
@@ -41,13 +42,14 @@ interface HttpSession {
 /**
  * 为 F1 的 HTTP server 装配 MCP Streamable HTTP 端点。
  *
- * 一个有状态的 MCP 客户端会话 = 一个 transport + 一个 server + 一个 core，
- * 它们共享同一个 {@link McpStore}，从而在同一群组内互相可见。会话无心跳时按
- * {@link MCP_SESSION_IDLE_TIMEOUT_MS} 回收，避免 Claude 端的悬挂会话泄漏。
+ * 一个有状态的 MCP 客户端会话 = 一个 transport + 一个 server + 一个 core。
+ * 每个 core 直接读写同一个 SQLite（F2 repository），因此同一群组内跨会话互相可见；
+ * 进程内仍共享一份「挂起等待」注册表用于跨会话唤醒。会话无心跳时按
+ * {@link MCP_SESSION_IDLE_TIMEOUT_MS} 回收，避免 Claude 端的悬挂会话泄漏；回收时
+ * 将该会话对应的持久化 MCP 会话标记为断开（状态恢复靠服务端持久化，D6）。
  */
 export function createMcpSessionsHandler(options: McpTransportOptions): McpSessionsHandler {
   const log = options.logger.child({ component: "mcp-http" });
-  const store = options.store ?? createMcpStore();
   const sessions = new Map<string, HttpSession>();
   let closed = false;
 
@@ -66,6 +68,8 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
     const session = sessions.get(sid);
     if (!session) return;
     sessions.delete(sid);
+    // 连接会话回收：把持久化的 MCP 会话标记为断开，并把成员运行状态置为 offline。
+    session.core.disconnect();
     session.core.close();
     try {
       await session.server.close();
@@ -82,7 +86,12 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
         log.info("mcp_session_initialized", { sessionId: sid });
       },
     });
-    const core = createMcpCore({ logger: options.logger, heartbeat: options.heartbeat, store, memberKey: "http" });
+    const core = createMcpCore({
+      logger: options.logger,
+      heartbeat: options.heartbeat,
+      db: options.db,
+      memberKey: "http",
+    });
     const server = createMcpServer({ core, logger: options.logger });
     const session: HttpSession = { transport, server, core, lastActivity: Date.now() };
 
@@ -91,6 +100,7 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
         sessions.delete(transport.sessionId);
         log.info("mcp_session_closed", { sessionId: transport.sessionId });
       }
+      core.disconnect();
       core.close();
     };
 

@@ -18,7 +18,11 @@ const DOMAIN_TABLES = [
   "messages",
   "message_deliveries",
   "member_statuses",
+  "mcp_sessions",
 ] as const;
+
+/** 期望的最高迁移版本（F2 v1 + T2 v2）。 */
+const EXPECTED_VERSION = 2;
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-schema-"));
@@ -42,8 +46,8 @@ test("空库执行生产迁移后建立全部领域表", async () => {
     const { db } = openDatabase(dir);
     try {
       const result = runMigrations(db, migrations);
-      assert.equal(result.version, 1);
-      assert.equal(result.applied.length, 1);
+      assert.equal(result.version, EXPECTED_VERSION);
+      assert.equal(result.applied.length, EXPECTED_VERSION);
 
       const created = tables(db);
       for (const table of DOMAIN_TABLES) {
@@ -63,8 +67,8 @@ test("重复执行生产迁移是幂等的", async () => {
       runMigrations(db, migrations);
       const second = runMigrations(db, migrations);
       assert.deepEqual(second.applied, []);
-      assert.equal(second.version, 1);
-      assert.equal(readMigrationState(db).applied.length, 1);
+      assert.equal(second.version, EXPECTED_VERSION);
+      assert.equal(readMigrationState(db).applied.length, EXPECTED_VERSION);
     } finally {
       db.close();
     }
@@ -91,6 +95,9 @@ test("领域表上存在预期的索引与唯一约束", async () => {
       assert.ok(indexes.includes("ux_deliveries_message_member"), "缺少投递去重唯一索引");
       // 状态按 (project, member) 唯一。
       assert.ok(indexes.includes("ux_member_statuses_scope"), "缺少状态作用域唯一索引");
+      // T2：Agent 全局身份唯一、MCP 活跃会话唯一。
+      assert.ok(indexes.includes("ux_agents_identity"), "缺少 Agent 身份唯一索引");
+      assert.ok(indexes.includes("ux_mcp_sessions_active"), "缺少 MCP 活跃会话唯一索引");
     } finally {
       db.close();
     }

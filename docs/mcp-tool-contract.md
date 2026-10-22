@@ -26,9 +26,8 @@ Streamable HTTP 贴合「本地单服务端、多成员」形态，便于在 F1 
 - **会话**：Streamable HTTP 有状态模式，每个 `initialize` 生成独立 `Mcp-Session-Id`；会话无心跳时按
   `MCP_SESSION_IDLE_TIMEOUT_MS`（默认 5 分钟）清理（D6：Codex 发 `DELETE`、Claude 不发，需容忍悬挂会话）。
   连接会话状态与成员运行状态 **分开建模**（D1）：MCP 会话连接 ≠ waiting/working。
-- **共享存储**：每个会话一个 `McpCore` 实例（各自独立 `memberKey`），但它们共用同一个内存 `McpStore`，
-  因此在同一群组内互相可见（A 发送的消息能唤醒等待中的 B）。持久化由 F2/T5 把 `McpStore` 换成
-  SQLite repository，不改工具契约。
+- **共享存储**：每个会话一个 `McpCore` 实例（各自独立 `memberKey`）。（F3 草案为共享内存 `McpStore`；
+  T2 已换成共享同一 SQLite 的 F2 repository，见 §7。）同一群组内互相可见（A 发送的消息能唤醒等待中的 B）。
 - **观测字段**（供 T4 状态看板与测试）：`mcpSessionCount`（活跃 HTTP 会话数）、
   `mcpPendingWaitCount`（挂起中的等待调用数）。
 
@@ -77,7 +76,7 @@ HTTP/传输层错误（Streamable HTTP 自身）由 SDK 返回 JSON-RPC 错误�
 
 ## 3. 工具清单
 
-阶段 1 固定注册以下 6 个工具。名字一经固定，后续票不得随意改名。
+阶段 1 固定注册以下 6 个工具（T2 追加 `heartbeat`，共 7 个）。名字一经固定，后续票不得随意改名。
 
 ### 3.1 `join` —— 入群 / 身份声明
 
@@ -238,3 +237,18 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 - 消息路由、可见性、mention 规则（T3）；限流阈值落地（T7）。
 - 持久化实现（F2/T5）；重连积压持久化。
 - **不承诺**可即时唤醒空闲宿主；**不承诺**打断在途工具调用（D6）。本票只实现工具自身挂起并在有消息时 resolve。
+
+## 7. T2（#15）落地补充
+
+T2 已把上述**内存 `McpStore` 替换为 F2 的 SQLite 持久化**（`src/server/mcp/core.ts` 直接读写
+`createRepositories(db)`）。工具对外形状（下表 6 个工具的名字/入参/出参/错误码）**保持不变**，仅：
+
+- **新增 `heartbeat` 工具**（第 7 个）：刷新本 MCP 会话的连接心跳与 Agent `last_seen_at`；不改成员运行状态。
+  入参无；出参 `{ ok, sessionId, state:"connected", lastHeartbeatAt }`。未入群 → `NOT_IN_GROUP`。
+- `wait_for_messages` 返回的 `cursor` 形如 `c_<seq>`（群组内单调 seq，稳定可解析）；`afterCursor` 接受同格式。
+- 持久化落点：`agents`（全局身份，`(display_name, host_type)` 唯一）、`members`、`group_participants`、
+  `mcp_sessions`（连接状态，D1）、`member_statuses`（运行状态，D1）、`messages`、`message_deliveries`。
+- 挂起中的等待仍是运行时对象（不落库）；进程重启后由 agent 重连重新等待（重连积压留 T5）。
+
+详见 `docs/t2-mcp-join-and-online.md`。
+

@@ -131,3 +131,28 @@ export interface MemberStatus {
 }
 
 export type MemberState = "online" | "offline" | "waiting" | "working";
+
+/**
+ * McpSession：一个 MCP 会话的连接状态（全局层，D1），持久化「可恢复」的部分。
+ *
+ * 与 {@link MemberStatus} 分开建模：
+ * - McpSession 记录某个 agent 的 MCP 会话在哪个项目/群组、何时连接/断开、最后心跳；
+ * - MemberStatus 记录项目成员运行状态（online/offline/waiting/working）。
+ * 连接是否**存活**由运行时按心跳推导；表只保存状态与时间戳，不保存连接对象。
+ */
+export type McpSessionState = "connected" | "disconnected";
+
+export interface McpSession {
+  readonly id: string;
+  readonly agentId: string;
+  readonly projectId: string;
+  readonly groupId: string;
+  readonly memberId: string;
+  readonly displayName: string;
+  readonly hostType: HostType;
+  readonly state: McpSessionState;
+  readonly connectedAt: string;
+  readonly lastHeartbeatAt: string | null;
+  readonly disconnectedAt: string | null;
+  readonly updatedAt: string;
+}

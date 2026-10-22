@@ -7,6 +7,7 @@ import { openDatabase } from "./db/database.ts";
 import { readMigrationState, runMigrations, type MigrationState } from "./db/migrate.ts";
 import { migrations } from "./db/migrations/index.ts";
 import { buildHealthReport } from "./health.ts";
+import { createRepositories } from "./db/repositories.ts";
 import type { Logger } from "./logger.ts";
 import { createStaticHandler, isWebUiBuilt } from "./static.ts";
 import { createWebSocketHub, type ServerEvent, type WebSocketHub } from "./ws.ts";
@@ -96,6 +97,29 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     );
   }
 
+  // T2 / D6：进程重启后，上一进程遗留的「connected」MCP 会话已失效。
+  // 启动时统一标记为断开，并把这些成员的运行状态置为 offline——恢复完全依赖
+  // 服务端持久化 + agent 重连后主动 join/心跳，不臆造在线（STATUS-02）。
+  try {
+    const recovered = createRepositories(db);
+    const staleAt = new Date().toISOString();
+    const staleCount = recovered.mcpSessions.markAllStale(staleAt);
+    if (staleCount > 0) {
+      for (const project of recovered.projects.list()) {
+        for (const member of recovered.members.listByProject(project.id)) {
+          const status = recovered.statuses.get(project.id, member.id);
+          if (status && (status.state === "online" || status.state === "waiting" || status.state === "working")) {
+            recovered.statuses.set(project.id, member.id, "offline");
+          }
+        }
+      }
+      log.info("启动恢复：清理遗留 MCP 会话", { staleSessions: staleCount });
+    }
+  } catch (error) {
+    // 恢复失败不阻止启动；记录并继续（下次心跳/重连会纠正状态）。
+    log.warn("启动恢复清理失败", { error });
+  }
+
   const webuiBuilt = await isWebUiBuilt(webRoot);
   if (!webuiBuilt) {
     log.warn("WebUI 构建产物缺失，静态页面将不可用", {
@@ -107,6 +131,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   const mcpHandler: McpSessionsHandler = createMcpSessionsHandler({
     logger,
     heartbeat: config.heartbeat,
+    db,
   });
   const t1Api = createT1ApiRouter({ db, logger });
 

@@ -32,6 +32,26 @@ export interface GroupDto {
   updatedAt: string;
 }
 
+/**
+ * 成员在线/连接状态（T2）。把分开建模的两层合并展示：
+ * - `connection`：全局 MCP 会话连接状态（connected / disconnected / none）；
+ * - `state`：项目成员运行状态（online/offline/waiting/working / null）。
+ */
+export interface MemberStatusDto {
+  memberId: string;
+  projectId: string;
+  displayName: string | null;
+  kind: "agent" | "human" | null;
+  agentId: string | null;
+  hostType: string | null;
+  connection: "connected" | "disconnected" | "none";
+  state: "online" | "offline" | "waiting" | "working" | null;
+  lastHeartbeatAt: string | null;
+  connectedAt: string | null;
+  disconnectedAt: string | null;
+  updatedAt: string | null;
+}
+
 export class ApiError extends Error {
   override readonly name = "ApiError";
   readonly code: string;
@@ -107,5 +127,8 @@ export const api = {
   },
   listParticipants(groupId: string): Promise<{ participants: MemberDto[] }> {
     return request("GET", `/api/groups/${encodeURIComponent(groupId)}/participants`);
+  },
+  listMemberStatuses(projectId: string): Promise<{ memberStatuses: MemberStatusDto[] }> {
+    return request("GET", `/api/projects/${encodeURIComponent(projectId)}/member-statuses`);
   },
 };
