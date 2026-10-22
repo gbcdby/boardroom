@@ -399,3 +399,36 @@ test("优雅关闭：正在等待的成员被取消等待后不回写成 working
     }
   });
 });
+
+test("积压查询（repository seam）：listPending 只返回未完成投递，按群组 seq 稳定排序，acked 后移除", async () => {
+  await withDir(async ({ dir }) => {
+    const env = await open(dir);
+    const human = env.repos.members.create({ projectId: env.projectId, kind: "human", displayName: "我" });
+    env.repos.groups.addParticipant(env.groupId, human.id);
+    const m1 = env.repos.messages.create({ groupId: env.groupId, senderMemberId: human.id, body: "一" });
+    const m2 = env.repos.messages.create({ groupId: env.groupId, senderMemberId: human.id, body: "二" });
+    const m3 = env.repos.messages.create({ groupId: env.groupId, senderMemberId: human.id, body: "三" });
+    for (const m of [m1, m2, m3]) env.repos.deliveries.ensure(m.id, human.id);
+
+    // 全部 pending 时按 seq 升序返回。
+    assert.deepEqual(
+      env.repos.deliveries.listPending(env.projectId, human.id).map((d) => d.messageId),
+      [m1.id, m2.id, m3.id],
+    );
+
+    // 中间一条 acked：不再出现在 pending 积压中。
+    env.repos.deliveries.recordAttempt(m2.id, human.id, "acked");
+    assert.deepEqual(
+      env.repos.deliveries.listPending(env.projectId, human.id).map((d) => d.messageId),
+      [m1.id, m3.id],
+    );
+
+    // delivered（未 ack）仍算待完成，可重投。
+    env.repos.deliveries.recordAttempt(m1.id, human.id, "delivered");
+    assert.deepEqual(
+      env.repos.deliveries.listPending(env.projectId, human.id).map((d) => d.messageId),
+      [m1.id, m3.id],
+    );
+    env.db.close();
+  });
+});
