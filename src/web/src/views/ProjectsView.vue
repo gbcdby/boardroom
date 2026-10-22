@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { ApiError, api, type GroupDto, type MemberDto, type ProjectDto } from "../api/client.ts";
+import { ApiError, api, type GroupDto, type MemberDto, type MemberStatusDto, type ProjectDto } from "../api/client.ts";
 
 /**
  * T1（#14）项目工作台：在 WebUI 中创建项目、管理项目成员、指定顶层 manager、
@@ -16,6 +16,8 @@ const members = ref<MemberDto[]>([]);
 const groups = ref<GroupDto[]>([]);
 /** 群组 id → 参与者列表。 */
 const participants = ref<Record<string, MemberDto[]>>({});
+/** 项目成员在线/连接状态（T2）：memberId → 状态视图。 */
+const statuses = ref<Record<string, MemberStatusDto>>({});
 
 const busy = ref(false);
 const error = ref<string | null>(null);
@@ -66,6 +68,7 @@ async function loadActiveProject(): Promise<void> {
     members.value = [];
     groups.value = [];
     participants.value = {};
+    statuses.value = {};
     return;
   }
   const [memberResult, groupResult] = await Promise.all([
@@ -77,6 +80,7 @@ async function loadActiveProject(): Promise<void> {
     groups.value = groupResult.groups;
     await loadParticipants();
   }
+  await loadStatuses();
 }
 
 async function loadParticipants(): Promise<void> {
@@ -88,6 +92,19 @@ async function loadParticipants(): Promise<void> {
     }),
   );
   participants.value = map;
+}
+
+async function loadStatuses(): Promise<void> {
+  const projectId = activeProjectId.value;
+  if (projectId === null) {
+    statuses.value = {};
+    return;
+  }
+  const result = await run(() => api.listMemberStatuses(projectId));
+  if (!result) return;
+  const map: Record<string, MemberStatusDto> = {};
+  for (const status of result.memberStatuses) map[status.memberId] = status;
+  statuses.value = map;
 }
 
 async function selectProject(projectId: string): Promise<void> {
@@ -171,6 +188,41 @@ async function createGroup(): Promise<void> {
   await loadActiveProject();
 }
 
+/** 连接状态的中文标签（全局 MCP 会话层，D1）。 */
+function connectionLabel(memberId: string): string {
+  const status = statuses.value[memberId];
+  if (!status) return "未知";
+  switch (status.connection) {
+    case "connected":
+      return "已连接";
+    case "disconnected":
+      return "已断开";
+    default:
+      return "未连接";
+  }
+}
+
+/** 运行状态的中文标签（项目成员层，waiting/working 只看显式上报）。 */
+function stateLabel(memberId: string): string {
+  const status = statuses.value[memberId];
+  if (!status || status.state === null) return "—";
+  switch (status.state) {
+    case "online":
+      return "在线";
+    case "offline":
+      return "离线";
+    case "waiting":
+      return "等待中";
+    case "working":
+      return "工作中";
+  }
+}
+
+function isOnline(memberId: string): boolean {
+  const status = statuses.value[memberId];
+  return status?.connection === "connected" && status?.state !== "offline";
+}
+
 function participantNames(groupId: string): string {
   return (participants.value[groupId] ?? []).map((m) => m.displayName).join("、") || "（暂无参与者）";
 }
@@ -231,9 +283,13 @@ onMounted(() => void loadProjects());
         <ul v-else class="list" data-testid="member-list">
           <li v-for="member in members" :key="member.id" class="list-item">
             <span>
+              <span class="dot" :class="isOnline(member.id) ? 'online' : 'offline'" data-testid="online-dot"></span>
               {{ member.displayName }}
               <span class="badge">{{ member.kind === "human" ? "人" : "agent" }}</span>
               <span v-if="member.role === 'manager'" class="badge manager">manager</span>
+              <span v-if="member.kind === 'agent'" class="badge state" data-testid="member-state">
+                {{ connectionLabel(member.id) }} / {{ stateLabel(member.id) }}
+              </span>
             </span>
             <span class="actions">
               <button
@@ -246,6 +302,27 @@ onMounted(() => void loadProjects());
               <button type="button" :disabled="busy" class="danger" @click="removeMember(member)">
                 移除
               </button>
+            </span>
+          </li>
+        </ul>
+      </div>
+
+      <!-- 成员在线状态（T2 基础展示；完整状态看板在 T4） -->
+      <div class="panel">
+        <h3>成员在线状态</h3>
+        <p class="muted small">
+          在线以 MCP 连接/心跳为准（不靠终端画面推断）：连接状态来自全局 MCP 会话，运行状态（等待/工作）来自成员显式上报。
+        </p>
+        <button type="button" :disabled="busy" data-testid="refresh-status" @click="loadStatuses">刷新状态</button>
+        <p v-if="members.length === 0" class="muted">暂无成员。</p>
+        <ul v-else class="list" data-testid="status-list">
+          <li v-for="member in members" :key="member.id" class="list-item">
+            <span>
+              <span class="dot" :class="isOnline(member.id) ? 'online' : 'offline'"></span>
+              {{ member.displayName }}
+            </span>
+            <span class="small" data-testid="status-detail">
+              {{ connectionLabel(member.id) }} · {{ stateLabel(member.id) }}
             </span>
           </li>
         </ul>
@@ -389,6 +466,28 @@ button.danger {
 .badge.manager {
   background: rgba(37, 99, 235, 0.18);
   color: var(--accent);
+}
+
+.badge.state {
+  background: rgba(127, 127, 127, 0.12);
+  color: var(--muted);
+}
+
+.dot {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  margin-right: 0.3rem;
+  vertical-align: middle;
+}
+
+.dot.online {
+  background: var(--ok);
+}
+
+.dot.offline {
+  background: var(--muted);
 }
 
 .participants-picker {

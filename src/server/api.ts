@@ -169,6 +169,47 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       return true;
     }
 
+    // /api/projects/:id/members/:memberId/status —— T2 成员在线/连接状态（基础展示）
+    if (
+      segments.length === 6 &&
+      segments[0] === "api" &&
+      segments[1] === "projects" &&
+      segments[3] === "members" &&
+      segments[5] === "status"
+    ) {
+      const projectId = decodeSegment(segments[2]!);
+      const memberId = decodeSegment(segments[4]!);
+      requireProject(r, projectId);
+      const member = r.members.get(memberId);
+      if (!member || member.projectId !== projectId) {
+        throw new RepositoryError("not_found", `成员 ${memberId} 不属于项目 ${projectId}。`);
+      }
+      if (method === "GET") {
+        writeJson(response, 200, { memberStatus: memberStatusView(r, projectId, memberId) });
+        return true;
+      }
+      methodNotAllowed(response, ["GET"]);
+      return true;
+    }
+
+    // /api/projects/:id/member-statuses —— 列出项目内所有成员的在线/连接状态（T2）
+    if (
+      segments.length === 4 &&
+      segments[0] === "api" &&
+      segments[1] === "projects" &&
+      segments[3] === "member-statuses"
+    ) {
+      const projectId = decodeSegment(segments[2]!);
+      requireProject(r, projectId);
+      if (method === "GET") {
+        const list = r.members.listByProject(projectId).map((m) => memberStatusView(r, projectId, m.id));
+        writeJson(response, 200, { memberStatuses: list });
+        return true;
+      }
+      methodNotAllowed(response, ["GET"]);
+      return true;
+    }
+
     // /api/projects/:id/manager
     if (
       segments.length === 4 &&
@@ -297,6 +338,40 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       name: group.name,
       createdAt: group.createdAt,
       updatedAt: group.updatedAt,
+    };
+  }
+
+  /**
+   * 成员在线/连接视图（T2）。
+   *
+   * 把分开建模的两层合并成一个**只读展示**视图：
+   * - `connection`：全局 MCP 会话连接状态（connected / disconnected / none），来自 mcp_sessions；
+   * - `state`：项目成员运行状态（online/offline/waiting/working），来自 member_statuses；
+   * - `lastHeartbeatAt`：最后一次心跳时间（连接层）。
+   * 两者始终分开存储；这里只是展示层拼接，不写回、不互相推导。
+   */
+  function memberStatusView(r: RepositorySet, projectId: string, memberId: string) {
+    const member = r.members.get(memberId);
+    const status = r.statuses.get(projectId, memberId);
+    const session = r.mcpSessions
+      .listByProject(projectId)
+      .filter((s) => s.memberId === memberId)
+      .sort((a, b) => (a.connectedAt < b.connectedAt ? 1 : -1))[0];
+    let connection: "connected" | "disconnected" | "none" = "none";
+    if (session) connection = session.state === "connected" ? "connected" : "disconnected";
+    return {
+      memberId,
+      projectId,
+      displayName: member?.displayName ?? null,
+      kind: member?.kind ?? null,
+      agentId: member?.agentId ?? null,
+      hostType: session?.hostType ?? null,
+      connection,
+      state: status?.state ?? null,
+      lastHeartbeatAt: session?.lastHeartbeatAt ?? null,
+      connectedAt: session?.connectedAt ?? null,
+      disconnectedAt: session?.disconnectedAt ?? null,
+      updatedAt: status?.updatedAt ?? session?.updatedAt ?? null,
     };
   }
 

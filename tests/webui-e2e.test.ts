@@ -87,11 +87,12 @@ test("构建产物包含项目/群组页面关键 UI 文本（自行构建到临
     let bundle = "";
     for (const file of jsFiles) bundle += await readFile(path.join(assetsDir, file), "utf8");
 
-    for (const marker of ["创建项目", "添加成员", "设为 manager", "创建群组", "参与者", "顶层 manager"]) {
+    for (const marker of ["创建项目", "添加成员", "设为 manager", "创建群组", "参与者", "顶层 manager", "成员在线状态"]) {
       assert.ok(bundle.includes(marker), `构建产物应包含文案「${marker}」`);
     }
-    // 前端调用的 API 路径确实存在。
+    // 前端调用的 API 路径确实存在（含 T2 成员状态端点）。
     assert.ok(bundle.includes("/api/projects"), "构建产物应调用 /api/projects");
+    assert.ok(bundle.includes("member-statuses"), "构建产物应调用成员状态端点");
   });
 });
 
