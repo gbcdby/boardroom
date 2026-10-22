@@ -33,9 +33,10 @@ export interface GroupDto {
 }
 
 /**
- * 成员在线/连接状态（T2）。把分开建模的两层合并展示：
+ * 成员在线/连接状态（T2 建立，T4 扩展）。把分开建模的两层合并展示：
  * - `connection`：全局 MCP 会话连接状态（connected / disconnected / none）；
- * - `state`：项目成员运行状态（online/offline/waiting/working / null）。
+ * - `state`：项目成员运行状态（online/offline/waiting/working），已结合心跳超时推导；
+ * - `stale` / `disconnected` / `heartbeatTimedOut` / `heartbeatStale`：陈旧与断线标记（T4）。
  */
 export interface MemberStatusDto {
   memberId: string;
@@ -46,6 +47,10 @@ export interface MemberStatusDto {
   hostType: string | null;
   connection: "connected" | "disconnected" | "none";
   state: "online" | "offline" | "waiting" | "working" | null;
+  stale: boolean;
+  disconnected: boolean;
+  heartbeatTimedOut: boolean;
+  heartbeatStale: boolean;
   lastHeartbeatAt: string | null;
   connectedAt: string | null;
   disconnectedAt: string | null;

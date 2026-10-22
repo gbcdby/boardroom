@@ -218,6 +218,16 @@ function stateLabel(memberId: string): string {
   }
 }
 
+/** 陈旧/断线提示（T4）。完整看板见「状态看板」页。 */
+function staleLabel(memberId: string): string | null {
+  const status = statuses.value[memberId];
+  if (!status) return null;
+  if (status.disconnected) return "断线";
+  if (status.heartbeatTimedOut) return "心跳超时";
+  if (status.stale) return "陈旧";
+  return null;
+}
+
 function isOnline(memberId: string): boolean {
   const status = statuses.value[memberId];
   return status?.connection === "connected" && status?.state !== "offline";
@@ -323,6 +333,9 @@ onMounted(() => void loadProjects());
             </span>
             <span class="small" data-testid="status-detail">
               {{ connectionLabel(member.id) }} · {{ stateLabel(member.id) }}
+              <template v-if="staleLabel(member.id)">
+                · <span class="bad">{{ staleLabel(member.id) }}</span>
+              </template>
             </span>
           </li>
         </ul>
