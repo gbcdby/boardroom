@@ -286,3 +286,19 @@ T4 **不新增/不改名/不改错误码**任何工具（`report_status` 仍为 
 - 状态视图新增字段 `stale / disconnected / heartbeatTimedOut / heartbeatStale / lastHeartbeatAt`（HTTP 端点与 WS 事件一致）。
 
 详见 `docs/t4-status-and-heartbeat.md`。
+
+## 10. T6（#19）落地补充：尽力打断与安全点投递
+
+T6 **不新增/不改名/不改错误码**任何 MCP 工具；拦截语义在领域核心实现，并明确**不承诺**打断在途工具调用（D6 #10）。
+
+- **打断尝试契约**（领域核心 `McpCore.attemptInterrupt`，非 MCP 工具）：返回可观察结果
+  `result: accepted | rejected | unsupported` + `targetStatus`（恒为 `working`，与 T4 一致）+ `attemptId` +
+  `reason` + `queuedMessageCount`；缺省按 `hostType` 默认能力（Claude Code 实测 `unsupported`，Codex 未验证按 `unsupported`）。
+- **安全点投递**：agent 忙碌（`working`）时新消息只写 `message_deliveries(pending)`，不推进游标、不丢弃；
+  agent 下一次进入 `wait_for_messages` 时拉取积压投递。**「已入队」≠「模型已处理」**，需 `acknowledge_message` 才 `acked`。
+- **与 T4/T5 兼容**：等待返回写 `working`；至少一次投递（acked 前可重读）语义不变，不新增重连策略（T5）。
+- **宿主能力记录**（AGENT-05 / AC-CORE-10）：Claude Code 2.1.233 实测**不能打断在途工具**（注入 12s 后仍 pending，
+  D6 `logs/claude-interrupt-clean.jsonl`）；Codex CLI 0.163.0 因配额耗尽**未验证**。证据见
+  `.agent-output/impl-phase1/host-evidence/`。
+
+详见 `docs/t6-interrupt-and-safe-point.md`。
