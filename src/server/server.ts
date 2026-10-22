@@ -205,6 +205,15 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   // 单群组内全部消息都在人的可见范围内。MCP agent 的投递不经过 WS（走 wait_for_messages）。
   broadcastMessage = (message) => {
     hub.broadcast({ type: "message", message });
+    // T8（#21）修复：人的消息经 HTTP 写入后，唤醒 HTTP 会话中在该群组等待、且被该消息
+    // 路由 wake 的 agent。否则 agent 只能等 wait 超时或下次 wait 才拿到积压（定向消息不及时）。
+    // MCP 的 send_message 已走 core 内部跨 core 唤醒，无需在此重复。
+    try {
+      const wakeGate = new Set(message.wakeMemberIds ?? []);
+      mcpHandler.wakeGroup(message.groupId, wakeGate);
+    } catch (error) {
+      log.warn("唤醒群组等待失败", { error, groupId: message.groupId });
+    }
   };
 
   // T4 状态看板：定期把每个项目的有效状态快照广播给可见 WebUI 客户端。
