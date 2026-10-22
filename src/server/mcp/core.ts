@@ -447,8 +447,12 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     if (idx >= 0) pendingWaits.splice(idx, 1);
     waitingMembers.delete(entry.memberId);
     // 结束等待 = 离开等待循环、进入下一轮处理 → working（T4/AGENT-04）。
-    const binding = bindingByMember(entry.memberId);
-    if (binding) markWorking(binding);
+    // 但服务端关闭/会话断开时取消等待属于「终止」，不得回写 working：成员已离线，
+    // 由 disconnect()/启动恢复置为 offline（STATUS-02，不臆造 working）。
+    if (!closed) {
+      const binding = bindingByMember(entry.memberId);
+      if (binding) markWorking(binding);
+    }
     entry.settled();
     entry.resolve(result);
   }
