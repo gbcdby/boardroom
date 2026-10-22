@@ -87,12 +87,17 @@ test("构建产物包含项目/群组页面关键 UI 文本（自行构建到临
     let bundle = "";
     for (const file of jsFiles) bundle += await readFile(path.join(assetsDir, file), "utf8");
 
-    for (const marker of ["创建项目", "添加成员", "设为 manager", "创建群组", "参与者", "顶层 manager", "成员在线状态"]) {
+    for (const marker of [
+      "创建项目", "添加成员", "设为 manager", "创建群组", "参与者", "顶层 manager", "成员在线状态",
+      // T3 群聊界面关键文案
+      "群聊", "发送身份", "输入消息", "@all",
+    ]) {
       assert.ok(bundle.includes(marker), `构建产物应包含文案「${marker}」`);
     }
-    // 前端调用的 API 路径确实存在（含 T2 成员状态端点）。
+    // 前端调用的 API 路径确实存在（含 T2 成员状态端点、T3 消息端点）。
     assert.ok(bundle.includes("/api/projects"), "构建产物应调用 /api/projects");
     assert.ok(bundle.includes("member-statuses"), "构建产物应调用成员状态端点");
+    assert.ok(bundle.includes("/messages"), "构建产物应调用群组消息端点");
   });
 });
 
@@ -162,6 +167,74 @@ test("WebUI 表单流程使用的同一组 HTTP 接口走通：项目→成员�
         assert.deepEqual(
           participants.participants.map((m: any) => m.displayName).sort(),
           ["Alice", "Bob"],
+        );
+      } finally {
+        await server.close();
+      }
+    });
+  });
+});
+
+/**
+ * T3（#16）群聊 E2E（轻量，非浏览器）——覆盖边界（诚实说明）：
+ * - **不做真实浏览器 DOM 交互**（本机未引入浏览器驱动）。这里走 ChatView 调用的
+ *   **同一组 HTTP 接口**：建项目→加成员→建群→发消息（@单人/@all）→读历史，
+ *   并校验 `/chat` 路由的深链回落可加载、`/messages` 端点在产物中被调用。
+ * - 未覆盖：Vue 组件内联渲染、点击绑定、WebSocket 在浏览器中的实际渲染
+ *   （WS 顺序由 `tests/chat-http-ws.test.ts` 在服务端边界验证）。
+ */
+test("群聊页面路由可加载；ChatView 使用的同一组 HTTP 接口走通发送与历史", async () => {
+  await withTempDir(async (buildDir) => {
+    const webRoot = path.join(buildDir, "web");
+    await buildWebInto(webRoot);
+
+    await withTempDir(async (dataDir) => {
+      const server = await startTestServer(dataDir, webRoot);
+      const post = async (pathname: string, body: unknown) => {
+        const res = await fetch(`${server.url}${pathname}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        return { status: res.status, body: (await res.json()) as any };
+      };
+      try {
+        // /chat 深链回落 index.html。
+        const chat = await fetch(`${server.url}/chat`);
+        assert.equal(chat.status, 200);
+        assert.match(await chat.text(), /<div id="app">/);
+
+        const project = (await post("/api/projects", { name: "聊天项目" })).body.project;
+        const alice = (await post(`/api/projects/${project.id}/members`, { kind: "human", displayName: "Alice" })).body
+          .member;
+        const bob = (await post(`/api/projects/${project.id}/members`, { kind: "human", displayName: "Bob" })).body
+          .member;
+        const group = (
+          await post(`/api/projects/${project.id}/groups`, { name: "聊天群", participantMemberIds: [alice.id, bob.id] })
+        ).body.group;
+
+        const m1 = await post(`/api/groups/${group.id}/messages`, {
+          senderMemberId: alice.id,
+          text: "你好 @Bob",
+        });
+        assert.equal(m1.status, 201);
+        assert.equal(m1.body.message.seq, 1);
+        assert.ok(m1.body.message.mentions.includes(bob.id));
+
+        const m2 = await post(`/api/groups/${group.id}/messages`, {
+          senderMemberId: alice.id,
+          text: "全体 @all",
+        });
+        assert.equal(m2.status, 201);
+
+        const hist = (await (await fetch(`${server.url}/api/groups/${group.id}/messages`)).json()) as any;
+        assert.deepEqual(
+          hist.messages.map((m: any) => m.text),
+          ["你好 @Bob", "全体 @all"],
+        );
+        assert.deepEqual(
+          hist.messages.map((m: any) => m.seq),
+          [1, 2],
         );
       } finally {
         await server.close();

@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from "vue-router";
 import HomeView from "./views/HomeView.vue";
 import ProjectsView from "./views/ProjectsView.vue";
+import ChatView from "./views/ChatView.vue";
 import PlaceholderView from "./views/PlaceholderView.vue";
 
 /**
@@ -16,7 +17,8 @@ export const router = createRouter({
   routes: [
     { path: "/", name: "home", component: HomeView },
     { path: "/projects", name: "projects", component: ProjectsView },
-    { path: "/groups", name: "groups", redirect: "/projects" },
+    { path: "/chat", name: "chat", component: ChatView },
+  { path: "/groups", name: "groups", redirect: "/chat" },
     { path: "/members", name: "members", redirect: "/projects" },
     { path: "/settings", name: "settings", component: PlaceholderView, props: { title: "设置" } },
     { path: "/:pathMatch(.*)*", name: "not-found", component: PlaceholderView, props: { title: "页面不存在" } },
