@@ -685,20 +685,26 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       );
       const persistedMentions = [...new Set([...mentionIds, ...plan.allRecipients])];
 
+      // T5：消息落库与「可见成员的 pending 投递」在同一事务内完成，避免中途崩溃留下
+      // 消息可见却无任何投递记录的半成品（NFR-01/NFR-09）。即便极端情况下缺失投递记录，
+      // wait_for_messages 的 deliverableSince 仍按「未 acked」补投，不丢消息（见测试）。
       let created: DbMessage;
       try {
-        created = repos.messages.create({
-          groupId,
-          senderMemberId: binding.memberId,
-          body: text,
-          // 持久化解析后的稳定成员 ID（含 @all 快照），不存 @all 语义本身。
-          mentions: persistedMentions,
+        created = repos.transaction(() => {
+          const message = repos.messages.create({
+            groupId,
+            senderMemberId: binding.memberId,
+            body: text,
+            // 持久化解析后的稳定成员 ID（含 @all 快照），不存 @all 语义本身。
+            mentions: persistedMentions,
+          });
+          // 为所有「可见」成员建立 pending 投递（含发送者自己，便于自身历史一致性）。
+          // 只对 visible 建投递，保证未参与/不可见成员无投递记录（不泄漏）。
+          for (const memberId of plan.visible) {
+            repos.deliveries.ensure(message.id, memberId);
+          }
+          return message;
         });
-        // 为所有「可见」成员建立 pending 投递（含发送者自己，便于自身历史一致性）。
-        // 只对 visible 建投递，保证未参与/不可见成员无投递记录（不泄漏）。
-        for (const memberId of plan.visible) {
-          repos.deliveries.ensure(created.id, memberId);
-        }
       } catch (error) {
         throw mapRepoError(error, { groupId, memberId: binding.memberId });
       }
