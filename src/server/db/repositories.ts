@@ -12,6 +12,8 @@ import type {
   Agent,
   DeliveryStatus,
   Group,
+  McpSession,
+  McpSessionState,
   Member,
   MemberRole,
   MemberState,
@@ -49,6 +51,11 @@ export interface AgentsRepository {
   /** 以完整字段插入（含外部提供的 ID），重复 ID 报 ConflictError。 */
   insertRaw(agent: Agent): Agent;
   get(id: string): Agent | null;
+  /**
+   * 按全局身份键（displayName + hostType）查找 agent（T2 身份唯一性）。
+   * 命中返回已有 agent；未命中返回 null，由调用方决定创建。
+   */
+  findByIdentity(displayName: string, hostType: string): Agent | null;
   list(): Agent[];
   update(id: string, patch: Partial<Pick<Agent, "displayName" | "hostType">>): Agent;
   touchLastSeen(id: string, at: string): Agent;
@@ -67,6 +74,8 @@ export interface MembersRepository {
   create(input: NewMember): Member;
   get(id: string): Member | null;
   listByProject(projectId: string): Member[];
+  /** 查找某 agent 在某项目中的成员关系（T2 幂等入群）。 */
+  findByAgent(projectId: string, agentId: string): Member | null;
   getManager(projectId: string): Member | null;
   update(id: string, patch: Partial<Pick<Member, "displayName" | "role">>): Member;
   delete(id: string): void;
@@ -107,6 +116,35 @@ export interface StatusesRepository {
   delete(projectId: string, memberId: string): void;
 }
 
+/**
+ * MCP 会话连接状态（T2，全局层 D1）。持久化可恢复部分，与 member_statuses 分开。
+ * 连接是否存活由运行时按心跳推导；本 repository 只记录状态与时间戳。
+ */
+export interface McpSessionsRepository {
+  /** 建立/恢复一个活跃会话：若同 agent+project+group 已有 connected 会话则复用其 id。 */
+  connect(input: {
+    agentId: string;
+    projectId: string;
+    groupId: string;
+    memberId: string;
+    displayName: string;
+    hostType: string;
+  }): McpSession;
+  /** 按会话 id 查找。 */
+  get(id: string): McpSession | null;
+  /** 查找某 agent 在某项目/群组的活跃（connected）会话。 */
+  findActive(agentId: string, projectId: string, groupId: string): McpSession | null;
+  /** 某项目下所有会话（含断开的历史会话），用于成员在线视图。 */
+  listByProject(projectId: string): McpSession[];
+  /** 记录一次心跳时间（不改变 state）。 */
+  heartbeat(id: string, at: string): McpSession;
+  /** 把会话标记为断开（未连接时幂等）。 */
+  disconnect(id: string, at: string): McpSession;
+  /** 启动时把所有仍为 connected 的会话标记为 disconnected（进程重启后连接已失效）。 */
+  markAllStale(at: string): number;
+  delete(id: string): void;
+}
+
 export interface RepositorySet {
   readonly agents: AgentsRepository;
   readonly projects: ProjectsRepository;
@@ -115,6 +153,7 @@ export interface RepositorySet {
   readonly messages: MessagesRepository;
   readonly deliveries: DeliveriesRepository;
   readonly statuses: StatusesRepository;
+  readonly mcpSessions: McpSessionsRepository;
   /** 在单个写事务内运行 fn；失败回滚并抛出归一化后的错误。 */
   transaction<T>(fn: () => T): T;
 }
@@ -133,6 +172,7 @@ export function createRepositories(db: Database.Database): RepositorySet {
     messages: createMessages(db),
     deliveries: createDeliveries(db),
     statuses: createStatuses(db),
+    mcpSessions: createMcpSessions(db),
     transaction: (fn) => runInTransaction(db, fn),
   };
 }
@@ -267,6 +307,12 @@ function createAgents(db: Database.Database): AgentsRepository {
     },
     get(id) {
       const row = db.prepare("SELECT * FROM agents WHERE id = ?").get(id) as AgentRow | undefined;
+      return row ? toAgent(row) : null;
+    },
+    findByIdentity(displayName, hostType) {
+      const row = db
+        .prepare("SELECT * FROM agents WHERE display_name = ? AND host_type = ?")
+        .get(displayName, hostType) as AgentRow | undefined;
       return row ? toAgent(row) : null;
     },
     list() {
@@ -427,6 +473,12 @@ function createMembers(db: Database.Database): MembersRepository {
       return (
         db.prepare("SELECT * FROM members WHERE project_id = ? ORDER BY created_at, id").all(projectId) as MemberRow[]
       ).map(toMember);
+    },
+    findByAgent(projectId, agentId) {
+      const row = db
+        .prepare("SELECT * FROM members WHERE project_id = ? AND agent_id = ?")
+        .get(projectId, agentId) as MemberRow | undefined;
+      return row ? toMember(row) : null;
     },
     getManager(projectId) {
       const row = db
@@ -811,6 +863,144 @@ function createStatuses(db: Database.Database): StatusesRepository {
       db.prepare("DELETE FROM member_statuses WHERE project_id = ? AND member_id = ?").run(projectId, memberId);
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// McpSessions（MCP 连接状态，全局层 D1；与 member_statuses 分开）
+// ---------------------------------------------------------------------------
+
+interface McpSessionRow {
+  id: string;
+  agent_id: string;
+  project_id: string;
+  group_id: string;
+  member_id: string;
+  display_name: string;
+  host_type: string;
+  state: string;
+  connected_at: string;
+  last_heartbeat_at: string | null;
+  disconnected_at: string | null;
+  updated_at: string;
+}
+
+function toMcpSession(row: McpSessionRow): McpSession {
+  return {
+    id: row.id,
+    agentId: row.agent_id,
+    projectId: row.project_id,
+    groupId: row.group_id,
+    memberId: row.member_id,
+    displayName: row.display_name,
+    hostType: row.host_type,
+    state: row.state as McpSessionState,
+    connectedAt: row.connected_at,
+    lastHeartbeatAt: row.last_heartbeat_at,
+    disconnectedAt: row.disconnected_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function createMcpSessions(db: Database.Database): McpSessionsRepository {
+  const getRow = (id: string) =>
+    db.prepare("SELECT * FROM mcp_sessions WHERE id = ?").get(id) as McpSessionRow | undefined;
+
+  const repo: McpSessionsRepository = {
+    connect(input) {
+      return runInTransaction(db, () => {
+        const existing = repo.findActive(input.agentId, input.projectId, input.groupId);
+        const at = nowIso();
+        if (existing) {
+          // 复用同一活跃会话；刷新成员/显示名与心跳，不改变 connected_at（会话连续性）。
+          db.prepare(
+            `UPDATE mcp_sessions
+               SET member_id = ?, display_name = ?, host_type = ?, last_heartbeat_at = ?, updated_at = ?
+             WHERE id = ?`,
+          ).run(input.memberId, input.displayName, input.hostType, at, at, existing.id);
+          return repo.get(existing.id)!;
+        }
+        const id = newId();
+        db.prepare(
+          `INSERT INTO mcp_sessions
+             (id, agent_id, project_id, group_id, member_id, display_name, host_type, state,
+              connected_at, last_heartbeat_at, disconnected_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, NULL, ?)`,
+        ).run(
+          id,
+          input.agentId,
+          input.projectId,
+          input.groupId,
+          input.memberId,
+          input.displayName,
+          input.hostType,
+          at,
+          at,
+          at,
+        );
+        return repo.get(id)!;
+      });
+    },
+    get(id) {
+      const row = getRow(id);
+      return row ? toMcpSession(row) : null;
+    },
+    findActive(agentId, projectId, groupId) {
+      const row = db
+        .prepare(
+          `SELECT * FROM mcp_sessions
+            WHERE agent_id = ? AND project_id = ? AND group_id = ? AND state = 'connected'
+            ORDER BY connected_at DESC, id DESC LIMIT 1`,
+        )
+        .get(agentId, projectId, groupId) as McpSessionRow | undefined;
+      return row ? toMcpSession(row) : null;
+    },
+    listByProject(projectId) {
+      return (
+        db
+          .prepare("SELECT * FROM mcp_sessions WHERE project_id = ? ORDER BY connected_at, id")
+          .all(projectId) as McpSessionRow[]
+      ).map(toMcpSession);
+    },
+    heartbeat(id, at) {
+      const row = getRow(id);
+      if (!row) throw new NotFoundError(`MCP 会话 ${id} 不存在。`);
+      runInTransaction(db, () =>
+        db
+          .prepare("UPDATE mcp_sessions SET last_heartbeat_at = ?, updated_at = ? WHERE id = ?")
+          .run(at, at, id),
+      );
+      return repo.get(id)!;
+    },
+    disconnect(id, at) {
+      const row = getRow(id);
+      if (!row) throw new NotFoundError(`MCP 会话 ${id} 不存在。`);
+      if (row.state === "disconnected") return repo.get(id)!;
+      runInTransaction(db, () =>
+        db
+          .prepare(
+            "UPDATE mcp_sessions SET state = 'disconnected', disconnected_at = ?, updated_at = ? WHERE id = ?",
+          )
+          .run(at, at, id),
+      );
+      return repo.get(id)!;
+    },
+    markAllStale(at) {
+      return runInTransaction(db, () => {
+        const result = db
+          .prepare(
+            "UPDATE mcp_sessions SET state = 'disconnected', disconnected_at = ?, updated_at = ? WHERE state = 'connected'",
+          )
+          .run(at, at);
+        return result.changes;
+      });
+    },
+    delete(id) {
+      db.prepare("DELETE FROM mcp_sessions WHERE id = ?").run(id);
+    },
+  };
+  return repo;
 }
 
 // ---------------------------------------------------------------------------

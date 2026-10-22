@@ -137,4 +137,42 @@ export const migrations: readonly Migration[] = [
       CREATE INDEX ix_member_statuses_state ON member_statuses (project_id, state);
     `,
   },
+  {
+    version: 2,
+    name: "mcp_sessions_and_agent_identity",
+    up: `
+      -- T2（#15）：双宿主 MCP 入群与在线。
+      --
+      -- 1) Agent 全局身份唯一：同一 agent（display_name + host_type）全局唯一，
+      --    避免同名同宿主的 agent 重复声明出多个全局身份。入群时按此键查找或创建。
+      --    用唯一索引把不变量落到数据库，而不是只在应用层判断。
+      CREATE UNIQUE INDEX ux_agents_identity ON agents (display_name, host_type);
+
+      -- 2) MCP 连接状态（全局会话层，D1）：与 member_statuses（项目成员运行状态）分开。
+      --    只在库中持久化「可恢复」的会话信息（会话 id、绑定的 agent/项目/群组、连接/
+      --    断开时间）；「连接是否存活」由运行时按心跳推导，不把连接对象落库。
+      --    进程重启后，未正常断开的会话在启动时被标记为断开（stale），不臆造在线。
+      CREATE TABLE mcp_sessions (
+        id            TEXT PRIMARY KEY NOT NULL,
+        agent_id      TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        group_id      TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+        member_id     TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        display_name  TEXT NOT NULL,
+        host_type     TEXT NOT NULL,
+        state         TEXT NOT NULL DEFAULT 'connected' CHECK (state IN ('connected', 'disconnected')),
+        connected_at  TEXT NOT NULL,
+        last_heartbeat_at TEXT,
+        disconnected_at   TEXT,
+        updated_at    TEXT NOT NULL
+      );
+
+      CREATE INDEX ix_mcp_sessions_agent ON mcp_sessions (agent_id);
+      CREATE INDEX ix_mcp_sessions_state ON mcp_sessions (state);
+      -- 一个 agent 在同一项目/群组下最多一个活跃会话（阶段 1 单项目单群组）。
+      CREATE UNIQUE INDEX ux_mcp_sessions_active
+        ON mcp_sessions (agent_id, project_id, group_id)
+        WHERE state = 'connected';
+    `,
+  },
 ];
