@@ -141,10 +141,12 @@ test("忙碌失败路径：无法打断时消息留在队列，下一安全点 w
       const r = await waiting;
       assert.equal(r.status, "message");
 
-      // B 忙碌（working）期间 A 再发，消息只入队。
+      // B 忙碌（working）期间 A 再发，消息只入队（不丢）。
+      // T5 语义：listPending = 未 ack 的消息（含已投递未确认的 first + 新入队的 second）。
       await a.call("send_message", { text: "second", mentions: [bId] });
       const pending = ctx.repos.deliveries.listPending(ctx.projectId, bId);
-      assert.equal(pending.length, 1);
+      const pendingTexts = pending.map((d) => ctx.repos.messages.get(d.messageId)!.body);
+      assert.ok(pendingTexts.includes("second"), "忙碌期间的消息必须保留在队列");
 
       // B 回到等待循环（下一安全点）→ 取走积压。"first" 未 ack，按 T5 至少一次语义可再次出现；
       // "second" 必须送达，消息不丢。

@@ -188,10 +188,12 @@ test("安全点投递：打断失败后消息保留，agent 回到 waiting 时�
     a.core.sendMessage(a.sessionId, { text: "third", mentions: [b.memberId] });
     const out = b.core.attemptInterrupt(b.sessionId, { hostCapability: "unsupported" });
     assert.equal(out.result, "unsupported");
-    assert.equal(out.queuedMessageCount, 2);
-    assert.deepEqual(queuedTexts(ctx, b.memberId).sort(), ["second", "third"]);
+    // T5 语义：queuedMessageCount = 未 ack 的消息数（含已投递未确认的 first），
+    // 这正是「至少一次、不丢消息」的可见依据。
+    assert.equal(out.queuedMessageCount, 3);
+    assert.deepEqual(queuedTexts(ctx, b.memberId).sort(), ["first", "second", "third"]);
 
-    // B 处理完 first 后回到等待循环（下一安全点），按至少一次语义取走 second/third。
+    // B 处理完 first 后回到等待循环（下一安全点），按至少一次语义取走积压。
     const next = await b.core.waitForMessages(b.sessionId, { timeoutMs: 20_000 });
     assert.equal(next.status, "message");
     const texts = next.messages.map((m) => m.text);
