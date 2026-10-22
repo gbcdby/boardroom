@@ -10,6 +10,7 @@ import {
 import { createRepositories, type RepositorySet } from "../db/repositories.ts";
 import type { McpSession, Member, Message as DbMessage } from "../db/types.ts";
 import { invalidArgument, McpToolError, notInGroup } from "./errors.ts";
+import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "../chat/routing.ts";
 
 /**
  * MCP 工具的领域核心（T2 / #15）。
@@ -315,10 +316,49 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     }
   }
 
-  /** 某成员「自己发送 + 被 @」的可见消息（D3）。 */
+  /**
+   * 构建群组参与者 roster（T3 路由输入）。
+   *
+   * 参与者来自 group_participants；role 取 members.role；kind 取 members.kind；
+   * 在线判定 = 该成员有 connected 的 MCP 会话（人视为在线）。未参与群组者不进入 roster，
+   * 因此可见/唤醒结果天然不含外部成员（隔离）。
+   */
+  function buildRoster(groupId: string): RoutingMember[] {
+    const participantIds = repos.groups.participants(groupId);
+    const onlineMemberIds = new Set(
+      repos.mcpSessions
+        .listByProject(repos.groups.get(groupId)?.projectId ?? "")
+        .filter((s) => s.state === "connected")
+        .map((s) => s.memberId),
+    );
+    const roster: RoutingMember[] = [];
+    for (const id of participantIds) {
+      const member = repos.members.get(id);
+      if (!member) continue;
+      roster.push({
+        id: member.id,
+        role: member.role,
+        kind: member.kind,
+        online: member.kind === "human" ? true : onlineMemberIds.has(member.id),
+        displayName: member.displayName,
+      });
+    }
+    return roster;
+  }
+
+  /** 某成员对该消息的可见性（T3 路由规则：普通=自己发送+被@；manager=全部；人=全部）。 */
   function isVisibleTo(binding: SessionBinding, message: DbMessage): boolean {
     if (message.groupId !== binding.groupId) return false;
-    return message.senderMemberId === binding.memberId || message.mentions.includes(binding.memberId);
+    const roster = buildRoster(message.groupId);
+    const plan = resolveWakeAndVisibility(
+      {
+        senderMemberId: message.senderMemberId,
+        mentionIds: message.mentions,
+        mentionsAll: false,
+      },
+      roster,
+    );
+    return plan.visible.includes(binding.memberId);
   }
 
   /** 从 afterSeq 之后取该成员可见、且未 acked 的消息（积压/唤醒）。 */
@@ -326,9 +366,15 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     const list = repos.messages.listByGroup(binding.groupId, {
       ...(afterSeq === undefined ? {} : { afterSeq }),
     });
+    // roster 在一次调用内不变，构建一次即可。
+    const roster = buildRoster(binding.groupId);
     const pending: DbMessage[] = [];
     for (const message of list) {
-      if (!isVisibleTo(binding, message)) continue;
+      const plan = resolveWakeAndVisibility(
+        { senderMemberId: message.senderMemberId, mentionIds: message.mentions, mentionsAll: false },
+        roster,
+      );
+      if (!plan.visible.includes(binding.memberId)) continue;
       const delivery = repos.deliveries.get(message.id, binding.memberId);
       if (delivery?.status === "acked") continue;
       pending.push(message);
@@ -376,16 +422,29 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   }
 
   /**
-   * 唤醒本 core 中在该群组等待、且有可投递消息的成员。
+   * 唤醒本 core 中在该群组等待、且「按路由规则应被唤醒」的成员。
    * 由「写入消息的 core」调用，跨 core 时通过注册表遍历所有 core。
+   *
+   * 唤醒判定用 chat/routing 的 wake 集合（普通 agent 只被 @、manager 被其他成员消息、
+   * 发送者排除）。可见但非唤醒的消息（例如普通 agent 自己发的）不会触发等待方返回。
    */
   function resolveGroup(groupId: string): void {
+    const roster = buildRoster(groupId);
     for (const entry of [...pendingWaits]) {
       const binding = bindingByMember(entry.memberId);
       if (!binding || binding.groupId !== groupId) continue;
       const messages = deliverableSince(binding, undefined);
       if (messages.length === 0) continue;
-      const delivered = markDelivered(binding, messages);
+      // 逐条判定是否属于该成员的唤醒范围；有任一消息唤醒才结算。
+      const wakeMessages = messages.filter((message) => {
+        const plan = resolveWakeAndVisibility(
+          { senderMemberId: message.senderMemberId, mentionIds: message.mentions, mentionsAll: false },
+          roster,
+        );
+        return plan.wake.includes(binding.memberId);
+      });
+      if (wakeMessages.length === 0) continue;
+      const delivered = markDelivered(binding, wakeMessages);
       settle(entry, {
         ok: true,
         status: "message",
@@ -564,22 +623,60 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         }
       }
 
+      // T3：mention 解析。显式 mentions 入参（稳定 ID）+ 正文里的 @ 名称/@all 合并。
+      const roster = buildRoster(groupId);
+      const parsed = parseMentions(text, roster);
+      if (parsed.unknownNames.length > 0) {
+        // 无效 mention 明确报错（失败路径之一），不静默丢弃。
+        throw new McpToolError("INVALID_ARGUMENT", `无法解析 @ 名称：${parsed.unknownNames.join("、")}`, {
+          unknownNames: parsed.unknownNames,
+        });
+      }
+      const explicitMentions = (params.mentions ?? []).filter((id) => {
+        // 显式 mention 必须是本群参与者（防止跨群/外部 ID 泄漏）。
+        if (!roster.some((m) => m.id === id)) {
+          throw new McpToolError("INVALID_ARGUMENT", `被 @ 的成员 ${id} 不是当前群组参与者`, { memberId: id });
+        }
+        return true;
+      });
+      const mentionIds = [...new Set([...explicitMentions, ...parsed.mentionIds])];
+
+      // @all：展开为发送时在线参与者快照，并把快照成员写入持久化 mentions，
+      // 使历史/投递与「发送时在线」一致（CHAT-02）。
+      const plan = resolveWakeAndVisibility(
+        { senderMemberId: binding.memberId, mentionIds, mentionsAll: parsed.all },
+        roster,
+      );
+      const persistedMentions = [...new Set([...mentionIds, ...plan.allRecipients])];
+
       let created: DbMessage;
       try {
         created = repos.messages.create({
           groupId,
           senderMemberId: binding.memberId,
           body: text,
-          mentions: params.mentions ?? [],
+          // 持久化解析后的稳定成员 ID（含 @all 快照），不存 @all 语义本身。
+          mentions: persistedMentions,
         });
+        // 为所有「可见」成员建立 pending 投递（含发送者自己，便于自身历史一致性）。
+        // 只对 visible 建投递，保证未参与/不可见成员无投递记录（不泄漏）。
+        for (const memberId of plan.visible) {
+          repos.deliveries.ensure(created.id, memberId);
+        }
       } catch (error) {
         throw mapRepoError(error, { groupId, memberId: binding.memberId });
       }
       if (params.clientMessageId) {
         clientKeys.set(`${binding.memberId}:${params.clientMessageId}`, created.id);
       }
-      log.info("message_sent", { memberId: binding.memberId, groupId, messageId: created.id });
-      // 新消息写入后，跨 core 唤醒该群组等待中的成员。
+      log.info("message_sent", {
+        memberId: binding.memberId,
+        groupId,
+        messageId: created.id,
+        wake: plan.wake,
+        visible: plan.visible,
+      });
+      // 新消息写入后，跨 core 唤醒该群组等待中的成员（按路由 wake 集合，发送者排除）。
       for (const reg of [...activeRegistrations]) reg.resolveGroup(groupId);
       return { ok: true, messageId: created.id, createdAt: created.createdAt, duplicate: false };
     },

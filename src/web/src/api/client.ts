@@ -52,6 +52,22 @@ export interface MemberStatusDto {
   updatedAt: string | null;
 }
 
+/**
+ * T3（#16）消息视图（与 `src/server/api.ts` 的 `MessageView` 对应）。
+ */
+export interface MessageDto {
+  id: string;
+  groupId: string;
+  seq: number;
+  senderMemberId: string;
+  senderDisplayName: string | null;
+  text: string;
+  mentions: string[];
+  wakeMemberIds: string[];
+  visibleMemberIds: string[];
+  createdAt: string;
+}
+
 export class ApiError extends Error {
   override readonly name = "ApiError";
   readonly code: string;
@@ -130,5 +146,15 @@ export const api = {
   },
   listMemberStatuses(projectId: string): Promise<{ memberStatuses: MemberStatusDto[] }> {
     return request("GET", `/api/projects/${encodeURIComponent(projectId)}/member-statuses`);
+  },
+  listMessages(groupId: string): Promise<{ messages: MessageDto[] }> {
+    return request("GET", `/api/groups/${encodeURIComponent(groupId)}/messages`);
+  },
+  sendMessage(groupId: string, senderMemberId: string, text: string, mentions?: string[]): Promise<{ message: MessageDto }> {
+    return request("POST", `/api/groups/${encodeURIComponent(groupId)}/messages`, {
+      senderMemberId,
+      text,
+      ...(mentions === undefined ? {} : { mentions }),
+    });
   },
 };

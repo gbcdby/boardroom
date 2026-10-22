@@ -4,6 +4,7 @@ import { RouterLink, RouterView } from "vue-router";
 const navigation = [
   { to: "/", label: "概览" },
   { to: "/projects", label: "项目与群组" },
+  { to: "/chat", label: "群聊" },
   { to: "/settings", label: "设置" },
 ];
 </script>

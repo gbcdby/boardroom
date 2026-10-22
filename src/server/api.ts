@@ -2,8 +2,9 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type Database from "better-sqlite3";
 import { RepositoryError } from "./db/errors.ts";
 import { createRepositories, type RepositorySet } from "./db/repositories.ts";
-import type { Group, Member, Project } from "./db/types.ts";
+import type { Group, Member, Message as DbMessage, Project } from "./db/types.ts";
 import type { Logger } from "./logger.ts";
+import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "./chat/routing.ts";
 
 /**
  * T1（#14）项目 / 群组 / 成员 HTTP API。
@@ -24,6 +25,11 @@ import type { Logger } from "./logger.ts";
 export interface T1ApiOptions {
   readonly db: Database.Database;
   readonly logger: Logger;
+  /**
+   * T3：人发送消息后，把消息广播给 WebUI（WebSocket）。可选：测试或无 WS 环境时省略。
+   * 广播范围（阶段 1）＝ 人在 WebUI 的视角（可见全部群组消息）。
+   */
+  readonly onMessage?: (message: MessageView) => void;
 }
 
 export interface T1ApiRouter {
@@ -32,6 +38,20 @@ export interface T1ApiRouter {
    * 返回 true 表示已处理并写完响应；false 表示路径不归本模块管。
    */
   handle(request: IncomingMessage, response: ServerResponse, pathname: string): Promise<boolean>;
+}
+
+/** T3：消息视图（HTTP 响应与 WebSocket 广播共用）。 */
+export interface MessageView {
+  readonly id: string;
+  readonly groupId: string;
+  readonly seq: number;
+  readonly senderMemberId: string;
+  readonly senderDisplayName: string | null;
+  readonly text: string;
+  readonly mentions: readonly string[];
+  readonly wakeMemberIds: readonly string[];
+  readonly visibleMemberIds: readonly string[];
+  readonly createdAt: string;
 }
 
 /** 错误码 → HTTP 状态。与 repository 层错误码一一对应。 */
@@ -300,12 +320,133 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       return true;
     }
 
+    // /api/groups/:id/messages —— T3 群人消息发送与历史（人的视角，可见全部）
+    if (
+      segments.length === 4 &&
+      segments[0] === "api" &&
+      segments[1] === "groups" &&
+      segments[3] === "messages"
+    ) {
+      const groupId = decodeSegment(segments[2]!);
+      const group = r.groups.get(groupId);
+      if (!group) throw new RepositoryError("not_found", `群组 ${groupId} 不存在。`);
+
+      if (method === "POST") {
+        const body = await readObjectBody(request);
+        const senderMemberId = requireString(body, "senderMemberId");
+        const text = requireString(body, "text");
+        const explicitMentions = optionalStringArray(body, "mentions") ?? [];
+
+        const sender = r.members.get(senderMemberId);
+        if (!sender || sender.projectId !== group.projectId) {
+          throw new RepositoryError("invalid_reference", `发送者 ${senderMemberId} 不属于该群组所在项目。`);
+        }
+        if (!r.groups.participants(groupId).includes(senderMemberId)) {
+          throw new RepositoryError("invalid_reference", `发送者 ${senderMemberId} 不是该群组参与者。`);
+        }
+
+        const roster = buildRoster(r, groupId);
+        const parsed = parseMentions(text, roster);
+        if (parsed.unknownNames.length > 0) {
+          throw new RepositoryError("invalid_argument", `无法解析 @ 名称：${parsed.unknownNames.join("、")}。`);
+        }
+        for (const id of explicitMentions) {
+          if (!roster.some((m) => m.id === id)) {
+            throw new RepositoryError("invalid_argument", `被 @ 的成员 ${id} 不是该群组参与者。`);
+          }
+        }
+        const mentionIds = [...new Set([...explicitMentions, ...parsed.mentionIds])];
+        const plan = resolveWakeAndVisibility(
+          { senderMemberId, mentionIds, mentionsAll: parsed.all },
+          roster,
+        );
+        const persistedMentions = [...new Set([...mentionIds, ...plan.allRecipients])];
+
+        const created = r.transaction(() => {
+          const message = r.messages.create({
+            groupId,
+            senderMemberId,
+            body: text,
+            mentions: persistedMentions,
+          });
+          for (const memberId of plan.visible) r.deliveries.ensure(message.id, memberId);
+          return message;
+        });
+        const view = messageView(r, created, plan);
+        log.info("发送群组消息", { groupId, messageId: created.id, senderMemberId, via: "http" });
+        options.onMessage?.(view);
+        writeJson(response, 201, { message: view });
+        return true;
+      }
+
+      if (method === "GET") {
+        const limitRaw = new URL(request.url ?? "/", "http://127.0.0.1").searchParams.get("limit");
+        const limit = limitRaw === null ? 200 : Math.min(Math.max(Number(limitRaw) || 200, 1), 500);
+        const all = r.messages.listByGroup(groupId);
+        const page = all.slice(Math.max(0, all.length - limit));
+        // 人的视角：可见全部群组消息（阶段 1 单群组）。
+        writeJson(response, 200, { messages: page.map((m) => messageView(r, m)) });
+        return true;
+      }
+
+      methodNotAllowed(response, ["GET", "POST"]);
+      return true;
+    }
+
     return false;
   }
 
   // -------------------------------------------------------------------------
   // 视图
   // -------------------------------------------------------------------------
+
+  /** T3：从群组参与者构建路由 roster（在线以 connected MCP 会话为准，人视为在线）。 */
+  function buildRoster(r: RepositorySet, groupId: string): RoutingMember[] {
+    const group = r.groups.get(groupId);
+    if (!group) return [];
+    const onlineIds = new Set(
+      r.mcpSessions
+        .listByProject(group.projectId)
+        .filter((s) => s.state === "connected")
+        .map((s) => s.memberId),
+    );
+    const roster: RoutingMember[] = [];
+    for (const id of r.groups.participants(groupId)) {
+      const member = r.members.get(id);
+      if (!member) continue;
+      roster.push({
+        id: member.id,
+        role: member.role,
+        kind: member.kind,
+        online: member.kind === "human" ? true : onlineIds.has(member.id),
+        displayName: member.displayName,
+      });
+    }
+    return roster;
+  }
+
+  /** 消息视图（HTTP/WS 共用）。 */
+  function messageView(r: RepositorySet, message: DbMessage, plan?: { wake: readonly string[]; visible: readonly string[] }): MessageView {
+    const sender = r.members.get(message.senderMemberId);
+    const resolvedPlan =
+      plan ??
+      resolveWakeAndVisibility(
+        { senderMemberId: message.senderMemberId, mentionIds: message.mentions, mentionsAll: false },
+        buildRoster(r, message.groupId),
+      );
+    return {
+      id: message.id,
+      groupId: message.groupId,
+      seq: message.seq,
+      senderMemberId: message.senderMemberId,
+      senderDisplayName: sender?.displayName ?? null,
+      text: message.body,
+      mentions: message.mentions,
+      wakeMemberIds: resolvedPlan.wake,
+      visibleMemberIds: resolvedPlan.visible,
+      createdAt: message.createdAt,
+    };
+  }
 
   function projectView(r: RepositorySet, project: Project) {
     const manager = r.members.getManager(project.id);
