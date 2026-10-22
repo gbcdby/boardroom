@@ -12,6 +12,7 @@ import { newId } from "../db/ids.ts";
 import type { McpSession, Member, Message as DbMessage } from "../db/types.ts";
 import { invalidArgument, McpToolError, notInGroup } from "./errors.ts";
 import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "../chat/routing.ts";
+import { buildRoster } from "../chat/roster.ts";
 import {
   createAntiLoop,
   DEFAULT_ANTI_LOOP_CONFIG,
@@ -452,27 +453,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 在线判定 = 该成员有 connected 的 MCP 会话（人视为在线）。未参与群组者不进入 roster，
    * 因此可见/唤醒结果天然不含外部成员（隔离）。
    */
-  function buildRoster(groupId: string): RoutingMember[] {
-    const participantIds = repos.groups.participants(groupId);
-    const onlineMemberIds = new Set(
-      repos.mcpSessions
-        .listByProject(repos.groups.get(groupId)?.projectId ?? "")
-        .filter((s) => s.state === "connected")
-        .map((s) => s.memberId),
-    );
-    const roster: RoutingMember[] = [];
-    for (const id of participantIds) {
-      const member = repos.members.get(id);
-      if (!member) continue;
-      roster.push({
-        id: member.id,
-        role: member.role,
-        kind: member.kind,
-        online: member.kind === "human" ? true : onlineMemberIds.has(member.id),
-        displayName: member.displayName,
-      });
-    }
-    return roster;
+  function buildRosterFor(groupId: string): RoutingMember[] {
+    return buildRoster(repos, groupId);
   }
 
   /**
@@ -507,7 +489,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   /** 某成员对该消息的可见性（T3 路由规则：普通=自己发送+被@；manager=全部；人=全部）。 */
   function isVisibleTo(binding: SessionBinding, message: DbMessage): boolean {
     if (message.groupId !== binding.groupId) return false;
-    const roster = buildRoster(message.groupId);
+    const roster = buildRosterFor(message.groupId);
     const plan = resolveWakeAndVisibility(
       {
         senderMemberId: message.senderMemberId,
@@ -525,7 +507,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       ...(afterSeq === undefined ? {} : { afterSeq }),
     });
     // roster 在一次调用内不变，构建一次即可。
-    const roster = buildRoster(binding.groupId);
+    const roster = buildRosterFor(binding.groupId);
     const pending: DbMessage[] = [];
     for (const message of list) {
       const plan = resolveWakeAndVisibility(
@@ -594,7 +576,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 发送者排除）。可见但非唤醒的消息（例如普通 agent 自己发的）不会触发等待方返回。
    */
   function resolveGroupInternal(groupId: string, wakeGate?: ReadonlySet<string>): void {
-    const roster = buildRoster(groupId);
+    const roster = buildRosterFor(groupId);
     for (const entry of [...pendingWaits]) {
       const binding = bindingByMember(entry.memberId);
       if (!binding || binding.groupId !== groupId) continue;
@@ -638,7 +620,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   function senderKindOf(memberId: string): "agent" | "human" {
     try {
       return repos.members.get(memberId)?.kind === "human" ? "human" : "agent";
-    } catch {
+    } catch (error) {
+      // 查库失败不静默：记录 warn（仅错误摘要与 memberId，不含消息正文），再兜底为 agent。
+      log.warn("sender_kind_lookup_failed", { error, memberId });
       return "agent";
     }
   }
@@ -808,7 +792,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       }
 
       // T3：mention 解析。显式 mentions 入参（稳定 ID）+ 正文里的 @ 名称/@all 合并。
-      const roster = buildRoster(groupId);
+      const roster = buildRosterFor(groupId);
       const parsed = parseMentions(text, roster);
       if (parsed.unknownNames.length > 0) {
         // 无效 mention 明确报错（失败路径之一），不静默丢弃。

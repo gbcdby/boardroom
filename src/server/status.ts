@@ -106,9 +106,6 @@ export function deriveEffectiveStatus(input: {
   const disconnected = connection === "disconnected";
   const live = connection === "connected" && !heartbeatTimedOut;
 
-  // 成员曾上报过运行态（waiting/working）或存在断开的历史会话 → 断开/超时可标记陈旧。
-  const hadRunState = input.storedState === "waiting" || input.storedState === "working";
-
   let state: MemberState;
   let stale: boolean;
   if (live) {
@@ -120,7 +117,6 @@ export function deriveEffectiveStatus(input: {
     stale = disconnected || input.storedState !== null || session !== null;
     // 心跳超时（会话仍标 connected 但时间过久）也属陈旧。
     if (heartbeatTimedOut && connection === "connected") stale = true;
-    void hadRunState;
   }
 
   return base(input, {

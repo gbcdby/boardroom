@@ -6,6 +6,7 @@ import { createRepositories, type RepositorySet } from "./db/repositories.ts";
 import type { Group, Member, McpSession, Message as DbMessage, Project } from "./db/types.ts";
 import type { Logger } from "./logger.ts";
 import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "./chat/routing.ts";
+import { buildRoster } from "./chat/roster.ts";
 import { resetGroupConsecutiveCount } from "./mcp/core.ts";
 import { deriveEffectiveStatus } from "./status.ts";
 
@@ -354,7 +355,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           throw new RepositoryError("invalid_reference", `发送者 ${senderMemberId} 不是该群组参与者。`);
         }
 
-        const roster = buildRoster(r, groupId);
+        const roster = buildRosterFor(r, groupId);
         const parsed = parseMentions(text, roster);
         if (parsed.unknownNames.length > 0) {
           throw new RepositoryError("invalid_argument", `无法解析 @ 名称：${parsed.unknownNames.join("、")}。`);
@@ -412,28 +413,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   // -------------------------------------------------------------------------
 
   /** T3：从群组参与者构建路由 roster（在线以 connected MCP 会话为准，人视为在线）。 */
-  function buildRoster(r: RepositorySet, groupId: string): RoutingMember[] {
-    const group = r.groups.get(groupId);
-    if (!group) return [];
-    const onlineIds = new Set(
-      r.mcpSessions
-        .listByProject(group.projectId)
-        .filter((s) => s.state === "connected")
-        .map((s) => s.memberId),
-    );
-    const roster: RoutingMember[] = [];
-    for (const id of r.groups.participants(groupId)) {
-      const member = r.members.get(id);
-      if (!member) continue;
-      roster.push({
-        id: member.id,
-        role: member.role,
-        kind: member.kind,
-        online: member.kind === "human" ? true : onlineIds.has(member.id),
-        displayName: member.displayName,
-      });
-    }
-    return roster;
+  function buildRosterFor(r: RepositorySet, groupId: string): RoutingMember[] {
+    return buildRoster(r, groupId);
   }
 
   /** 消息视图（HTTP/WS 共用）。 */
@@ -443,7 +424,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       plan ??
       resolveWakeAndVisibility(
         { senderMemberId: message.senderMemberId, mentionIds: message.mentions, mentionsAll: false },
-        buildRoster(r, message.groupId),
+        buildRosterFor(r, message.groupId),
       );
     return {
       id: message.id,
