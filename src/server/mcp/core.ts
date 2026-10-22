@@ -8,6 +8,7 @@ import {
   RepositoryError,
 } from "../db/errors.ts";
 import { createRepositories, type RepositorySet } from "../db/repositories.ts";
+import { newId } from "../db/ids.ts";
 import type { McpSession, Member, Message as DbMessage } from "../db/types.ts";
 import { invalidArgument, McpToolError, notInGroup } from "./errors.ts";
 import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "../chat/routing.ts";
@@ -148,6 +149,58 @@ export interface WaitParams {
   readonly signal?: AbortSignal;
 }
 
+/**
+ * 打断尝试的三种可观察结果（T6 / #19）。
+ *
+ * D6（#10）实测：Claude Code **不能打断在途工具调用**；「安全点投递」是唯一可靠语义。
+ * 因此：
+ * - `accepted`：宿主/适配层回报「已接受打断」。这是尽力而为的乐观结果，**不**保证在途工具
+ *   已停止；服务端只据此记录，不改投递语义。
+ * - `rejected`：宿主明确拒绝打断（当前轮不允许插入）。
+ * - `unsupported`：宿主不支持打断，或宿主能力未知（含 Claude Code 实测、Codex 未验证）。
+ * 三者都**不**丢弃消息：无法打断时消息留在持久化队列，在下一安全点由 `wait_for_messages` 送达。
+ */
+export type InterruptResult = "accepted" | "rejected" | "unsupported";
+
+/** 调用方（宿主适配层/测试）显式申报的宿主打断能力；缺省视为 unsupported。 */
+export type HostInterruptCapability = InterruptResult;
+
+/** 已知宿主的默认打断能力：Claude Code 实测 unsupported；Codex 配额阻塞，按 unsupported 处理（未验证）。 */
+export const DEFAULT_HOST_INTERRUPT_CAPABILITY: Readonly<Record<HostType, InterruptResult>> = {
+  "claude-code": "unsupported",
+  "codex-cli": "unsupported",
+  other: "unsupported",
+};
+
+export interface InterruptParams {
+  /** 显式申报宿主能力（测试/适配层用）；缺省按 hostType 的默认能力。 */
+  readonly hostCapability?: HostInterruptCapability;
+}
+
+export interface InterruptAttempt {
+  readonly ok: true;
+  /** 可观察结果：accepted / rejected / unsupported。 */
+  readonly result: InterruptResult;
+  /**
+   * 打断尝试后该成员的运行状态。打断永远不把一条已经进入处理的轮次伪装成 waiting；
+   * 这里恒为 `working`（与 T4 waiting/working 语义一致：wait 返回 → working）。
+   */
+  readonly targetStatus: RunStatus;
+  /** running：成员当前处于 working（正在处理）；idle：成员不处于可打断的忙碌轮次。 */
+  readonly target: "running" | "idle";
+  /** 该次打断尝试的稳定 ID，用于追溯。 */
+  readonly attemptId: string;
+  readonly attemptedAt: string;
+  /** 宿主类型与依据说明，便于写接入文档。 */
+  readonly hostType: HostType;
+  readonly reason: string;
+  /**
+   * 该成员此刻是否仍有未投递（pending）消息。无论打断结果如何，消息都保留在持久化队列，
+   * 由下一安全点的 `wait_for_messages` 送达；这里只是可观察的提示，不代表模型已处理。
+   */
+  readonly queuedMessageCount: number;
+}
+
 export const DEFAULT_HEARTBEAT: Heartbeat = { intervalMs: 10_000, timeoutMs: 30_000 };
 export const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 export const MAX_WAIT_TIMEOUT_MS = 300_000;
@@ -199,6 +252,11 @@ export interface McpCore {
   sendMessage(sessionId: string, params: SendMessageParams): SendMessageResult;
   acknowledgeMessage(sessionId: string, messageId: string): AcknowledgeResult;
   reportStatus(sessionId: string, params: { status: RunStatus; projectId?: string; memberId?: string }): StatusResult;
+  /**
+   * 尽力尝试打断该成员当前轮（T6 / #19）。结果可观察（accepted/rejected/unsupported）且记录；
+   * 不丢弃消息——无法打断时消息保留在队列，等下一安全点送达（D6/CHAT-05）。
+   */
+  attemptInterrupt(sessionId: string, params?: InterruptParams): InterruptAttempt;
   heartbeat(sessionId: string): HeartbeatResult;
   readHistory(sessionId: string, params: ReadHistoryParams): ReadHistoryResult;
   /** 当前挂起等待数（测试与观测用）。 */
@@ -773,6 +831,48 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       return { ok: true, status: params.status, projectId, memberId, updatedAt };
     },
 
+    attemptInterrupt(sessionId, params) {
+      const binding = bindingFor(sessionId);
+      touchSession(binding.mcpSessionId);
+
+      // 成员当前运行状态（显式信号驱动，T4）：什么决定「是否处于可打断的忙碌轮次」。
+      const currentState = repos.statuses.get(binding.projectId, binding.memberId)?.state ?? "online";
+      const target: "running" | "idle" = currentState === "working" ? "running" : "idle";
+
+      // 宿主能力：显式申报优先；缺省按 hostType 的默认（Claude Code 实测 unsupported）。
+      const result: InterruptResult =
+        params?.hostCapability ?? DEFAULT_HOST_INTERRUPT_CAPABILITY[binding.hostType] ?? "unsupported";
+
+      // 打断永远不把已进入处理的轮次伪装成 waiting；恒为 working（与「wait 返回 → working」一致）。
+      // 若成员已不在可打断的忙碌轮次（idle），仅记录一次尝试，不改运行状态。
+      if (target === "running") markWorking(binding);
+
+      // 消息是否仍在队列（可观察；必须与「模型已处理」区分）。
+      const queuedMessageCount = repos.deliveries.listPending(binding.projectId, binding.memberId).length;
+
+      const reason = buildInterruptReason(result, binding.hostType, target);
+      const attempt: InterruptAttempt = {
+        ok: true,
+        result,
+        targetStatus: "working",
+        target,
+        attemptId: newId(),
+        attemptedAt: now().toISOString(),
+        hostType: binding.hostType,
+        reason,
+        queuedMessageCount,
+      };
+      log.info("interrupt_attempted", {
+        memberId: binding.memberId,
+        hostType: binding.hostType,
+        result,
+        target,
+        queuedMessageCount,
+        attemptId: attempt.attemptId,
+      });
+      return attempt;
+    },
+
     heartbeat(sessionId) {
       const binding = bindingFor(sessionId);
       let session: McpSession;
@@ -917,8 +1017,26 @@ function cursorToSeq(cursor: string | undefined): number | undefined {
   return Number(match[1]);
 }
 
-/** 把 repository 错误映射为 MCP 业务错误码（不改工具对外形状）。 */
-function mapRepoError(error: unknown, ctx: Record<string, unknown>): McpToolError {
+/** 打断尝试的人类可读依据（随结果返回，便于写入接入文档/追溯）。 */
+function buildInterruptReason(result: InterruptResult, hostType: HostType, target: "running" | "idle"): string {
+  const hostNote =
+    hostType === "claude-code"
+      ? "Claude Code 实测不能打断在途工具调用（D6/#10），安全点投递是唯一可靠语义"
+      : hostType === "codex-cli"
+        ? "Codex CLI 等待/打断行为因配额阻塞未实测（D6/#10），按 unsupported 处理"
+        : "宿主能力未知";
+  if (target === "idle") return `成员当前不处于可打断的忙碌轮次（idle）；${hostNote}`;
+  switch (result) {
+    case "accepted":
+      return `宿主适配层回报已接受打断（尽力而为，不保证在途工具已停止）；消息保留在队列直到下一安全点`;
+    case "rejected":
+      return `宿主明确拒绝打断当前轮；消息保留在队列直到下一安全点`;
+    case "unsupported":
+      return `服务端不阻塞、消息不丢，但无法打断在途工具；${hostNote}；消息在下一安全点投递`;
+  }
+}
+
+/** 把 repository 错误映射为 MCP 业务错误码（不改工具对外形状）。 */function mapRepoError(error: unknown, ctx: Record<string, unknown>): McpToolError {
   if (error instanceof McpToolError) return error;
   if (error instanceof RepositoryError) {
     switch (error.code) {
