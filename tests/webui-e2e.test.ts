@@ -249,3 +249,55 @@ test("群聊页面路由可加载；ChatView 使用的同一组 HTTP 接口走�
     });
   });
 });
+
+test("T5：服务端重启后 WebUI 群聊历史页仍可加载并读到重启前的消息（历史持久化）", async () => {
+  await withTempDir(async (buildDir) => {
+    const webRoot = path.join(buildDir, "web");
+    await buildWebInto(webRoot);
+
+    await withTempDir(async (dataDir) => {
+      const post = async (server: RunningServer, pathname: string, body: unknown) => {
+        const res = await fetch(`${server.url}${pathname}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        return (await res.json()) as any;
+      };
+
+      // ---- 第一次进程：建项目/人成员/群组，发两条消息 ----
+      let first = await startTestServer(dataDir, webRoot);
+      const project = (await post(first, "/api/projects", { name: "持久化聊天" })).project;
+      const alice = (await post(first, `/api/projects/${project.id}/members`, { kind: "human", displayName: "Alice" }))
+        .member;
+      const group = (
+        await post(first, `/api/projects/${project.id}/groups`, { name: "群", participantMemberIds: [alice.id] })
+      ).group;
+      await post(first, `/api/groups/${group.id}/messages`, { senderMemberId: alice.id, text: "第一条" });
+      await post(first, `/api/groups/${group.id}/messages`, { senderMemberId: alice.id, text: "第二条" });
+      await first.close();
+
+      // ---- 重启：重新启动同一数据目录 + 同一构建产物 ----
+      const second = await startTestServer(dataDir, webRoot);
+      try {
+        // /chat 深链仍可回落加载。
+        const chat = await fetch(`${second.url}/chat`);
+        assert.equal(chat.status, 200);
+        assert.match(await chat.text(), /<div id="app">/);
+
+        // 历史接口返回重启前两条，顺序稳定。
+        const hist = (await (await fetch(`${second.url}/api/groups/${group.id}/messages`)).json()) as any;
+        assert.deepEqual(
+          hist.messages.map((m: any) => m.text),
+          ["第一条", "第二条"],
+        );
+        assert.deepEqual(
+          hist.messages.map((m: any) => m.seq),
+          [1, 2],
+        );
+      } finally {
+        await second.close();
+      }
+    });
+  });
+});
