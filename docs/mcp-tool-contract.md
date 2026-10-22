@@ -142,8 +142,8 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `groupId` | string | 否（默认当前入群群组） | 目标群组。 |
-| `text` | string | 是 | 正文（非空，≤ 8000 字符）。 |
-| `mentions` | string[] | 否 | 被 @ 的成员 ID；`@all` 由 T3 解析，本票只透传。 |
+| `text` | string | 是 | 正文（非空，≤ 8000 字符）。正文中的 `@名称` / `@all` 由 T3 解析为稳定成员 ID / 在线快照。 |
+| `mentions` | string[] | 否 | 被 @ 的成员稳定 ID（必须是本群参与者）。与正文 `@` 合并去重。 |
 | `clientMessageId` | string | 否 | 客户端幂等键：相同 `clientMessageId` + 发送者只落一条。 |
 
 出参：
@@ -152,7 +152,13 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 { "ok": true, "messageId": "msg_...", "createdAt": "...", "duplicate": false }
 ```
 
-错误：`INVALID_ARGUMENT`、`NOT_IN_GROUP`、`FORBIDDEN`（不在该群组）、`RATE_LIMITED`、`INTERNAL`。
+错误：`INVALID_ARGUMENT`（含无法解析的 `@名称`，`details.unknownNames`）、`NOT_IN_GROUP`、
+`FORBIDDEN`（不在该群组）、`RATE_LIMITED`（T7，本票未落地）、`INTERNAL`。
+
+> T3 起 `send_message` 落地 mention 解析与路由：`@all`/`@全体` 展开为发送时在线参与者快照并
+> 写入持久化 `mentions`；消息按可见性投递（普通 agent 只投自己发送+被 @、manager 投全部、人投全部、
+> 未参与者不投），并按唤醒规则唤醒（发送者排除）。详见 `docs/t3-chat-and-routing.md`。
+
 
 ### 3.4 `acknowledge_message` —— 确认消息（至少一次投递 + 重复确认去重）
 
@@ -211,7 +217,8 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 ```
 
 错误：`INVALID_ARGUMENT`、`NOT_IN_GROUP`、`FORBIDDEN`（跨群组/越权）、`INTERNAL`。
-**本票范围**：只按「自己发送 + 被 @」过滤；mention 解析细节与可见性是 T3。
+**T3 起可见性**：普通 agent 只返回「自己发送 + 被 @」；顶层 manager 返回群组全部消息；人（若以 MCP 接入）
+返回全部；未参与群组者读不到（`FORBIDDEN`）。规则见 `docs/t3-chat-and-routing.md`。
 
 ## 4. 超时、并发与生命周期
 
@@ -252,3 +259,16 @@ T2 已把上述**内存 `McpStore` 替换为 F2 的 SQLite 持久化**（`src/se
 
 详见 `docs/t2-mcp-join-and-online.md`。
 
+
+## 8. T3（#16）落地补充
+
+T3 在**不改工具名/错误码**的前提下落地消息路由与可见性（详见 `docs/t3-chat-and-routing.md`）：
+
+- `send_message`：正文 `@名称` / `@all` 解析为稳定成员 ID；`@all` 别名 `all/全体/所有人/大家` 展开为
+  发送时**在线参与者快照**（不含发送者），并写入持久化 `mentions`。显式 `mentions` 必须是本群参与者。
+  无法解析的 `@名称` → `INVALID_ARGUMENT`（`details.unknownNames`）。
+- 投递/可见：普通 agent = 自己发送 + 被 @；manager = 群组全部；人 = 全部；未参与者无投递、不可见。
+- 唤醒：普通 agent 只被 @；manager 被其他成员任何消息；**发送者永不唤醒自己**；多 @ 只唤醒被点名者。
+- `read_history` / `wait_for_messages` 的可见范围按上述规则（manager/人范围更宽）。
+- 人侧另有 HTTP `POST/GET /api/groups/:id/messages` 与 WebSocket `{ type:"message", message }` 广播，
+  供 WebUI 群聊；这是 HTTP/WS 边界，不改变 MCP 工具契约。
