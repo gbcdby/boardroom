@@ -3,9 +3,7 @@ import { RouterLink, RouterView } from "vue-router";
 
 const navigation = [
   { to: "/", label: "概览" },
-  { to: "/projects", label: "项目" },
-  { to: "/groups", label: "群组" },
-  { to: "/members", label: "成员与状态" },
+  { to: "/projects", label: "项目与群组" },
   { to: "/settings", label: "设置" },
 ];
 </script>
