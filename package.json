@@ -1,0 +1,39 @@
+{
+  "name": "agent-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent Studio — 本地运行的跨 Agent 协作平台",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "prestart": "npm run build:web",
+    "start": "node src/server/index.ts",
+    "dev:server": "node --watch src/server/index.ts",
+    "dev:web": "vite --config src/web/vite.config.ts",
+    "build": "npm run build:web",
+    "build:web": "vite build --config src/web/vite.config.ts",
+    "e2e": "node scripts/e2e-phase1.mjs",
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json && vue-tsc --noEmit -p src/web/tsconfig.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "better-sqlite3": "^13.0.3",
+    "vue": "^3.5.44",
+    "vue-router": "^4.6.4",
+    "ws": "^8.22.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^24.19.2",
+    "@types/ws": "^8.18.2",
+    "@vitejs/plugin-vue": "^6.0.10",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.0",
+    "vue-tsc": "^3.3.13"
+  }
+}
