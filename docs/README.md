@@ -12,6 +12,8 @@ docs/
 │   └── data-model.md         # 持久化数据模型、ID 方案、迁移与事务
 ├── mcp-tool-contract.md      # 阶段 1 MCP 工具契约（F3）
 ├── t1-project-group-api.md   # T1 项目/群组/成员 HTTP API 与 WebUI 页面
+├── getting-started-mcp.md    # T8 接入指南：Claude Code / Codex CLI MCP 配置与已知限制
+├── t8-acceptance-report.md   # T8 阶段 1 收口验收报告（AC-CORE-01..11 逐项结论）
 └── archive/                  # 已取代或废弃的架构文档（按需创建）
 ```
 
