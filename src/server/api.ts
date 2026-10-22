@@ -187,15 +187,18 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         }
         const current = r.members.getManager(projectId);
         if (current && current.id !== memberId) {
-          // D2：每项目最多一个顶层 manager；不静默覆盖已有 manager。
-          throw new ConflictError(
-            `项目已存在 manager ${current.id}；如需更换，请先清除现有 manager 或走后续阶段的更换流程。`,
-          );
-        }
-        if (member.role !== "manager") {
+          // 支持「更换」：事务内先把旧 manager 降为 normal，再把新成员升为 manager。
+          // 顺序保证任一时刻最多一个 manager（部分唯一索引 ux_members_project_manager）。
+          r.transaction(() => {
+            r.members.update(current.id, { role: "normal" });
+            r.members.update(memberId, { role: "manager" });
+          });
+          log.info("更换项目 manager", { projectId, from: current.id, to: memberId });
+        } else if (member.role !== "manager") {
+          // 无现有 manager（或已指定同一成员）：仅提升该成员；留空创建后在此首次指定。
           r.members.update(memberId, { role: "manager" });
+          log.info("指定项目 manager", { projectId, memberId });
         }
-        log.info("指定项目 manager", { projectId, memberId });
         writeJson(response, 200, { project: projectView(r, r.projects.get(projectId)!) });
         return true;
       }
@@ -320,13 +323,6 @@ class HttpError extends Error {
     super(message);
     this.code = code;
     this.status = status;
-  }
-}
-
-/** 用 ConflictError 的语义（conflict → 409）表达，复用 repository 错误映射。 */
-class ConflictError extends RepositoryError {
-  constructor(message: string) {
-    super("conflict", message);
   }
 }
 

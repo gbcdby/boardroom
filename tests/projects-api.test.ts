@@ -185,7 +185,33 @@ test("DELETE /api/projects/:id/members/:memberId 移除成员", async () => {
 // manager 指定（D2）
 // ---------------------------------------------------------------------------
 
-test("PUT /api/projects/:id/manager 指定 manager；再次指定另一成员返回 409", async () => {
+test("PUT /api/projects/:id/manager 无 manager 时指定成功（留空可用）", async () => {
+  await withTempDir(async (dir) => {
+    const server = await startTestServer(dir);
+    try {
+      const project = (await json(server, "POST", "/api/projects", { name: "P" })).body.project;
+      // 项目创建时 manager 留空。
+      assert.equal(project.manager, null);
+
+      const alice = (
+        await json(server, "POST", `/api/projects/${project.id}/members`, {
+          kind: "human",
+          displayName: "Alice",
+        })
+      ).body.member;
+
+      const set = await json(server, "PUT", `/api/projects/${project.id}/manager`, {
+        memberId: alice.id,
+      });
+      assert.equal(set.status, 200);
+      assert.equal(set.body.project.manager.id, alice.id);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+test("PUT /api/projects/:id/manager 可在已有 manager 时更换（旧降 normal，仅一个 manager）", async () => {
   await withTempDir(async (dir) => {
     const server = await startTestServer(dir);
     try {
@@ -203,41 +229,87 @@ test("PUT /api/projects/:id/manager 指定 manager；再次指定另一成员返
         })
       ).body.member;
 
-      const set = await json(server, "PUT", `/api/projects/${project.id}/manager`, {
+      const first = await json(server, "PUT", `/api/projects/${project.id}/manager`, {
         memberId: alice.id,
       });
-      assert.equal(set.status, 200);
-      assert.equal(set.body.project.manager.id, alice.id);
+      assert.equal(first.status, 200);
+      assert.equal(first.body.project.manager.id, alice.id);
 
-      // 已存在 manager 时再指定另一个 → 409 conflict（不静默覆盖）。
-      const conflict = await json(server, "PUT", `/api/projects/${project.id}/manager`, {
+      // 已有 manager A，更换为 B → 200，且 project.manager = B。
+      const replace = await json(server, "PUT", `/api/projects/${project.id}/manager`, {
         memberId: bob.id,
       });
-      assert.equal(conflict.status, 409);
-      assert.equal(conflict.body.error.code, "conflict");
+      assert.equal(replace.status, 200);
+      assert.equal(replace.body.project.manager.id, bob.id);
 
-      // 再次指定同一成员是幂等的（不产生冲突）。
-      const idempotent = await json(server, "PUT", `/api/projects/${project.id}/manager`, {
-        memberId: alice.id,
-      });
-      assert.equal(idempotent.status, 200);
-      assert.equal(idempotent.body.project.manager.id, alice.id);
+      // 复核：A 降为 normal、B 为 manager，成员列表中恰好一个 manager。
+      const members = (await json(server, "GET", `/api/projects/${project.id}/members`)).body.members as {
+        id: string;
+        role: string;
+      }[];
+      const byId = new Map(members.map((m) => [m.id, m.role]));
+      assert.equal(byId.get(alice.id), "normal");
+      assert.equal(byId.get(bob.id), "manager");
+      assert.equal(members.filter((m) => m.role === "manager").length, 1);
     } finally {
       await server.close();
     }
   });
 });
 
-test("PUT /api/projects/:id/manager 未知成员返回 404/400", async () => {
+test("PUT /api/projects/:id/manager 同一成员重复 PUT 幂等", async () => {
   await withTempDir(async (dir) => {
     const server = await startTestServer(dir);
     try {
       const project = (await json(server, "POST", "/api/projects", { name: "P" })).body.project;
-      const response = await json(server, "PUT", `/api/projects/${project.id}/manager`, {
+      const alice = (
+        await json(server, "POST", `/api/projects/${project.id}/members`, {
+          kind: "human",
+          displayName: "Alice",
+        })
+      ).body.member;
+
+      const first = await json(server, "PUT", `/api/projects/${project.id}/manager`, { memberId: alice.id });
+      assert.equal(first.status, 200);
+      const again = await json(server, "PUT", `/api/projects/${project.id}/manager`, { memberId: alice.id });
+      assert.equal(again.status, 200);
+      assert.equal(again.body.project.manager.id, alice.id);
+
+      const members = (await json(server, "GET", `/api/projects/${project.id}/members`)).body.members as {
+        role: string;
+      }[];
+      assert.equal(members.filter((m) => m.role === "manager").length, 1);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+test("PUT /api/projects/:id/manager 非项目成员被拒（404/400）", async () => {
+  await withTempDir(async (dir) => {
+    const server = await startTestServer(dir);
+    try {
+      const project = (await json(server, "POST", "/api/projects", { name: "P" })).body.project;
+      // 纯粹不存在的成员 id。
+      const unknown = await json(server, "PUT", `/api/projects/${project.id}/manager`, {
         memberId: "NOPE",
       });
-      assert.ok(response.status === 404 || response.status === 400);
-      assert.equal(response.body.error.code !== undefined, true);
+      assert.ok(unknown.status === 404 || unknown.status === 400);
+      assert.equal(unknown.body.error.code !== undefined, true);
+
+      // 属于另一个项目的成员也不能被指定为本项目 manager。
+      const other = (await json(server, "POST", "/api/projects", { name: "Q" })).body.project;
+      const outsider = (
+        await json(server, "POST", `/api/projects/${other.id}/members`, {
+          kind: "human",
+          displayName: "外部",
+        })
+      ).body.member;
+      const cross = await json(server, "PUT", `/api/projects/${project.id}/manager`, {
+        memberId: outsider.id,
+      });
+      assert.equal(cross.status, 404);
+      assert.equal(cross.body.error.code, "not_found");
     } finally {
       await server.close();
     }

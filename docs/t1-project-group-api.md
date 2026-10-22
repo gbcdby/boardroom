@@ -30,7 +30,7 @@
 | `invalid_argument` | 400 | 名称为空、kind/role 非法、请求体非对象等语义校验失败 |
 | `invalid_reference` | 400 | 跨项目引用（如群组参与者不是项目成员）、引用不存在的成员 |
 | `not_found` | 404 | 项目 / 群组 / 成员不存在 |
-| `conflict` | 409 | 重复指定 manager（D2：每项目最多一个顶层 manager） |
+| `conflict` | 409 | 其他唯一约束冲突（注意：正常更换 manager 走 200，不再返回 409） |
 | `write_failed` | 500 | 底层写入失败（已回滚） |
 | `invalid_json` / `payload_too_large` | 400 / 413 | 请求体非法 / 过大 |
 | `method_not_allowed` | 405 | 路径存在但方法不支持 |
@@ -45,7 +45,7 @@
 | `POST` | `/api/projects/:id/members` | `{ kind: "human"\|"agent", displayName: string, agentId?: string, role?: "manager"\|"normal" }` | `201 { member }` | 添加项目成员。`kind=human` 不绑 agent；`kind=agent` 需已存在的 `agentId`（T2 产生）。缺省 `role=normal`。 |
 | `GET` | `/api/projects/:id/members` | — | `200 { members: Member[] }` | 列出项目成员。 |
 | `DELETE` | `/api/projects/:id/members/:memberId` | — | `204` | 移除项目成员（连同其群组参与者关系级联删除）。 |
-| `PUT` | `/api/projects/:id/manager` | `{ memberId: string }` | `200 { project }` | 指定顶层 manager。**重复指定另一成员返回 409 conflict**；重复指定同一成员幂等返回 200。 |
+| `PUT` | `/api/projects/:id/manager` | `{ memberId: string }` | `200 { project }` | **指定或更换**顶层 manager。无 manager 时指定；已有 manager A 时指定另一成员 B 会在**同一事务内**把 A 降为 `normal`、B 升为 `manager`（始终保持最多一个 manager）。同一成员重复 PUT 幂等 200。 |
 | `POST` | `/api/projects/:id/groups` | `{ name: string, participantMemberIds?: string[] }` | `201 { group }` | 创建群组；初始参与者必须都是该项目成员（GROUP-02），越界返回 `invalid_reference`。 |
 | `GET` | `/api/projects/:id/groups` | — | `200 { groups: Group[] }` | 列出项目的群组。 |
 | `GET` | `/api/groups/:id/participants` | — | `200 { participants: Member[] }` | 列出群组参与者（展开为成员对象）。 |
@@ -60,8 +60,9 @@ Group   = { id, projectId, name, createdAt, updatedAt }
 
 ### 1.4 关键约束
 
-- **D2 每项目最多一个顶层 manager**：由数据库部分唯一索引 `ux_members_project_manager` 强制；
-  API 在写入前先检查现有 manager，重复指定返回 409，不静默覆盖。
+- **D2 每项目最多一个顶层 manager**：由数据库部分唯一索引 `ux_members_project_manager` 强制。
+  API 的 `PUT /manager` 支持**更换**：已有 manager 时在事务内先降旧、再升新（顺序保证任一时刻不出现两个 manager），
+  因此正常「更换 manager」返回 200，不触发 409。
 - **GROUP-02 参与者只能来自项目成员**：由 repository 的 `groups.create` / `addParticipant` 校验。
 - 阶段 1 只验收一个项目/一个群组，但数据按 project/group 作用域建模，便于阶段 2 扩展。
 
@@ -73,15 +74,15 @@ Group   = { id, projectId, name, createdAt, updatedAt }
 - 页面能力：
   - 创建项目（输入名称 → 创建）；项目以标签页切换。
   - 项目详情显示顶层 manager（未指定时显示「未指定」）。
-  - 成员区：添加人成员、移除成员、对任一非 manager 成员点「设为 manager」。
+  - 成员区：添加人成员、移除成员、对任一非 manager 成员点「设为 manager」（已有 manager 时即更换）。
   - 群组区：输入群组名、用复选框从**项目成员**中选择参与者、创建群组；列出现有群组及其参与者。
-  - 基础错误提示：接口错误（含 409 重复 manager）以红色文本显示；成功反馈以绿色文本显示。
+  - 基础错误提示：接口错误以红色文本显示；成功反馈（含更换 manager）以绿色文本显示。
 - 前端 API 客户端：`src/web/src/api/client.ts`（与 §1 契约一一对应）。
 
 ## 3. 测试与验证
 
-- `tests/projects-api.test.ts`：HTTP API 契约（创建项目/成员/群组、manager 指定与 409、GROUP-02 越界、
-  重启保留）。
+- `tests/projects-api.test.ts`：HTTP API 契约（创建项目/成员/群组、manager 首次指定/更换/幂等/非成员被拒、
+  GROUP-02 越界、重启保留）。
 - `tests/webui-e2e.test.ts`：WebUI 轻量 E2E——构建产物含关键 UI 文案、`/projects` 深链可加载、
   表单所用同一组 HTTP 接口走通完整流程。**非浏览器 Playwright 交互**（见文件头说明覆盖边界）。
 
@@ -89,4 +90,4 @@ Group   = { id, projectId, name, createdAt, updatedAt }
 
 - Agent 通过 MCP 入群与在线（T2）；群聊与消息（T3）；状态看板（T4）；多项目/多群组生命周期（阶段 2）。
 - 组织树、下级 manager、完整权限矩阵、归档/删除（阶段 2/5）、审计视图。
-- 更换 manager 的「先清除再指定」独立操作未提供（阶段 1 通过 409 明确拒绝重复指定；后续可按需补）。
+- 「清除 manager（回到留空）」的独立操作未提供；当前通过直接把另一成员指定为 manager 完成更换。
