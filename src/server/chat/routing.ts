@@ -146,7 +146,6 @@ export function resolveWakeAndVisibility(
   roster: readonly RoutingMember[],
 ): RoutingPlan {
   const byId = new Map(roster.map((m) => [m.id, m]));
-  const sender = byId.get(message.senderMemberId);
 
   // @all：发送时在线参与者快照（排除发送者本人）。
   const allRecipients: string[] = [];
@@ -196,8 +195,6 @@ export function resolveWakeAndVisibility(
 
   // 发送者明确排除在唤醒之外（含 manager）。
   wakeSet.delete(message.senderMemberId);
-  // 不存在的 sender 也不应产生任何可见/唤醒（防御）。
-  void sender;
 
   return {
     allRecipients,
@@ -206,8 +203,3 @@ export function resolveWakeAndVisibility(
   };
 }
 
-/** 某成员是否可见某条已持久化的消息（用于历史/投递过滤）。 */
-export function isMessageVisibleTo(message: RoutingMessage, roster: readonly RoutingMember[], memberId: string): boolean {
-  const plan = resolveWakeAndVisibility(message, roster);
-  return plan.visible.includes(memberId);
-}

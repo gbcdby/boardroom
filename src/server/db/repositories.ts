@@ -203,6 +203,7 @@ function runInTransaction<T>(db: Database.Database, fn: () => T): T {
         db.exec("ROLLBACK");
       }
     } catch {
+      // 回滚本身失败时不再抛，避免掩盖原始错误（原始 error 会在下方重新抛出）。
       // 事务可能已被数据库自动结束，或连接已关闭。
     }
     throw normalizeError(error);
