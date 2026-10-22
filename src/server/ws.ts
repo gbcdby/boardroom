@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import type { HeartbeatConfig } from "./config.ts";
 import type { Logger } from "./logger.ts";
+import type { MessageView } from "./api.ts";
 
 /** 客户端 → 服务端。 */
 export type ClientEvent = { type: "ping"; sentAt?: string };
@@ -18,6 +19,7 @@ export type ServerEvent =
     }
   | { type: "pong"; sentAt?: string; serverTime: string }
   | { type: "notice"; level: "info" | "warn"; message: string }
+  | { type: "message"; message: MessageView }
   | { type: "error"; code: "invalid_message" | "unknown_type"; message: string };
 
 export interface WebSocketHubOptions {

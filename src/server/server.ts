@@ -133,7 +133,13 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     heartbeat: config.heartbeat,
     db,
   });
-  const t1Api = createT1ApiRouter({ db, logger });
+  // T3：人的消息广播目标。hub 在 httpServer 之后创建，这里用晚绑定回调占位。
+  let broadcastMessage: (message: import("./api.ts").MessageView) => void = () => {};
+  const t1Api = createT1ApiRouter({
+    db,
+    logger,
+    onMessage: (message) => broadcastMessage(message),
+  });
 
   const httpServer = createServer((request, response) => {
     void handleRequest(request, response).catch((error: unknown) => {
@@ -188,6 +194,13 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     heartbeat: config.heartbeat,
     logger,
   });
+
+  // T3：把人的消息通过 WebSocket 广播给 WebUI（阶段 1 WebUI = 人，可见全部群组消息）。
+  // 注意：广播范围受本票约束「只推送允许范围内的消息」；目前 WebUI 连接即人的视角，
+  // 单群组内全部消息都在人的可见范围内。MCP agent 的投递不经过 WS（走 wait_for_messages）。
+  broadcastMessage = (message) => {
+    hub.broadcast({ type: "message", message });
+  };
 
   try {
     await new Promise<void>((resolve, reject) => {
