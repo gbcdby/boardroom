@@ -19,6 +19,8 @@ export interface McpTransportOptions {
   readonly heartbeat: Heartbeat;
   /** 持久化数据库；MCP 工具直接落 F2 repository（T2）。 */
   readonly db: Database;
+  /** T7：防环/限流阈值（跨会话共享限流器）。缺省用 D5 默认值。 */
+  readonly antiLoop?: import("./core.ts").AntiLoopRuntimeOptions;
 }
 
 export interface McpSessionsHandler {
@@ -91,6 +93,7 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
       heartbeat: options.heartbeat,
       db: options.db,
       memberKey: "http",
+      ...(options.antiLoop ? { antiLoop: options.antiLoop } : {}),
     });
     const server = createMcpServer({ core, logger: options.logger });
     const session: HttpSession = { transport, server, core, lastActivity: Date.now() };

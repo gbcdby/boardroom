@@ -22,6 +22,8 @@ test("没有配置文件时使用默认值", async () => {
     assert.equal(config.dataDir, path.join(dir, "data"));
     assert.equal(config.heartbeat.intervalMs, 10_000);
     assert.equal(config.heartbeat.timeoutMs, 30_000);
+    assert.equal(config.antiLoop?.maxConsecutiveAutoReplies, 6);
+    assert.equal(config.antiLoop?.maxWakesPerMinutePerMember, 20);
   });
 });
 
@@ -115,6 +117,37 @@ test("配置文件不是合法 JSON 时报错", async () => {
     await assert.rejects(loadConfig({ cwd: dir, env: {} }), {
       name: "ConfigError",
       message: /JSON/,
+    });
+  });
+});
+
+test("antiLoop 阈值可通过配置文件与环境变量覆盖", async () => {
+  await withTempDir(async (dir) => {
+    await writeFile(
+      path.join(dir, "config.json"),
+      JSON.stringify({ antiLoop: { maxConsecutiveAutoReplies: 3, maxWakesPerMinutePerMember: 5 } }),
+    );
+    const fromFile = await loadConfig({ cwd: dir, env: {} });
+    assert.equal(fromFile.antiLoop?.maxConsecutiveAutoReplies, 3);
+    assert.equal(fromFile.antiLoop?.maxWakesPerMinutePerMember, 5);
+
+    const fromEnv = await loadConfig({
+      cwd: dir,
+      env: {
+        AGENT_STUDIO_MAX_CONSECUTIVE_AUTO_REPLIES: "9",
+        AGENT_STUDIO_MAX_WAKES_PER_MINUTE_PER_MEMBER: "42",
+      },
+    });
+    assert.equal(fromEnv.antiLoop?.maxConsecutiveAutoReplies, 9);
+    assert.equal(fromEnv.antiLoop?.maxWakesPerMinutePerMember, 42);
+  });
+});
+
+test("antiLoop 阈值非正整数时报错", async () => {
+  await withTempDir(async (dir) => {
+    await assert.rejects(loadConfig({ cwd: dir, env: { AGENT_STUDIO_MAX_CONSECUTIVE_AUTO_REPLIES: "0" } }), {
+      name: "ConfigError",
+      message: /maxConsecutiveAutoReplies/,
     });
   });
 });

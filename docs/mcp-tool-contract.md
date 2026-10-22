@@ -62,7 +62,7 @@ Streamable HTTP 贴合「本地单服务端、多成员」形态，便于在 F1 
 | `NOT_IN_GROUP` | 未入群 / 尚未声明身份 | 未调用 `join` 就调用其他工具。 |
 | `FORBIDDEN` | 无权限或不可见 | 读取不在允许范围内的历史（跨群组、未参与的消息）。 |
 | `TIMEOUT` | 超时 | 等待类工具在给定 `timeoutMs` 内无结果（注意：等待超时用 `status:"timeout"` 正常返回更常见，见 §3.2；`TIMEOUT` 保留给其他阻塞型操作）。 |
-| `RATE_LIMITED` | 限流 | 触发每成员 20 次/分钟等阈值（阈值由 T7 落地，本票只定义错误码）。 |
+| `RATE_LIMITED` | 限流 | 触发每成员 20 次/分钟等阈值（T7 落地；见 `docs/t7-antiloop-and-rate-limit.md`）。注意：T7 主要抑制**唤醒**而非拒绝 `send_message`；超限消息仍持久化。 |
 | `CONFLICT` | 冲突 | 例如重复入群且身份不一致、重复确认的状态冲突。 |
 | `INTERNAL` | 内部错误 | 未预期的服务端异常。 |
 
@@ -153,7 +153,11 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 ```
 
 错误：`INVALID_ARGUMENT`（含无法解析的 `@名称`，`details.unknownNames`）、`NOT_IN_GROUP`、
-`FORBIDDEN`（不在该群组）、`RATE_LIMITED`（T7，本票未落地）、`INTERNAL`。
+`FORBIDDEN`（不在该群组）、`INTERNAL`。
+
+> T7 起 `send_message` 落地防环/限流：**消息本身不会被限流拒绝**（始终持久化）；限流只作用于
+> 「唤醒其他 agent」——连续自动回复超 6 次或某成员 1 分钟内被唤醒超 20 次时，该次不唤醒但消息保留
+> `pending`，窗口重置/人类消息后补投。详见 `docs/t7-antiloop-and-rate-limit.md`。
 
 > T3 起 `send_message` 落地 mention 解析与路由：`@all`/`@全体` 展开为发送时在线参与者快照并
 > 写入持久化 `mentions`；消息按可见性投递（普通 agent 只投自己发送+被 @、manager 投全部、人投全部、

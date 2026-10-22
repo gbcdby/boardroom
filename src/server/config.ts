@@ -9,6 +9,10 @@ export const DEFAULT_DATA_DIR = "data";
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
 /** D4：心跳超时默认 30s。 */
 export const DEFAULT_HEARTBEAT_TIMEOUT_MS = 30_000;
+/** T7 / D5：每群组连续自动回复默认上限 6。 */
+export const DEFAULT_MAX_CONSECUTIVE_AUTO_REPLIES = 6;
+/** T7 / D5：每成员滚动 1 分钟默认最多被唤醒 20 次。 */
+export const DEFAULT_MAX_WAKES_PER_MINUTE_PER_MEMBER = 20;
 
 /** 默认只读的配置文件路径（相对 cwd）。 */
 export const DEFAULT_CONFIG_FILE = "config.json";
@@ -20,6 +24,14 @@ export interface HeartbeatConfig {
   readonly timeoutMs: number;
 }
 
+/** T7 防环/限流配置（D5）。 */
+export interface AntiLoopConfig {
+  /** 每群组连续自动回复上限（达到后停止自动唤醒其他 agent）。 */
+  readonly maxConsecutiveAutoReplies: number;
+  /** 每成员滚动 1 分钟最多被唤醒次数（跨群累计）。 */
+  readonly maxWakesPerMinutePerMember: number;
+}
+
 export interface AppConfig {
   /** HTTP + WebSocket 监听端口。 */
   readonly port: number;
@@ -27,6 +39,8 @@ export interface AppConfig {
   readonly dataDir: string;
   /** 心跳配置。 */
   readonly heartbeat: HeartbeatConfig;
+  /** T7 防环/限流配置（D5）；缺省时使用 D5 默认值。 */
+  readonly antiLoop?: AntiLoopConfig;
   /** 实际加载的配置文件绝对路径；没有配置文件时为 null。 */
   readonly configFile: string | null;
 }
@@ -79,10 +93,29 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<AppCo
     );
   }
 
+  const fileAntiLoop = isObject(fileValues["antiLoop"]) ? fileValues["antiLoop"] : {};
+  const maxConsecutiveAutoReplies = parsePositiveInt(
+    "antiLoop.maxConsecutiveAutoReplies",
+    pick(
+      env["AGENT_STUDIO_MAX_CONSECUTIVE_AUTO_REPLIES"],
+      fileAntiLoop["maxConsecutiveAutoReplies"],
+      DEFAULT_MAX_CONSECUTIVE_AUTO_REPLIES,
+    ),
+  );
+  const maxWakesPerMinutePerMember = parsePositiveInt(
+    "antiLoop.maxWakesPerMinutePerMember",
+    pick(
+      env["AGENT_STUDIO_MAX_WAKES_PER_MINUTE_PER_MEMBER"],
+      fileAntiLoop["maxWakesPerMinutePerMember"],
+      DEFAULT_MAX_WAKES_PER_MINUTE_PER_MEMBER,
+    ),
+  );
+
   return {
     port,
     dataDir,
     heartbeat: { intervalMs, timeoutMs },
+    antiLoop: { maxConsecutiveAutoReplies, maxWakesPerMinutePerMember },
     configFile: loadedFile === null ? null : configFile,
   };
 }

@@ -135,6 +135,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     logger,
     heartbeat: config.heartbeat,
     db,
+    antiLoop: { ...(config.antiLoop ? { config: config.antiLoop } : {}) },
   });
   // T3：人的消息广播目标。hub 在 httpServer 之后创建，这里用晚绑定回调占位。
   let broadcastMessage: (message: import("./api.ts").MessageView) => void = () => {};

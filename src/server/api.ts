@@ -6,6 +6,7 @@ import { createRepositories, type RepositorySet } from "./db/repositories.ts";
 import type { Group, Member, McpSession, Message as DbMessage, Project } from "./db/types.ts";
 import type { Logger } from "./logger.ts";
 import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "./chat/routing.ts";
+import { resetGroupConsecutiveCount } from "./mcp/core.ts";
 import { deriveEffectiveStatus } from "./status.ts";
 
 /**
@@ -381,6 +382,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           return message;
         });
         const view = messageView(r, created, plan);
+        // T7：人类消息重置该群组的「连续自动回复」计数（防环恢复条件之一）。
+        if (sender.kind === "human") resetGroupConsecutiveCount(groupId);
         log.info("发送群组消息", { groupId, messageId: created.id, senderMemberId, via: "http" });
         options.onMessage?.(view);
         writeJson(response, 201, { message: view });

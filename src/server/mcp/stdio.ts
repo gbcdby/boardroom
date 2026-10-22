@@ -53,6 +53,7 @@ async function main(): Promise<void> {
     db: opened.db,
     memberKey: "stdio",
     ...(heartbeat === undefined ? {} : { heartbeat }),
+    ...(config?.antiLoop ? { antiLoop: { config: config.antiLoop } } : {}),
   });
   const server = createMcpServer({ core, logger });
   const transport = new StdioServerTransport();

@@ -12,6 +12,13 @@ import { newId } from "../db/ids.ts";
 import type { McpSession, Member, Message as DbMessage } from "../db/types.ts";
 import { invalidArgument, McpToolError, notInGroup } from "./errors.ts";
 import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "../chat/routing.ts";
+import {
+  createAntiLoop,
+  DEFAULT_ANTI_LOOP_CONFIG,
+  type AntiLoop,
+  type AntiLoopConfig,
+  type WakeSuppressionReason,
+} from "../chat/antiloop.ts";
 
 /**
  * MCP 工具的领域核心（T2 / #15）。
@@ -227,10 +234,64 @@ interface PendingWait {
  */
 interface CoreInternals {
   readonly core: McpCore;
-  resolveGroup(groupId: string): void;
+  /**
+   * 唤醒本 core 中在该群组等待、且属于 `wakeGate`（T7 限流放行集合）成员的挂起等待。
+   * `wakeGate` 为 undefined 表示不额外限流（仅用于内部/补投路径）。
+   */
+  resolveGroup(groupId: string, wakeGate?: ReadonlySet<string>): void;
 }
 
 const activeRegistrations = new Set<CoreInternals>();
+
+/**
+ * 进程级共享的防环/限流器（T7）：所有 core 共享同一实例，保证「每群组连续回复」与
+ * 「每成员每分钟唤醒」跨会话累计。首次创建时的 config/now 生效；后续 core 复用。
+ * 计数为内存计数，进程重启重置（见 docs/t7-antiloop-and-rate-limit.md）。
+ */
+let sharedAntiLoop: AntiLoop | null = null;
+let sharedAntiLoopSignature = "";
+
+function getSharedAntiLoop(options: AntiLoopRuntimeOptions | undefined): AntiLoop {
+  const config = options?.config ?? {};
+  const signature = JSON.stringify(config);
+  if (sharedAntiLoop !== null && sharedAntiLoopSignature === signature) return sharedAntiLoop;
+  sharedAntiLoop = createAntiLoop({
+    ...(options?.config ? { config: options.config } : {}),
+    ...(options?.now ? { now: options.now } : {}),
+  });
+  sharedAntiLoopSignature = signature;
+  return sharedAntiLoop;
+}
+
+/** 仅供测试/观测：重置进程级共享限流器（模拟「进程重启后计数重置」）。 */
+export function resetSharedAntiLoopForTests(): void {
+  sharedAntiLoop = null;
+  sharedAntiLoopSignature = "";
+}
+
+/**
+ * 显式恢复某群组的连续自动回复计数（T7）。人类消息或显式恢复动作调用它重置计数。
+ * 作用于进程级共享限流器；若尚未创建则无操作（下次发送时按 0 开始）。
+ * 供 HTTP API（人的消息）与显式恢复路径复用。
+ */
+export function resetGroupConsecutiveCount(groupId: string): void {
+  sharedAntiLoop?.resetGroup(groupId);
+}
+
+/**
+ * T7（#20）防环/限流运行时配置。
+ *
+ * 计数与限流器**进程内共享**（见 {@link getSharedAntiLoop}）：HTTP 每个会话一个 core，
+ * 但「每群组连续回复」与「每成员每分钟唤醒」都必须跨 core 累计，否则互相限不住。
+ * 因此所有 core 共享同一个 {@link AntiLoop} 实例；`now` 与 `config` 取首次创建时的值。
+ * stdio 进程只有单个 core，天然共享。
+ */
+export interface AntiLoopRuntimeOptions {
+  /** 覆盖默认阈值（连续上限 / 每成员每分钟上限 / 窗口长度）。 */
+  readonly config?: Partial<AntiLoopConfig>;
+  /** 注入时钟（毫秒）。测试用模拟时钟；生产默认 Date.now。 */
+  readonly now?: () => number;
+}
 
 export interface McpCoreOptions {
   readonly logger: Logger;
@@ -244,6 +305,8 @@ export interface McpCoreOptions {
    * - 测试（InMemoryTransport）：每个成员一个 core，必须不同成员。
    */
   readonly memberKey?: string;
+  /** T7：防环/限流运行时配置；缺省使用 D5 默认阈值与真实时钟。 */
+  readonly antiLoop?: AntiLoopRuntimeOptions;
 }
 
 export interface McpCore {
@@ -281,6 +344,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   const memberKey = options.memberKey ?? "default";
 
   const repos: RepositorySet = createRepositories(options.db);
+  /** T7：进程级共享的防环/限流器。 */
+  const antiLoop = getSharedAntiLoop(options.antiLoop);
   /** 会话键 → 绑定（运行时对象，进程内维护；持久化部分在 mcp_sessions/members/agents）。 */
   const bindings = new Map<string, SessionBinding>();
   /** 本 core 挂起的等待。 */
@@ -522,11 +587,13 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 唤醒判定用 chat/routing 的 wake 集合（普通 agent 只被 @、manager 被其他成员消息、
    * 发送者排除）。可见但非唤醒的消息（例如普通 agent 自己发的）不会触发等待方返回。
    */
-  function resolveGroup(groupId: string): void {
+  function resolveGroup(groupId: string, wakeGate?: ReadonlySet<string>): void {
     const roster = buildRoster(groupId);
     for (const entry of [...pendingWaits]) {
       const binding = bindingByMember(entry.memberId);
       if (!binding || binding.groupId !== groupId) continue;
+      // T7：限流门控——某成员不在放行集合内则本次不唤醒（其消息仍为 pending，后续补投）。
+      if (wakeGate && !wakeGate.has(binding.memberId)) continue;
       const messages = deliverableSince(binding, undefined);
       if (messages.length === 0) continue;
       // 逐条判定是否属于该成员的唤醒范围；有任一消息唤醒才结算。
@@ -555,6 +622,19 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       if (binding.memberId === memberId) return binding;
     }
     return undefined;
+  }
+
+  /**
+   * T7：判定一条消息的发送者类别（人类 / agent）。
+   * 经 MCP `send_message` 的消息发送者都是 agent；这里按成员 kind 兜底判定，
+   * 为将来「人通过 MCP 发送」保留正确语义（人类消息重置连续计数）。
+   */
+  function senderKindOf(memberId: string): "agent" | "human" {
+    try {
+      return repos.members.get(memberId)?.kind === "human" ? "human" : "agent";
+    } catch {
+      return "agent";
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -780,8 +860,36 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         wake: plan.wake,
         visible: plan.visible,
       });
-      // 新消息写入后，跨 core 唤醒该群组等待中的成员（按路由 wake 集合，发送者排除）。
-      for (const reg of [...activeRegistrations]) reg.resolveGroup(groupId);
+
+      // T7：防环/限流。候选唤醒 = T3 wake 集合（已排除发送者）。防环器对「每群组连续自动
+      // 回复」和「每成员跨群唤醒速率」做门控，返回允许唤醒的成员；被抑制的成员其消息已
+      // 持久化（上面已建 pending 投递），不丢弃，等窗口重置/恢复后由 wait 补投。
+      const decision = antiLoop.registerMessage({
+        groupId,
+        senderKind: senderKindOf(binding.memberId),
+        candidateWake: plan.wake,
+      });
+      if (decision.suppressed.size > 0) {
+        // 只记结构化元信息（原因、成员、计数），不记消息正文（NFR-05 / T7 可观察性）。
+        const byReason: Record<WakeSuppressionReason, string[]> = { consecutive_limit: [], rate_limited: [] };
+        for (const [memberId, reason] of decision.suppressed) byReason[reason].push(memberId);
+        log.warn("wake_suppressed", {
+          groupId,
+          messageId: created.id,
+          consecutiveAutoReplies: decision.consecutiveAutoReplies,
+          consecutiveLimit: antiLoop.config.maxConsecutiveAutoReplies,
+          consecutiveCapReached: decision.consecutiveCapReached,
+          rateLimited: byReason.rate_limited,
+          consecutiveLimited: byReason.consecutive_limit,
+          maxWakesPerMinutePerMember: antiLoop.config.maxWakesPerMinutePerMember,
+        });
+      }
+
+      // 新消息写入后，跨 core 唤醒该群组等待中的成员：只唤醒「路由 wake 集合 ∩ 限流放行」。
+      if (decision.allowed.length > 0) {
+        const allowedSet = new Set(decision.allowed);
+        for (const reg of [...activeRegistrations]) reg.resolveGroup(groupId, allowedSet);
+      }
       return { ok: true, messageId: created.id, createdAt: created.createdAt, duplicate: false };
     },
 

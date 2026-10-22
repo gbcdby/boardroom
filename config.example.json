@@ -4,5 +4,9 @@
   "heartbeat": {
     "intervalMs": 10000,
     "timeoutMs": 30000
+  },
+  "antiLoop": {
+    "maxConsecutiveAutoReplies": 6,
+    "maxWakesPerMinutePerMember": 20
   }
 }
