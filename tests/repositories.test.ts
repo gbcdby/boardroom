@@ -327,8 +327,16 @@ test("MessageDelivery：按成员列出待投递积压（重连补发）", async
     repos.deliveries.ensure(m2.id, r.id);
     repos.deliveries.recordAttempt(m2.id, r.id, "delivered");
 
+    // 至少一次投递语义（T5）：delivered 但未 acked 仍算待完成、需可重投；
+    // 只有 acked 才从积压中移除。
     const pending = repos.deliveries.listPending(project.id, r.id);
-    assert.deepEqual(pending.map((d) => d.messageId), [m1.id]);
+    assert.deepEqual(pending.map((d) => d.messageId), [m1.id, m2.id]);
+
+    repos.deliveries.recordAttempt(m2.id, r.id, "acked");
+    assert.deepEqual(
+      repos.deliveries.listPending(project.id, r.id).map((d) => d.messageId),
+      [m1.id],
+    );
   });
 });
 

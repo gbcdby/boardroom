@@ -103,7 +103,12 @@ export interface DeliveriesRepository {
   get(messageId: string, memberId: string): MessageDelivery | null;
   /** 记录一次投递尝试并更新状态；不存在则先 ensure。 */
   recordAttempt(messageId: string, memberId: string, status: DeliveryStatus, at?: string): MessageDelivery;
-  /** 某成员在项目中尚未投递完成（pending）的积压，按消息 seq 排序。 */
+  /**
+   * 某成员在项目中**尚未完成**（未 acked）的积压，按群组 seq 排序。
+   *
+   * 「未完成」包含 pending 与 delivered——两者都还没被客户端确认。这样至少一次投递的
+   * 重连补发才能重投「已投递但未确认」的消息（NFR-02）；只有 acked 才视为不需要再投。
+   */
   listPending(projectId: string, memberId: string): MessageDelivery[];
   delete(messageId: string, memberId: string): void;
 }
@@ -794,7 +799,7 @@ function createDeliveries(db: Database.Database): DeliveriesRepository {
           .prepare(
             `SELECT d.* FROM message_deliveries d
                JOIN messages m ON m.id = d.message_id
-              WHERE d.project_id = ? AND d.member_id = ? AND d.status = 'pending'
+              WHERE d.project_id = ? AND d.member_id = ? AND d.status <> 'acked'
               ORDER BY m.group_id, m.seq`,
           )
           .all(projectId, memberId) as DeliveryRow[]
