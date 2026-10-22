@@ -11,6 +11,7 @@ import type { Logger } from "./logger.ts";
 import { createStaticHandler, isWebUiBuilt } from "./static.ts";
 import { createWebSocketHub, type ServerEvent, type WebSocketHub } from "./ws.ts";
 import { MCP_HTTP_PATH, createMcpSessionsHandler, type McpSessionsHandler } from "./mcp/transport.ts";
+import { createT1ApiRouter } from "./api.ts";
 
 /** WebSocket 端点路径。 */
 export const WS_PATH = "/ws";
@@ -107,6 +108,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     logger,
     heartbeat: config.heartbeat,
   });
+  const t1Api = createT1ApiRouter({ db, logger });
 
   const httpServer = createServer((request, response) => {
     void handleRequest(request, response).catch((error: unknown) => {
@@ -139,6 +141,8 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     }
 
     if (pathname.startsWith("/api/")) {
+      // T1（#14）项目/群组/成员 API；未匹配时落到统一的 404。
+      if (await t1Api.handle(request, response, pathname)) return;
       writeJson(response, 404, { error: "not_found", path: pathname });
       return;
     }
