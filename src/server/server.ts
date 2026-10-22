@@ -13,6 +13,7 @@ import { createStaticHandler, isWebUiBuilt } from "./static.ts";
 import { createWebSocketHub, type ServerEvent, type WebSocketHub } from "./ws.ts";
 import { MCP_HTTP_PATH, createMcpSessionsHandler, type McpSessionsHandler } from "./mcp/transport.ts";
 import { createT1ApiRouter } from "./api.ts";
+import { buildStatusBoard } from "./status.ts";
 
 /** WebSocket 端点路径。 */
 export const WS_PATH = "/ws";
@@ -46,6 +47,8 @@ export interface RunningServer {
   readonly mcpPendingWaitCount: number;
   /** 服务端主动广播事件给所有 WebUI 连接。 */
   broadcast(event: ServerEvent): void;
+  /** 立即把某项目状态看板快照广播给可见客户端（T4）。 */
+  broadcastStatus(projectId: string): void;
   /** 当前 WebSocket 连接数。 */
   readonly clientCount: number;
   close(): Promise<void>;
@@ -138,6 +141,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   const t1Api = createT1ApiRouter({
     db,
     logger,
+    heartbeat: config.heartbeat,
     onMessage: (message) => broadcastMessage(message),
   });
 
@@ -202,6 +206,27 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     hub.broadcast({ type: "message", message });
   };
 
+  // T4 状态看板：定期把每个项目的有效状态快照广播给可见 WebUI 客户端。
+  // 客户端本地还会用心跳时间戳做平滑判定；服务端按心跳 interval 刷新即可。
+  const statusRepos = createRepositories(db);
+  const statusPublisher = (): void => {
+    const nowDate = new Date();
+    for (const project of statusRepos.projects.list()) {
+      try {
+        const statuses = buildStatusBoard(statusRepos, project.id, {
+          heartbeat: config.heartbeat,
+          now: nowDate,
+          humanOnlineMemberIds: hub.humanPresenceMembers(project.id),
+        });
+        hub.broadcastProjectStatus(project.id, statuses);
+      } catch (error) {
+        log.warn("状态看板广播失败", { error, projectId: project.id });
+      }
+    }
+  };
+  const statusTimer = setInterval(statusPublisher, config.heartbeat.intervalMs);
+  statusTimer.unref();
+
   try {
     await new Promise<void>((resolve, reject) => {
       const onError = (error: NodeJS.ErrnoException) => {
@@ -253,6 +278,14 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     database: db,
     migrationState,
     broadcast: (event) => hub.broadcast(event),
+    broadcastStatus: (projectId) => {
+      const statuses = buildStatusBoard(statusRepos, projectId, {
+        heartbeat: config.heartbeat,
+        now: new Date(),
+        humanOnlineMemberIds: hub.humanPresenceMembers(projectId),
+      });
+      hub.broadcastProjectStatus(projectId, statuses);
+    },
     get clientCount() {
       return hub.clientCount;
     },
@@ -264,6 +297,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
       return mcpHandler.pendingWaitCount;
     },
     async close() {
+      clearInterval(statusTimer);
       await mcpHandler.close();
       await hub.close();
       // 先在途的连接一并断开：Streamable HTTP 的 SSE 响应会持续保持连接，

@@ -1,10 +1,12 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type Database from "better-sqlite3";
+import type { HeartbeatConfig } from "./config.ts";
 import { RepositoryError } from "./db/errors.ts";
 import { createRepositories, type RepositorySet } from "./db/repositories.ts";
-import type { Group, Member, Message as DbMessage, Project } from "./db/types.ts";
+import type { Group, Member, McpSession, Message as DbMessage, Project } from "./db/types.ts";
 import type { Logger } from "./logger.ts";
 import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "./chat/routing.ts";
+import { deriveEffectiveStatus } from "./status.ts";
 
 /**
  * T1（#14）项目 / 群组 / 成员 HTTP API。
@@ -30,6 +32,10 @@ export interface T1ApiOptions {
    * 广播范围（阶段 1）＝ 人在 WebUI 的视角（可见全部群组消息）。
    */
   readonly onMessage?: (message: MessageView) => void;
+  /** D4 心跳配置；用于把连接层心跳时间推导为有效状态（T4）。默认 10s/30s。 */
+  readonly heartbeat?: HeartbeatConfig;
+  /** 服务端时钟；供测试注入 fake timers。默认 `() => new Date()`。 */
+  readonly now?: () => Date;
 }
 
 export interface T1ApiRouter {
@@ -70,6 +76,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   const { db, logger } = options;
   const repos = createRepositories(db);
   const log = logger.child({ component: "api" });
+  const heartbeat: HeartbeatConfig = options.heartbeat ?? { intervalMs: 10_000, timeoutMs: 30_000 };
+  const now = options.now ?? (() => new Date());
 
   return {
     async handle(request, response, pathname) {
@@ -483,37 +491,57 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   }
 
   /**
-   * 成员在线/连接视图（T2）。
+   * 成员在线/连接视图（T2 建立，T4 扩展为「有效状态」）。
    *
-   * 把分开建模的两层合并成一个**只读展示**视图：
+   * 把分开建模的两层合并成一个**只读展示**视图（D1）：
    * - `connection`：全局 MCP 会话连接状态（connected / disconnected / none），来自 mcp_sessions；
-   * - `state`：项目成员运行状态（online/offline/waiting/working），来自 member_statuses；
-   * - `lastHeartbeatAt`：最后一次心跳时间（连接层）。
-   * 两者始终分开存储；这里只是展示层拼接，不写回、不互相推导。
+   * - `state`：项目成员运行状态（online/offline/waiting/working），由
+   *   {@link deriveEffectiveStatus} 结合心跳超时（D4）推导；
+   * - `lastHeartbeatAt`：最后一次心跳时间（连接层），供前端本地判定陈旧/心跳超时。
+   * 两层始终分开存储；这里只是展示层推导，不写回、不互相落库。
    */
   function memberStatusView(r: RepositorySet, projectId: string, memberId: string) {
     const member = r.members.get(memberId);
     const status = r.statuses.get(projectId, memberId);
-    const session = r.mcpSessions
-      .listByProject(projectId)
-      .filter((s) => s.memberId === memberId)
-      .sort((a, b) => (a.connectedAt < b.connectedAt ? 1 : -1))[0];
-    let connection: "connected" | "disconnected" | "none" = "none";
-    if (session) connection = session.state === "connected" ? "connected" : "disconnected";
+    const session = latestSession(r, projectId, memberId);
+    const effective = deriveEffectiveStatus({
+      projectId,
+      memberId,
+      kind: member?.kind ?? "agent",
+      displayName: member?.displayName ?? "",
+      storedState: status?.state ?? null,
+      session,
+      heartbeat,
+      now: now(),
+    });
     return {
       memberId,
       projectId,
       displayName: member?.displayName ?? null,
       kind: member?.kind ?? null,
       agentId: member?.agentId ?? null,
-      hostType: session?.hostType ?? null,
-      connection,
-      state: status?.state ?? null,
-      lastHeartbeatAt: session?.lastHeartbeatAt ?? null,
-      connectedAt: session?.connectedAt ?? null,
-      disconnectedAt: session?.disconnectedAt ?? null,
+      hostType: effective.hostType,
+      connection: effective.connection,
+      state: effective.state,
+      stale: effective.stale,
+      disconnected: effective.disconnected,
+      heartbeatTimedOut: effective.heartbeatTimedOut,
+      heartbeatStale: effective.heartbeatStale,
+      lastHeartbeatAt: effective.lastHeartbeatAt,
+      connectedAt: effective.connectedAt,
+      disconnectedAt: effective.disconnectedAt,
       updatedAt: status?.updatedAt ?? session?.updatedAt ?? null,
     };
+  }
+
+  /** 某成员最近一次 MCP 会话（含已断开历史）。 */
+  function latestSession(r: RepositorySet, projectId: string, memberId: string): McpSession | null {
+    let best: McpSession | null = null;
+    for (const s of r.mcpSessions.listByProject(projectId)) {
+      if (s.memberId !== memberId) continue;
+      if (best === null || `${s.connectedAt}|${s.updatedAt}` > `${best.connectedAt}|${best.updatedAt}`) best = s;
+    }
+    return best;
   }
 
   // -------------------------------------------------------------------------

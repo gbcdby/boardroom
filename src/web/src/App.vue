@@ -5,6 +5,7 @@ const navigation = [
   { to: "/", label: "概览" },
   { to: "/projects", label: "项目与群组" },
   { to: "/chat", label: "群聊" },
+  { to: "/status", label: "状态看板" },
   { to: "/settings", label: "设置" },
 ];
 </script>

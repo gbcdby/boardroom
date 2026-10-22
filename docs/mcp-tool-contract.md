@@ -259,7 +259,6 @@ T2 已把上述**内存 `McpStore` 替换为 F2 的 SQLite 持久化**（`src/se
 
 详见 `docs/t2-mcp-join-and-online.md`。
 
-
 ## 8. T3（#16）落地补充
 
 T3 在**不改工具名/错误码**的前提下落地消息路由与可见性（详见 `docs/t3-chat-and-routing.md`）：
@@ -272,3 +271,18 @@ T3 在**不改工具名/错误码**的前提下落地消息路由与可见性（
 - `read_history` / `wait_for_messages` 的可见范围按上述规则（manager/人范围更宽）。
 - 人侧另有 HTTP `POST/GET /api/groups/:id/messages` 与 WebSocket `{ type:"message", message }` 广播，
   供 WebUI 群聊；这是 HTTP/WS 边界，不改变 MCP 工具契约。
+
+## 9. T4（#17）落地补充
+
+T4 **不新增/不改名/不改错误码**任何工具（`report_status` 仍为 waiting/working 上报），只补齐状态语义与看板：
+
+- **waiting/working 的等待循环对应**：进入 `wait_for_messages`（真正挂起）→ 成员状态写 `waiting`；
+  等待返回（message/timeout/cancelled，或立即拿到积压）→ 写 `working`（已进入处理）。
+  与 `report_status` 并存：宿主可在处理结束后再 `report_status("waiting")` 回到等待态。
+- **心跳/超时判定**：连接存活 = `mcp_sessions.state=connected` 且 `last_heartbeat_at` 距 now ≤ timeoutMs（D4 默认 30s）。
+  超时后状态端点显示 `offline` + 陈旧；刷新心跳（任意工具调用 / `heartbeat`）后恢复。
+- **WebUI 状态看板**：`/status` 页面经 `/ws` 接收 `status_update`（项目作用域快照），并发送 `presence` 声明人的在线；
+  人只显示 online/offline，agent 显示 online/offline/waiting/working 及断线/陈旧提示。看板不向未参与项目泄漏数据。
+- 状态视图新增字段 `stale / disconnected / heartbeatTimedOut / heartbeatStale / lastHeartbeatAt`（HTTP 端点与 WS 事件一致）。
+
+详见 `docs/t4-status-and-heartbeat.md`。

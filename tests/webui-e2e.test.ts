@@ -98,6 +98,13 @@ test("构建产物包含项目/群组页面关键 UI 文本（自行构建到临
     assert.ok(bundle.includes("/api/projects"), "构建产物应调用 /api/projects");
     assert.ok(bundle.includes("member-statuses"), "构建产物应调用成员状态端点");
     assert.ok(bundle.includes("/messages"), "构建产物应调用群组消息端点");
+
+    // T4 状态看板：页面文案与 WS 事件名/在线离线关键词确实打包进产物。
+    for (const marker of ["状态看板", "等待中", "工作中", "在线", "离线", "断线", "心跳超时"]) {
+      assert.ok(bundle.includes(marker), `构建产物应包含状态看板文案「${marker}」`);
+    }
+    assert.ok(bundle.includes("status_update"), "构建产物应含 status_update 实时事件名");
+    assert.ok(bundle.includes("presence"), "构建产物应含 presence 在线声明");
   });
 });
 

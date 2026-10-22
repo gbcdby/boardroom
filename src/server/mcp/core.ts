@@ -346,6 +346,35 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     return roster;
   }
 
+  /**
+   * 等待循环 ↔ waiting/working 的对应（T4 / AGENT-04）。
+   *
+   * 子 spec 要求 waiting/working「由该成员在当前项目的显式状态信号驱动」。两类显式信号：
+   * 1. 宿主主动调用 `report_status`（当前 T2 已有契约，保留不变）；
+   * 2. 宿主处于 `wait_for_messages` 等待循环：开始等待 = 显式「我在等」→ waiting；
+   *    等待返回（拿到消息 / 超时 / 取消）= 已离开等待、进入下一轮处理 → working。
+   *
+   * 这里只在**运行时**把等待循环映射为成员运行状态写入 member_statuses；不推断终端画面
+   * （STATUS-02），不改连接状态（D1）。持久的 status 仍只是 waiting/working/online/offline。
+   * 若宿主在等待中从未进入等待循环（如已结束本轮），则不会触发 waiting——符合
+   * 「不承诺唤醒空闲宿主」的边界。
+   */
+  function markWaiting(binding: SessionBinding): void {
+    try {
+      repos.statuses.set(binding.projectId, binding.memberId, "waiting");
+    } catch (error) {
+      log.warn("status_waiting_write_failed", { error, memberId: binding.memberId });
+    }
+  }
+
+  function markWorking(binding: SessionBinding): void {
+    try {
+      repos.statuses.set(binding.projectId, binding.memberId, "working");
+    } catch (error) {
+      log.warn("status_working_write_failed", { error, memberId: binding.memberId });
+    }
+  }
+
   /** 某成员对该消息的可见性（T3 路由规则：普通=自己发送+被@；manager=全部；人=全部）。 */
   function isVisibleTo(binding: SessionBinding, message: DbMessage): boolean {
     if (message.groupId !== binding.groupId) return false;
@@ -417,6 +446,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     const idx = pendingWaits.indexOf(entry);
     if (idx >= 0) pendingWaits.splice(idx, 1);
     waitingMembers.delete(entry.memberId);
+    // 结束等待 = 离开等待循环、进入下一轮处理 → working（T4/AGENT-04）。
+    const binding = bindingByMember(entry.memberId);
+    if (binding) markWorking(binding);
     entry.settled();
     entry.resolve(result);
   }
@@ -540,6 +572,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       const backlog = deliverableSince(binding, afterSeq);
       if (backlog.length > 0) {
         const delivered = markDelivered(binding, backlog);
+        // 立即拿到积压：不在等待循环中停留，跳过 waiting 直接进入 working（处理收到的消息）。
+        markWorking(binding);
         log.debug("wait_drained_backlog", { memberId: binding.memberId, count: delivered.messages.length });
         return {
           ok: true,
@@ -551,6 +585,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       }
 
       waitingMembers.add(binding.memberId);
+      // 进入等待循环 = 显式「在等待」→ waiting（T4/AGENT-04）。
+      markWaiting(binding);
       return await new Promise<WaitResult>((resolve) => {
         const entry: PendingWait = {
           ownerKey: memberKey,
