@@ -30,6 +30,13 @@ export interface McpSessionsHandler {
   readonly sessionCount: number;
   /** 当前挂起中的等待调用数（测试与观测）。 */
   readonly pendingWaitCount: number;
+  /**
+   * T8（#21）修复：人经 HTTP 发送消息后，唤醒 HTTP 会话中在该群组等待、且被该消息
+   * 路由 `wake` 的成员。MCP `send_message` 走 core 内部跨 core 唤醒；人的消息走 HTTP API
+   * 不经过任何 core，需要显式触发本群组的挂起等待结算，否则等待方只能等超时或下次 wait
+   * 才拿到积压（不符合 NFR-03 定向消息及时送达）。`wakeGate` 为该消息的 wake 成员集合。
+   */
+  wakeGroup(groupId: string, wakeGate?: ReadonlySet<string>): void;
   /** 关闭所有 HTTP 会话与挂起等待。幂等。 */
   close(): Promise<void>;
 }
@@ -152,6 +159,13 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
       let total = 0;
       for (const session of sessions.values()) total += session.core.pendingWaitCount;
       return total;
+    },
+
+    wakeGroup(groupId, wakeGate) {
+      // 遍历所有 HTTP 会话（每个会话一个 core），只唤醒在该群组等待且被放行的成员。
+      for (const session of sessions.values()) {
+        session.core.resolveGroup(groupId, wakeGate);
+      }
     },
 
     async close() {

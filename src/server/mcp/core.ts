@@ -322,6 +322,12 @@ export interface McpCore {
   attemptInterrupt(sessionId: string, params?: InterruptParams): InterruptAttempt;
   heartbeat(sessionId: string): HeartbeatResult;
   readHistory(sessionId: string, params: ReadHistoryParams): ReadHistoryResult;
+  /**
+   * T8（#21）：唤醒本 core 中在该群组等待、且属于 `wakeGate` 放行集合的成员。
+   * 供人的 HTTP 消息路径显式触发（该路径不经过任何 core 的 send_message，因此需外部调用）。
+   * `wakeGate` 为 undefined 表示不额外限流。
+   */
+  resolveGroup(groupId: string, wakeGate?: ReadonlySet<string>): void;
   /** 当前挂起等待数（测试与观测用）。 */
   readonly pendingWaitCount: number;
   /** 某个会话是否已入群（测试用）。 */
@@ -587,7 +593,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 唤醒判定用 chat/routing 的 wake 集合（普通 agent 只被 @、manager 被其他成员消息、
    * 发送者排除）。可见但非唤醒的消息（例如普通 agent 自己发的）不会触发等待方返回。
    */
-  function resolveGroup(groupId: string, wakeGate?: ReadonlySet<string>): void {
+  function resolveGroupInternal(groupId: string, wakeGate?: ReadonlySet<string>): void {
     const roster = buildRoster(groupId);
     for (const entry of [...pendingWaits]) {
       const binding = bindingByMember(entry.memberId);
@@ -1040,6 +1046,11 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       return bindings.has(selfKey(sessionId));
     },
 
+    // T8（#21）：把内部的 resolveGroup 暴露给 HTTP 消息路径跨 core 唤醒。
+    resolveGroup(groupId, wakeGate) {
+      resolveGroupInternal(groupId, wakeGate);
+    },
+
     close() {
       if (closed) return;
       closed = true;
@@ -1073,7 +1084,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     },
   };
 
-  const registration: CoreInternals = { core, resolveGroup };
+  const registration: CoreInternals = { core, resolveGroup: resolveGroupInternal };
   activeRegistrations.add(registration);
 
   return core;
