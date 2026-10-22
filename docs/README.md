@@ -10,6 +10,8 @@ docs/
 ├── architecture/
 │   ├── agent-studio.md       # 产品宏观架构、范围与验收基线
 │   └── data-model.md         # 持久化数据模型、ID 方案、迁移与事务
+├── mcp-tool-contract.md      # 阶段 1 MCP 工具契约（F3）
+├── t1-project-group-api.md   # T1 项目/群组/成员 HTTP API 与 WebUI 页面
 └── archive/                  # 已取代或废弃的架构文档（按需创建）
 ```
 
