@@ -79,7 +79,10 @@ CHAT-05（不丢消息）由持久化队列保证；「打断」不作为可靠�
 - **T4（状态）**：`attemptInterrupt` 不改等待循环映射；打断后 `targetStatus` 恒为 `working`，
   不伪造 `waiting`。idle（不在忙碌轮次）时只记录尝试，不改状态。
 - **T5（重连积压 / 至少一次）**：本票复用 `message_deliveries` 的 `pending/delivered/acked` 语义。
-  acked 前同一消息**可重复读取**（至少一次），靠 `acknowledge_message` 去重；T6 不新增重连策略，
+  acked 前同一消息**可重复读取**（至少一次），靠 `acknowledge_message` 去重。T5 合并后
+  `repositories.deliveries.listPending` 的语义为 `status <> 'acked'`（含已投递未确认的 `delivered`），
+  因此 `InterruptAttempt.queuedMessageCount` = **未 ack 的消息数**（不只是 `pending`），这与
+  「至少一次、不丢消息」一致，T6 采用该语义。T6 不新增重连策略，
   也不改 T5 的补投游标（`afterCursor`）。测试固定了「未 ack 可重读、ack 后不再投递」。
 - **T7（防环/限流）**：本票不实现限流阈值；`attemptInterrupt` 与普通工具一样刷新会话心跳，
   限流由 T7 在工具层统一处理。
