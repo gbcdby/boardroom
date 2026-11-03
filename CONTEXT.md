@@ -33,7 +33,8 @@
 | Claude Code | 2.1.233 | **不能打断在途工具调用**：等待期间注入用户消息，不会取消正在执行的工具。 | `--input-format stream-json` 注入消息后 12s，`wait_for_messages` 仍 pending。 | 2026-10-21 |
 | Claude Code | 2.1.233 | 重连：宿主不保留跨会话 MCP 状态；积压需服务端持久化，重连后首次等待立即补投。 | 进程退出→服务端留存→新会话 `initialize`→`drained_backlog: true`。 | 2026-10-21 |
 | Codex CLI | 0.163.0 | 传输：仅 stdio 与 Streamable HTTP（`codex mcp add -- <cmd>` / `--url`）；**不支持 SSE**。 | 两种传输均完成 `initialize` + `tools/list`；HTTP 会话结束发 `DELETE` 优雅关闭。 | 2026-10-21 |
-| Codex CLI | 0.163.0 | 等待/打断/重连语义**未验证**：本机模型后端配额耗尽，无法发起带工具调用的轮次。 | 仅证实 MCP 传输层；`codex exec` 返回 usage limit。 | 2026-10-21 |
+| Codex CLI | 0.166.0 | 等待：`wait_for_messages` 挂起后可被服务端投递结束、同一轮继续；重连靠服务端持久化、重连首等待补投；**不能打断在途工具**（`unsupported`）；不支持 SSE。 | Streamable HTTP 真实接入：join 成功；等待中 `state=waiting` 后收到人消息（`drainedBacklog:false`）；agent↔agent 双向 @；服务端重启后重连 `drainedBacklog:true`。 | 2026-11-03 |
+| DeepSeek Harness (dsh) | 0.2.1-rc.5 | `@deepseek-ai/dsh-mcp-client` 支持 `stdio`/`streamable-http`；以 `hostType=other` 可作为宿主入群。 | Streamable HTTP 真实接入 boardroom：join 成功；等待中 `state=waiting` 后收到人消息（`drainedBacklog:false`）。 | 2026-11-03 |
 
 ## 踩坑记录
 
@@ -49,6 +50,6 @@
 
 | 假设 / 问题 | 影响 | 验证方法 | 状态 |
 | --- | --- | --- | --- |
-| Codex CLI 的等待/打断/重连行为是否与 Claude Code 一致 | 决定能否对 Codex 承诺「安全点投递」和等待循环 | Codex 配额恢复后（约 2026-10-27）重跑 `run-claude-*.mjs` 同款探针，把 `claude` 换成 `codex exec` | 待验证 |
+| Codex CLI 的等待/打断/重连行为是否与 Claude Code 一致 | 决定能否对 Codex 承诺「安全点投递」和等待循环 | Codex 配额恢复后（约 2026-10-27）重跑 | 已验证（2026-11-03，0.166.0）：等待活唤醒与重连补投与 Claude 一致；打断同为 `unsupported` |
 | Claude Code `MCP_TOOL_TIMEOUT` / `MCP_TOOL_IDLE_TIMEOUT` 的默认值 | 决定单次等待时长上限的保守取值 | 显式设置环境变量做对照实验 | 待验证 |
 | 宿主被强制杀死（非优雅退出）后的 MCP 会话回收时延 | 决定服务端会话清理超时 | 杀进程后轮询服务端会话表 | 待验证 |

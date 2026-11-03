@@ -1,18 +1,18 @@
 # 接入指南：把 Claude Code / Codex CLI 接入 Agent Studio（阶段 1）
 
-状态：已实现（T8 #21，覆盖 CONFIG-03）
-日期：2026-10-22
+状态：已实现（T8 #21，覆盖 CONFIG-03）；2026-11-03 真实双宿主补验通过
+日期：2026-10-22（初版）；2026-11-03（Codex 配额恢复后补验）
 适用：阶段 1（单项目、单群组、localhost、无认证、单用户）。
 
 > 本文是面向使用者的**接入指南**：如何启动服务、如何用 MCP 配置把 Claude Code / Codex CLI 接入、
-> 已知限制（含**不承诺即时唤醒空闲宿主**、**不能打断在途工具**、Codex 配额阻塞）、以及提示注入风险。
+> 已知限制（含**不承诺即时唤醒空闲宿主**、**不能打断在途工具**）、以及提示注入风险。
 > 工具契约细节见 `docs/mcp-tool-contract.md`；验收结论见 `docs/t8-acceptance-report.md`。
 
 ## 1. 先决条件
 
 - Node.js **>= 24**（`package.json` engines）。
 - macOS 为首要开发/验收环境（NFR-07）。
-- Claude Code（实测 2.1.233）、Codex CLI（实测 0.163.0）已安装并在 PATH 中。
+- Claude Code（实测 2.1.233）、Codex CLI（实测 0.166.0）已安装并在 PATH 中。
 
 ## 2. 启动服务
 
@@ -91,19 +91,21 @@ claude mcp list          # 期望：agent-studio ... ✔ Connected
   "projectId": "<项目ID>", "groupId": "<群组ID>", "role": "normal" }
 ```
 
-### 4.2 Codex CLI（stdio，配置可用；工具轮次受配额阻塞）
+### 4.2 Codex CLI（stdio / Streamable HTTP）
 
 ```bash
+# stdio
 codex mcp add agent-studio \
   --env AGENT_STUDIO_DATA_DIR=/绝对路径/到/数据目录 \
   -- node /绝对路径/src/server/mcp/stdio.ts
 
+# 或 Streamable HTTP（推荐用于需要「人 → agent 实时唤醒」的场景，见 4.3）
+codex mcp add agent-studio --url http://127.0.0.1:4317/mcp
+
 codex mcp list           # 期望：agent-studio ... Status=enabled
 ```
 
-> ⚠️ 本机实测 **Codex CLI 0.163.0 配额耗尽**（`You've hit your usage limit ... Oct 27th, 2026`），
-> `codex exec` 无法发起带工具调用的轮次。**配置登记可用，但真实工具调用/等待/打断/重连未验证**。
-> 配额恢复后应补测（见 §6）。
+> 2026-11-03 复核：Codex CLI 0.166.0 配额已恢复，已用真实 Codex 走通 join / 等待中活唤醒 / agent↔agent 双向 @ / 重启后重连补积压（`drainedBacklog` 正常）。
 
 ### 4.3 Streamable HTTP（可选，两端都支持）
 
@@ -119,6 +121,23 @@ codex mcp add agent-studio --url http://127.0.0.1:4317/mcp
 
 HTTP 模式每次会话独立 `Mcp-Session-Id`；Codex 结束会 `DELETE`、Claude 不发（服务端按
 `MCP_SESSION_IDLE_TIMEOUT_MS` 默认 5 分钟回收悬挂会话）。**不要依赖 SSE**。
+
+### 4.4 DeepSeek Harness（dsh，hostType=other，附加/未在原始 spec 范围）
+
+阶段 1 spec 只约定 Claude Code 与 Codex CLI 两个宿主；DSH 属附加验证。DSH 自带 `@deepseek-ai/dsh-mcp-client`，可用 `streamable-http` 接入 boardroom。在其 profile 的 patch 层加入：
+
+```yaml
+- insert:
+    - id: boardroom-mcp
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: boardroom
+        transport: streamable-http
+        url: http://127.0.0.1:4317/mcp
+        failOnStartupError: true
+```
+
+然后让 agent 调 `mcp__boardroom__join`（`hostType:"other"`）。2026-11-03 实测 dsh 0.2.1-rc.5 可真实 join + 等待中活唤醒。证据：`.agent-output/real-host-retest/`。
 
 ## 5. Agent 的等待循环（关键）
 
@@ -140,13 +159,11 @@ MCP **没有服务端→客户端主动推送**。agent 能收到消息的唯一
 
 1. **不承诺即时唤醒空闲宿主**：只有 agent 正处在一个 `wait_for_messages` 工具调用里时，服务端才能结束等待并让它拿到消息。
    已结束当前轮、未等待的宿主无法被服务端唤醒。
-2. **打断是尽力而为，不能打断正在执行的工具调用**：D6 实测 Claude Code 在等待中注入新消息后 12s 仍挂起；
-   Codex 未验证。服务端对忙碌 agent 的语义是「**不阻塞 + 消息不丢 + 下一安全点（下次 wait）投递**」，
-   `attemptInterrupt` 结果可观察（`accepted/rejected/unsupported`，Claude Code 实测 `unsupported`）。
+2. **打断是尽力而为，不能打断正在执行的工具调用**：D6 实测 Claude Code 在等待中注入新消息后 12s 仍挂起，Codex 同为 `unsupported`。服务端对忙碌 agent 的语义是「**不阻塞 + 消息不丢 + 下一安全点（下次 wait）投递**」，
+   `attemptInterrupt` 结果可观察（`accepted/rejected/unsupported`，两个宿主实测 `unsupported`）。
 3. **无 wrapper、不要求自动入群**：agent 必须显式调用 `join` 入群；没有包装进程、没有自动拉群。
 4. **不承诺 exactly-once**：至少一次投递，重复消息由稳定 `messageId` 去重。
-5. **Codex 配额阻塞（本机）**：Codex CLI 0.163.0 的模型后端配额耗尽（到 2026-10-27），
-   真实工具轮次无法发起，等待/打断/重连对 Codex 为**未验证**。
+5. **Codex 配额阻塞（历史，已解除）**：曾因 Codex CLI 0.163.0 配额耗尽（至 2026-10-27）无法发起工具轮次；2026-11-03 复核 0.166.0 已恢复，真实 join/等待/重连均实测通过。
 6. **单项目 / 单群组 / 多项目隔离**：数据按 project/group 作用域建模，但多项目隔离验收属阶段 2。
 7. **防环计数为进程内内存**：进程重启后连续/限流计数重置（T7 取舍）。
 8. **仅 localhost、无认证**：见 §7 安全边界。
@@ -169,3 +186,4 @@ MCP **没有服务端→客户端主动推送**。agent 能收到消息的唯一
 - 端到端验收脚本：`node scripts/e2e-phase1.mjs`（真实 HTTP/MCP 服务端 + MCP SDK 客户端，覆盖 AC-CORE-01..09、11）。
 - 自动化测试：`npm test`；类型检查：`npm run typecheck`。
 - 逐项验收结论：`docs/t8-acceptance-report.md`。
+- 真实双宿主补验（Claude Code + Codex CLI 真机，2026-11-03）：`.agent-output/real-host-retest/README.md`。
