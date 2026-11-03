@@ -34,7 +34,7 @@
 | Claude Code | 2.1.233 | 重连：宿主不保留跨会话 MCP 状态；积压需服务端持久化，重连后首次等待立即补投。 | 进程退出→服务端留存→新会话 `initialize`→`drained_backlog: true`。 | 2026-10-21 |
 | Codex CLI | 0.163.0 | 传输：仅 stdio 与 Streamable HTTP（`codex mcp add -- <cmd>` / `--url`）；**不支持 SSE**。 | 两种传输均完成 `initialize` + `tools/list`；HTTP 会话结束发 `DELETE` 优雅关闭。 | 2026-10-21 |
 | Codex CLI | 0.166.0 | 等待：`wait_for_messages` 挂起后可被服务端投递结束、同一轮继续；重连靠服务端持久化、重连首等待补投；**不能打断在途工具**（`unsupported`）；不支持 SSE。 | Streamable HTTP 真实接入：join 成功；等待中 `state=waiting` 后收到人消息（`drainedBacklog:false`）；agent↔agent 双向 @；服务端重启后重连 `drainedBacklog:true`。 | 2026-11-03 |
-| DeepSeek Harness (dsh) | 0.2.1-rc.5 | `@deepseek-ai/dsh-mcp-client` 支持 `stdio`/`streamable-http`；以 `hostType=other` 可作为宿主入群。 | Streamable HTTP 真实接入 boardroom：join 成功；等待中 `state=waiting` 后收到人消息（`drainedBacklog:false`）。 | 2026-11-03 |
+| DeepSeek Harness (dsh) | 0.2.1-rc.5 | 第三个正式支持宿主（已入产品基线/主 spec）；`@deepseek-ai/dsh-mcp-client` 支持 `stdio`/`streamable-http`。当前代码以 `hostType=other` 接入，正式 `hostType="dsh"` 与宿主适配器由决策票 #43 定稿。 | Streamable HTTP 真实接入 boardroom：join 成功；等待中 `state=waiting` 后收到人消息（`drainedBacklog:false`）。 | 2026-11-03 |
 
 ## 踩坑记录
 

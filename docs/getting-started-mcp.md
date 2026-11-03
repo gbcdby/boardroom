@@ -1,18 +1,18 @@
-# 接入指南：把 Claude Code / Codex CLI 接入 Agent Studio（阶段 1）
+# 接入指南：把 Claude Code / Codex CLI / DSH 接入 Agent Studio（阶段 1）
 
-状态：已实现（T8 #21，覆盖 CONFIG-03）；2026-11-03 真实双宿主补验通过
-日期：2026-10-22（初版）；2026-11-03（Codex 配额恢复后补验）
+状态：已实现（T8 #21，覆盖 CONFIG-03）；2026-11-03 真实双宿主补验通过；DSH 列为第三个正式支持宿主
+日期：2026-10-22（初版）；2026-11-03（补验 + DSH 入范围）
 适用：阶段 1（单项目、单群组、localhost、无认证、单用户）。
 
-> 本文是面向使用者的**接入指南**：如何启动服务、如何用 MCP 配置把 Claude Code / Codex CLI 接入、
+> 本文是面向使用者的**接入指南**：如何启动服务、如何用 MCP 配置把 Claude Code / Codex CLI / DSH 接入、
 > 已知限制（含**不承诺即时唤醒空闲宿主**、**不能打断在途工具**）、以及提示注入风险。
-> 工具契约细节见 `docs/mcp-tool-contract.md`；验收结论见 `docs/t8-acceptance-report.md`。
+> 工具契约细节见 `docs/mcp-tool-contract.md`；验收结论见 `docs/t8-acceptance-report.md`；宿主适配器扩展见决策票 #43。
 
 ## 1. 先决条件
 
 - Node.js **>= 24**（`package.json` engines）。
 - macOS 为首要开发/验收环境（NFR-07）。
-- Claude Code（实测 2.1.233）、Codex CLI（实测 0.166.0）已安装并在 PATH 中。
+- 已安装并在 PATH 中：Claude Code（实测 2.1.233）、Codex CLI（实测 0.166.0）、DSH（实测 0.2.1-rc.5）。
 
 ## 2. 启动服务
 
@@ -122,9 +122,9 @@ codex mcp add agent-studio --url http://127.0.0.1:4317/mcp
 HTTP 模式每次会话独立 `Mcp-Session-Id`；Codex 结束会 `DELETE`、Claude 不发（服务端按
 `MCP_SESSION_IDLE_TIMEOUT_MS` 默认 5 分钟回收悬挂会话）。**不要依赖 SSE**。
 
-### 4.4 DeepSeek Harness（dsh，hostType=other，附加/未在原始 spec 范围）
+### 4.4 DeepSeek Harness（dsh，第三个正式支持宿主）
 
-阶段 1 spec 只约定 Claude Code 与 Codex CLI 两个宿主；DSH 属附加验证。DSH 自带 `@deepseek-ai/dsh-mcp-client`，可用 `streamable-http` 接入 boardroom。在其 profile 的 patch 层加入：
+DSH 是第三个正式支持宿主（产品基线 §1/§5.1 已列入；宿主适配器与 `hostType` 标识由决策票 #43 定稿）。DSH 自带 `@deepseek-ai/dsh-mcp-client`，可用 `streamable-http` 接入 boardroom。在其 profile 的 patch 层加入：
 
 ```yaml
 - insert:
@@ -137,7 +137,7 @@ HTTP 模式每次会话独立 `Mcp-Session-Id`；Codex 结束会 `DELETE`、Clau
         failOnStartupError: true
 ```
 
-然后让 agent 调 `mcp__boardroom__join`（`hostType:"other"`）。2026-11-03 实测 dsh 0.2.1-rc.5 可真实 join + 等待中活唤醒。证据：`.agent-output/real-host-retest/`。
+然后让 agent 调 `mcp__boardroom__join`（`hostType:"dsh"`；当前代码尚未加该枚举，暂用 `"other"` 接入，正式标识与校验随决策票 #43 落地）。2026-11-03 实测 dsh 0.2.1-rc.5 可真实 join + 等待中活唤醒。证据：`.agent-output/real-host-retest/`。
 
 ## 5. Agent 的等待循环（关键）
 

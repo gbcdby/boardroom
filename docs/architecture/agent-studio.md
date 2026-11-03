@@ -11,20 +11,20 @@
 
 ## 1. 摘要
 
-Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Codex CLI 等 coding agent 通过 MCP 作为独立成员加入项目；人在 WebUI 中参与群聊、查看状态、设定组织架构、管理任务和记忆。
+Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Codex CLI、DeepSeek Harness（DSH）等 coding agent 通过 MCP 作为独立成员加入项目；人在 WebUI 中参与群聊、查看状态、设定组织架构、管理任务和记忆。
 
-首版覆盖：Claude Code + Codex CLI、多项目/多群组、项目级组织与任务板、双轴代码评审、三层记忆、本地 WebUI 与持久化。平台不托管模型推理，不包装 agent 启动；每个 agent 保留自己的会话与上下文。
+首版覆盖：Claude Code + Codex CLI + DSH（三个正式支持宿主；新增宿主按「宿主适配器」方式扩展，见 §10.2 / 决策票 #43）、多项目/多群组、项目级组织与任务板、双轴代码评审、三层记忆、本地 WebUI 与持久化。平台不托管模型推理，不包装 agent 启动；每个 agent 保留自己的会话与上下文。
 
 目标是让 agent 保留身份与上下文协作，让人参与决策，并通过组织、任务板、评审和记忆让工作可分配、可追踪、可验收。
 
 ## 2. 成功标准（V1）
 
-- 人 + 两个真实 agent 完成加入项目、@ 收发、等待、断线重连、任务分配、评审和记忆更新的端到端场景。
+- 人 + 多个（≥2）真实 agent 完成加入项目、@ 收发、等待、断线重连、任务分配、评审和记忆更新的端到端场景。
 - 顶层 manager 能看到项目内所有群组并被其他成员的消息唤醒；普通 agent 只收到允许的消息。
 - 任务状态流转和双轴评审可在真实任务上完成，报告可追溯。
 - 重启后消息、任务、组织、记忆不丢失。
 - 项目、群组、记忆作用域之间的隔离符合本文件。
-- 两个宿主的实际等待/打断能力有记录，不把未验证能力写成承诺。
+- 各正式宿主（Claude Code / Codex CLI / DSH）的实际等待/打断能力有记录，不把未验证能力写成承诺。
 
 ## 3. 用户与角色
 
@@ -84,7 +84,7 @@ Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Code
 
 ### 5.1 首版包含
 
-- 两个真实宿主：Claude Code、Codex CLI。
+- 三个正式支持宿主：Claude Code、Codex CLI、DeepSeek Harness（DSH）。各宿主通过统一的 MCP 工具契约接入；宿主差异收敛为「宿主适配器描述符」（能力默认值、支持的传输、接入配置模板、实测证据），见 §10.2 与决策票 #43。
 - MCP 入群；不要求 wrapper；不要求自动入群。
 - 多项目、多群组；项目与群组生命周期。
 - 项目级多层组织树、角色、manager、权限和最小审计。
@@ -220,7 +220,7 @@ Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Code
 
 - **CONFIG-01**：Node.js LTS + TypeScript；SQLite；WebSocket；MCP server；Vue 3 WebUI。
 - **CONFIG-02**：仅绑定 localhost，无认证；不暴露公网。
-- **CONFIG-03**：提供 MCP 配置示例与 Claude Code / Codex CLI 接入说明。
+- **CONFIG-03**：提供 MCP 配置示例与 Claude Code / Codex CLI / DSH 接入说明；每个正式宿主有一条适配器描述符记录其传输与已知限制（见决策票 #43）。
 - **CONFIG-04**：配置项包括 MCP 端点、端口、数据目录、N、记忆限制、心跳间隔/超时。
 - **CONFIG-05**：结构化日志和关键操作审计；不记录敏感内容。
 
@@ -233,7 +233,7 @@ Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Code
 - **NFR-05 安全边界**：仅 localhost；文件权限保护 SQLite 与配置；日志不泄露密钥；接入文档说明提示注入风险。
 - **NFR-06 可观测性**：结构化日志；manager/人的关键变更进入审计。
 - **NFR-07 兼容性**：macOS 为首要开发和验收环境；Linux 可选验证；Node LTS。
-- **NFR-08 可测试性**：消息路由、mention 规则、权限、任务状态机、记忆作用域、项目隔离必须有自动化测试；双宿主接入需集成验证记录。
+- **NFR-08 可测试性**：消息路由、mention 规则、权限、任务状态机、记忆作用域、项目隔离必须有自动化测试；各宿主接入需集成验证记录。
 - **NFR-09 失败处理**：SQLite 写入失败、host 断线、MCP 超时、无效 fixed point 要有明确错误与可恢复路径。
 - **NFR-10 防止循环**：manager 被其他成员的消息唤醒 + agent 互相 @ 必须限流/防环，阈值设计阶段确定。
 
@@ -254,6 +254,8 @@ Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Code
 - [ ] **AC-CORE-09**：连续对话不会无限自触发；manager 不唤醒自己。
 - [ ] **AC-CORE-10**：记录并文档化两个宿主的实际等待/打断能力，包括无法即时唤醒空闲宿主。
 - [ ] **AC-CORE-11**：完整走通「人 + 2 agent」的双向 @ 收发、等待、断线重连。
+
+> 注：AC-CORE-02/05/10/11 的「双宿主」指阶段 1 当时交付的 Claude Code + Codex CLI。**DSH 已在阶段 1 之后列为第三个正式支持宿主**（见 §1/§5.1），并以真实宿主完成 join / 等待活唤醒 / 重连补投（验收证据见 `docs/t8-acceptance-report.md` §6）；其接入架构由决策票 #43 统一。
 
 ### 8.2 阶段 2：项目/群组/组织
 
@@ -326,6 +328,7 @@ Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Code
 
 ### 10.2 待定设计项
 
+- 宿主适配器架构：把 `HostType` 校验、能力默认表、支持传输、接入配置模板与实测证据从分散的硬编码收敛为**声明式宿主描述符注册表**，使新增 harness 成为「加一条描述符 + 填实测证据」的扩展（见决策票 #43；DSH 已作为第三个正式宿主入范围，其代码层 `hostType` 落地随该票结论执行）。
 - 自动总结的 N 默认值、心跳间隔/超时、记忆大小与注入截断。
 - 会话结束的判定方式（宿主事件、超时或显式信号）。
 - 成员运行状态的作用域（全局 agent 或项目成员），以及 Agent 连接状态与 Status 的边界。
