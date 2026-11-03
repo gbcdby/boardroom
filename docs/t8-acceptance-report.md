@@ -123,5 +123,5 @@
 | @all | 两宿主同时等待 | `wakeMemberIds` 覆盖两者、同一 messageId、均 `drainedBacklog:false` |
 | 重启后重连补积压 | Claude Code / Codex CLI | 重启前排队消息，重连首等待 `drainedBacklog:true`、messageId 一致 |
 
-- 附加（超出原始 spec 宿主范围）：DeepSeek Harness（dsh 0.2.1-rc.5）以 `hostType=other` 也完成真实 join + 等待活唤醒（`drainedBacklog:false`）；记录于证据索引，作为可行性参考，不变更阶段 1 spec 的宿主范围。
+- DeepSeek Harness（DSH，dsh 0.2.1-rc.5）：已列为**第三个正式支持宿主**（产品基线 §1/§5.1、主 spec #1）；本次以 `hostType=other` 完成真实 join + 等待活唤醒（`drainedBacklog:false`）。其正式 `hostType` 标识与宿主适配器落地由决策票 #43 定稿。
 - 证据索引与复现：`.agent-output/real-host-retest/README.md`。
