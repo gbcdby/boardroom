@@ -46,7 +46,7 @@
 
 | 方法 | 路径 | 入参（JSON 体） | 成功响应 | 说明 |
 | --- | --- | --- | --- | --- |
-| `POST` | `/api/projects` | `{ name: string }` | `201 { project }` | 创建项目；**manager 可留空**，返回 `manager: null`。名称不要求唯一。PROJECT-02 的「创建时指定」在**同一创建流程内**由 `PUT /manager` 完成——项目成员必须先于岗位存在，创建请求里没有可引用的成员。 |
+| `POST` | `/api/projects` | `{ name: string, managerAgentId?: string }` | `201 { project }` | 创建项目。名称不要求唯一。**PROJECT-02 两种给法**：带 `managerAgentId`（必须由 MCP 入群产生过的全局 agent）= 创建时指定，服务端在同一事务内为该 agent 建本项目的 manager 岗位；省略 = 留空待分配（`manager: null`），稍后用 `PUT /manager` 指定。agent 不存在 → `400 invalid_reference`，且**不会留下半个项目**。 |
 | `GET` | `/api/projects` | — | `200 { projects: Project[] }` | 列出项目（缺省不含已归档）。人/顶层 manager 的跨项目清单；绑定在某项目的主体只看得到该项目（#48 行级收窄）。 |
 | `GET` | `/api/projects/:id` | — | `200 { project }` | 单个项目（含 `manager`）。 |
 | `POST` | `/api/projects/:id/members` | `{ kind: "human"\|"agent", displayName: string, agentId?: string, role?: "manager"\|"normal" }` | `201 { member }` | 添加项目成员。`kind=human` 不绑 agent；`kind=agent` 需已存在的 `agentId`（T2 产生）。缺省 `role=normal`。 |
@@ -82,6 +82,8 @@ Group   = { id, projectId, name, createdAt, updatedAt, archivedAt: string|null }
   API 的 `PUT /manager` 支持**更换**：已有 manager 时在事务内先降旧、再升新（顺序保证任一时刻不出现两个 manager），
   因此正常「更换 manager」返回 200，不触发 409。
 - **GROUP-02 参与者只能来自项目成员**：由 repository 的 `groups.create` / `addParticipant` 校验。
+- **归档群组不再接受新参与者**（#48）：`groups.addParticipant` 同样受归档写规则约束，
+  因此 MCP 的 `join` 指向已归档群组时返回 `CONFLICT`（错误信息含「归档」），恢复后照常可加入。
 - 阶段 1 只验收一个项目/一个群组，但数据按 project/group 作用域建模，便于阶段 2 扩展。
 
 ### 1.5 生命周期与隔离（#48）
@@ -91,7 +93,8 @@ Group   = { id, projectId, name, createdAt, updatedAt, archivedAt: string|null }
 - 实现：`projects.archived_at` / `groups.archived_at`（迁移 v3，`NULL` = 未归档）；恢复只把该列置回 `NULL`。
 - 列表默认只返回未归档对象，`?includeArchived=true` 连归档一起返回；归档对象仍可按 ID 定位与读取历史。
 - **写路径在 repository 这一唯一写入边界拒绝**（HTTP 与 MCP 共享同一规则）：
-  归档项目内不能建群组/加成员/改成员；归档群组或其项目归档时不能发消息。错误码 `archived`（409）。
+  归档项目内不能建群组/加成员/改成员；归档群组或其项目归档时不能发消息、也不能再加入参与者。
+  错误码 `archived`（409，MCP 侧归一为 `CONFLICT`）。
 - 主体边界：`project:archive` / `group:archive` 由人（owner）与 manager 持有；
   **永久删除只有人能做**（`project:purge` / `group:purge` 不在 manager 能力集内 → 403 `forbidden`），
   顶层 manager 可归档但不能删除（LIFE-ARC-01）。
