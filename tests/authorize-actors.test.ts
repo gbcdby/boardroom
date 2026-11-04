@@ -50,7 +50,7 @@ test("未落 T2 组织树时 nodeId/subtreeNodeIds 为 null，不影响 project 
 });
 
 test("MCP 会话绑定映射为 actor：角色取成员行，缺省 normal", () => {
-  const binding = { memberId: "m5", projectId: "p1", kind: "agent" as const, role: undefined };
+  const binding = { memberId: "m5", projectId: "p1", kind: "agent" as const };
   assert.equal(actorForSession(binding).role, "member");
   assert.equal(actorForSession({ ...binding, role: "manager" }).role, "top_manager");
 });

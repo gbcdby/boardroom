@@ -78,6 +78,12 @@ export interface GuardScope {
    * 子树可见性/建群范围判定用（ORG-03 / #32）。
    */
   readonly groupMemberNodeIds?: readonly (string | null)[];
+  /**
+   * 连接层作用域（#37 强制点）：这条连接被允许触碰的项目/群组。
+   * 越出即拒绝，与角色能力无关——阶段 1 一个 MCP 会话只绑定一个群组，
+   * 阶段 2 的 conn-scoped 查询同样据此收窄。
+   */
+  readonly conn?: { readonly projectId?: string; readonly groupIds?: readonly string[] };
 }
 
 /**
@@ -86,11 +92,13 @@ export interface GuardScope {
  */
 export type Capability =
   | "project:create"
+  | "project:view"
   | "project:archive"
   | "project:purge"
   | "overview:view"
   | "org:manage"
   | "member:manage"
+  | "member:view"
   | "status:view"
   | "group:create"
   | "group:archive"
@@ -117,12 +125,15 @@ type BoundaryKind = "project" | "subtree" | "participation" | "visibility" | "se
 
 const CAPABILITY_BOUNDARY: Readonly<Record<Capability, BoundaryKind>> = {
   "project:create": "project",
+  "project:view": "project",
   "project:archive": "project",
   "project:purge": "project",
   "overview:view": "project",
   "org:manage": "subtree",
   "member:manage": "subtree",
-  "status:view": "subtree",
+  "member:view": "project",
+  // 状态读数：端点级只判项目，子树/行级收窄由 T4 用 conn 范围做（见 visibleGroups 同类用法）。
+  "status:view": "project",
   "group:create": "subtree",
   "group:archive": "subtree",
   "group:purge": "project",
@@ -148,6 +159,8 @@ const CAPABILITY_BOUNDARY: Readonly<Record<Capability, BoundaryKind>> = {
 export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capability>>> = {
   owner: new Set<Capability>([
     "project:create",
+    "project:view",
+    "member:view",
     "project:archive",
     "project:purge",
     "overview:view",
@@ -168,6 +181,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
     "session:heartbeat",
   ]),
   top_manager: new Set<Capability>([
+    "project:view",
+    "member:view",
     "project:archive",
     "overview:view",
     "org:manage",
@@ -186,6 +201,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
     "session:heartbeat",
   ]),
   sub_manager: new Set<Capability>([
+    "project:view",
+    "member:view",
     "org:manage",
     "member:manage",
     "status:view",
@@ -202,7 +219,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
     "session:heartbeat",
   ]),
   member: new Set<Capability>([
-    "status:view",
+    "project:view",
     "group:view",
     "group:post",
     "message:ack",
@@ -223,6 +240,7 @@ export const DENY_CODES = [
   "not_a_member",
   "not_visible",
   "not_self",
+  "out_of_connection",
 ] as const;
 export type DenyCode = (typeof DENY_CODES)[number];
 
@@ -272,6 +290,9 @@ export function authorize(actor: Actor, capability: Capability, scope: GuardScop
     return deny("forbidden", capability, `角色 ${String(actor.role)} 没有 ${capability} 能力点。`);
   }
 
+  if (scope.conn?.groupIds && scope.groupId !== undefined && !scope.conn.groupIds.includes(scope.groupId)) {
+    return deny("out_of_connection", capability, "目标群组不在本连接的允许范围内。");
+  }
   const reach = actor.reach ?? ROLE_REACH[actor.role];
   const boundary = CAPABILITY_BOUNDARY[capability];
   if (boundary === "subtree") {
@@ -314,6 +335,8 @@ function checkSubtree(
   scope: GuardScope,
 ): AuthorizeDecision | null {
   if (reach === "project") return null;
+  // 端点级调用（没带节点/参与者数据）只校验能力点；行级范围由 connScope/visibleGroups 收窄。
+  if (scope.nodeId === undefined && scope.groupMemberIds === undefined) return null;
   // own：管辖范围就是自己所在的那一个节点。
   const subtree = reach === "own" ? (actor.nodeId === null ? null : [actor.nodeId]) : actor.subtreeNodeIds;
   if (subtree === null || subtree === undefined) {
@@ -350,6 +373,8 @@ function checkVisibility(
   scope: GuardScope,
 ): { allowed: true; decision: null } | { allowed: false; decision: AuthorizeDecision } {
   if (reach === "project") return ok();
+  // 端点级调用（未点名群组）只校验能力点，行级由 visibleGroups 收窄。
+  if (scope.groupId === undefined && scope.groupMemberIds === undefined) return ok();
   if (scope.groupMemberIds?.includes(actor.actorId)) return ok();
   const granted = ROLE_CAPABILITIES[actor.role];
   if (granted.has("group:view_subtree") && (reach === "subtree" || reach === "own")) {
@@ -392,6 +417,7 @@ const DENY_STATUS: Readonly<Record<DenyCode, number>> = {
   not_a_member: 403,
   not_visible: 403,
   not_self: 403,
+  out_of_connection: 403,
   unknown_action: 400,
 };
 

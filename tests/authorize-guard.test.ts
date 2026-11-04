@@ -239,3 +239,26 @@ test("拒绝语义：被允许时返回判定，不抛错", () => {
   const decision = authorizeOrThrow(humanOwner(), "group:create", { projectId: "p1" });
   assert.equal(decision.allowed, true);
 });
+
+// ---------------------------------------------------------------------------
+// 连接作用域（#37：强制点收敛到 conn-scoped 查询 + 服务端守卫）
+// ---------------------------------------------------------------------------
+
+test("连接作用域：会话只绑定一个群组，越出即拒绝（阶段 1 契约不变）", () => {
+  const conn = { projectId: "p1", groupIds: ["g-own"] };
+  const agent: Actor = { actorId: "m1", kind: "agent", role: "member", projectId: "p1", nodeId: null, subtreeNodeIds: null };
+  const own = authorize(agent, "group:post", { projectId: "p1", groupId: "g-own", groupMemberIds: ["m1"], conn });
+  assert.equal(own.allowed, true);
+  const other = authorize(agent, "group:post", { projectId: "p1", groupId: "g-other", groupMemberIds: ["m1"], conn });
+  assert.equal(other.allowed, false);
+  if (!other.allowed) assert.equal(other.code, "out_of_connection");
+});
+
+test("连接作用域：拒绝码 out_of_connection 映射 HTTP 403", () => {
+  const conn = { projectId: "p1", groupIds: ["g-own"] };
+  const agent: Actor = { actorId: "m1", kind: "agent", role: "member", projectId: "p1", nodeId: null, subtreeNodeIds: null };
+  assert.throws(
+    () => authorizeOrThrow(agent, "group:view", { projectId: "p1", groupId: "g-other", conn }),
+    (error: unknown) => error instanceof ForbiddenError && error.status === 403,
+  );
+});

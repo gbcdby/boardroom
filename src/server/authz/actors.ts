@@ -11,6 +11,7 @@
  */
 import type { Member, MemberKind, MemberRole } from "../db/types.ts";
 import type { Actor, Capability } from "./authorize.ts";
+export type { Actor, Capability, GuardScope } from "./authorize.ts";
 
 /** 阶段 1 无认证时人的稳定主体标识（不落 `members` 表，避免与真实成员 ID 混淆）。 */
 export const DEFAULT_HUMAN_ACTOR_ID = "human:local";
