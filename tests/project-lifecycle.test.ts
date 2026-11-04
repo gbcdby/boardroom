@@ -256,5 +256,96 @@ test("已归档群组拒绝新消息：发送返回 409 archived，同项目的�
 });
 
 // ---------------------------------------------------------------------------
-// 占位：以下循环按 TDD 逐个补入（D/E 永久删除、F 守卫、G 隔离、H 多群组）
+// 循环 D：项目永久删除 = 人二次确认 + 级联清除（PROJECT-03、LIFE-ARC-02）
+// ---------------------------------------------------------------------------
+
+/** 同一个数据目录里连续启停（验证删除是持久化的，不是进程内标记）。 */
+async function withPersistentServer<T>(
+  dir: string,
+  fn: (server: RunningServer) => Promise<T>,
+): Promise<T> {
+  const server = await startServer({
+    config: { port: 0, dataDir: dir, heartbeat: { intervalMs: 10_000, timeoutMs: 30_000 }, configFile: null },
+    logger: silentLogger,
+  });
+  try {
+    return await fn(server);
+  } finally {
+    await server.close();
+  }
+}
+
+test("项目永久删除需二次确认：首次只给级联清单与确认凭据，确认后彻底清除且不影响其他项目", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-t1purge-"));
+  let doomedId = "";
+  try {
+    await withPersistentServer(dir, async (server) => {
+      const doomed = await createProject(server, "要删掉的项目");
+      doomedId = doomed.id;
+      const other = await createProject(server, "别动的项目");
+      const dave = await addHuman(server, doomed.id, "Dave");
+      const ogave = await addHuman(server, other.id, "Oga");
+      const doomedGroup = await createGroup(server, doomed.id, "将被清除的群组", [dave.id]);
+      const otherGroup = await createGroup(server, other.id, "另一个项目的群组", [ogave.id]);
+      await call(server, "POST", `/api/groups/${doomedGroup.id}/messages`, {
+        senderMemberId: dave.id,
+        text: "第一条",
+      });
+      await call(server, "POST", `/api/groups/${otherGroup.id}/messages`, {
+        senderMemberId: ogave.id,
+        text: "别的项目的消息",
+      });
+
+      // 第一刀：没有确认凭据 → 不删，只返回级联清单与一次性凭据。
+      const first = await call(server, "DELETE", `/api/projects/${doomed.id}`);
+      assert.equal(first.status, 409, JSON.stringify(first.body));
+      assert.equal(first.body.error.code, "confirmation_required");
+      const confirmation = first.body.confirmation;
+      assert.equal(confirmation.projectId, doomed.id);
+      assert.equal(confirmation.projectName, "要删掉的项目");
+      assert.equal(typeof confirmation.token, "string");
+      assert.equal(typeof confirmation.expiresAt, "string");
+      assert.ok(confirmation.cascade.groups >= 1, "清单应包含将被清除的群组数");
+      assert.ok(confirmation.cascade.members >= 1, "清单应包含将被清除的成员数");
+      assert.ok(confirmation.cascade.messages >= 1, "清单应包含将被清除的群聊消息数");
+
+      // 未确认时数据仍在。
+      assert.equal((await call(server, "GET", `/api/projects/${doomed.id}`)).status, 200);
+
+      // 凭据不对 → 拒绝执行，不删。
+      const bad = await call(server, "DELETE", `/api/projects/${doomed.id}`, { confirm: "not-the-token" });
+      assert.equal(bad.status, 400, JSON.stringify(bad.body));
+      assert.equal(bad.body.error.code, "invalid_confirmation");
+      assert.equal((await call(server, "GET", `/api/projects/${doomed.id}`)).status, 200);
+
+      // 第二刀：带上一轮给出的确认凭据 → 永久删除。
+      const purged = await call(server, "DELETE", `/api/projects/${doomed.id}`, {
+        confirm: confirmation.token,
+      });
+      assert.equal(purged.status, 204, JSON.stringify(purged.body));
+      assert.equal((await call(server, "GET", `/api/projects/${doomed.id}`)).status, 404);
+      assert.equal((await call(server, "GET", `/api/groups/${doomedGroup.id}/messages`)).status, 404);
+
+      // 级联清除只覆盖本项目：其他项目的项目/群组/消息照常可读（PROJECT-01 隔离）。
+      const projects = await call(server, "GET", "/api/projects");
+      assert.deepEqual((projects.body.projects as any[]).map((p) => p.id), [other.id]);
+      assert.equal((await call(server, "GET", `/api/projects/${other.id}/groups`)).body.groups.length, 1);
+      const history = await call(server, "GET", `/api/groups/${otherGroup.id}/messages`);
+      assert.equal(history.status, 200);
+      assert.equal((history.body.messages as any[]).length, 1);
+    });
+
+    // 重启后仍然是「已永久删除」：清除落在持久层，不是进程内标记。
+    await withPersistentServer(dir, async (server) => {
+      assert.equal((await call(server, "GET", `/api/projects/${doomedId}`)).status, 404);
+      const projects = await call(server, "GET", "/api/projects");
+      assert.equal((projects.body.projects as any[]).length, 1);
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 占位：以下循环按 TDD 逐个补入（E 群组永久删除、F 守卫、G 隔离、H 多群组）
 // ---------------------------------------------------------------------------

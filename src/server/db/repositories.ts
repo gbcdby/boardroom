@@ -69,6 +69,28 @@ export interface AgentsRepository {
   delete(id: string): void;
 }
 
+/**
+ * 永久删除的级联清单（#48 / LIFE-ARC-02）：删除前给人看的「会被清掉什么」，
+ * 删除后作为实际清除的行数返回。口径 = 当前已落库的范围（阶段 1/2）；
+ * 任务、评论、记忆分别在阶段 3、阶段 4 落库，届时按同一形状补进清单。
+ */
+export interface PurgeCounts {
+  readonly groups: number;
+  readonly members: number;
+  readonly messages: number;
+  readonly deliveries: number;
+  readonly memberStatuses: number;
+  readonly mcpSessions: number;
+}
+
+/** 群组级联清单（#48）：删群组只清群聊与参与者关系，**不动成员本身**。 */
+export interface GroupPurgeCounts {
+  readonly messages: number;
+  readonly deliveries: number;
+  readonly participants: number;
+  readonly mcpSessions: number;
+}
+
 export interface ProjectsRepository {
   create(input: NewProject): Project;
   get(id: string): Project | null;
@@ -79,6 +101,14 @@ export interface ProjectsRepository {
   archive(id: string, at?: string): Project;
   /** 恢复：清除归档时间；未归档时幂等返回。 */
   restore(id: string): Project;
+  /** 永久删除前的级联清单（只读，不改数据）。项目不存在时抛 NotFoundError。 */
+  previewPurge(id: string): PurgeCounts;
+  /**
+   * 永久删除项目：在**单个事务**内按「子 → 父」顺序级联清除群组、群聊消息、投递、
+   * 参与者关系、成员、成员状态与 MCP 会话，最后删项目本身；返回实际清除的行数。
+   * 只应在人二次确认后由入口调用（PROJECT-03）：agent 主体没有 `project:purge` 能力点。
+   */
+  purge(id: string): PurgeCounts;
   delete(id: string): void;
 }
 
@@ -297,6 +327,24 @@ function requireGroupActive(db: Database.Database, groupId: string, action: stri
   }
 }
 
+/**
+ * 永久删除项目时会波及的行数清单（#48 / LIFE-ARC-02）。
+ * 只读；与 {@link ProjectsRepository.purge} 的删除顺序一一对应。
+ */
+function projectPurgeCounts(db: Database.Database, projectId: string): PurgeCounts {
+  const count = (sql: string): number => (db.prepare(sql).get(projectId) as { c: number }).c;
+  return {
+    groups: count("SELECT COUNT(*) AS c FROM groups WHERE project_id = ?"),
+    members: count("SELECT COUNT(*) AS c FROM members WHERE project_id = ?"),
+    messages: count(
+      "SELECT COUNT(*) AS c FROM messages m WHERE m.group_id IN (SELECT id FROM groups WHERE project_id = ?)",
+    ),
+    deliveries: count("SELECT COUNT(*) AS c FROM message_deliveries WHERE project_id = ?"),
+    memberStatuses: count("SELECT COUNT(*) AS c FROM member_statuses WHERE project_id = ?"),
+    mcpSessions: count("SELECT COUNT(*) AS c FROM mcp_sessions WHERE project_id = ?"),
+  };
+}
+
 function toAgent(row: AgentRow): Agent {
   return {
     id: row.id,
@@ -475,6 +523,32 @@ function createProjects(db: Database.Database): ProjectsRepository {
         db.prepare("UPDATE projects SET archived_at = NULL, updated_at = ? WHERE id = ?").run(nowIso(), id),
       );
       return this.get(id)!;
+    },
+    previewPurge(id) {
+      if (!this.get(id)) throw new NotFoundError(`Project ${id} 不存在。`);
+      return projectPurgeCounts(db, id);
+    },
+    purge(id) {
+      if (!this.get(id)) throw new NotFoundError(`Project ${id} 不存在。`);
+      const counts = projectPurgeCounts(db, id);
+      runInTransaction(db, () => {
+        // 显式「子 → 父」顺序，而不是只依赖外键级联：清单与实际清除的行必须一一对得上，
+        // 也让 PG 重写（M1 #54）时不依赖特定级联顺序。
+        db.prepare("DELETE FROM message_deliveries WHERE project_id = ?").run(id);
+        db
+          .prepare("DELETE FROM messages WHERE group_id IN (SELECT id FROM groups WHERE project_id = ?)")
+          .run(id);
+        db
+          .prepare("DELETE FROM group_participants WHERE group_id IN (SELECT id FROM groups WHERE project_id = ?)")
+          .run(id);
+        db.prepare("DELETE FROM groups WHERE project_id = ?").run(id);
+        db.prepare("DELETE FROM mcp_sessions WHERE project_id = ?").run(id);
+        db.prepare("DELETE FROM member_statuses WHERE project_id = ?").run(id);
+        db.prepare("DELETE FROM members WHERE project_id = ?").run(id);
+        const removed = db.prepare("DELETE FROM projects WHERE id = ?").run(id);
+        if (removed.changes === 0) throw new NotFoundError(`Project ${id} 不存在。`);
+      });
+      return counts;
     },
     delete(id) {
       const result = db.prepare("DELETE FROM projects WHERE id = ?").run(id);

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type Database from "better-sqlite3";
 import type { HeartbeatConfig } from "./config.ts";
@@ -104,6 +105,9 @@ const ERROR_STATUS: Record<string, number> = {
 
 const MAX_BODY_BYTES = 1_000_000;
 
+/** 永久删除确认凭据的有效期（PROJECT-03：人二次确认；超时需重新发起）。 */
+const PURGE_CONFIRM_TTL_MS = 5 * 60 * 1000;
+
 /** 创建 T1 API 路由。日志不记录消息正文等敏感字段（本模块无正文）。 */
 export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   const { db, logger } = options;
@@ -111,6 +115,17 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   const log = logger.child({ component: "api" });
   const heartbeat: HeartbeatConfig = options.heartbeat ?? { intervalMs: 10_000, timeoutMs: 30_000 };
   const now = options.now ?? (() => new Date());
+
+  /**
+   * 待确认的永久删除（T1 #48）：`project:<id>` / `group:<id>` → 一次性凭据与到期时间。
+   * 第一刀只登记凭据并返回级联清单，带**同一凭据**的第二刀才真正执行清除。
+   * 凭据活在进程内（默认 {@link PURGE_CONFIRM_TTL_MS}）：服务重启后失效，需要重新发起，
+   * 不会拿旧凭据删掉重启之后的数据。
+   *
+   * 必须在 `return { handle }` 之前初始化：路由器工厂靠提前 return 暴露句柄，
+   * 之后的 `const` 不会被执行到（详见本文件底部的函数声明区）。
+   */
+  const pendingPurges = new Map<string, { token: string; expiresAt: number }>();
 
   /** 默认主体：阶段 1 的人（owner）；给定 memberId 时用其成员行推导静态角色。 */
   function resolveDefaultActor(r: RepositorySet, resolution: ActorResolution): Actor {
@@ -220,7 +235,12 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         writeJson(response, 200, { project: projectView(r, project) });
         return true;
       }
-      methodNotAllowed(response, ["GET"]);
+      if (method === "DELETE") {
+        // T1 #48：项目永久删除（PROJECT-03、LIFE-ARC-02），走二次确认流程。
+        await purgeProject(r, request, response, projectId);
+        return true;
+      }
+      methodNotAllowed(response, ["GET", "DELETE"]);
       return true;
     }
 
@@ -578,6 +598,86 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   }
 
   // -------------------------------------------------------------------------
+  // 永久删除的二次确认（PROJECT-03 / LIFE-ARC-01）
+  // -------------------------------------------------------------------------
+  // 注：待确认凭据表 `pendingPurges` 在路由器工厂顶部初始化（必须早于 `return { handle }`，
+  // 否则该 `const` 永远不会执行到，这里只是复用同一个闭包变量）。
+
+  function issuePurgeConfirmation(key: string): { token: string; expiresAt: number } {
+    const entry = { token: randomUUID(), expiresAt: Date.now() + PURGE_CONFIRM_TTL_MS };
+    pendingPurges.set(key, entry);
+    return entry;
+  }
+
+  /**
+   * 校验并消费确认凭据（一次性：成功执行后立刻失效）。
+   * 凭据**不对或已过期时不消费**——失败重试仍用同一凭据即可，不必重新发起；
+   * 过期后（{@link PURGE_CONFIRM_TTL_MS}）必须重新拿一份最新的级联清单。
+   */
+  function consumePurgeConfirmation(key: string, token: string): boolean {
+    const entry = pendingPurges.get(key);
+    if (entry === undefined) return false;
+    if (entry.token !== token || entry.expiresAt < Date.now()) return false;
+    pendingPurges.delete(key);
+    return true;
+  }
+
+  /**
+   * `DELETE /api/projects/:id`：无凭据 → 409 + 级联清单 + 凭据；凭据不符 → 400；
+   * 凭据匹配 → 事务内级联清除群组/群聊/投递/参与者/成员/状态/会话后删除项目（204）。
+   */
+  async function purgeProject(
+    r: RepositorySet,
+    request: IncomingMessage,
+    response: ServerResponse,
+    projectId: string,
+  ): Promise<void> {
+    const project = requireProject(r, projectId);
+    // 守卫：只有「人（owner）」持有 project:purge；顶层 manager 没有 → 403（LIFE-ARC-01）。
+    guard(r, request, "project:purge", { projectId: project.id });
+    const body = await readOptionalObjectBody(request);
+    const confirm = typeof body["confirm"] === "string" ? (body["confirm"] as string) : null;
+    const key = `project:${project.id}`;
+
+    if (confirm === null) {
+      const cascade = r.projects.previewPurge(project.id);
+      const entry = issuePurgeConfirmation(key);
+      log.info("项目永久删除等待二次确认", { projectId: project.id, cascade });
+      writeJson(response, 409, {
+        error: {
+          code: "confirmation_required",
+          message:
+            `永久删除项目「${project.name}」会级联清除它的群组、群聊消息、投递、成员与状态，且不可恢复。` +
+            "确认无误后请带 confirmation.token 重新发起 DELETE。",
+        },
+        confirmation: {
+          kind: "project",
+          projectId: project.id,
+          projectName: project.name,
+          archivedAt: project.archivedAt,
+          cascade,
+          token: entry.token,
+          expiresAt: new Date(entry.expiresAt).toISOString(),
+        },
+      });
+      return;
+    }
+
+    if (!consumePurgeConfirmation(key, confirm)) {
+      throw new HttpError(
+        400,
+        "invalid_confirmation",
+        "永久删除的确认凭据无效或已过期，请重新发起以获取最新的级联清单与凭据。",
+      );
+    }
+
+    const cleared = r.projects.purge(project.id);
+    log.info("永久删除项目", { projectId: project.id, cleared });
+    response.writeHead(204, { "cache-control": "no-store" });
+    response.end();
+  }
+
+  // -------------------------------------------------------------------------
   // 视图
   // -------------------------------------------------------------------------
 
@@ -796,6 +896,22 @@ function truthyParam(request: IncomingMessage, name: string): boolean {
 }
 
 async function readObjectBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readRawBody(request);
+  if (raw.trim() === "") throw new InvalidArgumentError("请求体不能为空，需为 JSON 对象。");
+  return parseObjectBody(raw);
+}
+
+/**
+ * 可选 JSON 体：空体返回 `{}`。用于 `DELETE …?二次确认` 这类「带不带确认凭据都合法」的调用
+ * （T1 #48 永久删除的第一刀就没有请求体）。
+ */
+async function readOptionalObjectBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readRawBody(request);
+  if (raw.trim() === "") return {};
+  return parseObjectBody(raw);
+}
+
+async function readRawBody(request: IncomingMessage): Promise<string> {
   let raw = "";
   let size = 0;
   for await (const chunk of request) {
@@ -803,7 +919,10 @@ async function readObjectBody(request: IncomingMessage): Promise<Record<string, 
     if (size > MAX_BODY_BYTES) throw new HttpError(413, "payload_too_large", "请求体过大。");
     raw += chunk;
   }
-  if (raw.trim() === "") throw new InvalidArgumentError("请求体不能为空，需为 JSON 对象。");
+  return raw;
+}
+
+function parseObjectBody(raw: string): Record<string, unknown> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
