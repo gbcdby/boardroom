@@ -147,7 +147,9 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     const staleAt = new Date().toISOString();
     const staleCount = recovered.mcpSessions.markAllStale(staleAt);
     if (staleCount > 0) {
-      for (const project of recovered.projects.list()) {
+      // 清扫覆盖**全部**项目（含 #48 的已归档项目）：归档只是非活跃态，
+      // 遗留会话仍必须标记断开，不臆造在线。
+      for (const project of recovered.projects.list({ includeArchived: true })) {
         for (const member of recovered.members.listByProject(project.id)) {
           const status = recovered.statuses.get(project.id, member.id);
           if (status && (status.state === "online" || status.state === "waiting" || status.state === "working")) {

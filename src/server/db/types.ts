@@ -33,6 +33,12 @@ export interface Project {
   readonly name: string;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /**
+   * 归档时间（ISO 字符串）；null = 未归档。
+   * 归档是**可恢复**的非活跃态（#48 / PROJECT-03、LIFE-ARC-01）：不删数据，
+   * 默认列表隐藏、写路径拒绝；恢复即把该列置回 null。
+   */
+  readonly archivedAt: string | null;
 }
 
 export interface NewProject {
@@ -73,6 +79,8 @@ export interface Group {
   readonly name: string;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /** 归档时间（ISO 字符串）；null = 未归档。语义同 {@link Project.archivedAt}（GROUP-04）。 */
+  readonly archivedAt: string | null;
 }
 
 export interface NewGroup {

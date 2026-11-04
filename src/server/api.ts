@@ -201,7 +201,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       if (method === "GET") {
         // F2：跨项目清单 = overview:view（OVERVIEW-01：仅人 / 顶层 manager 可见）。
         guard(r, request, "overview:view", {});
-        writeJson(response, 200, { projects: r.projects.list().map((p) => projectView(r, p)) });
+        const includeArchived = truthyParam(request, "includeArchived");
+        const projects = r.projects.list({ includeArchived });
+        writeJson(response, 200, { projects: projects.map((p) => projectView(r, p)) });
         return true;
       }
       methodNotAllowed(response, ["GET", "POST"]);
@@ -218,6 +220,30 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         return true;
       }
       methodNotAllowed(response, ["GET"]);
+      return true;
+    }
+
+    // /api/projects/:id/archive 与 /api/projects/:id/restore —— T1 #48 归档 / 恢复
+    // （PROJECT-03、LIFE-ARC-01：归档可恢复，不删任何数据；永久删除走 purge 流程）
+    if (
+      segments.length === 4 &&
+      segments[0] === "api" &&
+      segments[1] === "projects" &&
+      (segments[3] === "archive" || segments[3] === "restore")
+    ) {
+      const projectId = decodeSegment(segments[2]!);
+      const project = requireProject(r, projectId);
+      if (method === "POST") {
+        // 归档与恢复共用 `project:archive` 能力点：恢复 = 取消归档，权限同位。
+        // 顶层 manager 可归档（LIFE-ARC-01），但矩阵里没有 project:purge → 不能永久删除。
+        guard(r, request, "project:archive", { projectId: project.id });
+        const next =
+          segments[3] === "archive" ? r.projects.archive(project.id) : r.projects.restore(project.id);
+        log.info(segments[3] === "archive" ? "归档项目" : "恢复项目", { projectId });
+        writeJson(response, 200, { project: projectView(r, next) });
+        return true;
+      }
+      methodNotAllowed(response, ["POST"]);
       return true;
     }
 
@@ -561,6 +587,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       name: project.name,
       createdAt: project.createdAt,
       updatedAt: project.updatedAt,
+      // T1 #48：归档时间（null = 未归档）。归档对象默认不出现在列表里，但形状一致。
+      archivedAt: project.archivedAt,
       manager: manager ? memberView(manager) : null,
     };
   }
@@ -721,6 +749,12 @@ function decodeSegment(segment: string): string {
   } catch {
     return segment;
   }
+}
+
+/** 查询串里的布尔开关：`?x=1|true` 视为真，其余（含缺省）为假。 */
+function truthyParam(request: IncomingMessage, name: string): boolean {
+  const value = new URL(request.url ?? "/", "http://127.0.0.1").searchParams.get(name);
+  return value === "1" || value === "true";
 }
 
 async function readObjectBody(request: IncomingMessage): Promise<Record<string, unknown>> {

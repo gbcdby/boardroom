@@ -21,8 +21,8 @@ const DOMAIN_TABLES = [
   "mcp_sessions",
 ] as const;
 
-/** 期望的最高迁移版本（F2 v1 + T2 v2）。 */
-const EXPECTED_VERSION = 2;
+/** 期望的最高迁移版本（F2 v1 + T2 v2 + T1 #48 v3 归档标记）。 */
+const EXPECTED_VERSION = 3;
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-schema-"));

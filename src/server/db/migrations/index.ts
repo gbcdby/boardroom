@@ -6,6 +6,7 @@ import type { Migration } from "../migrate.ts";
  * F1（#11）只建立迁移版本表 `schema_migrations`，不建领域表。
  * F2（#12）新增 `init_domain_model`：Agent/Project/Member/Group/Message/
  * MessageDelivery/MemberStatus 领域表、索引与外键约束。
+ * T1（#48）新增 `archive_flags_for_project_and_group`：项目/群组的归档标记。
  *
  * 规则：版本号递增，一旦应用就不可修改（runner 校验 checksum）；后续票只追加迁移。
  */
@@ -173,6 +174,23 @@ export const migrations: readonly Migration[] = [
       CREATE UNIQUE INDEX ux_mcp_sessions_active
         ON mcp_sessions (agent_id, project_id, group_id)
         WHERE state = 'connected';
+    `,
+  },
+  {
+    version: 3,
+    name: "archive_flags_for_project_and_group",
+    up: `
+      -- T1（#48）归档标记（PROJECT-03 / GROUP-04 / LIFE-ARC-01）。
+      --
+      -- 归档 = 可恢复的非活跃态：只加一个可空时间戳，NULL 表示未归档。
+      -- 不新增状态枚举、不删数据：恢复即把该列置回 NULL，
+      -- 永久删除（LIFE-ARC-02）走 repository 的显式级联清除，不靠这里。
+      ALTER TABLE projects ADD COLUMN archived_at TEXT;
+      ALTER TABLE groups ADD COLUMN archived_at TEXT;
+
+      -- 列表默认只取未归档行（项目列表 / 项目内群组列表），按归档位建索引避免全表扫。
+      CREATE INDEX ix_projects_archived ON projects (archived_at);
+      CREATE INDEX ix_groups_project_archived ON groups (project_id, archived_at);
     `,
   },
 ];

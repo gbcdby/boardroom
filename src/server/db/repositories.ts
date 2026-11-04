@@ -46,6 +46,12 @@ export interface MessageListOptions {
   readonly limit?: number;
 }
 
+/** 归档态列表的通用收窄选项（#48：默认只看未归档对象）。 */
+export interface ListOptions {
+  /** true = 连已归档行一起返回；缺省 false 只返回未归档行。 */
+  readonly includeArchived?: boolean;
+}
+
 export interface AgentsRepository {
   create(input: NewAgent): Agent;
   /** 以完整字段插入（含外部提供的 ID），重复 ID 报 ConflictError。 */
@@ -65,8 +71,13 @@ export interface AgentsRepository {
 export interface ProjectsRepository {
   create(input: NewProject): Project;
   get(id: string): Project | null;
-  list(): Project[];
+  /** 默认只列**未归档**项目；`includeArchived` 时连归档项目一起返回（#48 / PROJECT-03）。 */
+  list(options?: ListOptions): Project[];
   rename(id: string, name: string): Project;
+  /** 归档：写入归档时间；已归档时幂等返回（可恢复，不删数据）。 */
+  archive(id: string, at?: string): Project;
+  /** 恢复：清除归档时间；未归档时幂等返回。 */
+  restore(id: string): Project;
   delete(id: string): void;
 }
 
@@ -362,10 +373,17 @@ interface ProjectRow {
   name: string;
   created_at: string;
   updated_at: string;
+  archived_at: string | null;
 }
 
 function toProject(row: ProjectRow): Project {
-  return { id: row.id, name: row.name, createdAt: row.created_at, updatedAt: row.updated_at };
+  return {
+    id: row.id,
+    name: row.name,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    archivedAt: row.archived_at ?? null,
+  };
 }
 
 function createProjects(db: Database.Database): ProjectsRepository {
@@ -373,7 +391,7 @@ function createProjects(db: Database.Database): ProjectsRepository {
     create(input) {
       const name = requireNonEmpty(input.name, "Project.name");
       const at = nowIso();
-      const project: Project = { id: newId(), name, createdAt: at, updatedAt: at };
+      const project: Project = { id: newId(), name, createdAt: at, updatedAt: at, archivedAt: null };
       runInTransaction(db, () =>
         db
           .prepare("INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)")
@@ -385,8 +403,11 @@ function createProjects(db: Database.Database): ProjectsRepository {
       const row = db.prepare("SELECT * FROM projects WHERE id = ?").get(id) as ProjectRow | undefined;
       return row ? toProject(row) : null;
     },
-    list() {
-      return (db.prepare("SELECT * FROM projects ORDER BY created_at, id").all() as ProjectRow[]).map(toProject);
+    list(options = {}) {
+      const where = options.includeArchived ? "" : "WHERE archived_at IS NULL";
+      return (
+        db.prepare(`SELECT * FROM projects ${where} ORDER BY created_at, id`).all() as ProjectRow[]
+      ).map(toProject);
     },
     rename(id, name) {
       const value = requireNonEmpty(name, "Project.name");
@@ -394,6 +415,25 @@ function createProjects(db: Database.Database): ProjectsRepository {
         .prepare("UPDATE projects SET name = ?, updated_at = ? WHERE id = ?")
         .run(value, nowIso(), id);
       if (result.changes === 0) throw new NotFoundError(`Project ${id} 不存在。`);
+      return this.get(id)!;
+    },
+    archive(id, at) {
+      const existing = this.get(id);
+      if (!existing) throw new NotFoundError(`Project ${id} 不存在。`);
+      if (existing.archivedAt !== null) return existing;
+      const stamp = at ?? nowIso();
+      runInTransaction(db, () =>
+        db.prepare("UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?").run(stamp, stamp, id),
+      );
+      return this.get(id)!;
+    },
+    restore(id) {
+      const existing = this.get(id);
+      if (!existing) throw new NotFoundError(`Project ${id} 不存在。`);
+      if (existing.archivedAt === null) return existing;
+      runInTransaction(db, () =>
+        db.prepare("UPDATE projects SET archived_at = NULL, updated_at = ? WHERE id = ?").run(nowIso(), id),
+      );
       return this.get(id)!;
     },
     delete(id) {
@@ -528,10 +568,18 @@ interface GroupRow {
   name: string;
   created_at: string;
   updated_at: string;
+  archived_at: string | null;
 }
 
 function toGroup(row: GroupRow): Group {
-  return { id: row.id, projectId: row.project_id, name: row.name, createdAt: row.created_at, updatedAt: row.updated_at };
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    name: row.name,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    archivedAt: row.archived_at ?? null,
+  };
 }
 
 function createGroups(db: Database.Database): GroupsRepository {
