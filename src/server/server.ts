@@ -3,8 +3,9 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import type { AppConfig } from "./config.ts";
-import { openDatabase } from "./db/database.ts";
-import { readMigrationState, runMigrations, type MigrationState } from "./db/migrate.ts";
+import { createDbDriver, type DbDriver } from "./db/driver.ts";
+import { SqliteDriver } from "./db/drivers/sqlite.ts";
+import type { MigrationState } from "./db/migrate.ts";
 import { migrations } from "./db/migrations/index.ts";
 import { buildHealthReport } from "./health.ts";
 import { createRepositories } from "./db/repositories.ts";
@@ -73,26 +74,48 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   const webRoot = options.webRoot ?? defaultWebRoot();
   const startedAt = Date.now();
 
-  let opened: { db: Database.Database; file: string };
+  // F1（#46）：经连接工厂打开持久化驱动；默认 SQLite，阶段 1 行为不变。
+  let driver: DbDriver;
   try {
-    opened = openDatabase(config.dataDir);
+    driver = createDbDriver({
+      dbDriver: config.dbDriver ?? "sqlite",
+      dataDir: config.dataDir,
+      ...(config.pgConnectionString === undefined ? {} : { pgConnectionString: config.pgConnectionString }),
+    });
+  } catch (error) {
+    log.error("数据库驱动配置无效", { error, dataDir: config.dataDir });
+    throw new ServerStartupError((error as Error).message);
+  }
+  if (!(driver instanceof SqliteDriver)) {
+    // 业务仓储尚未切 PG（M1 #54）；此处快速失败，不打开 SQLite、不连接 PG。
+    throw new ServerStartupError(
+      `dbDriver=postgres 暂时不能启动：阶段 1 业务仓储仍直接依赖 SQLite，` +
+        `PostgreSQL 业务表重写与既有数据迁移由 M1（#54）交付。\n` +
+        `驱动层（connect/migrate/query/方言）已接入并有冒烟验证。\n` +
+        `回滚方式：保持或改回 AGENT_STUDIO_DB_DRIVER=sqlite（默认值），继续使用本地 SQLite 数据目录 ${config.dataDir}。`,
+    );
+  }
+  const sqlite = driver;
+
+  try {
+    await sqlite.connect();
   } catch (error) {
     log.error("数据库初始化失败", { error, dataDir: config.dataDir });
     throw new ServerStartupError((error as Error).message);
   }
 
-  const db = opened.db;
+  const db = sqlite.handle;
   let migrationState: MigrationState;
   try {
-    const result = runMigrations(db, migrations);
-    migrationState = readMigrationState(db);
+    const result = await sqlite.migrate(migrations);
+    migrationState = await sqlite.migrationState();
     log.info("迁移完成", {
       version: migrationState.version,
       applied: result.applied.length,
       pending: migrations.length - migrationState.applied.length,
     });
   } catch (error) {
-    db.close();
+    await sqlite.close();
     log.error("迁移失败", { error });
     throw new ServerStartupError(
       `${(error as Error).message}\n数据目录：${config.dataDir}\n` +
@@ -253,7 +276,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     });
   } catch (error) {
     await hub.close();
-    db.close();
+    await sqlite.close();
     const err = error as NodeJS.ErrnoException;
     const message =
       err.code === "EADDRINUSE"
@@ -275,7 +298,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     url,
     wsUrl: `ws://${HOST}:${port}${WS_PATH}`,
     dataDir: config.dataDir,
-    database: opened.file,
+    database: sqlite.file,
     heartbeat: config.heartbeat,
     webuiBuilt,
   });
@@ -317,7 +340,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
         httpServer.close(() => resolve());
         httpServer.closeAllConnections();
       });
-      if (db.open) db.close();
+      await sqlite.close();
       log.info("服务已停止");
     },
   };

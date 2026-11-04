@@ -233,7 +233,8 @@ export class PostgresDriver implements DbDriver {
       if (url.password !== "") out = out.split(url.password).join("***");
     } catch {
       const match = /password=(\S+)/i.exec(this.connectionString);
-      if (match !== undefined) out = out.split(match[1] as string).join("***");
+      const password = match?.[1];
+      if (password !== undefined) out = out.split(password).join("***");
     }
     return out;
   }
