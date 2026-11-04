@@ -1192,6 +1192,9 @@ function buildInterruptReason(result: InterruptResult, hostType: HostType, targe
     switch (error.code) {
       case "conflict":
         return new McpToolError("CONFLICT", `身份或成员冲突：${error.message}`, ctx);
+      case "archived":
+        // #48：目标项目/群组已归档，写路径拒绝（恢复后放行）。
+        return new McpToolError("CONFLICT", error.message, ctx);
       case "invalid_reference":
       case "invalid_argument":
       case "not_found":

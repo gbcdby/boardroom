@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import {
+  ArchivedError,
   ConflictError,
   InvalidArgumentError,
   InvalidReferenceError,
@@ -262,6 +263,40 @@ function requireNonEmpty(value: unknown, field: string): string {
   return value;
 }
 
+/**
+ * 归档态写检查（#48 / PROJECT-03、GROUP-04）。
+ *
+ * 归档 = **可恢复的非活跃态**：不删数据、历史仍可读，但拒绝新写入。
+ * 强制点放在 repository 这一唯一的写入边界上，HTTP（人）与 MCP（agent）两个入口
+ * 因此共享同一条规则，不依赖调用方自律。
+ */
+function requireProjectActive(db: Database.Database, projectId: string, action: string): void {
+  const row = db
+    .prepare("SELECT archived_at FROM projects WHERE id = ?")
+    .get(projectId) as { archived_at: string | null } | undefined;
+  if (row?.archived_at != null) {
+    throw new ArchivedError(`项目已归档，不能${action}；如需继续，请先恢复该项目。`);
+  }
+}
+
+/** 同 {@link requireProjectActive}，但面向群组：群组自身或其所属项目归档即拒绝写入。 */
+function requireGroupActive(db: Database.Database, groupId: string, action: string): void {
+  const row = db
+    .prepare(
+      `SELECT g.archived_at AS group_archived, p.archived_at AS project_archived
+         FROM groups g JOIN projects p ON p.id = g.project_id
+        WHERE g.id = ?`,
+    )
+    .get(groupId) as { group_archived: string | null; project_archived: string | null } | undefined;
+  if (row === undefined) return; // 群组不存在由调用方各自的引用校验负责，这里不重复报错。
+  if (row.group_archived != null) {
+    throw new ArchivedError(`群组已归档，不能${action}；如需继续，请先恢复该群组。`);
+  }
+  if (row.project_archived != null) {
+    throw new ArchivedError(`项目已归档，不能${action}；如需继续，请先恢复该项目。`);
+  }
+}
+
 function toAgent(row: AgentRow): Agent {
   return {
     id: row.id,
@@ -485,6 +520,7 @@ function createMembers(db: Database.Database): MembersRepository {
       if (!projectExists.get(input.projectId)) {
         throw new InvalidReferenceError(`项目 ${input.projectId} 不存在，无法添加成员。`);
       }
+      requireProjectActive(db, input.projectId, "添加项目成员");
       const displayName = requireNonEmpty(input.displayName, "Member.displayName");
       if (input.kind !== "agent" && input.kind !== "human") {
         throw new InvalidArgumentError(`Member.kind 必须是 agent 或 human，收到：${String(input.kind)}。`);
@@ -540,6 +576,7 @@ function createMembers(db: Database.Database): MembersRepository {
     update(id, patch) {
       const existing = repo.get(id);
       if (!existing) throw new NotFoundError(`Member ${id} 不存在。`);
+      requireProjectActive(db, existing.projectId, "修改项目成员");
       const displayName =
         patch.displayName === undefined
           ? existing.displayName
@@ -597,6 +634,7 @@ function createGroups(db: Database.Database): GroupsRepository {
       if (!projectExists.get(input.projectId)) {
         throw new InvalidReferenceError(`项目 ${input.projectId} 不存在，无法创建群组。`);
       }
+      requireProjectActive(db, input.projectId, "在项目内创建群组");
       const name = requireNonEmpty(input.name, "Group.name");
       const participants = dedupe(input.participantMemberIds ?? []);
       for (const memberId of participants) {
@@ -717,6 +755,7 @@ function createMessages(db: Database.Database): MessagesRepository {
           | { project_id: string }
           | undefined;
         if (!group) throw new InvalidReferenceError(`群组 ${input.groupId} 不存在，无法发送消息。`);
+        requireGroupActive(db, input.groupId, "向群组发送消息");
 
         const sender = db.prepare("SELECT project_id FROM members WHERE id = ?").get(input.senderMemberId) as
           | { project_id: string }

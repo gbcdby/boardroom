@@ -188,5 +188,73 @@ test("群组可恢复：恢复后回到项目群组列表且 archivedAt 为空",
 });
 
 // ---------------------------------------------------------------------------
-// 占位：以下循环按 TDD 逐个补入（C 归档写路径、D/E 永久删除、F 守卫、G 隔离、H 多群组）
+// 循环 C：归档 = 非活跃态，写路径被拒（PROJECT-03、GROUP-04 的可观察后果）
+// ---------------------------------------------------------------------------
+
+test("已归档项目拒绝新写入：建群组/加成员/指定 manager 返回 409 archived，恢复后放行", async () => {
+  await withServer({ logger: silentLogger }, async (server) => {
+    const project = await createProject(server, "归档后不再新增");
+    const alice = await addHuman(server, project.id, "Alice");
+    await call(server, "POST", `/api/projects/${project.id}/archive`);
+
+    const group = await call(server, "POST", `/api/projects/${project.id}/groups`, {
+      name: "归档后新建群组",
+      participantMemberIds: [alice.id],
+    });
+    assert.equal(group.status, 409, JSON.stringify(group.body));
+    assert.equal(group.body.error.code, "archived");
+
+    const member = await call(server, "POST", `/api/projects/${project.id}/members`, {
+      kind: "human",
+      displayName: "Bob",
+    });
+    assert.equal(member.status, 409);
+    assert.equal(member.body.error.code, "archived");
+
+    const manager = await call(server, "PUT", `/api/projects/${project.id}/manager`, {
+      memberId: alice.id,
+    });
+    assert.equal(manager.status, 409);
+    assert.equal(manager.body.error.code, "archived");
+
+    // 恢复后同样的写入应当放行（归档是可恢复态，不是只读墓碑）。
+    await call(server, "POST", `/api/projects/${project.id}/restore`);
+    const afterRestore = await call(server, "POST", `/api/projects/${project.id}/groups`, {
+      name: "恢复后新建群组",
+      participantMemberIds: [alice.id],
+    });
+    assert.equal(afterRestore.status, 201, JSON.stringify(afterRestore.body));
+  });
+});
+
+test("已归档群组拒绝新消息：发送返回 409 archived，同项目的其他群组不受影响", async () => {
+  await withServer({ logger: silentLogger }, async (server) => {
+    const project = await createProject(server, "两群组项目");
+    const alice = await addHuman(server, project.id, "Alice");
+    const active = await createGroup(server, project.id, "在用群组", [alice.id]);
+    const retired = await createGroup(server, project.id, "已归档群组", [alice.id]);
+    await call(server, "POST", `/api/groups/${retired.id}/archive`);
+
+    const blocked = await call(server, "POST", `/api/groups/${retired.id}/messages`, {
+      senderMemberId: alice.id,
+      text: "归档后还想说话",
+    });
+    assert.equal(blocked.status, 409, JSON.stringify(blocked.body));
+    assert.equal(blocked.body.error.code, "archived");
+
+    // 隔离在群组级：同项目的未归档群组照常收消息。
+    const allowed = await call(server, "POST", `/api/groups/${active.id}/messages`, {
+      senderMemberId: alice.id,
+      text: "照常发言",
+    });
+    assert.equal(allowed.status, 201, JSON.stringify(allowed.body));
+
+    // 已归档群组的既有历史仍可读（归档不删数据）。
+    const history = await call(server, "GET", `/api/groups/${retired.id}/messages`);
+    assert.equal(history.status, 200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 占位：以下循环按 TDD 逐个补入（D/E 永久删除、F 守卫、G 隔离、H 多群组）
 // ---------------------------------------------------------------------------

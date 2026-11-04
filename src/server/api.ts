@@ -29,7 +29,7 @@ import { actorForMember, ownerActor } from "./authz/actors.ts";
  * - 路由前缀 `/api`；本模块只处理已确认的路径，未匹配时返回 `matched: false`，
  *   由 server.ts 继续走 404 / MCP / 静态资源。
  * - 错误统一 JSON `{ error: { code, message } }`，`code` 与 F2 repository 错误码一致
- *   （not_found / conflict / invalid_reference / invalid_argument / write_failed），
+ *   （not_found / conflict / archived / invalid_reference / invalid_argument / write_failed），
  *   权限判定拒绝用 F2 守卫的拒绝码（forbidden / out_of_subtree / …，HTTP 403）。
  * - 校验与持久化复用 F2 repository（`createRepositories`），不重复实现唯一 manager 约束；
  *   重复指定 manager 由 repository/唯一索引归一为 ConflictError → HTTP 409（D2）。
@@ -96,6 +96,7 @@ export interface MessageView {
 const ERROR_STATUS: Record<string, number> = {
   not_found: 404,
   conflict: 409,
+  archived: 409,
   invalid_reference: 400,
   invalid_argument: 400,
   write_failed: 500,
