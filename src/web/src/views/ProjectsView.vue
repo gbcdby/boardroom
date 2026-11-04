@@ -1,13 +1,27 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { ApiError, api, type GroupDto, type MemberDto, type MemberStatusDto, type ProjectDto } from "../api/client.ts";
+import {
+  ApiError,
+  api,
+  type GroupDto,
+  type GroupPurgeConfirmation,
+  type MemberDto,
+  type MemberStatusDto,
+  type ProjectDto,
+  type ProjectPurgeConfirmation,
+} from "../api/client.ts";
 
 /**
- * T1（#14）项目工作台：在 WebUI 中创建项目、管理项目成员、指定顶层 manager、
- * 创建群组并选择参与者（只能从项目成员中选）。
+ * T1（#14）项目工作台 + T1（#48）项目/群组生命周期：
+ * 创建项目、管理成员、指定顶层 manager、创建群组选参与者，以及
+ * **归档 / 恢复 / 永久删除（人二次确认）**。
  *
- * 阶段 1 只验收单个项目；页面允许切换项目。真实 agent 成员由 T2（MCP 入群）产生，
- * 本页只管理已存在的成员（currently 人 + 后续 T2 加入的 agent）。
+ * 生命周期规则（与 `src/server/api.ts` 一致）：
+ * - 归档是可恢复的非活跃态：默认列表隐藏（勾选「显示已归档」可见），归档对象拒绝新写入。
+ * - 永久删除要两刀：第一刀只取级联清单与一次性确认凭据，第二刀带同一凭据才真正清除。
+ *   项目清除其群组/群聊/成员与状态；群组只清群聊与参与者关系，成员保留。
+ *
+ * 阶段 1 只验收单个项目；页面允许切换项目。真实 agent 成员由 T2（MCP 入群）产生。
  */
 
 const projects = ref<ProjectDto[]>([]);
@@ -18,6 +32,11 @@ const groups = ref<GroupDto[]>([]);
 const participants = ref<Record<string, MemberDto[]>>({});
 /** 项目成员在线/连接状态（T2）：memberId → 状态视图。 */
 const statuses = ref<Record<string, MemberStatusDto>>({});
+/** 「显示已归档」开关：项目与群组列表一起受影响。 */
+const showArchived = ref(false);
+/** 等待人二次确认的永久删除（#48）。 */
+const pendingProjectPurge = ref<ProjectPurgeConfirmation | null>(null);
+const pendingGroupPurge = ref<GroupPurgeConfirmation | null>(null);
 
 const busy = ref(false);
 const error = ref<string | null>(null);
@@ -53,13 +72,18 @@ async function run<T>(fn: () => Promise<T>, success?: string): Promise<T | null>
 }
 
 async function loadProjects(): Promise<void> {
-  const result = await run(() => api.listProjects());
+  const result = await run(() => api.listProjects({ includeArchived: showArchived.value }));
   if (!result) return;
   projects.value = result.projects;
   if (activeProjectId.value === null || !projects.value.some((p) => p.id === activeProjectId.value)) {
     activeProjectId.value = projects.value[0]?.id ?? null;
   }
   await loadActiveProject();
+}
+
+async function toggleShowArchived(): Promise<void> {
+  showArchived.value = !showArchived.value;
+  await loadProjects();
 }
 
 async function loadActiveProject(): Promise<void> {
@@ -73,7 +97,7 @@ async function loadActiveProject(): Promise<void> {
   }
   const [memberResult, groupResult] = await Promise.all([
     run(() => api.listMembers(projectId)),
-    run(() => api.listGroups(projectId)),
+    run(() => api.listGroups(projectId, { includeArchived: showArchived.value })),
   ]);
   if (memberResult) members.value = memberResult.members;
   if (groupResult) {
@@ -188,6 +212,86 @@ async function createGroup(): Promise<void> {
   await loadActiveProject();
 }
 
+// ---------------------------------------------------------------------------
+// T1 #48：归档 / 恢复 / 永久删除（二次确认）
+// ---------------------------------------------------------------------------
+
+async function archiveProject(): Promise<void> {
+  const projectId = activeProjectId.value;
+  if (projectId === null) return;
+  const result = await run(() => api.archiveProject(projectId), "项目已归档（可恢复）。");
+  if (!result) return;
+  await loadProjects();
+}
+
+async function restoreProject(): Promise<void> {
+  const projectId = activeProjectId.value;
+  if (projectId === null) return;
+  const result = await run(() => api.restoreProject(projectId), "项目已恢复。");
+  if (!result) return;
+  await loadProjects();
+}
+
+/** 第一刀：只取级联清单与确认凭据，不删除；清单显示在确认面板里等人点「确认永久删除」。 */
+async function requestProjectPurge(): Promise<void> {
+  const projectId = activeProjectId.value;
+  if (projectId === null) return;
+  const outcome = await run(() => api.purgeProject(projectId));
+  if (!outcome) return;
+  if (outcome.state === "confirmation_required") pendingProjectPurge.value = outcome.confirmation;
+  else pendingProjectPurge.value = null;
+}
+
+async function confirmProjectPurge(): Promise<void> {
+  const confirmation = pendingProjectPurge.value;
+  if (confirmation === null) return;
+  const outcome = await run(() => api.purgeProject(confirmation.projectId, confirmation.token));
+  if (!outcome) return;
+  pendingProjectPurge.value = null;
+  if (outcome.state === "deleted") {
+    activeProjectId.value = null;
+    await loadProjects();
+  }
+}
+
+function cancelProjectPurge(): void {
+  pendingProjectPurge.value = null;
+  notice.value = "已取消永久删除（确认凭据过期后需重新发起）。";
+}
+
+async function archiveGroup(group: GroupDto): Promise<void> {
+  const result = await run(() => api.archiveGroup(group.id), `群组「${group.name}」已归档（可恢复）。`);
+  if (!result) return;
+  await loadActiveProject();
+}
+
+async function restoreGroup(group: GroupDto): Promise<void> {
+  const result = await run(() => api.restoreGroup(group.id), `群组「${group.name}」已恢复。`);
+  if (!result) return;
+  await loadActiveProject();
+}
+
+async function requestGroupPurge(group: GroupDto): Promise<void> {
+  const outcome = await run(() => api.purgeGroup(group.id));
+  if (!outcome) return;
+  if (outcome.state === "confirmation_required") pendingGroupPurge.value = outcome.confirmation;
+  else pendingGroupPurge.value = null;
+}
+
+async function confirmGroupPurge(): Promise<void> {
+  const confirmation = pendingGroupPurge.value;
+  if (confirmation === null) return;
+  const outcome = await run(() => api.purgeGroup(confirmation.groupId, confirmation.token));
+  if (!outcome) return;
+  pendingGroupPurge.value = null;
+  await loadActiveProject();
+}
+
+function cancelGroupPurge(): void {
+  pendingGroupPurge.value = null;
+  notice.value = "已取消永久删除群组。";
+}
+
 /** 连接状态的中文标签（全局 MCP 会话层，D1）。 */
 function connectionLabel(memberId: string): string {
   const status = statuses.value[memberId];
@@ -245,7 +349,8 @@ onMounted(() => void loadProjects());
     <h1>项目</h1>
     <p class="muted">
       创建一个项目，在项目内添加成员、指定一个顶层 manager，并创建带参与者的群组。
-      阶段 1 只验收单个项目；真实 agent 成员由 MCP 入群（后续），本页管理已存在的成员。
+      项目之间数据隔离；归档可恢复，永久删除需要你二次确认。
+      真实 agent 成员由 MCP 入群（后续），本页管理已存在的成员。
     </p>
 
     <p v-if="error" class="error" data-testid="error">{{ error }}</p>
@@ -255,6 +360,15 @@ onMounted(() => void loadProjects());
     <form class="row" @submit.prevent="createProject">
       <input v-model="newProjectName" placeholder="新项目名称" data-testid="new-project-name" />
       <button type="submit" :disabled="busy" data-testid="create-project">创建项目</button>
+      <button
+        type="button"
+        :disabled="busy"
+        class="chip"
+        data-testid="toggle-archived"
+        @click="toggleShowArchived"
+      >
+        {{ showArchived ? "隐藏已归档" : "显示已归档" }}
+      </button>
     </form>
 
     <!-- 项目切换 -->
@@ -267,19 +381,80 @@ onMounted(() => void loadProjects());
         :class="{ active: project.id === activeProjectId }"
         @click="selectProject(project.id)"
       >
-        {{ project.name }}
+        {{ project.name }}<template v-if="project.archivedAt">（已归档）</template>
       </button>
     </div>
 
     <template v-if="activeProject">
       <div class="panel" data-testid="project-detail">
-        <h2>{{ activeProject.name }}</h2>
+        <h2>
+          {{ activeProject.name }}
+          <span v-if="activeProject.archivedAt" class="badge" data-testid="project-archived-badge">已归档</span>
+        </h2>
         <p class="muted small">项目 ID：<code>{{ activeProject.id }}</code></p>
         <p data-testid="manager-line">
           顶层 manager：
           <strong v-if="manager" data-testid="manager-name">{{ manager.displayName }}</strong>
-          <span v-else class="muted">（未指定）</span>
+          <span v-else class="muted">（未指定，可稍后指定）</span>
         </p>
+
+        <!-- T1 #48：项目生命周期 -->
+        <div class="row" data-testid="project-lifecycle">
+          <button
+            v-if="!activeProject.archivedAt"
+            type="button"
+            :disabled="busy"
+            data-testid="archive-project"
+            @click="archiveProject"
+          >
+            归档项目
+          </button>
+          <button
+            v-else
+            type="button"
+            :disabled="busy"
+            data-testid="restore-project"
+            @click="restoreProject"
+          >
+            恢复项目
+          </button>
+          <button
+            type="button"
+            :disabled="busy"
+            class="danger"
+            data-testid="purge-project"
+            @click="requestProjectPurge"
+          >
+            永久删除项目
+          </button>
+        </div>
+
+        <div v-if="pendingProjectPurge" class="confirm" data-testid="project-purge-confirm">
+          <h3>确认永久删除项目「{{ pendingProjectPurge.projectName }}」？</h3>
+          <p class="muted small">
+            这一步不可恢复，并且会级联清除该项目下的以下内容（任务与记忆分别属于阶段 3、4，尚未落库）：
+          </p>
+          <ul class="small">
+            <li>群组：{{ pendingProjectPurge.cascade.groups }} 个</li>
+            <li>成员：{{ pendingProjectPurge.cascade.members }} 个</li>
+            <li>群聊消息：{{ pendingProjectPurge.cascade.messages }} 条（投递记录 {{ pendingProjectPurge.cascade.deliveries }} 条）</li>
+            <li>成员状态：{{ pendingProjectPurge.cascade.memberStatuses }} 条</li>
+            <li>MCP 会话记录：{{ pendingProjectPurge.cascade.mcpSessions }} 条</li>
+          </ul>
+          <p class="muted small">确认凭据在 {{ pendingProjectPurge.expiresAt }} 后失效。</p>
+          <div class="row">
+            <button
+              type="button"
+              :disabled="busy"
+              class="danger"
+              data-testid="confirm-purge-project"
+              @click="confirmProjectPurge"
+            >
+              确认永久删除
+            </button>
+            <button type="button" data-testid="cancel-purge-project" @click="cancelProjectPurge">取消</button>
+          </div>
+        </div>
       </div>
 
       <!-- 成员 -->
@@ -366,10 +541,64 @@ onMounted(() => void loadProjects());
         <p v-if="groups.length === 0" class="muted">暂无群组。</p>
         <ul v-else class="list" data-testid="group-list">
           <li v-for="group in groups" :key="group.id" class="list-item column">
-            <strong>{{ group.name }}</strong>
+            <strong>
+              {{ group.name }}
+              <span v-if="group.archivedAt" class="badge" data-testid="group-archived-badge">已归档</span>
+            </strong>
             <span class="small muted">参与者：{{ participantNames(group.id) }}</span>
+            <span class="actions" data-testid="group-lifecycle">
+              <button
+                v-if="!group.archivedAt"
+                type="button"
+                :disabled="busy"
+                data-testid="archive-group"
+                @click="archiveGroup(group)"
+              >
+                归档群组
+              </button>
+              <button
+                v-else
+                type="button"
+                :disabled="busy"
+                data-testid="restore-group"
+                @click="restoreGroup(group)"
+              >
+                恢复群组
+              </button>
+              <button
+                type="button"
+                :disabled="busy"
+                class="danger"
+                data-testid="purge-group"
+                @click="requestGroupPurge(group)"
+              >
+                永久删除群组
+              </button>
+            </span>
           </li>
         </ul>
+
+        <div v-if="pendingGroupPurge" class="confirm" data-testid="group-purge-confirm">
+          <h3>确认永久删除群组「{{ pendingGroupPurge.groupName }}」？</h3>
+          <p class="muted small">这一步不可恢复。删群组只清除群聊与参与者关系，项目成员本身保留。</p>
+          <ul class="small">
+            <li>群聊消息：{{ pendingGroupPurge.cascade.messages }} 条（投递记录 {{ pendingGroupPurge.cascade.deliveries }} 条）</li>
+            <li>参与者关系：{{ pendingGroupPurge.cascade.participants }} 条</li>
+            <li>MCP 会话记录：{{ pendingGroupPurge.cascade.mcpSessions }} 条</li>
+          </ul>
+          <div class="row">
+            <button
+              type="button"
+              :disabled="busy"
+              class="danger"
+              data-testid="confirm-purge-group"
+              @click="confirmGroupPurge"
+            >
+              确认永久删除
+            </button>
+            <button type="button" data-testid="cancel-purge-group" @click="cancelGroupPurge">取消</button>
+          </div>
+        </div>
       </div>
     </template>
     <p v-else class="muted">还没有项目，创建第一个项目开始。</p>
@@ -456,6 +685,29 @@ button.danger {
   padding: 0.5rem 0.75rem;
   border: 1px solid var(--border);
   border-radius: 8px;
+}
+
+/* T1 #48：永久删除的二次确认面板（红边提示不可恢复）。 */
+.confirm {
+  margin: 0.75rem 0 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--bad);
+  border-radius: 8px;
+  background: rgba(220, 38, 38, 0.06);
+}
+
+.confirm h3 {
+  margin: 0 0 0.35rem;
+  font-size: 1rem;
+}
+
+.confirm ul {
+  margin: 0.25rem 0 0.5rem;
+  padding-left: 1.25rem;
+}
+
+.chip {
+  border-radius: 999px;
 }
 
 .list-item.column {

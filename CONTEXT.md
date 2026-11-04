@@ -45,6 +45,7 @@
 | --- | --- | --- | --- | --- |
 | 原型 MCP server 在宿主被杀后日志暴涨到 1.2G | stderr 已断（EPIPE），`uncaughtException` 处理里又写 stderr，递归触发自身 | 日志写入必须 try/catch 包裹；EPIPE 单独短路，且对 uncaught 限次记录 | 任何 stdio MCP server | `.agent-output/d6-host-capability/` 修复前后对比 |
 | `skill` 工具报「skill "interview" is not available for model invocation」，读不到显式触发类技能 | 这些技能 frontmatter 有 `disable-model-invocation: true`（`interview`/`to-spec`/`to-tickets`/`implement`/`decision-map`/`handoff`），禁止 model 主动调用 | 用户示意「你自己往下走」时，直接读盘 `.agents/skills/<name>/SKILL.md` 按其流程执行；但 HITL 类（`interview`、decision:interview 票）仍**不得代用户回答**，只能用提问工具逐轮收敛 | 本仓库决策票与 `AGENTS.md` 工作流 | 2026-11-04 解 #31 全程；`.agents/skills/interview/SKILL.md:4` |
+| 给 `createT1ApiRouter` 加闭包内 `const` 状态（#48 永久删除待确认表）后，请求直接 500 `Cannot access 'pendingPurges' before initialization` | 该工厂函数**先 `return { handle }`**，后面的函数声明靠 hoisting 才能被调用；写在 `return` 之后的 `const`/`let` 永远不会初始化（TDZ） | 新增闭包状态必须声明在 `return` 之前（本仓库 `src/server/api.ts` 的结构就是「先 return，再写函数声明区」）；排查同类问题先看错误是否为 ReferenceError | `src/server/api.ts` 及其他「提前 return + 下方函数声明」的工厂 | 2026-11-04 #48 实现期；修复见同分支提交 |
 
 ## 待验证
 

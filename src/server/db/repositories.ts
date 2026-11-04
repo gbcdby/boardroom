@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import {
+  ArchivedError,
   ConflictError,
   InvalidArgumentError,
   InvalidReferenceError,
@@ -46,6 +47,12 @@ export interface MessageListOptions {
   readonly limit?: number;
 }
 
+/** 归档态列表的通用收窄选项（#48：默认只看未归档对象）。 */
+export interface ListOptions {
+  /** true = 连已归档行一起返回；缺省 false 只返回未归档行。 */
+  readonly includeArchived?: boolean;
+}
+
 export interface AgentsRepository {
   create(input: NewAgent): Agent;
   /** 以完整字段插入（含外部提供的 ID），重复 ID 报 ConflictError。 */
@@ -62,11 +69,46 @@ export interface AgentsRepository {
   delete(id: string): void;
 }
 
+/**
+ * 永久删除的级联清单（#48 / LIFE-ARC-02）：删除前给人看的「会被清掉什么」，
+ * 删除后作为实际清除的行数返回。口径 = 当前已落库的范围（阶段 1/2）；
+ * 任务、评论、记忆分别在阶段 3、阶段 4 落库，届时按同一形状补进清单。
+ */
+export interface PurgeCounts {
+  readonly groups: number;
+  readonly members: number;
+  readonly messages: number;
+  readonly deliveries: number;
+  readonly memberStatuses: number;
+  readonly mcpSessions: number;
+}
+
+/** 群组级联清单（#48）：删群组只清群聊与参与者关系，**不动成员本身**。 */
+export interface GroupPurgeCounts {
+  readonly messages: number;
+  readonly deliveries: number;
+  readonly participants: number;
+  readonly mcpSessions: number;
+}
+
 export interface ProjectsRepository {
   create(input: NewProject): Project;
   get(id: string): Project | null;
-  list(): Project[];
+  /** 默认只列**未归档**项目；`includeArchived` 时连归档项目一起返回（#48 / PROJECT-03）。 */
+  list(options?: ListOptions): Project[];
   rename(id: string, name: string): Project;
+  /** 归档：写入归档时间；已归档时幂等返回（可恢复，不删数据）。 */
+  archive(id: string, at?: string): Project;
+  /** 恢复：清除归档时间；未归档时幂等返回。 */
+  restore(id: string): Project;
+  /** 永久删除前的级联清单（只读，不改数据）。项目不存在时抛 NotFoundError。 */
+  previewPurge(id: string): PurgeCounts;
+  /**
+   * 永久删除项目：在**单个事务**内按「子 → 父」顺序级联清除群组、群聊消息、投递、
+   * 参与者关系、成员、成员状态与 MCP 会话，最后删项目本身；返回实际清除的行数。
+   * 只应在人二次确认后由入口调用（PROJECT-03）：agent 主体没有 `project:purge` 能力点。
+   */
+  purge(id: string): PurgeCounts;
   delete(id: string): void;
 }
 
@@ -84,7 +126,20 @@ export interface MembersRepository {
 export interface GroupsRepository {
   create(input: NewGroup): Group;
   get(id: string): Group | null;
-  listByProject(projectId: string): Group[];
+  /** 默认只列**未归档**群组；`includeArchived` 时连归档群组一起返回（#48 / GROUP-04）。 */
+  listByProject(projectId: string, options?: ListOptions): Group[];
+  /** 归档（可恢复）：写入归档时间；已归档时幂等。 */
+  archive(id: string, at?: string): Group;
+  /** 恢复：清除归档时间；未归档时幂等。 */
+  restore(id: string): Group;
+  /** 永久删除前的级联清单（只读）。群组不存在时抛 NotFoundError。 */
+  previewPurge(id: string): GroupPurgeCounts;
+  /**
+   * 永久删除群组（#48 / GROUP-04、LIFE-ARC-02）：单事务内清除**该群组的群聊**
+   * （消息与投递记录）、**参与者关系**，以及随群组消失的连接会话记录。
+   * 项目成员本身**不动**——这是与 {@link ProjectsRepository.purge} 的关键差别。
+   */
+  purge(id: string): GroupPurgeCounts;
   participants(groupId: string): string[];
   addParticipant(groupId: string, memberId: string): void;
   removeParticipant(groupId: string, memberId: string): void;
@@ -246,6 +301,74 @@ function requireNonEmpty(value: unknown, field: string): string {
   return value;
 }
 
+/**
+ * 归档态写检查（#48 / PROJECT-03、GROUP-04）。
+ *
+ * 归档 = **可恢复的非活跃态**：不删数据、历史仍可读，但拒绝新写入。
+ * 强制点放在 repository 这一唯一的写入边界上，HTTP（人）与 MCP（agent）两个入口
+ * 因此共享同一条规则，不依赖调用方自律。
+ */
+function requireProjectActive(db: Database.Database, projectId: string, action: string): void {
+  const row = db
+    .prepare("SELECT archived_at FROM projects WHERE id = ?")
+    .get(projectId) as { archived_at: string | null } | undefined;
+  if (row?.archived_at != null) {
+    throw new ArchivedError(`项目已归档，不能${action}；如需继续，请先恢复该项目。`);
+  }
+}
+
+/** 同 {@link requireProjectActive}，但面向群组：群组自身或其所属项目归档即拒绝写入。 */
+function requireGroupActive(db: Database.Database, groupId: string, action: string): void {
+  const row = db
+    .prepare(
+      `SELECT g.archived_at AS group_archived, p.archived_at AS project_archived
+         FROM groups g JOIN projects p ON p.id = g.project_id
+        WHERE g.id = ?`,
+    )
+    .get(groupId) as { group_archived: string | null; project_archived: string | null } | undefined;
+  if (row === undefined) return; // 群组不存在由调用方各自的引用校验负责，这里不重复报错。
+  if (row.group_archived != null) {
+    throw new ArchivedError(`群组已归档，不能${action}；如需继续，请先恢复该群组。`);
+  }
+  if (row.project_archived != null) {
+    throw new ArchivedError(`项目已归档，不能${action}；如需继续，请先恢复该项目。`);
+  }
+}
+
+/**
+ * 永久删除项目时会波及的行数清单（#48 / LIFE-ARC-02）。
+ * 只读；与 {@link ProjectsRepository.purge} 的删除顺序一一对应。
+ */
+function projectPurgeCounts(db: Database.Database, projectId: string): PurgeCounts {
+  const count = (sql: string): number => (db.prepare(sql).get(projectId) as { c: number }).c;
+  return {
+    groups: count("SELECT COUNT(*) AS c FROM groups WHERE project_id = ?"),
+    members: count("SELECT COUNT(*) AS c FROM members WHERE project_id = ?"),
+    messages: count(
+      "SELECT COUNT(*) AS c FROM messages m WHERE m.group_id IN (SELECT id FROM groups WHERE project_id = ?)",
+    ),
+    deliveries: count("SELECT COUNT(*) AS c FROM message_deliveries WHERE project_id = ?"),
+    memberStatuses: count("SELECT COUNT(*) AS c FROM member_statuses WHERE project_id = ?"),
+    mcpSessions: count("SELECT COUNT(*) AS c FROM mcp_sessions WHERE project_id = ?"),
+  };
+}
+
+/**
+ * 永久删除群组时会波及的行数清单（#48 / LIFE-ARC-02）。
+ * 口径只含群聊与参与者关系（外加随群组消失的会话记录），**不含成员**。
+ */
+function groupPurgeCounts(db: Database.Database, groupId: string): GroupPurgeCounts {
+  const count = (sql: string): number => (db.prepare(sql).get(groupId) as { c: number }).c;
+  return {
+    messages: count("SELECT COUNT(*) AS c FROM messages WHERE group_id = ?"),
+    deliveries: count(
+      "SELECT COUNT(*) AS c FROM message_deliveries WHERE message_id IN (SELECT id FROM messages WHERE group_id = ?)",
+    ),
+    participants: count("SELECT COUNT(*) AS c FROM group_participants WHERE group_id = ?"),
+    mcpSessions: count("SELECT COUNT(*) AS c FROM mcp_sessions WHERE group_id = ?"),
+  };
+}
+
 function toAgent(row: AgentRow): Agent {
   return {
     id: row.id,
@@ -362,31 +485,62 @@ interface ProjectRow {
   name: string;
   created_at: string;
   updated_at: string;
+  archived_at: string | null;
 }
 
 function toProject(row: ProjectRow): Project {
-  return { id: row.id, name: row.name, createdAt: row.created_at, updatedAt: row.updated_at };
+  return {
+    id: row.id,
+    name: row.name,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    archivedAt: row.archived_at ?? null,
+  };
 }
 
 function createProjects(db: Database.Database): ProjectsRepository {
   return {
     create(input) {
       const name = requireNonEmpty(input.name, "Project.name");
+      // 创建时指定顶层 manager（#48 / PROJECT-02）：agent 必须已存在，否则整体拒绝，
+      // 不留半个项目（引用校验放在写入之前）。
+      const managerAgentId = input.managerAgentId ?? null;
+      let managerName: string | null = null;
+      if (managerAgentId !== null) {
+        const agent = db
+          .prepare("SELECT display_name FROM agents WHERE id = ?")
+          .get(managerAgentId) as { display_name: string } | undefined;
+        if (!agent) {
+          throw new InvalidReferenceError(
+            `Agent ${managerAgentId} 不存在，无法在创建项目时指定为顶层 manager。`,
+          );
+        }
+        managerName = agent.display_name;
+      }
       const at = nowIso();
-      const project: Project = { id: newId(), name, createdAt: at, updatedAt: at };
-      runInTransaction(db, () =>
+      const project: Project = { id: newId(), name, createdAt: at, updatedAt: at, archivedAt: null };
+      runInTransaction(db, () => {
         db
           .prepare("INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)")
-          .run(project.id, project.name, project.createdAt, project.updatedAt),
-      );
+          .run(project.id, project.name, project.createdAt, project.updatedAt);
+        if (managerAgentId !== null && managerName !== null) {
+          db.prepare(
+            `INSERT INTO members (id, project_id, agent_id, kind, display_name, role, created_at, updated_at)
+             VALUES (?, ?, ?, 'agent', ?, 'manager', ?, ?)`,
+          ).run(newId(), project.id, managerAgentId, managerName, at, at);
+        }
+      });
       return project;
     },
     get(id) {
       const row = db.prepare("SELECT * FROM projects WHERE id = ?").get(id) as ProjectRow | undefined;
       return row ? toProject(row) : null;
     },
-    list() {
-      return (db.prepare("SELECT * FROM projects ORDER BY created_at, id").all() as ProjectRow[]).map(toProject);
+    list(options = {}) {
+      const where = options.includeArchived ? "" : "WHERE archived_at IS NULL";
+      return (
+        db.prepare(`SELECT * FROM projects ${where} ORDER BY created_at, id`).all() as ProjectRow[]
+      ).map(toProject);
     },
     rename(id, name) {
       const value = requireNonEmpty(name, "Project.name");
@@ -395,6 +549,51 @@ function createProjects(db: Database.Database): ProjectsRepository {
         .run(value, nowIso(), id);
       if (result.changes === 0) throw new NotFoundError(`Project ${id} 不存在。`);
       return this.get(id)!;
+    },
+    archive(id, at) {
+      const existing = this.get(id);
+      if (!existing) throw new NotFoundError(`Project ${id} 不存在。`);
+      if (existing.archivedAt !== null) return existing;
+      const stamp = at ?? nowIso();
+      runInTransaction(db, () =>
+        db.prepare("UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?").run(stamp, stamp, id),
+      );
+      return this.get(id)!;
+    },
+    restore(id) {
+      const existing = this.get(id);
+      if (!existing) throw new NotFoundError(`Project ${id} 不存在。`);
+      if (existing.archivedAt === null) return existing;
+      runInTransaction(db, () =>
+        db.prepare("UPDATE projects SET archived_at = NULL, updated_at = ? WHERE id = ?").run(nowIso(), id),
+      );
+      return this.get(id)!;
+    },
+    previewPurge(id) {
+      if (!this.get(id)) throw new NotFoundError(`Project ${id} 不存在。`);
+      return projectPurgeCounts(db, id);
+    },
+    purge(id) {
+      if (!this.get(id)) throw new NotFoundError(`Project ${id} 不存在。`);
+      const counts = projectPurgeCounts(db, id);
+      runInTransaction(db, () => {
+        // 显式「子 → 父」顺序，而不是只依赖外键级联：清单与实际清除的行必须一一对得上，
+        // 也让 PG 重写（M1 #54）时不依赖特定级联顺序。
+        db.prepare("DELETE FROM message_deliveries WHERE project_id = ?").run(id);
+        db
+          .prepare("DELETE FROM messages WHERE group_id IN (SELECT id FROM groups WHERE project_id = ?)")
+          .run(id);
+        db
+          .prepare("DELETE FROM group_participants WHERE group_id IN (SELECT id FROM groups WHERE project_id = ?)")
+          .run(id);
+        db.prepare("DELETE FROM groups WHERE project_id = ?").run(id);
+        db.prepare("DELETE FROM mcp_sessions WHERE project_id = ?").run(id);
+        db.prepare("DELETE FROM member_statuses WHERE project_id = ?").run(id);
+        db.prepare("DELETE FROM members WHERE project_id = ?").run(id);
+        const removed = db.prepare("DELETE FROM projects WHERE id = ?").run(id);
+        if (removed.changes === 0) throw new NotFoundError(`Project ${id} 不存在。`);
+      });
+      return counts;
     },
     delete(id) {
       const result = db.prepare("DELETE FROM projects WHERE id = ?").run(id);
@@ -440,6 +639,7 @@ function createMembers(db: Database.Database): MembersRepository {
       if (!projectExists.get(input.projectId)) {
         throw new InvalidReferenceError(`项目 ${input.projectId} 不存在，无法添加成员。`);
       }
+      requireProjectActive(db, input.projectId, "添加项目成员");
       const displayName = requireNonEmpty(input.displayName, "Member.displayName");
       if (input.kind !== "agent" && input.kind !== "human") {
         throw new InvalidArgumentError(`Member.kind 必须是 agent 或 human，收到：${String(input.kind)}。`);
@@ -495,6 +695,7 @@ function createMembers(db: Database.Database): MembersRepository {
     update(id, patch) {
       const existing = repo.get(id);
       if (!existing) throw new NotFoundError(`Member ${id} 不存在。`);
+      requireProjectActive(db, existing.projectId, "修改项目成员");
       const displayName =
         patch.displayName === undefined
           ? existing.displayName
@@ -528,10 +729,18 @@ interface GroupRow {
   name: string;
   created_at: string;
   updated_at: string;
+  archived_at: string | null;
 }
 
 function toGroup(row: GroupRow): Group {
-  return { id: row.id, projectId: row.project_id, name: row.name, createdAt: row.created_at, updatedAt: row.updated_at };
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    name: row.name,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    archivedAt: row.archived_at ?? null,
+  };
 }
 
 function createGroups(db: Database.Database): GroupsRepository {
@@ -544,6 +753,7 @@ function createGroups(db: Database.Database): GroupsRepository {
       if (!projectExists.get(input.projectId)) {
         throw new InvalidReferenceError(`项目 ${input.projectId} 不存在，无法创建群组。`);
       }
+      requireProjectActive(db, input.projectId, "在项目内创建群组");
       const name = requireNonEmpty(input.name, "Group.name");
       const participants = dedupe(input.participantMemberIds ?? []);
       for (const memberId of participants) {
@@ -574,10 +784,56 @@ function createGroups(db: Database.Database): GroupsRepository {
       const row = getGroupRow(id);
       return row ? toGroup(row) : null;
     },
-    listByProject(projectId) {
+    listByProject(projectId, options = {}) {
+      const where = options.includeArchived
+        ? "WHERE project_id = ?"
+        : "WHERE project_id = ? AND archived_at IS NULL";
       return (
-        db.prepare("SELECT * FROM groups WHERE project_id = ? ORDER BY created_at, id").all(projectId) as GroupRow[]
+        db.prepare(`SELECT * FROM groups ${where} ORDER BY created_at, id`).all(projectId) as GroupRow[]
       ).map(toGroup);
+    },
+    archive(id, at) {
+      const existing = this.get(id);
+      if (!existing) throw new NotFoundError(`Group ${id} 不存在。`);
+      if (existing.archivedAt !== null) return existing;
+      const stamp = at ?? nowIso();
+      runInTransaction(db, () =>
+        db.prepare("UPDATE groups SET archived_at = ?, updated_at = ? WHERE id = ?").run(stamp, stamp, id),
+      );
+      return this.get(id)!;
+    },
+    restore(id) {
+      const existing = this.get(id);
+      if (!existing) throw new NotFoundError(`Group ${id} 不存在。`);
+      if (existing.archivedAt === null) return existing;
+      runInTransaction(db, () =>
+        db.prepare("UPDATE groups SET archived_at = NULL, updated_at = ? WHERE id = ?").run(nowIso(), id),
+      );
+      return this.get(id)!;
+    },
+    previewPurge(id) {
+      if (!getGroupRow(id)) throw new NotFoundError(`Group ${id} 不存在。`);
+      return groupPurgeCounts(db, id);
+    },
+    purge(id) {
+      if (!getGroupRow(id)) throw new NotFoundError(`Group ${id} 不存在。`);
+      const counts = groupPurgeCounts(db, id);
+      runInTransaction(db, () => {
+        // 只清「群聊 + 参与者关系」（LIFE-ARC-02）：投递记录随消息一起清，
+        // 会话记录随群组一起清；**members 与 member_statuses 一行都不动**。
+        db
+          .prepare(
+            `DELETE FROM message_deliveries
+              WHERE message_id IN (SELECT id FROM messages WHERE group_id = ?)`,
+          )
+          .run(id);
+        db.prepare("DELETE FROM messages WHERE group_id = ?").run(id);
+        db.prepare("DELETE FROM group_participants WHERE group_id = ?").run(id);
+        db.prepare("DELETE FROM mcp_sessions WHERE group_id = ?").run(id);
+        const removed = db.prepare("DELETE FROM groups WHERE id = ?").run(id);
+        if (removed.changes === 0) throw new NotFoundError(`Group ${id} 不存在。`);
+      });
+      return counts;
     },
     participants(groupId) {
       return (
@@ -589,6 +845,8 @@ function createGroups(db: Database.Database): GroupsRepository {
     addParticipant(groupId, memberId) {
       const group = getGroupRow(groupId);
       if (!group) throw new NotFoundError(`Group ${groupId} 不存在。`);
+      // 归档 = 非活跃态：不再接受新参与者（含 MCP 入群时落到本群组的 addParticipant）。
+      requireGroupActive(db, groupId, "把成员加入群组");
       if (!memberInProject.get(memberId, group.project_id)) {
         throw new InvalidReferenceError(`成员 ${memberId} 不属于项目 ${group.project_id}，不能加入该群组。`);
       }
@@ -642,6 +900,7 @@ function createMessages(db: Database.Database): MessagesRepository {
           | { project_id: string }
           | undefined;
         if (!group) throw new InvalidReferenceError(`群组 ${input.groupId} 不存在，无法发送消息。`);
+        requireGroupActive(db, input.groupId, "向群组发送消息");
 
         const sender = db.prepare("SELECT project_id FROM members WHERE id = ?").get(input.senderMemberId) as
           | { project_id: string }

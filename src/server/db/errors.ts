@@ -21,7 +21,9 @@ export type RepositoryErrorCode =
   | "conflict"
   | "invalid_reference"
   | "invalid_argument"
-  | "write_failed";
+  | "write_failed"
+  /** 目标项目/群组处于归档态：写路径拒绝，恢复后放行（#48 PROJECT-03 / GROUP-04）。 */
+  | "archived";
 
 /** 目标实体不存在。 */
 export class NotFoundError extends RepositoryError {
@@ -60,5 +62,18 @@ export class WriteFailedError extends RepositoryError {
   override readonly name = "WriteFailedError";
   constructor(message: string, cause?: unknown) {
     super("write_failed", message, cause);
+  }
+}
+
+/**
+ * 目标处于归档态，写入被拒（#48 T1）。
+ *
+ * 归档是**可恢复**的非活跃态：这里只拒绝新写入并给出恢复指引，不删任何数据；
+ * 永久删除走 `purge`（人二次确认），与本错误无关。
+ */
+export class ArchivedError extends RepositoryError {
+  override readonly name = "ArchivedError";
+  constructor(message: string, cause?: unknown) {
+    super("archived", message, cause);
   }
 }

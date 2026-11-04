@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type Database from "better-sqlite3";
 import type { HeartbeatConfig } from "./config.ts";
@@ -12,7 +13,9 @@ import { deriveEffectiveStatus } from "./status.ts";
 import {
   authorizeOrThrow,
   ForbiddenError,
+  visibleGroups,
   type Actor,
+  type AuthorizeDecision,
   type Capability,
   type GuardScope,
 } from "./authz/authorize.ts";
@@ -29,7 +32,7 @@ import { actorForMember, ownerActor } from "./authz/actors.ts";
  * - 路由前缀 `/api`；本模块只处理已确认的路径，未匹配时返回 `matched: false`，
  *   由 server.ts 继续走 404 / MCP / 静态资源。
  * - 错误统一 JSON `{ error: { code, message } }`，`code` 与 F2 repository 错误码一致
- *   （not_found / conflict / invalid_reference / invalid_argument / write_failed），
+ *   （not_found / conflict / archived / invalid_reference / invalid_argument / write_failed），
  *   权限判定拒绝用 F2 守卫的拒绝码（forbidden / out_of_subtree / …，HTTP 403）。
  * - 校验与持久化复用 F2 repository（`createRepositories`），不重复实现唯一 manager 约束；
  *   重复指定 manager 由 repository/唯一索引归一为 ConflictError → HTTP 409（D2）。
@@ -96,12 +99,16 @@ export interface MessageView {
 const ERROR_STATUS: Record<string, number> = {
   not_found: 404,
   conflict: 409,
+  archived: 409,
   invalid_reference: 400,
   invalid_argument: 400,
   write_failed: 500,
 };
 
 const MAX_BODY_BYTES = 1_000_000;
+
+/** 永久删除确认凭据的有效期（PROJECT-03：人二次确认；超时需重新发起）。 */
+const PURGE_CONFIRM_TTL_MS = 5 * 60 * 1000;
 
 /** 创建 T1 API 路由。日志不记录消息正文等敏感字段（本模块无正文）。 */
 export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
@@ -110,6 +117,17 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   const log = logger.child({ component: "api" });
   const heartbeat: HeartbeatConfig = options.heartbeat ?? { intervalMs: 10_000, timeoutMs: 30_000 };
   const now = options.now ?? (() => new Date());
+
+  /**
+   * 待确认的永久删除（T1 #48）：`project:<id>` / `group:<id>` → 一次性凭据与到期时间。
+   * 第一刀只登记凭据并返回级联清单，带**同一凭据**的第二刀才真正执行清除。
+   * 凭据活在进程内（默认 {@link PURGE_CONFIRM_TTL_MS}）：服务重启后失效，需要重新发起，
+   * 不会拿旧凭据删掉重启之后的数据。
+   *
+   * 必须在 `return { handle }` 之前初始化：路由器工厂靠提前 return 暴露句柄，
+   * 之后的 `const` 不会被执行到（详见本文件底部的函数声明区）。
+   */
+  const pendingPurges = new Map<string, { token: string; expiresAt: number }>();
 
   /** 默认主体：阶段 1 的人（owner）；给定 memberId 时用其成员行推导静态角色。 */
   function resolveDefaultActor(r: RepositorySet, resolution: ActorResolution): Actor {
@@ -121,8 +139,12 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   }
 
   /**
-   * 守卫式调用：允许则继续执行，拒绝抛 {@link ForbiddenError}（HTTP 403 + 稳定拒绝码）。
-   * 调用点一律放在参数/引用校验之后，保证既有失败路径的状态码与错误码不变。
+   * 守卫式调用：允许则继续执行并返回**主体 + 判定**，拒绝抛 {@link ForbiddenError}
+   * （HTTP 403 + 稳定拒绝码）。调用点一律放在参数/引用校验之后，
+   * 保证既有失败路径的状态码与错误码不变。
+   *
+   * 返回判定里的 `conn` 是 #48 行级收窄的输入：列表端点据此只取主体被允许触碰的行
+   * （NFR-PROJ-01 / 决策票 #37 的 conn-scoped 强制点），不依赖调用方自律。
    */
   function guard(
     r: RepositorySet,
@@ -130,7 +152,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     capability: Capability,
     scope: GuardScope,
     memberId?: string,
-  ): void {
+  ): { actor: Actor; decision: Extract<AuthorizeDecision, { allowed: true }> } {
     const resolution: ActorResolution = {
       request,
       projectId: scope.projectId ?? null,
@@ -147,7 +169,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         reason: "无法确定请求主体，守卫按 fail-closed 拒绝。",
       });
     }
-    authorizeOrThrow(actor, capability, scope);
+    return { actor, decision: authorizeOrThrow(actor, capability, scope) };
   }
 
   return {
@@ -193,15 +215,27 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         const body = await readObjectBody(request);
         // F2：创建项目 = project:create（阶段 1 默认人=owner 放行；manager 无此能力点）。
         guard(r, request, "project:create", {});
-        const project = r.projects.create({ name: requireString(body, "name") });
+        // #48 / PROJECT-02：可选「创建时指定」顶层 manager（已有全局 agent）；省略 = 留空待分配。
+        const managerAgentId = optionalStringOrNull(body, "managerAgentId");
+        const project = r.projects.create({
+          name: requireString(body, "name"),
+          ...(managerAgentId === undefined ? {} : { managerAgentId }),
+        });
         log.info("创建项目", { projectId: project.id });
         writeJson(response, 201, { project: projectView(r, project) });
         return true;
       }
       if (method === "GET") {
         // F2：跨项目清单 = overview:view（OVERVIEW-01：仅人 / 顶层 manager 可见）。
-        guard(r, request, "overview:view", {});
-        writeJson(response, 200, { projects: r.projects.list().map((p) => projectView(r, p)) });
+        const { decision } = guard(r, request, "overview:view", {});
+        const includeArchived = truthyParam(request, "includeArchived");
+        // #48 行级收窄：绑定在某项目上的主体（agent 成员）只看得到自己那个项目；
+        // 全局主体（阶段 1 的人）conn.projectId = null → 仍看到全部，行为不变。
+        const boundProjectId = decision.conn.projectId;
+        const projects = r
+          .projects.list({ includeArchived })
+          .filter((p) => boundProjectId === null || p.id === boundProjectId);
+        writeJson(response, 200, { projects: projects.map((p) => projectView(r, p)) });
         return true;
       }
       methodNotAllowed(response, ["GET", "POST"]);
@@ -217,7 +251,36 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         writeJson(response, 200, { project: projectView(r, project) });
         return true;
       }
-      methodNotAllowed(response, ["GET"]);
+      if (method === "DELETE") {
+        // T1 #48：项目永久删除（PROJECT-03、LIFE-ARC-02），走二次确认流程。
+        await purgeProject(r, request, response, projectId);
+        return true;
+      }
+      methodNotAllowed(response, ["GET", "DELETE"]);
+      return true;
+    }
+
+    // /api/projects/:id/archive 与 /api/projects/:id/restore —— T1 #48 归档 / 恢复
+    // （PROJECT-03、LIFE-ARC-01：归档可恢复，不删任何数据；永久删除走 purge 流程）
+    if (
+      segments.length === 4 &&
+      segments[0] === "api" &&
+      segments[1] === "projects" &&
+      (segments[3] === "archive" || segments[3] === "restore")
+    ) {
+      const projectId = decodeSegment(segments[2]!);
+      const project = requireProject(r, projectId);
+      if (method === "POST") {
+        // 归档与恢复共用 `project:archive` 能力点：恢复 = 取消归档，权限同位。
+        // 顶层 manager 可归档（LIFE-ARC-01），但矩阵里没有 project:purge → 不能永久删除。
+        guard(r, request, "project:archive", { projectId: project.id });
+        const next =
+          segments[3] === "archive" ? r.projects.archive(project.id) : r.projects.restore(project.id);
+        log.info(segments[3] === "archive" ? "归档项目" : "恢复项目", { projectId });
+        writeJson(response, 200, { project: projectView(r, next) });
+        return true;
+      }
+      methodNotAllowed(response, ["POST"]);
       return true;
     }
 
@@ -393,12 +456,67 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         return true;
       }
       if (method === "GET") {
-        // 端点级判定；「我看到哪些群组」的行级收窄由守卫的 `visibleGroups` 负责（T1/T2/T4 复用）。
-        guard(r, request, "group:view", { projectId });
-        writeJson(response, 200, { groups: r.groups.listByProject(projectId).map(groupView) });
+        // 端点级判定 + #48 行级收窄：`visibleGroups` 只留下主体可见的群组
+        // （参与的、或全项目岗位看到的全部）；不可见的群组**不出现**，不泄漏存在。
+        const { actor } = guard(r, request, "group:view", { projectId });
+        const includeArchived = truthyParam(request, "includeArchived");
+        const candidates = r.groups.listByProject(projectId, { includeArchived });
+        const visible = new Set(
+          visibleGroups(
+            actor,
+            candidates.map((g) => ({ id: g.id, projectId, memberIds: r.groups.participants(g.id) })),
+          ).map((g) => g.id),
+        );
+        writeJson(response, 200, { groups: candidates.filter((g) => visible.has(g.id)).map(groupView) });
         return true;
       }
       methodNotAllowed(response, ["GET", "POST"]);
+      return true;
+    }
+
+    // /api/groups/:id/archive 与 /api/groups/:id/restore —— T1 #48 群组归档 / 恢复
+    // （GROUP-04、LIFE-ARC-01：归档可恢复、不删数据；永久删除走 purge 流程）
+    if (
+      segments.length === 4 &&
+      segments[0] === "api" &&
+      segments[1] === "groups" &&
+      (segments[3] === "archive" || segments[3] === "restore")
+    ) {
+      const groupId = decodeSegment(segments[2]!);
+      const group = requireGroup(r, groupId);
+      if (method === "POST") {
+        // 归档与恢复共用 `group:archive`（owner / 顶层 manager / 下级 manager 限子树）。
+        guard(r, request, "group:archive", { projectId: group.projectId, groupId });
+        const next = segments[3] === "archive" ? r.groups.archive(groupId) : r.groups.restore(groupId);
+        log.info(segments[3] === "archive" ? "归档群组" : "恢复群组", {
+          projectId: group.projectId,
+          groupId,
+        });
+        writeJson(response, 200, { group: groupView(next) });
+        return true;
+      }
+      methodNotAllowed(response, ["POST"]);
+      return true;
+    }
+
+    // /api/groups/:id —— T1 #48：GET 单个群组；DELETE 走二次确认的永久删除（只清群聊与参与者关系）
+    if (segments.length === 3 && segments[0] === "api" && segments[1] === "groups") {
+      const groupId = decodeSegment(segments[2]!);
+      if (method === "GET") {
+        const group = requireGroup(r, groupId);
+        guard(r, request, "group:view", {
+          projectId: group.projectId,
+          groupId,
+          groupMemberIds: r.groups.participants(groupId),
+        });
+        writeJson(response, 200, { group: groupView(group) });
+        return true;
+      }
+      if (method === "DELETE") {
+        await purgeGroup(r, request, response, groupId);
+        return true;
+      }
+      methodNotAllowed(response, ["GET", "DELETE"]);
       return true;
     }
 
@@ -523,6 +641,164 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   }
 
   // -------------------------------------------------------------------------
+  // 永久删除的二次确认（PROJECT-03 / LIFE-ARC-01）
+  // -------------------------------------------------------------------------
+  // 注：待确认凭据表 `pendingPurges` 在路由器工厂顶部初始化（必须早于 `return { handle }`，
+  // 否则该 `const` 永远不会执行到，这里只是复用同一个闭包变量）。
+
+  function issuePurgeConfirmation(key: string): { token: string; expiresAt: number } {
+    const entry = { token: randomUUID(), expiresAt: Date.now() + PURGE_CONFIRM_TTL_MS };
+    pendingPurges.set(key, entry);
+    return entry;
+  }
+
+  /**
+   * 校验并消费确认凭据（一次性：成功执行后立刻失效）。
+   * 凭据**不对或已过期时不消费**——失败重试仍用同一凭据即可，不必重新发起；
+   * 过期后（{@link PURGE_CONFIRM_TTL_MS}）必须重新拿一份最新的级联清单。
+   */
+  function consumePurgeConfirmation(key: string, token: string): boolean {
+    const entry = pendingPurges.get(key);
+    if (entry === undefined) return false;
+    if (entry.token !== token || entry.expiresAt < Date.now()) return false;
+    pendingPurges.delete(key);
+    return true;
+  }
+
+  /**
+   * 永久删除的一刀两拍（#48：PROJECT-03 / GROUP-04 共用同一流程）。
+   *
+   * 第一刀不删，只返回级联清单与一次性确认凭据；第二刀带同一凭据才执行 {@link PurgeFlow.execute}。
+   * 守卫（能力点）在取凭据之前判定：manager 主体连清单都拿不到（403），人必须确认两次。
+   */
+  interface PurgeFlow {
+    /** 待确认表键：`project:<id>` / `group:<id>`。 */
+    readonly key: string;
+    readonly capability: Capability;
+    readonly scope: GuardScope;
+    /** 确认载荷里的资源字段（kind/id/名称/归档位……），随级联清单一起返回。 */
+    readonly resource: () => Record<string, unknown>;
+    /** 第一刀给「人」看的可读说明：会清掉什么、能不能反悔。 */
+    readonly ask: () => string;
+    /** 日志事件名。 */
+    readonly event: string;
+    /** 第一刀的级联清单（只读）。 */
+    readonly preview: () => unknown;
+    /** 第二刀的实际清除，返回清除行数。 */
+    readonly execute: () => unknown;
+  }
+
+  async function purgeWithConfirmation(
+    r: RepositorySet,
+    flow: PurgeFlow,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    guard(r, request, flow.capability, flow.scope);
+    const body = await readOptionalObjectBody(request);
+    const confirm = typeof body["confirm"] === "string" ? (body["confirm"] as string) : null;
+
+    if (confirm === null) {
+      const cascade = flow.preview();
+      const entry = issuePurgeConfirmation(flow.key);
+      log.info(`${flow.event}：等待二次确认`, { cascade });
+      writeJson(response, 409, {
+        error: { code: "confirmation_required", message: flow.ask() },
+        confirmation: {
+          ...flow.resource(),
+          cascade,
+          token: entry.token,
+          expiresAt: new Date(entry.expiresAt).toISOString(),
+        },
+      });
+      return;
+    }
+
+    if (!consumePurgeConfirmation(flow.key, confirm)) {
+      throw new HttpError(
+        400,
+        "invalid_confirmation",
+        "永久删除的确认凭据无效或已过期，请重新发起以获取最新的级联清单与凭据。",
+      );
+    }
+
+    const cleared = flow.execute();
+    log.info(`${flow.event}：已清除`, { cleared });
+    response.writeHead(204, { "cache-control": "no-store" });
+    response.end();
+  }
+
+  /** `DELETE /api/projects/:id`：永久删除项目并级联清除其群组/群聊/成员与状态（PROJECT-03、LIFE-ARC-02）。 */
+  async function purgeProject(
+    r: RepositorySet,
+    request: IncomingMessage,
+    response: ServerResponse,
+    projectId: string,
+  ): Promise<void> {
+    const project = requireProject(r, projectId);
+    await purgeWithConfirmation(
+      r,
+      {
+        key: `project:${project.id}`,
+        // 只有「人（owner）」持有 project:purge；顶层 manager 没有 → 403（LIFE-ARC-01）。
+        capability: "project:purge",
+        scope: { projectId: project.id },
+        resource: () => ({
+          kind: "project",
+          projectId: project.id,
+          projectName: project.name,
+          archivedAt: project.archivedAt,
+        }),
+        ask: () =>
+          `永久删除项目「${project.name}」会级联清除它的群组、群聊消息、投递、成员与状态，且不可恢复。` +
+          "确认无误后请带 confirmation.token 重新发起 DELETE。",
+        event: "永久删除项目",
+        preview: () => r.projects.previewPurge(project.id),
+        execute: () => r.projects.purge(project.id),
+      },
+      request,
+      response,
+    );
+  }
+
+  /**
+   * `DELETE /api/groups/:id`：与项目同构的二次确认流程，但级联范围**只到群聊与参与者关系**
+   * （LIFE-ARC-02）：项目成员、其所在其他群组、成员状态都保持不变。
+   */
+  async function purgeGroup(
+    r: RepositorySet,
+    request: IncomingMessage,
+    response: ServerResponse,
+    groupId: string,
+  ): Promise<void> {
+    const group = requireGroup(r, groupId);
+    await purgeWithConfirmation(
+      r,
+      {
+        key: `group:${group.id}`,
+        // `group:purge` 同样只有人持有（LIFE-ARC-01）。
+        capability: "group:purge",
+        scope: { projectId: group.projectId, groupId: group.id },
+        resource: () => ({
+          kind: "group",
+          projectId: group.projectId,
+          groupId: group.id,
+          groupName: group.name,
+          archivedAt: group.archivedAt,
+        }),
+        ask: () =>
+          `永久删除群组「${group.name}」会清除它的群聊消息与参与者关系，且不可恢复；项目成员本身不受影响。` +
+          "确认后请带 confirmation.token 重新发起 DELETE。",
+        event: "永久删除群组",
+        preview: () => r.groups.previewPurge(group.id),
+        execute: () => r.groups.purge(group.id),
+      },
+      request,
+      response,
+    );
+  }
+
+  // -------------------------------------------------------------------------
   // 视图
   // -------------------------------------------------------------------------
 
@@ -561,6 +837,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       name: project.name,
       createdAt: project.createdAt,
       updatedAt: project.updatedAt,
+      // T1 #48：归档时间（null = 未归档）。归档对象默认不出现在列表里，但形状一致。
+      archivedAt: project.archivedAt,
       manager: manager ? memberView(manager) : null,
     };
   }
@@ -585,6 +863,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       name: group.name,
       createdAt: group.createdAt,
       updatedAt: group.updatedAt,
+      // T1 #48：归档时间（null = 未归档）。
+      archivedAt: group.archivedAt,
     };
   }
 
@@ -650,6 +930,13 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     const project = r.projects.get(projectId);
     if (!project) throw new RepositoryError("not_found", `项目 ${projectId} 不存在。`);
     return project;
+  }
+
+  /** T1 #48：群组定位（归档/恢复/永久删除共用）；不存在 → 404。 */
+  function requireGroup(r: RepositorySet, groupId: string): Group {
+    const group = r.groups.get(groupId);
+    if (!group) throw new RepositoryError("not_found", `群组 ${groupId} 不存在。`);
+    return group;
   }
 }
 
@@ -723,7 +1010,29 @@ function decodeSegment(segment: string): string {
   }
 }
 
+/** 查询串里的布尔开关：`?x=1|true` 视为真，其余（含缺省）为假。 */
+function truthyParam(request: IncomingMessage, name: string): boolean {
+  const value = new URL(request.url ?? "/", "http://127.0.0.1").searchParams.get(name);
+  return value === "1" || value === "true";
+}
+
 async function readObjectBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readRawBody(request);
+  if (raw.trim() === "") throw new InvalidArgumentError("请求体不能为空，需为 JSON 对象。");
+  return parseObjectBody(raw);
+}
+
+/**
+ * 可选 JSON 体：空体返回 `{}`。用于 `DELETE …?二次确认` 这类「带不带确认凭据都合法」的调用
+ * （T1 #48 永久删除的第一刀就没有请求体）。
+ */
+async function readOptionalObjectBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readRawBody(request);
+  if (raw.trim() === "") return {};
+  return parseObjectBody(raw);
+}
+
+async function readRawBody(request: IncomingMessage): Promise<string> {
   let raw = "";
   let size = 0;
   for await (const chunk of request) {
@@ -731,7 +1040,10 @@ async function readObjectBody(request: IncomingMessage): Promise<Record<string, 
     if (size > MAX_BODY_BYTES) throw new HttpError(413, "payload_too_large", "请求体过大。");
     raw += chunk;
   }
-  if (raw.trim() === "") throw new InvalidArgumentError("请求体不能为空，需为 JSON 对象。");
+  return raw;
+}
+
+function parseObjectBody(raw: string): Record<string, unknown> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);

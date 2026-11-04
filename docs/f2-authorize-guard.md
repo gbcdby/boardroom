@@ -134,13 +134,13 @@ V1 仍是 localhost / 单用户 / 无认证（spec #45 §5.3 假设 2）。三�
 
 | 注入点 | 位置 | 用途 |
 | --- | --- | --- |
-| `T1ApiOptions.resolveActor(resolution)` | `src/server/api.ts` | 认证主体 / 以某成员为主体 |
+| `T1ApiOptions.resolveActor(resolution)` | `src/server/api.ts` | 认证主体 / 以某成员为主体；#48 起 `guard()` 把主体与判定一并返回给列表端点做行级收窄 |
 | `McpCoreOptions.authz.actorFor(binding)` | `src/server/mcp/core.ts` | 会话 → 带岗位节点与子树的 Actor |
 | `WebSocketHubOptions.resolveActor({projectId, memberId})` | `src/server/ws.ts` | 连接主体 |
 | `StartServerOptions.authorization` | `src/server/server.ts` | 装配上述三个解析点的统一入口 |
 | `Actor.nodeId` / `subtreeNodeIds` / `reach` | `src/server/authz/authorize.ts` | T2 由 `org_nodes` 递归 CTE 填充，守卫与调用点无需再改 |
 | `GuardScope.groupMemberNodeIds`、`GuardedGroup.memberNodeIds` | 同上 | T2 由 `members.node_id` + `group_participants` 组装 |
-| `visibleGroups(actor, groups)` | 同上 | T1/T2/T4/T6 的行级可见范围收窄 |
+| `visibleGroups(actor, groups)` | 同上 | **T1 #48 已接入** `GET /api/projects/:id/groups`（只返回主体可见的群组，不可见者不出现）；T2/T4/T6 继续复用同一函数 |
 
 T2（#49）需要新增角色或能力点时，只改 `authorize.ts` 的两张表并补对应单测；不要在入口里写 `if (role === ...)`。
 

@@ -33,10 +33,22 @@ export interface Project {
   readonly name: string;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /**
+   * 归档时间（ISO 字符串）；null = 未归档。
+   * 归档是**可恢复**的非活跃态（#48 / PROJECT-03、LIFE-ARC-01）：不删数据，
+   * 默认列表隐藏、写路径拒绝；恢复即把该列置回 null。
+   */
+  readonly archivedAt: string | null;
 }
 
 export interface NewProject {
   readonly name: string;
+  /**
+   * 创建项目时同时指定顶层 manager（#48 / PROJECT-02「创建时指定」）：
+   * 必须是**已存在的全局 agent**（由 MCP 入群产生），服务端在同一事务里
+   * 为该 agent 建本项目的成员岗位并置为 manager。省略 = 留空待分配。
+   */
+  readonly managerAgentId?: string | null;
 }
 
 /** 成员类别：agent 或人。 */
@@ -73,6 +85,8 @@ export interface Group {
   readonly name: string;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /** 归档时间（ISO 字符串）；null = 未归档。语义同 {@link Project.archivedAt}（GROUP-04）。 */
+  readonly archivedAt: string | null;
 }
 
 export interface NewGroup {

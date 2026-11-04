@@ -21,6 +21,8 @@ export interface ProjectDto {
   name: string;
   createdAt: string;
   updatedAt: string;
+  /** 归档时间（ISO 字符串）；null = 未归档（T1 #48 / PROJECT-03）。 */
+  archivedAt: string | null;
   manager: MemberDto | null;
 }
 
@@ -30,6 +32,8 @@ export interface GroupDto {
   name: string;
   createdAt: string;
   updatedAt: string;
+  /** 归档时间（ISO 字符串）；null = 未归档（T1 #48 / GROUP-04）。 */
+  archivedAt: string | null;
 }
 
 /**
@@ -112,9 +116,81 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return payload as T;
 }
 
+/**
+ * 永久删除的级联清单（T1 #48）：确认弹窗里给「人」看清楚会清掉什么。
+ * 项目清群组/群聊/投递/成员/状态/会话；群组只清群聊与参与者关系（成员保留）。
+ */
+export interface ProjectPurgeCascade {
+  groups: number;
+  members: number;
+  messages: number;
+  deliveries: number;
+  memberStatuses: number;
+  mcpSessions: number;
+}
+
+export interface GroupPurgeCascade {
+  messages: number;
+  deliveries: number;
+  participants: number;
+  mcpSessions: number;
+}
+
+export interface ProjectPurgeConfirmation {
+  kind: "project";
+  projectId: string;
+  projectName: string;
+  archivedAt: string | null;
+  cascade: ProjectPurgeCascade;
+  token: string;
+  expiresAt: string;
+}
+
+export interface GroupPurgeConfirmation {
+  kind: "group";
+  projectId: string;
+  groupId: string;
+  groupName: string;
+  archivedAt: string | null;
+  cascade: GroupPurgeCascade;
+  token: string;
+  expiresAt: string;
+}
+
+/** 永久删除的一刀两拍：第一次返回待确认清单，带同一凭据的第二次才删除。 */
+export type PurgeOutcome<T> =
+  | { readonly state: "confirmation_required"; readonly confirmation: T }
+  | { readonly state: "deleted" };
+
+async function purgeRequest<C>(pathname: string, token?: string): Promise<PurgeOutcome<C>> {
+  const init: RequestInit = { method: "DELETE", headers: { accept: "application/json" } };
+  if (token !== undefined) {
+    init.headers = { ...init.headers, "content-type": "application/json" };
+    init.body = JSON.stringify({ confirm: token });
+  }
+  const response = await fetch(pathname, init);
+  if (response.status === 204) return { state: "deleted" };
+
+  let payload: any = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (response.status === 409 && payload?.error?.code === "confirmation_required" && payload.confirmation) {
+    return { state: "confirmation_required", confirmation: payload.confirmation as C };
+  }
+  throw new ApiError(
+    response.status,
+    payload?.error?.code ?? "unknown_error",
+    payload?.error?.message ?? `请求失败（HTTP ${response.status}）`,
+  );
+}
+
 export const api = {
-  listProjects(): Promise<{ projects: ProjectDto[] }> {
-    return request("GET", "/api/projects");
+  listProjects(options?: { includeArchived?: boolean }): Promise<{ projects: ProjectDto[] }> {
+    const suffix = options?.includeArchived ? "?includeArchived=true" : "";
+    return request("GET", `/api/projects${suffix}`);
   },
   createProject(name: string): Promise<{ project: ProjectDto }> {
     return request("POST", "/api/projects", { name });
@@ -137,8 +213,9 @@ export const api = {
   setManager(projectId: string, memberId: string): Promise<{ project: ProjectDto }> {
     return request("PUT", `/api/projects/${encodeURIComponent(projectId)}/manager`, { memberId });
   },
-  listGroups(projectId: string): Promise<{ groups: GroupDto[] }> {
-    return request("GET", `/api/projects/${encodeURIComponent(projectId)}/groups`);
+  listGroups(projectId: string, options?: { includeArchived?: boolean }): Promise<{ groups: GroupDto[] }> {
+    const suffix = options?.includeArchived ? "?includeArchived=true" : "";
+    return request("GET", `/api/projects/${encodeURIComponent(projectId)}/groups${suffix}`);
   },
   createGroup(projectId: string, name: string, participantMemberIds: string[]): Promise<{ group: GroupDto }> {
     return request("POST", `/api/projects/${encodeURIComponent(projectId)}/groups`, {
@@ -161,5 +238,27 @@ export const api = {
       text,
       ...(mentions === undefined ? {} : { mentions }),
     });
+  },
+
+  // --- T1 #48：归档 / 恢复 / 永久删除（二次确认）-------------------------
+
+  archiveProject(projectId: string): Promise<{ project: ProjectDto }> {
+    return request("POST", `/api/projects/${encodeURIComponent(projectId)}/archive`);
+  },
+  restoreProject(projectId: string): Promise<{ project: ProjectDto }> {
+    return request("POST", `/api/projects/${encodeURIComponent(projectId)}/restore`);
+  },
+  /** 不带 token = 取级联清单与确认凭据（不删除）；带 token = 执行永久删除。 */
+  purgeProject(projectId: string, token?: string): Promise<PurgeOutcome<ProjectPurgeConfirmation>> {
+    return purgeRequest<ProjectPurgeConfirmation>(`/api/projects/${encodeURIComponent(projectId)}`, token);
+  },
+  archiveGroup(groupId: string): Promise<{ group: GroupDto }> {
+    return request("POST", `/api/groups/${encodeURIComponent(groupId)}/archive`);
+  },
+  restoreGroup(groupId: string): Promise<{ group: GroupDto }> {
+    return request("POST", `/api/groups/${encodeURIComponent(groupId)}/restore`);
+  },
+  purgeGroup(groupId: string, token?: string): Promise<PurgeOutcome<GroupPurgeConfirmation>> {
+    return purgeRequest<GroupPurgeConfirmation>(`/api/groups/${encodeURIComponent(groupId)}`, token);
   },
 };

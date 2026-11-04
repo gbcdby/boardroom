@@ -21,8 +21,8 @@ const DOMAIN_TABLES = [
   "mcp_sessions",
 ] as const;
 
-/** 期望的最高迁移版本（F2 v1 + T2 v2）。 */
-const EXPECTED_VERSION = 2;
+/** 期望的最高迁移版本（F2 v1 + T2 v2 + T1 #48 v3 归档标记）。 */
+const EXPECTED_VERSION = 3;
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-schema-"));
@@ -98,6 +98,9 @@ test("领域表上存在预期的索引与唯一约束", async () => {
       // T2：Agent 全局身份唯一、MCP 活跃会话唯一。
       assert.ok(indexes.includes("ux_agents_identity"), "缺少 Agent 身份唯一索引");
       assert.ok(indexes.includes("ux_mcp_sessions_active"), "缺少 MCP 活跃会话唯一索引");
+      // T1 #48：归档标记的列表索引（默认只取未归档行）。
+      assert.ok(indexes.includes("ix_projects_archived"), "缺少项目归档列表索引");
+      assert.ok(indexes.includes("ix_groups_project_archived"), "缺少群组项目+归档列表索引");
     } finally {
       db.close();
     }
@@ -116,6 +119,66 @@ test("外键约束开启时拒绝悬空引用", async () => {
             .run("m1", "no-such-project", "幽灵成员", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z"),
         /FOREIGN KEY/i,
       );
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("阶段 1 已有库（v2）升级到 v3：补上归档列且旧数据不丢（#48 回滚/升级路径）", async () => {
+  await withTempDir(async (dir) => {
+    const { db } = openDatabase(dir);
+    try {
+      // 1) 先只跑到 v2，模拟用户手上已有的阶段 1 数据库
+      runMigrations(
+        db,
+        migrations.filter((m) => m.version <= 2),
+      );
+      assert.equal(readMigrationState(db).version, 2);
+      const T = "2026-01-01T00:00:00.000Z";
+      db.prepare("INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)").run(
+        "p-old",
+        "老项目",
+        T,
+        T,
+      );
+      db.prepare("INSERT INTO groups (id, project_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(
+        "g-old",
+        "p-old",
+        "老群组",
+        T,
+        T,
+      );
+
+      // 2) 再跑当前迁移列表：只追加 v3，已有行保留、归档列初值为 NULL
+      const result = runMigrations(db, migrations);
+      assert.deepEqual(
+        result.applied.map((m) => m.version),
+        [3],
+      );
+      assert.equal(result.version, EXPECTED_VERSION);
+      assert.equal(
+        (db.prepare("SELECT archived_at FROM projects WHERE id = ?").get("p-old") as { archived_at: string | null })
+          .archived_at,
+        null,
+        "升级后老项目应为未归档",
+      );
+      assert.equal(
+        (db.prepare("SELECT archived_at FROM groups WHERE id = ?").get("g-old") as { archived_at: string | null })
+          .archived_at,
+        null,
+        "升级后老群组应为未归档",
+      );
+
+      // 3) 归档标记在升级后的库上可用（列表默认只取未归档行）
+      db.prepare("UPDATE projects SET archived_at = ? WHERE id = ?").run(T, "p-old");
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) AS c FROM projects WHERE archived_at IS NULL").get() as { c: number }).c,
+        0,
+      );
+
+      // 4) 幂等：重复执行不再应用任何迁移
+      assert.deepEqual(runMigrations(db, migrations).applied, []);
     } finally {
       db.close();
     }

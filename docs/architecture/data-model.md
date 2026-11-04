@@ -21,9 +21,9 @@ MemberStatus >─ Project + Member
 | 实体 | 含义 | 关键字段 |
 | --- | --- | --- |
 | **Agent** | 跨项目的全局身份 | `display_name`、`host_type`、`last_seen_at` |
-| **Project** | 协作容器；阶段 1 只验收一个，但按项目作用域建模 | `name` |
+| **Project** | 协作容器；按项目作用域建模（阶段 2 起多项目并用） | `name`、`archived_at` |
 | **Member** | agent 或人在项目中的成员关系与岗位 | `project_id`、`agent_id`、`kind`、`role` |
-| **Group** | 项目内聊天空间 | `project_id`、`name` |
+| **Group** | 项目内聊天空间（一项目多群组） | `project_id`、`name`、`archived_at` |
 | **group_participants** | 群组参与者（多对多关系表） | `group_id`、`member_id` |
 | **Message** | 群组消息 | `group_id`、`sender_member_id`、`seq`、`body`、`mentions` |
 | **MessageDelivery** | 某消息对某成员的投递记录 | `message_id`、`member_id`、`status`、`attempt_count` |
@@ -46,6 +46,14 @@ MemberStatus >─ Project + Member
 - `members.role` 取值 `manager` / `normal`，默认 `normal`。
 - **每项目最多一个顶层 manager**：由部分唯一索引 `ux_members_project_manager ON members(project_id) WHERE role='manager'` 强制。不同项目各自可有一个 manager。
 - 阶段 1 只此两值；完整角色/权限矩阵留阶段 2。
+
+### 1.4 归档标记（阶段 2 #48）
+
+- `projects.archived_at` 与 `groups.archived_at`（迁移 v3）：`NULL` = 未归档，非空 = 归档时间（ISO 文本）。
+- 归档是**可恢复的非活跃态**：不加状态枚举、不搬数据、不建归档表；恢复只把该列置回 `NULL`。
+- 读侧默认只取未归档行（列表带 `includeArchived` 可选放宽）；写侧在 repository 这一唯一写入边界拒绝
+  （`ArchivedError` / code `archived`），HTTP 与 MCP 因此共享同一规则。
+- **归档 ≠ 删除**：永久删除由 repository 的 `purge` 显式级联清除（见 §7），与归档标记无关。
 
 ## 2. 稳定 ID 方案
 
@@ -75,7 +83,10 @@ MemberStatus >─ Project + Member
 - 空库首次启动自动应用全部迁移；重复启动幂等（已应用版本不重复执行）。
 - 当前版本：
   - `1 init_domain_model`：建立全部领域表、索引与外键（F2）。
+  - `2 mcp_sessions_and_agent_identity`：Agent 全局身份唯一索引 + `mcp_sessions` 连接状态表（T2）。
+  - `3 archive_flags_for_project_and_group`：项目/群组 `archived_at` 标记与列表索引（T1 #48）。
   - F1 只建立 `schema_migrations` 版本表，无领域表。
+- 迁移 SQL 双方言中立（`ALTER TABLE ADD COLUMN` + 普通索引）；业务表按 PostgreSQL 方言重写属 M1 #54。
 
 ## 5. 事务与并发
 
@@ -94,6 +105,7 @@ MemberStatus >─ Project + Member
 | `InvalidReferenceError` | `invalid_reference` | 引用不存在的项目/成员/群组；跨项目/跨群组引用；发送者非群组参与者 |
 | `InvalidArgumentError` | `invalid_argument` | 空名称、非法 kind/role/state、human 绑 agent 等语义校验失败 |
 | `WriteFailedError` | `write_failed` | 连接关闭、磁盘满、只读、I/O 等底层写入失败（已回滚） |
+| `ArchivedError` | `archived` | 目标项目/群组已归档时的写入（#48：建群组、加/改成员、发消息等；恢复后放行） |
 
 上层（T1–T7、MCP、HTTP）应依据 `code` 分支处理，向调用方返回明确错误，而非吞掉写入失败。
 
@@ -104,15 +116,25 @@ MemberStatus >─ Project + Member
 | repository | 主要方法 |
 | --- | --- |
 | `agents` | `create / get / list / update / touchLastSeen / delete / insertRaw` |
-| `projects` | `create / get / list / rename / delete` |
+| `projects` | `create / get / list({includeArchived}) / rename / archive / restore / previewPurge / purge / delete` |
 | `members` | `create / get / listByProject / getManager / update / delete` |
-| `groups` | `create / get / listByProject / participants / addParticipant / removeParticipant / delete` |
+| `groups` | `create / get / listByProject({includeArchived}) / archive / restore / previewPurge / purge / participants / addParticipant / removeParticipant / delete` |
 | `messages` | `create / get / listByGroup({afterSeq, limit})` |
 | `deliveries` | `ensure / get / recordAttempt / listPending / delete` |
 | `statuses` | `set / get / listByProject / delete` |
 | （set 级） | `transaction(fn)` |
 
 类型定义见 `src/server/db/types.ts`；错误类型见 `src/server/db/errors.ts`。
+
+**永久删除（purge）的级联范围（#48 / LIFE-ARC-02）**：在单个事务内按「子 → 父」显式删除，
+不只依赖外键级联，好让「确认清单里的计数」与「实际清除的行」一一对应，也便于 M1 按方言重写。
+
+- `projects.purge(id)`：`message_deliveries`（按项目）→ `messages`（按项目内群组）→ `group_participants`
+  → `groups` → `mcp_sessions` → `member_statuses` → `members` → `projects`。
+  全局 `agents` 不删（同一 agent 可在其他项目继续任职）。
+- `groups.purge(id)`：该群组的 `message_deliveries` → `messages` → `group_participants` → `mcp_sessions`
+  → `groups`。**`members` 与 `member_statuses` 不动**——这是与删项目的关键差别。
+- 任务、评论（阶段 3）与三层记忆（阶段 4）落库后按同一顺序补进清单；当前不声称已覆盖。
 
 ## 8. 阶段 1 边界
 
