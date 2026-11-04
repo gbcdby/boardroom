@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { get } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -157,8 +158,18 @@ test("优雅关闭后端口可立即被重新监听（不泄漏）", async () =>
     // 用同一端口重新启动；若端口泄漏（未释放），listen 会 EADDRINUSE。
     const second = await startServer({ config: { ...baseConfig, port }, logger: silentLogger });
     try {
-      const res = await fetch(`${second.url}/api/health`);
-      assert.equal(res.status, 200);
+      // 探针必须用**新建连接**：全局 fetch 的连接池会按 origin（127.0.0.1:同一端口）
+      // 复用上一个进程遗留的 keep-alive socket，重启后的第一个请求因此可能落在已失效的
+      // 连接上得到 ECONNRESET——那是客户端连接复用，不是端口泄漏。本用例断言的是
+      // 「重启能立刻重新监听」，所以显式绕过连接池（agent: false）。
+      const health = await new Promise<{ statusCode: number }>((resolve, reject) => {
+        const req = get(`${second.url}/api/health`, { agent: false }, (res) => {
+          res.resume();
+          res.on("end", () => resolve({ statusCode: res.statusCode ?? 0 }));
+        });
+        req.on("error", (error) => reject(new Error(`健康探针失败：${(error as { code?: string }).code ?? error}`)));
+      });
+      assert.equal(health.statusCode, 200);
       const probe = await connectClient(second, "restart-client-2");
       const listed = await probe.client.listTools();
       assert.equal(listed.tools.length, 7);
