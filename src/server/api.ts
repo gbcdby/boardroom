@@ -13,7 +13,9 @@ import { deriveEffectiveStatus } from "./status.ts";
 import {
   authorizeOrThrow,
   ForbiddenError,
+  visibleGroups,
   type Actor,
+  type AuthorizeDecision,
   type Capability,
   type GuardScope,
 } from "./authz/authorize.ts";
@@ -137,8 +139,12 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   }
 
   /**
-   * 守卫式调用：允许则继续执行，拒绝抛 {@link ForbiddenError}（HTTP 403 + 稳定拒绝码）。
-   * 调用点一律放在参数/引用校验之后，保证既有失败路径的状态码与错误码不变。
+   * 守卫式调用：允许则继续执行并返回**主体 + 判定**，拒绝抛 {@link ForbiddenError}
+   * （HTTP 403 + 稳定拒绝码）。调用点一律放在参数/引用校验之后，
+   * 保证既有失败路径的状态码与错误码不变。
+   *
+   * 返回判定里的 `conn` 是 #48 行级收窄的输入：列表端点据此只取主体被允许触碰的行
+   * （NFR-PROJ-01 / 决策票 #37 的 conn-scoped 强制点），不依赖调用方自律。
    */
   function guard(
     r: RepositorySet,
@@ -146,7 +152,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     capability: Capability,
     scope: GuardScope,
     memberId?: string,
-  ): void {
+  ): { actor: Actor; decision: Extract<AuthorizeDecision, { allowed: true }> } {
     const resolution: ActorResolution = {
       request,
       projectId: scope.projectId ?? null,
@@ -163,7 +169,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         reason: "无法确定请求主体，守卫按 fail-closed 拒绝。",
       });
     }
-    authorizeOrThrow(actor, capability, scope);
+    return { actor, decision: authorizeOrThrow(actor, capability, scope) };
   }
 
   return {
@@ -216,9 +222,14 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       }
       if (method === "GET") {
         // F2：跨项目清单 = overview:view（OVERVIEW-01：仅人 / 顶层 manager 可见）。
-        guard(r, request, "overview:view", {});
+        const { decision } = guard(r, request, "overview:view", {});
         const includeArchived = truthyParam(request, "includeArchived");
-        const projects = r.projects.list({ includeArchived });
+        // #48 行级收窄：绑定在某项目上的主体（agent 成员）只看得到自己那个项目；
+        // 全局主体（阶段 1 的人）conn.projectId = null → 仍看到全部，行为不变。
+        const boundProjectId = decision.conn.projectId;
+        const projects = r
+          .projects.list({ includeArchived })
+          .filter((p) => boundProjectId === null || p.id === boundProjectId);
         writeJson(response, 200, { projects: projects.map((p) => projectView(r, p)) });
         return true;
       }
@@ -440,12 +451,18 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         return true;
       }
       if (method === "GET") {
-        // 端点级判定；「我看到哪些群组」的行级收窄由守卫的 `visibleGroups` 负责（T1/T2/T4 复用）。
-        guard(r, request, "group:view", { projectId });
+        // 端点级判定 + #48 行级收窄：`visibleGroups` 只留下主体可见的群组
+        // （参与的、或全项目岗位看到的全部）；不可见的群组**不出现**，不泄漏存在。
+        const { actor } = guard(r, request, "group:view", { projectId });
         const includeArchived = truthyParam(request, "includeArchived");
-        writeJson(response, 200, {
-          groups: r.groups.listByProject(projectId, { includeArchived }).map(groupView),
-        });
+        const candidates = r.groups.listByProject(projectId, { includeArchived });
+        const visible = new Set(
+          visibleGroups(
+            actor,
+            candidates.map((g) => ({ id: g.id, projectId, memberIds: r.groups.participants(g.id) })),
+          ).map((g) => g.id),
+        );
+        writeJson(response, 200, { groups: candidates.filter((g) => visible.has(g.id)).map(groupView) });
         return true;
       }
       methodNotAllowed(response, ["GET", "POST"]);

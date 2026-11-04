@@ -486,5 +486,138 @@ test("顶层 manager 可归档项目与群组，但不能发起永久删除（40
 });
 
 // ---------------------------------------------------------------------------
-// 占位：以下循环按 TDD 逐个补入（G 隔离、H 多群组）
+// 循环 G：跨项目数据隔离 + 列表按主体收窄（PROJECT-01、AC-PROJ-01、AC-IDENT-01 部分）
+// ---------------------------------------------------------------------------
+
+test("项目间数据隔离：成员/群组/群聊按项目作用域互不可见，跨项目引用被拒", async () => {
+  await withServer({ logger: silentLogger }, async (server) => {
+    const a = await createProject(server, "项目甲");
+    const b = await createProject(server, "项目乙");
+    const alice = await addHuman(server, a.id, "Alice");
+    const bob = await addHuman(server, b.id, "Bob");
+    const groupA = await createGroup(server, a.id, "甲群组", [alice.id]);
+    const groupB = await createGroup(server, b.id, "乙群组", [bob.id]);
+
+    await call(server, "POST", `/api/groups/${groupA.id}/messages`, {
+      senderMemberId: alice.id,
+      text: "只在甲项目说的一句话",
+    });
+
+    // 成员与群组按项目作用域列出，互不串。
+    const membersA = await call(server, "GET", `/api/projects/${a.id}/members`);
+    assert.deepEqual((membersA.body.members as any[]).map((m) => m.id), [alice.id]);
+    const groupsA = await call(server, "GET", `/api/projects/${a.id}/groups`);
+    assert.deepEqual((groupsA.body.groups as any[]).map((g) => g.id), [groupA.id]);
+    const groupsB = await call(server, "GET", `/api/projects/${b.id}/groups`);
+    assert.deepEqual((groupsB.body.groups as any[]).map((g) => g.id), [groupB.id]);
+
+    // 聊天室按群组隔离：乙群组读不到甲群组的群聊。
+    const historyB = await call(server, "GET", `/api/groups/${groupB.id}/messages`);
+    assert.equal((historyB.body.messages as any[]).length, 0);
+
+    // 跨项目引用被拒：不能把乙项目成员拉进甲项目的群组（GROUP-02）。
+    const crossCreate = await call(server, "POST", `/api/projects/${a.id}/groups`, {
+      name: "越界群组",
+      participantMemberIds: [bob.id],
+    });
+    assert.equal(crossCreate.status, 400, JSON.stringify(crossCreate.body));
+    assert.equal(crossCreate.body.error.code, "invalid_reference");
+
+    // 跨项目发言同样被拒。
+    const crossSend = await call(server, "POST", `/api/groups/${groupA.id}/messages`, {
+      senderMemberId: bob.id,
+      text: "想混进甲群组",
+    });
+    assert.equal(crossSend.status, 400, JSON.stringify(crossSend.body));
+    assert.equal(crossSend.body.error.code, "invalid_reference");
+  });
+});
+
+test("列表按主体收窄：跨项目概览只有人/顶层 manager 问得到，普通成员只看自己参与的群组", async () => {
+  const ids = { a: "", b: "", alice: "", joined: "", notJoined: "" };
+
+  await withServer(
+    {
+      logger: silentLogger,
+      // F2 注入点：同一服务里按请求头切换主体——人（owner）建数据，
+      // 之后以「甲项目的普通成员 Alice」为主体读取列表，验证行级收窄。
+      authorization: {
+        resolveHttpActor: ({ request, projectId }) => {
+          const as = request.headers["x-actor"];
+          if (as === "member") {
+            return {
+              actorId: ids.alice,
+              kind: "human",
+              role: "member",
+              projectId: ids.a,
+              nodeId: null,
+              subtreeNodeIds: null,
+            };
+          }
+          if (as === "manager") {
+            return {
+              actorId: "member-manager",
+              kind: "agent",
+              role: "top_manager",
+              projectId: ids.a,
+              nodeId: null,
+              subtreeNodeIds: null,
+            };
+          }
+          return ownerActor(projectId);
+        },
+      },
+    },
+    async (server) => {
+      const member = { "x-actor": "member" };
+      const manager = { "x-actor": "manager" };
+      const a = await createProject(server, "收窄甲");
+      const b = await createProject(server, "收窄乙");
+      ids.a = a.id;
+      ids.b = b.id;
+      const alice = await addHuman(server, a.id, "Alice");
+      const carol = await addHuman(server, a.id, "Carol");
+      ids.alice = alice.id;
+      await addHuman(server, b.id, "Bob");
+      const joined = await createGroup(server, a.id, "甲-她参与", [alice.id, carol.id]);
+      const notJoined = await createGroup(server, a.id, "甲-她未参与", [carol.id]);
+      ids.joined = joined.id;
+      ids.notJoined = notJoined.id;
+      await createGroup(server, b.id, "乙-群组", []);
+
+      // 跨项目概览本身不在普通成员的能力集里：连「有哪些项目」都问不到（OVERVIEW-01）。
+      const memberProjects = await call(server, "GET", "/api/projects", undefined, member);
+      assert.equal(memberProjects.status, 403, JSON.stringify(memberProjects.body));
+      assert.equal(memberProjects.body.error.code, "forbidden");
+
+      // 顶层 manager 有 overview:view，但行级收窄只回他所属的那一个项目。
+      const managerProjects = await call(server, "GET", "/api/projects", undefined, manager);
+      assert.equal(managerProjects.status, 200, JSON.stringify(managerProjects.body));
+      assert.deepEqual((managerProjects.body.projects as any[]).map((p) => p.id), [a.id]);
+
+      // 群组列表收窄到她参与的群组：未参与的群组**不出现**，不泄漏存在。
+      const groups = await call(server, "GET", `/api/projects/${a.id}/groups`, undefined, member);
+      assert.equal(groups.status, 200, JSON.stringify(groups.body));
+      assert.deepEqual((groups.body.groups as any[]).map((g) => g.id), [joined.id]);
+
+      // 越出项目：403 cross_project（不返回别的项目的群组清单）。
+      const cross = await call(server, "GET", `/api/projects/${b.id}/groups`, undefined, member);
+      assert.equal(cross.status, 403, JSON.stringify(cross.body));
+      assert.equal(cross.body.error.code, "cross_project");
+
+      // 未参与的同项目群组：读历史被拒 not_visible（AC-IDENT-01「不能读未参与群组消息」）。
+      const history = await call(server, "GET", `/api/groups/${notJoined.id}/messages`, undefined, member);
+      assert.equal(history.status, 403, JSON.stringify(history.body));
+      assert.equal(history.body.error.code, "not_visible");
+
+      // 归档这类生命周期动作不在她的能力集里。
+      const archive = await call(server, "POST", `/api/projects/${a.id}/archive`, undefined, member);
+      assert.equal(archive.status, 403, JSON.stringify(archive.body));
+      assert.equal(archive.body.error.code, "forbidden");
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 占位：以下循环按 TDD 逐个补入（H 多群组）
 // ---------------------------------------------------------------------------
