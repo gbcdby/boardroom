@@ -26,11 +26,21 @@ function memberActor(projectId: string): Actor {
 }
 
 async function withServer<T>(
-  serverOptions: Parameters<typeof startServer>[0],
+  serverOptions: Omit<Parameters<typeof startServer>[0], "config">,
   fn: (server: RunningServer) => Promise<T>,
 ): Promise<T> {
+  // F1（#46）后 startServer 经连接工厂取驱动，sqlite 驱动要求显式 dataDir；
+  // 与 tests/http.test.ts 同一惯例：mkdtemp 临时目录注入 config.dataDir，用完即删。
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-f2guard-"));
-  const server = await startServer(serverOptions);
+  const server = await startServer({
+    ...serverOptions,
+    config: {
+      port: 0,
+      dataDir: dir,
+      heartbeat: { intervalMs: 10_000, timeoutMs: 30_000 },
+      configFile: null,
+    },
+  });
   try {
     return await fn(server);
   } finally {
@@ -38,13 +48,6 @@ async function withServer<T>(
     await rm(dir, { recursive: true, force: true });
   }
 }
-
-const baseConfig = {
-  port: 0,
-  dataDir: "",
-  heartbeat: { intervalMs: 10_000, timeoutMs: 30_000 },
-  configFile: null,
-} as const;
 
 async function post(server: RunningServer, pathname: string, body: unknown) {
   const res = await fetch(`${server.url}${pathname}`, {
@@ -58,7 +61,6 @@ async function post(server: RunningServer, pathname: string, body: unknown) {
 test("HTTP 入口：注入的主体缺能力点时返回 403 forbidden", async () => {
   await withServer(
     {
-      config: { ...baseConfig },
       logger: silentLogger,
       authorization: { resolveHttpActor: ({ projectId }) => memberActor(projectId ?? "p1") },
     },
@@ -73,7 +75,7 @@ test("HTTP 入口：注入的主体缺能力点时返回 403 forbidden", async (
 
 test("HTTP 入口：主体无法解析时按 fail-closed 拒绝", async () => {
   await withServer(
-    { config: { ...baseConfig }, logger: silentLogger, authorization: { resolveHttpActor: () => null } },
+    { logger: silentLogger, authorization: { resolveHttpActor: () => null } },
     async (server) => {
       const created = await post(server, "/api/projects", { name: "P" });
       assert.equal(created.status, 403);
@@ -85,7 +87,6 @@ test("HTTP 入口：主体无法解析时按 fail-closed 拒绝", async () => {
 test("WS 入口：presence 声明越出主体范围时拒绝，不记录在线", async () => {
   await withServer(
     {
-      config: { ...baseConfig },
       logger: silentLogger,
       authorization: { resolveWsActor: () => memberActor("p1") },
     },
