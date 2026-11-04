@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createLogger } from "../src/server/logger.ts";
 import { startServer, type RunningServer } from "../src/server/server.ts";
 import type { Actor } from "../src/server/authz/authorize.ts";
@@ -619,5 +621,174 @@ test("列表按主体收窄：跨项目概览只有人/顶层 manager 问得到�
 });
 
 // ---------------------------------------------------------------------------
-// 占位：以下循环按 TDD 逐个补入（H 多群组）
+// 循环 H：一项目多群组 + 每群组一个聊天室（GROUP-01、GROUP-02、AC-PROJ-02）
 // ---------------------------------------------------------------------------
+
+test("一项目多群组：每群组一个聊天室，序号与历史各自独立，同一成员可同时参与多个群组", async () => {
+  await withServer({ logger: silentLogger }, async (server) => {
+    const project = await createProject(server, "多群组聊天室");
+    const alice = await addHuman(server, project.id, "Alice");
+    const bob = await addHuman(server, project.id, "Bob");
+    const design = await createGroup(server, project.id, "设计组", [alice.id, bob.id]);
+    const ops = await createGroup(server, project.id, "运维组", [alice.id]);
+
+    // 两个群组都在同一项目下。
+    const groups = await call(server, "GET", `/api/projects/${project.id}/groups`);
+    assert.deepEqual((groups.body.groups as any[]).map((g) => g.id).sort(), [design.id, ops.id].sort());
+
+    // 同一成员参与多个群组（GROUP-02）。
+    const designMembers = await call(server, "GET", `/api/groups/${design.id}/participants`);
+    const opsMembers = await call(server, "GET", `/api/groups/${ops.id}/participants`);
+    assert.deepEqual((designMembers.body.participants as any[]).map((m) => m.id).sort(), [alice.id, bob.id].sort());
+    assert.deepEqual((opsMembers.body.participants as any[]).map((m) => m.id), [alice.id]);
+
+    // 每个聊天室自己的 seq 从 1 起算，历史互不混入。
+    const d1 = await call(server, "POST", `/api/groups/${design.id}/messages`, {
+      senderMemberId: alice.id,
+      text: "设计组第一条",
+    });
+    const d2 = await call(server, "POST", `/api/groups/${design.id}/messages`, {
+      senderMemberId: bob.id,
+      text: "设计组第二条",
+    });
+    const o1 = await call(server, "POST", `/api/groups/${ops.id}/messages`, {
+      senderMemberId: alice.id,
+      text: "运维组第一条",
+    });
+    assert.equal(d1.body.message.seq, 1);
+    assert.equal(d2.body.message.seq, 2);
+    assert.equal(o1.body.message.seq, 1, "另一个聊天室的序号应独立起算");
+
+    const designHistory = await call(server, "GET", `/api/groups/${design.id}/messages`);
+    const opsHistory = await call(server, "GET", `/api/groups/${ops.id}/messages`);
+    assert.deepEqual((designHistory.body.messages as any[]).map((m) => m.text), ["设计组第一条", "设计组第二条"]);
+    assert.deepEqual((opsHistory.body.messages as any[]).map((m) => m.text), ["运维组第一条"]);
+
+    // 不是该群组参与者就不能发言（即便同项目）。
+    const notParticipant = await call(server, "POST", `/api/groups/${ops.id}/messages`, {
+      senderMemberId: bob.id,
+      text: "我不在运维组",
+    });
+    assert.equal(notParticipant.status, 400, JSON.stringify(notParticipant.body));
+    assert.equal(notParticipant.body.error.code, "invalid_reference");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 循环 I：同一 agent 跨项目的独立身份与群聊隔离（AC-IDENT-01 的跨项目部分）
+// seam：MCP 工具边界（真实 Streamable HTTP，与宿主同一 wire 协议）+ 项目/群组 HTTP API。
+// ---------------------------------------------------------------------------
+
+interface ToolPayload {
+  ok: boolean;
+  error?: { code: string; message: string };
+  [key: string]: unknown;
+}
+
+async function connectAgent(server: RunningServer, name: string): Promise<Client> {
+  const transport = new StreamableHTTPClientTransport(new URL(server.mcpUrl), {
+    reconnectionOptions: {
+      initialReconnectionDelay: 50,
+      maxReconnectionDelay: 200,
+      reconnectionDelayGrowFactor: 1.5,
+      maxRetries: 0,
+    },
+  });
+  const client = new Client({ name, version: "0.0.0" });
+  await client.connect(transport as unknown as Parameters<typeof client.connect>[0]);
+  return client;
+}
+
+async function callTool(client: Client, name: string, args: Record<string, unknown>): Promise<ToolPayload> {
+  const result = (await client.callTool({ name, arguments: args })) as {
+    content: Array<{ type: string; text?: string }>;
+  };
+  const text = result.content.find((part) => part.type === "text")?.text;
+  assert.ok(text, `工具 ${name} 应返回 text`);
+  return JSON.parse(text) as ToolPayload;
+}
+
+test("同一 agent 参与两个项目：全局身份相同、项目岗位各自独立，群聊不跨项目泄漏", async () => {
+  await withServer({ logger: silentLogger }, async (server) => {
+    const a = await createProject(server, "身份甲项目");
+    const b = await createProject(server, "身份乙项目");
+    const groupA = await createGroup(server, a.id, "甲群组", []);
+    const groupB = await createGroup(server, b.id, "乙群组", []);
+
+    // 两个会话、同一个 (displayName, hostType) = 同一个全局 agent 身份。
+    const clientA = await connectAgent(server, "agent-in-a");
+    const clientB = await connectAgent(server, "agent-in-b");
+    try {
+      const joinA = await callTool(clientA, "join", {
+        displayName: "Kimi",
+        hostType: "claude-code",
+        projectId: a.id,
+        groupId: groupA.id,
+      });
+      const joinB = await callTool(clientB, "join", {
+        displayName: "Kimi",
+        hostType: "claude-code",
+        projectId: b.id,
+        groupId: groupB.id,
+      });
+      assert.equal(joinA.ok, true, JSON.stringify(joinA));
+      assert.equal(joinB.ok, true, JSON.stringify(joinB));
+
+      // 全局身份唯一：同一个 agent；项目内成员关系（岗位）按项目分开。
+      assert.equal(String(joinA.agentId), String(joinB.agentId), "同 displayName+hostType 应复用同一全局 agent");
+      assert.notEqual(String(joinA.memberId), String(joinB.memberId), "两个项目应有各自独立的成员岗位");
+
+      // 在甲项目发言 → 乙项目的同一 agent 读不到（连接只绑定自己那个群组）。
+      const sent = await callTool(clientA, "send_message", { text: "只在甲群组说的话" });
+      assert.equal(sent.ok, true, JSON.stringify(sent));
+      const historyB = await callTool(clientB, "read_history", {});
+      assert.equal(historyB.ok, true, JSON.stringify(historyB));
+      const textsB = (historyB["messages"] as any[] ?? []).map((m) => m.text);
+      assert.ok(!textsB.includes("只在甲群组说的话"), "乙项目会话不应读到甲项目的群聊");
+
+      // 想跨项目发言：被连接的允许范围挡住（#37 conn-scoped 强制点）。
+      const cross = await callTool(clientB, "send_message", {
+        groupId: groupA.id,
+        text: "想跨项目发言",
+      });
+      assert.equal(cross.ok, false, JSON.stringify(cross));
+      assert.equal(cross.error?.code, "FORBIDDEN");
+    } finally {
+      await clientA.close();
+      await clientB.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 循环 J：每项目一个顶层 manager（PROJECT-02）跨项目互不影响
+// ---------------------------------------------------------------------------
+
+test("每个项目各有自己的顶层 manager：一个项目指定 manager 不影响另一个项目", async () => {
+  await withServer({ logger: silentLogger }, async (server) => {
+    const a = await createProject(server, "经理甲项目");
+    const b = await createProject(server, "经理乙项目");
+    const alice = await addHuman(server, a.id, "Alice");
+    const bob = await addHuman(server, b.id, "Bob");
+
+    // 创建时都留空：manager 为 null，等待后续分配（PROJECT-02）。
+    assert.equal(a.manager, null);
+    assert.equal(b.manager, null);
+
+    const setA = await call(server, "PUT", `/api/projects/${a.id}/manager`, { memberId: alice.id });
+    assert.equal(setA.status, 200, JSON.stringify(setA.body));
+    assert.equal(setA.body.project.manager.id, alice.id);
+
+    const projects = await call(server, "GET", "/api/projects");
+    const byId = Object.fromEntries(
+      (projects.body.projects as any[]).map((p) => [p.id, p.manager?.id ?? null]),
+    );
+    assert.equal(byId[a.id], alice.id, "甲项目应有自己的 manager");
+    assert.equal(byId[b.id], null, "乙项目不受影响，仍是留空待分配");
+
+    const setB = await call(server, "PUT", `/api/projects/${b.id}/manager`, { memberId: bob.id });
+    assert.equal(setB.body.project.manager.id, bob.id);
+    const after = await call(server, "GET", `/api/projects/${a.id}`);
+    assert.equal(after.body.project.manager.id, alice.id, "甲项目的 manager 不被乙项目顶掉");
+  });
+});
