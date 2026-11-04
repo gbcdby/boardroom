@@ -46,6 +46,8 @@ npm run build && npm start
 | --- | --- | --- | --- | --- |
 | 端口 | `AGENT_STUDIO_PORT` | `port` | `4317` | HTTP + WebSocket 监听端口，仅绑定 `127.0.0.1` |
 | 数据目录 | `AGENT_STUDIO_DATA_DIR` | `dataDir` | `data` | SQLite 数据库与运行时数据所在目录（相对 cwd 解析为绝对路径） |
+| 持久化驱动 | `AGENT_STUDIO_DB_DRIVER` | `dbDriver` | `sqlite` | F1（#46）连接工厂选择的驱动：`sqlite` / `postgres`。业务仓储在 M1（#54）迁移前仍仅支持 SQLite，配置为 `postgres` 时服务启动即快速失败并给出回滚指引 |
+| PG 连接串 | `AGENT_STUDIO_PG_CONNECTION_STRING` | `pgConnectionString` | — | `dbDriver=postgres` 时必填：`postgres://user:password@host:port/database`；缺失时启动报 ConfigError |
 | 心跳间隔 | `AGENT_STUDIO_HEARTBEAT_INTERVAL_MS` | `heartbeat.intervalMs` | `10000`（10s） | WebSocket 心跳发送间隔，D4 默认值 |
 | 心跳超时 | `AGENT_STUDIO_HEARTBEAT_TIMEOUT_MS` | `heartbeat.timeoutMs` | `30000`（30s） | 超过该时长未收到心跳即判定断线，D4 默认值 |
 | 日志级别 | `AGENT_STUDIO_LOG_LEVEL` | — | `info` | `debug` / `info` / `warn` / `error` |
@@ -87,6 +89,7 @@ curl -s http://127.0.0.1:4317/api/health
 
 ## 数据与迁移
 
+- **持久化驱动抽象（F1 #46）**：`src/server/db/driver.ts` 定义 `DbDriver`（connect / migrate / query / exec / transaction / close）与连接工厂 `createDbDriver`；SQLite 与 PostgreSQL 双驱动经 `dbDriver` 配置切换，默认 SQLite，阶段 1 行为不回归。SQL 方言差异（`?`→`$n` 占位符、事务语句、类型/自增/JSON/时间戳映射、迁移版本表 DDL）收敛在 `src/server/db/dialect.ts`。阶段 1 业务仓储仍直接持有 SQLite 句柄（`SqliteDriver.handle`），PG 业务表重写、数据迁移与回滚脚本属于 M1（#54）；「回滚」当前指把配置切回 `sqlite`。
 - SQLite 连接参数：WAL 日志模式、`synchronous = NORMAL`、外键开启、`busy_timeout = 5000`。
 - 迁移 runner：版本号单调递增，每条迁移在独立事务内执行；已应用迁移记录在 `schema_migrations` 表并校验 checksum，已应用的迁移不可改写。
 - **幂等**：重复启动不会重复执行已应用的迁移；迁移版本与数据目录在重启后保留。
@@ -128,4 +131,12 @@ npm test          # 全部自动化测试
 npm run typecheck # 类型检查
 ```
 
-测试覆盖：配置加载与覆盖优先级、日志结构化与脱敏、SQLite 连接与迁移幂等/回滚、HTTP 健康检查与静态页、WebSocket welcome/ping-pong/广播/非法帧；F2 领域 schema/索引/外键、稳定 ID、各实体 CRUD、项目/群组隔离、每项目唯一 manager、消息稳定 ID 去重、投递去重与至少一次投递、状态按项目成员作用域、写入失败明确错误、事务回滚、重启持久化与 WAL 读写并发。
+PostgreSQL 驱动冒烟默认跳过（无 PG 环境不影响 `npm test`）；需要时显式开启：
+
+```bash
+# 专用一次性冒烟容器（示例）：
+docker run -d --name boardroom-pg-f1-smoke -e POSTGRES_PASSWORD=smokepw -p 15432:5432 postgres:16-alpine
+AGENT_STUDIO_PG_TEST_URL=postgres://postgres:smokepw@127.0.0.1:15432/postgres npm test
+```
+
+测试覆盖：配置加载与覆盖优先级、日志结构化与脱敏、SQLite 连接与迁移幂等/回滚、HTTP 健康检查与静态页、WebSocket welcome/ping-pong/广播/非法帧；F2 领域 schema/索引/外键、稳定 ID、各实体 CRUD、项目/群组隔离、每项目唯一 manager、消息稳定 ID 去重、投递去重与至少一次投递、状态按项目成员作用域、写入失败明确错误、事务回滚、重启持久化与 WAL 读写并发；F1 驱动接口/连接工厂（双驱动切换、失败路径脱敏、方言渲染与类型映射）、PostgreSQL 冒烟（基线迁移幂等、checksum 防篡改、参数渲染、JSONB/BOOLEAN/自增/时间戳往返、事务回滚、schema 隔离，经 `AGENT_STUDIO_PG_TEST_URL` 开启）。
