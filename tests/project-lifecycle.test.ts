@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createLogger } from "../src/server/logger.ts";
 import { startServer, type RunningServer } from "../src/server/server.ts";
+import type { Actor } from "../src/server/authz/authorize.ts";
+import { ownerActor } from "../src/server/authz/actors.ts";
 
 /**
  * T1（#48）项目与群组生命周期 + 跨项目数据隔离。
@@ -48,10 +50,11 @@ async function call(
   method: string,
   pathname: string,
   body?: unknown,
+  headers?: Record<string, string>,
 ): Promise<{ status: number; body: any }> {
-  const init: RequestInit = { method };
+  const init: RequestInit = { method, ...(headers ? { headers } : {}) };
   if (body !== undefined) {
-    init.headers = { "content-type": "application/json" };
+    init.headers = { "content-type": "application/json", ...(headers ?? {}) };
     init.body = JSON.stringify(body);
   }
   const response = await fetch(`${server.url}${pathname}`, init);
@@ -424,5 +427,64 @@ test("群组永久删除需二次确认，且只清群聊与参与者关系：�
 });
 
 // ---------------------------------------------------------------------------
-// 占位：以下循环按 TDD 逐个补入（F 守卫、G 隔离、H 多群组）
+// 循环 F：谁能归档 / 谁能永久删除（LIFE-ARC-01、AC-LIFE-01）
+// ---------------------------------------------------------------------------
+
+test("顶层 manager 可归档项目与群组，但不能发起永久删除（403），人才能发起（409 待确认）", async () => {
+  const managerActor = (projectId: string): Actor => ({
+    actorId: "member-manager",
+    kind: "agent",
+    role: "top_manager",
+    projectId,
+    nodeId: null,
+    subtreeNodeIds: null,
+  });
+
+  await withServer(
+    {
+      logger: silentLogger,
+      // F2 注入点：本用例按请求头切换主体，模拟「以顶层 manager 身份调用」与「以人身份调用」。
+      authorization: {
+        resolveHttpActor: ({ request, projectId }) =>
+          request.headers["x-as"] === "manager" ? managerActor(projectId ?? "") : ownerActor(projectId),
+      },
+    },
+    async (server) => {
+      const asManager = { "x-as": "manager" };
+      const project = await createProject(server, "谁能删");
+      const alice = await addHuman(server, project.id, "Alice");
+      const group = await createGroup(server, project.id, "群组", [alice.id]);
+
+      // 顶层 manager：归档可以（project:archive / group:archive 在能力集里）。
+      const archiveProject = await call(server, "POST", `/api/projects/${project.id}/archive`, undefined, asManager);
+      assert.equal(archiveProject.status, 200, JSON.stringify(archiveProject.body));
+      const restoreProject = await call(server, "POST", `/api/projects/${project.id}/restore`, undefined, asManager);
+      assert.equal(restoreProject.status, 200);
+      const archiveGroup = await call(server, "POST", `/api/groups/${group.id}/archive`, undefined, asManager);
+      assert.equal(archiveGroup.status, 200, JSON.stringify(archiveGroup.body));
+      await call(server, "POST", `/api/groups/${group.id}/restore`);
+
+      // 顶层 manager：永久删除被守卫拒绝，连确认清单都拿不到（LIFE-ARC-01）。
+      const purgeProject = await call(server, "DELETE", `/api/projects/${project.id}`, undefined, asManager);
+      assert.equal(purgeProject.status, 403, JSON.stringify(purgeProject.body));
+      assert.equal(purgeProject.body.error.code, "forbidden");
+      assert.match(purgeProject.body.error.message, /project:purge/);
+      const purgeGroup = await call(server, "DELETE", `/api/groups/${group.id}`, undefined, asManager);
+      assert.equal(purgeGroup.status, 403, JSON.stringify(purgeGroup.body));
+      assert.match(purgeGroup.body.error.message, /group:purge/);
+
+      // 数据仍在：拒绝发生在写入之前。
+      assert.equal((await call(server, "GET", `/api/projects/${project.id}`)).status, 200);
+      assert.equal((await call(server, "GET", `/api/groups/${group.id}`)).status, 200);
+
+      // 人（owner）：可发起，但要走二次确认（409 待确认，而不是直接删）。
+      const humanPurge = await call(server, "DELETE", `/api/projects/${project.id}`);
+      assert.equal(humanPurge.status, 409);
+      assert.equal(humanPurge.body.error.code, "confirmation_required");
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 占位：以下循环按 TDD 逐个补入（G 隔离、H 多群组）
 // ---------------------------------------------------------------------------
