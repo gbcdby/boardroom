@@ -477,6 +477,27 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       return true;
     }
 
+    // /api/groups/:id —— T1 #48：GET 单个群组；DELETE 走二次确认的永久删除（只清群聊与参与者关系）
+    if (segments.length === 3 && segments[0] === "api" && segments[1] === "groups") {
+      const groupId = decodeSegment(segments[2]!);
+      if (method === "GET") {
+        const group = requireGroup(r, groupId);
+        guard(r, request, "group:view", {
+          projectId: group.projectId,
+          groupId,
+          groupMemberIds: r.groups.participants(groupId),
+        });
+        writeJson(response, 200, { group: groupView(group) });
+        return true;
+      }
+      if (method === "DELETE") {
+        await purgeGroup(r, request, response, groupId);
+        return true;
+      }
+      methodNotAllowed(response, ["GET", "DELETE"]);
+      return true;
+    }
+
     // /api/groups/:id/participants
     if (
       segments.length === 4 &&
@@ -673,6 +694,62 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
 
     const cleared = r.projects.purge(project.id);
     log.info("永久删除项目", { projectId: project.id, cleared });
+    response.writeHead(204, { "cache-control": "no-store" });
+    response.end();
+  }
+
+  /**
+   * `DELETE /api/groups/:id`：与项目同构的二次确认流程，但级联范围**只到群聊与参与者关系**
+   * （LIFE-ARC-02）：项目成员、其所在其他群组、成员状态都保持不变。
+   */
+  async function purgeGroup(
+    r: RepositorySet,
+    request: IncomingMessage,
+    response: ServerResponse,
+    groupId: string,
+  ): Promise<void> {
+    const group = requireGroup(r, groupId);
+    // 守卫：`group:purge` 只有人（owner）持有；顶层 manager 没有（LIFE-ARC-01）。
+    guard(r, request, "group:purge", { projectId: group.projectId, groupId });
+    const body = await readOptionalObjectBody(request);
+    const confirm = typeof body["confirm"] === "string" ? (body["confirm"] as string) : null;
+    const key = `group:${group.id}`;
+
+    if (confirm === null) {
+      const cascade = r.groups.previewPurge(group.id);
+      const entry = issuePurgeConfirmation(key);
+      log.info("群组永久删除等待二次确认", { projectId: group.projectId, groupId: group.id, cascade });
+      writeJson(response, 409, {
+        error: {
+          code: "confirmation_required",
+          message:
+            `永久删除群组「${group.name}」会清除它的群聊消息与参与者关系，且不可恢复；` +
+            "项目成员本身不受影响。确认后请带 confirmation.token 重新发起 DELETE。",
+        },
+        confirmation: {
+          kind: "group",
+          projectId: group.projectId,
+          groupId: group.id,
+          groupName: group.name,
+          archivedAt: group.archivedAt,
+          cascade,
+          token: entry.token,
+          expiresAt: new Date(entry.expiresAt).toISOString(),
+        },
+      });
+      return;
+    }
+
+    if (!consumePurgeConfirmation(key, confirm)) {
+      throw new HttpError(
+        400,
+        "invalid_confirmation",
+        "永久删除的确认凭据无效或已过期，请重新发起以获取最新的级联清单与凭据。",
+      );
+    }
+
+    const cleared = r.groups.purge(group.id);
+    log.info("永久删除群组", { projectId: group.projectId, groupId: group.id, cleared });
     response.writeHead(204, { "cache-control": "no-store" });
     response.end();
   }

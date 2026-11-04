@@ -347,5 +347,82 @@ test("项目永久删除需二次确认：首次只给级联清单与确认凭�
 });
 
 // ---------------------------------------------------------------------------
-// 占位：以下循环按 TDD 逐个补入（E 群组永久删除、F 守卫、G 隔离、H 多群组）
+// 循环 E：群组永久删除 = 只清群聊与参与者关系（GROUP-04、LIFE-ARC-02）
+// ---------------------------------------------------------------------------
+
+test("群组永久删除需二次确认，且只清群聊与参与者关系：成员与同项目其他群组不受影响", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-t1gpurge-"));
+  let doomedGroupId = "";
+  try {
+    await withPersistentServer(dir, async (server) => {
+      const project = await createProject(server, "两群组一个要删");
+      const alice = await addHuman(server, project.id, "Alice");
+      const bob = await addHuman(server, project.id, "Bob");
+      const doomedGroup = await createGroup(server, project.id, "解散的群组", [alice.id, bob.id]);
+      doomedGroupId = doomedGroup.id;
+      const keptGroup = await createGroup(server, project.id, "留下的群组", [alice.id]);
+      await call(server, "POST", `/api/groups/${doomedGroup.id}/messages`, {
+        senderMemberId: alice.id,
+        text: "要被清掉的一条",
+      });
+      await call(server, "POST", `/api/groups/${doomedGroup.id}/messages`, {
+        senderMemberId: bob.id,
+        text: "要被清掉的二条",
+      });
+      await call(server, "POST", `/api/groups/${keptGroup.id}/messages`, {
+        senderMemberId: alice.id,
+        text: "留下的一条",
+      });
+
+      // 第一刀：只给清单，不删。
+      const first = await call(server, "DELETE", `/api/groups/${doomedGroup.id}`);
+      assert.equal(first.status, 409, JSON.stringify(first.body));
+      assert.equal(first.body.error.code, "confirmation_required");
+      assert.equal(first.body.confirmation.kind, "group");
+      assert.equal(first.body.confirmation.cascade.messages, 2);
+      assert.equal(first.body.confirmation.cascade.participants, 2);
+      assert.equal((await call(server, "GET", `/api/groups/${doomedGroup.id}/participants`)).status, 200);
+
+      // 第二刀：带确认凭据后删除。
+      const purged = await call(server, "DELETE", `/api/groups/${doomedGroup.id}`, {
+        confirm: first.body.confirmation.token,
+      });
+      assert.equal(purged.status, 204, JSON.stringify(purged.body));
+      assert.equal((await call(server, "GET", `/api/groups/${doomedGroup.id}`)).status, 404);
+      assert.equal((await call(server, "GET", `/api/groups/${doomedGroup.id}/messages`)).status, 404);
+
+      // 成员本身保留（LIFE-ARC-02：删群组不清项目成员）。
+      const members = await call(server, "GET", `/api/projects/${project.id}/members`);
+      assert.equal(members.status, 200);
+      assert.deepEqual(
+        (members.body.members as any[]).map((m) => m.displayName).sort(),
+        ["Alice", "Bob"],
+      );
+
+      // 同项目另一个群组的群聊与参与者关系完好，成员仍能发言（多群组关系未被牵连）。
+      const keptHistory = await call(server, "GET", `/api/groups/${keptGroup.id}/messages`);
+      assert.equal((keptHistory.body.messages as any[]).length, 1);
+      const keptParticipants = await call(server, "GET", `/api/groups/${keptGroup.id}/participants`);
+      assert.deepEqual((keptParticipants.body.participants as any[]).map((m) => m.id), [alice.id]);
+      const stillSends = await call(server, "POST", `/api/groups/${keptGroup.id}/messages`, {
+        senderMemberId: alice.id,
+        text: "删除其他群组后照常发言",
+      });
+      assert.equal(stillSends.status, 201, JSON.stringify(stillSends.body));
+
+      const groups = await call(server, "GET", `/api/projects/${project.id}/groups?includeArchived=true`);
+      assert.deepEqual((groups.body.groups as any[]).map((g) => g.id), [keptGroup.id]);
+    });
+
+    // 重启后仍是已删除状态（删除落在持久层）。
+    await withPersistentServer(dir, async (server) => {
+      assert.equal((await call(server, "GET", `/api/groups/${doomedGroupId}`)).status, 404);
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 占位：以下循环按 TDD 逐个补入（F 守卫、G 隔离、H 多群组）
 // ---------------------------------------------------------------------------

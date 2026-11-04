@@ -132,6 +132,14 @@ export interface GroupsRepository {
   archive(id: string, at?: string): Group;
   /** 恢复：清除归档时间；未归档时幂等。 */
   restore(id: string): Group;
+  /** 永久删除前的级联清单（只读）。群组不存在时抛 NotFoundError。 */
+  previewPurge(id: string): GroupPurgeCounts;
+  /**
+   * 永久删除群组（#48 / GROUP-04、LIFE-ARC-02）：单事务内清除**该群组的群聊**
+   * （消息与投递记录）、**参与者关系**，以及随群组消失的连接会话记录。
+   * 项目成员本身**不动**——这是与 {@link ProjectsRepository.purge} 的关键差别。
+   */
+  purge(id: string): GroupPurgeCounts;
   participants(groupId: string): string[];
   addParticipant(groupId: string, memberId: string): void;
   removeParticipant(groupId: string, memberId: string): void;
@@ -342,6 +350,22 @@ function projectPurgeCounts(db: Database.Database, projectId: string): PurgeCoun
     deliveries: count("SELECT COUNT(*) AS c FROM message_deliveries WHERE project_id = ?"),
     memberStatuses: count("SELECT COUNT(*) AS c FROM member_statuses WHERE project_id = ?"),
     mcpSessions: count("SELECT COUNT(*) AS c FROM mcp_sessions WHERE project_id = ?"),
+  };
+}
+
+/**
+ * 永久删除群组时会波及的行数清单（#48 / LIFE-ARC-02）。
+ * 口径只含群聊与参与者关系（外加随群组消失的会话记录），**不含成员**。
+ */
+function groupPurgeCounts(db: Database.Database, groupId: string): GroupPurgeCounts {
+  const count = (sql: string): number => (db.prepare(sql).get(groupId) as { c: number }).c;
+  return {
+    messages: count("SELECT COUNT(*) AS c FROM messages WHERE group_id = ?"),
+    deliveries: count(
+      "SELECT COUNT(*) AS c FROM message_deliveries WHERE message_id IN (SELECT id FROM messages WHERE group_id = ?)",
+    ),
+    participants: count("SELECT COUNT(*) AS c FROM group_participants WHERE group_id = ?"),
+    mcpSessions: count("SELECT COUNT(*) AS c FROM mcp_sessions WHERE group_id = ?"),
   };
 }
 
@@ -765,6 +789,30 @@ function createGroups(db: Database.Database): GroupsRepository {
         db.prepare("UPDATE groups SET archived_at = NULL, updated_at = ? WHERE id = ?").run(nowIso(), id),
       );
       return this.get(id)!;
+    },
+    previewPurge(id) {
+      if (!getGroupRow(id)) throw new NotFoundError(`Group ${id} 不存在。`);
+      return groupPurgeCounts(db, id);
+    },
+    purge(id) {
+      if (!getGroupRow(id)) throw new NotFoundError(`Group ${id} 不存在。`);
+      const counts = groupPurgeCounts(db, id);
+      runInTransaction(db, () => {
+        // 只清「群聊 + 参与者关系」（LIFE-ARC-02）：投递记录随消息一起清，
+        // 会话记录随群组一起清；**members 与 member_statuses 一行都不动**。
+        db
+          .prepare(
+            `DELETE FROM message_deliveries
+              WHERE message_id IN (SELECT id FROM messages WHERE group_id = ?)`,
+          )
+          .run(id);
+        db.prepare("DELETE FROM messages WHERE group_id = ?").run(id);
+        db.prepare("DELETE FROM group_participants WHERE group_id = ?").run(id);
+        db.prepare("DELETE FROM mcp_sessions WHERE group_id = ?").run(id);
+        const removed = db.prepare("DELETE FROM groups WHERE id = ?").run(id);
+        if (removed.changes === 0) throw new NotFoundError(`Group ${id} 不存在。`);
+      });
+      return counts;
     },
     participants(groupId) {
       return (
