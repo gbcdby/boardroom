@@ -144,7 +144,18 @@ V1 仍是 localhost / 单用户 / 无认证（spec #45 §5.3 假设 2）。三�
 
 T2（#49）需要新增角色或能力点时，只改 `authorize.ts` 的两张表并补对应单测；不要在入口里写 `if (role === ...)`。
 
-## 8. 不包含
+## 8. 验证
+
+```bash
+npm test            # 全量 248 用例；含阶段 1 回归（默认人=owner 行为不变）
+npm run typecheck   # tsc + vue-tsc
+node --test tests/authorize-guard.test.ts tests/authorize-actors.test.ts \
+            tests/authorize-mcp.test.ts tests/authorize-callsites.test.ts   # 守卫本体 41 用例
+```
+
+守卫单测覆盖三类路径（AC-PROJ-GUARD-01）：正常放行、越权拒绝（含 fail-closed）、子树边界（含只读可见性不扩成写权限）；接入点位另见 `tests/authorize-mcp.test.ts`（MCP 工具边界）与 `tests/authorize-callsites.test.ts`（HTTP 403 / WS 拒绝帧）。未实测项：本票不涉及宿主能力，无需宿主侧验证记录。
+
+## 9. 不包含
 
 - `org_nodes` / `members` 等业务表结构与迁移（T2 #49）；角色配置 UI（T2 #49）。
 - 审计写入与撤销动作（T5 #52）；本票只给 `audit` 之外的能力点判定入口与拒绝语义。
