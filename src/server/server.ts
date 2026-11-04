@@ -13,7 +13,9 @@ import type { Logger } from "./logger.ts";
 import { createStaticHandler, isWebUiBuilt } from "./static.ts";
 import { createWebSocketHub, type ServerEvent, type WebSocketHub } from "./ws.ts";
 import { MCP_HTTP_PATH, createMcpSessionsHandler, type McpSessionsHandler } from "./mcp/transport.ts";
-import { createT1ApiRouter } from "./api.ts";
+import { createT1ApiRouter, type ActorResolution } from "./api.ts";
+import type { WsActorContext } from "./ws.ts";
+import type { Actor } from "./authz/authorize.ts";
 import { buildStatusBoard } from "./status.ts";
 
 /** WebSocket 端点路径。 */
@@ -24,11 +26,23 @@ export class ServerStartupError extends Error {
   override readonly name = "ServerStartupError";
 }
 
+/**
+ * F2（#47）入口主体注入点。
+ * 省略 = 阶段 1 单用户、无认证：HTTP/WS 的连接主体一律是「人（owner）」，守卫放行。
+ * 接入认证或 T2 组织数据后在这里返回真实 Actor（含 nodeId / subtreeNodeIds）。
+ */
+export interface ServerAuthorization {
+  readonly resolveHttpActor?: (resolution: ActorResolution) => Actor | null;
+  readonly resolveWsActor?: (context: WsActorContext) => Actor | null;
+}
+
 export interface StartServerOptions {
   readonly config: AppConfig;
   readonly logger: Logger;
   /** WebUI 构建产物目录，默认 `<repo>/dist/web`。 */
   readonly webRoot?: string;
+  /** F2 权限守卫主体注入（默认阶段 1 人=owner，行为不变）。 */
+  readonly authorization?: ServerAuthorization;
 }
 
 export interface RunningServer {
@@ -52,6 +66,8 @@ export interface RunningServer {
   broadcastStatus(projectId: string): void;
   /** 当前 WebSocket 连接数。 */
   readonly clientCount: number;
+  /** 某项目当前声明在线的人的数量（F2：配合守卫注入的观测口）。 */
+  humanPresenceCount(projectId: string): number;
   close(): Promise<void>;
 }
 
@@ -167,6 +183,9 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     logger,
     heartbeat: config.heartbeat,
     onMessage: (message) => broadcastMessage(message),
+    ...(options.authorization?.resolveHttpActor
+      ? { resolveActor: options.authorization.resolveHttpActor }
+      : {}),
   });
 
   const httpServer = createServer((request, response) => {
@@ -221,6 +240,9 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     path: WS_PATH,
     heartbeat: config.heartbeat,
     logger,
+    ...(options.authorization?.resolveWsActor
+      ? { resolveActor: options.authorization.resolveWsActor }
+      : {}),
   });
 
   // T3：把人的消息通过 WebSocket 广播给 WebUI（阶段 1 WebUI = 人，可见全部群组消息）。
@@ -322,6 +344,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     get clientCount() {
       return hub.clientCount;
     },
+    humanPresenceCount: (projectId) => hub.humanPresenceCount(projectId),
     mcpUrl: `http://${HOST}:${port}${MCP_HTTP_PATH}`,
     get mcpSessionCount() {
       return mcpHandler.sessionCount;
