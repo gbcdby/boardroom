@@ -10,23 +10,10 @@
  *   守卫的 project 级判定不受影响，子树边界判定等 T2 注入后生效。
  */
 import type { Member, MemberKind, MemberRole } from "../db/types.ts";
-import type { Actor, Capability } from "./authorize.ts";
-export type { Actor, Capability, GuardScope } from "./authorize.ts";
+import type { Actor } from "./authorize.ts";
 
 /** 阶段 1 无认证时人的稳定主体标识（不落 `members` 表，避免与真实成员 ID 混淆）。 */
 export const DEFAULT_HUMAN_ACTOR_ID = "human:local";
-
-/** 既有入口点位实际用到的能力点集合（顺序即接入顺序）。 */
-export const PROJECT_CAPABILITIES: readonly Capability[] = [
-  "project:create",
-  "group:create",
-  "group:view",
-  "group:post",
-  "message:ack",
-  "status:report_own",
-  "interrupt:self",
-  "session:heartbeat",
-];
 
 /** 阶段 1 角色（manager/normal）→ 阶段 2 静态角色的兼容映射（决策票 #25）。 */
 export function toAuthzRole(kind: MemberKind, role: MemberRole | undefined): Actor["role"] {

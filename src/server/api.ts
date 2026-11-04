@@ -128,7 +128,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     r: RepositorySet,
     request: IncomingMessage,
     capability: Capability,
-    scope: GuardScope & { projectId?: string },
+    scope: GuardScope,
     memberId?: string,
   ): void {
     const resolution: ActorResolution = {

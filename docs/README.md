@@ -9,7 +9,9 @@ docs/
 ├── README.md
 ├── architecture/
 │   ├── agent-studio.md       # 产品宏观架构、范围与验收基线
-│   └── data-model.md         # 持久化数据模型、ID 方案、迁移与事务
+│   ├── data-model.md         # 持久化数据模型、ID 方案、迁移与事务
+│   └── （阶段 2 起按需新增架构/契约文档）
+├── f2-authorize-guard.md     # F2 统一权限守卫：能力点矩阵、拒绝语义、接入点位
 ├── mcp-tool-contract.md      # 阶段 1 MCP 工具契约（F3）
 ├── t1-project-group-api.md   # T1 项目/群组/成员 HTTP API 与 WebUI 页面
 ├── getting-started-mcp.md    # T8 接入指南：Claude Code / Codex CLI MCP 配置与已知限制

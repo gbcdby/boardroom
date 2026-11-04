@@ -303,19 +303,23 @@ export function authorize(actor: Actor, capability: Capability, scope: GuardScop
       return deny("not_a_member", capability, `主体 ${actor.actorId} 不是目标群组参与者。`);
     }
   } else if (boundary === "visibility") {
-    const visible = checkVisibility(actor, reach, capability, scope);
-    if (!visible.allowed) return visible.decision;
+    const denial = checkVisibility(actor, reach, capability, scope);
+    if (denial) return denial;
   } else if (boundary === "self") {
     if (scope.memberId !== undefined && scope.memberId !== actor.actorId) {
       return deny("not_self", capability, "只能作用于自己的状态、任务与记忆。");
     }
   }
 
-  return { allowed: true, capability, conn: connScopeOf(actor, reach, scope) };
+  return { allowed: true, capability, conn: connScopeOf(actor, scope) };
 }
 
-/** 供入口层与后续票复用：actor 的 conn 查询范围。 */
-export function connScopeOf(actor: Actor, reach: ActorReach = actor.reach ?? ROLE_REACH[actor.role], scope: GuardScope = {}): ConnScope {
+/**
+ * 供入口层与后续票复用：把主体收窄成 conn-scoped 查询约束
+ * （`nodeIds` = 允许的组织节点，`groupIds` = 允许的群组；null 即该维度不限）。
+ */
+export function connScopeOf(actor: Actor, scope: GuardScope = {}): ConnScope {
+  const reach = actor.reach ?? ROLE_REACH[actor.role];
   return {
     projectId: actor.projectId,
     nodeIds: reach === "subtree" ? (actor.subtreeNodeIds ?? null) : null,
@@ -360,41 +364,30 @@ function checkSubtree(
 }
 
 /**
- * 群组可见性（ORG-03 / AC-ORG-07）：
+ * 群组可见性（ORG-03 / AC-ORG-07）。返回 null 表示可见，否则返回拒绝判定：
  * - 全项目范围（人 / 顶层 manager）：全部群组；
  * - 任何角色：自己参与的群组；
- * - `group:view_subtree` + 子树范围：参与者**全部**属于该子树的群组（只读；写路径走
- *   `participation` 边界，因此只读可见性不会扩成发言权）。
+ * - `group:view_subtree` + 子树/自身范围：参与者**全部**属于该子树的群组（只读；
+ *   写路径走 `participation` 边界，因此只读可见性不会扩成发言权）。
  */
 function checkVisibility(
   actor: Actor,
   reach: ActorReach,
   capability: Capability,
   scope: GuardScope,
-): { allowed: true; decision: null } | { allowed: false; decision: AuthorizeDecision } {
-  if (reach === "project") return ok();
+): AuthorizeDecision | null {
+  if (reach === "project") return null;
   // 端点级调用（未点名群组）只校验能力点，行级由 visibleGroups 收窄。
-  if (scope.groupId === undefined && scope.groupMemberIds === undefined) return ok();
-  if (scope.groupMemberIds?.includes(actor.actorId)) return ok();
-  const granted = ROLE_CAPABILITIES[actor.role];
-  if (granted.has("group:view_subtree") && (reach === "subtree" || reach === "own")) {
-    const subtree = actor.subtreeNodeIds;
+  if (scope.groupId === undefined && scope.groupMemberIds === undefined) return null;
+  if (scope.groupMemberIds?.includes(actor.actorId)) return null;
+  const subtree = actor.subtreeNodeIds ?? (reach === "own" && actor.nodeId !== null ? [actor.nodeId] : null);
+  if (ROLE_CAPABILITIES[actor.role].has("group:view_subtree") && subtree) {
     const nodes = scope.groupMemberNodeIds;
-    if (subtree && nodes && scope.groupMemberIds && nodes.length === scope.groupMemberIds.length) {
-      if (nodes.every((nodeId) => nodeId !== null && subtree.includes(nodeId))) return ok();
+    if (nodes && scope.groupMemberIds && nodes.length === scope.groupMemberIds.length) {
+      if (nodes.every((nodeId) => nodeId !== null && subtree.includes(nodeId))) return null;
     }
   }
-  return fail(
-    deny("not_visible", capability, "该群组不在主体的可见范围内（未参与、且不属可见子树）。"),
-  );
-}
-
-function ok(): { allowed: true; decision: null } {
-  return { allowed: true, decision: null };
-}
-
-function fail(decision: AuthorizeDecision): { allowed: false; decision: AuthorizeDecision } {
-  return { allowed: false, decision };
+  return deny("not_visible", capability, "该群组不在主体的可见范围内（未参与、且不属可见子树）。");
 }
 
 function isKnownCapability(capability: Capability): boolean {

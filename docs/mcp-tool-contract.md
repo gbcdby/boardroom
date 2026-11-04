@@ -68,6 +68,8 @@ Streamable HTTP 贴合「本地单服务端、多成员」形态，便于在 F1 
 
 HTTP/传输层错误（Streamable HTTP 自身）由 SDK 返回 JSON-RPC 错误，不属于本表。
 
+**F2（#47）之后**：工具内的权限判定统一交给 `src/server/authz/authorize.ts`（见 `docs/f2-authorize-guard.md`），错误码表不变；`FORBIDDEN` 的 `details` 会携带 `{ deny, capability }`，其中 `deny` 是守卫的稳定拒绝码（`forbidden` / `cross_project` / `out_of_subtree` / `not_a_member` / `not_visible` / `not_self` / `out_of_connection`）。宿主仍只需按 `code` 分支，`deny` 用于排障与后续票的细粒度判断。工具名、入参、出参与其余语义均未改变。
+
 ### 2.3 身份 / 会话
 
 - MCP 会话与成员身份分离：一个会话可能在未 `join` 前调用工具（此时返回 `NOT_IN_GROUP`）。

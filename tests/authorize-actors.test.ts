@@ -1,12 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { authorize, type Capability } from "../src/server/authz/authorize.ts";
-import {
-  actorForMember,
-  actorForSession,
-  ownerActor,
-  PROJECT_CAPABILITIES,
-} from "../src/server/authz/actors.ts";
+import { actorForMember, actorForSession, ownerActor } from "../src/server/authz/actors.ts";
 import type { Member } from "../src/server/db/types.ts";
 
 /**
@@ -55,11 +50,32 @@ test("MCP 会话绑定映射为 actor：角色取成员行，缺省 normal", () 
   assert.equal(actorForSession({ ...binding, role: "manager" }).role, "top_manager");
 });
 
+/**
+ * 阶段 1 已接入的能力点清单（独立来源：docs/f2-authorize-guard.md §5 的接入点位表）。
+ * 新增点位时同步这里，用于回归「默认人一律放行」。
+ */
+const WIRED_CAPABILITIES: readonly Capability[] = [
+  "project:create",
+  "project:view",
+  "overview:view",
+  "member:manage",
+  "member:view",
+  "status:view",
+  "org:manage",
+  "group:create",
+  "group:view",
+  "group:post",
+  "message:ack",
+  "status:report_own",
+  "interrupt:self",
+  "session:heartbeat",
+];
+
 test("阶段 1 默认主体是人（owner）：未认证时全部已有点位放行", () => {
   const actor = ownerActor("p1");
   assert.equal(actor.kind, "human");
   assert.equal(actor.role, "owner");
-  for (const capability of PROJECT_CAPABILITIES) {
+  for (const capability of WIRED_CAPABILITIES) {
     assert.equal(
       authorize(actor, capability as Capability, { projectId: "p1", groupMemberIds: [actor.actorId] }).allowed,
       true,
