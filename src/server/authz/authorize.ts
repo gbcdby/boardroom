@@ -363,3 +363,86 @@ function isKnownCapability(capability: Capability): boolean {
 function deny(code: DenyCode, capability: Capability | null, reason: string): AuthorizeDecision {
   return { allowed: false, capability, code, reason };
 }
+
+// ---------------------------------------------------------------------------
+// 拒绝语义与查询守卫（入口层复用）
+// ---------------------------------------------------------------------------
+
+/** 拒绝码 → HTTP 状态（决策票 #26）；MCP 侧统一收敛为 `FORBIDDEN` 错误码。 */
+const DENY_STATUS: Readonly<Record<DenyCode, number>> = {
+  forbidden: 403,
+  cross_project: 403,
+  out_of_subtree: 403,
+  not_a_member: 403,
+  not_visible: 403,
+  not_self: 403,
+  unknown_action: 400,
+};
+
+/** 守卫拒绝：入口层据此产出稳定错误载荷（HTTP 403 / MCP FORBIDDEN）。 */
+export class ForbiddenError extends Error {
+  override readonly name = "ForbiddenError";
+  readonly status: number;
+  readonly code: DenyCode;
+  readonly capability: Capability | null;
+
+  constructor(decision: Extract<AuthorizeDecision, { allowed: false }>) {
+    super(decision.reason);
+    this.code = decision.code;
+    this.capability = decision.capability;
+    this.status = DENY_STATUS[decision.code];
+  }
+}
+
+/**
+ * 判定并在拒绝时抛 {@link ForbiddenError}：给 HTTP / MCP 调用点做「守卫式」调用。
+ * 允许时返回收窄后的判定（含 conn 查询范围）。
+ */
+export function authorizeOrThrow(
+  actor: Actor,
+  capability: Capability,
+  scope: GuardScope,
+): Extract<AuthorizeDecision, { allowed: true }> {
+  const decision = authorize(actor, capability, scope);
+  if (!decision.allowed) throw new ForbiddenError(decision);
+  return decision;
+}
+
+/** 群组查询守卫的输入：一个群组在项目内的归属与参与者快照。 */
+export interface GuardedGroup {
+  readonly id: string;
+  readonly projectId: string;
+  readonly memberIds: readonly string[];
+  /** 参与者各自的组织节点（顺序与 `memberIds` 对齐）；缺字段时子树只读可见性判不出来。 */
+  readonly memberNodeIds?: readonly (string | null)[];
+}
+
+/** 可见群组：`writable=false` 表示只读可见（能看元数据与历史，不唤醒、不能发言）。 */
+export interface VisibleGroup {
+  readonly id: string;
+  readonly writable: boolean;
+}
+
+/**
+ * conn-scoped 群组查询守卫：把 `authorize` 的判定套到「列出我看到哪些群组」这类查询上，
+ * 后续票（T1/T2/T4/T6）据此收窄 SQL/结果集，不必各自实现权限（AC-ORG-07 / AC-IDENT-01）。
+ *
+ * 判定顺序：先问「能不能发消息」（参与的群组，可写）；否则问「能不能看」
+ * （全项目岗位，或 `group:view_subtree` 的子树只读）。看不到的群组直接不出现——不泄漏存在。
+ */
+export function visibleGroups(actor: Actor, groups: Iterable<GuardedGroup>): VisibleGroup[] {
+  const visible: VisibleGroup[] = [];
+  for (const group of groups) {
+    const scope: GuardScope = {
+      projectId: group.projectId,
+      groupId: group.id,
+      groupMemberIds: group.memberIds,
+      ...(group.memberNodeIds === undefined ? {} : { groupMemberNodeIds: group.memberNodeIds }),
+    };
+    const writable = authorize(actor, "group:post", scope).allowed;
+    if (writable || authorize(actor, "group:view", scope).allowed) {
+      visible.push({ id: group.id, writable });
+    }
+  }
+  return visible;
+}

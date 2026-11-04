@@ -2,7 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   authorize,
+  authorizeOrThrow,
   AUTHZ_ROLES,
+  ForbiddenError,
+  visibleGroups,
   type Actor,
 } from "../src/server/authz/authorize.ts";
 
@@ -153,4 +156,86 @@ test("子树可见性只给下级 manager：顶层 manager 走全项目范围，
 test("子树边界：缺少参与者节点数据时拒绝（不默认放行）", () => {
   const decision = authorize(subManager(), "group:view_subtree", { projectId: "p1", groupId: "g-2" });
   assert.equal(decision.allowed, false);
+});
+
+// ---------------------------------------------------------------------------
+// conn-scoped 查询守卫（NFR-PROJ-01 / #37：授权之后仍只允许查本范围）
+// ---------------------------------------------------------------------------
+
+/** 一个项目的群组快照：id + 参与者 + 参与者节点（T2 从 DB 组装，本票用纯数据）。 */
+const GROUPS = [
+  { projectId: "p1", id: "g-own", memberIds: ["m-sub-1", "m-a"], memberNodeIds: ["n2", "n3"] },
+  { projectId: "p1", id: "g-subtree", memberIds: ["m-a", "m-b"], memberNodeIds: ["n3", "n4"] },
+  { projectId: "p1", id: "g-outside", memberIds: ["m-a", "m-z"], memberNodeIds: ["n3", "n9"] },
+  { projectId: "p1", id: "g-foreign", memberIds: ["m-x", "m-y"], memberNodeIds: ["n8", "n9"] },
+  { projectId: "p2", id: "g-other-project", memberIds: ["m-sub-1"], memberNodeIds: ["n2"] },
+] as const;
+
+test("允许之后返回 conn 范围：全项目岗位不限子树", () => {
+  const decision = authorize(humanOwner(), "group:view", { projectId: "p1", groupId: "g-own" });
+  assert.equal(decision.allowed, true);
+  if (decision.allowed) {
+    assert.deepEqual(decision.conn, { projectId: "p1", nodeIds: null, groupIds: ["g-own"] });
+  }
+});
+
+test("允许之后返回 conn 范围：下级 manager 仅本子树（后续查询据此收窄）", () => {
+  const decision = authorize(subManager(), "group:view", {
+    projectId: "p1",
+    groupMemberIds: ["m-sub-1", "m-a"],
+    groupMemberNodeIds: ["n2", "n3"],
+  });
+  assert.equal(decision.allowed, true);
+  if (decision.allowed) {
+    assert.deepEqual(decision.conn.nodeIds, ["n2", "n3", "n4"]);
+  }
+});
+
+test("群组查询守卫：子树岗位拿到「参与的（可写）+ 子树内全员的（只读）」", () => {
+  const visible = visibleGroups(subManager(), GROUPS);
+  assert.deepEqual(
+    visible.map((g) => `${g.id}:${g.writable ? "rw" : "ro"}`),
+    ["g-own:rw", "g-subtree:ro"],
+    // g-outside 含子树外参与者、g-foreign 与本岗位无关、g-other-project 跨项目，都不出现。
+    "只读可见性不得标成可写；子树外群组不得出现（AC-ORG-07）",
+  );
+});
+
+test("群组查询守卫：普通成员只看得到自己参与的群组（AC-IDENT-01 不泄漏）", () => {
+  const member: Actor = { actorId: "m-a", kind: "agent", role: "member", projectId: "p1", nodeId: "n3", subtreeNodeIds: null };
+  const visible = visibleGroups(member, GROUPS);
+  assert.deepEqual(visible.map((g) => g.id), ["g-own", "g-subtree", "g-outside"]);
+  assert.ok(!visible.some((g) => g.id === "g-foreign"), "未参与的群组不得出现在结果里");
+});
+
+test("群组查询守卫：跨项目群组一律不出现", () => {
+  const visible = visibleGroups(humanOwner("p9"), GROUPS);
+  assert.deepEqual(visible, []);
+});
+
+test("群组查询守卫：人（owner）看得到本项目全部群组", () => {
+  assert.deepEqual(visibleGroups(humanOwner(), GROUPS).map((g) => g.id), [
+    "g-own",
+    "g-subtree",
+    "g-outside",
+    "g-foreign",
+  ]);
+});
+
+test("拒绝语义：守卫辅助函数抛出带 403 语义的 ForbiddenError", () => {
+  assert.throws(
+    () => authorizeOrThrow({ ...humanOwner(), role: "member" }, "group:create", { projectId: "p1" }),
+    (error: unknown) => {
+      assert.ok(error instanceof ForbiddenError);
+      assert.equal(error.status, 403);
+      assert.equal(error.code, "forbidden");
+      assert.equal(error.capability, "group:create");
+      return true;
+    },
+  );
+});
+
+test("拒绝语义：被允许时返回判定，不抛错", () => {
+  const decision = authorizeOrThrow(humanOwner(), "group:create", { projectId: "p1" });
+  assert.equal(decision.allowed, true);
 });
