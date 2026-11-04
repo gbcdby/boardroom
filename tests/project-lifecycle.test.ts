@@ -138,6 +138,55 @@ test("项目可恢复：恢复后回到默认列表且 archivedAt 为空（归�
 });
 
 // ---------------------------------------------------------------------------
-// 占位：以下循环按 TDD 逐个补入（B 群组归档、C 归档写路径、D/E 永久删除、
-// F 守卫、G 隔离、H 多群组）
+// 循环 B：群组归档 / 恢复（GROUP-04、LIFE-ARC-01）
+// ---------------------------------------------------------------------------
+
+test("群组可归档：默认项目群组列表隐藏它，includeArchived 可见，参与者仍可读", async () => {
+  await withServer({ logger: silentLogger }, async (server) => {
+    const project = await createProject(server, "多群组项目");
+    const alice = await addHuman(server, project.id, "Alice");
+    const kept = await createGroup(server, project.id, "在用群组", [alice.id]);
+    const retired = await createGroup(server, project.id, "解散中的群组", [alice.id]);
+
+    const archived = await call(server, "POST", `/api/groups/${retired.id}/archive`);
+    assert.equal(archived.status, 200, JSON.stringify(archived.body));
+    assert.equal(typeof archived.body.group.archivedAt, "string", "归档后应带 archivedAt");
+
+    const active = await call(server, "GET", `/api/projects/${project.id}/groups`);
+    assert.equal(active.status, 200);
+    const ids = (active.body.groups as any[]).map((g) => g.id);
+    assert.ok(!ids.includes(retired.id), "默认列表不应包含已归档群组");
+    assert.ok(ids.includes(kept.id), "未归档群组照常列出");
+
+    const all = await call(server, "GET", `/api/projects/${project.id}/groups?includeArchived=true`);
+    const listed = (all.body.groups as any[]).find((g) => g.id === retired.id);
+    assert.ok(listed, "includeArchived=true 应列出已归档群组");
+    assert.equal(typeof listed.archivedAt, "string");
+
+    // 归档不删数据：参与者关系仍在（恢复入口与后续审计需要它）。
+    const participants = await call(server, "GET", `/api/groups/${retired.id}/participants`);
+    assert.equal(participants.status, 200);
+    assert.deepEqual((participants.body.participants as any[]).map((m) => m.id), [alice.id]);
+  });
+});
+
+test("群组可恢复：恢复后回到项目群组列表且 archivedAt 为空", async () => {
+  await withServer({ logger: silentLogger }, async (server) => {
+    const project = await createProject(server, "会回来的群组项目");
+    const alice = await addHuman(server, project.id, "Alice");
+    const group = await createGroup(server, project.id, "临时群组", [alice.id]);
+    await call(server, "POST", `/api/groups/${group.id}/archive`);
+
+    const restored = await call(server, "POST", `/api/groups/${group.id}/restore`);
+    assert.equal(restored.status, 200, JSON.stringify(restored.body));
+    assert.equal(restored.body.group.archivedAt, null);
+
+    const active = await call(server, "GET", `/api/projects/${project.id}/groups`);
+    const ids = (active.body.groups as any[]).map((g) => g.id);
+    assert.ok(ids.includes(group.id), "恢复后应回到默认列表");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 占位：以下循环按 TDD 逐个补入（C 归档写路径、D/E 永久删除、F 守卫、G 隔离、H 多群组）
 // ---------------------------------------------------------------------------

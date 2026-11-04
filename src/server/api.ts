@@ -421,10 +421,38 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       if (method === "GET") {
         // 端点级判定；「我看到哪些群组」的行级收窄由守卫的 `visibleGroups` 负责（T1/T2/T4 复用）。
         guard(r, request, "group:view", { projectId });
-        writeJson(response, 200, { groups: r.groups.listByProject(projectId).map(groupView) });
+        const includeArchived = truthyParam(request, "includeArchived");
+        writeJson(response, 200, {
+          groups: r.groups.listByProject(projectId, { includeArchived }).map(groupView),
+        });
         return true;
       }
       methodNotAllowed(response, ["GET", "POST"]);
+      return true;
+    }
+
+    // /api/groups/:id/archive 与 /api/groups/:id/restore —— T1 #48 群组归档 / 恢复
+    // （GROUP-04、LIFE-ARC-01：归档可恢复、不删数据；永久删除走 purge 流程）
+    if (
+      segments.length === 4 &&
+      segments[0] === "api" &&
+      segments[1] === "groups" &&
+      (segments[3] === "archive" || segments[3] === "restore")
+    ) {
+      const groupId = decodeSegment(segments[2]!);
+      const group = requireGroup(r, groupId);
+      if (method === "POST") {
+        // 归档与恢复共用 `group:archive`（owner / 顶层 manager / 下级 manager 限子树）。
+        guard(r, request, "group:archive", { projectId: group.projectId, groupId });
+        const next = segments[3] === "archive" ? r.groups.archive(groupId) : r.groups.restore(groupId);
+        log.info(segments[3] === "archive" ? "归档群组" : "恢复群组", {
+          projectId: group.projectId,
+          groupId,
+        });
+        writeJson(response, 200, { group: groupView(next) });
+        return true;
+      }
+      methodNotAllowed(response, ["POST"]);
       return true;
     }
 
@@ -613,6 +641,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       name: group.name,
       createdAt: group.createdAt,
       updatedAt: group.updatedAt,
+      // T1 #48：归档时间（null = 未归档）。
+      archivedAt: group.archivedAt,
     };
   }
 
@@ -678,6 +708,13 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     const project = r.projects.get(projectId);
     if (!project) throw new RepositoryError("not_found", `项目 ${projectId} 不存在。`);
     return project;
+  }
+
+  /** T1 #48：群组定位（归档/恢复/永久删除共用）；不存在 → 404。 */
+  function requireGroup(r: RepositorySet, groupId: string): Group {
+    const group = r.groups.get(groupId);
+    if (!group) throw new RepositoryError("not_found", `群组 ${groupId} 不存在。`);
+    return group;
   }
 }
 

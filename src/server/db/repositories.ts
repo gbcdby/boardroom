@@ -95,7 +95,12 @@ export interface MembersRepository {
 export interface GroupsRepository {
   create(input: NewGroup): Group;
   get(id: string): Group | null;
-  listByProject(projectId: string): Group[];
+  /** 默认只列**未归档**群组；`includeArchived` 时连归档群组一起返回（#48 / GROUP-04）。 */
+  listByProject(projectId: string, options?: ListOptions): Group[];
+  /** 归档（可恢复）：写入归档时间；已归档时幂等。 */
+  archive(id: string, at?: string): Group;
+  /** 恢复：清除归档时间；未归档时幂等。 */
+  restore(id: string): Group;
   participants(groupId: string): string[];
   addParticipant(groupId: string, memberId: string): void;
   removeParticipant(groupId: string, memberId: string): void;
@@ -622,10 +627,32 @@ function createGroups(db: Database.Database): GroupsRepository {
       const row = getGroupRow(id);
       return row ? toGroup(row) : null;
     },
-    listByProject(projectId) {
+    listByProject(projectId, options = {}) {
+      const where = options.includeArchived
+        ? "WHERE project_id = ?"
+        : "WHERE project_id = ? AND archived_at IS NULL";
       return (
-        db.prepare("SELECT * FROM groups WHERE project_id = ? ORDER BY created_at, id").all(projectId) as GroupRow[]
+        db.prepare(`SELECT * FROM groups ${where} ORDER BY created_at, id`).all(projectId) as GroupRow[]
       ).map(toGroup);
+    },
+    archive(id, at) {
+      const existing = this.get(id);
+      if (!existing) throw new NotFoundError(`Group ${id} 不存在。`);
+      if (existing.archivedAt !== null) return existing;
+      const stamp = at ?? nowIso();
+      runInTransaction(db, () =>
+        db.prepare("UPDATE groups SET archived_at = ?, updated_at = ? WHERE id = ?").run(stamp, stamp, id),
+      );
+      return this.get(id)!;
+    },
+    restore(id) {
+      const existing = this.get(id);
+      if (!existing) throw new NotFoundError(`Group ${id} 不存在。`);
+      if (existing.archivedAt === null) return existing;
+      runInTransaction(db, () =>
+        db.prepare("UPDATE groups SET archived_at = NULL, updated_at = ? WHERE id = ?").run(nowIso(), id),
+      );
+      return this.get(id)!;
     },
     participants(groupId) {
       return (
