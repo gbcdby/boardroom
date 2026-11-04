@@ -19,10 +19,12 @@ const DOMAIN_TABLES = [
   "message_deliveries",
   "member_statuses",
   "mcp_sessions",
+  // T2 #49：组织树岗位节点（决策票 #24：成员「占据」节点，汇报线 = parent_id）。
+  "org_nodes",
 ] as const;
 
-/** 期望的最高迁移版本（F2 v1 + T2 v2 + T1 #48 v3 归档标记）。 */
-const EXPECTED_VERSION = 3;
+/** 期望的最高迁移版本（F2 v1 + T2 v2 + T1 #48 v3 归档标记 + T2 #49 v4 组织树）。 */
+const EXPECTED_VERSION = 4;
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-schema-"));
@@ -87,8 +89,14 @@ test("领域表上存在预期的索引与唯一约束", async () => {
           .all() as { name: string }[]
       ).map((row) => row.name);
 
-      // 每项目最多一个 manager：部分唯一索引。
-      assert.ok(indexes.includes("ux_members_project_manager"), "缺少 manager 唯一索引");
+      // T2 #49：阶段 1 的「每项目至多一个 manager」部分唯一索引按决策票 #24 移除，
+      // 顶层 manager 唯一性改由组织树根节点唯一（ux_org_nodes_single_root）表达；
+      // 阶段 1 兼容语义（legacy members.role='manager' 唯一）下沉到 repository 应用层校验。
+      assert.ok(!indexes.includes("ux_members_project_manager"), "旧 manager 唯一索引应已被 v4 移除");
+      assert.ok(indexes.includes("ux_org_nodes_single_root"), "缺少组织树根节点唯一索引");
+      assert.ok(indexes.includes("ux_members_node"), "缺少成员占岗唯一索引（一人一岗、一岗一实例）");
+      assert.ok(indexes.includes("ix_org_nodes_project"), "缺少组织节点项目索引");
+      assert.ok(indexes.includes("ix_org_nodes_parent"), "缺少组织节点父指针索引（子树递归查询用）");
       // 消息按群组 + 时间稳定排序。
       assert.ok(indexes.includes("ix_messages_group_seq"), "缺少消息群组序号索引");
       // 投递按 (message, member) 唯一去重。
@@ -125,7 +133,7 @@ test("外键约束开启时拒绝悬空引用", async () => {
   });
 });
 
-test("阶段 1 已有库（v2）升级到 v3：补上归档列且旧数据不丢（#48 回滚/升级路径）", async () => {
+test("阶段 1 已有库（v2）升级到当前版本：补上归档列与组织树结构且旧数据不丢（#48/#49 升级路径）", async () => {
   await withTempDir(async (dir) => {
     const { db } = openDatabase(dir);
     try {
@@ -150,11 +158,11 @@ test("阶段 1 已有库（v2）升级到 v3：补上归档列且旧数据不丢
         T,
       );
 
-      // 2) 再跑当前迁移列表：只追加 v3，已有行保留、归档列初值为 NULL
+      // 2) 再跑当前迁移列表：只追加 v3 与 v4，已有行保留、归档列初值为 NULL
       const result = runMigrations(db, migrations);
       assert.deepEqual(
         result.applied.map((m) => m.version),
-        [3],
+        [3, 4],
       );
       assert.equal(result.version, EXPECTED_VERSION);
       assert.equal(
@@ -178,6 +186,79 @@ test("阶段 1 已有库（v2）升级到 v3：补上归档列且旧数据不丢
       );
 
       // 4) 幂等：重复执行不再应用任何迁移
+      assert.deepEqual(runMigrations(db, migrations).applied, []);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("v3 库升级到 v4：建立组织树结构、旧数据不回填、兼容映射继续可用（#49 升级路径）", async () => {
+  await withTempDir(async (dir) => {
+    const { db } = openDatabase(dir);
+    try {
+      // 1) 跑到 v3（阶段 2 T1 #48 之后的现有库形态），并留下阶段 1 语义的旧数据。
+      runMigrations(
+        db,
+        migrations.filter((m) => m.version <= 3),
+      );
+      const T = "2026-01-01T00:00:00.000Z";
+      db.prepare("INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)").run("p-old", "老项目", T, T);
+      db
+        .prepare("INSERT INTO agents (id, display_name, host_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+        .run("a-old", "老经理", "claude-code", T, T);
+      db
+        .prepare("INSERT INTO members (id, project_id, agent_id, kind, display_name, role, created_at, updated_at) VALUES (?, ?, ?, 'agent', ?, 'manager', ?, ?)")
+        .run("m-mgr", "p-old", "a-old", "老经理", T, T);
+      db
+        .prepare("INSERT INTO members (id, project_id, kind, display_name, role, created_at, updated_at) VALUES (?, ?, 'human', ?, 'normal', ?, ?)")
+        .run("m-nrm", "p-old", "老成员", T, T);
+
+      // 2) 执行当前迁移：只追加 v4。
+      const result = runMigrations(db, migrations);
+      assert.deepEqual(
+        result.applied.map((m) => m.version),
+        [4],
+      );
+      assert.equal(result.version, EXPECTED_VERSION);
+
+      // 3) v4 **不回填**组织树：升级后的库默认无组织数据（票面硬约束——
+      //    resolveActor 的阶段 1 兼容映射在升级路径上继续工作）。
+      assert.equal((db.prepare("SELECT COUNT(*) AS c FROM org_nodes").get() as { c: number }).c, 0);
+      assert.equal(
+        (db.prepare("SELECT node_id FROM members WHERE id = ?").get("m-mgr") as { node_id: string | null }).node_id,
+        null,
+      );
+      assert.equal(
+        (db.prepare("SELECT role FROM members WHERE id = ?").get("m-mgr") as { role: string }).role,
+        "manager",
+        "旧成员的兼容角色字段必须原样保留",
+      );
+
+      // 4) 旧「每项目至多一个 manager」唯一索引已按 #24 移除（多层树与它冲突）。
+      const indexes = (
+        db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'").all() as {
+          name: string;
+        }[]
+      ).map((row) => row.name);
+      assert.ok(!indexes.includes("ux_members_project_manager"), "v4 应移除旧 manager 唯一索引");
+      assert.ok(indexes.includes("ux_org_nodes_single_root"), "v4 应建立根节点唯一索引");
+
+      // 5) 组织树在升级后的库上可用：根节点唯一约束实际生效。
+      db.prepare(
+        "INSERT INTO org_nodes (id, project_id, parent_id, name, role, sort_order, created_at, updated_at) VALUES (?, ?, NULL, ?, 'top_manager', 0, ?, ?)",
+      ).run("n-root", "p-old", "项目统筹", T, T);
+      assert.throws(
+        () =>
+          db
+            .prepare(
+              "INSERT INTO org_nodes (id, project_id, parent_id, name, role, sort_order, created_at, updated_at) VALUES (?, ?, NULL, ?, 'top_manager', 0, ?, ?)",
+            )
+            .run("n-root2", "p-old", "第二个根", T, T),
+        /UNIQUE/i,
+      );
+
+      // 6) 幂等。
       assert.deepEqual(runMigrations(db, migrations).applied, []);
     } finally {
       db.close();
