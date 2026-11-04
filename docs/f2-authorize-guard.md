@@ -153,6 +153,8 @@ node --test tests/authorize-guard.test.ts tests/authorize-actors.test.ts \
             tests/authorize-mcp.test.ts tests/authorize-callsites.test.ts   # 守卫本体 41 用例
 ```
 
+阶段 1 端到端脚本（真实 HTTP + MCP Streamable HTTP 链路）在守卫接入后复跑通过：`npm run build:web && node scripts/e2e-phase1.mjs` → AC-CORE-01/02/03/04/05/06/07/08/09/11 全 PASS（29 通过 / 0 失败），即「默认人=owner 放行、既有行为不变」得到链路级证据。该脚本的既有说明仍适用：AC-CORE-02/10/11 的真实 Codex 宿主部分不由本脚本伪造。
+
 守卫单测覆盖三类路径（AC-PROJ-GUARD-01）：正常放行、越权拒绝（含 fail-closed）、子树边界（含只读可见性不扩成写权限）；接入点位另见 `tests/authorize-mcp.test.ts`（MCP 工具边界）与 `tests/authorize-callsites.test.ts`（HTTP 403 / WS 拒绝帧）。未实测项：本票不涉及宿主能力，无需宿主侧验证记录。
 
 ## 9. 不包含
