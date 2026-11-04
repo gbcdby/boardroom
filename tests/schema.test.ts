@@ -158,12 +158,14 @@ test("阶段 1 已有库（v2）升级到 v3：补上归档列且旧数据不丢
       );
       assert.equal(result.version, EXPECTED_VERSION);
       assert.equal(
-        db.prepare("SELECT archived_at FROM projects WHERE id = ?").get("p-old").archived_at,
+        (db.prepare("SELECT archived_at FROM projects WHERE id = ?").get("p-old") as { archived_at: string | null })
+          .archived_at,
         null,
         "升级后老项目应为未归档",
       );
       assert.equal(
-        db.prepare("SELECT archived_at FROM groups WHERE id = ?").get("g-old").archived_at,
+        (db.prepare("SELECT archived_at FROM groups WHERE id = ?").get("g-old") as { archived_at: string | null })
+          .archived_at,
         null,
         "升级后老群组应为未归档",
       );
@@ -171,7 +173,7 @@ test("阶段 1 已有库（v2）升级到 v3：补上归档列且旧数据不丢
       // 3) 归档标记在升级后的库上可用（列表默认只取未归档行）
       db.prepare("UPDATE projects SET archived_at = ? WHERE id = ?").run(T, "p-old");
       assert.equal(
-        db.prepare("SELECT COUNT(*) AS c FROM projects WHERE archived_at IS NULL").get().c,
+        (db.prepare("SELECT COUNT(*) AS c FROM projects WHERE archived_at IS NULL").get() as { c: number }).c,
         0,
       );
 
