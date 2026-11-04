@@ -792,3 +792,98 @@ test("每个项目各有自己的顶层 manager：一个项目指定 manager 不
     assert.equal(after.body.project.manager.id, alice.id, "甲项目的 manager 不被乙项目顶掉");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 循环 K：PROJECT-02「创建时指定」——同一请求里把已有全局 agent 落为该项目的 manager
+// ---------------------------------------------------------------------------
+
+test("创建项目时可同时指定顶层 manager（留空仍可稍后分配）", async () => {
+  await withServer({ logger: silentLogger }, async (server) => {
+    // 先让一个 agent 通过 MCP 在别的项目里取得全局身份（真实入群，不造占位数据）。
+    const first = await createProject(server, "身份来源项目");
+    const firstGroup = await createGroup(server, first.id, "来源群组", []);
+    const client = await connectAgent(server, "manager-candidate");
+    let agentId = "";
+    try {
+      const join = await callTool(client, "join", {
+        displayName: "PM",
+        hostType: "claude-code",
+        projectId: first.id,
+        groupId: firstGroup.id,
+      });
+      assert.equal(join.ok, true, JSON.stringify(join));
+      agentId = String(join.agentId);
+    } finally {
+      await client.close();
+    }
+
+    // 创建时指定：同一个 agent 在新项目里就是顶层 manager。
+    const created = await call(server, "POST", "/api/projects", {
+      name: "创建时定经理",
+      managerAgentId: agentId,
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    assert.equal(created.body.project.manager?.displayName, "PM");
+    assert.equal(created.body.project.manager?.role, "manager");
+    assert.notEqual(created.body.project.manager?.id, undefined);
+
+    // 留空仍然可用（既有流程不变）。
+    const blank = await createProject(server, "留空待分配");
+    assert.equal(blank.manager, null);
+
+    // 指定不存在的 agent → 明确引用错误，不静默创建项目。
+    const bogus = await call(server, "POST", "/api/projects", {
+      name: "假经理",
+      managerAgentId: "00000000000000000000000000",
+    });
+    assert.equal(bogus.status, 400, JSON.stringify(bogus.body));
+    assert.equal(bogus.body.error.code, "invalid_reference");
+    const projects = await call(server, "GET", "/api/projects");
+    assert.ok(
+      !(projects.body.projects as any[]).some((p) => p.name === "假经理"),
+      "引用校验失败时不应留下项目",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 循环 L：归档群组不再接受新的参与者（MCP 入群也受同一条归档写规则约束）
+// ---------------------------------------------------------------------------
+
+test("已归档群组不能被加入：MCP 入群在归档写规则前被拒", async () => {
+  await withServer({ logger: silentLogger }, async (server) => {
+    const project = await createProject(server, "归档群组项目");
+    const group = await createGroup(server, project.id, "只读归档群组", []);
+    await call(server, "POST", `/api/groups/${group.id}/archive`);
+
+    const client = await connectAgent(server, "late-joiner");
+    try {
+      const join = await callTool(client, "join", {
+        displayName: "Late",
+        hostType: "codex-cli",
+        projectId: project.id,
+        groupId: group.id,
+      });
+      assert.equal(join.ok, false, JSON.stringify(join));
+      assert.equal(join.error?.code, "CONFLICT");
+      assert.match(String(join.error?.message), /归档/);
+    } finally {
+      await client.close();
+    }
+
+    // 恢复后照常可入群（归档是可恢复态）。
+    await call(server, "POST", `/api/groups/${group.id}/restore`);
+    const reopened = await connectAgent(server, "late-joiner-2");
+    try {
+      const join = await callTool(reopened, "join", {
+        displayName: "Late2",
+        hostType: "codex-cli",
+        projectId: project.id,
+        groupId: group.id,
+      });
+      assert.equal(join.ok, true, JSON.stringify(join));
+    } finally {
+      await reopened.close();
+    }
+  });
+});

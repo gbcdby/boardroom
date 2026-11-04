@@ -502,13 +502,34 @@ function createProjects(db: Database.Database): ProjectsRepository {
   return {
     create(input) {
       const name = requireNonEmpty(input.name, "Project.name");
+      // 创建时指定顶层 manager（#48 / PROJECT-02）：agent 必须已存在，否则整体拒绝，
+      // 不留半个项目（引用校验放在写入之前）。
+      const managerAgentId = input.managerAgentId ?? null;
+      let managerName: string | null = null;
+      if (managerAgentId !== null) {
+        const agent = db
+          .prepare("SELECT display_name FROM agents WHERE id = ?")
+          .get(managerAgentId) as { display_name: string } | undefined;
+        if (!agent) {
+          throw new InvalidReferenceError(
+            `Agent ${managerAgentId} 不存在，无法在创建项目时指定为顶层 manager。`,
+          );
+        }
+        managerName = agent.display_name;
+      }
       const at = nowIso();
       const project: Project = { id: newId(), name, createdAt: at, updatedAt: at, archivedAt: null };
-      runInTransaction(db, () =>
+      runInTransaction(db, () => {
         db
           .prepare("INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)")
-          .run(project.id, project.name, project.createdAt, project.updatedAt),
-      );
+          .run(project.id, project.name, project.createdAt, project.updatedAt);
+        if (managerAgentId !== null && managerName !== null) {
+          db.prepare(
+            `INSERT INTO members (id, project_id, agent_id, kind, display_name, role, created_at, updated_at)
+             VALUES (?, ?, ?, 'agent', ?, 'manager', ?, ?)`,
+          ).run(newId(), project.id, managerAgentId, managerName, at, at);
+        }
+      });
       return project;
     },
     get(id) {
@@ -824,6 +845,8 @@ function createGroups(db: Database.Database): GroupsRepository {
     addParticipant(groupId, memberId) {
       const group = getGroupRow(groupId);
       if (!group) throw new NotFoundError(`Group ${groupId} 不存在。`);
+      // 归档 = 非活跃态：不再接受新参与者（含 MCP 入群时落到本群组的 addParticipant）。
+      requireGroupActive(db, groupId, "把成员加入群组");
       if (!memberInProject.get(memberId, group.project_id)) {
         throw new InvalidReferenceError(`成员 ${memberId} 不属于项目 ${group.project_id}，不能加入该群组。`);
       }

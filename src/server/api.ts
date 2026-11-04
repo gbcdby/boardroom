@@ -215,7 +215,12 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         const body = await readObjectBody(request);
         // F2：创建项目 = project:create（阶段 1 默认人=owner 放行；manager 无此能力点）。
         guard(r, request, "project:create", {});
-        const project = r.projects.create({ name: requireString(body, "name") });
+        // #48 / PROJECT-02：可选「创建时指定」顶层 manager（已有全局 agent）；省略 = 留空待分配。
+        const managerAgentId = optionalStringOrNull(body, "managerAgentId");
+        const project = r.projects.create({
+          name: requireString(body, "name"),
+          ...(managerAgentId === undefined ? {} : { managerAgentId }),
+        });
         log.info("创建项目", { projectId: project.id });
         writeJson(response, 201, { project: projectView(r, project) });
         return true;

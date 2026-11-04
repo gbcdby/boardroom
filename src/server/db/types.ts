@@ -43,6 +43,12 @@ export interface Project {
 
 export interface NewProject {
   readonly name: string;
+  /**
+   * 创建项目时同时指定顶层 manager（#48 / PROJECT-02「创建时指定」）：
+   * 必须是**已存在的全局 agent**（由 MCP 入群产生），服务端在同一事务里
+   * 为该 agent 建本项目的成员岗位并置为 manager。省略 = 留空待分配。
+   */
+  readonly managerAgentId?: string | null;
 }
 
 /** 成员类别：agent 或人。 */
