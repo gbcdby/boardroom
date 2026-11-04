@@ -6,7 +6,7 @@
 
 Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Codex CLI 等作为保留各自上下文与身份的独立成员参与；人在 WebUI 中参与群聊、设定组织架构、管理任务和记忆。
 
-当前处于需求/方案阶段。产品基线见 `docs/architecture/agent-studio.md`；decision map、详细 spec、ticket、依赖与状态以 GitHub Issues 为准。技术栈为 Node/TypeScript + SQLite + WebSocket + MCP + Vue 3，仅 localhost、单用户、无认证。
+当前处于需求/方案阶段。产品基线见 `docs/architecture/agent-studio.md`；decision map、详细 spec、ticket、依赖与状态以 GitHub Issues 为准。技术栈为 Node/TypeScript + PostgreSQL + WebSocket + MCP + Vue 3，默认 localhost、单用户、无认证；架构基线支持未来远程/多用户（V1 仍单用户/无认证，具体范围待立项重评）。
 
 ## 工作约定
 

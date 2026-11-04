@@ -20,6 +20,7 @@
 | 自己参与的消息（阶段 1） | 阶段 1 只覆盖自己发送 + 被 @；任务关联消息留阶段 3，最终定义在阶段 3 重新确认。 | 决策票 #6（D3，2026-10-18） |
 | fixed point | 双轴评审的 diff 基准点（commit SHA、分支、tag 等）；评审记录必须可追溯。 | `docs/architecture/agent-studio.md` §6.7；`.agents/skills/code-review/SKILL.md` |
 | 三层记忆 | Agent 全局记忆、项目共享记忆、项目+agent 记忆；作用域、读写权限和注入方式不同。 | `docs/architecture/agent-studio.md` §6.8 |
+| 状态看板 vs 跨项目总览 | 状态看板 = **项目作用域的成员级明细**（阶段 1 现路由 `/status`，`StatusBoardView.vue`）；跨项目总览 = 阶段 2 的 `/` 页，**只到每项目计数**，无成员明细。自 #31 起两者共用同一条**不绑项目的全局 human presence**（memberId 级连接引用计数），所以「人在所有项目都算在线」是设计而非 bug。 | 决策票 #31（2026-11-04）、#40（子地图 #35） |
 
 ## 宿主差异（Claude Code / Codex CLI）
 
@@ -43,6 +44,7 @@
 | 现象 | 原因 | 结论 / 做法 | 适用范围 | 证据 |
 | --- | --- | --- | --- | --- |
 | 原型 MCP server 在宿主被杀后日志暴涨到 1.2G | stderr 已断（EPIPE），`uncaughtException` 处理里又写 stderr，递归触发自身 | 日志写入必须 try/catch 包裹；EPIPE 单独短路，且对 uncaught 限次记录 | 任何 stdio MCP server | `.agent-output/d6-host-capability/` 修复前后对比 |
+| `skill` 工具报「skill "interview" is not available for model invocation」，读不到显式触发类技能 | 这些技能 frontmatter 有 `disable-model-invocation: true`（`interview`/`to-spec`/`to-tickets`/`implement`/`decision-map`/`handoff`），禁止 model 主动调用 | 用户示意「你自己往下走」时，直接读盘 `.agents/skills/<name>/SKILL.md` 按其流程执行；但 HITL 类（`interview`、decision:interview 票）仍**不得代用户回答**，只能用提问工具逐轮收敛 | 本仓库决策票与 `AGENTS.md` 工作流 | 2026-11-04 解 #31 全程；`.agents/skills/interview/SKILL.md:4` |
 
 ## 待验证
 
