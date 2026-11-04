@@ -45,8 +45,11 @@ export interface Actor {
   readonly actorId: string;
   readonly kind: "human" | "agent";
   readonly role: AuthzRole;
-  /** 本主体所属项目：跨项目一律拒绝（NFR-PROJ-01 隔离）。 */
-  readonly projectId: string;
+  /**
+   * 本主体所属项目；null = 全局主体（阶段 1 未认证的人，可跨项目操作）。
+   * agent 主体必须绑定项目：`projectId = null` 且 `kind = "agent"` 会被拒绝（fail-closed）。
+   */
+  readonly projectId: string | null;
   /** 岗位所在的组织节点（`org_nodes.id`）；owner / 未落位时为 null。 */
   readonly nodeId: string | null;
   /**
@@ -88,6 +91,7 @@ export type Capability =
   | "overview:view"
   | "org:manage"
   | "member:manage"
+  | "status:view"
   | "group:create"
   | "group:archive"
   | "group:purge"
@@ -118,6 +122,7 @@ const CAPABILITY_BOUNDARY: Readonly<Record<Capability, BoundaryKind>> = {
   "overview:view": "project",
   "org:manage": "subtree",
   "member:manage": "subtree",
+  "status:view": "subtree",
   "group:create": "subtree",
   "group:archive": "subtree",
   "group:purge": "project",
@@ -148,6 +153,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
     "overview:view",
     "org:manage",
     "member:manage",
+    "status:view",
     "group:create",
     "group:archive",
     "group:purge",
@@ -166,6 +172,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
     "overview:view",
     "org:manage",
     "member:manage",
+    "status:view",
     "group:create",
     "group:archive",
     "group:view",
@@ -181,6 +188,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
   sub_manager: new Set<Capability>([
     "org:manage",
     "member:manage",
+    "status:view",
     "group:create",
     "group:archive",
     "group:view",
@@ -194,6 +202,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
     "session:heartbeat",
   ]),
   member: new Set<Capability>([
+    "status:view",
     "group:view",
     "group:post",
     "message:ack",
@@ -222,7 +231,8 @@ export type DenyCode = (typeof DENY_CODES)[number];
  * `null` 表示该维度不限（全项目授权）；数组是白名单，查询层据此加 WHERE。
  */
 export interface ConnScope {
-  readonly projectId: string;
+  /** 主体绑定的项目；null = 全局主体（人），由调用方按请求上下文收窄。 */
+  readonly projectId: string | null;
   /** 允许的组织节点（子树）；null = 全项目。 */
   readonly nodeIds: readonly string[] | null;
   /** 明确允许的群组（请求已点名某群组时）；null = 由可见性规则再筛。 */
@@ -247,7 +257,12 @@ export function authorize(actor: Actor, capability: Capability, scope: GuardScop
   if (!isKnownCapability(capability)) {
     return deny("unknown_action", null, `未知能力点：${String(capability)}`);
   }
-  if (!actor.projectId || (scope.projectId !== undefined && scope.projectId !== actor.projectId)) {
+  if (actor.projectId === null) {
+    // 只有人可以是全局主体；agent 必须绑定项目（NFR-PROJ-01）。
+    if (actor.kind !== "human") {
+      return deny("cross_project", capability, "agent 主体必须绑定项目后才能鉴权。");
+    }
+  } else if (scope.projectId !== undefined && scope.projectId !== actor.projectId) {
     return deny("cross_project", capability, "目标资源不在该主体所属项目内。");
   }
   const granted = (AUTHZ_ROLES as readonly string[]).includes(actor.role)
@@ -299,8 +314,9 @@ function checkSubtree(
   scope: GuardScope,
 ): AuthorizeDecision | null {
   if (reach === "project") return null;
-  const subtree = actor.subtreeNodeIds;
-  if (reach !== "subtree" || subtree === null || subtree === undefined) {
+  // own：管辖范围就是自己所在的那一个节点。
+  const subtree = reach === "own" ? (actor.nodeId === null ? null : [actor.nodeId]) : actor.subtreeNodeIds;
+  if (subtree === null || subtree === undefined) {
     return deny("out_of_subtree", capability, "该岗位没有可判定的子树范围。");
   }
   if (scope.nodeId !== undefined) {
@@ -336,7 +352,7 @@ function checkVisibility(
   if (reach === "project") return ok();
   if (scope.groupMemberIds?.includes(actor.actorId)) return ok();
   const granted = ROLE_CAPABILITIES[actor.role];
-  if (granted.has("group:view_subtree") && reach === "subtree") {
+  if (granted.has("group:view_subtree") && (reach === "subtree" || reach === "own")) {
     const subtree = actor.subtreeNodeIds;
     const nodes = scope.groupMemberNodeIds;
     if (subtree && nodes && scope.groupMemberIds && nodes.length === scope.groupMemberIds.length) {
