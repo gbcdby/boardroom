@@ -104,7 +104,15 @@ HTTP/传输层错误（Streamable HTTP 自身）由 SDK 返回 JSON-RPC 错误�
   "projectId": "...",
   "groupId": "...",
   "role": "normal",
-  "heartbeat": { "intervalMs": 10000, "timeoutMs": 30000 } // D4，随入群下发
+  "heartbeat": { "intervalMs": 10000, "timeoutMs": 30000 }, // D4，随入群下发
+  "context": {               // T6（#53）：入群即注入的会话上下文
+    "project": { "id": "...", "name": "..." },
+    "group": { "id": "...", "name": "..." },
+    "identity": { "memberId": "m_...", "displayName": "...", "role": "member", "reach": "own" },
+    "visibility": { "canPost": true, "canWake": true, "scope": "write" },
+    "participants": [ { "memberId": "m_...", "displayName": "...", "role": "normal", "kind": "agent" } ],
+    "isolation": { "projectId": "...", "crossProjectAccess": false, "note": "..." }
+  }
 }
 ```
 
