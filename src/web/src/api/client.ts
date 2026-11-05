@@ -31,6 +31,19 @@ export interface ProjectDto {
   /** 归档时间（ISO 字符串）；null = 未归档（T1 #48 / PROJECT-03）。 */
   archivedAt: string | null;
   manager: MemberDto | null;
+  /** T4（#51）跨项目概览聚合字段：以下为可选，便于逐步落地与兼容旧缓存。 */
+  /** 成员数（含人/agent）。 */
+  memberCount?: number;
+  /** 活跃群组数。 */
+  groupCount?: number;
+  /** 项目组消息总数。 */
+  messageCount?: number;
+  /** 在线成员数（online/waiting/working）。 */
+  onlineCount?: number;
+  /** 最近一条消息时间（ISO 字符串）；无消息为 null。 */
+  lastActivityAt?: string | null;
+  /** 项目聚合状态：active = 有成员在线；idle = 无人在线；archived = 已归档（非活跃）。 */
+  status?: "active" | "idle" | "archived";
 }
 
 export interface GroupDto {
