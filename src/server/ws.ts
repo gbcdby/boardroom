@@ -62,7 +62,7 @@ export interface WebSocketHubOptions {
    * F2（#47）守卫主体解析点：把 WebUI 的 presence 声明纳入统一守卫。
    * 省略 = 阶段 1 单用户无认证，连接主体一律是「人（owner）」→ 全部放行，行为不变。
    */
-  readonly resolveActor?: (context: WsActorContext) => Actor | null;
+  readonly resolveActor?: (context: WsActorContext) => Promise<Actor | null>;
 }
 
 /** WS 主体解析上下文：客户端声明的项目与成员。 */
@@ -105,7 +105,7 @@ export function createWebSocketHub(options: WebSocketHubOptions): WebSocketHub {
   const now = options.now ?? (() => new Date());
   const log = logger.child({ component: "ws" });
   /** 阶段 1 默认主体：人（owner），不做范围收窄。 */
-  const resolveActor = options.resolveActor ?? (({ projectId }) => ownerActor(projectId));
+  const resolveActor = options.resolveActor ?? (async ({ projectId }) => ownerActor(projectId));
   const wss = new WebSocketServer({ noServer: true });
   /** 最近一次收到 pong 的时间戳（毫秒）。 */
   const lastSeen = new Map<WebSocket, number>();
@@ -129,7 +129,7 @@ export function createWebSocketHub(options: WebSocketHubOptions): WebSocketHub {
 
     client.on("pong", () => lastSeen.set(client, Date.now()));
 
-    client.on("message", (data, isBinary) => {
+    client.on("message", async (data, isBinary) => {
       if (isBinary) {
         send(client, { type: "error", code: "invalid_message", message: "仅支持文本 JSON 帧" });
         return;
@@ -158,7 +158,7 @@ export function createWebSocketHub(options: WebSocketHubOptions): WebSocketHub {
         }
         // F2（#47）：presence 是「在该项目里在线」的写入，交给统一守卫判定主体范围。
         // 阶段 1 默认主体是人（owner）→ 放行，行为不变；越出范围按拒绝码回错帧且不记录在线。
-        const actor = resolveActor({ projectId, memberId });
+        const actor = await (resolveActor({ projectId, memberId }));
         if (actor === null || actor === undefined) {
           log.info("presence 主体无法解析，守卫按 fail-closed 拒绝", { clientId, projectId });
           send(client, { type: "error", code: "forbidden", message: "无法确定连接主体，守卫拒绝。" });

@@ -1,7 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
-import type Database from "better-sqlite3";
 import type { AppConfig } from "./config.ts";
 import { createDbDriver, type DbDriver } from "./db/driver.ts";
 import { SqliteDriver } from "./db/drivers/sqlite.ts";
@@ -39,10 +38,10 @@ export class ServerStartupError extends Error {
  * 测试/未来认证可显式注入覆盖三个解析点。
  */
 export interface ServerAuthorization {
-  readonly resolveHttpActor?: (resolution: ActorResolution) => Actor | null;
-  readonly resolveWsActor?: (context: WsActorContext) => Actor | null;
+  readonly resolveHttpActor?: (resolution: ActorResolution) => Promise<Actor | null>;
+  readonly resolveWsActor?: (context: WsActorContext) => Promise<Actor | null>;
   /** MCP 会话绑定 → 带岗位与子树的 Actor（注入到 core 的 `authz.actorFor`）。 */
-  readonly resolveMcpActor?: (binding: SessionBinding) => Actor;
+  readonly resolveMcpActor?: (binding: SessionBinding) => Promise<Actor>;
 }
 
 export interface StartServerOptions {
@@ -63,7 +62,7 @@ export interface RunningServer {
   readonly host: string;
   readonly url: string;
   readonly wsUrl: string;
-  readonly database: Database.Database;
+  readonly database: DbDriver;
   readonly migrationState: MigrationState;
   /** MCP Streamable HTTP 端点 URL（挂在同一 HTTP server 上）。 */
   readonly mcpUrl: string;
@@ -113,36 +112,26 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     log.error("数据库驱动配置无效", { error, dataDir: config.dataDir });
     throw new ServerStartupError((error as Error).message);
   }
-  if (!(driver instanceof SqliteDriver)) {
-    // 业务仓储尚未切 PG（M1 #54）；此处快速失败，不打开 SQLite、不连接 PG。
-    throw new ServerStartupError(
-      `dbDriver=postgres 暂时不能启动：阶段 1 业务仓储仍直接依赖 SQLite，` +
-        `PostgreSQL 业务表重写与既有数据迁移由 M1（#54）交付。\n` +
-        `驱动层（connect/migrate/query/方言）已接入并有冒烟验证。\n` +
-        `回滚方式：保持或改回 AGENT_STUDIO_DB_DRIVER=sqlite（默认值），继续使用本地 SQLite 数据目录 ${config.dataDir}。`,
-    );
-  }
-  const sqlite = driver;
 
   try {
-    await sqlite.connect();
+    await driver.connect();
   } catch (error) {
     log.error("数据库初始化失败", { error, dataDir: config.dataDir });
     throw new ServerStartupError((error as Error).message);
   }
 
-  const db = sqlite.handle;
+  const db = (driver as SqliteDriver).handle;
   let migrationState: MigrationState;
   try {
-    const result = await sqlite.migrate(migrations);
-    migrationState = await sqlite.migrationState();
+    const result = await driver.migrate(migrations);
+    migrationState = await driver.migrationState();
     log.info("迁移完成", {
       version: migrationState.version,
       applied: result.applied.length,
       pending: migrations.length - migrationState.applied.length,
     });
   } catch (error) {
-    await sqlite.close();
+    await driver.close();
     log.error("迁移失败", { error });
     throw new ServerStartupError(
       `${(error as Error).message}\n数据目录：${config.dataDir}\n` +
@@ -154,17 +143,17 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   // 启动时统一标记为断开，并把这些成员的运行状态置为 offline——恢复完全依赖
   // 服务端持久化 + agent 重连后主动 join/心跳，不臆造在线（STATUS-02）。
   try {
-    const recovered = createRepositories(db);
+    const recovered = createRepositories(driver);
     const staleAt = new Date().toISOString();
-    const staleCount = recovered.mcpSessions.markAllStale(staleAt);
+    const staleCount = await (recovered.mcpSessions.markAllStale(staleAt));
     if (staleCount > 0) {
       // 清扫覆盖**全部**项目（含 #48 的已归档项目）：归档只是非活跃态，
       // 遗留会话仍必须标记断开，不臆造在线。
-      for (const project of recovered.projects.list({ includeArchived: true })) {
-        for (const member of recovered.members.listByProject(project.id)) {
-          const status = recovered.statuses.get(project.id, member.id);
+      for (const project of await (recovered.projects.list({ includeArchived: true }))) {
+        for (const member of await (recovered.members.listByProject(project.id))) {
+          const status = await (recovered.statuses.get(project.id, member.id));
           if (status && (status.state === "online" || status.state === "waiting" || status.state === "working")) {
-            recovered.statuses.set(project.id, member.id, "offline");
+            await (recovered.statuses.set(project.id, member.id, "offline"));
           }
         }
       }
@@ -178,7 +167,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   // T2（#49）：把 F2 的纯权限结构接到真实 DB 数据。未显式注入 authorization 时，
   // 三个入口统一用 org_nodes / members.node_id 装配 Actor；无组织数据的升级库
   // 逐入口回退到阶段 1 兼容映射（人=owner），AC-CORE-* 行为不变。
-  const orgResolver = createOrgActorResolver(createRepositories(db));
+  const orgResolver = createOrgActorResolver(createRepositories(driver));
   const authorization: ServerAuthorization = options.authorization ?? {
     resolveHttpActor: (resolution) => orgResolver.resolveHttpActor(resolution),
     resolveWsActor: (context) => orgResolver.resolveWsActor(context),
@@ -196,7 +185,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   const mcpHandler: McpSessionsHandler = createMcpSessionsHandler({
     logger,
     heartbeat: config.heartbeat,
-    db,
+    db: driver,
     antiLoop: { ...(config.antiLoop ? { config: config.antiLoop } : {}) },
     ...(authorization.resolveMcpActor ? { actorFor: authorization.resolveMcpActor } : {}),
   });
@@ -205,9 +194,9 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   // T5（#52）：把 T2/T3 的 noop 钩子换成默认真实 recorder（写 audit_log）。
   // 显式注入（测试替身 / 未来装配）优先，保证既有 org-authz 等用例不变。
   const auditRecorder: OrgChangeRecorder =
-    options.orgChangeRecorder ?? createAuditRecorder(createRepositories(db).audit);
+    options.orgChangeRecorder ?? createAuditRecorder(createRepositories(driver).audit);
   const t1Api = createT1ApiRouter({
-    db,
+    db: driver,
     logger,
     heartbeat: config.heartbeat,
     onMessage: (message) => broadcastMessage(message),
@@ -288,10 +277,10 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
 
   // T4 状态看板：定期把每个项目的有效状态快照广播给可见 WebUI 客户端。
   // 客户端本地还会用心跳时间戳做平滑判定；服务端按心跳 interval 刷新即可。
-  const statusRepos = createRepositories(db);
-  const statusPublisher = (): void => {
+  const statusRepos = createRepositories(driver);
+  const statusPublisher = async (): Promise<void> => {
     const nowDate = new Date();
-    const projects = statusRepos.projects.list(); // 活跃项目（默认出周期快照）
+    const projects = await (statusRepos.projects.list()); // 活跃项目（默认出周期快照）
     const known = new Set(projects.map((p) => p.id));
     // T4（#51）：归档项目默认不进周期快照（T1 unresolved / 归档=非活跃）。
     // 仅当某 WebUI 客户端通过 presence 显式声明该归档项目时，才按需推送其快照，
@@ -299,16 +288,16 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     const declared = new Set(hub.declaredProjectIds());
     for (const pid of declared) {
       if (known.has(pid)) continue;
-      const archived = statusRepos.projects.get(pid);
+      const archived = await (statusRepos.projects.get(pid));
       if (archived && archived.archivedAt !== null) projects.push(archived);
     }
     for (const project of projects) {
       try {
-        const statuses = buildStatusBoard(statusRepos, project.id, {
+        const statuses = await (buildStatusBoard(statusRepos, project.id, {
           heartbeat: config.heartbeat,
           now: nowDate,
           humanOnlineMemberIds: hub.humanPresenceMembers(project.id),
-        });
+        }));
         hub.broadcastProjectStatus(project.id, statuses);
       } catch (error) {
         log.warn("状态看板广播失败", { error, projectId: project.id });
@@ -334,7 +323,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     });
   } catch (error) {
     await hub.close();
-    await sqlite.close();
+    await driver.close();
     const err = error as NodeJS.ErrnoException;
     const message =
       err.code === "EADDRINUSE"
@@ -356,7 +345,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     url,
     wsUrl: `ws://${HOST}:${port}${WS_PATH}`,
     dataDir: config.dataDir,
-    database: sqlite.file,
+    database: driver.kind,
     heartbeat: config.heartbeat,
     webuiBuilt,
   });
@@ -366,15 +355,15 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     host: HOST,
     url,
     wsUrl: `ws://${HOST}:${port}${WS_PATH}`,
-    database: db,
+    database: driver,
     migrationState,
     broadcast: (event) => hub.broadcast(event),
-    broadcastStatus: (projectId) => {
-      const statuses = buildStatusBoard(statusRepos, projectId, {
+    broadcastStatus: async (projectId) => {
+      const statuses = await (buildStatusBoard(statusRepos, projectId, {
         heartbeat: config.heartbeat,
         now: new Date(),
         humanOnlineMemberIds: hub.humanPresenceMembers(projectId),
-      });
+      }));
       hub.broadcastProjectStatus(projectId, statuses);
     },
     get clientCount() {
@@ -399,7 +388,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
         httpServer.close(() => resolve());
         httpServer.closeAllConnections();
       });
-      await sqlite.close();
+      await driver.close();
       log.info("服务已停止");
     },
   };

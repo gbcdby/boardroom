@@ -151,15 +151,15 @@ function base(
  * 按项目列出所有成员的有效状态。人的「在线」需要 WebUI 在线集合，由调用方注入。
  * 这里只覆盖 agent 会话推导与人成员的持久状态（offline/online）。
  */
-export function deriveProjectStatuses(
+export async function deriveProjectStatuses(
   repos: RepositorySet,
   projectId: string,
   ctx: DeriveContext,
-): EffectiveStatus[] {
-  const sessions = repos.mcpSessions.listByProject(projectId);
-  return repos.members.listByProject(projectId).map((member) => {
+): Promise<EffectiveStatus[]> {
+  const sessions = (await (repos.mcpSessions.listByProject(projectId)));
+  return (await Promise.all((await (repos.members.listByProject(projectId))).map(async (member) => {
     const session = latestSessionForMember(sessions, member.id);
-    const stored = repos.statuses.get(projectId, member.id);
+    const stored = (await (repos.statuses.get(projectId, member.id)));
     return deriveEffectiveStatus({
       projectId,
       memberId: member.id,
@@ -170,7 +170,7 @@ export function deriveProjectStatuses(
       heartbeat: ctx.heartbeat,
       now: ctx.now,
     });
-  });
+  })));
 }
 
 /** 取某成员最近一次会话（按 connectedAt 倒序，其次 updatedAt）。 */
@@ -194,16 +194,16 @@ function sessionSortKey(session: McpSession): string {
  * 人没有 MCP 会话，其在线来自 WebSocket 连接（`humanOnlineMemberIds`）；不在线的成员显示 offline。
  * 人**永远**不会出现 waiting/working。只读，不写库。
  */
-export function buildStatusBoard(
+export async function buildStatusBoard(
   repos: RepositorySet,
   projectId: string,
   ctx: DeriveContext & { readonly humanOnlineMemberIds?: readonly string[] },
-): EffectiveStatus[] {
+): Promise<EffectiveStatus[]> {
   const humanOnline = new Set(ctx.humanOnlineMemberIds ?? []);
-  const sessions = repos.mcpSessions.listByProject(projectId);
-  return repos.members.listByProject(projectId).map((member) => {
+  const sessions = (await (repos.mcpSessions.listByProject(projectId)));
+  return (await Promise.all((await (repos.members.listByProject(projectId))).map(async (member) => {
     const session = latestSessionForMember(sessions, member.id);
-    const stored = repos.statuses.get(projectId, member.id);
+    const stored = (await (repos.statuses.get(projectId, member.id)));
     if (member.kind === "human") {
       const online = humanOnline.has(member.id);
       return deriveEffectiveStatus({
@@ -227,5 +227,5 @@ export function buildStatusBoard(
       heartbeat: ctx.heartbeat,
       now: ctx.now,
     });
-  });
+  })));
 }

@@ -10,18 +10,18 @@
 import type { RepositorySet } from "../db/repositories.ts";
 import type { RoutingMember } from "./routing.ts";
 
-export function buildRoster(repos: RepositorySet, groupId: string): RoutingMember[] {
-  const group = repos.groups.get(groupId);
+export async function buildRoster(repos: RepositorySet, groupId: string): Promise<RoutingMember[]> {
+  const group = (await (repos.groups.get(groupId)));
   if (!group) return [];
   const onlineIds = new Set(
-    repos.mcpSessions
-      .listByProject(group.projectId)
+    (await (repos.mcpSessions
+      .listByProject(group.projectId)))
       .filter((s) => s.state === "connected")
       .map((s) => s.memberId),
   );
   const roster: RoutingMember[] = [];
-  for (const id of repos.groups.participants(groupId)) {
-    const member = repos.members.get(id);
+  for (const id of (await (repos.groups.participants(groupId)))) {
+    const member = (await (repos.members.get(id)));
     if (!member) continue;
     roster.push({
       id: member.id,

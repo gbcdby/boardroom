@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import type { Database } from "better-sqlite3";
+import type { DbDriver } from "../db/driver.ts";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -19,14 +19,14 @@ export interface McpTransportOptions {
   readonly logger: Logger;
   readonly heartbeat: Heartbeat;
   /** 持久化数据库；MCP 工具直接落 F2 repository（T2）。 */
-  readonly db: Database;
+  readonly db: DbDriver;
   /** T7：防环/限流阈值（跨会话共享限流器）。缺省用 D5 默认值。 */
   readonly antiLoop?: import("./core.ts").AntiLoopRuntimeOptions;
   /**
    * T2（#49）：F2 守卫的「会话绑定 → Actor」装配口。省略时 core 用阶段 1 兼容映射
    * （`members.role` 的 manager/normal → top_manager/member），既有行为不变。
    */
-  readonly actorFor?: (binding: SessionBinding) => Actor;
+  readonly actorFor?: (binding: SessionBinding) => Promise<Actor>;
 }
 
 export interface McpSessionsHandler {

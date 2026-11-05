@@ -1,5 +1,5 @@
-import type { Database } from "better-sqlite3";
 import type { Logger } from "../logger.ts";
+import type { DbDriver } from "../db/driver.ts";
 import {
   ConflictError,
   InvalidArgumentError,
@@ -362,7 +362,7 @@ export interface AntiLoopRuntimeOptions {
 
 export interface McpCoreOptions {
   readonly logger: Logger;
-  readonly db: Database;
+  readonly db: DbDriver;
   readonly heartbeat?: Heartbeat;
   readonly now?: () => Date;
   /**
@@ -384,36 +384,36 @@ export interface McpCoreOptions {
 
 export interface McpAuthzOptions {
   /** 覆盖「会话绑定 → Actor」的映射（注入 nodeId / subtreeNodeIds）。 */
-  readonly actorFor?: (binding: SessionBinding) => Actor;
+  readonly actorFor?: (binding: SessionBinding) => Promise<Actor>;
 }
 
 export interface McpCore {
-  join(sessionId: string, params: JoinParams): JoinResult;
+  join(sessionId: string, params: JoinParams): Promise<JoinResult>;
   waitForMessages(sessionId: string, params: WaitParams): Promise<WaitResult>;
-  sendMessage(sessionId: string, params: SendMessageParams): SendMessageResult;
-  acknowledgeMessage(sessionId: string, messageId: string): AcknowledgeResult;
-  reportStatus(sessionId: string, params: { status: RunStatus; projectId?: string; memberId?: string }): StatusResult;
+  sendMessage(sessionId: string, params: SendMessageParams): Promise<SendMessageResult>;
+  acknowledgeMessage(sessionId: string, messageId: string): Promise<AcknowledgeResult>;
+  reportStatus(sessionId: string, params: { status: RunStatus; projectId?: string; memberId?: string }): Promise<StatusResult>;
   /**
    * 尽力尝试打断该成员当前轮（T6 / #19）。结果可观察（accepted/rejected/unsupported）且记录；
    * 不丢弃消息——无法打断时消息保留在队列，等下一安全点送达（D6/CHAT-05）。
    */
-  attemptInterrupt(sessionId: string, params?: InterruptParams): InterruptAttempt;
-  heartbeat(sessionId: string): HeartbeatResult;
-  readHistory(sessionId: string, params: ReadHistoryParams): ReadHistoryResult;
+  attemptInterrupt(sessionId: string, params?: InterruptParams): Promise<InterruptAttempt>;
+  heartbeat(sessionId: string): Promise<HeartbeatResult>;
+  readHistory(sessionId: string, params: ReadHistoryParams): Promise<ReadHistoryResult>;
   /**
    * T8（#21）：唤醒本 core 中在该群组等待、且属于 `wakeGate` 放行集合的成员。
    * 供人的 HTTP 消息路径显式触发（该路径不经过任何 core 的 send_message，因此需外部调用）。
    * `wakeGate` 为 undefined 表示不额外限流。
    */
-  resolveGroup(groupId: string, wakeGate?: ReadonlySet<string>): void;
+  resolveGroup(groupId: string, wakeGate?: ReadonlySet<string>): Promise<void>;
   /** 当前挂起等待数（测试与观测用）。 */
   readonly pendingWaitCount: number;
   /** 某个会话是否已入群（测试用）。 */
   isJoined(sessionId: string): boolean;
   /** 中止本 core 所有挂起等待并以 cancelled 返回；用于优雅关闭。幂等。 */
-  close(): void;
+  close(): Promise<void>;
   /** 把本 core 的持久化会话标记为断开（保留历史）。 */
-  disconnect(): void;
+  disconnect(): Promise<void>;
 }
 
 const RUNNING_STATES = new Set<RunStatus>(["waiting", "working"]);
@@ -451,18 +451,18 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 全局身份唯一；跨项目 member 唯一；同 agent+project+group 活跃会话唯一。
    * 冲突以明确错误返回，绝不静默创建重复身份。
    */
-  function joinPersisted(
+  async function joinPersisted(
     projectId: string,
     groupId: string,
     displayName: string,
     hostType: HostType,
     role: MemberRole,
-  ): { agentId: string; member: Member; session: McpSession } {
-    const project = repos.projects.get(projectId);
+  ): Promise<{ agentId: string; member: Member; session: McpSession }> {
+    const project = await (repos.projects.get(projectId));
     if (!project) {
       throw new McpToolError("INVALID_ARGUMENT", `项目 ${projectId} 不存在，请先在 WebUI 创建`, { projectId });
     }
-    const group = repos.groups.get(groupId);
+    const group = await (repos.groups.get(groupId));
     if (!group) {
       throw new McpToolError("INVALID_ARGUMENT", `群组 ${groupId} 不存在，请先在 WebUI 创建`, { groupId });
     }
@@ -471,53 +471,53 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     }
 
     try {
-      return repos.transaction(() => {
+      return await (repos.transaction(async () => {
         // 1) 全局身份：按 (displayName, hostType) 查找或创建（唯一索引兜底）。
-        let agent = repos.agents.findByIdentity(displayName, hostType);
-        if (!agent) agent = repos.agents.create({ displayName, hostType });
+        let agent = await (repos.agents.findByIdentity(displayName, hostType));
+        if (!agent) agent = await (repos.agents.create({ displayName, hostType }));
         const agentId = agent.id;
 
         // 2) 项目成员：同 agent 在同项目唯一（(project_id, agent_id) 唯一索引）。
-        let member = repos.members.findByAgent(projectId, agentId);
+        let member = await (repos.members.findByAgent(projectId, agentId));
         if (!member) {
           // 阶段 1 一个项目只有一个岗位（D2）；入群保留已有 manager，不覆盖。
-          member = repos.members.create({
+          member = await (repos.members.create({
             projectId,
             kind: "agent",
             agentId,
             displayName,
             role: role === "manager" ? "manager" : "normal",
-          });
+          }));
         } else if (member.displayName !== displayName) {
-          member = repos.members.update(member.id, { displayName });
+          member = await (repos.members.update(member.id, { displayName }));
         }
 
         // 3) 群组参与者（幂等）。
-        repos.groups.addParticipant(groupId, member.id);
+        await (repos.groups.addParticipant(groupId, member.id));
 
         // 4) MCP 会话（连接状态，D1）：建立或复用活跃会话。
-        const session = repos.mcpSessions.connect({
+        const session = await (repos.mcpSessions.connect({
           agentId,
           projectId,
           groupId,
           memberId: member.id,
           displayName,
           hostType,
-        });
+        }));
 
         // 5) 成员运行状态：连接建立 → online（与连接心跳分开记录）。
-        repos.statuses.set(projectId, member.id, "online");
+        await (repos.statuses.set(projectId, member.id, "online"));
 
         return { agentId, member, session };
-      });
+      }));
     } catch (error) {
       throw mapRepoError(error, { projectId, groupId, displayName, hostType });
     }
   }
 
-  function touchSession(mcpSessionId: string): void {
+  async function touchSession(mcpSessionId: string): Promise<void> {
     try {
-      repos.mcpSessions.heartbeat(mcpSessionId, now().toISOString());
+      await (repos.mcpSessions.heartbeat(mcpSessionId, now().toISOString()));
     } catch (error) {
       log.warn("mcp_session_heartbeat_failed", { error, mcpSessionId });
     }
@@ -530,8 +530,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 在线判定 = 该成员有 connected 的 MCP 会话（人视为在线）。未参与群组者不进入 roster，
    * 因此可见/唤醒结果天然不含外部成员（隔离）。
    */
-  function buildRosterFor(groupId: string): RoutingMember[] {
-    return buildRoster(repos, groupId);
+  async function buildRosterFor(groupId: string): Promise<RoutingMember[]> {
+    return await (buildRoster(repos, groupId));
   }
 
   /**
@@ -539,14 +539,14 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * （阶段 1 一个会话只绑定一个群组）与群组参与者事实，交给 `authorize` 判定；
    * 拒绝时按 MCP 契约抛 `FORBIDDEN`，并在 details 里给出稳定拒绝码。
    */
-  function guard(binding: SessionBinding, capability: Capability, scope: GuardScope, denyMessage?: string): void {
+  async function guard(binding: SessionBinding, capability: Capability, scope: GuardScope, denyMessage?: string): Promise<void> {
     const decision = authorize(
-      options.authz?.actorFor?.(binding) ?? actorForSession(binding),
+      (await (options.authz?.actorFor?.(binding))) ?? actorForSession(binding),
       capability,
       {
         ...scope,
         ...(scope.groupId !== undefined && scope.groupMemberIds === undefined
-          ? { groupMemberIds: repos.groups.participants(scope.groupId) }
+          ? { groupMemberIds: await (repos.groups.participants(scope.groupId)) }
           : {}),
         conn: { projectId: binding.projectId, groupIds: [binding.groupId] },
       },
@@ -577,26 +577,26 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 若宿主在等待中从未进入等待循环（如已结束本轮），则不会触发 waiting——符合
    * 「不承诺唤醒空闲宿主」的边界。
    */
-  function markWaiting(binding: SessionBinding): void {
+  async function markWaiting(binding: SessionBinding): Promise<void> {
     try {
-      repos.statuses.set(binding.projectId, binding.memberId, "waiting");
+      await (repos.statuses.set(binding.projectId, binding.memberId, "waiting"));
     } catch (error) {
       log.warn("status_waiting_write_failed", { error, memberId: binding.memberId });
     }
   }
 
-  function markWorking(binding: SessionBinding): void {
+  async function markWorking(binding: SessionBinding): Promise<void> {
     try {
-      repos.statuses.set(binding.projectId, binding.memberId, "working");
+      await (repos.statuses.set(binding.projectId, binding.memberId, "working"));
     } catch (error) {
       log.warn("status_working_write_failed", { error, memberId: binding.memberId });
     }
   }
 
   /** 某成员对该消息的可见性（T3 路由规则：普通=自己发送+被@；manager=全部；人=全部）。 */
-  function isVisibleTo(binding: SessionBinding, message: DbMessage): boolean {
+  async function isVisibleTo(binding: SessionBinding, message: DbMessage): Promise<boolean> {
     if (message.groupId !== binding.groupId) return false;
-    const roster = buildRosterFor(message.groupId);
+    const roster = await (buildRosterFor(message.groupId));
     const plan = resolveWakeAndVisibility(
       {
         senderMemberId: message.senderMemberId,
@@ -609,12 +609,12 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   }
 
   /** 从 afterSeq 之后取该成员可见、且未 acked 的消息（积压/唤醒）。 */
-  function deliverableSince(binding: SessionBinding, afterSeq: number | undefined): DbMessage[] {
-    const list = repos.messages.listByGroup(binding.groupId, {
+  async function deliverableSince(binding: SessionBinding, afterSeq: number | undefined): Promise<DbMessage[]> {
+    const list = await (repos.messages.listByGroup(binding.groupId, {
       ...(afterSeq === undefined ? {} : { afterSeq }),
-    });
+    }));
     // roster 在一次调用内不变，构建一次即可。
-    const roster = buildRosterFor(binding.groupId);
+    const roster = await (buildRosterFor(binding.groupId));
     const pending: DbMessage[] = [];
     for (const message of list) {
       const plan = resolveWakeAndVisibility(
@@ -622,7 +622,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         roster,
       );
       if (!plan.visible.includes(binding.memberId)) continue;
-      const delivery = repos.deliveries.get(message.id, binding.memberId);
+      const delivery = await (repos.deliveries.get(message.id, binding.memberId));
       if (delivery?.status === "acked") continue;
       pending.push(message);
     }
@@ -630,14 +630,14 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   }
 
   /** 把一批消息记为「已投递」（至少一次；acked 前可重复读取，靠 acked 过滤去重）。 */
-  function markDelivered(
+  async function markDelivered(
     binding: SessionBinding,
     messages: DbMessage[],
-  ): { messages: Message[]; lastSeq: number } {
+  ): Promise<{ messages: Message[]; lastSeq: number }> {
     const result: Message[] = [];
     for (const message of messages) {
       try {
-        repos.deliveries.recordAttempt(message.id, binding.memberId, "delivered");
+        await (repos.deliveries.recordAttempt(message.id, binding.memberId, "delivered"));
       } catch (error) {
         log.warn("delivery_record_failed", { error, messageId: message.id });
       }
@@ -647,17 +647,17 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   }
 
   /** 某成员最后一条非 pending 消息的游标（timeout/cancelled 时回显 afterCursor）。 */
-  function lastDeliveredCursor(binding: SessionBinding): string | null {
-    const list = repos.messages.listByGroup(binding.groupId);
+  async function lastDeliveredCursor(binding: SessionBinding): Promise<string | null> {
+    const list = await (repos.messages.listByGroup(binding.groupId));
     let lastSeq: number | null = null;
     for (const message of list) {
-      const delivery = repos.deliveries.get(message.id, binding.memberId);
+      const delivery = await (repos.deliveries.get(message.id, binding.memberId));
       if (delivery && delivery.status !== "pending") lastSeq = message.seq;
     }
     return lastSeq === null ? null : seqCursor(lastSeq);
   }
 
-  function settle(entry: PendingWait, result: WaitResult): void {
+  async function settle(entry: PendingWait, result: WaitResult): Promise<void> {
     if (entry.done) return;
     entry.done = true;
     if (entry.timer) clearTimeout(entry.timer);
@@ -669,7 +669,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     // 由 disconnect()/启动恢复置为 offline（STATUS-02，不臆造 working）。
     if (!closed) {
       const binding = bindingByMember(entry.memberId);
-      if (binding) markWorking(binding);
+      if (binding) await (markWorking(binding));
     }
     entry.settled();
     entry.resolve(result);
@@ -682,14 +682,14 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 唤醒判定用 chat/routing 的 wake 集合（普通 agent 只被 @、manager 被其他成员消息、
    * 发送者排除）。可见但非唤醒的消息（例如普通 agent 自己发的）不会触发等待方返回。
    */
-  function resolveGroupInternal(groupId: string, wakeGate?: ReadonlySet<string>): void {
-    const roster = buildRosterFor(groupId);
+  async function resolveGroupInternal(groupId: string, wakeGate?: ReadonlySet<string>): Promise<void> {
+    const roster = await (buildRosterFor(groupId));
     for (const entry of [...pendingWaits]) {
       const binding = bindingByMember(entry.memberId);
       if (!binding || binding.groupId !== groupId) continue;
       // T7：限流门控——某成员不在放行集合内则本次不唤醒（其消息仍为 pending，后续补投）。
       if (wakeGate && !wakeGate.has(binding.memberId)) continue;
-      const messages = deliverableSince(binding, undefined);
+      const messages = await (deliverableSince(binding, undefined));
       if (messages.length === 0) continue;
       // 逐条判定是否属于该成员的唤醒范围；有任一消息唤醒才结算。
       const wakeMessages = messages.filter((message) => {
@@ -700,14 +700,14 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         return plan.wake.includes(binding.memberId);
       });
       if (wakeMessages.length === 0) continue;
-      const delivered = markDelivered(binding, wakeMessages);
-      settle(entry, {
+      const delivered = await (markDelivered(binding, wakeMessages));
+      await (settle(entry, {
         ok: true,
         status: "message",
         messages: delivered.messages,
         cursor: seqCursor(delivered.lastSeq),
         drainedBacklog: false,
-      });
+      }));
       return;
     }
   }
@@ -724,9 +724,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 经 MCP `send_message` 的消息发送者都是 agent；这里按成员 kind 兜底判定，
    * 为将来「人通过 MCP 发送」保留正确语义（人类消息重置连续计数）。
    */
-  function senderKindOf(memberId: string): "agent" | "human" {
+  async function senderKindOf(memberId: string): Promise<"agent" | "human"> {
     try {
-      return repos.members.get(memberId)?.kind === "human" ? "human" : "agent";
+      return (await (repos.members.get(memberId)))?.kind === "human" ? "human" : "agent";
     } catch (error) {
       // 查库失败不静默：记录 warn（仅错误摘要与 memberId，不含消息正文），再兜底为 agent。
       log.warn("sender_kind_lookup_failed", { error, memberId });
@@ -739,7 +739,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   // -------------------------------------------------------------------------
 
   const core: McpCore = {
-    join(sessionId, params) {
+    async join(sessionId, params) {
       if (closed) throw new McpToolError("INTERNAL", "服务端正在关闭");
       const displayName = params.displayName.trim();
       if (displayName.length === 0 || displayName.length > MAX_DISPLAY_NAME_LENGTH) {
@@ -767,10 +767,10 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         ) {
           throw new McpToolError("CONFLICT", "该会话已以不同身份入群，不能重复声明不同身份");
         }
-        return toJoinResult(existing, heartbeat, buildSessionContext(existing));
+        return toJoinResult(existing, heartbeat, await (buildSessionContext(existing)));
       }
 
-      const joined = joinPersisted(params.projectId, params.groupId, displayName, params.hostType, role);
+      const joined = await (joinPersisted(params.projectId, params.groupId, displayName, params.hostType, role));
       const binding: SessionBinding = {
         sessionId: selfKey(sessionId),
         agentId: joined.agentId,
@@ -792,7 +792,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         hostType: binding.hostType,
         mcpSessionId: binding.mcpSessionId,
       });
-      return toJoinResult(binding, heartbeat, buildSessionContext(binding));
+      return toJoinResult(binding, heartbeat, await (buildSessionContext(binding)));
     },
 
     async waitForMessages(sessionId, params) {
@@ -804,17 +804,17 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       if (waitingMembers.has(binding.memberId)) {
         throw new McpToolError("CONFLICT", "该成员已有一个未完成的等待调用");
       }
-      touchSession(binding.mcpSessionId);
+      await (touchSession(binding.mcpSessionId));
       if (params.signal?.aborted) {
         return { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false };
       }
 
       const afterSeq = cursorToSeq(params.afterCursor);
-      const backlog = deliverableSince(binding, afterSeq);
+      const backlog = await (deliverableSince(binding, afterSeq));
       if (backlog.length > 0) {
-        const delivered = markDelivered(binding, backlog);
+        const delivered = await (markDelivered(binding, backlog));
         // 立即拿到积压：不在等待循环中停留，跳过 waiting 直接进入 working（处理收到的消息）。
-        markWorking(binding);
+        await (markWorking(binding));
         log.debug("wait_drained_backlog", { memberId: binding.memberId, count: delivered.messages.length });
         return {
           ok: true,
@@ -827,7 +827,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
       waitingMembers.add(binding.memberId);
       // 进入等待循环 = 显式「在等待」→ waiting（T4/AGENT-04）。
-      markWaiting(binding);
+      await (markWaiting(binding));
       return await new Promise<WaitResult>((resolve) => {
         const entry: PendingWait = {
           ownerKey: memberKey,
@@ -843,27 +843,27 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
           timer: null,
           abortListener: null,
         };
-        entry.timer = setTimeout(() => {
+        entry.timer = setTimeout(async () => {
           log.debug("wait_timeout", { memberId: binding.memberId, timeoutMs });
-          settle(entry, {
+          await (settle(entry, {
             ok: true,
             status: "timeout",
             messages: [],
-            cursor: lastDeliveredCursor(binding),
+            cursor: await (lastDeliveredCursor(binding)),
             drainedBacklog: false,
-          });
+          }));
         }, timeoutMs);
 
         if (params.signal) {
-          entry.abortListener = () => {
+          entry.abortListener = async () => {
             log.debug("wait_cancelled", { memberId: binding.memberId });
-            settle(entry, {
+            await (settle(entry, {
               ok: true,
               status: "cancelled",
               messages: [],
-              cursor: lastDeliveredCursor(binding),
+              cursor: await (lastDeliveredCursor(binding)),
               drainedBacklog: false,
-            });
+            }));
           };
           params.signal.addEventListener("abort", entry.abortListener, { once: true });
         }
@@ -872,9 +872,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       });
     },
 
-    sendMessage(sessionId, params) {
+    async sendMessage(sessionId, params) {
       const binding = bindingFor(sessionId);
-      touchSession(binding.mcpSessionId);
+      await (touchSession(binding.mcpSessionId));
       const text = params.text;
       if (typeof text !== "string" || text.trim().length === 0) {
         throw invalidArgument("text 必填且不能为空");
@@ -884,12 +884,12 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       }
       const groupId = params.groupId ?? binding.groupId;
       // F2（#47）：跨群组写入由统一守卫判定（conn 作用域 + group:post 参与范围）。
-      guard(binding, "group:post", { projectId: binding.projectId, groupId }, "只能向当前入群的群组发送消息");
+      await (guard(binding, "group:post", { projectId: binding.projectId, groupId }, "只能向当前入群的群组发送消息"));
 
       if (params.clientMessageId) {
         const existingId = clientKeys.get(`${binding.memberId}:${params.clientMessageId}`);
         if (existingId) {
-          const existing = repos.messages.get(existingId);
+          const existing = await (repos.messages.get(existingId));
           return {
             ok: true,
             messageId: existingId,
@@ -900,7 +900,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       }
 
       // T3：mention 解析。显式 mentions 入参（稳定 ID）+ 正文里的 @ 名称/@all 合并。
-      const roster = buildRosterFor(groupId);
+      const roster = await (buildRosterFor(groupId));
       const parsed = parseMentions(text, roster);
       if (parsed.unknownNames.length > 0) {
         // 无效 mention 明确报错（失败路径之一），不静默丢弃。
@@ -930,21 +930,21 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       // wait_for_messages 的 deliverableSince 仍按「未 acked」补投，不丢消息（见测试）。
       let created: DbMessage;
       try {
-        created = repos.transaction(() => {
-          const message = repos.messages.create({
+        created = await (repos.transaction(async () => {
+          const message = await (repos.messages.create({
             groupId,
             senderMemberId: binding.memberId,
             body: text,
             // 持久化解析后的稳定成员 ID（含 @all 快照），不存 @all 语义本身。
             mentions: persistedMentions,
-          });
+          }));
           // 为所有「可见」成员建立 pending 投递（含发送者自己，便于自身历史一致性）。
           // 只对 visible 建投递，保证未参与/不可见成员无投递记录（不泄漏）。
           for (const memberId of plan.visible) {
-            repos.deliveries.ensure(message.id, memberId);
+            await (repos.deliveries.ensure(message.id, memberId));
           }
           return message;
-        });
+        }));
       } catch (error) {
         throw mapRepoError(error, { groupId, memberId: binding.memberId });
       }
@@ -964,7 +964,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       // 持久化（上面已建 pending 投递），不丢弃，等窗口重置/恢复后由 wait 补投。
       const decision = antiLoop.registerMessage({
         groupId,
-        senderKind: senderKindOf(binding.memberId),
+        senderKind: await (senderKindOf(binding.memberId)),
         candidateWake: plan.wake,
       });
       if (decision.suppressed.size > 0) {
@@ -991,43 +991,43 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       return { ok: true, messageId: created.id, createdAt: created.createdAt, duplicate: false };
     },
 
-    acknowledgeMessage(sessionId, messageId) {
+    async acknowledgeMessage(sessionId, messageId) {
       const binding = bindingFor(sessionId);
-      touchSession(binding.mcpSessionId);
+      await (touchSession(binding.mcpSessionId));
       if (typeof messageId !== "string" || messageId.trim() === "") {
         throw invalidArgument("messageId 必填");
       }
-      const message = repos.messages.get(messageId);
+      const message = await (repos.messages.get(messageId));
       if (!message) {
         throw new McpToolError("FORBIDDEN", "消息不存在或不在允许范围内", { messageId });
       }
       // F2（#47）：确认动作同样受 conn 作用域与参与范围约束。
-      guard(binding, "message:ack", { projectId: binding.projectId, groupId: message.groupId }, "消息不存在或不在允许范围内");
-      if (!isVisibleTo(binding, message)) {
+      await (guard(binding, "message:ack", { projectId: binding.projectId, groupId: message.groupId }, "消息不存在或不在允许范围内"));
+      if (!await (isVisibleTo(binding, message))) {
         throw new McpToolError("FORBIDDEN", "无权确认该消息", { messageId });
       }
-      const delivery = repos.deliveries.get(messageId, binding.memberId);
+      const delivery = await (repos.deliveries.get(messageId, binding.memberId));
       const alreadyAcknowledged = delivery?.status === "acked";
       if (!alreadyAcknowledged) {
-        repos.deliveries.recordAttempt(messageId, binding.memberId, "acked");
+        await (repos.deliveries.recordAttempt(messageId, binding.memberId, "acked"));
         log.debug("message_acknowledged", { memberId: binding.memberId, messageId });
       }
       return { ok: true, messageId, alreadyAcknowledged };
     },
 
-    reportStatus(sessionId, params) {
+    async reportStatus(sessionId, params) {
       const binding = bindingFor(sessionId);
-      touchSession(binding.mcpSessionId);
+      await (touchSession(binding.mcpSessionId));
       if (!RUNNING_STATES.has(params.status)) {
         throw invalidArgument("status 必须是 waiting 或 working");
       }
       const projectId = params.projectId ?? binding.projectId;
       const memberId = params.memberId ?? binding.memberId;
       // F2（#47）：状态上报是 self 边界（ORG-06 只更新自己的状态），项目上下文受 conn 约束。
-      guard(binding, "status:report_own", { projectId, memberId }, "只能上报自己的运行状态与当前项目");
+      await (guard(binding, "status:report_own", { projectId, memberId }, "只能上报自己的运行状态与当前项目"));
       let updatedAt: string;
       try {
-        updatedAt = repos.statuses.set(projectId, memberId, params.status).updatedAt;
+        updatedAt = (await (repos.statuses.set(projectId, memberId, params.status))).updatedAt;
       } catch (error) {
         throw mapRepoError(error, { projectId, memberId });
       }
@@ -1035,14 +1035,14 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       return { ok: true, status: params.status, projectId, memberId, updatedAt };
     },
 
-    attemptInterrupt(sessionId, params) {
+    async attemptInterrupt(sessionId, params) {
       const binding = bindingFor(sessionId);
       // F2（#47）：打断只作用于自己的会话（self 边界）。
-      guard(binding, "interrupt:self", { projectId: binding.projectId, memberId: binding.memberId });
-      touchSession(binding.mcpSessionId);
+      await (guard(binding, "interrupt:self", { projectId: binding.projectId, memberId: binding.memberId }));
+      await (touchSession(binding.mcpSessionId));
 
       // 成员当前运行状态（显式信号驱动，T4）：什么决定「是否处于可打断的忙碌轮次」。
-      const currentState = repos.statuses.get(binding.projectId, binding.memberId)?.state ?? "online";
+      const currentState = (await (repos.statuses.get(binding.projectId, binding.memberId)))?.state ?? "online";
       const target: "running" | "idle" = currentState === "working" ? "running" : "idle";
 
       // 宿主能力：显式申报优先；缺省按 hostType 在注册表中的声明能力（单一事实来源）。
@@ -1052,10 +1052,10 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
       // 打断永远不把已进入处理的轮次伪装成 waiting；恒为 working（与「wait 返回 → working」一致）。
       // 若成员已不在可打断的忙碌轮次（idle），仅记录一次尝试，不改运行状态。
-      if (target === "running") markWorking(binding);
+      if (target === "running") await (markWorking(binding));
 
       // 消息是否仍在队列（可观察；必须与「模型已处理」区分）。
-      const queuedMessageCount = repos.deliveries.listPending(binding.projectId, binding.memberId).length;
+      const queuedMessageCount = (await (repos.deliveries.listPending(binding.projectId, binding.memberId))).length;
 
       const reason = buildInterruptReason(result, binding.hostType, target);
       const attempt: InterruptAttempt = {
@@ -1080,17 +1080,17 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       return attempt;
     },
 
-    heartbeat(sessionId) {
+    async heartbeat(sessionId) {
       const binding = bindingFor(sessionId);
-      guard(binding, "session:heartbeat", { projectId: binding.projectId });
+      await (guard(binding, "session:heartbeat", { projectId: binding.projectId }));
       let session: McpSession;
       try {
-        session = repos.mcpSessions.heartbeat(binding.mcpSessionId, now().toISOString());
+        session = await (repos.mcpSessions.heartbeat(binding.mcpSessionId, now().toISOString()));
       } catch (error) {
         throw mapRepoError(error, { mcpSessionId: binding.mcpSessionId });
       }
       try {
-        repos.agents.touchLastSeen(binding.agentId, session.lastHeartbeatAt ?? now().toISOString());
+        await (repos.agents.touchLastSeen(binding.agentId, session.lastHeartbeatAt ?? now().toISOString()));
       } catch (error) {
         log.warn("touch_last_seen_failed", { error });
       }
@@ -1102,17 +1102,21 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       };
     },
 
-    readHistory(sessionId, params) {
+    async readHistory(sessionId, params) {
       const binding = bindingFor(sessionId);
-      touchSession(binding.mcpSessionId);
+      await (touchSession(binding.mcpSessionId));
       const limit = params.limit ?? DEFAULT_HISTORY_LIMIT;
       if (!Number.isInteger(limit) || limit <= 0 || limit > MAX_HISTORY_LIMIT) {
         throw invalidArgument(`limit 必须是 1–${MAX_HISTORY_LIMIT} 的整数`, { limit });
       }
       const groupId = params.groupId ?? binding.groupId;
       // F2（#47）：历史读取受 conn 作用域 + 可见性判定（替代手写的群组比较）。
-      guard(binding, "group:view", { projectId: binding.projectId, groupId }, "只能读取当前入群群组的历史");
-      const visible = repos.messages.listByGroup(groupId).filter((m) => isVisibleTo(binding, m));
+      await (guard(binding, "group:view", { projectId: binding.projectId, groupId }, "只能读取当前入群群组的历史"));
+      const messages = await (repos.messages.listByGroup(groupId));
+      const visible: typeof messages = [];
+      for (const m of messages) {
+        if (await isVisibleTo(binding, m)) visible.push(m);
+      }
 
       let endIndex = visible.length;
       if (params.beforeCursor) {
@@ -1140,36 +1144,36 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     },
 
     // T8（#21）：把内部的 resolveGroup 暴露给 HTTP 消息路径跨 core 唤醒。
-    resolveGroup(groupId, wakeGate) {
-      resolveGroupInternal(groupId, wakeGate);
+    async resolveGroup(groupId, wakeGate) {
+      await (resolveGroupInternal(groupId, wakeGate));
     },
 
-    close() {
+    async close() {
       if (closed) return;
       closed = true;
       activeRegistrations.delete(registration);
       let drained = 0;
       for (const entry of [...pendingWaits]) {
         if (entry.ownerKey !== memberKey) continue;
-        settle(entry, {
+        await (settle(entry, {
           ok: true,
           status: "cancelled",
           messages: [],
           cursor: null,
           drainedBacklog: false,
-        });
+        }));
         drained += 1;
       }
       log.info("mcp_core_closed", { pendingWaitsDrained: drained });
     },
 
-    disconnect() {
+    async disconnect() {
       const at = now().toISOString();
       for (const binding of bindings.values()) {
         try {
-          repos.mcpSessions.disconnect(binding.mcpSessionId, at);
+          await (repos.mcpSessions.disconnect(binding.mcpSessionId, at));
           // 连接断开 → 成员运行状态 off（online/waiting/working 都视为离线）。
-          repos.statuses.set(binding.projectId, binding.memberId, "offline");
+          await (repos.statuses.set(binding.projectId, binding.memberId, "offline"));
         } catch (error) {
           log.warn("mcp_session_disconnect_failed", { error, mcpSessionId: binding.mcpSessionId });
         }
@@ -1201,16 +1205,16 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * - 参与者名单只取本群组、本项目成员，绝不跨项目（MCPCTX-02 / AC-PROJ-GUARD-01）。
    * - 隔离边界固定 `crossProjectAccess: false`。
    */
-  function buildSessionContext(binding: SessionBinding): McpSessionContext {
-    const project = repos.projects.get(binding.projectId);
-    const group = repos.groups.get(binding.groupId);
-    const actor = options.authz?.actorFor?.(binding) ?? actorForSession(binding);
-    const participantIds = repos.groups.participants(binding.groupId);
+  async function buildSessionContext(binding: SessionBinding): Promise<McpSessionContext> {
+    const project = await (repos.projects.get(binding.projectId));
+    const group = await (repos.groups.get(binding.groupId));
+    const actor = (await (options.authz?.actorFor?.(binding))) ?? actorForSession(binding);
+    const participantIds = await (repos.groups.participants(binding.groupId));
     const scope: GuardScope = {
       projectId: binding.projectId,
       groupId: binding.groupId,
       groupMemberIds: participantIds,
-      groupMemberNodeIds: participantIds.map((id) => repos.members.get(id)?.nodeId ?? null),
+      groupMemberNodeIds: (await Promise.all(participantIds.map(async (id) => (await (repos.members.get(id)))?.nodeId ?? null))),
     };
     const canPost = authorize(actor, "group:post", scope).allowed;
     const canView = canPost || authorize(actor, "group:view", scope).allowed;
@@ -1220,8 +1224,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         ? "read_only"
         : "none";
     const participants = canView
-      ? participantIds
-          .map((id) => repos.members.get(id))
+      ? (await Promise.all(participantIds
+          .map(async (id) => await (repos.members.get(id)))))
           .filter((m): m is Member => m !== null)
           .map((m) => ({
             memberId: m.id,
