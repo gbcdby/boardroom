@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Logger } from "../logger.ts";
 import type { McpCore } from "./core.ts";
 import { McpToolError } from "./errors.ts";
+import { isRegistered, listAdapterIds } from "./adapters/index.ts";
 
 /**
  * MCP 工具注册层：把 {@link McpCore} 暴露为符合 docs/mcp-tool-contract.md 的工具。
@@ -77,7 +78,14 @@ export function createMcpServer(options: CreateMcpServerOptions): McpServer {
       description: "声明全局身份与宿主类型，并加入阶段 1 的唯一群组。返回 memberId、agentId 与心跳配置。",
       inputSchema: {
         displayName: z.string().describe("显示名，1–64 字符"),
-        hostType: z.enum(["claude-code", "codex-cli", "other"]).describe("宿主类型"),
+        // HostType 为开放类型；以注册表校验替代写死的枚举（#58 / NFR-HOST-03）：
+        // 任何 isRegistered 值（含内建 "other"）均接受，未注册宿主被拒绝。
+        hostType: z
+          .string()
+          .refine((v) => isRegistered(v), {
+            message: `未知 hostType：请先注册宿主适配器（${[...listAdapterIds()].sort().join(" / ")}）`,
+          })
+          .describe("宿主类型（已注册适配器 id 或 other）"),
         projectId: z.string().describe("项目 ID"),
         groupId: z.string().describe("群组 ID"),
         role: z.enum(["manager", "normal"]).optional().describe("提示性角色，默认 normal"),

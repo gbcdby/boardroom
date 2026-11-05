@@ -238,6 +238,7 @@ Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Code
 - **NFR-08 可测试性**：消息路由、mention 规则、权限、任务状态机、记忆作用域、项目隔离必须有自动化测试；各宿主接入需集成验证记录。
 - **NFR-09 失败处理**：PostgreSQL 连接/写入失败、host 断线、MCP 超时、无效 fixed point 要有明确错误与可恢复路径。**修订（2026-11-04，#34）：SQLite → PostgreSQL。**
 - **NFR-10 防止循环**：manager 被其他成员的消息唤醒 + agent 互相 @ 必须限流/防环，阈值设计阶段确定。
+- **NFR-HOST-02 宿主能力真实性（证据驱动）**：新增宿主适配器所声明的每一项能力（join / 等待活唤醒 / 重连补投 `drainedBacklog` / 空闲唤醒 / 打断等）都必须有来自**真实宿主**的实测证据（命令、版本、可溯源结果），参照 #42 证据索引做法，原始记录可本地留档于 `.agent-output/`、受控证据复制到 `evidence/real-host-retest/` 并在文档索引；**未实测的能力一律视为 `unsupported`**，不得把静态核查、推断或未复现的能力写成承诺（呼应 AGENTS.md 技术边界与主 spec #1 §2）。新增宿主的完整「完成定义（DoD）与真实实测证据索引」见 `docs/getting-started-mcp.md` §4.5。
 
 ## 8. 产品验收基线
 
@@ -330,7 +331,7 @@ Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Code
 
 ### 10.2 待定设计项
 
-- 宿主适配器架构：把 `HostType` 校验、能力默认表、支持传输、接入配置模板与实测证据从分散的硬编码收敛为**每宿主独立的宿主适配器代码模块（适配层）**，使新增 harness 成为「加一个适配模块 + 填实测证据」的扩展（见决策票 #43 / 子 spec #55；DSH 以一等公民 `hostType="dsh"` 接入，落地见票 #56–#60）。
+- 宿主适配器架构：把 `HostType` 校验、能力默认表、支持传输、接入配置模板与实测证据从分散的硬编码收敛为**每宿主独立的宿主适配器代码模块（适配层）**，使新增 harness 成为「加一个适配模块 + 填实测证据」的扩展（见决策票 #43 / 子 spec #55；DSH 以一等公民 `hostType="dsh"` 接入，落地见票 #56–#60）。**新增宿主的完成定义（DoD）与真实实测证据索引见 `docs/getting-started-mcp.md` §4.5（NFR-HOST-02：未实测能力一律 `unsupported`）；DSH 0.2.1-rc.5 的真实证据见 `evidence/real-host-retest/`，其 `reconnect`/`wakeIdle` 因无实测保守视为 `unsupported`。**
 - 自动总结的 N 默认值、心跳间隔/超时、记忆大小与注入截断。
 - 会话结束的判定方式（宿主事件、超时或显式信号）。
 - 成员运行状态的作用域（全局 agent 或项目成员），以及 Agent 连接状态与 Status 的边界。
