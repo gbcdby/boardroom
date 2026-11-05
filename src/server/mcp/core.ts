@@ -9,10 +9,20 @@ import {
 } from "../db/errors.ts";
 import { createRepositories, type RepositorySet } from "../db/repositories.ts";
 import { newId } from "../db/ids.ts";
-import type { McpSession, Member, Message as DbMessage } from "../db/types.ts";
+import type { McpSession, Member, MemberKind, Message as DbMessage } from "../db/types.ts";
 import { invalidArgument, McpToolError, notInGroup } from "./errors.ts";
 import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "../chat/routing.ts";
 import { buildRoster } from "../chat/roster.ts";
+import {
+  authorize,
+  type Actor,
+  type ActorReach,
+  type AuthzRole,
+  type Capability,
+  type GuardScope,
+  ROLE_REACH,
+} from "../authz/authorize.ts";
+import { actorForSession } from "../authz/actors.ts";
 import {
   createAntiLoop,
   DEFAULT_ANTI_LOOP_CONFIG,
@@ -82,6 +92,53 @@ export interface JoinParams {
   readonly role?: MemberRole;
 }
 
+/**
+ * T6（#53）MCP 会话上下文：入群（会话建立）时注入，使 agent 在后续对话中知道自己身处哪个
+ * 项目/群组、本方岗位与身份、可见性范围与跨项目隔离边界。
+ *
+ * 可见性范围（`visibility.scope`）由 F2 守卫结果推导：
+ * - `write`：`group:post` 经守卫放行（参与者 / 顶层 manager 等）→ 可发言、可唤醒；
+ * - `read_only`：`group:post` 被拒但 `group:view` 放行（子树只读可见 `group:view_subtree`）
+ *   → 仅含元数据与历史，不暴露发言/唤醒能力；
+ * - `none`：既不可写也不可见（异常入群，正常流程不应出现）。
+ *
+ * 隔离边界（`isolation`）固定 `crossProjectAccess: false`：上下文只含所属项目/群组的参与者，
+ * 绝不出现任何跨项目数据（MCPCTX-02 / AC-PROJ-GUARD-01）。
+ */
+export interface McpSessionContext {
+  readonly project: { readonly id: string; readonly name: string };
+  readonly group: { readonly id: string; readonly name: string };
+  readonly identity: {
+    readonly memberId: string;
+    readonly displayName: string;
+    /** 静态角色（F2）：owner / top_manager / sub_manager / member。 */
+    readonly role: AuthzRole;
+    /** 管辖范围（F2）：own / subtree / project。 */
+    readonly reach: ActorReach;
+  };
+  readonly visibility: {
+    /** 能否在群内发言：当且仅当 `group:post` 经 F2 守卫放行。 */
+    readonly canPost: boolean;
+    /** 能否唤醒他人：仅可写时为真（只读可见性不开放唤醒，CHAT-05）。 */
+    readonly canWake: boolean;
+    /** 可见性范围：write / read_only / none。 */
+    readonly scope: "write" | "read_only" | "none";
+  };
+  /** 可见参与者名单（均在群内、同属一个项目，绝不跨项目）。 */
+  readonly participants: ReadonlyArray<{
+    readonly memberId: string;
+    readonly displayName: string;
+    readonly role: MemberRole;
+    readonly kind: MemberKind;
+  }>;
+  /** 跨项目隔离边界：本会话唯一可访问项目，绝不开放跨项目访问。 */
+  readonly isolation: {
+    readonly projectId: string;
+    readonly crossProjectAccess: false;
+    readonly note: string;
+  };
+}
+
 export interface JoinResult {
   readonly ok: true;
   readonly memberId: string;
@@ -90,6 +147,8 @@ export interface JoinResult {
   readonly groupId: string;
   readonly role: MemberRole;
   readonly heartbeat: Heartbeat;
+  /** T6（#53）：入群即注入的会话上下文。 */
+  readonly context: McpSessionContext;
 }
 
 export interface SendMessageParams {
@@ -308,6 +367,17 @@ export interface McpCoreOptions {
   readonly memberKey?: string;
   /** T7：防环/限流运行时配置；缺省使用 D5 默认阈值与真实时钟。 */
   readonly antiLoop?: AntiLoopRuntimeOptions;
+  /**
+   * F2（#47）权限守卫注入点。省略时用阶段 1 数据推导主体
+   * （`members.role` 的 manager/normal → 静态角色 top_manager/member）。
+   * T2（#49）落 `org_nodes` 后在这里注入岗位节点与子树范围，守卫与调用点不必再改。
+   */
+  readonly authz?: McpAuthzOptions;
+}
+
+export interface McpAuthzOptions {
+  /** 覆盖「会话绑定 → Actor」的映射（注入 nodeId / subtreeNodeIds）。 */
+  readonly actorFor?: (binding: SessionBinding) => Actor;
 }
 
 export interface McpCore {
@@ -455,6 +525,36 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    */
   function buildRosterFor(groupId: string): RoutingMember[] {
     return buildRoster(repos, groupId);
+  }
+
+  /**
+   * F2（#47）统一守卫调用点：会话绑定 → Actor，带上本连接的 conn 作用域
+   * （阶段 1 一个会话只绑定一个群组）与群组参与者事实，交给 `authorize` 判定；
+   * 拒绝时按 MCP 契约抛 `FORBIDDEN`，并在 details 里给出稳定拒绝码。
+   */
+  function guard(binding: SessionBinding, capability: Capability, scope: GuardScope, denyMessage?: string): void {
+    const decision = authorize(
+      options.authz?.actorFor?.(binding) ?? actorForSession(binding),
+      capability,
+      {
+        ...scope,
+        ...(scope.groupId !== undefined && scope.groupMemberIds === undefined
+          ? { groupMemberIds: repos.groups.participants(scope.groupId) }
+          : {}),
+        conn: { projectId: binding.projectId, groupIds: [binding.groupId] },
+      },
+    );
+    if (!decision.allowed) {
+      log.warn("authorize_denied", {
+        memberId: binding.memberId,
+        capability,
+        deny: decision.code,
+      });
+      throw new McpToolError("FORBIDDEN", denyMessage ?? decision.reason, {
+        deny: decision.code,
+        capability: String(decision.capability ?? capability),
+      });
+    }
   }
 
   /**
@@ -658,7 +758,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         ) {
           throw new McpToolError("CONFLICT", "该会话已以不同身份入群，不能重复声明不同身份");
         }
-        return toJoinResult(existing, heartbeat);
+        return toJoinResult(existing, heartbeat, buildSessionContext(existing));
       }
 
       const joined = joinPersisted(params.projectId, params.groupId, displayName, params.hostType, role);
@@ -683,7 +783,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         hostType: binding.hostType,
         mcpSessionId: binding.mcpSessionId,
       });
-      return toJoinResult(binding, heartbeat);
+      return toJoinResult(binding, heartbeat, buildSessionContext(binding));
     },
 
     async waitForMessages(sessionId, params) {
@@ -774,9 +874,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         throw invalidArgument(`text 不能超过 ${MAX_MESSAGE_LENGTH} 个字符`, { length: text.length });
       }
       const groupId = params.groupId ?? binding.groupId;
-      if (groupId !== binding.groupId) {
-        throw new McpToolError("FORBIDDEN", "只能向当前入群的群组发送消息");
-      }
+      // F2（#47）：跨群组写入由统一守卫判定（conn 作用域 + group:post 参与范围）。
+      guard(binding, "group:post", { projectId: binding.projectId, groupId }, "只能向当前入群的群组发送消息");
 
       if (params.clientMessageId) {
         const existingId = clientKeys.get(`${binding.memberId}:${params.clientMessageId}`);
@@ -890,9 +989,11 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         throw invalidArgument("messageId 必填");
       }
       const message = repos.messages.get(messageId);
-      if (!message || message.groupId !== binding.groupId) {
+      if (!message) {
         throw new McpToolError("FORBIDDEN", "消息不存在或不在允许范围内", { messageId });
       }
+      // F2（#47）：确认动作同样受 conn 作用域与参与范围约束。
+      guard(binding, "message:ack", { projectId: binding.projectId, groupId: message.groupId }, "消息不存在或不在允许范围内");
       if (!isVisibleTo(binding, message)) {
         throw new McpToolError("FORBIDDEN", "无权确认该消息", { messageId });
       }
@@ -913,12 +1014,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       }
       const projectId = params.projectId ?? binding.projectId;
       const memberId = params.memberId ?? binding.memberId;
-      if (memberId !== binding.memberId) {
-        throw new McpToolError("FORBIDDEN", "只能上报自己的运行状态");
-      }
-      if (projectId !== binding.projectId) {
-        throw new McpToolError("FORBIDDEN", "只能上报当前项目的运行状态");
-      }
+      // F2（#47）：状态上报是 self 边界（ORG-06 只更新自己的状态），项目上下文受 conn 约束。
+      guard(binding, "status:report_own", { projectId, memberId }, "只能上报自己的运行状态与当前项目");
       let updatedAt: string;
       try {
         updatedAt = repos.statuses.set(projectId, memberId, params.status).updatedAt;
@@ -931,6 +1028,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
     attemptInterrupt(sessionId, params) {
       const binding = bindingFor(sessionId);
+      // F2（#47）：打断只作用于自己的会话（self 边界）。
+      guard(binding, "interrupt:self", { projectId: binding.projectId, memberId: binding.memberId });
       touchSession(binding.mcpSessionId);
 
       // 成员当前运行状态（显式信号驱动，T4）：什么决定「是否处于可打断的忙碌轮次」。
@@ -973,6 +1072,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
     heartbeat(sessionId) {
       const binding = bindingFor(sessionId);
+      guard(binding, "session:heartbeat", { projectId: binding.projectId });
       let session: McpSession;
       try {
         session = repos.mcpSessions.heartbeat(binding.mcpSessionId, now().toISOString());
@@ -1000,9 +1100,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         throw invalidArgument(`limit 必须是 1–${MAX_HISTORY_LIMIT} 的整数`, { limit });
       }
       const groupId = params.groupId ?? binding.groupId;
-      if (groupId !== binding.groupId) {
-        throw new McpToolError("FORBIDDEN", "只能读取当前入群群组的历史");
-      }
+      // F2（#47）：历史读取受 conn 作用域 + 可见性判定（替代手写的群组比较）。
+      guard(binding, "group:view", { projectId: binding.projectId, groupId }, "只能读取当前入群群组的历史");
       const visible = repos.messages.listByGroup(groupId).filter((m) => isVisibleTo(binding, m));
 
       let endIndex = visible.length;
@@ -1083,6 +1182,62 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     if (!binding) throw notInGroup();
     return binding;
   }
+
+  /**
+   * T6（#53）：入群时构建会话上下文，经 F2 守卫收窄可见性/行级范围。
+   *
+   * - 可见性（`write` / `read_only` / `none`）由 `group:post` 与 `group:view` 的守卫结果推导；
+   *   只读可见的群组不暴露发言/唤醒能力（CHAT-05 / ORG-07）。
+   * - 参与者名单只取本群组、本项目成员，绝不跨项目（MCPCTX-02 / AC-PROJ-GUARD-01）。
+   * - 隔离边界固定 `crossProjectAccess: false`。
+   */
+  function buildSessionContext(binding: SessionBinding): McpSessionContext {
+    const project = repos.projects.get(binding.projectId);
+    const group = repos.groups.get(binding.groupId);
+    const actor = options.authz?.actorFor?.(binding) ?? actorForSession(binding);
+    const participantIds = repos.groups.participants(binding.groupId);
+    const scope: GuardScope = {
+      projectId: binding.projectId,
+      groupId: binding.groupId,
+      groupMemberIds: participantIds,
+      groupMemberNodeIds: participantIds.map((id) => repos.members.get(id)?.nodeId ?? null),
+    };
+    const canPost = authorize(actor, "group:post", scope).allowed;
+    const canView = canPost || authorize(actor, "group:view", scope).allowed;
+    const visibilityScope: McpSessionContext["visibility"]["scope"] = canPost
+      ? "write"
+      : canView
+        ? "read_only"
+        : "none";
+    const participants = canView
+      ? participantIds
+          .map((id) => repos.members.get(id))
+          .filter((m): m is Member => m !== null)
+          .map((m) => ({
+            memberId: m.id,
+            displayName: m.displayName,
+            role: m.role,
+            kind: m.kind,
+          }))
+      : [];
+    return {
+      project: { id: project!.id, name: project!.name },
+      group: { id: group!.id, name: group!.name },
+      identity: {
+        memberId: binding.memberId,
+        displayName: binding.displayName,
+        role: actor.role,
+        reach: actor.reach ?? ROLE_REACH[actor.role],
+      },
+      visibility: { canPost, canWake: canPost, scope: visibilityScope },
+      participants,
+      isolation: {
+        projectId: binding.projectId,
+        crossProjectAccess: false,
+        note: "本 MCP 会话仅可访问所属项目，跨项目数据不会出现在上下文中。",
+      },
+    };
+  }
 }
 
 function toMessage(message: DbMessage): Message {
@@ -1096,7 +1251,11 @@ function toMessage(message: DbMessage): Message {
   };
 }
 
-function toJoinResult(binding: SessionBinding, heartbeat: Heartbeat): JoinResult {
+function toJoinResult(
+  binding: SessionBinding,
+  heartbeat: Heartbeat,
+  context: McpSessionContext,
+): JoinResult {
   return {
     ok: true,
     memberId: binding.memberId,
@@ -1105,6 +1264,7 @@ function toJoinResult(binding: SessionBinding, heartbeat: Heartbeat): JoinResult
     groupId: binding.groupId,
     role: binding.role,
     heartbeat,
+    context,
   };
 }
 
@@ -1145,6 +1305,9 @@ function buildInterruptReason(result: InterruptResult, hostType: HostType, targe
     switch (error.code) {
       case "conflict":
         return new McpToolError("CONFLICT", `身份或成员冲突：${error.message}`, ctx);
+      case "archived":
+        // #48：目标项目/群组已归档，写路径拒绝（恢复后放行）。
+        return new McpToolError("CONFLICT", error.message, ctx);
       case "invalid_reference":
       case "invalid_argument":
       case "not_found":

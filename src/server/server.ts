@@ -3,8 +3,9 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import type { AppConfig } from "./config.ts";
-import { openDatabase } from "./db/database.ts";
-import { readMigrationState, runMigrations, type MigrationState } from "./db/migrate.ts";
+import { createDbDriver, type DbDriver } from "./db/driver.ts";
+import { SqliteDriver } from "./db/drivers/sqlite.ts";
+import type { MigrationState } from "./db/migrate.ts";
 import { migrations } from "./db/migrations/index.ts";
 import { buildHealthReport } from "./health.ts";
 import { createRepositories } from "./db/repositories.ts";
@@ -12,7 +13,13 @@ import type { Logger } from "./logger.ts";
 import { createStaticHandler, isWebUiBuilt } from "./static.ts";
 import { createWebSocketHub, type ServerEvent, type WebSocketHub } from "./ws.ts";
 import { MCP_HTTP_PATH, createMcpSessionsHandler, type McpSessionsHandler } from "./mcp/transport.ts";
-import { createT1ApiRouter } from "./api.ts";
+import { createT1ApiRouter, type ActorResolution } from "./api.ts";
+import type { WsActorContext } from "./ws.ts";
+import type { Actor } from "./authz/authorize.ts";
+import type { SessionBinding } from "./mcp/core.ts";
+import { createOrgActorResolver } from "./authz/org-actors.ts";
+import type { OrgChangeRecorder } from "./org-change-hook.ts";
+import { createAuditRecorder } from "./audit.ts";
 import { buildStatusBoard } from "./status.ts";
 
 /** WebSocket 端点路径。 */
@@ -23,11 +30,30 @@ export class ServerStartupError extends Error {
   override readonly name = "ServerStartupError";
 }
 
+/**
+ * F2（#47）入口主体注入点；T2（#49）默认装配真实组织数据。
+ *
+ * 省略 `authorization` 时，`startServer` 用 `createOrgActorResolver` 读真实
+ * `org_nodes` / `members.node_id`：有岗位数据就注入 `nodeId` / `subtreeNodeIds`；
+ * 升级库默认无组织数据时逐入口回退到阶段 1 兼容映射（人=owner），既有行为不变。
+ * 测试/未来认证可显式注入覆盖三个解析点。
+ */
+export interface ServerAuthorization {
+  readonly resolveHttpActor?: (resolution: ActorResolution) => Actor | null;
+  readonly resolveWsActor?: (context: WsActorContext) => Actor | null;
+  /** MCP 会话绑定 → 带岗位与子树的 Actor（注入到 core 的 `authz.actorFor`）。 */
+  readonly resolveMcpActor?: (binding: SessionBinding) => Actor;
+}
+
 export interface StartServerOptions {
   readonly config: AppConfig;
   readonly logger: Logger;
   /** WebUI 构建产物目录，默认 `<repo>/dist/web`。 */
   readonly webRoot?: string;
+  /** F2 权限守卫主体注入（默认阶段 1 人=owner，行为不变）。 */
+  readonly authorization?: ServerAuthorization;
+  /** T5（#52）审计/撤销接口钩子；省略时默认注入写 audit_log 的真实 recorder。 */
+  readonly orgChangeRecorder?: OrgChangeRecorder;
 }
 
 export interface RunningServer {
@@ -51,6 +77,8 @@ export interface RunningServer {
   broadcastStatus(projectId: string): void;
   /** 当前 WebSocket 连接数。 */
   readonly clientCount: number;
+  /** 某项目当前声明在线的人的数量（F2：配合守卫注入的观测口）。 */
+  humanPresenceCount(projectId: string): number;
   close(): Promise<void>;
 }
 
@@ -73,26 +101,48 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   const webRoot = options.webRoot ?? defaultWebRoot();
   const startedAt = Date.now();
 
-  let opened: { db: Database.Database; file: string };
+  // F1（#46）：经连接工厂打开持久化驱动；默认 SQLite，阶段 1 行为不变。
+  let driver: DbDriver;
   try {
-    opened = openDatabase(config.dataDir);
+    driver = createDbDriver({
+      dbDriver: config.dbDriver ?? "sqlite",
+      dataDir: config.dataDir,
+      ...(config.pgConnectionString === undefined ? {} : { pgConnectionString: config.pgConnectionString }),
+    });
+  } catch (error) {
+    log.error("数据库驱动配置无效", { error, dataDir: config.dataDir });
+    throw new ServerStartupError((error as Error).message);
+  }
+  if (!(driver instanceof SqliteDriver)) {
+    // 业务仓储尚未切 PG（M1 #54）；此处快速失败，不打开 SQLite、不连接 PG。
+    throw new ServerStartupError(
+      `dbDriver=postgres 暂时不能启动：阶段 1 业务仓储仍直接依赖 SQLite，` +
+        `PostgreSQL 业务表重写与既有数据迁移由 M1（#54）交付。\n` +
+        `驱动层（connect/migrate/query/方言）已接入并有冒烟验证。\n` +
+        `回滚方式：保持或改回 AGENT_STUDIO_DB_DRIVER=sqlite（默认值），继续使用本地 SQLite 数据目录 ${config.dataDir}。`,
+    );
+  }
+  const sqlite = driver;
+
+  try {
+    await sqlite.connect();
   } catch (error) {
     log.error("数据库初始化失败", { error, dataDir: config.dataDir });
     throw new ServerStartupError((error as Error).message);
   }
 
-  const db = opened.db;
+  const db = sqlite.handle;
   let migrationState: MigrationState;
   try {
-    const result = runMigrations(db, migrations);
-    migrationState = readMigrationState(db);
+    const result = await sqlite.migrate(migrations);
+    migrationState = await sqlite.migrationState();
     log.info("迁移完成", {
       version: migrationState.version,
       applied: result.applied.length,
       pending: migrations.length - migrationState.applied.length,
     });
   } catch (error) {
-    db.close();
+    await sqlite.close();
     log.error("迁移失败", { error });
     throw new ServerStartupError(
       `${(error as Error).message}\n数据目录：${config.dataDir}\n` +
@@ -108,7 +158,9 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     const staleAt = new Date().toISOString();
     const staleCount = recovered.mcpSessions.markAllStale(staleAt);
     if (staleCount > 0) {
-      for (const project of recovered.projects.list()) {
+      // 清扫覆盖**全部**项目（含 #48 的已归档项目）：归档只是非活跃态，
+      // 遗留会话仍必须标记断开，不臆造在线。
+      for (const project of recovered.projects.list({ includeArchived: true })) {
         for (const member of recovered.members.listByProject(project.id)) {
           const status = recovered.statuses.get(project.id, member.id);
           if (status && (status.state === "online" || status.state === "waiting" || status.state === "working")) {
@@ -123,6 +175,16 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     log.warn("启动恢复清理失败", { error });
   }
 
+  // T2（#49）：把 F2 的纯权限结构接到真实 DB 数据。未显式注入 authorization 时，
+  // 三个入口统一用 org_nodes / members.node_id 装配 Actor；无组织数据的升级库
+  // 逐入口回退到阶段 1 兼容映射（人=owner），AC-CORE-* 行为不变。
+  const orgResolver = createOrgActorResolver(createRepositories(db));
+  const authorization: ServerAuthorization = options.authorization ?? {
+    resolveHttpActor: (resolution) => orgResolver.resolveHttpActor(resolution),
+    resolveWsActor: (context) => orgResolver.resolveWsActor(context),
+    resolveMcpActor: (binding) => orgResolver.actorForMcpBinding(binding),
+  };
+
   const webuiBuilt = await isWebUiBuilt(webRoot);
   if (!webuiBuilt) {
     log.warn("WebUI 构建产物缺失，静态页面将不可用", {
@@ -136,14 +198,21 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     heartbeat: config.heartbeat,
     db,
     antiLoop: { ...(config.antiLoop ? { config: config.antiLoop } : {}) },
+    ...(authorization.resolveMcpActor ? { actorFor: authorization.resolveMcpActor } : {}),
   });
   // T3：人的消息广播目标。hub 在 httpServer 之后创建，这里用晚绑定回调占位。
   let broadcastMessage: (message: import("./api.ts").MessageView) => void = () => {};
+  // T5（#52）：把 T2/T3 的 noop 钩子换成默认真实 recorder（写 audit_log）。
+  // 显式注入（测试替身 / 未来装配）优先，保证既有 org-authz 等用例不变。
+  const auditRecorder: OrgChangeRecorder =
+    options.orgChangeRecorder ?? createAuditRecorder(createRepositories(db).audit);
   const t1Api = createT1ApiRouter({
     db,
     logger,
     heartbeat: config.heartbeat,
     onMessage: (message) => broadcastMessage(message),
+    ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}),
+    orgChangeRecorder: auditRecorder,
   });
 
   const httpServer = createServer((request, response) => {
@@ -198,6 +267,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     path: WS_PATH,
     heartbeat: config.heartbeat,
     logger,
+    ...(authorization.resolveWsActor ? { resolveActor: authorization.resolveWsActor } : {}),
   });
 
   // T3：把人的消息通过 WebSocket 广播给 WebUI（阶段 1 WebUI = 人，可见全部群组消息）。
@@ -221,7 +291,18 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   const statusRepos = createRepositories(db);
   const statusPublisher = (): void => {
     const nowDate = new Date();
-    for (const project of statusRepos.projects.list()) {
+    const projects = statusRepos.projects.list(); // 活跃项目（默认出周期快照）
+    const known = new Set(projects.map((p) => p.id));
+    // T4（#51）：归档项目默认不进周期快照（T1 unresolved / 归档=非活跃）。
+    // 仅当某 WebUI 客户端通过 presence 显式声明该归档项目时，才按需推送其快照，
+    // 触发条件由前端「显示已归档」开关切换 presence 产生。
+    const declared = new Set(hub.declaredProjectIds());
+    for (const pid of declared) {
+      if (known.has(pid)) continue;
+      const archived = statusRepos.projects.get(pid);
+      if (archived && archived.archivedAt !== null) projects.push(archived);
+    }
+    for (const project of projects) {
       try {
         const statuses = buildStatusBoard(statusRepos, project.id, {
           heartbeat: config.heartbeat,
@@ -253,7 +334,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     });
   } catch (error) {
     await hub.close();
-    db.close();
+    await sqlite.close();
     const err = error as NodeJS.ErrnoException;
     const message =
       err.code === "EADDRINUSE"
@@ -275,7 +356,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     url,
     wsUrl: `ws://${HOST}:${port}${WS_PATH}`,
     dataDir: config.dataDir,
-    database: opened.file,
+    database: sqlite.file,
     heartbeat: config.heartbeat,
     webuiBuilt,
   });
@@ -299,6 +380,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     get clientCount() {
       return hub.clientCount;
     },
+    humanPresenceCount: (projectId) => hub.humanPresenceCount(projectId),
     mcpUrl: `http://${HOST}:${port}${MCP_HTTP_PATH}`,
     get mcpSessionCount() {
       return mcpHandler.sessionCount;
@@ -317,7 +399,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
         httpServer.close(() => resolve());
         httpServer.closeAllConnections();
       });
-      if (db.open) db.close();
+      await sqlite.close();
       log.info("服务已停止");
     },
   };

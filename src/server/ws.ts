@@ -5,6 +5,8 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { HeartbeatConfig } from "./config.ts";
 import type { Logger } from "./logger.ts";
 import type { MessageView } from "./api.ts";
+import { authorize, type Actor, type DenyCode } from "./authz/authorize.ts";
+import { ownerActor } from "./authz/actors.ts";
 
 /** 客户端 → 服务端。 */
 export type ClientEvent =
@@ -37,7 +39,17 @@ export type ServerEvent =
       serverTime: string;
       statuses: unknown[];
     }
-  | { type: "error"; code: "invalid_message" | "unknown_type"; message: string };
+  | {
+      type: "error";
+      /**
+       * 协议/守卫错误码。F2（#47）的权限拒绝统一以 `forbidden` 呈现，
+       * 具体拒绝语义（cross_project / out_of_subtree / …）放在 `deny`。
+       */
+      code: "invalid_message" | "unknown_type" | "forbidden";
+      message: string;
+      /** 守卫稳定拒绝码（仅 code=forbidden 时有值）。 */
+      deny?: DenyCode;
+    };
 
 export interface WebSocketHubOptions {
   readonly server: HttpServer;
@@ -46,6 +58,17 @@ export interface WebSocketHubOptions {
   readonly logger: Logger;
   /** 服务端时钟，便于测试。 */
   readonly now?: () => Date;
+  /**
+   * F2（#47）守卫主体解析点：把 WebUI 的 presence 声明纳入统一守卫。
+   * 省略 = 阶段 1 单用户无认证，连接主体一律是「人（owner）」→ 全部放行，行为不变。
+   */
+  readonly resolveActor?: (context: WsActorContext) => Actor | null;
+}
+
+/** WS 主体解析上下文：客户端声明的项目与成员。 */
+export interface WsActorContext {
+  readonly projectId: string;
+  readonly memberId: string | null;
 }
 
 export interface WebSocketHub {
@@ -62,6 +85,12 @@ export interface WebSocketHub {
   humanPresenceCount(projectId: string): number;
   /** 某项目当前在线的人的 memberId 集合（测试用）。 */
   humanPresenceMembers(projectId: string): readonly string[];
+  /**
+   * T4（#51）：当前被客户端声明 presence 的项目集合。
+   * 用于归档项目的「按需快照」——归档项目默认不进周期快照（T1 unresolved），
+   * 仅当某客户端显式声明其 presence 时才推送，避免泄漏与非必要开销。
+   */
+  declaredProjectIds(): readonly string[];
   /** 关闭所有连接并释放升级监听。 */
   close(): Promise<void>;
 }
@@ -75,6 +104,8 @@ export function createWebSocketHub(options: WebSocketHubOptions): WebSocketHub {
   const { server, path: wsPath, heartbeat, logger } = options;
   const now = options.now ?? (() => new Date());
   const log = logger.child({ component: "ws" });
+  /** 阶段 1 默认主体：人（owner），不做范围收窄。 */
+  const resolveActor = options.resolveActor ?? (({ projectId }) => ownerActor(projectId));
   const wss = new WebSocketServer({ noServer: true });
   /** 最近一次收到 pong 的时间戳（毫秒）。 */
   const lastSeen = new Map<WebSocket, number>();
@@ -118,14 +149,31 @@ export function createWebSocketHub(options: WebSocketHubOptions): WebSocketHub {
       if (event?.type === "presence") {
         // 人的在线声明（T4）：仅记录该项目/成员，不产生 waiting/working。
         const projectId = typeof event.projectId === "string" ? event.projectId : "";
+        const memberId = typeof event.memberId === "string" && event.memberId !== "" ? event.memberId : null;
         if (projectId === "") {
           presence.delete(client);
-        } else {
-          presence.set(client, {
-            projectId,
-            memberId: typeof event.memberId === "string" && event.memberId !== "" ? event.memberId : null,
-          });
+          log.debug("presence_cleared", { clientId });
+          send(client, { type: "notice", level: "info", message: "presence 已更新" });
+          return;
         }
+        // F2（#47）：presence 是「在该项目里在线」的写入，交给统一守卫判定主体范围。
+        // 阶段 1 默认主体是人（owner）→ 放行，行为不变；越出范围按拒绝码回错帧且不记录在线。
+        const actor = resolveActor({ projectId, memberId });
+        if (actor === null || actor === undefined) {
+          log.info("presence 主体无法解析，守卫按 fail-closed 拒绝", { clientId, projectId });
+          send(client, { type: "error", code: "forbidden", message: "无法确定连接主体，守卫拒绝。" });
+          return;
+        }
+        const decision = authorize(actor, "status:view", {
+          projectId,
+          ...(memberId === null ? {} : { memberId }),
+        });
+        if (!decision.allowed) {
+          log.info("presence 被权限守卫拒绝", { clientId, code: decision.code, projectId });
+          send(client, { type: "error", code: "forbidden", deny: decision.code, message: decision.reason });
+          return;
+        }
+        presence.set(client, { projectId, memberId });
         log.debug("presence_updated", { clientId, projectId });
         send(client, { type: "notice", level: "info", message: "presence 已更新" });
         return;
@@ -211,6 +259,13 @@ export function createWebSocketHub(options: WebSocketHubOptions): WebSocketHub {
         if (decl.projectId === projectId && decl.memberId !== null) ids.push(decl.memberId);
       }
       return ids;
+    },
+    declaredProjectIds() {
+      const ids = new Set<string>();
+      for (const decl of presence.values()) {
+        if (decl.projectId !== "") ids.add(decl.projectId);
+      }
+      return [...ids];
     },
     async close() {
       clearInterval(heartbeatTimer);

@@ -487,3 +487,29 @@ test("T2：启动时 markAllStale 把遗留 connected 会话标记为断开", as
     assert.equal(repos.mcpSessions.findActive(agent.id, project.id, group.id), null);
   });
 });
+
+test("T4（#51）：messages.countByProject / latestByProject 跨群组聚合且不串项目", async () => {
+  await withDb(async ({ db }) => {
+    const repos = createRepositories(db);
+    const projectA = repos.projects.create({ name: "A" });
+    const projectB = repos.projects.create({ name: "B" });
+    const agent = repos.agents.create({ displayName: "Alice", hostType: "claude-code" });
+    const memberA = repos.members.create({ projectId: projectA.id, kind: "agent", agentId: agent.id, displayName: "Alice" });
+    const memberB = repos.members.create({ projectId: projectB.id, kind: "agent", agentId: agent.id, displayName: "Alice" });
+    const groupA1 = repos.groups.create({ projectId: projectA.id, name: "A1", participantMemberIds: [memberA.id] });
+    const groupA2 = repos.groups.create({ projectId: projectA.id, name: "A2", participantMemberIds: [memberA.id] });
+    const groupB = repos.groups.create({ projectId: projectB.id, name: "B", participantMemberIds: [memberB.id] });
+
+    assert.equal(repos.messages.countByProject(projectA.id), 0);
+    assert.equal(repos.messages.latestByProject(projectA.id), null);
+
+    repos.messages.create({ groupId: groupA1.id, senderMemberId: memberA.id, body: "一" });
+    const second = repos.messages.create({ groupId: groupA2.id, senderMemberId: memberA.id, body: "二" });
+    repos.messages.create({ groupId: groupB.id, senderMemberId: memberB.id, body: "别的" });
+
+    assert.equal(repos.messages.countByProject(projectA.id), 2, "跨两个群组合并计数");
+    assert.equal(repos.messages.countByProject(projectB.id), 1);
+    assert.equal(repos.messages.latestByProject(projectA.id), second.createdAt, "取最新一条消息时间");
+    assert.ok(repos.messages.latestByProject(projectB.id) !== null);
+  });
+});

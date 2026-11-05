@@ -151,3 +151,53 @@ test("antiLoop 阈值非正整数时报错", async () => {
     });
   });
 });
+
+// F1（#46）：持久化驱动配置项（dbDriver / PG 连接串）。默认 SQLite，阶段 1 行为不回归。
+
+test("dbDriver 默认为 sqlite，未配置时无 PG 连接串", async () => {
+  await withTempDir(async (dir) => {
+    const config = await loadConfig({ cwd: dir, env: {} });
+    assert.equal(config.dbDriver, "sqlite");
+    assert.equal(config.pgConnectionString, undefined);
+  });
+});
+
+test("dbDriver 与 PG 连接串可通过配置文件和环境变量配置", async () => {
+  await withTempDir(async (dir) => {
+    await writeFile(
+      path.join(dir, "config.json"),
+      JSON.stringify({ dbDriver: "postgres", pgConnectionString: "postgres://u:p@h:5432/db" }),
+    );
+    const fromFile = await loadConfig({ cwd: dir, env: {} });
+    assert.equal(fromFile.dbDriver, "postgres");
+    assert.equal(fromFile.pgConnectionString, "postgres://u:p@h:5432/db");
+
+    const fromEnv = await loadConfig({
+      cwd: dir,
+      env: {
+        AGENT_STUDIO_DB_DRIVER: "sqlite",
+        AGENT_STUDIO_PG_CONNECTION_STRING: "postgres://env:env@127.0.0.1:5432/envdb",
+      },
+    });
+    assert.equal(fromEnv.dbDriver, "sqlite");
+    assert.equal(fromEnv.pgConnectionString, "postgres://env:env@127.0.0.1:5432/envdb");
+  });
+});
+
+test("dbDriver 非法值报错并给出合法取值", async () => {
+  await withTempDir(async (dir) => {
+    await assert.rejects(loadConfig({ cwd: dir, env: { AGENT_STUDIO_DB_DRIVER: "mysql" } }), {
+      name: "ConfigError",
+      message: /dbDriver.*sqlite.*postgres/,
+    });
+  });
+});
+
+test("dbDriver=postgres 但缺少 PG 连接串时报错并给出恢复路径", async () => {
+  await withTempDir(async (dir) => {
+    await assert.rejects(loadConfig({ cwd: dir, env: { AGENT_STUDIO_DB_DRIVER: "postgres" } }), {
+      name: "ConfigError",
+      message: /AGENT_STUDIO_PG_CONNECTION_STRING/,
+    });
+  });
+});

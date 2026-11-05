@@ -5,6 +5,9 @@
  * 页面据此做基础错误提示。
  */
 
+/** T3（#50）成员生命周期状态（与 member_statuses 的运行状态、mcp_sessions 的连接状态分开）。 */
+export type MemberLifecycleStatus = "active" | "disabled" | "pending";
+
 export interface MemberDto {
   id: string;
   projectId: string;
@@ -12,6 +15,10 @@ export interface MemberDto {
   kind: "agent" | "human";
   displayName: string;
   role: "manager" | "normal";
+  /** T2 #49：占据的组织岗位（null = 未落位）。 */
+  nodeId: string | null;
+  /** T3 #50：生命周期状态（active / disabled / pending）；老库默认 active，可恢复、不物理删除。 */
+  status: MemberLifecycleStatus;
   createdAt: string;
   updatedAt: string;
 }
@@ -21,7 +28,22 @@ export interface ProjectDto {
   name: string;
   createdAt: string;
   updatedAt: string;
+  /** 归档时间（ISO 字符串）；null = 未归档（T1 #48 / PROJECT-03）。 */
+  archivedAt: string | null;
   manager: MemberDto | null;
+  /** T4（#51）跨项目概览聚合字段：以下为可选，便于逐步落地与兼容旧缓存。 */
+  /** 成员数（含人/agent）。 */
+  memberCount?: number;
+  /** 活跃群组数。 */
+  groupCount?: number;
+  /** 项目组消息总数。 */
+  messageCount?: number;
+  /** 在线成员数（online/waiting/working）。 */
+  onlineCount?: number;
+  /** 最近一条消息时间（ISO 字符串）；无消息为 null。 */
+  lastActivityAt?: string | null;
+  /** 项目聚合状态：active = 有成员在线；idle = 无人在线；archived = 已归档（非活跃）。 */
+  status?: "active" | "idle" | "archived";
 }
 
 export interface GroupDto {
@@ -30,6 +52,42 @@ export interface GroupDto {
   name: string;
   createdAt: string;
   updatedAt: string;
+  /** 归档时间（ISO 字符串）；null = 未归档（T1 #48 / GROUP-04）。 */
+  archivedAt: string | null;
+  /**
+   * T2 #49：群组列表端点返回的可写标记。false = 子树只读可见
+   * （可看元数据与历史，不唤醒、不能发消息）；其它端点不返回该字段。
+   */
+  writable?: boolean;
+}
+
+/** T2 #49：组织岗位节点（静态角色写在岗位上；汇报线 = parentId）。 */
+export interface OrgNodeDto {
+  id: string;
+  projectId: string;
+  parentId: string | null;
+  name: string;
+  role: "owner" | "top_manager" | "sub_manager" | "member";
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+  memberId: string | null;
+  memberDisplayName: string | null;
+}
+
+/** 角色配置入口的目录项：F2 静态角色 → 能力点集合。 */
+export interface RoleCatalogEntry {
+  role: "owner" | "top_manager" | "sub_manager" | "member";
+  capabilities: string[];
+  /** owner 是人的内建全局主体，不建岗位节点。 */
+  nodeRole: boolean;
+}
+
+export interface OrgSnapshot {
+  nodes: OrgNodeDto[];
+  rootId: string | null;
+  roles: RoleCatalogEntry[];
+  members: MemberDto[];
 }
 
 /**
@@ -112,9 +170,103 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return payload as T;
 }
 
+/**
+ * 永久删除的级联清单（T1 #48）：确认弹窗里给「人」看清楚会清掉什么。
+ * 项目清群组/群聊/投递/成员/状态/会话；群组只清群聊与参与者关系（成员保留）。
+ */
+export interface ProjectPurgeCascade {
+  groups: number;
+  members: number;
+  /** T2 #49：随项目一起清除的组织岗位节点数。 */
+  orgNodes: number;
+  messages: number;
+  deliveries: number;
+  memberStatuses: number;
+  mcpSessions: number;
+}
+
+export interface GroupPurgeCascade {
+  messages: number;
+  deliveries: number;
+  participants: number;
+  mcpSessions: number;
+}
+
+export interface ProjectPurgeConfirmation {
+  kind: "project";
+  projectId: string;
+  projectName: string;
+  archivedAt: string | null;
+  cascade: ProjectPurgeCascade;
+  token: string;
+  expiresAt: string;
+}
+
+export interface GroupPurgeConfirmation {
+  kind: "group";
+  projectId: string;
+  groupId: string;
+  groupName: string;
+  archivedAt: string | null;
+  cascade: GroupPurgeCascade;
+  token: string;
+  expiresAt: string;
+}
+
+/** 永久删除的一刀两拍：第一次返回待确认清单，带同一凭据的第二次才删除。 */
+export type PurgeOutcome<T> =
+  | { readonly state: "confirmation_required"; readonly confirmation: T }
+  | { readonly state: "deleted" };
+
+/** T5 #52：审计事件视图（与 `src/server/audit.ts` 的 `auditView` 对应）。JSON 快照以字符串原样透传。 */
+export interface AuditEntryDto {
+  id: string;
+  projectId: string;
+  actorKind: "human" | "agent" | "system";
+  actorMemberId: string | null;
+  actorName: string;
+  action: string;
+  targetKind: string;
+  targetId: string;
+  targetName: string;
+  changed: string | null;
+  before: string | null;
+  after: string | null;
+  detail: string | null;
+  reversedAt: string | null;
+  reversedByAuditId: string | null;
+  createdAt: string;
+}
+
+async function purgeRequest<C>(pathname: string, token?: string): Promise<PurgeOutcome<C>> {
+  const init: RequestInit = { method: "DELETE", headers: { accept: "application/json" } };
+  if (token !== undefined) {
+    init.headers = { ...init.headers, "content-type": "application/json" };
+    init.body = JSON.stringify({ confirm: token });
+  }
+  const response = await fetch(pathname, init);
+  if (response.status === 204) return { state: "deleted" };
+
+  let payload: any = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (response.status === 409 && payload?.error?.code === "confirmation_required" && payload.confirmation) {
+    return { state: "confirmation_required", confirmation: payload.confirmation as C };
+  }
+  throw new ApiError(
+    response.status,
+    payload?.error?.code ?? "unknown_error",
+    payload?.error?.message ?? `请求失败（HTTP ${response.status}）`,
+  );
+}
+
 export const api = {
-  listProjects(): Promise<{ projects: ProjectDto[] }> {
-    return request("GET", "/api/projects");
+  listProjects(options?: { includeArchived?: boolean }): Promise<{ projects: ProjectDto[] }> {
+    const suffix = options?.includeArchived ? "?includeArchived=true" : "";
+    return request("GET", `/api/projects${suffix}`);
   },
   createProject(name: string): Promise<{ project: ProjectDto }> {
     return request("POST", "/api/projects", { name });
@@ -134,11 +286,38 @@ export const api = {
       `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(memberId)}`,
     );
   },
+  /** T3 #50：暂停成员（status → disabled），可恢复、不物理删除。 */
+  disableMember(projectId: string, memberId: string): Promise<{ member: MemberDto }> {
+    return request(
+      "POST",
+      `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(memberId)}/disable`,
+    );
+  },
+  /** T3 #50：恢复成员（status → active，恢复岗位）。 */
+  enableMember(projectId: string, memberId: string): Promise<{ member: MemberDto }> {
+    return request(
+      "POST",
+      `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(memberId)}/enable`,
+    );
+  },
+  /** T3 #50：通用状态转换（非法转换由服务端状态机拒绝）。 */
+  setMemberStatus(
+    projectId: string,
+    memberId: string,
+    status: MemberLifecycleStatus,
+  ): Promise<{ member: MemberDto }> {
+    return request(
+      "PUT",
+      `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(memberId)}/lifecycle`,
+      { status },
+    );
+  },
   setManager(projectId: string, memberId: string): Promise<{ project: ProjectDto }> {
     return request("PUT", `/api/projects/${encodeURIComponent(projectId)}/manager`, { memberId });
   },
-  listGroups(projectId: string): Promise<{ groups: GroupDto[] }> {
-    return request("GET", `/api/projects/${encodeURIComponent(projectId)}/groups`);
+  listGroups(projectId: string, options?: { includeArchived?: boolean }): Promise<{ groups: GroupDto[] }> {
+    const suffix = options?.includeArchived ? "?includeArchived=true" : "";
+    return request("GET", `/api/projects/${encodeURIComponent(projectId)}/groups${suffix}`);
   },
   createGroup(projectId: string, name: string, participantMemberIds: string[]): Promise<{ group: GroupDto }> {
     return request("POST", `/api/projects/${encodeURIComponent(projectId)}/groups`, {
@@ -161,5 +340,77 @@ export const api = {
       text,
       ...(mentions === undefined ? {} : { mentions }),
     });
+  },
+
+  // --- T1 #48：归档 / 恢复 / 永久删除（二次确认）-------------------------
+
+  archiveProject(projectId: string): Promise<{ project: ProjectDto }> {
+    return request("POST", `/api/projects/${encodeURIComponent(projectId)}/archive`);
+  },
+  restoreProject(projectId: string): Promise<{ project: ProjectDto }> {
+    return request("POST", `/api/projects/${encodeURIComponent(projectId)}/restore`);
+  },
+  /** 不带 token = 取级联清单与确认凭据（不删除）；带 token = 执行永久删除。 */
+  purgeProject(projectId: string, token?: string): Promise<PurgeOutcome<ProjectPurgeConfirmation>> {
+    return purgeRequest<ProjectPurgeConfirmation>(`/api/projects/${encodeURIComponent(projectId)}`, token);
+  },
+  archiveGroup(groupId: string): Promise<{ group: GroupDto }> {
+    return request("POST", `/api/groups/${encodeURIComponent(groupId)}/archive`);
+  },
+  restoreGroup(groupId: string): Promise<{ group: GroupDto }> {
+    return request("POST", `/api/groups/${encodeURIComponent(groupId)}/restore`);
+  },
+  purgeGroup(groupId: string, token?: string): Promise<PurgeOutcome<GroupPurgeConfirmation>> {
+    return purgeRequest<GroupPurgeConfirmation>(`/api/groups/${encodeURIComponent(groupId)}`, token);
+  },
+
+  // --- T2 #49：组织树与角色（WebUI 最小可用）--------------------------------
+
+  getOrg(projectId: string): Promise<OrgSnapshot> {
+    return request("GET", `/api/projects/${encodeURIComponent(projectId)}/org`);
+  },
+  createOrgNode(
+    projectId: string,
+    body: { parentId?: string | null; name: string; role: "top_manager" | "sub_manager" | "member"; sortOrder?: number },
+  ): Promise<{ node: OrgNodeDto }> {
+    return request("POST", `/api/projects/${encodeURIComponent(projectId)}/org/nodes`, body);
+  },
+  updateOrgNode(
+    nodeId: string,
+    patch: { name?: string; role?: "top_manager" | "sub_manager" | "member"; parentId?: string | null; sortOrder?: number },
+  ): Promise<{ node: OrgNodeDto }> {
+    return request("PUT", `/api/org/nodes/${encodeURIComponent(nodeId)}`, patch);
+  },
+  deleteOrgNode(nodeId: string): Promise<void> {
+    return request("DELETE", `/api/org/nodes/${encodeURIComponent(nodeId)}`);
+  },
+  /** memberId 为 null = 腾出该岗位当前占据者。 */
+  assignOrgNode(nodeId: string, memberId: string | null): Promise<{ member: MemberDto | null }> {
+    return request("PUT", `/api/org/nodes/${encodeURIComponent(nodeId)}/assignee`, { memberId });
+  },
+  autoPlaceMember(projectId: string, memberId: string): Promise<{ node: OrgNodeDto | null }> {
+    return request("POST", `/api/projects/${encodeURIComponent(projectId)}/org/auto-place`, { memberId });
+  },
+
+  // --- T5 #52：审计查看与撤销（人的撤销权）------------------------------
+
+  listAudit(
+    projectId: string,
+    options?: { action?: string; targetKind?: string; targetId?: string; limit?: number },
+  ): Promise<{ entries: AuditEntryDto[] }> {
+    const params = new URLSearchParams();
+    if (options?.action) params.set("action", options.action);
+    if (options?.targetKind) params.set("targetKind", options.targetKind);
+    if (options?.targetId) params.set("targetId", options.targetId);
+    if (options?.limit !== undefined) params.set("limit", String(options.limit));
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    return request("GET", `/api/projects/${encodeURIComponent(projectId)}/audit${suffix}`);
+  },
+  /** 撤销一条可逆审计事件（仅人；agent 被服务端拒绝）。 */
+  revokeAudit(projectId: string, auditId: string): Promise<{ entry: AuditEntryDto }> {
+    return request(
+      "POST",
+      `/api/projects/${encodeURIComponent(projectId)}/audit/${encodeURIComponent(auditId)}/revoke`,
+    );
   },
 };

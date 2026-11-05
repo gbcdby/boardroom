@@ -6,6 +6,14 @@ import type { Migration } from "../migrate.ts";
  * F1（#11）只建立迁移版本表 `schema_migrations`，不建领域表。
  * F2（#12）新增 `init_domain_model`：Agent/Project/Member/Group/Message/
  * MessageDelivery/MemberStatus 领域表、索引与外键约束。
+ * T1（#48）新增 `archive_flags_for_project_and_group`：项目/群组的归档标记。
+ * T2（#49）新增 `org_tree_and_static_roles`：`org_nodes` 组织树（岗位 + 汇报线）、
+ * `members.node_id` 占岗锚点与「一人一岗」唯一索引；移除与多层树冲突的旧
+ * `ux_members_project_manager`（决策票 #24；阶段 1 兼容语义下沉到 repository 应用层校验）。
+ * T3（#50）新增 `member_lifecycle_status`：`members.status` 生命周期枚举
+ * （active/disabled/pending），老库默认 active、可恢复、不物理删除。
+ * T5（#52）新增 `init_audit_log`：最小审计单表（append-only、无外键、before/after
+ * 快照 + 撤销两列），老库升级后为空表，不影响既有数据（决策票 #30/#28）。
  *
  * 规则：版本号递增，一旦应用就不可修改（runner 校验 checksum）；后续票只追加迁移。
  */
@@ -173,6 +181,131 @@ export const migrations: readonly Migration[] = [
       CREATE UNIQUE INDEX ux_mcp_sessions_active
         ON mcp_sessions (agent_id, project_id, group_id)
         WHERE state = 'connected';
+    `,
+  },
+  {
+    version: 3,
+    name: "archive_flags_for_project_and_group",
+    up: `
+      -- T1（#48）归档标记（PROJECT-03 / GROUP-04 / LIFE-ARC-01）。
+      --
+      -- 归档 = 可恢复的非活跃态：只加一个可空时间戳，NULL 表示未归档。
+      -- 不新增状态枚举、不删数据：恢复即把该列置回 NULL，
+      -- 永久删除（LIFE-ARC-02）走 repository 的显式级联清除，不靠这里。
+      ALTER TABLE projects ADD COLUMN archived_at TEXT;
+      ALTER TABLE groups ADD COLUMN archived_at TEXT;
+
+      -- 列表默认只取未归档行（项目列表 / 项目内群组列表），按归档位建索引避免全表扫。
+      CREATE INDEX ix_projects_archived ON projects (archived_at);
+      CREATE INDEX ix_groups_project_archived ON groups (project_id, archived_at);
+    `,
+  },
+  {
+    version: 4,
+    name: "org_tree_and_static_roles",
+    up: `
+      -- T2（#49）组织树与角色（决策票 #24/#25；spec #45 §4/§6.2）。
+      --
+      -- org_nodes 表达「岗位 + 汇报线」：parent_id 即汇报线（上级=父节点），递归 CTE 现算子树。
+      -- role 是**静态枚举**（spec #45 §3/§5.3 假设 4，不引入动态 RBAC）；角色与岗位分离：
+      -- 这里是「该岗位实例是什么角色」，能力集合由 F2 的 ROLE_CAPABILITIES 静态矩阵表达。
+      -- owner 属于角色枚举（人的内建角色），但**不建节点**（人是全局主体，决策票 #26）。
+      CREATE TABLE org_nodes (
+        id          TEXT PRIMARY KEY NOT NULL,
+        project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        parent_id   TEXT NULL REFERENCES org_nodes(id),
+        name        TEXT NOT NULL,
+        role        TEXT NOT NULL CHECK (role IN ('owner', 'top_manager', 'sub_manager', 'member')),
+        sort_order  INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        CHECK (length(trim(name)) > 0)
+      );
+
+      -- 每项目根层最多一个节点（顶端 = 顶层 manager 岗位，#24：顶层唯一性由根位置推导）。
+      CREATE UNIQUE INDEX ux_org_nodes_single_root
+        ON org_nodes (project_id)
+        WHERE parent_id IS NULL;
+      CREATE INDEX ix_org_nodes_project ON org_nodes (project_id);
+      CREATE INDEX ix_org_nodes_parent  ON org_nodes (parent_id);
+
+      -- 成员「占据」岗位：node_id 为刚性外键锚点（#24）；ON DELETE SET NULL 保证
+      -- 删岗位不误删成员——岗位被删只腾出岗位（成员回到未落位态），成员本身保留。
+      ALTER TABLE members ADD COLUMN node_id TEXT REFERENCES org_nodes(id) ON DELETE SET NULL;
+
+      -- 一人一岗、一岗一实例（AC-ORG-05：同一 agent 同项目只占一岗位由 members 本身唯一 + 此索引）。
+      CREATE UNIQUE INDEX ux_members_node
+        ON members (node_id)
+        WHERE node_id IS NOT NULL;
+
+      -- #24 迁移步骤：旧「每项目至多一个 manager」部分唯一索引与多层树冲突，删除；
+      -- 阶段 1 兼容语义（legacy role='manager' 唯一）改由 members repository 应用层校验，
+      -- 保证升级路径与 e2e-phase1 行为不变。回填岗位**不自动执行**：
+      -- 升级后的库默认无组织树数据（票面硬约束），由人经 WebUI/API 建立（ORG-08）。
+      DROP INDEX ux_members_project_manager;
+    `,
+  },
+  {
+    version: 5,
+    name: "member_lifecycle_status",
+    up: `
+      -- T3（#50）成员生命周期状态（LIFE-MEM-01/02/03；决策票 #27）。
+      --
+      -- active / disabled / pending 是「成员在不在岗」的**持久化标记**：
+      --   active   = 正常在岗；
+      --   disabled = 已暂停/停用（保留身份、历史、数据、岗位与群组参与，不物理删除）；
+      --   pending  = 待激活（已登记、尚未正式在岗）。
+      -- 与 member_statuses（online/offline/waiting/working 运行状态）、mcp_sessions
+      -- （连接/心跳状态）分开建模：断连不删除成员、不改写本列（LIFE-MEM-03）。
+      -- 只加列 + CHECK + 列表索引：老库一律默认 active（阶段 1 行为不回归），
+      -- 不回填业务数据、不删任何行；disable/re-enable 的状态机在 members repository。
+      ALTER TABLE members ADD COLUMN status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'disabled', 'pending'));
+
+      CREATE INDEX ix_members_project_status ON members (project_id, status);
+    `,
+  },
+  {
+    version: 6,
+    name: "init_audit_log",
+    up: `
+      -- T5（#52）最小审计单表（决策票 #30 的结论；spec #45 §6.7 / §8.2 AC-PROJ-AUDIT-01）。
+      --
+      -- 复用普通表、append-only、不引入审计子系统。记录关键操作
+      -- （成员增删/暂停恢复、组织变更、项目/群组归档恢复/永久删除），
+      -- 每条含 actor / action / target(scope) / timestamp，以及足以撤销的
+      -- before / after 最小全量快照与字段级 changed diff。
+      --
+      -- 关键设计（#30）：
+      --  * 无外键（含不指向 projects/members/org_nodes/groups）：项目/群组被永久删除后
+      --    审计痕迹仍在；也不进入 #28 的 PROJECT_SCOPED_TABLES 级联删除注册表。
+      --  * id 为时间有序 ULID（复用阶段 1 newId），可作列表游标与「最近一条」判定。
+      --  * 索引不写 DESC，排序在查询里做，保证 SQLite/PostgreSQL 双引擎可移植。
+      --  * 历史行除 reversed_at / reversed_by_audit_id 两列外永不改写；
+      --    撤销本身写一条新行（reversed_by_audit_id 指向被撤销事件）。
+      --  * 老库升级后为空表（无历史回填），既有数据不受影响。
+      CREATE TABLE audit_log (
+        id                   TEXT PRIMARY KEY NOT NULL,
+        project_id           TEXT NOT NULL,
+        actor_kind           TEXT NOT NULL CHECK (actor_kind IN ('human', 'agent', 'system')),
+        actor_member_id      TEXT,
+        actor_name           TEXT NOT NULL,
+        action               TEXT NOT NULL,
+        target_kind          TEXT NOT NULL CHECK (target_kind IN ('member', 'node', 'role', 'capability', 'group', 'project')),
+        target_id            TEXT NOT NULL,
+        target_name          TEXT NOT NULL,
+        changed              TEXT,
+        before               TEXT,
+        after                TEXT,
+        detail               TEXT,
+        reversed_at          TEXT,
+        reversed_by_audit_id TEXT,
+        created_at           TEXT NOT NULL
+      );
+
+      CREATE INDEX ix_audit_project_created ON audit_log (project_id, created_at, id);
+      CREATE INDEX ix_audit_project_target  ON audit_log (project_id, target_kind, target_id, id);
+      CREATE INDEX ix_audit_project_action  ON audit_log (project_id, action);
     `,
   },
 ];

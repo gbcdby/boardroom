@@ -33,10 +33,22 @@ export interface Project {
   readonly name: string;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /**
+   * 归档时间（ISO 字符串）；null = 未归档。
+   * 归档是**可恢复**的非活跃态（#48 / PROJECT-03、LIFE-ARC-01）：不删数据，
+   * 默认列表隐藏、写路径拒绝；恢复即把该列置回 null。
+   */
+  readonly archivedAt: string | null;
 }
 
 export interface NewProject {
   readonly name: string;
+  /**
+   * 创建项目时同时指定顶层 manager（#48 / PROJECT-02「创建时指定」）：
+   * 必须是**已存在的全局 agent**（由 MCP 入群产生），服务端在同一事务里
+   * 为该 agent 建本项目的成员岗位并置为 manager。省略 = 留空待分配。
+   */
+  readonly managerAgentId?: string | null;
 }
 
 /** 成员类别：agent 或人。 */
@@ -44,6 +56,55 @@ export type MemberKind = "agent" | "human";
 
 /** 阶段 1 的项目级角色（D2）。 */
 export type MemberRole = "manager" | "normal";
+
+/**
+ * 成员生命周期状态（T3 #50 / LIFE-MEM-01/02/03）。
+ *
+ * 与 {@link MemberState}（online/offline/waiting/working 运行状态）、
+ * {@link McpSessionState}（连接/心跳状态）**分开建模**：
+ * 本枚举只表达「成员在不在岗」，不表达在线/离线、也不表达任务状态。
+ * - `active`：正常在岗；
+ * - `disabled`：已暂停/停用；**保留**身份、历史、数据、岗位与群组参与，不物理删除；
+ * - `pending`：待激活（已登记、尚未正式在岗）。
+ *
+ * 状态可经 `members.setStatus` 在合法转换表内迁移、可恢复；断连不改写本列（LIFE-MEM-03）。
+ * 老库升级（迁移 v5）一律默认 `active`，阶段 1 行为不回归。
+ */
+export type MemberLifecycleStatus = "active" | "disabled" | "pending";
+
+/**
+ * 岗位角色的静态枚举（T2 #49；spec #45 §3、决策票 #25/#26 定稿口径）。
+ * 与 F2 `AUTHZ_ROLES` 同值：角色静态、岗位动态（角色与岗位分离）；
+ * 能力集合由 F2 的 `ROLE_CAPABILITIES` 静态矩阵表达，本表不建角色/能力点 DB 表。
+ * `owner` 是人的内建角色，**不建岗位节点**（人是全局主体，决策票 #26）。
+ */
+export type OrgNodeRole = "owner" | "top_manager" | "sub_manager" | "member";
+
+/**
+ * OrgNode：组织树的岗位节点（T2 #49 / 决策票 #24）。
+ * 汇报线 = `parent_id`（上级即父节点）；子树边界用递归 CTE 现算。
+ * 每项目根层最多一个节点，该位置即「顶层 manager 岗位」；空岗 = 无成员占据。
+ */
+export interface OrgNode {
+  readonly id: string;
+  readonly projectId: string;
+  /** 上级岗位；null = 根（顶层 manager 岗位）。 */
+  readonly parentId: string | null;
+  readonly name: string;
+  readonly role: OrgNodeRole;
+  /** 同级展示顺序（#33 WebUI）。 */
+  readonly sortOrder: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface NewOrgNode {
+  readonly projectId: string;
+  readonly parentId?: string | null;
+  readonly name: string;
+  readonly role: OrgNodeRole;
+  readonly sortOrder?: number;
+}
 
 /** Member：agent 或人在某项目中的成员关系与岗位。 */
 export interface Member {
@@ -53,6 +114,13 @@ export interface Member {
   readonly kind: MemberKind;
   readonly displayName: string;
   readonly role: MemberRole;
+  /**
+   * 占据的组织岗位（T2 #49）。null = 未落位；未落位成员的守卫主体走阶段 1 兼容映射
+   * （`role` 的 manager/normal → top_manager/member），保证既有库升级路径行为不变。
+   */
+  readonly nodeId: string | null;
+  /** 生命周期状态（T3 #50）；老库默认 active。与运行状态/连接状态分开（见 {@link MemberLifecycleStatus}）。 */
+  readonly status: MemberLifecycleStatus;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -64,6 +132,8 @@ export interface NewMember {
   readonly kind: MemberKind;
   readonly displayName: string;
   readonly role?: MemberRole;
+  /** 生命周期状态（T3 #50）；省略 = active。可显式登记为 pending（待激活）。 */
+  readonly status?: MemberLifecycleStatus;
 }
 
 /** Group：项目内聊天空间。 */
@@ -73,6 +143,8 @@ export interface Group {
   readonly name: string;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /** 归档时间（ISO 字符串）；null = 未归档。语义同 {@link Project.archivedAt}（GROUP-04）。 */
+  readonly archivedAt: string | null;
 }
 
 export interface NewGroup {

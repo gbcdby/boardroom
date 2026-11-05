@@ -17,6 +17,8 @@
 | Status vs 任务状态 | Status 是成员的在线/离线、等待/工作中的运行状态；任务状态属于 Task，两者分开建模。 | 同上 |
 | Agent 连接状态 vs Status | Agent 连接状态是全局 MCP 会话状态（connected/disconnected、最后心跳）；Status 是项目成员的 online/offline/waiting/working，按 `(project_id, member_id)` 记录。 | 决策票 #4（D1，2026-10-18） |
 | role（阶段 1） | Member 的项目级角色字段；阶段 1 只有 `manager` / `normal`，每项目最多一个顶层 manager；完整角色模型在阶段 2。 | 决策票 #5（D2，2026-10-18） |
+| legacy `members.role='manager'`（T2 #49 起） | **不再是真实角色**，只是组织树根节点（顶层 manager 岗位）的阶段 1 兼容投影：旧 `ux_members_project_manager` 索引在迁移 v4 移除，唯一性下沉到 `members` repository 应用层；占据/让出根节点时同步升降。真实角色看 `org_nodes.role`（静态枚举）与 F2 `ROLE_CAPABILITIES`。升级库默认无组织数据，未落位成员走 `actorForMember` 兼容映射（人=owner），因此阶段 1 行为不变。 | 决策票 #24/#25/#26、T2 #49 |
+| 角色 vs 岗位（T2 #49 起） | 角色是静态枚举 `owner/top_manager/sub_manager/member` 的能力集合定义（不落库）；岗位是 `org_nodes` 节点上的实例，`members.node_id` 指向它。二者正交：`node_id` 管「谁占哪个岗」，节点 `role` 管「该岗位是什么角色」。 | 决策票 #25、T2 #49 |
 | 自己参与的消息（阶段 1） | 阶段 1 只覆盖自己发送 + 被 @；任务关联消息留阶段 3，最终定义在阶段 3 重新确认。 | 决策票 #6（D3，2026-10-18） |
 | fixed point | 双轴评审的 diff 基准点（commit SHA、分支、tag 等）；评审记录必须可追溯。 | `docs/architecture/agent-studio.md` §6.7；`.agents/skills/code-review/SKILL.md` |
 | 三层记忆 | Agent 全局记忆、项目共享记忆、项目+agent 记忆；作用域、读写权限和注入方式不同。 | `docs/architecture/agent-studio.md` §6.8 |
@@ -45,6 +47,8 @@
 | --- | --- | --- | --- | --- |
 | 原型 MCP server 在宿主被杀后日志暴涨到 1.2G | stderr 已断（EPIPE），`uncaughtException` 处理里又写 stderr，递归触发自身 | 日志写入必须 try/catch 包裹；EPIPE 单独短路，且对 uncaught 限次记录 | 任何 stdio MCP server | `.agent-output/d6-host-capability/` 修复前后对比 |
 | `skill` 工具报「skill "interview" is not available for model invocation」，读不到显式触发类技能 | 这些技能 frontmatter 有 `disable-model-invocation: true`（`interview`/`to-spec`/`to-tickets`/`implement`/`decision-map`/`handoff`），禁止 model 主动调用 | 用户示意「你自己往下走」时，直接读盘 `.agents/skills/<name>/SKILL.md` 按其流程执行；但 HITL 类（`interview`、decision:interview 票）仍**不得代用户回答**，只能用提问工具逐轮收敛 | 本仓库决策票与 `AGENTS.md` 工作流 | 2026-11-04 解 #31 全程；`.agents/skills/interview/SKILL.md:4` |
+| 给 `createT1ApiRouter` 加闭包内 `const` 状态（#48 永久删除待确认表）后，请求直接 500 `Cannot access 'pendingPurges' before initialization` | 该工厂函数**先 `return { handle }`**，后面的函数声明靠 hoisting 才能被调用；写在 `return` 之后的 `const`/`let` 永远不会初始化（TDZ） | 新增闭包状态必须声明在 `return` 之前（本仓库 `src/server/api.ts` 的结构就是「先 return，再写函数声明区」）；排查同类问题先看错误是否为 ReferenceError | `src/server/api.ts` 及其他「提前 return + 下方函数声明」的工厂 | 2026-11-04 #48 实现期；修复见同分支提交 |
+| 测试里 `await client.close(); await transport.terminateSession()` 之后，服务端 `mcp_sessions` 仍是 `connected`（成员一直 online） | MCP SDK `StreamableHTTPClientTransport.close()` 会 `abortController.abort()`；随后 `terminateSession()` 里的 DELETE fetch 用的正是这个**已 abort 的 signal**，DELETE 根本没到服务端，`onclose→core.disconnect()` 不触发 | 必须**先** `await transport.terminateSession()` 发 DELETE（触发服务端 onclose / 会话断开 / 运行状态回落 offline），**再** `await client.close()`。仅 `client.close()` 的既有清理顺序不适用于「要验证断开态」的用例 | 所有用 `StreamableHTTPClientTransport` 验证「断开/离线」的测试；仅做收尾清理时顺序无所谓 | 2026-11-05 #50 LIFE-MEM-03 用例调试；SDK `dist/esm/client/streamableHttp.js` `close()` / `terminateSession()` |
 
 ## 待验证
 

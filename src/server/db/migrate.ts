@@ -131,7 +131,11 @@ function readAppliedRows(db: Database.Database): AppliedMigration[] {
   }));
 }
 
-function validateAndSort(migrations: readonly Migration[]): readonly Migration[] {
+/**
+ * 校验迁移定义并按版本升序返回。
+ * F1（#46）导出给 PostgreSQL 异步迁移运行器复用同一套定义校验。
+ */
+export function validateAndSort(migrations: readonly Migration[]): readonly Migration[] {
   const seen = new Set<number>();
   for (const migration of migrations) {
     if (!Number.isInteger(migration.version) || migration.version <= 0) {
@@ -148,6 +152,7 @@ function validateAndSort(migrations: readonly Migration[]): readonly Migration[]
   return [...migrations].sort((a, b) => a.version - b.version);
 }
 
-function checksumOf(migration: Migration): string {
+/** 迁移内容的稳定校验和；F1（#46）导出给跨方言迁移运行器复用。 */
+export function checksumOf(migration: Migration): string {
   return createHash("sha256").update(migration.up).digest("hex").slice(0, 16);
 }

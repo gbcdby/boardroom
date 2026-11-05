@@ -120,3 +120,28 @@ CSS 呈现；覆盖的是「产物已打包关键 UI + 前端使用的同一组 
 - WebSocket/SSE 更新 ≠ 消息进入模型上下文 ≠ 唤醒空闲宿主（见 `AGENTS.md` 技术边界）；
   本票只让 WebUI 实时看到状态，不承诺唤醒效应。
 - 不改已应用迁移（T4 未新增迁移）；不改 MCP 工具名/错误码（`report_status` 形状不变）。
+
+## 9. 未决项（Unresolved）
+
+本票实现时遇到三处与既有边界/措辞不一致，记录于此，待产品/评审确认：
+
+1. **「普通成员只见自己项目」与既有安全边界冲突（范围变更，未放开）。**
+   原 ticket 措辞是「普通成员只见自己项目」。但本仓库 F2 能力矩阵里 `overview:view` 只属于 **owner / top_manager**，
+   普通成员（member/sub_manager）没有该能力点；既有 `tests/project-lifecycle.test.ts:590-593` 已锁定
+   「普通成员 GET /api/projects → 403」。本票选择**保留这一安全边界**：跨项目概览对普通成员直接拒绝（403），
+   而非「让其只看自己项目」。如产品确实需要「成员看自己项目的概览」，需在 F2 矩阵放开 `overview:view`
+   （并明确是否也需 project:view 行级收窄），属于范围变更，不在本 ticket 内。
+   验证：`tests/overview-t4.test.ts`（普通成员被拒）、`scripts/e2e-t4.mjs`（member 403 边界）。
+
+2. **归档项目可见性（T1 未决项，本票已做出明确决策）。**
+   T1 未决：归档项目默认是否进周期快照。本票明确两条：
+   - HTTP 概览：`GET /api/projects` **默认排除**归档项目；显式 `?includeArchived=true` 时才纳入，
+     且归档项目聚合 `status=archived`（不臆造在线/活跃）。
+   - WS 周期快照：`server.ts` 的 `statusPublisher` 默认只含活跃项目；归档项目**仅当某客户端声明其 presence**
+     （`hub.declaredProjectIds()`）时才按需追加进该次快照，不默认推送。
+   这两条已写入本票代码决策，若与 T1 最终裁决冲突再以 T1 为准。
+
+3. **验收项「SM-01 / SM-02」未找到逐字定义。**
+   在 spec #45 及本仓库既有文档中未检索到逐字 "SM-01"/"SM-02" 验收项。本票按「跨项目概览」语义理解并落地
+   （对应 OVERVIEW-01 / AC-PROJ-OVERVIEW-01：owner 看全部聚合、顶层 manager 行级收窄、安全边界不泄漏）。
+   若 SM-01/02 另有精确语义（例如成员维度聚合指标），需补充到 spec 后另行实现。

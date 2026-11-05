@@ -17,6 +17,12 @@ export const DEFAULT_MAX_WAKES_PER_MINUTE_PER_MEMBER = 20;
 /** 默认只读的配置文件路径（相对 cwd）。 */
 export const DEFAULT_CONFIG_FILE = "config.json";
 
+/** 持久化驱动种类（F1 #46）；与连接工厂的 DbDriver.kind 对应。 */
+export type DbDriverKind = "sqlite" | "postgres";
+
+/** F1 #46：默认持久化驱动。阶段 1 行为保持 SQLite，PG 需显式配置。 */
+export const DEFAULT_DB_DRIVER: DbDriverKind = "sqlite";
+
 export interface HeartbeatConfig {
   /** 心跳发送间隔，毫秒。 */
   readonly intervalMs: number;
@@ -41,6 +47,14 @@ export interface AppConfig {
   readonly heartbeat: HeartbeatConfig;
   /** T7 防环/限流配置（D5）；缺省时使用 D5 默认值。 */
   readonly antiLoop?: AntiLoopConfig;
+  /**
+   * 持久化驱动（F1 #46）。默认 `sqlite`，阶段 1 行为不变；
+   * 可切 `postgres`——驱动层已接入，但业务仓储在 M1（#54）迁移前仅支持 SQLite。
+   * 可选以兼容既有手工构造的配置对象；缺省即 {@link DEFAULT_DB_DRIVER}。
+   */
+  readonly dbDriver?: DbDriverKind;
+  /** PostgreSQL 连接串；仅当 dbDriver=postgres 时必须配置。 */
+  readonly pgConnectionString?: string;
   /** 实际加载的配置文件绝对路径；没有配置文件时为 null。 */
   readonly configFile: string | null;
 }
@@ -111,13 +125,54 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<AppCo
     ),
   );
 
+  const dbDriver = parseDbDriver(pick(env["AGENT_STUDIO_DB_DRIVER"], fileValues["dbDriver"], DEFAULT_DB_DRIVER));
+  const pgConnectionString = parsePgConnectionString(
+    pick(env["AGENT_STUDIO_PG_CONNECTION_STRING"], fileValues["pgConnectionString"]),
+    dbDriver,
+  );
+
   return {
     port,
     dataDir,
     heartbeat: { intervalMs, timeoutMs },
     antiLoop: { maxConsecutiveAutoReplies, maxWakesPerMinutePerMember },
+    dbDriver,
+    ...(pgConnectionString === undefined ? {} : { pgConnectionString }),
     configFile: loadedFile === null ? null : configFile,
   };
+}
+
+/** F1 #46：dbDriver 只接受 sqlite / postgres；其余值报错并给出恢复路径。 */
+function parseDbDriver(value: unknown): DbDriverKind {
+  if (value === "sqlite" || value === "postgres") return value;
+  throw new ConfigError(
+    `dbDriver 必须是 "sqlite" 或 "postgres"，收到：${JSON.stringify(value)}。` +
+      `请修改 AGENT_STUDIO_DB_DRIVER 或配置文件中的 dbDriver 字段。`,
+  );
+}
+
+/**
+ * F1 #46：PG 连接串校验。
+ *
+ * - dbDriver=postgres 时必须配置非空连接串，否则报错（启动失败快于运行期失败）。
+ * - dbDriver=sqlite 时允许保留连接串（便于切换），原样返回。
+ */
+function parsePgConnectionString(value: unknown, dbDriver: DbDriverKind): string | undefined {
+  if (value !== undefined && (typeof value !== "string" || value.trim() === "")) {
+    throw new ConfigError(
+      `pgConnectionString 必须是非空字符串，收到：${JSON.stringify(value)}。` +
+        `请修改 AGENT_STUDIO_PG_CONNECTION_STRING 或配置文件中的 pgConnectionString 字段。`,
+    );
+  }
+  const connectionString = typeof value === "string" ? value.trim() : undefined;
+  if (dbDriver === "postgres" && connectionString === undefined) {
+    throw new ConfigError(
+      `dbDriver=postgres 但缺少 PG 连接串。` +
+        `请设置 AGENT_STUDIO_PG_CONNECTION_STRING=postgres://user:password@host:port/database` +
+        `（或配置文件中的 pgConnectionString 字段）；如需继续使用本地 SQLite，请保持 dbDriver=sqlite。`,
+    );
+  }
+  return connectionString;
 }
 
 async function readConfigFile(configFile: string, required: boolean): Promise<JsonObject | null> {
