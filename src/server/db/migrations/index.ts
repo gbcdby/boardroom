@@ -12,6 +12,8 @@ import type { Migration } from "../migrate.ts";
  * `ux_members_project_manager`（决策票 #24；阶段 1 兼容语义下沉到 repository 应用层校验）。
  * T3（#50）新增 `member_lifecycle_status`：`members.status` 生命周期枚举
  * （active/disabled/pending），老库默认 active、可恢复、不物理删除。
+ * T5（#52）新增 `init_audit_log`：最小审计单表（append-only、无外键、before/after
+ * 快照 + 撤销两列），老库升级后为空表，不影响既有数据（决策票 #30/#28）。
  *
  * 规则：版本号递增，一旦应用就不可修改（runner 校验 checksum）；后续票只追加迁移。
  */
@@ -261,6 +263,49 @@ export const migrations: readonly Migration[] = [
         CHECK (status IN ('active', 'disabled', 'pending'));
 
       CREATE INDEX ix_members_project_status ON members (project_id, status);
+    `,
+  },
+  {
+    version: 6,
+    name: "init_audit_log",
+    up: `
+      -- T5（#52）最小审计单表（决策票 #30 的结论；spec #45 §6.7 / §8.2 AC-PROJ-AUDIT-01）。
+      --
+      -- 复用普通表、append-only、不引入审计子系统。记录关键操作
+      -- （成员增删/暂停恢复、组织变更、项目/群组归档恢复/永久删除），
+      -- 每条含 actor / action / target(scope) / timestamp，以及足以撤销的
+      -- before / after 最小全量快照与字段级 changed diff。
+      --
+      -- 关键设计（#30）：
+      --  * 无外键（含不指向 projects/members/org_nodes/groups）：项目/群组被永久删除后
+      --    审计痕迹仍在；也不进入 #28 的 PROJECT_SCOPED_TABLES 级联删除注册表。
+      --  * id 为时间有序 ULID（复用阶段 1 newId），可作列表游标与「最近一条」判定。
+      --  * 索引不写 DESC，排序在查询里做，保证 SQLite/PostgreSQL 双引擎可移植。
+      --  * 历史行除 reversed_at / reversed_by_audit_id 两列外永不改写；
+      --    撤销本身写一条新行（reversed_by_audit_id 指向被撤销事件）。
+      --  * 老库升级后为空表（无历史回填），既有数据不受影响。
+      CREATE TABLE audit_log (
+        id                   TEXT PRIMARY KEY NOT NULL,
+        project_id           TEXT NOT NULL,
+        actor_kind           TEXT NOT NULL CHECK (actor_kind IN ('human', 'agent', 'system')),
+        actor_member_id      TEXT,
+        actor_name           TEXT NOT NULL,
+        action               TEXT NOT NULL,
+        target_kind          TEXT NOT NULL CHECK (target_kind IN ('member', 'node', 'role', 'capability', 'group', 'project')),
+        target_id            TEXT NOT NULL,
+        target_name          TEXT NOT NULL,
+        changed              TEXT,
+        before               TEXT,
+        after                TEXT,
+        detail               TEXT,
+        reversed_at          TEXT,
+        reversed_by_audit_id TEXT,
+        created_at           TEXT NOT NULL
+      );
+
+      CREATE INDEX ix_audit_project_created ON audit_log (project_id, created_at, id);
+      CREATE INDEX ix_audit_project_target  ON audit_log (project_id, target_kind, target_id, id);
+      CREATE INDEX ix_audit_project_action  ON audit_log (project_id, action);
     `,
   },
 ];

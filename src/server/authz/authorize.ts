@@ -111,6 +111,9 @@ export type Capability =
   | "task:update_own"
   | "memory:write_own"
   | "interrupt:self"
+  // T5（#52）最小审计：查看（可分配，默认人 + top_manager）与撤销（人内建特权）。
+  | "audit:view"
+  | "org:revoke"
   | "session:heartbeat";
 
 /**
@@ -145,6 +148,9 @@ const CAPABILITY_BOUNDARY: Readonly<Record<Capability, BoundaryKind>> = {
   "task:update_own": "self",
   "memory:write_own": "self",
   "interrupt:self": "self",
+  // T5 #52：审计查看/撤销都是项目级动作（具体谁能做由矩阵 + 主体类别决定）。
+  "audit:view": "project",
+  "org:revoke": "project",
   "session:heartbeat": "self",
 };
 
@@ -179,6 +185,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
     "memory:write_own",
     "interrupt:self",
     "session:heartbeat",
+    // T5 #52：人（owner）独占审计查看与撤销（#30 §5：org:revoke 为人内建特权）。
+    "audit:view",
+    "org:revoke",
   ]),
   top_manager: new Set<Capability>([
     "project:view",
@@ -199,6 +208,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
     "memory:write_own",
     "interrupt:self",
     "session:heartbeat",
+    // T5 #52：top_manager 预设持有审计查看（#30 §5：audit:view 可分配，默认此角色）。
+    "audit:view",
   ]),
   sub_manager: new Set<Capability>([
     "project:view",
@@ -288,6 +299,11 @@ export function authorize(actor: Actor, capability: Capability, scope: GuardScop
     : undefined;
   if (!granted || !granted.has(capability)) {
     return deny("forbidden", capability, `角色 ${String(actor.role)} 没有 ${capability} 能力点。`);
+  }
+  // T5（#52）/ #30 §5：`org:revoke` 是「主体类别决定」的人内建特权，不进可分配能力点模型。
+  // 即便角色矩阵里挂了该点位，agent 主体也一律拒绝，保证撤销不可越权。
+  if (capability === "org:revoke" && actor.kind !== "human") {
+    return deny("forbidden", capability, "org:revoke 仅人（owner）可持有，agent 主体一律拒绝。");
   }
 
   if (scope.conn?.groupIds && scope.groupId !== undefined && !scope.conn.groupIds.includes(scope.groupId)) {

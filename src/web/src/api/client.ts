@@ -205,6 +205,26 @@ export type PurgeOutcome<T> =
   | { readonly state: "confirmation_required"; readonly confirmation: T }
   | { readonly state: "deleted" };
 
+/** T5 #52：审计事件视图（与 `src/server/audit.ts` 的 `auditView` 对应）。JSON 快照以字符串原样透传。 */
+export interface AuditEntryDto {
+  id: string;
+  projectId: string;
+  actorKind: "human" | "agent" | "system";
+  actorMemberId: string | null;
+  actorName: string;
+  action: string;
+  targetKind: string;
+  targetId: string;
+  targetName: string;
+  changed: string | null;
+  before: string | null;
+  after: string | null;
+  detail: string | null;
+  reversedAt: string | null;
+  reversedByAuditId: string | null;
+  createdAt: string;
+}
+
 async function purgeRequest<C>(pathname: string, token?: string): Promise<PurgeOutcome<C>> {
   const init: RequestInit = { method: "DELETE", headers: { accept: "application/json" } };
   if (token !== undefined) {
@@ -357,5 +377,27 @@ export const api = {
   },
   autoPlaceMember(projectId: string, memberId: string): Promise<{ node: OrgNodeDto | null }> {
     return request("POST", `/api/projects/${encodeURIComponent(projectId)}/org/auto-place`, { memberId });
+  },
+
+  // --- T5 #52：审计查看与撤销（人的撤销权）------------------------------
+
+  listAudit(
+    projectId: string,
+    options?: { action?: string; targetKind?: string; targetId?: string; limit?: number },
+  ): Promise<{ entries: AuditEntryDto[] }> {
+    const params = new URLSearchParams();
+    if (options?.action) params.set("action", options.action);
+    if (options?.targetKind) params.set("targetKind", options.targetKind);
+    if (options?.targetId) params.set("targetId", options.targetId);
+    if (options?.limit !== undefined) params.set("limit", String(options.limit));
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    return request("GET", `/api/projects/${encodeURIComponent(projectId)}/audit${suffix}`);
+  },
+  /** 撤销一条可逆审计事件（仅人；agent 被服务端拒绝）。 */
+  revokeAudit(projectId: string, auditId: string): Promise<{ entry: AuditEntryDto }> {
+    return request(
+      "POST",
+      `/api/projects/${encodeURIComponent(projectId)}/audit/${encodeURIComponent(auditId)}/revoke`,
+    );
   },
 };

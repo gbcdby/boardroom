@@ -19,6 +19,7 @@ import type { Actor } from "./authz/authorize.ts";
 import type { SessionBinding } from "./mcp/core.ts";
 import { createOrgActorResolver } from "./authz/org-actors.ts";
 import type { OrgChangeRecorder } from "./org-change-hook.ts";
+import { createAuditRecorder } from "./audit.ts";
 import { buildStatusBoard } from "./status.ts";
 
 /** WebSocket 端点路径。 */
@@ -51,7 +52,7 @@ export interface StartServerOptions {
   readonly webRoot?: string;
   /** F2 权限守卫主体注入（默认阶段 1 人=owner，行为不变）。 */
   readonly authorization?: ServerAuthorization;
-  /** T5（#52）审计/撤销接口钩子；本票不写 audit_log，留装配口。 */
+  /** T5（#52）审计/撤销接口钩子；省略时默认注入写 audit_log 的真实 recorder。 */
   readonly orgChangeRecorder?: OrgChangeRecorder;
 }
 
@@ -201,13 +202,17 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   });
   // T3：人的消息广播目标。hub 在 httpServer 之后创建，这里用晚绑定回调占位。
   let broadcastMessage: (message: import("./api.ts").MessageView) => void = () => {};
+  // T5（#52）：把 T2/T3 的 noop 钩子换成默认真实 recorder（写 audit_log）。
+  // 显式注入（测试替身 / 未来装配）优先，保证既有 org-authz 等用例不变。
+  const auditRecorder: OrgChangeRecorder =
+    options.orgChangeRecorder ?? createAuditRecorder(createRepositories(db).audit);
   const t1Api = createT1ApiRouter({
     db,
     logger,
     heartbeat: config.heartbeat,
     onMessage: (message) => broadcastMessage(message),
     ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}),
-    ...(options.orgChangeRecorder ? { orgChangeRecorder: options.orgChangeRecorder } : {}),
+    orgChangeRecorder: auditRecorder,
   });
 
   const httpServer = createServer((request, response) => {
