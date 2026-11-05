@@ -18,7 +18,7 @@ import type { Logger } from "./logger.ts";
 import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "./chat/routing.ts";
 import { buildRoster } from "./chat/roster.ts";
 import { resetGroupConsecutiveCount } from "./mcp/core.ts";
-import { deriveEffectiveStatus } from "./status.ts";
+import { buildStatusBoard, deriveEffectiveStatus } from "./status.ts";
 import {
   AUTHZ_ROLES,
   ROLE_CAPABILITIES,
@@ -1438,6 +1438,17 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
 
   function projectView(r: RepositorySet, project: Project) {
     const manager = r.members.getManager(project.id);
+    const members = r.members.listByProject(project.id);
+    const groups = r.groups.listByProject(project.id);
+    const messageCount = r.messages.countByProject(project.id);
+    const lastActivityAt = r.messages.latestByProject(project.id);
+    // T4（#51）：跨项目概览——聚合「运行状态 / 成员数 / 群组数 / 最近活跃」。
+    // onlineCount 来自状态看板推导（WebSocket/会话在线）；人仅经 WS presence 在线，
+    // 此处无 hub，故人按 offline 计（实时看板仍以 WS 推送为准）。
+    const statuses = buildStatusBoard(r, project.id, { heartbeat, now: new Date(), humanOnlineMemberIds: [] });
+    const onlineCount = statuses.filter((s) => s.state !== "offline").length;
+    const status: "active" | "idle" | "archived" =
+      project.archivedAt !== null ? "archived" : onlineCount > 0 ? "active" : "idle";
     return {
       id: project.id,
       name: project.name,
@@ -1446,6 +1457,13 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       // T1 #48：归档时间（null = 未归档）。归档对象默认不出现在列表里，但形状一致。
       archivedAt: project.archivedAt,
       manager: manager ? memberView(manager) : null,
+      // T4（#51）跨项目概览聚合字段：
+      memberCount: members.length,
+      groupCount: groups.length,
+      messageCount,
+      onlineCount,
+      lastActivityAt,
+      status,
     };
   }
 
