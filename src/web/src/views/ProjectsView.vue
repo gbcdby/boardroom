@@ -544,6 +544,8 @@ onMounted(() => void loadProjects());
             <strong>
               {{ group.name }}
               <span v-if="group.archivedAt" class="badge" data-testid="group-archived-badge">已归档</span>
+              <!-- T2 #49 / #32：writable=false = 子树只读可见（可看元数据与历史，不唤醒、不能发消息）。 -->
+              <span v-if="group.writable === false" class="badge" data-testid="group-readonly-badge">只读可见</span>
             </strong>
             <span class="small muted">参与者：{{ participantNames(group.id) }}</span>
             <span class="actions" data-testid="group-lifecycle">

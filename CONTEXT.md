@@ -17,6 +17,8 @@
 | Status vs 任务状态 | Status 是成员的在线/离线、等待/工作中的运行状态；任务状态属于 Task，两者分开建模。 | 同上 |
 | Agent 连接状态 vs Status | Agent 连接状态是全局 MCP 会话状态（connected/disconnected、最后心跳）；Status 是项目成员的 online/offline/waiting/working，按 `(project_id, member_id)` 记录。 | 决策票 #4（D1，2026-10-18） |
 | role（阶段 1） | Member 的项目级角色字段；阶段 1 只有 `manager` / `normal`，每项目最多一个顶层 manager；完整角色模型在阶段 2。 | 决策票 #5（D2，2026-10-18） |
+| legacy `members.role='manager'`（T2 #49 起） | **不再是真实角色**，只是组织树根节点（顶层 manager 岗位）的阶段 1 兼容投影：旧 `ux_members_project_manager` 索引在迁移 v4 移除，唯一性下沉到 `members` repository 应用层；占据/让出根节点时同步升降。真实角色看 `org_nodes.role`（静态枚举）与 F2 `ROLE_CAPABILITIES`。升级库默认无组织数据，未落位成员走 `actorForMember` 兼容映射（人=owner），因此阶段 1 行为不变。 | 决策票 #24/#25/#26、T2 #49 |
+| 角色 vs 岗位（T2 #49 起） | 角色是静态枚举 `owner/top_manager/sub_manager/member` 的能力集合定义（不落库）；岗位是 `org_nodes` 节点上的实例，`members.node_id` 指向它。二者正交：`node_id` 管「谁占哪个岗」，节点 `role` 管「该岗位是什么角色」。 | 决策票 #25、T2 #49 |
 | 自己参与的消息（阶段 1） | 阶段 1 只覆盖自己发送 + 被 @；任务关联消息留阶段 3，最终定义在阶段 3 重新确认。 | 决策票 #6（D3，2026-10-18） |
 | fixed point | 双轴评审的 diff 基准点（commit SHA、分支、tag 等）；评审记录必须可追溯。 | `docs/architecture/agent-studio.md` §6.7；`.agents/skills/code-review/SKILL.md` |
 | 三层记忆 | Agent 全局记忆、项目共享记忆、项目+agent 记忆；作用域、读写权限和注入方式不同。 | `docs/architecture/agent-studio.md` §6.8 |

@@ -303,3 +303,107 @@ test("T5：服务端重启后 WebUI 群聊历史页仍可加载并读到重启�
     });
   });
 });
+
+/**
+ * T2（#49）组织树管理页（最小可用）：
+ * 覆盖边界同本文件其它用例——构建产物含关键文案（说明页面确实被打包）、`/org` 深链可加载、
+ * 组件调用的同一组组织 HTTP 接口走通「建树 → 建下级岗位 → 指派 → 自动分配」流程。
+ * 非浏览器 DOM 交互；Vue 组件内联渲染与点击绑定不在覆盖范围内。
+ */
+test("组织与角色页打包、/org 深链与组织 API 走通（T2 #49）", async () => {
+  await withTempDir(async (buildDir) => {
+    const webRoot = path.join(buildDir, "web");
+    await buildWebInto(webRoot);
+
+    const assetsDir = path.join(webRoot, "assets");
+    const files = await readdir(assetsDir);
+    let bundle = "";
+    for (const file of files.filter((f) => f.endsWith(".js"))) {
+      bundle += await readFile(path.join(assetsDir, file), "utf8");
+    }
+    for (const marker of [
+      "组织与角色",
+      "建立顶层 manager 岗位",
+      "新增下级岗位",
+      "调整汇报线",
+      "角色与能力点",
+      "自动分配岗位",
+      "group:view_subtree",
+      // 前端调用的 org API 路径确实存在。
+      "/org/nodes",
+      "/org/auto-place",
+      // #32：群组列表区分只读可见与可参与。
+      "只读可见",
+    ]) {
+      assert.ok(bundle.includes(marker), `构建产物应包含组织页文案「${marker}」`);
+    }
+
+    await withTempDir(async (dataDir) => {
+      const server = await startTestServer(dataDir, webRoot);
+      const post = async (pathname: string, body: unknown) => {
+        const res = await fetch(`${server.url}${pathname}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        return { status: res.status, body: (await res.json()) as any };
+      };
+      const put = async (pathname: string, body: unknown) => {
+        const res = await fetch(`${server.url}${pathname}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        return { status: res.status, body: (await res.json()) as any };
+      };
+      const get = async (pathname: string) =>
+        (await (await fetch(`${server.url}${pathname}`)).json()) as any;
+
+      try {
+        const orgPage = await fetch(`${server.url}/org`);
+        assert.equal(orgPage.status, 200);
+        assert.match(await orgPage.text(), /<div id="app">/);
+
+        const project = (await post("/api/projects", { name: "组织页项目" })).body.project;
+        const empty = await get(`/api/projects/${project.id}/org`);
+        assert.equal(empty.nodes.length, 0, "升级/新建项目默认无组织数据（阶段 1 兼容）");
+        assert.equal(empty.rootId, null);
+        assert.ok(empty.roles.some((r: any) => r.role === "sub_manager"));
+
+        const root = (await post(`/api/projects/${project.id}/org/nodes`, {
+          name: "统筹",
+          role: "top_manager",
+        })).body.node;
+        assert.equal(root.role, "top_manager");
+        const child = (await post(`/api/projects/${project.id}/org/nodes`, {
+          parentId: root.id,
+          name: "A 线",
+          role: "sub_manager",
+        })).body.node;
+        assert.equal(child.parentId, root.id);
+
+        const alice = (await post(`/api/projects/${project.id}/members`, {
+          kind: "human",
+          displayName: "Alice",
+        })).body.member;
+        const assigned = await put(`/api/org/nodes/${child.id}/assignee`, { memberId: alice.id });
+        assert.equal(assigned.status, 200);
+        assert.equal(assigned.body.member.nodeId, child.id);
+
+        const bob = (await post(`/api/projects/${project.id}/members`, {
+          kind: "human",
+          displayName: "Bob",
+        })).body.member;
+        const placed = await post(`/api/projects/${project.id}/org/auto-place`, { memberId: bob.id });
+        assert.equal(placed.body.node.role, "member");
+        assert.equal(placed.body.node.parentId, root.id);
+
+        const snapshot = await get(`/api/projects/${project.id}/org`);
+        assert.equal(snapshot.nodes.length, 3);
+        assert.equal(snapshot.rootId, root.id);
+      } finally {
+        await server.close();
+      }
+    });
+  });
+});

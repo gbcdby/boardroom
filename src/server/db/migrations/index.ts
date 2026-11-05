@@ -7,6 +7,9 @@ import type { Migration } from "../migrate.ts";
  * F2（#12）新增 `init_domain_model`：Agent/Project/Member/Group/Message/
  * MessageDelivery/MemberStatus 领域表、索引与外键约束。
  * T1（#48）新增 `archive_flags_for_project_and_group`：项目/群组的归档标记。
+ * T2（#49）新增 `org_tree_and_static_roles`：`org_nodes` 组织树（岗位 + 汇报线）、
+ * `members.node_id` 占岗锚点与「一人一岗」唯一索引；移除与多层树冲突的旧
+ * `ux_members_project_manager`（决策票 #24；阶段 1 兼容语义下沉到 repository 应用层校验）。
  *
  * 规则：版本号递增，一旦应用就不可修改（runner 校验 checksum）；后续票只追加迁移。
  */
@@ -191,6 +194,51 @@ export const migrations: readonly Migration[] = [
       -- 列表默认只取未归档行（项目列表 / 项目内群组列表），按归档位建索引避免全表扫。
       CREATE INDEX ix_projects_archived ON projects (archived_at);
       CREATE INDEX ix_groups_project_archived ON groups (project_id, archived_at);
+    `,
+  },
+  {
+    version: 4,
+    name: "org_tree_and_static_roles",
+    up: `
+      -- T2（#49）组织树与角色（决策票 #24/#25；spec #45 §4/§6.2）。
+      --
+      -- org_nodes 表达「岗位 + 汇报线」：parent_id 即汇报线（上级=父节点），递归 CTE 现算子树。
+      -- role 是**静态枚举**（spec #45 §3/§5.3 假设 4，不引入动态 RBAC）；角色与岗位分离：
+      -- 这里是「该岗位实例是什么角色」，能力集合由 F2 的 ROLE_CAPABILITIES 静态矩阵表达。
+      -- owner 属于角色枚举（人的内建角色），但**不建节点**（人是全局主体，决策票 #26）。
+      CREATE TABLE org_nodes (
+        id          TEXT PRIMARY KEY NOT NULL,
+        project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        parent_id   TEXT NULL REFERENCES org_nodes(id),
+        name        TEXT NOT NULL,
+        role        TEXT NOT NULL CHECK (role IN ('owner', 'top_manager', 'sub_manager', 'member')),
+        sort_order  INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        CHECK (length(trim(name)) > 0)
+      );
+
+      -- 每项目根层最多一个节点（顶端 = 顶层 manager 岗位，#24：顶层唯一性由根位置推导）。
+      CREATE UNIQUE INDEX ux_org_nodes_single_root
+        ON org_nodes (project_id)
+        WHERE parent_id IS NULL;
+      CREATE INDEX ix_org_nodes_project ON org_nodes (project_id);
+      CREATE INDEX ix_org_nodes_parent  ON org_nodes (parent_id);
+
+      -- 成员「占据」岗位：node_id 为刚性外键锚点（#24）；ON DELETE SET NULL 保证
+      -- 删岗位不误删成员——岗位被删只腾出岗位（成员回到未落位态），成员本身保留。
+      ALTER TABLE members ADD COLUMN node_id TEXT REFERENCES org_nodes(id) ON DELETE SET NULL;
+
+      -- 一人一岗、一岗一实例（AC-ORG-05：同一 agent 同项目只占一岗位由 members 本身唯一 + 此索引）。
+      CREATE UNIQUE INDEX ux_members_node
+        ON members (node_id)
+        WHERE node_id IS NOT NULL;
+
+      -- #24 迁移步骤：旧「每项目至多一个 manager」部分唯一索引与多层树冲突，删除；
+      -- 阶段 1 兼容语义（legacy role='manager' 唯一）改由 members repository 应用层校验，
+      -- 保证升级路径与 e2e-phase1 行为不变。回填岗位**不自动执行**：
+      -- 升级后的库默认无组织树数据（票面硬约束），由人经 WebUI/API 建立（ORG-08）。
+      DROP INDEX ux_members_project_manager;
     `,
   },
 ];

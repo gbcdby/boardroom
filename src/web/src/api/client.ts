@@ -12,6 +12,8 @@ export interface MemberDto {
   kind: "agent" | "human";
   displayName: string;
   role: "manager" | "normal";
+  /** T2 #49：占据的组织岗位（null = 未落位）。 */
+  nodeId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -34,6 +36,40 @@ export interface GroupDto {
   updatedAt: string;
   /** 归档时间（ISO 字符串）；null = 未归档（T1 #48 / GROUP-04）。 */
   archivedAt: string | null;
+  /**
+   * T2 #49：群组列表端点返回的可写标记。false = 子树只读可见
+   * （可看元数据与历史，不唤醒、不能发消息）；其它端点不返回该字段。
+   */
+  writable?: boolean;
+}
+
+/** T2 #49：组织岗位节点（静态角色写在岗位上；汇报线 = parentId）。 */
+export interface OrgNodeDto {
+  id: string;
+  projectId: string;
+  parentId: string | null;
+  name: string;
+  role: "owner" | "top_manager" | "sub_manager" | "member";
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+  memberId: string | null;
+  memberDisplayName: string | null;
+}
+
+/** 角色配置入口的目录项：F2 静态角色 → 能力点集合。 */
+export interface RoleCatalogEntry {
+  role: "owner" | "top_manager" | "sub_manager" | "member";
+  capabilities: string[];
+  /** owner 是人的内建全局主体，不建岗位节点。 */
+  nodeRole: boolean;
+}
+
+export interface OrgSnapshot {
+  nodes: OrgNodeDto[];
+  rootId: string | null;
+  roles: RoleCatalogEntry[];
+  members: MemberDto[];
 }
 
 /**
@@ -123,6 +159,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 export interface ProjectPurgeCascade {
   groups: number;
   members: number;
+  /** T2 #49：随项目一起清除的组织岗位节点数。 */
+  orgNodes: number;
   messages: number;
   deliveries: number;
   memberStatuses: number;
@@ -260,5 +298,33 @@ export const api = {
   },
   purgeGroup(groupId: string, token?: string): Promise<PurgeOutcome<GroupPurgeConfirmation>> {
     return purgeRequest<GroupPurgeConfirmation>(`/api/groups/${encodeURIComponent(groupId)}`, token);
+  },
+
+  // --- T2 #49：组织树与角色（WebUI 最小可用）--------------------------------
+
+  getOrg(projectId: string): Promise<OrgSnapshot> {
+    return request("GET", `/api/projects/${encodeURIComponent(projectId)}/org`);
+  },
+  createOrgNode(
+    projectId: string,
+    body: { parentId?: string | null; name: string; role: "top_manager" | "sub_manager" | "member"; sortOrder?: number },
+  ): Promise<{ node: OrgNodeDto }> {
+    return request("POST", `/api/projects/${encodeURIComponent(projectId)}/org/nodes`, body);
+  },
+  updateOrgNode(
+    nodeId: string,
+    patch: { name?: string; role?: "top_manager" | "sub_manager" | "member"; parentId?: string | null; sortOrder?: number },
+  ): Promise<{ node: OrgNodeDto }> {
+    return request("PUT", `/api/org/nodes/${encodeURIComponent(nodeId)}`, patch);
+  },
+  deleteOrgNode(nodeId: string): Promise<void> {
+    return request("DELETE", `/api/org/nodes/${encodeURIComponent(nodeId)}`);
+  },
+  /** memberId 为 null = 腾出该岗位当前占据者。 */
+  assignOrgNode(nodeId: string, memberId: string | null): Promise<{ member: MemberDto | null }> {
+    return request("PUT", `/api/org/nodes/${encodeURIComponent(nodeId)}/assignee`, { memberId });
+  },
+  autoPlaceMember(projectId: string, memberId: string): Promise<{ node: OrgNodeDto | null }> {
+    return request("POST", `/api/projects/${encodeURIComponent(projectId)}/org/auto-place`, { memberId });
   },
 };
