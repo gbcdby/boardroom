@@ -1276,7 +1276,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     const confirm = typeof body["confirm"] === "string" ? (body["confirm"] as string) : null;
 
     if (confirm === null) {
-      const cascade = flow.preview();
+      const cascade = await flow.preview();
       const entry = issuePurgeConfirmation(flow.key);
       log.info(`${flow.event}：等待二次确认`, { cascade });
       writeJson(response, 409, {
@@ -1299,7 +1299,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       );
     }
 
-    const cleared = flow.execute();
+    const cleared = await flow.execute();
     log.info(`${flow.event}：已清除`, { cleared });
     // T5 #52：永久删除虽不可撤销，但必须留痕（项目/群组被删后审计行仍按无外键存活）。
     if (flow.audit) {

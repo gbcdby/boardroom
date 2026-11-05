@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { readMigrationState, runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 
@@ -47,7 +47,9 @@ function tables(db: Database.Database): string[] {
 
 test("空库执行生产迁移后建立全部领域表", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       const result = runMigrations(db, migrations);
       assert.equal(result.version, EXPECTED_VERSION);
@@ -59,14 +61,16 @@ test("空库执行生产迁移后建立全部领域表", async () => {
       }
       assert.ok(created.includes("schema_migrations"));
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });
 
 test("重复执行生产迁移是幂等的", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       runMigrations(db, migrations);
       const second = runMigrations(db, migrations);
@@ -74,14 +78,16 @@ test("重复执行生产迁移是幂等的", async () => {
       assert.equal(second.version, EXPECTED_VERSION);
       assert.equal(readMigrationState(db).applied.length, EXPECTED_VERSION);
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });
 
 test("领域表上存在预期的索引与唯一约束", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       runMigrations(db, migrations);
 
@@ -137,14 +143,16 @@ test("领域表上存在预期的索引与唯一约束", async () => {
         /CHECK/i,
       );
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });
 
 test("外键约束开启时拒绝悬空引用", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       runMigrations(db, migrations);
       assert.throws(
@@ -155,14 +163,16 @@ test("外键约束开启时拒绝悬空引用", async () => {
         /FOREIGN KEY/i,
       );
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });
 
 test("阶段 1 已有库（v2）升级到当前版本：补上归档列与组织树结构且旧数据不丢（#48/#49 升级路径）", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       // 1) 先只跑到 v2，模拟用户手上已有的阶段 1 数据库
       runMigrations(
@@ -215,14 +225,16 @@ test("阶段 1 已有库（v2）升级到当前版本：补上归档列与组织
       // 4) 幂等：重复执行不再应用任何迁移
       assert.deepEqual(runMigrations(db, migrations).applied, []);
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });
 
 test("v3 库升级到当前版本（v4 组织树 + v5 成员状态）：旧数据不回填、兼容映射与默认 active 继续可用（#49/#50 升级路径）", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       // 1) 跑到 v3（阶段 2 T1 #48 之后的现有库形态），并留下阶段 1 语义的旧数据。
       runMigrations(
@@ -297,14 +309,16 @@ test("v3 库升级到当前版本（v4 组织树 + v5 成员状态）：旧数�
       // 6) 幂等。
       assert.deepEqual(runMigrations(db, migrations).applied, []);
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });
 
 test("v4 库升级到 v5：成员状态列默认 active、旧数据不丢、状态机写入可用（#50 升级路径）", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       // 1) 跑到 v4（T2 #49 之后的现有库形态），留一名阶段 1 语义的旧成员（无 status 列）。
       runMigrations(
@@ -347,14 +361,16 @@ test("v4 库升级到 v5：成员状态列默认 active、旧数据不丢、状�
       // 4) 幂等。
       assert.deepEqual(runMigrations(db, migrations).applied, []);
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });
 
 test("v5 库升级到 v6：audit_log 为空表、旧数据不丢、审计写入可用（#52 升级路径）", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       // 1) 跑到 v5（T3 #50 之后的现有库形态），留阶段 1 语义的旧成员（无 audit_log）。
       runMigrations(
@@ -402,7 +418,7 @@ test("v5 库升级到 v6：audit_log 为空表、旧数据不丢、审计写入�
       // 6) 幂等。
       assert.deepEqual(runMigrations(db, migrations).applied, []);
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });

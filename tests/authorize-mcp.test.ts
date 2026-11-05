@@ -9,7 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createLogger } from "../src/server/logger.ts";
 import { createMcpCore, type SessionBinding } from "../src/server/mcp/core.ts";
 import { createMcpServer } from "../src/server/mcp/server.ts";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -26,7 +26,7 @@ import type { Actor } from "../src/server/authz/authorize.ts";
 const silentLogger = createLogger({ level: "error", write: () => {} });
 
 interface Ctx {
-  readonly db: Database.Database;
+  readonly db: SqliteDriver;
   readonly repos: RepositorySet;
   readonly projectId: string;
   readonly groupId: string;
@@ -46,22 +46,25 @@ interface ToolPayload {
 
 async function withDb<T>(fn: (ctx: Ctx) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-f2-mcp-"));
-  const { db } = openDatabase(dir);
+  const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
   runMigrations(db, migrations);
-  const repos = createRepositories(db);
-  const project = repos.projects.create({ name: "P" });
-  const group = repos.groups.create({ projectId: project.id, name: "G" });
-  const otherGroup = repos.groups.create({ projectId: project.id, name: "G2" });
+  const repos = createRepositories(driver);
+  const project = (await ((await (repos.projects.create({ name: "P" })))));
+  const group = (await ((await (repos.groups.create({ projectId: project.id, name: "G" })))));
+  const otherGroup = (await ((await (repos.groups.create({ projectId: project.id, name: "G2" })))));
   try {
     return await fn({
-      db,
+      db: driver,
       repos,
       projectId: project.id,
       groupId: group.id,
       otherGroupId: otherGroup.id,
     });
   } finally {
-    if (db.open) db.close();
+    await driver.close();
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -70,7 +73,7 @@ async function withDb<T>(fn: (ctx: Ctx) => Promise<T>): Promise<T> {
 async function spawn(
   ctx: Ctx,
   name: string,
-  actorFor?: (binding: SessionBinding) => Actor,
+  actorFor?: (binding: SessionBinding) => Promise<Actor>,
 ): Promise<Member> {
   const core = createMcpCore({
     logger: silentLogger,
@@ -102,7 +105,7 @@ async function joined(
   ctx: Ctx,
   name: string,
   role?: "manager" | "normal",
-  actorFor?: (binding: SessionBinding) => Actor,
+  actorFor?: (binding: SessionBinding) => Promise<Actor>,
 ): Promise<Member> {
   const member = await spawn(ctx, name, actorFor);
   const join = await member.call("join", {
@@ -184,7 +187,7 @@ test("注入主体（T2 接口）：下级 manager 的非参与者身份被参�
       nodeId: "n2",
       subtreeNodeIds: ["n2", "n3"],
     };
-    const injected = await joined(ctx, "S", undefined, () => outsider);
+    const injected = await joined(ctx, "S", undefined, async () => outsider);
     try {
       const sent = await injected.call("send_message", { text: "我不是参与者" });
       assert.equal(sent.ok, false);

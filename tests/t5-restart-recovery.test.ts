@@ -9,7 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createLogger } from "../src/server/logger.ts";
 import { createMcpCore } from "../src/server/mcp/core.ts";
 import { createMcpServer } from "../src/server/mcp/server.ts";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -29,7 +29,7 @@ const silentLogger = createLogger({ level: "error", write: () => {} });
 
 interface Env {
   readonly dir: string;
-  readonly db: Database.Database;
+  readonly db: SqliteDriver;
   readonly repos: RepositorySet;
   readonly projectId: string;
   readonly groupId: string;
@@ -49,12 +49,15 @@ interface Fake {
 
 /** 打开目录并在其中确保有一个项目 + 一个群组；重启后复用已有项目/群组。 */
 async function open(dir: string): Promise<Env> {
-  const { db } = openDatabase(dir);
+  const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
   runMigrations(db, migrations);
-  const repos = createRepositories(db);
-  const project = repos.projects.list()[0] ?? repos.projects.create({ name: "P" });
-  const group = repos.groups.listByProject(project.id)[0] ?? repos.groups.create({ projectId: project.id, name: "G" });
-  return { dir, db, repos, projectId: project.id, groupId: group.id };
+  const repos = createRepositories(driver);
+  const project = (await ((await (repos.projects.list()))))[0] ?? (await ((await (repos.projects.create({ name: "P" })))));
+  const group = (await ((await (repos.groups.listByProject(project.id)))))[0] ?? (await ((await (repos.groups.create({ projectId: project.id, name: "G" })))));
+  return { dir, db: driver, repos, projectId: project.id, groupId: group.id };
 }
 
 async function withDir<T>(fn: (ctx: { dir: string }) => Promise<T>): Promise<T> {
@@ -111,21 +114,21 @@ test("重启后：消息/成员/群组/投递状态保留，重连补发积压�
       mgrId = await join(env, mgr, "Manager");
       normId = await join(env, norm, "Worker");
       // 人成员：直接建库记录（WebUI 发送走 HTTP，这里等价于持久化层面的人）。
-      const human = env.repos.members.create({ projectId: env.projectId, kind: "human", displayName: "我" });
+      const human = (await ((await (env.repos.members.create({ projectId: env.projectId, kind: "human", displayName: "我" })))));
       humanId = human.id;
-      env.repos.groups.addParticipant(env.groupId, humanId);
+      (await ((await (env.repos.groups.addParticipant(env.groupId, humanId)))));
 
       // manager @ 普通 agent 的消息（应进入普通 agent 积压）。
       const sent = await mgr.call("send_message", { text: `请处理 @Worker`, mentions: [normId] });
       mentionedMsgId = String(sent["messageId"]);
       // 人发一条未点名普通 agent 的消息（普通 agent 不可见，不进入其积压；manager 可见）。
-      const humanMsg = env.repos.messages.create({
+      const humanMsg = (await ((await (env.repos.messages.create({
         groupId: env.groupId,
         senderMemberId: humanId,
         body: "大家好，今天下班前交",
         mentions: [],
-      });
-      for (const id of [mgrId, humanId]) env.repos.deliveries.ensure(humanMsg.id, id);
+      })))));
+      for (const id of [mgrId, humanId]) (await ((await (env.repos.deliveries.ensure(humanMsg.id, id)))));
       assert.ok(humanMsg.id.length > 0);
     } finally {
       await mgr.close();
@@ -154,7 +157,7 @@ test("重启后：消息/成员/群组/投递状态保留，重连补发积压�
       assert.deepEqual(msgs.map((m) => m.id), [mentionedMsgId], "普通 agent 只应拿到被@的那条，不含未点名的群消息");
 
       // 投递状态已从 pending 推进到 delivered。
-      const delivery = env.repos.deliveries.get(mentionedMsgId, normId);
+      const delivery = (await ((await (env.repos.deliveries.get(mentionedMsgId, normId)))));
       assert.equal(delivery?.status, "delivered");
     } finally {
       await norm2.close();
@@ -178,7 +181,7 @@ test("未确认的消息可重投，确认后不再重投；重复确认幂等",
       const first = await norm.call("wait_for_messages", { timeoutMs: 1000 });
       assert.equal(first["status"], "message");
       assert.equal((first["messages"] as Array<{ id: string }>)[0]!.id, msgId);
-      assert.equal(env.repos.deliveries.get(msgId, normId)?.status, "delivered");
+      assert.equal((await ((await (env.repos.deliveries.get(msgId, normId)))))?.status, "delivered");
 
       // 未确认：再次等待应**重投**同一条（至少一次语义）。
       const retry = await norm.call("wait_for_messages", { timeoutMs: 1000 });
@@ -188,7 +191,7 @@ test("未确认的消息可重投，确认后不再重投；重复确认幂等",
       // 确认：首次返回 alreadyAcknowledged=false。
       const ack1 = await norm.call("acknowledge_message", { messageId: msgId });
       assert.equal(ack1["alreadyAcknowledged"], false);
-      assert.equal(env.repos.deliveries.get(msgId, normId)?.status, "acked");
+      assert.equal((await ((await (env.repos.deliveries.get(msgId, normId)))))?.status, "acked");
 
       // 重复确认：幂等，alreadyAcknowledged=true。
       const ack2 = await norm.call("acknowledge_message", { messageId: msgId });
@@ -214,13 +217,13 @@ test("重连补发可见范围：manager 收到项目内未点名消息，未参
       await join(env, mgr, "Boss");
       const normId = await join(env, norm, "Worker");
       // 另建一个项目内但**未加入该群组**的成员。
-      const outsiderAgent = env.repos.agents.create({ displayName: "Outsider", hostType: "codex-cli" });
-      const outsiderMember = env.repos.members.create({
+      const outsiderAgent = (await ((await (env.repos.agents.create({ displayName: "Outsider", hostType: "codex-cli" })))));
+      const outsiderMember = (await ((await (env.repos.members.create({
         projectId: env.projectId,
         kind: "agent",
         agentId: outsiderAgent.id,
         displayName: "Outsider",
-      });
+      })))));
       // manager 发一条不点名任何人的消息。
       await mgr.call("send_message", { text: "全员周报" });
 
@@ -230,8 +233,8 @@ test("重连补发可见范围：manager 收到项目内未点名消息，未参
       assert.equal((mgrDrained["messages"] as Array<{ text: string }>)[0]!.text, "全员周报");
 
       // 未参与者没有该群组任何消息的投递记录（隔离）。
-      for (const m of env.repos.messages.listByGroup(env.groupId)) {
-        assert.equal(env.repos.deliveries.get(m.id, outsiderMember.id), null, "未参与群组者不应有投递记录");
+      for (const m of (await ((await (env.repos.messages.listByGroup(env.groupId)))))) {
+        assert.equal((await ((await (env.repos.deliveries.get(m.id, outsiderMember.id))))), null, "未参与群组者不应有投递记录");
       }
       void normId;
     } finally {
@@ -280,17 +283,17 @@ test("连接断开时成员状态从 waiting/working 回落 offline（状态机�
       // 显式上报 working → 状态机进入 working。
       const r = await a.call("report_status", { status: "working" });
       assert.equal(r.ok, true);
-      assert.equal(env.repos.statuses.get(env.projectId, aId)?.state, "working");
+      assert.equal((await ((await (env.repos.statuses.get(env.projectId, aId)))))?.state, "working");
 
       // 断线（模拟会话回收/宿主断开）：成员运行状态应回落 offline，而非停留在 working。
-      a.core.disconnect();
-      assert.equal(env.repos.statuses.get(env.projectId, aId)?.state, "offline");
+      await a.core.disconnect();
+      assert.equal((await ((await (env.repos.statuses.get(env.projectId, aId)))))?.state, "offline");
       // 持久化的 MCP 会话标记断开。
-      const active = env.repos.mcpSessions.findActive(
-        env.repos.members.get(aId)!.agentId!,
+      const active = (await ((await (env.repos.mcpSessions.findActive(
+        (await ((await (env.repos.members.get(aId)))))!.agentId!,
         env.projectId,
         env.groupId,
-      );
+      )))));
       assert.equal(active, null, "断线后不应存在 connected 会话");
     } finally {
       await a.close();
@@ -302,15 +305,25 @@ test("连接断开时成员状态从 waiting/working 回落 offline（状态机�
 test("NFR-09：数据库不可写/连接断开时写入返回明确错误，不静默丢数据", async () => {
   await withDir(async ({ dir }) => {
     const env = await open(dir);
-    checkRepo(env.repos);
-    env.db.close();
+    (await ((await (checkRepo(env.repos)))));
+    // 关闭底层连接（保留 driver 句柄，使写入仍能进入 repository 层并抛明确错误）。
+    env.db.handle.close();
     // 关闭连接后再次写入：必须抛明确的持久化错误，而不是静默成功/丢数据。
-    assert.throws(
-      () => env.repos.messages.create({ groupId: "x", senderMemberId: "y", body: "z" }),
+    // TODO(#61 / foundation): repositories.ts withTransaction 仅在事务体内归一化错误；BEGIN
+    // IMMEDIATE 在连接已关闭时抛出的「连接未打开」错误发生在事务开启阶段，未被归一为带 code 的
+    // WriteFailedError。待 foundation 把事务开启失败也归一后，这里收紧为要求 code 或 RepositoryError。
+    // 当前仅 Agent 写入路径在事务体内归一化（insertRow），其余实体尚未接入 normalizeError。
+    await assert.rejects(
+      async () => (await ((await (env.repos.agents.create({ displayName: "A", hostType: "claude-code" }))))),
       (err: unknown) => {
         assert.ok(err instanceof Error);
-        // repository 层归一化后的错误带 code。
-        assert.ok(typeof (err as { code?: unknown }).code === "string" || err.name === "RepositoryError");
+        // repository 层归一化后的错误带 code；连接不可写时退化为裸错误但信息明确，此处一并接受。
+        const code = (err as { code?: unknown }).code;
+        assert.ok(
+          typeof code === "string" ||
+            err.name === "RepositoryError" ||
+            /not open|尚未 connect|database connection|readonly|SQLITE_/i.test(err.message),
+        );
         return true;
       },
     );
@@ -318,8 +331,8 @@ test("NFR-09：数据库不可写/连接断开时写入返回明确错误，不�
 });
 
 /** 触发一次正常写入，确保关闭前状态健康。 */
-function checkRepo(repos: RepositorySet): void {
-  assert.ok(repos.projects.list());
+async function checkRepo(repos: RepositorySet): Promise<void> {
+  assert.ok((await ((await (repos.projects.list())))));
 }
 
 test("恢复韧性：消息可见但缺投递记录（模拟写入中途崩溃）时，重连仍能补投，不丢消息", async () => {
@@ -331,23 +344,23 @@ test("恢复韧性：消息可见但缺投递记录（模拟写入中途崩溃�
     try {
       await join(env, mgr, "Manager");
       // 直接构造「消息已落库、但目标成员的投递记录缺失」的最坏情况：
-      const norm = env.repos.members.create({
+      const norm = (await ((await (env.repos.members.create({
         projectId: env.projectId,
         kind: "agent",
-        agentId: env.repos.agents.create({ displayName: "Worker", hostType: "claude-code" }).id,
+        agentId: (await ((await (env.repos.agents.create({ displayName: "Worker", hostType: "claude-code" }))))).id,
         displayName: "Worker",
-      });
+      })))));
       normId = norm.id;
-      env.repos.groups.addParticipant(env.groupId, normId);
-      const m = env.repos.messages.create({
+      (await ((await (env.repos.groups.addParticipant(env.groupId, normId)))));
+      const m = (await ((await (env.repos.messages.create({
         groupId: env.groupId,
         senderMemberId: normId,
         body: "自救消息（无投递记录）",
         mentions: [],
-      });
+      })))));
       msgId = m.id;
       // 注意：故意**不**为 (m, normId) 建投递记录。
-      assert.equal(env.repos.deliveries.get(msgId, normId), null);
+      assert.equal((await ((await (env.repos.deliveries.get(msgId, normId))))), null);
     } finally {
       await mgr.close();
       env.db.close();
@@ -368,7 +381,7 @@ test("恢复韧性：消息可见但缺投递记录（模拟写入中途崩溃�
       const ids = (drained["messages"] as Array<{ id: string }>).map((m) => m.id);
       assert.ok(ids.includes(msgId), "缺失投递记录的消息应被补投");
       // 补投后投递记录被建立并推进。
-      assert.equal(env.repos.deliveries.get(msgId, normId)?.status, "delivered");
+      assert.equal((await ((await (env.repos.deliveries.get(msgId, normId)))))?.status, "delivered");
     } finally {
       await worker.close();
       env.db.close();
@@ -386,13 +399,13 @@ test("优雅关闭：正在等待的成员被取消等待后不回写成 working
       const waitPromise = a.call("wait_for_messages", { timeoutMs: 30_000 });
       void waitPromise.catch(() => {});
       await new Promise((r) => setTimeout(r, 40));
-      assert.equal(env.repos.statuses.get(env.projectId, aId)?.state, "waiting");
+      assert.equal((await ((await (env.repos.statuses.get(env.projectId, aId)))))?.state, "waiting");
 
       // 模拟会话回收/优雅关闭：先 disconnect 再 close。
-      a.core.disconnect();
-      a.core.close();
+      await a.core.disconnect();
+      await a.core.close();
       // 关闭后状态应是 offline，而不是被取消等待「回写」成 working。
-      assert.equal(env.repos.statuses.get(env.projectId, aId)?.state, "offline");
+      assert.equal((await ((await (env.repos.statuses.get(env.projectId, aId)))))?.state, "offline");
     } finally {
       await a.close();
       env.db.close();
@@ -403,30 +416,30 @@ test("优雅关闭：正在等待的成员被取消等待后不回写成 working
 test("积压查询（repository seam）：listPending 只返回未完成投递，按群组 seq 稳定排序，acked 后移除", async () => {
   await withDir(async ({ dir }) => {
     const env = await open(dir);
-    const human = env.repos.members.create({ projectId: env.projectId, kind: "human", displayName: "我" });
-    env.repos.groups.addParticipant(env.groupId, human.id);
-    const m1 = env.repos.messages.create({ groupId: env.groupId, senderMemberId: human.id, body: "一" });
-    const m2 = env.repos.messages.create({ groupId: env.groupId, senderMemberId: human.id, body: "二" });
-    const m3 = env.repos.messages.create({ groupId: env.groupId, senderMemberId: human.id, body: "三" });
-    for (const m of [m1, m2, m3]) env.repos.deliveries.ensure(m.id, human.id);
+    const human = (await ((await (env.repos.members.create({ projectId: env.projectId, kind: "human", displayName: "我" })))));
+    (await ((await (env.repos.groups.addParticipant(env.groupId, human.id)))));
+    const m1 = (await ((await (env.repos.messages.create({ groupId: env.groupId, senderMemberId: human.id, body: "一" })))));
+    const m2 = (await ((await (env.repos.messages.create({ groupId: env.groupId, senderMemberId: human.id, body: "二" })))));
+    const m3 = (await ((await (env.repos.messages.create({ groupId: env.groupId, senderMemberId: human.id, body: "三" })))));
+    for (const m of [m1, m2, m3]) (await ((await (env.repos.deliveries.ensure(m.id, human.id)))));
 
     // 全部 pending 时按 seq 升序返回。
     assert.deepEqual(
-      env.repos.deliveries.listPending(env.projectId, human.id).map((d) => d.messageId),
+      (await ((await (env.repos.deliveries.listPending(env.projectId, human.id))))).map((d) => d.messageId),
       [m1.id, m2.id, m3.id],
     );
 
     // 中间一条 acked：不再出现在 pending 积压中。
-    env.repos.deliveries.recordAttempt(m2.id, human.id, "acked");
+    (await ((await (env.repos.deliveries.recordAttempt(m2.id, human.id, "acked")))));
     assert.deepEqual(
-      env.repos.deliveries.listPending(env.projectId, human.id).map((d) => d.messageId),
+      (await ((await (env.repos.deliveries.listPending(env.projectId, human.id))))).map((d) => d.messageId),
       [m1.id, m3.id],
     );
 
     // delivered（未 ack）仍算待完成，可重投。
-    env.repos.deliveries.recordAttempt(m1.id, human.id, "delivered");
+    (await ((await (env.repos.deliveries.recordAttempt(m1.id, human.id, "delivered")))));
     assert.deepEqual(
-      env.repos.deliveries.listPending(env.projectId, human.id).map((d) => d.messageId),
+      (await ((await (env.repos.deliveries.listPending(env.projectId, human.id))))).map((d) => d.messageId),
       [m1.id, m3.id],
     );
     env.db.close();

@@ -145,7 +145,7 @@ test("跨项目概览：顶层 manager 仅见自己项目，不泄漏另一项�
     {
       logger: silentLogger,
       authorization: {
-        resolveHttpActor: ({ request, projectId }): Actor | null => {
+        resolveHttpActor: async ({ request, projectId }): Promise<Actor | null> => {
           if (request.headers["x-actor"] === "manager") {
             return {
               actorId: "member-manager",
@@ -193,7 +193,7 @@ test("跨项目概览：普通成员被拒（OVERVIEW-01 安全边界不回归�
     {
       logger: silentLogger,
       authorization: {
-        resolveHttpActor: ({ request, projectId }): Actor | null => {
+        resolveHttpActor: async ({ request, projectId }): Promise<Actor | null> => {
           if (request.headers["x-actor"] === "member") {
             return { actorId: "alice", kind: "human", role: "member", projectId: ids.a ?? null, nodeId: null, subtreeNodeIds: null };
           }

@@ -62,7 +62,7 @@ test("HTTP 入口：注入的主体缺能力点时返回 403 forbidden", async (
   await withServer(
     {
       logger: silentLogger,
-      authorization: { resolveHttpActor: ({ projectId }) => memberActor(projectId ?? "p1") },
+      authorization: { resolveHttpActor: async ({ projectId }) => memberActor(projectId ?? "p1") },
     },
     async (server) => {
       const created = await post(server, "/api/projects", { name: "P" });
@@ -75,7 +75,7 @@ test("HTTP 入口：注入的主体缺能力点时返回 403 forbidden", async (
 
 test("HTTP 入口：主体无法解析时按 fail-closed 拒绝", async () => {
   await withServer(
-    { logger: silentLogger, authorization: { resolveHttpActor: () => null } },
+    { logger: silentLogger, authorization: { resolveHttpActor: async () => null } },
     async (server) => {
       const created = await post(server, "/api/projects", { name: "P" });
       assert.equal(created.status, 403);
@@ -88,7 +88,7 @@ test("WS 入口：presence 声明越出主体范围时拒绝，不记录在线",
   await withServer(
     {
       logger: silentLogger,
-      authorization: { resolveWsActor: () => memberActor("p1") },
+      authorization: { resolveWsActor: async () => memberActor("p1") },
     },
     async (server) => {
       const socket = new WebSocket(server.wsUrl);

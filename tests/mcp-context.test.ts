@@ -9,7 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createLogger } from "../src/server/logger.ts";
 import { createMcpCore, type McpSessionContext, type SessionBinding } from "../src/server/mcp/core.ts";
 import { createMcpServer } from "../src/server/mcp/server.ts";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -27,7 +27,7 @@ import type { Actor } from "../src/server/authz/authorize.ts";
 const silentLogger = createLogger({ level: "error", write: () => {} });
 
 interface Ctx {
-  readonly db: Database.Database;
+  readonly db: SqliteDriver;
   readonly repos: RepositorySet;
   readonly projectId: string;
   readonly groupId: string;
@@ -48,21 +48,24 @@ interface Member {
 
 async function withDb<T>(fn: (ctx: Ctx) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-t6-ctx-"));
-  const { db } = openDatabase(dir);
+  const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
   runMigrations(db, migrations);
-  const repos = createRepositories(db);
-  const project = repos.projects.create({ name: "P" });
-  const group = repos.groups.create({ projectId: project.id, name: "G" });
+  const repos = createRepositories(driver);
+  const project = (await ((await (repos.projects.create({ name: "P" })))));
+  const group = (await ((await (repos.groups.create({ projectId: project.id, name: "G" })))));
   try {
-    return await fn({ db, repos, projectId: project.id, groupId: group.id });
+    return await fn({ db: driver, repos, projectId: project.id, groupId: group.id });
   } finally {
-    if (db.open) db.close();
+    await driver.close();
     await rm(dir, { recursive: true, force: true });
   }
 }
 
 /** 一个成员 = 一个 core（可注入 authz.actorFor，模拟 T2 的岗位数据）+ fake client。 */
-async function spawn(ctx: Ctx, name: string, actorFor?: (binding: SessionBinding) => Actor): Promise<Member> {
+async function spawn(ctx: Ctx, name: string, actorFor?: (binding: SessionBinding) => Promise<Actor>): Promise<Member> {
   const core = createMcpCore({
     logger: silentLogger,
     db: ctx.db,
@@ -133,17 +136,17 @@ test("正常参与者入群：上下文含项目/群组/身份/可见参与者�
 test("跨项目隔离：上下文只含所属项目/群组，绝不出现任何跨项目数据（MCPCTX-02 / AC-PROJ-GUARD-01）", async () => {
   await withDb(async (ctx) => {
     // 制造跨项目数据：另一项目 / 另一群组 / 另一项目的成员。
-    const otherProject = ctx.repos.projects.create({ name: "P2" });
-    const otherGroup = ctx.repos.groups.create({ projectId: otherProject.id, name: "G2" });
-    const otherAgent = ctx.repos.agents.create({ displayName: "Other", hostType: "other" });
-    const otherMember = ctx.repos.members.create({
+    const otherProject = (await ((await (ctx.repos.projects.create({ name: "P2" })))));
+    const otherGroup = (await ((await (ctx.repos.groups.create({ projectId: otherProject.id, name: "G2" })))));
+    const otherAgent = (await ((await (ctx.repos.agents.create({ displayName: "Other", hostType: "other" })))));
+    const otherMember = (await ((await (ctx.repos.members.create({
       projectId: otherProject.id,
       kind: "agent",
       agentId: otherAgent.id,
       displayName: "Other",
       role: "normal",
-    });
-    ctx.repos.groups.addParticipant(otherGroup.id, otherMember.id);
+    })))));
+    (await ((await (ctx.repos.groups.addParticipant(otherGroup.id, otherMember.id)))));
 
     const a = await spawn(ctx, "A");
     try {
@@ -181,57 +184,57 @@ test("只读可见（group:view_subtree）的群组：上下文 scope=read_only�
     // 组织树：根（顶层 manager，top_manager）→ n1（sub_manager）→ 两个下属岗位（member）。
     // 每个岗位至多一名成员占据（唯一约束），故入群成员与参与者分别占 n1 / n1a / n1b，
     // 全部落在 n1 的子树内。
-    const root = ctx.repos.org.createNode({
+    const root = (await ((await (ctx.repos.org.createNode({
       projectId: ctx.projectId,
       parentId: null,
       name: "统筹",
       role: "top_manager",
-    });
-    const n1 = ctx.repos.org.createNode({
+    })))));
+    const n1 = (await ((await (ctx.repos.org.createNode({
       projectId: ctx.projectId,
       parentId: root.id,
       name: "A 线",
       role: "sub_manager",
-    });
-    const n1a = ctx.repos.org.createNode({
+    })))));
+    const n1a = (await ((await (ctx.repos.org.createNode({
       projectId: ctx.projectId,
       parentId: n1.id,
       name: "A1 岗",
       role: "member",
-    });
-    const n1b = ctx.repos.org.createNode({
+    })))));
+    const n1b = (await ((await (ctx.repos.org.createNode({
       projectId: ctx.projectId,
       parentId: n1.id,
       name: "A2 岗",
       role: "member",
-    });
-    const subtree = ctx.repos.org.subtreeNodeIds(n1.id);
+    })))));
+    const subtree = (await ((await (ctx.repos.org.subtreeNodeIds(n1.id)))));
 
     // 预先建好「入群成员」的 agent/member 并占岗 n1，使 join 复用（nodeId 落在子树内）。
-    const viewerAgent = ctx.repos.agents.create({ displayName: "Viewer", hostType: "claude-code" });
-    const viewerMember = ctx.repos.members.create({
+    const viewerAgent = (await ((await (ctx.repos.agents.create({ displayName: "Viewer", hostType: "claude-code" })))));
+    const viewerMember = (await ((await (ctx.repos.members.create({
       projectId: ctx.projectId,
       kind: "agent",
       agentId: viewerAgent.id,
       displayName: "Viewer",
       role: "normal",
-    });
-    ctx.repos.org.assignNode(viewerMember.id, n1.id);
+    })))));
+    (await ((await (ctx.repos.org.assignNode(viewerMember.id, n1.id)))));
 
     // 群内另两名参与者，分别占 n1a / n1b（均在子树内）。
     const seats = [n1a.id, n1b.id];
     let seatIdx = 0;
     for (const name of ["M1", "M2"]) {
-      const a = ctx.repos.agents.create({ displayName: name, hostType: "claude-code" });
-      const m = ctx.repos.members.create({
+      const a = (await ((await (ctx.repos.agents.create({ displayName: name, hostType: "claude-code" })))));
+      const m = (await ((await (ctx.repos.members.create({
         projectId: ctx.projectId,
         kind: "agent",
         agentId: a.id,
         displayName: name,
         role: "normal",
-      });
-      ctx.repos.org.assignNode(m.id, seats[seatIdx++]!);
-      ctx.repos.groups.addParticipant(ctx.groupId, m.id);
+      })))));
+      (await ((await (ctx.repos.org.assignNode(m.id, seats[seatIdx++]!)))));
+      (await ((await (ctx.repos.groups.addParticipant(ctx.groupId, m.id)))));
     }
 
     // 注入「非参与者但子树覆盖全部参与者」的 sub_manager 主体（T2 接口）。
@@ -243,7 +246,7 @@ test("只读可见（group:view_subtree）的群组：上下文 scope=read_only�
       nodeId: n1.id,
       subtreeNodeIds: subtree,
     };
-    const member = await spawn(ctx, "Viewer", () => viewerActor);
+    const member = await spawn(ctx, "Viewer", async () => viewerActor);
     try {
       const join = await member.call("join", {
         displayName: "Viewer",

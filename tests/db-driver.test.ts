@@ -17,7 +17,7 @@ import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories } from "../src/server/db/repositories.ts";
 import { createLogger } from "../src/server/logger.ts";
-import { startServer, ServerStartupError } from "../src/server/server.ts";
+import { startServer } from "../src/server/server.ts";
 
 const silentLogger = createLogger({ write: () => {} });
 
@@ -67,9 +67,9 @@ test("SQLite 驱动句柄可直接交给既有 repository 调用点（旧调用�
     await driver.connect();
     try {
       await driver.migrate(migrations);
-      const repos = createRepositories(driver.handle);
-      const project = repos.projects.create({ name: "F1 项目" });
-      assert.equal(repos.projects.get(project.id)?.name, "F1 项目");
+      const repos = createRepositories(driver);
+      const project = (await ((await (repos.projects.create({ name: "F1 项目" })))));
+      assert.equal((await ((await (repos.projects.get(project.id)))))?.name, "F1 项目");
     } finally {
       await driver.close();
     }
@@ -135,7 +135,7 @@ test("PostgreSQL 驱动连接失败：明确错误类型、恢复路径，且不
   await driver.close();
 });
 
-test("服务启动经连接工厂：默认 SQLite 正常，业务仓储未迁移前 postgres 明确拒绝启动", async () => {
+test("服务启动经连接工厂：默认 SQLite 正常，迁移完成", async () => {
   await withTempDir(async (dir) => {
     // 默认（未写 dbDriver）仍走 SQLite，阶段 1 启动路径不回归。
     const server = await startServer({
@@ -152,30 +152,32 @@ test("服务启动经连接工厂：默认 SQLite 正常，业务仓储未迁移
     } finally {
       await server.close();
     }
+  });
+});
 
-    // postgres：业务表尚未迁移（M1 #54），启动应失败并给出切回 sqlite 的回滚指引。
-    // 手动承接 Promise：在实现尚未拒绝时也不泄漏已启动的 server。
-    let started: import("../src/server/server.ts").RunningServer | null = null;
-    let caught: unknown = null;
+// postgres 运行时路径：仅当显式配置 AGENT_STUDIO_PG_TEST_URL 时验证；
+// 未配置（本地/CI 默认 SQLite）则跳过，避免无 PG 时失败。
+const pgTestUrl = process.env["AGENT_STUDIO_PG_TEST_URL"];
+const postgresStartupTest = pgTestUrl ? test : test.skip;
+postgresStartupTest("服务启动经连接工厂：postgres 完成迁移", async () => {
+  const pgUrl = process.env["AGENT_STUDIO_PG_TEST_URL"];
+  if (!pgUrl) return;
+  await withTempDir(async (dir) => {
+    const server = await startServer({
+      config: {
+        port: 0,
+        dataDir: dir,
+        heartbeat: { intervalMs: 10_000, timeoutMs: 30_000 },
+        dbDriver: "postgres",
+        pgConnectionString: pgUrl,
+        configFile: null,
+      },
+      logger: silentLogger,
+    });
     try {
-      started = await startServer({
-        config: {
-          port: 0,
-          dataDir: dir,
-          heartbeat: { intervalMs: 10_000, timeoutMs: 30_000 },
-          dbDriver: "postgres",
-          pgConnectionString: "postgres://user:pass@127.0.0.1:1/appdb",
-          configFile: null,
-        },
-        logger: silentLogger,
-      });
-    } catch (error) {
-      caught = error;
+      assert.equal(server.migrationState.version, migrations.length);
+    } finally {
+      await server.close();
     }
-    if (started !== null) await started.close();
-    assert.ok(caught instanceof ServerStartupError, "postgres 启动应抛 ServerStartupError");
-    assert.match(caught.message, /PostgreSQL/);
-    assert.match(caught.message, /M1/);
-    assert.match(caught.message, /sqlite/);
   });
 });

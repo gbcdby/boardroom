@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -32,31 +32,34 @@ interface Seed {
 
 async function withApi<T>(now: () => Date, fn: (call: (p: string) => Promise<any>, seed: Seed, repos: RepositorySet) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-t4http-"));
-  let db: ReturnType<typeof openDatabase> | null = null;
+  let driver: SqliteDriver | null = null;
   try {
-    db = openDatabase(dir);
-    runMigrations(db.db, migrations);
-    const repos = createRepositories(db.db);
-    const project = repos.projects.create({ name: "P" });
-    const group = repos.groups.create({ projectId: project.id, name: "G" });
-    const agent = repos.agents.create({ displayName: "Alice", hostType: "claude-code" });
-    const member = repos.members.create({
+    driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const handle = driver.handle;
+    runMigrations(handle, migrations);
+    const repos = createRepositories(driver);
+    const project = (await ((await (repos.projects.create({ name: "P" })))));
+    const group = (await ((await (repos.groups.create({ projectId: project.id, name: "G" })))));
+    const agent = (await ((await (repos.agents.create({ displayName: "Alice", hostType: "claude-code" })))));
+    const member = (await ((await (repos.members.create({
       projectId: project.id,
       kind: "agent",
       agentId: agent.id,
       displayName: "Alice",
-    });
-    const session = repos.mcpSessions.connect({
+    })))));
+    const session = (await ((await (repos.mcpSessions.connect({
       agentId: agent.id,
       projectId: project.id,
       groupId: group.id,
       memberId: member.id,
       displayName: "Alice",
       hostType: "claude-code",
-    });
-    repos.statuses.set(project.id, member.id, "waiting");
+    })))));
+    (await ((await (repos.statuses.set(project.id, member.id, "waiting")))));
 
-    const router = createT1ApiRouter({ db: db.db, logger: silentLogger, heartbeat: HEARTBEAT, now });
+    const router = createT1ApiRouter({ db: driver, logger: silentLogger, heartbeat: HEARTBEAT, now });
     const call = async (pathname: string): Promise<any> => {
       // 构造最小 IncomingMessage/ServerResponse 垫片，直接驱动路由（不经过真实 socket）。
       const { Readable } = await import("node:stream");
@@ -85,7 +88,7 @@ async function withApi<T>(now: () => Date, fn: (call: (p: string) => Promise<any
     };
     return await fn(call, { repos, projectId: project.id, memberId: member.id, mcpSessionId: session.id }, repos);
   } finally {
-    db?.db.close();
+    await driver?.close();
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -96,7 +99,7 @@ test("fake timers：心跳 30s 内在线（waiting）；超过 30s → 端点返
 
   await withApi(() => new Date(Date.now()), async (call, seed, repos) => {
     // 心跳时间 = base（connect 时写入的是真实时钟，这里覆盖为 base 以保证与 fake now 对齐）。
-    repos.mcpSessions.heartbeat(seed.mcpSessionId, base.toISOString());
+    (await ((await (repos.mcpSessions.heartbeat(seed.mcpSessionId, base.toISOString())))));
 
     // 20s：仍在线 waiting。
     t.mock.timers.tick(20_000);
@@ -112,7 +115,7 @@ test("fake timers：心跳 30s 内在线（waiting）；超过 30s → 端点返
     assert.equal(view.stale, true, "心跳超时后应标记陈旧");
 
     // 恢复心跳 → 回到在线（在线/等待），陈旧清除。
-    repos.mcpSessions.heartbeat(seed.mcpSessionId, new Date(Date.now()).toISOString());
+    (await ((await (repos.mcpSessions.heartbeat(seed.mcpSessionId, new Date(Date.now()).toISOString())))));
     await t.mock.timers.tick?.(0);
     view = (await call(`/api/projects/${seed.projectId}/members/${seed.memberId}/status`)).body.memberStatus;
     assert.equal(view.heartbeatTimedOut, false);
@@ -123,18 +126,21 @@ test("fake timers：心跳 30s 内在线（waiting）；超过 30s → 端点返
 
 test("人：HTTP 状态端点只给 online/offline，不出现 waiting/working", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-t4human-"));
-  let db: ReturnType<typeof openDatabase> | null = null;
+  let driver: SqliteDriver | null = null;
   try {
-    db = openDatabase(dir);
-    runMigrations(db.db, migrations);
-    const repos = createRepositories(db.db);
-    const project = repos.projects.create({ name: "P" });
-    const human = repos.members.create({ projectId: project.id, kind: "human", displayName: "H" });
+    driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const handle = driver.handle;
+    runMigrations(handle, migrations);
+    const repos = createRepositories(driver);
+    const project = (await ((await (repos.projects.create({ name: "P" })))));
+    const human = (await ((await (repos.members.create({ projectId: project.id, kind: "human", displayName: "H" })))));
     // 即便把持久状态写成 working（异常数据），端点也不得透出 working。
-    repos.statuses.set(project.id, human.id, "working");
+    (await ((await (repos.statuses.set(project.id, human.id, "working")))));
 
     const now = new Date("2026-10-22T00:00:00.000Z");
-    const router = createT1ApiRouter({ db: db.db, logger: silentLogger, heartbeat: HEARTBEAT, now: () => now });
+    const router = createT1ApiRouter({ db: driver, logger: silentLogger, heartbeat: HEARTBEAT, now: () => now });
     // 直接调用推导函数验证（端点同样使用它）。
     const effective = deriveEffectiveStatus({
       projectId: project.id,
@@ -151,7 +157,7 @@ test("人：HTTP 状态端点只给 online/offline，不出现 waiting/working",
     assert.equal(effective.state, "offline");
     void router;
   } finally {
-    db?.db.close();
+    await driver?.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

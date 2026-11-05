@@ -986,7 +986,11 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       // 新消息写入后，跨 core 唤醒该群组等待中的成员：只唤醒「路由 wake 集合 ∩ 限流放行」。
       if (decision.allowed.length > 0) {
         const allowedSet = new Set(decision.allowed);
-        for (const reg of [...activeRegistrations]) reg.resolveGroup(groupId, allowedSet);
+        // #61：resolveGroup 已改为异步（返回 Promise<void>）。此处必须等待唤醒完成，
+        // 否则唤醒作为未 await 的微任务会在 sendMessage 返回、withCtx 关闭驱动后才执行，
+        // 查询会因「尚未 connect」失败（原同步语义是在发送返回前完成唤醒）。
+        const wakeTasks = [...activeRegistrations].map((reg) => reg.resolveGroup(groupId, allowedSet));
+        await Promise.allSettled(wakeTasks);
       }
       return { ok: true, messageId: created.id, createdAt: created.createdAt, duplicate: false };
     },

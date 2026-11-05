@@ -9,7 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createLogger } from "../src/server/logger.ts";
 import { createMcpCore, type McpCore } from "../src/server/mcp/core.ts";
 import { createMcpServer } from "../src/server/mcp/server.ts";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -35,31 +35,34 @@ const silentLogger = createLogger({ level: "error", write: () => {} });
 const KNOWN_HOSTS = ["claude-code", "codex-cli", "dsh", "other"] as const;
 
 interface CoreCtx {
-  readonly db: Database.Database;
+  readonly db: SqliteDriver;
   readonly repos: RepositorySet;
   readonly projectId: string;
   readonly groupId: string;
   /** 以指定 hostType 创建并登记一个 core（用例结束统一 close）。 */
-  readonly spawn: (key: string, name: string, hostType: string) => {
+  readonly spawn: (key: string, name: string, hostType: string) => Promise<{
     core: McpCore;
     sessionId: string;
     memberId: string;
-  };
+  }>;
 }
 
 async function withCoreCtx<T>(fn: (ctx: CoreCtx) => Promise<T> | T): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-t58-"));
-  const { db } = openDatabase(dir);
+  const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
   runMigrations(db, migrations);
-  const repos = createRepositories(db);
-  const project = repos.projects.create({ name: "P" });
-  const group = repos.groups.create({ projectId: project.id, name: "G" });
+  const repos = createRepositories(driver);
+  const project = (await ((await (repos.projects.create({ name: "P" })))));
+  const group = (await ((await (repos.groups.create({ projectId: project.id, name: "G" })))));
   const cores: Array<McpCore> = [];
-  const spawn: CoreCtx["spawn"] = (key, name, hostType) => {
-    const core = createMcpCore({ logger: silentLogger, db, memberKey: key });
+  const spawn: CoreCtx["spawn"] = async (key, name, hostType) => {
+    const core = createMcpCore({ logger: silentLogger, db: driver, memberKey: key });
     cores.push(core);
     const sessionId = "sess";
-    const result = core.join(sessionId, {
+    const result = await core.join(sessionId, {
       displayName: name,
       hostType: hostType as never,
       projectId: project.id,
@@ -68,10 +71,10 @@ async function withCoreCtx<T>(fn: (ctx: CoreCtx) => Promise<T> | T): Promise<T> 
     return { core, sessionId, memberId: result.memberId };
   };
   try {
-    return await fn({ db, repos, projectId: project.id, groupId: group.id, spawn });
+    return await fn({ db: driver, repos, projectId: project.id, groupId: group.id, spawn });
   } finally {
     for (const core of cores) core.close();
-    if (db.open) db.close();
+    await driver.close();
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -112,9 +115,9 @@ async function spawnServerMember(ctx: CoreCtx, name: string) {
 test("默认打断能力从注册表派生：四个宿主均取 adapter.capabilities.interrupt（非硬编码映射）", async () => {
   await withCoreCtx(async (ctx) => {
     for (const hostType of KNOWN_HOSTS) {
-      const m = ctx.spawn(hostType, hostType, hostType);
+      const m = await ctx.spawn(hostType, hostType, hostType);
       // 不申报 hostCapability → 取注册表默认；须等于该 adapter 声明的能力值。
-      const outcome = m.core.attemptInterrupt(m.sessionId);
+      const outcome = (await (m.core.attemptInterrupt(m.sessionId)));
       const expected = getAdapter(hostType as never).capabilities.interrupt;
       assert.equal(
         outcome.result,
@@ -130,8 +133,8 @@ test("默认打断能力从注册表派生：四个宿主均取 adapter.capabili
 
 test("buildInterruptReason（claude-code / unsupported）仍匹配 /不能打断|无法打断/ 且保留 D6 实测说明", async () => {
   await withCoreCtx(async (ctx) => {
-    const m = ctx.spawn("cc", "CC", "claude-code");
-    const outcome = m.core.attemptInterrupt(m.sessionId); // 无申报 → unsupported。
+    const m = await ctx.spawn("cc", "CC", "claude-code");
+    const outcome = (await (m.core.attemptInterrupt(m.sessionId))); // 无申报 → unsupported。
     assert.equal(outcome.result, "unsupported");
     assert.match(outcome.reason, /不能打断|无法打断/);
     // 注册表提供的 D6 实测说明原样出现在依据中。
@@ -147,7 +150,7 @@ test("join 运行期白名单改为注册表驱动：拒绝未注册宿主、接
     for (const hostType of KNOWN_HOSTS) {
       const core = createMcpCore({ logger: silentLogger, db: ctx.db, memberKey: `ok-${hostType}` });
       try {
-        const r = core.join("s", {
+        const r = await core.join("s", {
           displayName: "X",
           hostType: hostType as never,
           projectId: ctx.projectId,
@@ -162,8 +165,8 @@ test("join 运行期白名单改为注册表驱动：拒绝未注册宿主、接
     // 未注册宿主：应被 isRegistered 拒绝，抛出 INVALID_ARGUMENT（含「未知 hostType」）。
     const stranger = createMcpCore({ logger: silentLogger, db: ctx.db, memberKey: "stranger" });
     try {
-      assert.throws(
-        () =>
+      await assert.rejects(
+        async () =>
           stranger.join("s", {
             displayName: "X",
             hostType: "totally-unknown-host" as never,

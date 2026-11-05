@@ -6,7 +6,7 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import { createLogger } from "../src/server/logger.ts";
 import { createMcpCore, type McpCore } from "../src/server/mcp/core.ts";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -40,21 +40,24 @@ interface Ctx {
   readonly projectId: string;
   readonly groupId: string;
   /** 以指定 hostType 入群，写入真实 agents / members / mcp_sessions 行（用例结束统一 close core）。 */
-  readonly join: (key: string, name: string, hostType: string) => { core: McpCore; memberId: string };
+  readonly join: (key: string, name: string, hostType: string) => Promise<{ core: McpCore; memberId: string }>;
 }
 
 async function withCtx<T>(fn: (ctx: Ctx) => Promise<T> | T): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-t59-"));
-  const { db } = openDatabase(dir);
+  const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
   runMigrations(db, migrations);
-  const repos = createRepositories(db);
-  const project = repos.projects.create({ name: "P" });
-  const group = repos.groups.create({ projectId: project.id, name: "G" });
+  const repos = createRepositories(driver);
+  const project = (await ((await (repos.projects.create({ name: "P" })))));
+  const group = (await ((await (repos.groups.create({ projectId: project.id, name: "G" })))));
   const cores: McpCore[] = [];
-  const join: Ctx["join"] = (key, name, hostType) => {
-    const core = createMcpCore({ logger: silentLogger, db, memberKey: key });
+  const join: Ctx["join"] = async (key, name, hostType) => {
+    const core = createMcpCore({ logger: silentLogger, db: driver, memberKey: key });
     cores.push(core);
-    const result = core.join("sess", {
+    const result = await core.join("sess", {
       displayName: name,
       hostType,
       projectId: project.id,
@@ -66,7 +69,7 @@ async function withCtx<T>(fn: (ctx: Ctx) => Promise<T> | T): Promise<T> {
     return await fn({ db, repos, projectId: project.id, groupId: group.id, join });
   } finally {
     for (const c of cores) c.close();
-    if (db.open) db.close();
+    await driver.close();
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -80,9 +83,9 @@ function countSessions(db: Database.Database, hostType: string): number {
 
 test("T3-1：迁移把历史 other→dsh，已 dsh 行不变", async () => {
   await withCtx(async (ctx) => {
-    ctx.join("k1", "OldOther", "other");
-    ctx.join("k2", "AnotherOther", "other");
-    ctx.join("k3", "AlreadyDsh", "dsh");
+    await ctx.join("k1", "OldOther", "other");
+    await ctx.join("k2", "AnotherOther", "other");
+    await ctx.join("k3", "AlreadyDsh", "dsh");
 
     assert.equal(countAgents(ctx.db, "other"), 2);
     assert.equal(countAgents(ctx.db, "dsh"), 1);
@@ -98,7 +101,7 @@ test("T3-1：迁移把历史 other→dsh，已 dsh 行不变", async () => {
     // agents：所有 other 变 dsh，已 dsh 保留。
     assert.equal(countAgents(ctx.db, "other"), 0);
     assert.equal(countAgents(ctx.db, "dsh"), 3);
-    assert.ok(ctx.repos.agents.findByIdentity("AlreadyDsh", "dsh"));
+    assert.ok((await ((await (ctx.repos.agents.findByIdentity("AlreadyDsh", "dsh"))))));
 
     // mcp_sessions：全部 dsh。
     assert.equal(countSessions(ctx.db, "other"), 0);
@@ -108,8 +111,8 @@ test("T3-1：迁移把历史 other→dsh，已 dsh 行不变", async () => {
 
 test("T3-2：幂等 —— 重跑改变 0 行、报告 0", async () => {
   await withCtx(async (ctx) => {
-    ctx.join("k1", "X", "other");
-    ctx.join("k2", "Y", "dsh");
+    await ctx.join("k1", "X", "other");
+    await ctx.join("k2", "Y", "dsh");
 
     const r1 = migrateOtherToDsh(ctx.db);
     assert.equal(r1.changedAgents, 1);
@@ -130,13 +133,13 @@ test("T3-2：幂等 —— 重跑改变 0 行、报告 0", async () => {
 
 test("T3-3：D4 —— 迁移后 'other' 仍可作为新未知宿主合法值", async () => {
   await withCtx(async (ctx) => {
-    ctx.join("k1", "Hist", "other");
+    await ctx.join("k1", "Hist", "other");
     migrateOtherToDsh(ctx.db);
 
     // 迁移后，新未知宿主仍可用 'other' 入群（不禁止 'other'）。
-    const fresh = ctx.repos.agents.create({ displayName: "BrandNewUnknown", hostType: "other" });
+    const fresh = (await ((await (ctx.repos.agents.create({ displayName: "BrandNewUnknown", hostType: "other" })))));
     assert.equal(fresh.hostType, "other");
-    assert.ok(ctx.repos.agents.findByIdentity("BrandNewUnknown", "other"));
+    assert.ok((await ((await (ctx.repos.agents.findByIdentity("BrandNewUnknown", "other"))))));
 
     // 不破坏唯一索引。
     assert.equal(countAgents(ctx.db, "other"), 1);
@@ -146,10 +149,10 @@ test("T3-3：D4 —— 迁移后 'other' 仍可作为新未知宿主合法值", 
 test("T3-4：ux_agents_identity 冲突时中止且不改动任何数据", async () => {
   await withCtx(async (ctx) => {
     // 同一 display_name 同时拥有 other 与 dsh 两行 —— 改写会生成重复唯一键。
-    ctx.join("k1", "Dup", "other");
-    ctx.join("k2", "Dup", "dsh");
+    await ctx.join("k1", "Dup", "other");
+    await ctx.join("k2", "Dup", "dsh");
     // 另有纯 other 行，用于验证"整体未改动"。
-    ctx.join("k3", "Plain", "other");
+    await ctx.join("k3", "Plain", "other");
 
     assert.equal(countAgents(ctx.db, "other"), 2);
     assert.equal(countAgents(ctx.db, "dsh"), 1);
@@ -170,18 +173,18 @@ test("T3-4：ux_agents_identity 冲突时中止且不改动任何数据", async 
     // 数据未改动：仍是 2 个 other、1 个 dsh，且唯一索引仍健全。
     assert.equal(countAgents(ctx.db, "other"), 2);
     assert.equal(countAgents(ctx.db, "dsh"), 1);
-    assert.ok(ctx.repos.agents.findByIdentity("Dup", "other"));
-    assert.ok(ctx.repos.agents.findByIdentity("Dup", "dsh"));
-    assert.ok(ctx.repos.agents.findByIdentity("Plain", "other"));
+    assert.ok((await ((await (ctx.repos.agents.findByIdentity("Dup", "other"))))));
+    assert.ok((await ((await (ctx.repos.agents.findByIdentity("Dup", "dsh"))))));
+    assert.ok((await ((await (ctx.repos.agents.findByIdentity("Plain", "other"))))));
   });
 });
 
 test("T3-5：AC-HOST-05 —— 成员以 hostType='dsh' 入群后持久化 host_type='dsh'", async () => {
   await withCtx(async (ctx) => {
-    const { core, memberId } = ctx.join("k-dsh", "DeepSeek", "dsh");
+    const { core, memberId } = await ctx.join("k-dsh", "DeepSeek", "dsh");
     core.close();
 
-    const agent = ctx.repos.agents.findByIdentity("DeepSeek", "dsh");
+    const agent = (await ((await (ctx.repos.agents.findByIdentity("DeepSeek", "dsh")))));
     assert.ok(agent, "应存在 (DeepSeek, dsh) 全局身份");
     assert.equal(agent.hostType, "dsh");
 
@@ -194,8 +197,8 @@ test("T3-5：AC-HOST-05 —— 成员以 hostType='dsh' 入群后持久化 host_
 
 test("T3-6：dry-run 只报告、不执行", async () => {
   await withCtx(async (ctx) => {
-    ctx.join("k1", "X", "other");
-    ctx.join("k2", "Y", "dsh");
+    await ctx.join("k1", "X", "other");
+    await ctx.join("k2", "Y", "dsh");
 
     const report: MigrationReport = migrateOtherToDsh(ctx.db, { dryRun: true });
     assert.equal(report.dryRun, true);
