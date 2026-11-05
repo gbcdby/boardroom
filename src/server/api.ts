@@ -7,6 +7,7 @@ import { createRepositories, type RepositorySet } from "./db/repositories.ts";
 import type {
   Group,
   Member,
+  MemberLifecycleStatus,
   McpSession,
   Message as DbMessage,
   OrgNode,
@@ -316,6 +317,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         const body = await readObjectBody(request);
         const agentId = optionalStringOrNull(body, "agentId");
         const role = optionalRole(body);
+        const status = optionalLifecycleStatus(body);
         // F2：增成员 = member:manage（ORG-07；下级 manager 的子树限制待 T2 注入节点数据）。
         guard(r, request, "member:manage", { projectId });
         const member = r.members.create({
@@ -324,6 +326,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           displayName: requireString(body, "displayName"),
           ...(agentId === undefined ? {} : { agentId }),
           ...(role === undefined ? {} : { role }),
+          // T3 #50：可显式登记为 pending（待激活）；省略 = active（阶段 1 行为不变）。
+          ...(status === undefined ? {} : { status }),
         });
         log.info("添加项目成员", { projectId, memberId: member.id });
         writeJson(response, 201, { member: memberView(member) });
@@ -362,6 +366,57 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         return true;
       }
       methodNotAllowed(response, ["DELETE"]);
+      return true;
+    }
+
+    // T3（#50）成员生命周期：暂停 / 恢复 / 通用状态转换（LIFE-MEM-01/02、ORG-07）。
+    // 三个动作都经 F2 `member:manage` 守卫（subtree 边界：目标成员的岗位节点作为判定输入），
+    // 且**无需逐次确认**（与 T1 的永久删除二次确认流程区分）；状态机在 members repository。
+    if (
+      segments.length === 6 &&
+      segments[0] === "api" &&
+      segments[1] === "projects" &&
+      segments[3] === "members" &&
+      (segments[5] === "disable" || segments[5] === "enable" || segments[5] === "lifecycle")
+    ) {
+      const projectId = decodeSegment(segments[2]!);
+      const memberId = decodeSegment(segments[4]!);
+      const action = segments[5]!;
+      requireProject(r, projectId);
+      const member = r.members.get(memberId);
+      if (!member || member.projectId !== projectId) {
+        throw new RepositoryError("not_found", `成员 ${memberId} 不属于项目 ${projectId}。`);
+      }
+      const allowed = action === "lifecycle" ? ["PUT"] : ["POST"];
+      if (method !== allowed[0]) {
+        methodNotAllowed(response, allowed);
+        return true;
+      }
+      let status: MemberLifecycleStatus;
+      let hookAction: "member.disable" | "member.enable" | "member.status_change";
+      if (action === "disable") {
+        status = "disabled";
+        hookAction = "member.disable";
+      } else if (action === "enable") {
+        status = "active";
+        hookAction = "member.enable";
+      } else {
+        status = requireLifecycleStatus(await readObjectBody(request));
+        hookAction = "member.status_change";
+      }
+      guard(r, request, "member:manage", { projectId, nodeId: member.nodeId });
+      const from = member.status;
+      const updated = r.members.setStatus(memberId, status);
+      // T5 #52：只留审计钩子，不写 audit_log（成员状态变更不写审计）。
+      orgChangeRecorder.record({
+        projectId,
+        action: hookAction,
+        nodeId: updated.nodeId,
+        memberId,
+        detail: { from, to: updated.status },
+      });
+      log.info("成员生命周期状态变更", { projectId, memberId, from, to: updated.status });
+      writeJson(response, 200, { member: memberView(updated) });
       return true;
     }
 
@@ -1090,6 +1145,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       role: member.role,
       // T2 #49：占岗锚点（null = 未落位；阶段 1 升级库一律为 null）。
       nodeId: member.nodeId,
+      // T3 #50：成员生命周期状态（active / disabled / pending）；老库默认 active。
+      status: member.status,
       createdAt: member.createdAt,
       updatedAt: member.updatedAt,
     };
@@ -1278,6 +1335,21 @@ function optionalRole(body: Record<string, unknown>): "manager" | "normal" | und
     throw new InvalidArgumentError("role 必须是 manager 或 normal。");
   }
   return value;
+}
+
+/** T3 #50：成员生命周期状态（active / disabled / pending）；非法值 → 400 invalid_argument。 */
+function requireLifecycleStatus(body: Record<string, unknown>): MemberLifecycleStatus {
+  const value = body["status"];
+  if (value !== "active" && value !== "disabled" && value !== "pending") {
+    throw new InvalidArgumentError("status 必须是 active / disabled / pending。");
+  }
+  return value;
+}
+
+/** 登记成员时可选的状态；省略 = active（repository 默认），可显式置 pending。 */
+function optionalLifecycleStatus(body: Record<string, unknown>): MemberLifecycleStatus | undefined {
+  if (body["status"] === undefined) return undefined;
+  return requireLifecycleStatus(body);
 }
 
 /** T2 #49：岗位角色是静态枚举，且 owner（人）不建岗位节点。 */
