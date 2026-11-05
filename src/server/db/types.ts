@@ -5,8 +5,15 @@
  * 只描述可持久化字段；运行时对象（WebSocket 连接、宿主进程句柄等）不进入这里。
  */
 
-/** Agent 宿主类型。阶段 1 已知宿主；允许字符串以容纳未来宿主。 */
-export type HostType = "claude-code" | "codex-cli" | (string & {});
+/**
+ * Agent 宿主类型。开放类型：任何已注册宿主适配器的 id + 内建 `"other"`，
+ * 不再写死为联合类型。这样既兼容现有 `claude-code` / `codex-cli` / `other`，
+ * 又为未来宿主（如 `dsh`）留出扩展空间，无需改核心类型（#56 / NFR-HOST-01）。
+ * 当前已知 id 集合见 `src/server/mcp/adapters/index.ts` 的 `KNOWN_HOST_TYPES`。
+ *
+ * DB `host_type` 列仍是自由 TEXT（不在此约束），本类型只是 TS 层的开放别名。
+ */
+export type HostType = string & {};
 
 /** Agent：跨项目的全局身份。 */
 export interface Agent {

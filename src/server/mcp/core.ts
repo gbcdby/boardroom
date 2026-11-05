@@ -56,7 +56,15 @@ export interface Heartbeat {
   readonly timeoutMs: number;
 }
 
-export type HostType = "claude-code" | "codex-cli" | "other";
+/**
+ * `HostType` 改为开放类型（#56 / F1）：任何已注册宿主适配器 id + 内建 `"other"`，
+ * 不再写死联合类型。此处从 `db/types.ts` 统一导入并再导出，保持既有导入方不变；
+ * 当前已知 id 集合见 `src/server/mcp/adapters/index.ts` 的 `KNOWN_HOST_TYPES`。
+ * 注意：本文件的运行期硬编码（join 白名单、DEFAULT_HOST_INTERRUPT_CAPABILITY、
+ * buildInterruptReason 的 hostType 分支）属于 T2（#58），本票只改类型，不改行为。
+ */
+import type { HostType } from "../db/types.ts";
+export type { HostType };
 export type MemberRole = "manager" | "normal";
 export type RunStatus = "waiting" | "working";
 
