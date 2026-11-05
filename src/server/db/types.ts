@@ -58,6 +58,21 @@ export type MemberKind = "agent" | "human";
 export type MemberRole = "manager" | "normal";
 
 /**
+ * 成员生命周期状态（T3 #50 / LIFE-MEM-01/02/03）。
+ *
+ * 与 {@link MemberState}（online/offline/waiting/working 运行状态）、
+ * {@link McpSessionState}（连接/心跳状态）**分开建模**：
+ * 本枚举只表达「成员在不在岗」，不表达在线/离线、也不表达任务状态。
+ * - `active`：正常在岗；
+ * - `disabled`：已暂停/停用；**保留**身份、历史、数据、岗位与群组参与，不物理删除；
+ * - `pending`：待激活（已登记、尚未正式在岗）。
+ *
+ * 状态可经 `members.setStatus` 在合法转换表内迁移、可恢复；断连不改写本列（LIFE-MEM-03）。
+ * 老库升级（迁移 v5）一律默认 `active`，阶段 1 行为不回归。
+ */
+export type MemberLifecycleStatus = "active" | "disabled" | "pending";
+
+/**
  * 岗位角色的静态枚举（T2 #49；spec #45 §3、决策票 #25/#26 定稿口径）。
  * 与 F2 `AUTHZ_ROLES` 同值：角色静态、岗位动态（角色与岗位分离）；
  * 能力集合由 F2 的 `ROLE_CAPABILITIES` 静态矩阵表达，本表不建角色/能力点 DB 表。
@@ -104,6 +119,8 @@ export interface Member {
    * （`role` 的 manager/normal → top_manager/member），保证既有库升级路径行为不变。
    */
   readonly nodeId: string | null;
+  /** 生命周期状态（T3 #50）；老库默认 active。与运行状态/连接状态分开（见 {@link MemberLifecycleStatus}）。 */
+  readonly status: MemberLifecycleStatus;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -115,6 +132,8 @@ export interface NewMember {
   readonly kind: MemberKind;
   readonly displayName: string;
   readonly role?: MemberRole;
+  /** 生命周期状态（T3 #50）；省略 = active。可显式登记为 pending（待激活）。 */
+  readonly status?: MemberLifecycleStatus;
 }
 
 /** Group：项目内聊天空间。 */

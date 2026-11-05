@@ -104,6 +104,7 @@ HTTP（`src/server/api.ts`，守卫一律排在参数与引用校验之后，保
 | `GET /api/projects` | `overview:view` |
 | `GET /api/projects/:id` | `project:view` |
 | `POST /api/projects/:id/members`、`DELETE …/members/:memberId` | `member:manage` |
+| `POST …/members/:memberId/disable`、`POST …/members/:memberId/enable`、`PUT …/members/:memberId/lifecycle`（T3 #50） | `member:manage`（subtree 边界取目标成员的 `node_id`） |
 | `GET /api/projects/:id/members` | `member:view` |
 | `GET …/members/:memberId/status`、`GET …/member-statuses` | `status:view` |
 | `PUT /api/projects/:id/manager` | `org:manage` |

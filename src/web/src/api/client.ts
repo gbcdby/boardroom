@@ -5,6 +5,9 @@
  * 页面据此做基础错误提示。
  */
 
+/** T3（#50）成员生命周期状态（与 member_statuses 的运行状态、mcp_sessions 的连接状态分开）。 */
+export type MemberLifecycleStatus = "active" | "disabled" | "pending";
+
 export interface MemberDto {
   id: string;
   projectId: string;
@@ -14,6 +17,8 @@ export interface MemberDto {
   role: "manager" | "normal";
   /** T2 #49：占据的组织岗位（null = 未落位）。 */
   nodeId: string | null;
+  /** T3 #50：生命周期状态（active / disabled / pending）；老库默认 active，可恢复、不物理删除。 */
+  status: MemberLifecycleStatus;
   createdAt: string;
   updatedAt: string;
 }
@@ -246,6 +251,32 @@ export const api = {
     return request(
       "DELETE",
       `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(memberId)}`,
+    );
+  },
+  /** T3 #50：暂停成员（status → disabled），可恢复、不物理删除。 */
+  disableMember(projectId: string, memberId: string): Promise<{ member: MemberDto }> {
+    return request(
+      "POST",
+      `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(memberId)}/disable`,
+    );
+  },
+  /** T3 #50：恢复成员（status → active，恢复岗位）。 */
+  enableMember(projectId: string, memberId: string): Promise<{ member: MemberDto }> {
+    return request(
+      "POST",
+      `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(memberId)}/enable`,
+    );
+  },
+  /** T3 #50：通用状态转换（非法转换由服务端状态机拒绝）。 */
+  setMemberStatus(
+    projectId: string,
+    memberId: string,
+    status: MemberLifecycleStatus,
+  ): Promise<{ member: MemberDto }> {
+    return request(
+      "PUT",
+      `/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(memberId)}/lifecycle`,
+      { status },
     );
   },
   setManager(projectId: string, memberId: string): Promise<{ project: ProjectDto }> {

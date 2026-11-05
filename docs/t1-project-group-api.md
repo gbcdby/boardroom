@@ -160,7 +160,9 @@ Group   = { id, projectId, name, createdAt, updatedAt, archivedAt: string|null }
 - Agent 通过 MCP 入群与在线（T2 #15）；群聊与消息（T3）；状态看板（T4）。
 - 组织树、下级 manager 的子树范围、完整角色配置：由 T2（#49）在其后交付
   （`/api/projects/:id/org`、`/api/org/nodes/:id` 等端点；本文端点契约不含它们）。
-  成员状态机（T3 #50）；审计写入（T5 #52）。
+  成员状态机（T3 #50，已交付，见 `docs/t3-member-lifecycle.md`；其 `disable/enable/lifecycle`
+  端点与成员视图的 `status` 字段不在本文契约内）；审计写入（T5 #52）。
+  T3 复核并沿用了本文的归档/恢复/永久删除二次确认与级联范围，未改动删除流程。
 - 本票（#48）已交付：多项目隔离、归档/恢复、永久删除二次确认与级联清除、一项目多群组与参与者约束。
 - 群组参与者的**事后增删端点**未提供（票面只要求创建时从项目成员中选、同成员可参与多群组）；
   `groups.addParticipant` / `removeParticipant` 已在 repository 层可用，补端点时按 GROUP-02 复用即可。

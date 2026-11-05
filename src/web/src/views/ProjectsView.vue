@@ -12,14 +12,16 @@ import {
 } from "../api/client.ts";
 
 /**
- * T1（#14）项目工作台 + T1（#48）项目/群组生命周期：
+ * T1（#14）项目工作台 + T1（#48）项目/群组生命周期 + T3（#50）成员生命周期：
  * 创建项目、管理成员、指定顶层 manager、创建群组选参与者，以及
- * **归档 / 恢复 / 永久删除（人二次确认）**。
+ * **归档 / 恢复 / 永久删除（人二次确认）** 与 **成员暂停 / 恢复**。
  *
  * 生命周期规则（与 `src/server/api.ts` 一致）：
  * - 归档是可恢复的非活跃态：默认列表隐藏（勾选「显示已归档」可见），归档对象拒绝新写入。
  * - 永久删除要两刀：第一刀只取级联清单与一次性确认凭据，第二刀带同一凭据才真正清除。
  *   项目清除其群组/群聊/成员与状态；群组只清群聊与参与者关系，成员保留。
+ * - 成员生命周期（active/disabled/pending）与在线/运行状态分开：暂停保留历史、数据与岗位、
+ *   可随时恢复，不物理删除；断连不删除成员、不改写该状态（#50）。
  *
  * 阶段 1 只验收单个项目；页面允许切换项目。真实 agent 成员由 T2（MCP 入群）产生。
  */
@@ -174,6 +176,33 @@ async function removeMember(member: MemberDto): Promise<void> {
   );
   if (result === null && error.value === null) return;
   newGroupSelection.value = newGroupSelection.value.filter((id) => id !== member.id);
+  await loadActiveProject();
+}
+
+/** T3 #50：生命周期状态中文标签（与在线/离线、等待/工作等运行状态分开）。 */
+function lifecycleLabel(member: MemberDto): string {
+  switch (member.status) {
+    case "active":
+      return "在岗";
+    case "disabled":
+      return "已暂停";
+    case "pending":
+      return "待激活";
+  }
+}
+
+/** T3 #50：暂停 / 恢复成员（无需逐次确认；可恢复、不物理删除）。 */
+async function toggleMemberStatus(member: MemberDto): Promise<void> {
+  const projectId = activeProjectId.value;
+  if (projectId === null) return;
+  const toActive = member.status !== "active";
+  const result = await run(
+    () => (toActive ? api.enableMember(projectId, member.id) : api.disableMember(projectId, member.id)),
+    toActive
+      ? `成员「${member.displayName}」已恢复在岗（岗位恢复）。`
+      : `成员「${member.displayName}」已暂停（可恢复，历史与数据保留）。`,
+  );
+  if (!result) return;
   await loadActiveProject();
 }
 
@@ -460,6 +489,10 @@ onMounted(() => void loadProjects());
       <!-- 成员 -->
       <div class="panel">
         <h3>成员</h3>
+        <p class="muted small">
+          成员生命周期与在线状态分开建模：暂停（已暂停）保留历史、数据与岗位，可随时恢复；
+          断连不删除成员，也不改写这里的生命周期状态。
+        </p>
         <form class="row" @submit.prevent="addMember">
           <input v-model="newMemberName" placeholder="成员显示名（人）" data-testid="new-member-name" />
           <button type="submit" :disabled="busy" data-testid="add-member">添加成员</button>
@@ -472,6 +505,10 @@ onMounted(() => void loadProjects());
               {{ member.displayName }}
               <span class="badge">{{ member.kind === "human" ? "人" : "agent" }}</span>
               <span v-if="member.role === 'manager'" class="badge manager">manager</span>
+              <!-- T3 #50：生命周期状态（active/disabled/pending），与右侧在线/运行状态分开。 -->
+              <span class="badge lifecycle" :class="`lifecycle-${member.status}`" data-testid="member-lifecycle-status">
+                {{ lifecycleLabel(member) }}
+              </span>
               <span v-if="member.kind === 'agent'" class="badge state" data-testid="member-state">
                 {{ connectionLabel(member.id) }} / {{ stateLabel(member.id) }}
               </span>
@@ -483,6 +520,14 @@ onMounted(() => void loadProjects());
                 @click="assignManager(member)"
               >
                 设为 manager
+              </button>
+              <button
+                type="button"
+                :disabled="busy"
+                data-testid="toggle-member-status"
+                @click="toggleMemberStatus(member)"
+              >
+                {{ member.status === "active" ? "暂停成员" : "恢复成员" }}
               </button>
               <button type="button" :disabled="busy" class="danger" @click="removeMember(member)">
                 移除
@@ -738,6 +783,16 @@ button.danger {
 .badge.state {
   background: rgba(127, 127, 127, 0.12);
   color: var(--muted);
+}
+
+/* T3 #50：生命周期状态徽章（暂停红、待激活黄、在岗沿用中性色）。 */
+.badge.lifecycle-disabled {
+  background: rgba(220, 38, 38, 0.16);
+  color: var(--bad);
+}
+
+.badge.lifecycle-pending {
+  background: rgba(234, 179, 8, 0.18);
 }
 
 .dot {
