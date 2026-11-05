@@ -9,6 +9,10 @@ import {
   WriteFailedError,
 } from "./errors.ts";
 import { newId } from "./ids.ts";
+import {
+  createAuditRepository,
+  type AuditRepository,
+} from "../audit.ts";
 import type {
   Agent,
   DeliveryStatus,
@@ -135,6 +139,13 @@ export interface MembersRepository {
    */
   setStatus(id: string, status: MemberLifecycleStatus): Member;
   delete(id: string): void;
+  /**
+   * T5（#52）撤销补偿：按 `before` 全量快照**直接复原**成员行（upsert）。
+   * 专供撤销入口在单事务内调用：故意绕过 `setStatus` 的单向转换表与
+   * `requireNoOtherManager` 约束，因为补偿恢复的是「已确认存在的历史状态」，
+   * 不是一次新的前向业务变更。FK/唯一约束仍由数据库把关。
+   */
+  restoreRow(member: Member): void;
 }
 
 /**
@@ -178,6 +189,12 @@ export interface OrgRepository {
   autoPlaceMember(projectId: string, memberId: string): OrgNode | null;
   /** 某成员当前占据的岗位（未落位返回 null）。 */
   nodeOfMember(memberId: string): OrgNode | null;
+  /**
+   * T5（#52）撤销补偿：按 `before` 全量快照直接复原岗位行（upsert）。
+   * 绕过前向的防环/根唯一校验——补偿恢复的是已存在的历史状态，
+   * 余下约束（父指针外键、单根唯一索引）仍由数据库把关。
+   */
+  restoreRow(node: OrgNode): void;
 }
 
 export interface GroupsRepository {
@@ -200,6 +217,11 @@ export interface GroupsRepository {
   participants(groupId: string): string[];
   addParticipant(groupId: string, memberId: string): void;
   removeParticipant(groupId: string, memberId: string): void;
+  /**
+   * T5（#52）撤销补偿：直接补回一条参与者关系（INSERT OR IGNORE），
+   * 故意不跑 `requireGroupActive`——撤销复原的是删除前的历史参与事实。
+   */
+  restoreParticipant(groupId: string, memberId: string): void;
   delete(id: string): void;
 }
 
@@ -273,6 +295,8 @@ export interface RepositorySet {
   readonly deliveries: DeliveriesRepository;
   readonly statuses: StatusesRepository;
   readonly mcpSessions: McpSessionsRepository;
+  /** T5（#52）：最小审计单表仓储（append-only + 撤销两列回写）。 */
+  readonly audit: AuditRepository;
   /** 在单个写事务内运行 fn；失败回滚并抛出归一化后的错误。 */
   transaction<T>(fn: () => T): T;
 }
@@ -310,6 +334,7 @@ export function createRepositories(db: Database.Database): RepositorySet {
     deliveries: createDeliveries(db),
     statuses: createStatuses(db),
     mcpSessions: createMcpSessions(db),
+    audit: createAuditRepository(db),
     transaction: (fn) => runInTransaction(db, fn),
   };
 }
@@ -849,6 +874,21 @@ function createMembers(db: Database.Database): MembersRepository {
       const result = db.prepare("DELETE FROM members WHERE id = ?").run(id);
       if (result.changes === 0) throw new NotFoundError(`Member ${id} 不存在。`);
     },
+    // T5 #52：按 before 快照直接复原成员行（撤销补偿，upsert）。
+    restoreRow(member) {
+      db.prepare(
+        `INSERT INTO members
+           (id, project_id, agent_id, kind, display_name, role, node_id, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           project_id = excluded.project_id, agent_id = excluded.agent_id, kind = excluded.kind,
+           display_name = excluded.display_name, role = excluded.role, node_id = excluded.node_id,
+           status = excluded.status, created_at = excluded.created_at, updated_at = excluded.updated_at`,
+      ).run(
+        member.id, member.projectId, member.agentId, member.kind, member.displayName,
+        member.role, member.nodeId, member.status, member.createdAt, member.updatedAt,
+      );
+    },
   };
   return repo;
 }
@@ -990,6 +1030,13 @@ function createGroups(db: Database.Database): GroupsRepository {
     },
     removeParticipant(groupId, memberId) {
       db.prepare("DELETE FROM group_participants WHERE group_id = ? AND member_id = ?").run(groupId, memberId);
+    },
+    // T5 #52：撤销补偿：直接补回一条参与者关系（INSERT OR IGNORE），
+    // 故意不跑 requireGroupActive——撤销复原的是删除前的历史参与事实。
+    restoreParticipant(groupId, memberId) {
+      db.prepare(
+        "INSERT OR IGNORE INTO group_participants (group_id, member_id, joined_at) VALUES (?, ?, ?)",
+      ).run(groupId, memberId, nowIso());
     },
     delete(id) {
       const result = db.prepare("DELETE FROM groups WHERE id = ?").run(id);
@@ -1710,6 +1757,21 @@ function createOrg(db: Database.Database): OrgRepository {
       const row = memberById.get(memberId) as MemberRow | undefined;
       if (!row || row.node_id === null) return null;
       return get(row.node_id);
+    },
+    // T5 #52：按 before 快照直接复原岗位行（撤销补偿，upsert）。
+    restoreRow(node) {
+      db.prepare(
+        `INSERT INTO org_nodes
+           (id, project_id, parent_id, name, role, sort_order, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           project_id = excluded.project_id, parent_id = excluded.parent_id, name = excluded.name,
+           role = excluded.role, sort_order = excluded.sort_order,
+           created_at = excluded.created_at, updated_at = excluded.updated_at`,
+      ).run(
+        node.id, node.projectId, node.parentId, node.name, node.role,
+        node.sortOrder, node.createdAt, node.updatedAt,
+      );
     },
   };
   return repo;
