@@ -23,6 +23,7 @@ import {
   ROLE_REACH,
 } from "../authz/authorize.ts";
 import { actorForSession } from "../authz/actors.ts";
+import { getAdapter, isRegistered } from "./adapters/index.ts";
 import {
   createAntiLoop,
   DEFAULT_ANTI_LOOP_CONFIG,
@@ -60,8 +61,12 @@ export interface Heartbeat {
  * `HostType` 改为开放类型（#56 / F1）：任何已注册宿主适配器 id + 内建 `"other"`，
  * 不再写死联合类型。此处从 `db/types.ts` 统一导入并再导出，保持既有导入方不变；
  * 当前已知 id 集合见 `src/server/mcp/adapters/index.ts` 的 `KNOWN_HOST_TYPES`。
- * 注意：本文件的运行期硬编码（join 白名单、DEFAULT_HOST_INTERRUPT_CAPABILITY、
- * buildInterruptReason 的 hostType 分支）属于 T2（#58），本票只改类型，不改行为。
+ *
+ * T2（#58）：core 的运行期硬编码已收敛到宿主适配层注册表（`src/server/mcp/adapters/index.ts`），
+ * 单一事实来源：`join` 白名单用 `isRegistered` 校验、`DEFAULT_HOST_INTERRUPT_CAPABILITY`
+ * 硬编码映射已删除（默认打断能力改从 `getAdapter(hostType).capabilities.interrupt` 读取）、
+ * `buildInterruptReason` 的 hostType 分支改用 `interruptReasonNote`（注册表字段）。
+ * core 不再有任何按 hostType 硬编码的分支/列表。
  */
 import type { HostType } from "../db/types.ts";
 export type { HostType };
@@ -239,13 +244,6 @@ export type InterruptResult = "accepted" | "rejected" | "unsupported";
 
 /** 调用方（宿主适配层/测试）显式申报的宿主打断能力；缺省视为 unsupported。 */
 export type HostInterruptCapability = InterruptResult;
-
-/** 已知宿主的默认打断能力：Claude Code 实测 unsupported；Codex 配额阻塞，按 unsupported 处理（未验证）。 */
-export const DEFAULT_HOST_INTERRUPT_CAPABILITY: Readonly<Record<HostType, InterruptResult>> = {
-  "claude-code": "unsupported",
-  "codex-cli": "unsupported",
-  other: "unsupported",
-};
 
 export interface InterruptParams {
   /** 显式申报宿主能力（测试/适配层用）；缺省按 hostType 的默认能力。 */
@@ -751,8 +749,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       if (params.projectId.trim() === "" || params.groupId.trim() === "") {
         throw invalidArgument("projectId 与 groupId 必填");
       }
-      if (!["claude-code", "codex-cli", "other"].includes(params.hostType)) {
-        throw invalidArgument("hostType 必须是 claude-code / codex-cli / other");
+      if (!isRegistered(params.hostType)) {
+        throw invalidArgument("未知 hostType：请先注册宿主适配器（claude-code / codex-cli / dsh / other）");
       }
       const role: MemberRole = params.role ?? "normal";
 
@@ -1044,9 +1042,10 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       const currentState = repos.statuses.get(binding.projectId, binding.memberId)?.state ?? "online";
       const target: "running" | "idle" = currentState === "working" ? "running" : "idle";
 
-      // 宿主能力：显式申报优先；缺省按 hostType 的默认（Claude Code 实测 unsupported）。
+      // 宿主能力：显式申报优先；缺省按 hostType 在注册表中的声明能力（单一事实来源）。
+      // getAdapter 对任意 hostType 都返回合法适配器（未知回退到 UNKNOWN_ADAPTER，interrupt=unsupported）。
       const result: InterruptResult =
-        params?.hostCapability ?? DEFAULT_HOST_INTERRUPT_CAPABILITY[binding.hostType] ?? "unsupported";
+        params?.hostCapability ?? getAdapter(binding.hostType).capabilities.interrupt ?? "unsupported";
 
       // 打断永远不把已进入处理的轮次伪装成 waiting；恒为 working（与「wait 返回 → working」一致）。
       // 若成员已不在可打断的忙碌轮次（idle），仅记录一次尝试，不改运行状态。
@@ -1290,12 +1289,9 @@ function cursorToSeq(cursor: string | undefined): number | undefined {
 
 /** 打断尝试的人类可读依据（随结果返回，便于写入接入文档/追溯）。 */
 function buildInterruptReason(result: InterruptResult, hostType: HostType, target: "running" | "idle"): string {
-  const hostNote =
-    hostType === "claude-code"
-      ? "Claude Code 实测不能打断在途工具调用（D6/#10），安全点投递是唯一可靠语义"
-      : hostType === "codex-cli"
-        ? "Codex CLI 等待/打断行为因配额阻塞未实测（D6/#10），按 unsupported 处理"
-        : "宿主能力未知";
+  // 宿主实测说明取自注册表（单一事实来源）；未声明时回退到「宿主能力未知」。
+  // 现存宿主的 interruptReasonNote 已包含与旧 hostType 分支逐字相同的解释文本（兼容既有测试）。
+  const hostNote = getAdapter(hostType).interruptReasonNote ?? "宿主能力未知";
   if (target === "idle") return `成员当前不处于可打断的忙碌轮次（idle）；${hostNote}`;
   switch (result) {
     case "accepted":
