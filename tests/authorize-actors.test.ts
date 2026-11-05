@@ -16,6 +16,8 @@ function member(overrides: Partial<Member> & Pick<Member, "id" | "kind" | "role"
     projectId: "p1",
     agentId: null,
     displayName: "M",
+    // T2 #49：members.node_id 占岗锚点；阶段 1 兼容映射用例均为未落位成员。
+    nodeId: null,
     createdAt: "",
     updatedAt: "",
     ...overrides,

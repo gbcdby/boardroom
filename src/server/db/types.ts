@@ -57,6 +57,40 @@ export type MemberKind = "agent" | "human";
 /** 阶段 1 的项目级角色（D2）。 */
 export type MemberRole = "manager" | "normal";
 
+/**
+ * 岗位角色的静态枚举（T2 #49；spec #45 §3、决策票 #25/#26 定稿口径）。
+ * 与 F2 `AUTHZ_ROLES` 同值：角色静态、岗位动态（角色与岗位分离）；
+ * 能力集合由 F2 的 `ROLE_CAPABILITIES` 静态矩阵表达，本表不建角色/能力点 DB 表。
+ * `owner` 是人的内建角色，**不建岗位节点**（人是全局主体，决策票 #26）。
+ */
+export type OrgNodeRole = "owner" | "top_manager" | "sub_manager" | "member";
+
+/**
+ * OrgNode：组织树的岗位节点（T2 #49 / 决策票 #24）。
+ * 汇报线 = `parent_id`（上级即父节点）；子树边界用递归 CTE 现算。
+ * 每项目根层最多一个节点，该位置即「顶层 manager 岗位」；空岗 = 无成员占据。
+ */
+export interface OrgNode {
+  readonly id: string;
+  readonly projectId: string;
+  /** 上级岗位；null = 根（顶层 manager 岗位）。 */
+  readonly parentId: string | null;
+  readonly name: string;
+  readonly role: OrgNodeRole;
+  /** 同级展示顺序（#33 WebUI）。 */
+  readonly sortOrder: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface NewOrgNode {
+  readonly projectId: string;
+  readonly parentId?: string | null;
+  readonly name: string;
+  readonly role: OrgNodeRole;
+  readonly sortOrder?: number;
+}
+
 /** Member：agent 或人在某项目中的成员关系与岗位。 */
 export interface Member {
   readonly id: string;
@@ -65,6 +99,11 @@ export interface Member {
   readonly kind: MemberKind;
   readonly displayName: string;
   readonly role: MemberRole;
+  /**
+   * 占据的组织岗位（T2 #49）。null = 未落位；未落位成员的守卫主体走阶段 1 兼容映射
+   * （`role` 的 manager/normal → top_manager/member），保证既有库升级路径行为不变。
+   */
+  readonly nodeId: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }

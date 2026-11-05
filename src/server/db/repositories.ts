@@ -25,7 +25,10 @@ import type {
   NewGroup,
   NewMember,
   NewMessage,
+  NewOrgNode,
   NewProject,
+  OrgNode,
+  OrgNodeRole,
   Project,
 } from "./types.ts";
 
@@ -77,6 +80,8 @@ export interface AgentsRepository {
 export interface PurgeCounts {
   readonly groups: number;
   readonly members: number;
+  /** T2 #49：项目组织岗位节点（随项目一起清除，成员先删避免悬空占岗外键）。 */
+  readonly orgNodes: number;
   readonly messages: number;
   readonly deliveries: number;
   readonly memberStatuses: number;
@@ -121,6 +126,49 @@ export interface MembersRepository {
   getManager(projectId: string): Member | null;
   update(id: string, patch: Partial<Pick<Member, "displayName" | "role">>): Member;
   delete(id: string): void;
+}
+
+/**
+ * 组织树 repository（T2 #49 / 决策票 #24）。
+ *
+ * 唯一写入边界，规则与 #45 §6.2 对应：
+ * - 根岗位（`parent_id IS NULL`）每项目最多一个，位置即「顶层 manager 岗位」（ORG-01）；
+ * - 角色是静态枚举，写在**岗位**上（角色与岗位分离）；`owner` 不建岗（人是全局主体）；
+ * - 汇报线调整应用层防环（#24：目标父不能是自身或自身子孙，无深度上限）；
+ * - 删除岗位时**子树提升到父**，占据成员腾出岗位但成员保留（`ON DELETE SET NULL`）；
+ * - 一人一岗、一岗一实例（`ux_members_node`，AC-ORG-05）。
+ */
+export interface OrgRepository {
+  createNode(input: NewOrgNode): OrgNode;
+  getNode(id: string): OrgNode | null;
+  /** 项目全部岗位（层级展示顺序：父 → 子，同级按 sort_order）。 */
+  listNodes(projectId: string): OrgNode[];
+  getRootNode(projectId: string): OrgNode | null;
+  /**
+   * 某节点的子树节点 id 集合（**含自身**）。
+   * SQLite/PG 通用的 `WITH RECURSIVE` CTE 现算（#24：本地量小不建闭包表）；
+   * 节点不存在时返回空数组。
+   */
+  subtreeNodeIds(nodeId: string): string[];
+  /** 改岗位：改名 / 改角色 / 调整汇报线 / 排序。防环与根规则在这里统一把关。 */
+  updateNode(id: string, patch: Partial<Pick<OrgNode, "name" | "role" | "parentId" | "sortOrder">>): OrgNode;
+  /** 删除岗位：直接子节点提升到本节点的父；占据成员回到未落位。 */
+  deleteNode(id: string): void;
+  /**
+   * 成员占据/腾出岗位（`nodeId = null` 为腾出）。ORG-02/08：manager 分配、人可调整。
+   * 同步阶段 1 兼容投影：占据顶层岗 → legacy `role='manager'`（旧 manager 降 normal）；
+   * 让出顶层岗 → 归还 normal。保证升级路径与 T1 API（`PUT /manager`、projectView）一致。
+   */
+  assignNode(memberId: string, nodeId: string | null): Member;
+  /**
+   * manager 自动分配新成员岗位（ORG-02）：项目**已有组织树**时，在根下建一个
+   * `member` 岗（名称取成员展示名）并让该成员占据；项目尚无组织树时返回 null
+   * ——不自动造树，保证阶段 1 兼容路径与既有行为不变（人可另行独立创建，ORG-08）。
+   * 成员已落位时幂等返回其现有岗位。
+   */
+  autoPlaceMember(projectId: string, memberId: string): OrgNode | null;
+  /** 某成员当前占据的岗位（未落位返回 null）。 */
+  nodeOfMember(memberId: string): OrgNode | null;
 }
 
 export interface GroupsRepository {
@@ -209,6 +257,8 @@ export interface RepositorySet {
   readonly agents: AgentsRepository;
   readonly projects: ProjectsRepository;
   readonly members: MembersRepository;
+  /** T2 #49：组织树唯一写入边界（递归 CTE 子树、占岗、自动落位）。 */
+  readonly org: OrgRepository;
   readonly groups: GroupsRepository;
   readonly messages: MessagesRepository;
   readonly deliveries: DeliveriesRepository;
@@ -228,6 +278,7 @@ export function createRepositories(db: Database.Database): RepositorySet {
     agents: createAgents(db),
     projects: createProjects(db),
     members: createMembers(db),
+    org: createOrg(db),
     groups: createGroups(db),
     messages: createMessages(db),
     deliveries: createDeliveries(db),
@@ -344,6 +395,7 @@ function projectPurgeCounts(db: Database.Database, projectId: string): PurgeCoun
   return {
     groups: count("SELECT COUNT(*) AS c FROM groups WHERE project_id = ?"),
     members: count("SELECT COUNT(*) AS c FROM members WHERE project_id = ?"),
+    orgNodes: count("SELECT COUNT(*) AS c FROM org_nodes WHERE project_id = ?"),
     messages: count(
       "SELECT COUNT(*) AS c FROM messages m WHERE m.group_id IN (SELECT id FROM groups WHERE project_id = ?)",
     ),
@@ -590,6 +642,8 @@ function createProjects(db: Database.Database): ProjectsRepository {
         db.prepare("DELETE FROM mcp_sessions WHERE project_id = ?").run(id);
         db.prepare("DELETE FROM member_statuses WHERE project_id = ?").run(id);
         db.prepare("DELETE FROM members WHERE project_id = ?").run(id);
+        // T2 #49：members 先删（node_id 外键指向 org_nodes），再清组织岗位，避免悬空引用。
+        db.prepare("DELETE FROM org_nodes WHERE project_id = ?").run(id);
         const removed = db.prepare("DELETE FROM projects WHERE id = ?").run(id);
         if (removed.changes === 0) throw new NotFoundError(`Project ${id} 不存在。`);
       });
@@ -613,6 +667,7 @@ interface MemberRow {
   kind: string;
   display_name: string;
   role: string;
+  node_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -625,6 +680,7 @@ function toMember(row: MemberRow): Member {
     kind: row.kind as Member["kind"],
     displayName: row.display_name,
     role: row.role as MemberRole,
+    nodeId: row.node_id ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -633,6 +689,25 @@ function toMember(row: MemberRow): Member {
 function createMembers(db: Database.Database): MembersRepository {
   const projectExists = db.prepare("SELECT 1 FROM projects WHERE id = ?");
   const agentExists = db.prepare("SELECT 1 FROM agents WHERE id = ?");
+  /**
+   * 阶段 1 兼容投影的唯一性（D2「每项目最多一个顶层 manager」）。
+   * 原 `ux_members_project_manager` 部分唯一索引已按决策票 #24 移除（与多层树冲突），
+   * 不变量下沉到这条查询——legacy `role='manager'` 只作为阶段 1 兼容与
+   * `PUT /api/projects/:id/manager`、`projectView.manager` 的投影存在；
+   * 真实顶层岗位由组织树根节点（`org_nodes`，`role='top_manager'`）表达。
+   */
+  const otherManager = db.prepare(
+    "SELECT id FROM members WHERE project_id = ? AND role = 'manager' AND id <> ? LIMIT 1",
+  );
+
+  function requireNoOtherManager(projectId: string, selfId: string): void {
+    const clash = otherManager.get(projectId, selfId) as { id: string } | undefined;
+    if (clash) {
+      throw new ConflictError(
+        `项目 ${projectId} 已有顶层 manager（成员 ${clash.id}）；阶段 1 语义下每项目最多一个，请先更换。`,
+      );
+    }
+  }
 
   const repo: MembersRepository = {
     create(input) {
@@ -661,14 +736,15 @@ function createMembers(db: Database.Database): MembersRepository {
       }
       const at = nowIso();
       const id = newId();
-      runInTransaction(db, () =>
+      runInTransaction(db, () => {
+        if (role === "manager") requireNoOtherManager(input.projectId, id);
         db
           .prepare(
             `INSERT INTO members (id, project_id, agent_id, kind, display_name, role, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           )
-          .run(id, input.projectId, agentId, input.kind, displayName, role, at, at),
-      );
+          .run(id, input.projectId, agentId, input.kind, displayName, role, at, at);
+      });
       return repo.get(id)!;
     },
     get(id) {
@@ -704,11 +780,14 @@ function createMembers(db: Database.Database): MembersRepository {
       if (!MEMBER_ROLES.includes(role)) {
         throw new InvalidArgumentError(`Member.role 必须是 manager 或 normal，收到：${String(patch.role)}。`);
       }
-      runInTransaction(db, () =>
+      runInTransaction(db, () => {
+        if (role === "manager" && existing.role !== "manager") {
+          requireNoOtherManager(existing.projectId, id);
+        }
         db
           .prepare("UPDATE members SET display_name = ?, role = ?, updated_at = ? WHERE id = ?")
-          .run(displayName, role, nowIso(), id),
-      );
+          .run(displayName, role, nowIso(), id);
+      });
       return repo.get(id)!;
     },
     delete(id) {
@@ -1263,6 +1342,319 @@ function createMcpSessions(db: Database.Database): McpSessionsRepository {
     },
     delete(id) {
       db.prepare("DELETE FROM mcp_sessions WHERE id = ?").run(id);
+    },
+  };
+  return repo;
+}
+
+// ---------------------------------------------------------------------------
+// Org（T2 #49 / 决策票 #24、#25）
+// ---------------------------------------------------------------------------
+
+/** 岗位角色的静态枚举（与 F2 `AUTHZ_ROLES` 同值）；`owner` 是人的内建角色，不建岗。 */
+const ORG_NODE_ROLES: readonly OrgNodeRole[] = ["owner", "top_manager", "sub_manager", "member"];
+
+interface OrgNodeRow {
+  id: string;
+  project_id: string;
+  parent_id: string | null;
+  name: string;
+  role: string;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
+function toOrgNode(row: OrgNodeRow): OrgNode {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    parentId: row.parent_id,
+    name: row.name,
+    role: row.role as OrgNodeRole,
+    sortOrder: row.sort_order,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+/**
+ * 组织树 repository：唯一写入边界。
+ *
+ * 规则（#24/#25，spec #45 §6.2）：
+ * - 根岗位（`parent_id IS NULL`）每项目最多一个，位置即「顶层 manager 岗位」；
+ *   顶层唯一性由 `ux_org_nodes_single_root` 兜底，应用层归一为 `ConflictError`。
+ * - 角色写在岗位上（角色静态、岗位动态）；`owner` 不建岗（人是全局主体）；
+ *   根岗位固定 `top_manager`，非根岗位不能是 `top_manager`。
+ * - 汇报线调整应用层防环：目标父不能是自身或自身子孙（递归 CTE 现算），无深度上限。
+ * - 删岗位时**子树提升到父**，占据成员靠 `ON DELETE SET NULL` 腾出岗位但成员保留。
+ * - 一人一岗、一岗一实例（`ux_members_node`），跨项目占岗拒绝。
+ * - 阶段 1 兼容投影：legacy `members.role='manager'` 只由「占据根岗位」的成员持有；
+ *   无组织树数据的库（v3→v4 升级默认无）不受影响，兼容映射继续可用。
+ */
+function createOrg(db: Database.Database): OrgRepository {
+  const projectExists = db.prepare("SELECT 1 FROM projects WHERE id = ?");
+  const nodeById = db.prepare("SELECT * FROM org_nodes WHERE id = ?");
+  const memberById = db.prepare("SELECT * FROM members WHERE id = ?");
+  const childrenOf = db.prepare("SELECT COUNT(*) AS c FROM org_nodes WHERE parent_id = ?");
+  const rootOfProject = db.prepare("SELECT * FROM org_nodes WHERE project_id = ? AND parent_id IS NULL");
+
+  /**
+   * 子树边界（#24）：`WITH RECURSIVE` 现算，含自身。统一 `?` 占位符，
+   * 经 F1 方言抽象（`renderPlaceholders`）可原样渲染到 SQLite / PostgreSQL 的 `$1`。
+   * 不建闭包表：本地单用户、数据量小，现算足够；防环由应用层保证不会死循环。
+   */
+  const subtreeStmt = db.prepare(
+    `WITH RECURSIVE subtree(id) AS (
+       SELECT id FROM org_nodes WHERE id = ?
+       UNION ALL
+       SELECT n.id FROM org_nodes n JOIN subtree s ON n.parent_id = s.id
+     )
+     SELECT id FROM subtree`,
+  );
+
+  function getRow(id: string): OrgNodeRow | null {
+    return (nodeById.get(id) as OrgNodeRow | undefined) ?? null;
+  }
+
+  function get(id: string): OrgNode | null {
+    const row = getRow(id);
+    return row ? toOrgNode(row) : null;
+  }
+
+  function subtreeNodeIds(nodeId: string): string[] {
+    if (!getRow(nodeId)) return [];
+    return (subtreeStmt.all(nodeId) as { id: string }[]).map((row) => row.id);
+  }
+
+  function requireProject(projectId: string): void {
+    if (!projectExists.get(projectId)) {
+      throw new InvalidReferenceError(`项目 ${projectId} 不存在，无法建立/调整组织岗位。`);
+    }
+  }
+
+  function validateRole(role: OrgNodeRole): void {
+    if (!ORG_NODE_ROLES.includes(role)) {
+      throw new InvalidArgumentError(`OrgNode.role 必须是静态枚举之一，收到：${String(role)}。`);
+    }
+    if (role === "owner") {
+      throw new InvalidArgumentError("owner（人）是内建全局主体，不建立组织岗位节点（决策票 #26）。");
+    }
+  }
+
+  function validateSortOrder(value: number): void {
+    if (!Number.isFinite(value)) {
+      throw new InvalidArgumentError("OrgNode.sortOrder 必须是有限数字。");
+    }
+  }
+
+  /** 阶段 1 兼容投影：把 `node_id` 与 legacy `role` 一起更新，保证至多一个 manager。 */
+  function applyAssignment(memberRow: MemberRow, nodeId: string | null, isRoot: boolean, at: string): void {
+    if (isRoot) {
+      db.prepare(
+        "UPDATE members SET role = 'normal', updated_at = ? WHERE project_id = ? AND role = 'manager' AND id <> ?",
+      ).run(at, memberRow.project_id, memberRow.id);
+    }
+    const role = isRoot ? "manager" : memberRow.role === "manager" ? "normal" : memberRow.role;
+    db.prepare("UPDATE members SET node_id = ?, role = ?, updated_at = ? WHERE id = ?").run(
+      nodeId,
+      role,
+      at,
+      memberRow.id,
+    );
+  }
+
+  const repo: OrgRepository = {
+    createNode(input) {
+      requireProject(input.projectId);
+      requireProjectActive(db, input.projectId, "建立组织岗位");
+      const name = requireNonEmpty(input.name, "OrgNode.name");
+      const role = input.role;
+      validateRole(role);
+      const parentId = input.parentId ?? null;
+      const sortOrder = input.sortOrder ?? 0;
+      validateSortOrder(sortOrder);
+
+      if (parentId === null) {
+        // 根位置 = 顶层 manager 岗位；角色固定，且每项目根唯一。
+        if (role !== "top_manager") {
+          throw new InvalidArgumentError("根岗位（顶层 manager）角色必须是 top_manager。");
+        }
+        if (rootOfProject.get(input.projectId)) {
+          throw new ConflictError(`项目 ${input.projectId} 已有根岗位（顶层 manager），每项目最多一个。`);
+        }
+      } else {
+        if (role === "top_manager") {
+          throw new InvalidArgumentError("只有根岗位可以是 top_manager；下级 manager 请用 sub_manager。");
+        }
+        const parent = getRow(parentId);
+        if (!parent) throw new InvalidReferenceError(`父岗位 ${parentId} 不存在。`);
+        if (parent.project_id !== input.projectId) {
+          throw new InvalidReferenceError(`父岗位 ${parentId} 不属于项目 ${input.projectId}，不能跨项目建岗。`);
+        }
+      }
+
+      const at = nowIso();
+      const id = newId();
+      runInTransaction(db, () =>
+        db
+          .prepare(
+            `INSERT INTO org_nodes (id, project_id, parent_id, name, role, sort_order, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(id, input.projectId, parentId, name, role, sortOrder, at, at),
+      );
+      return get(id)!;
+    },
+
+    getNode: get,
+
+    listNodes(projectId) {
+      // 层级展示顺序：父 → 子（递归 CTE 算深度），同级按 sort_order / created_at 稳定排序。
+      const rows = db
+        .prepare(
+          `WITH RECURSIVE tree(id, depth) AS (
+             SELECT id, 0 FROM org_nodes WHERE project_id = ? AND parent_id IS NULL
+             UNION ALL
+             SELECT n.id, t.depth + 1 FROM org_nodes n JOIN tree t ON n.parent_id = t.id
+           )
+           SELECT o.* FROM org_nodes o
+             LEFT JOIN tree t ON t.id = o.id
+           WHERE o.project_id = ?
+           ORDER BY COALESCE(t.depth, 0), o.sort_order, o.created_at, o.id`,
+        )
+        .all(projectId, projectId) as OrgNodeRow[];
+      return rows.map(toOrgNode);
+    },
+
+    getRootNode(projectId) {
+      const row = rootOfProject.get(projectId) as OrgNodeRow | undefined;
+      return row ? toOrgNode(row) : null;
+    },
+
+    subtreeNodeIds,
+
+    updateNode(id, patch) {
+      const row = getRow(id);
+      if (!row) throw new NotFoundError(`组织岗位 ${id} 不存在。`);
+      requireProjectActive(db, row.project_id, "调整组织岗位");
+
+      const name = patch.name === undefined ? row.name : requireNonEmpty(patch.name, "OrgNode.name");
+      let role = row.role as OrgNodeRole;
+      if (patch.role !== undefined) {
+        validateRole(patch.role);
+        if (row.parent_id === null && patch.role !== "top_manager") {
+          throw new InvalidArgumentError("根岗位角色固定为 top_manager，不能修改。");
+        }
+        if (row.parent_id !== null && patch.role === "top_manager") {
+          throw new InvalidArgumentError("只有根岗位可以是 top_manager；下级 manager 请用 sub_manager。");
+        }
+        role = patch.role;
+      }
+
+      let parentId = row.parent_id;
+      if (patch.parentId !== undefined) {
+        const target = patch.parentId;
+        if (target === null) {
+          // 把非根岗位移到根层会产生第二棵树（多个根），拒绝；根保持 null 是无操作。
+          if (row.parent_id !== null) {
+            throw new InvalidArgumentError("不能把非根岗位移到根层：每项目根岗位唯一（顶层 manager）。");
+          }
+        } else {
+          if (target === id) throw new InvalidArgumentError("汇报线不能指向自身（防环）。");
+          const parent = getRow(target);
+          if (!parent) throw new InvalidReferenceError(`父岗位 ${target} 不存在。`);
+          if (parent.project_id !== row.project_id) {
+            throw new InvalidReferenceError(`父岗位 ${target} 不属于同一项目，不能跨项目调整汇报线。`);
+          }
+          // 防环：目标父不能是本岗位的子孙（子树递归 CTE 现算，含自身）。
+          if (subtreeNodeIds(id).includes(target)) {
+            throw new InvalidArgumentError("汇报线调整会形成环：目标父岗位是本岗位的子孙。");
+          }
+          parentId = target;
+        }
+      }
+
+      const sortOrder = patch.sortOrder ?? row.sort_order;
+      validateSortOrder(sortOrder);
+      runInTransaction(db, () =>
+        db
+          .prepare(
+            "UPDATE org_nodes SET parent_id = ?, name = ?, role = ?, sort_order = ?, updated_at = ? WHERE id = ?",
+          )
+          .run(parentId, name, role, sortOrder, nowIso(), id),
+      );
+      return get(id)!;
+    },
+
+    deleteNode(id) {
+      const row = getRow(id);
+      if (!row) throw new NotFoundError(`组织岗位 ${id} 不存在。`);
+      requireProjectActive(db, row.project_id, "删除组织岗位");
+      const childCount = (childrenOf.get(id) as { c: number }).c;
+      if (row.parent_id === null && childCount > 0) {
+        throw new InvalidArgumentError("根岗位还有下级岗位，不能直接删除（否则会出现多个根）；请先调整汇报线。");
+      }
+      runInTransaction(db, () => {
+        // 子树提升到被删节点的父（不级联删；无子节点的根删除时该 UPDATE 无匹配行）。
+        db.prepare("UPDATE org_nodes SET parent_id = ?, updated_at = ? WHERE parent_id = ?").run(
+          row.parent_id,
+          nowIso(),
+          id,
+        );
+        // members.node_id ON DELETE SET NULL：占据成员腾出岗位，成员本身保留。
+        db.prepare("DELETE FROM org_nodes WHERE id = ?").run(id);
+      });
+    },
+
+    assignNode(memberId, nodeId) {
+      const memberRow = memberById.get(memberId) as MemberRow | undefined;
+      if (!memberRow) throw new NotFoundError(`成员 ${memberId} 不存在。`);
+      let nodeRow: OrgNodeRow | null = null;
+      if (nodeId !== null) {
+        nodeRow = getRow(nodeId);
+        if (!nodeRow) throw new InvalidReferenceError(`组织岗位 ${nodeId} 不存在。`);
+        if (nodeRow.project_id !== memberRow.project_id) {
+          throw new InvalidReferenceError(`岗位 ${nodeId} 与成员 ${memberId} 不属于同一项目，拒绝跨项目占岗。`);
+        }
+      }
+      requireProjectActive(db, memberRow.project_id, "分配成员岗位");
+      const isRoot = nodeRow !== null && nodeRow.parent_id === null;
+      runInTransaction(db, () => applyAssignment(memberRow, nodeId, isRoot, nowIso()));
+      return toMember(memberById.get(memberId) as MemberRow);
+    },
+
+    autoPlaceMember(projectId, memberId) {
+      const memberRow = memberById.get(memberId) as MemberRow | undefined;
+      if (!memberRow) throw new NotFoundError(`成员 ${memberId} 不存在。`);
+      if (memberRow.project_id !== projectId) {
+        throw new InvalidReferenceError(`成员 ${memberId} 不属于项目 ${projectId}。`);
+      }
+      requireProjectActive(db, projectId, "自动分配成员岗位");
+      // 幂等：已落位的成员返回其现有岗位，不重复建岗。
+      if (memberRow.node_id !== null) {
+        const existing = get(memberRow.node_id);
+        if (existing) return existing;
+      }
+      const rootRow = rootOfProject.get(projectId) as OrgNodeRow | undefined;
+      // 阶段 1 兼容：项目尚无组织树时不自动造树（升级路径默认无组织数据）。
+      if (!rootRow) return null;
+      const at = nowIso();
+      const nodeId = newId();
+      runInTransaction(db, () => {
+        db.prepare(
+          `INSERT INTO org_nodes (id, project_id, parent_id, name, role, sort_order, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'member', 0, ?, ?)`,
+        ).run(nodeId, projectId, rootRow.id, memberRow.display_name, at, at);
+        applyAssignment(memberRow, nodeId, false, at);
+      });
+      return get(nodeId)!;
+    },
+
+    nodeOfMember(memberId) {
+      const row = memberById.get(memberId) as MemberRow | undefined;
+      if (!row || row.node_id === null) return null;
+      return get(row.node_id);
     },
   };
   return repo;
