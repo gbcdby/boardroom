@@ -29,11 +29,13 @@ import {
 
 test("内建 unknown 适配器是默认回退，且 'other' 被视为已注册", () => {
   // 未注册、非 'other' 的宿主回退到 unknown 适配器。
-  const fallback = getAdapter("dsh" as HostType);
+  // 注意：#57（T1）已把 dsh 注册为正式宿主模块，故此处改用其它未注册 id 作为示例。
+  const UNREGISTERED = "unregistered-host" as HostType;
+  const fallback = getAdapter(UNREGISTERED);
   assert.equal(fallback.id, UNKNOWN_HOST_ID);
   assert.equal(fallback, UNKNOWN_ADAPTER);
   // 该未注册宿主本身不被认为是已注册（除 'other' 这一内建回退外）。
-  assert.equal(isRegistered("dsh" as HostType), false);
+  assert.equal(isRegistered(UNREGISTERED), false);
 
   // 'other' 是内建回退，视为已注册；getAdapter('other') 返回的就是 unknown 适配器。
   assert.equal(isRegistered(UNKNOWN_HOST_ID), true);

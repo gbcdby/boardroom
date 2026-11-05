@@ -17,100 +17,44 @@
  * dsh 身份迁移（T3 #59）、证据文档（T4 #60）。本模块只提供骨架与注册机制。
  */
 
-import type { HostType } from "../../db/types.ts";
+// #57：纯类型 + 工厂（HostType / HostCapabilities / defineHostAdapter / DEFAULT_HOST_CAPABILITIES 等）
+// 已抽到 dependency-free 的 ./types.ts，以打破 index.ts ⇄ 各宿主模块之间的循环导入。
+// 这里统一再导出，保持 index.ts 作为宿主适配层对外入口不变（#56 的公开 API 不回归）。
+import type {
+  HostAdapter,
+  HostAdapterSpec,
+  HostCapabilities,
+  HostEvidence,
+  HostInterruptCapabilityValue,
+  HostJoinConfig,
+  HostReconnectCapability,
+  HostType,
+} from "./types.ts";
+import { DEFAULT_HOST_CAPABILITIES, defineHostAdapter } from "./types.ts";
 
-/** 再导出开放 `HostType`，使 adapters 模块成为宿主类型的统一引用点（#56）。 */
-export type { HostType };
+export type {
+  HostAdapter,
+  HostAdapterSpec,
+  HostCapabilities,
+  HostEvidence,
+  HostInterruptCapabilityValue,
+  HostJoinConfig,
+  HostReconnectCapability,
+  HostType,
+} from "./types.ts";
+export { DEFAULT_HOST_CAPABILITIES, defineHostAdapter } from "./types.ts";
+
+// #57（T1）：把四个具体宿主模块注册进全局默认注册表。
+// 「unknown」即内建 UNKNOWN_ADAPTER（id "other"），已在下方定义，不重复注册。
+import { CLAUDE_CODE_ADAPTER } from "./claude-code.ts";
+import { CODEX_CLI_ADAPTER } from "./codex-cli.ts";
+import { DSH_ADAPTER } from "./dsh.ts";
 
 /** 已知宿主 id 集合：当前已认知的宿主。未来宿主只需注册，不必改这里（NFR-HOST-01）。 */
 export const KNOWN_HOST_TYPES: readonly HostType[] = ["claude-code", "codex-cli", "other"];
 
 /** 未知宿主的内建 id；所有未注册、非其它宿主都回退到它。 */
 export const UNKNOWN_HOST_ID = "other" as const;
-
-/** 宿主打断能力：与 `InterruptResult` 同源，缺省 `unsupported`。 */
-export type HostInterruptCapabilityValue = "accepted" | "rejected" | "unsupported";
-
-/** 宿主重连能力，缺省 `unsupported`。 */
-export type HostReconnectCapability = "supported" | "unsupported";
-
-/**
- * 宿主能力声明。
- *
- * NFR-HOST-02（不臆造能力）：任何未显式声明的能力一律视为「不承诺」。
- * 因此每个字段都有安全的默认值（见 {@link DEFAULT_HOST_CAPABILITIES}）。
- */
-export interface HostCapabilities {
-  /** 能否打断在途工具；缺省 `unsupported`。 */
-  readonly interrupt: HostInterruptCapabilityValue;
-  /** 能否主动唤醒空闲宿主；缺省 `false`（未承诺）。 */
-  readonly wakeIdle: boolean;
-  /** 断线后能否自动重连；缺省 `unsupported`。 */
-  readonly reconnect: HostReconnectCapability;
-}
-
-/** 能力默认值：全部「不承诺」（NFR-HOST-02）。 */
-export const DEFAULT_HOST_CAPABILITIES: HostCapabilities = Object.freeze({
-  interrupt: "unsupported",
-  wakeIdle: false,
-  reconnect: "unsupported",
-});
-
-/** 入群相关配置（未来宿主可在此声明入群约束；当前为空，由各宿主模块在 T1 填充）。 */
-export interface HostJoinConfig {
-  readonly notes?: string;
-}
-
-/** 能力证据：声明的能力必须可追溯、可复现（NFR-HOST-02）。 */
-export interface HostEvidence {
-  /** 证据来源描述（如「D6/#10 Claude Code 实测」）。 */
-  readonly source?: string;
-  /** 是否已验证（实测/文档）；未验证的能力不应被声明为 supported。 */
-  readonly verified?: boolean;
-}
-
-/** 宿主适配器：描述一个宿主的差异点（传输方式、能力、入群配置、证据）。 */
-export interface HostAdapter {
-  /** 唯一 id；同时是 `HostType` 的一个取值。 */
-  readonly id: HostType;
-  /** 人类可读名称。 */
-  readonly label: string;
-  /** 支持的传输方式（如 `"mcp"` / `"websocket"` / `"stdio"`）。 */
-  readonly transports: readonly string[];
-  /** 能力声明；未声明字段按 {@link DEFAULT_HOST_CAPABILITIES} 计。 */
-  readonly capabilities: HostCapabilities;
-  /** 入群配置。 */
-  readonly joinConfig: HostJoinConfig;
-  /** 能力证据。 */
-  readonly evidence: HostEvidence;
-}
-
-/** 注册一个 adapter 时允许的部分字段；缺省由 {@link DEFAULT_HOST_CAPABILITIES} 等补齐。 */
-export interface HostAdapterSpec {
-  readonly id: HostType;
-  readonly label: string;
-  readonly transports?: readonly string[];
-  readonly capabilities?: Partial<HostCapabilities>;
-  readonly joinConfig?: HostJoinConfig;
-  readonly evidence?: HostEvidence;
-}
-
-/**
- * 用声明式 spec 构造一个 {@link HostAdapter}，并把缺失的能力/字段补齐为安全默认值。
- *
- * NFR-HOST-02：未声明的能力字段一律落到 {@link DEFAULT_HOST_CAPABILITIES}，
- * 因此调用方「少写」一个能力绝不会让它变成 `supported` / `true`。
- */
-export function defineHostAdapter(spec: HostAdapterSpec): HostAdapter {
-  return {
-    id: spec.id,
-    label: spec.label,
-    transports: spec.transports ?? [],
-    capabilities: { ...DEFAULT_HOST_CAPABILITIES, ...spec.capabilities },
-    joinConfig: spec.joinConfig ?? {},
-    evidence: spec.evidence ?? {},
-  };
-}
 
 /** 内建「未知宿主」适配器：所有未注册宿主的回退。 */
 export const UNKNOWN_ADAPTER: HostAdapter = Object.freeze(
@@ -121,6 +65,8 @@ export const UNKNOWN_ADAPTER: HostAdapter = Object.freeze(
       source: "内置回退；宿主能力未知，按 unsupported / false 处理",
       verified: false,
     },
+    // #57：unknown 的打断原因说明（T2 #58 将消费此字段）。
+    interruptReasonNote: "宿主能力未知",
   }),
 );
 
@@ -173,6 +119,13 @@ export function createHostAdapterRegistry(
 
 /** 全局默认注册表（内建包含 {@link UNKNOWN_ADAPTER}）。 */
 export const defaultRegistry: HostAdapterRegistry = createHostAdapterRegistry();
+
+// #57（T1）：把四个具体宿主模块中的 claude-code / codex-cli / dsh 注册进全局默认注册表，
+// 实现「一个宿主 = 一个代码模块」。「unknown」（id "other"）即上方内建 UNKNOWN_ADAPTER，
+// 已作为默认回退始终可用，无需重复注册。
+defaultRegistry.registerAdapter(CLAUDE_CODE_ADAPTER);
+defaultRegistry.registerAdapter(CODEX_CLI_ADAPTER);
+defaultRegistry.registerAdapter(DSH_ADAPTER);
 
 // 便捷函数：直接操作全局默认注册表，避免到处引用 defaultRegistry。
 export function registerAdapter(adapter: HostAdapter): void {
