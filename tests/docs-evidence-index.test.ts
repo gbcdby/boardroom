@@ -33,6 +33,27 @@ test("证据索引引用的真实实测文件都存在（不悬空）", () => {
   }
 });
 
+test("证据 README 中引用的每个证据文件都存在（真正不悬空）", () => {
+  const readmePath = path.resolve(repoRoot, "evidence/real-host-retest/README.md");
+  const text = fs.readFileSync(readmePath, "utf8");
+  // 抽取 README 中反引号内的证据文件名（仅同级文件名，含 .out/.log/.json/.mjs 扩展名）。
+  const refs = new Set<string>();
+  for (const m of text.matchAll(/`([A-Za-z0-9_.-]+\.(?:out|log|json|mjs))`/g)) {
+    const ref = m[1];
+    if (ref) refs.add(ref);
+  }
+  assert.ok(refs.size > 0, "证据 README 应至少索引一个证据文件");
+  for (const ref of refs) {
+    // 跨目录引用（含 "/"）不在同级目录校验；本 README 约定只索引同目录已提交文件。
+    const abs = path.resolve(repoRoot, "evidence/real-host-retest", ref);
+    assert.ok(
+      fs.existsSync(abs),
+      `证据 README 引用的文件应存在（不得悬空）：${ref}`,
+    );
+    assert.ok(fs.statSync(abs).size > 0, `证据文件不应为空：${ref}`);
+  }
+});
+
 test("getting-started-mcp.md §4.5 含 DoD 关键术语与证据路径", () => {
   const docPath = path.resolve(repoRoot, "docs/getting-started-mcp.md");
   assert.ok(fs.existsSync(docPath), "docs/getting-started-mcp.md 应存在");

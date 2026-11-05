@@ -13,7 +13,7 @@ import { openDatabase } from "../src/server/db/database.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
-import { getAdapter, isRegistered } from "../src/server/mcp/adapters/index.ts";
+import { getAdapter, isRegistered, defineHostAdapter, registerAdapter, unregisterAdapter } from "../src/server/mcp/adapters/index.ts";
 
 /**
  * #58（T2）core 运行期硬编码收敛到宿主适配层注册表 —— 测试 seam。
@@ -229,6 +229,56 @@ test("server.ts join 校验注册表驱动：拒绝未知 hostType、接受已�
       );
     } finally {
       await z.close();
+    }
+  });
+});
+
+test("AC-HOST-01：登记一个仅含适配模块的新宿主后，join 即成功入群且能力默认 unsupported", async () => {
+  await withCoreCtx(async (ctx) => {
+    const TEMP_ID = "ac-host-01-temp-host";
+    // 仅新增一个适配模块并登记，不改 core 任何硬编码。
+    registerAdapter(defineHostAdapter({ id: TEMP_ID, label: "AC-HOST-01 临时宿主" }));
+    try {
+      assert.equal(isRegistered(TEMP_ID as never), true, "登记后应视为已注册");
+
+      const core = createMcpCore({ logger: silentLogger, db: ctx.db, memberKey: "ac-host-01" });
+      try {
+        const r = core.join("s", {
+          displayName: "TempHostMember",
+          hostType: TEMP_ID as never,
+          projectId: ctx.projectId,
+          groupId: ctx.groupId,
+        });
+        assert.ok(r.memberId, "新宿主应成功入群（join 由注册表驱动，无需改 core）");
+
+        // 能力默认未承诺：interrupt 取适配器缺省 unsupported。
+        const outcome = core.attemptInterrupt("s");
+        assert.equal(outcome.result, "unsupported", "未声明能力的宿主 interrupt 默认 unsupported");
+        assert.equal(getAdapter(TEMP_ID as never).capabilities.wakeIdle, false);
+        assert.equal(getAdapter(TEMP_ID as never).capabilities.reconnect, "unsupported");
+      } finally {
+        core.close();
+      }
+    } finally {
+      // 清理全局注册表，避免污染其它用例。
+      unregisterAdapter(TEMP_ID as never);
+      assert.equal(isRegistered(TEMP_ID as never), false, "卸载后应不再注册");
+    }
+  });
+});
+
+test("AC-HOST-04：四宿主的 buildInterruptReason 均取自适配器 interruptReasonNote，无硬编码分支", async () => {
+  await withCoreCtx(async (ctx) => {
+    for (const hostType of KNOWN_HOSTS) {
+      const m = ctx.spawn(`t4-${hostType}`, `T4-${hostType}`, hostType);
+      // idle：reason 恒含 hostNote；running：按 unsupported 结果拼接 hostNote。
+      const idle = m.core.attemptInterrupt(m.sessionId);
+      const note = getAdapter(hostType as never).interruptReasonNote ?? "宿主能力未知";
+      assert.ok(
+        idle.reason.includes(note),
+        `${hostType} 的打断依据应包含适配器 interruptReasonNote（${note}）`,
+      );
+      m.core.close();
     }
   });
 });

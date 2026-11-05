@@ -3,7 +3,7 @@ import { defineHostAdapter } from "./types.ts";
 /**
  * codex-cli 宿主适配器（#57 / T1）：一个宿主 = 一个代码模块。
  *
- * 实测证据（见 `.agent-output/real-host-retest/`）：
+ * 实测证据（见 `docs/t8-acceptance-report.md`；原始 `.out` 见本地留档 `.agent-output/real-host-retest/`，不入库）：
  * - interrupt: `"unsupported"` — D6/#10 配额阻塞未实测，按 unsupported 处理。
  * - reconnect: `"supported"` — `reconnect-codex2.out` 重连补投 `drainedBacklog:true`。
  * - transports: `["stdio","streamable-http"]`（与现有 join 行为一致）。
