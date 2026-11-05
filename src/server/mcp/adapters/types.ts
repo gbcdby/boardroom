@@ -44,11 +44,6 @@ export const DEFAULT_HOST_CAPABILITIES: HostCapabilities = Object.freeze({
   reconnect: "unsupported",
 });
 
-/** 入群相关配置（未来宿主可在此声明入群约束）。 */
-export interface HostJoinConfig {
-  readonly notes?: string;
-}
-
 /** 能力证据：声明的能力必须可追溯、可复现（NFR-HOST-02）。 */
 export interface HostEvidence {
   /** 证据来源描述（如「D6/#10 Claude Code 实测」）。 */
@@ -68,12 +63,14 @@ export interface HostAdapter {
   readonly id: HostType;
   /** 人类可读名称。 */
   readonly label: string;
-  /** 支持的传输方式（如 `"stdio"` / `"streamable-http"`）。 */
-  readonly transports: readonly string[];
+  /**
+   * 支持的传输方式（如 `"stdio"` / `"streamable-http"`）。
+   * 可选：仅作信息性声明，运行期无读取方；未实测的宿主不应声明显式能力
+   * （NFR-HOST-02：不把未实测能力写成承诺），缺省为空数组。
+   */
+  readonly transports?: readonly string[];
   /** 能力声明；未声明字段按 {@link DEFAULT_HOST_CAPABILITIES} 计。 */
   readonly capabilities: HostCapabilities;
-  /** 入群配置。 */
-  readonly joinConfig: HostJoinConfig;
   /** 能力证据。 */
   readonly evidence: HostEvidence;
   /**
@@ -89,7 +86,6 @@ export interface HostAdapterSpec {
   readonly label: string;
   readonly transports?: readonly string[];
   readonly capabilities?: Partial<HostCapabilities>;
-  readonly joinConfig?: HostJoinConfig;
   readonly evidence?: HostEvidence;
   /** 打断原因说明（见 {@link HostAdapter.interruptReasonNote}）。 */
   readonly interruptReasonNote?: string;
@@ -107,7 +103,6 @@ export function defineHostAdapter(spec: HostAdapterSpec): HostAdapter {
     label: spec.label,
     transports: spec.transports ?? [],
     capabilities: { ...DEFAULT_HOST_CAPABILITIES, ...spec.capabilities },
-    joinConfig: spec.joinConfig ?? {},
     evidence: spec.evidence ?? {},
     // 仅在显式提供时才带 interruptReasonNote，避免 exactOptionalPropertyTypes 下写入 undefined。
     ...(spec.interruptReasonNote !== undefined

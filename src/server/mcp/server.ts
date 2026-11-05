@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { Logger } from "../logger.ts";
 import type { McpCore } from "./core.ts";
 import { McpToolError } from "./errors.ts";
-import { isRegistered } from "./adapters/index.ts";
+import { isRegistered, listAdapterIds } from "./adapters/index.ts";
 
 /**
  * MCP 工具注册层：把 {@link McpCore} 暴露为符合 docs/mcp-tool-contract.md 的工具。
@@ -83,7 +83,7 @@ export function createMcpServer(options: CreateMcpServerOptions): McpServer {
         hostType: z
           .string()
           .refine((v) => isRegistered(v), {
-            message: "未知 hostType：请先注册宿主适配器（claude-code / codex-cli / dsh / other）",
+            message: `未知 hostType：请先注册宿主适配器（${[...listAdapterIds()].sort().join(" / ")}）`,
           })
           .describe("宿主类型（已注册适配器 id 或 other）"),
         projectId: z.string().describe("项目 ID"),

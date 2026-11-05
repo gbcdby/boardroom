@@ -35,21 +35,22 @@ test("四个宿主模块都在 defaultRegistry 中已注册且 getAdapter 返回
 test("claude-code / codex-cli / dsh 的 transports 与 capabilities 符合实测证据表", () => {
   // claude-code：reconnect=supported，interrupt=unsupported，wakeIdle=false。
   const cc = getAdapter("claude-code" as never);
-  assert.deepEqual([...cc.transports].sort(), ["stdio", "streamable-http"]);
+  assert.deepEqual([...(cc.transports ?? [])].sort(), ["stdio", "streamable-http"]);
   assert.equal(cc.capabilities.interrupt, "unsupported");
   assert.equal(cc.capabilities.wakeIdle, false);
   assert.equal(cc.capabilities.reconnect, "supported");
 
   // codex-cli：reconnect=supported，其余默认。
   const cx = getAdapter("codex-cli" as never);
-  assert.deepEqual([...cx.transports].sort(), ["stdio", "streamable-http"]);
+  assert.deepEqual([...(cx.transports ?? [])].sort(), ["stdio", "streamable-http"]);
   assert.equal(cx.capabilities.interrupt, "unsupported");
   assert.equal(cx.capabilities.wakeIdle, false);
   assert.equal(cx.capabilities.reconnect, "supported");
 
-  // dsh：所有能力保持默认（unsupported / false）；transports 与两者一致。
+  // dsh：所有能力保持默认（unsupported / false）；transports 未对 agent harness 独立实测，
+  // 不臆造（NFR-HOST-02），故缺省为空数组（与 claude-code / codex-cli 的已知事实不同）。
   const dsh = getAdapter("dsh" as never);
-  assert.deepEqual([...dsh.transports].sort(), ["stdio", "streamable-http"]);
+  assert.deepEqual([...(dsh.transports ?? [])].sort(), []);
   assert.equal(dsh.capabilities.interrupt, "unsupported");
   assert.equal(dsh.capabilities.wakeIdle, false);
   assert.equal(dsh.capabilities.reconnect, "unsupported");
@@ -57,9 +58,9 @@ test("claude-code / codex-cli / dsh 的 transports 与 capabilities 符合实测
 
 test("dsh 模块 evidence 指向真实实测证据且能力未臆造", () => {
   const dsh = getAdapter("dsh" as never);
-  // 证据必须指向真实测量目录 .agent-output/real-host-retest/。
+  // 证据必须指向已提交的实证目录 evidence/real-host-retest/（DSH 0.2.1-rc.5 真实实测）。
   assert.ok(
-    (dsh.evidence.source ?? "").includes(".agent-output/real-host-retest/"),
+    (dsh.evidence.source ?? "").includes("evidence/real-host-retest/"),
     `dsh evidence 应指向真实实测目录，实际为：${dsh.evidence.source}`,
   );
   assert.equal(dsh.evidence.verified, true);
@@ -70,7 +71,7 @@ test("dsh 模块 evidence 指向真实实测证据且能力未臆造", () => {
 
 test("unknown (other) 模块能力全默认且 transports 为空", () => {
   const other = getAdapter("other" as never);
-  assert.deepEqual([...other.transports].sort(), []);
+  assert.deepEqual([...(other.transports ?? [])].sort(), []);
   assert.equal(other.capabilities.interrupt, "unsupported");
   assert.equal(other.capabilities.wakeIdle, false);
   assert.equal(other.capabilities.reconnect, "unsupported");

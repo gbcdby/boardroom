@@ -16,9 +16,9 @@ import path from "node:path";
 const repoRoot = path.resolve(import.meta.dirname, "..");
 
 const EVIDENCE_FILES = [
-  ".agent-output/real-host-retest/README.md",
-  ".agent-output/real-host-retest/dsh-join.out",
-  ".agent-output/real-host-retest/dsh-wait.out",
+  "evidence/real-host-retest/README.md",
+  "evidence/real-host-retest/dsh-join.out",
+  "evidence/real-host-retest/dsh-wait.out",
 ];
 
 test("证据索引引用的真实实测文件都存在（不悬空）", () => {
@@ -54,7 +54,7 @@ test("getting-started-mcp.md §4.5 含 DoD 关键术语与证据路径", () => {
   // 证据路径确实被索引（相对仓库根）。
   assert.ok(
     text.includes("real-host-retest"),
-    "文档应索引 .agent-output/real-host-retest 证据目录",
+    "文档应索引 evidence/real-host-retest 证据目录",
   );
   assert.ok(
     text.includes("dsh-join.out") && text.includes("dsh-wait.out"),

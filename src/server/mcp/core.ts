@@ -23,7 +23,7 @@ import {
   ROLE_REACH,
 } from "../authz/authorize.ts";
 import { actorForSession } from "../authz/actors.ts";
-import { getAdapter, isRegistered } from "./adapters/index.ts";
+import { getAdapter, isRegistered, listAdapterIds } from "./adapters/index.ts";
 import {
   createAntiLoop,
   DEFAULT_ANTI_LOOP_CONFIG,
@@ -60,7 +60,8 @@ export interface Heartbeat {
 /**
  * `HostType` 改为开放类型（#56 / F1）：任何已注册宿主适配器 id + 内建 `"other"`，
  * 不再写死联合类型。此处从 `db/types.ts` 统一导入并再导出，保持既有导入方不变；
- * 当前已知 id 集合见 `src/server/mcp/adapters/index.ts` 的 `KNOWN_HOST_TYPES`。
+ * 宿主 id 的单一事实来源是 `src/server/mcp/adapters/index.ts` 的注册表
+ * （`listAdapterIds()` / `defaultRegistry`）；`KNOWN_HOST_TYPES` 仅是方便阅读的已知宿主快照。
  *
  * T2（#58）：core 的运行期硬编码已收敛到宿主适配层注册表（`src/server/mcp/adapters/index.ts`），
  * 单一事实来源：`join` 白名单用 `isRegistered` 校验、`DEFAULT_HOST_INTERRUPT_CAPABILITY`
@@ -750,7 +751,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         throw invalidArgument("projectId 与 groupId 必填");
       }
       if (!isRegistered(params.hostType)) {
-        throw invalidArgument("未知 hostType：请先注册宿主适配器（claude-code / codex-cli / dsh / other）");
+        throw invalidArgument(
+          `未知 hostType：请先注册宿主适配器（${[...listAdapterIds()].sort().join(" / ")}）`,
+        );
       }
       const role: MemberRole = params.role ?? "normal";
 
@@ -1045,7 +1048,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       // 宿主能力：显式申报优先；缺省按 hostType 在注册表中的声明能力（单一事实来源）。
       // getAdapter 对任意 hostType 都返回合法适配器（未知回退到 UNKNOWN_ADAPTER，interrupt=unsupported）。
       const result: InterruptResult =
-        params?.hostCapability ?? getAdapter(binding.hostType).capabilities.interrupt ?? "unsupported";
+        params?.hostCapability ?? getAdapter(binding.hostType).capabilities.interrupt;
 
       // 打断永远不把已进入处理的轮次伪装成 waiting；恒为 working（与「wait 返回 → working」一致）。
       // 若成员已不在可打断的忙碌轮次（idle），仅记录一次尝试，不改运行状态。

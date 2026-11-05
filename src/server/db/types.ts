@@ -9,7 +9,8 @@
  * Agent 宿主类型。开放类型：任何已注册宿主适配器的 id + 内建 `"other"`，
  * 不再写死为联合类型。这样既兼容现有 `claude-code` / `codex-cli` / `other`，
  * 又为未来宿主（如 `dsh`）留出扩展空间，无需改核心类型（#56 / NFR-HOST-01）。
- * 当前已知 id 集合见 `src/server/mcp/adapters/index.ts` 的 `KNOWN_HOST_TYPES`。
+ * 宿主 id 的单一事实来源是 `src/server/mcp/adapters/index.ts` 的注册表
+ * （`listAdapterIds()` / `defaultRegistry`）；`KNOWN_HOST_TYPES` 仅是方便阅读的已知宿主快照。
  *
  * DB `host_type` 列仍是自由 TEXT（不在此约束），本类型只是 TS 层的开放别名。
  */

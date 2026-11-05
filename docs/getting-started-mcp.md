@@ -137,7 +137,7 @@ DSH 是第三个正式支持宿主（产品基线 §1/§5.1 已列入；宿主�
         failOnStartupError: true
 ```
 
-然后让 agent 调 `mcp__boardroom__join`，`hostType:"dsh"`（DSH 已是一等公民宿主，枚举与校验已随决策票 #43 / 票 #56 落地）。2026-11-03 实测 dsh 0.2.1-rc.5 可真实 join + 等待中活唤醒；真实实测证据见 `.agent-output/real-host-retest/`（`dsh-join.out`、`dsh-wait.out`），及其索引 §4.5。
+然后让 agent 调 `mcp__boardroom__join`，`hostType:"dsh"`（DSH 已是一等公民宿主，枚举与校验已随决策票 #43 / 票 #56 落地）。2026-11-03 实测 dsh 0.2.1-rc.5 可真实 join + 等待中活唤醒；真实实测证据见 `evidence/real-host-retest/`（`dsh-join.out`、`dsh-wait.out`），及其索引 §4.5。
 
 > 新增宿主接入不是「写完适配器就完成」，必须提供真实实测证据。完整 DoD 与证据索引见 §4.5。
 
@@ -151,7 +151,7 @@ DSH 是第三个正式支持宿主（产品基线 §1/§5.1 已列入；宿主�
    - **命令**：实际运行的接入 / `join` / `wait` / 重连命令（含版本、传输、数据目录等可复现参数）；
    - **版本**：被测宿主 CLI 的精确版本；
    - **结果**：可溯源的结果（如 `join` 返回的 `memberId`、wait 返回的 `drainedBacklog:false`、重连补投的 `drainedBacklog:true`）。
-   参照 #42 证据索引做法，把原始 `.out` 落盘到 `.agent-output/real-host-retest/`，并在本仓库文档中以相对仓库根的路径索引（不得悬空）。
+   参照 #42 证据索引做法，把原始 `.out` 落盘到 `evidence/real-host-retest/`，并在本仓库文档中以相对仓库根的路径索引（不得悬空）。
 2. **失败路径约定**：必须写明
    - `failOnStartupError` 的取值与含义（MCP 客户端启动时连接 / 握手失败如何处理）；
    - 等待（`wait_for_messages`）与重连的超时阈值；
@@ -164,9 +164,9 @@ DSH 已作为一等公民 `hostType="dsh"` 接入，以下为真实实测证据�
 
 | 能力 | 宿主 | 版本 | 关键结果 | 证据文件（相对仓库根） |
 | --- | --- | --- | --- | --- |
-| 真实 join（入群成功） | DSH | 0.2.1-rc.5 | `{"ok":true,"memberId":"01M6GWWBTR..."}` | `.agent-output/real-host-retest/dsh-join.out` |
-| 等待中活唤醒（收到精确 messageId） | DSH | 0.2.1-rc.5 | `drainedBacklog:false` | `.agent-output/real-host-retest/dsh-wait.out` |
-| 证据索引与复现要点 | DSH | 0.2.1-rc.5 | 环境、逐项证据、复现步骤 | `.agent-output/real-host-retest/README.md` |
+| 真实 join（入群成功） | DSH | 0.2.1-rc.5 | `{"ok":true,"memberId":"01M6GWWBTR..."}` | `evidence/real-host-retest/dsh-join.out` |
+| 等待中活唤醒（收到精确 messageId） | DSH | 0.2.1-rc.5 | `drainedBacklog:false` | `evidence/real-host-retest/dsh-wait.out` |
+| 证据索引与复现要点 | DSH | 0.2.1-rc.5 | 环境、逐项证据、复现步骤 | `evidence/real-host-retest/README.md` |
 
 > **保守声明**：dsh 的 `reconnect`（断线重连补积压 `drainedBacklog:true`）与 `wakeIdle`（唤醒空闲宿主）**无真实实测**，按 NFR-HOST-02 一律保守视为 `unsupported`；不得据此声称 DSH 支持重连补投或空闲唤醒。
 
@@ -222,4 +222,4 @@ MCP **没有服务端→客户端主动推送**。agent 能收到消息的唯一
 - 端到端验收脚本：`node scripts/e2e-phase1.mjs`（真实 HTTP/MCP 服务端 + MCP SDK 客户端，覆盖 AC-CORE-01..09、11）。
 - 自动化测试：`npm test`；类型检查：`npm run typecheck`。
 - 逐项验收结论：`docs/t8-acceptance-report.md`。
-- 真实双宿主补验（Claude Code + Codex CLI 真机，2026-11-03）：`.agent-output/real-host-retest/README.md`。
+- 真实双宿主补验（Claude Code + Codex CLI 真机，2026-11-03）：`evidence/real-host-retest/README.md`。

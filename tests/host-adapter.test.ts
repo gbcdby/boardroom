@@ -103,9 +103,8 @@ test("能力默认值遵循 NFR-HOST-02：未声明即不承诺", () => {
   assert.equal(partial.capabilities.wakeIdle, false);
   assert.equal(partial.capabilities.reconnect, "unsupported");
 
-  // transports / joinConfig / evidence 缺省为安全值。
+  // transports / evidence 缺省为安全值（NFR-HOST-02：未声明即不承诺）。
   assert.deepEqual(partial.transports, []);
-  assert.deepEqual(partial.joinConfig, {});
   assert.deepEqual(partial.evidence, {});
 });
 

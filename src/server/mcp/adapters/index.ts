@@ -26,7 +26,6 @@ import type {
   HostCapabilities,
   HostEvidence,
   HostInterruptCapabilityValue,
-  HostJoinConfig,
   HostReconnectCapability,
   HostType,
 } from "./types.ts";
@@ -38,7 +37,6 @@ export type {
   HostCapabilities,
   HostEvidence,
   HostInterruptCapabilityValue,
-  HostJoinConfig,
   HostReconnectCapability,
   HostType,
 } from "./types.ts";
@@ -50,8 +48,17 @@ import { CLAUDE_CODE_ADAPTER } from "./claude-code.ts";
 import { CODEX_CLI_ADAPTER } from "./codex-cli.ts";
 import { DSH_ADAPTER } from "./dsh.ts";
 
-/** 已知宿主 id 集合：当前已认知的宿主。未来宿主只需注册，不必改这里（NFR-HOST-01）。 */
-export const KNOWN_HOST_TYPES: readonly HostType[] = ["claude-code", "codex-cli", "other"];
+/**
+ * 已知宿主 id 快照：仅为方便阅读的「当前已注册宿主」清单。
+ * 单一事实来源是下方注册表（{@link listAdapterIds} / `defaultRegistry`）；
+ * 新增宿主只需 `registerAdapter`，无需（也不应）改这里（NFR-HOST-01：核心不随宿主变化）。
+ */
+export const KNOWN_HOST_TYPES: readonly HostType[] = [
+  "claude-code",
+  "codex-cli",
+  "dsh",
+  "other",
+];
 
 /** 未知宿主的内建 id；所有未注册、非其它宿主都回退到它。 */
 export const UNKNOWN_HOST_ID = "other" as const;
