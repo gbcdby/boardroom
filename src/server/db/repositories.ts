@@ -16,6 +16,7 @@ import type {
   McpSession,
   McpSessionState,
   Member,
+  MemberLifecycleStatus,
   MemberRole,
   MemberState,
   MemberStatus,
@@ -125,6 +126,14 @@ export interface MembersRepository {
   findByAgent(projectId: string, agentId: string): Member | null;
   getManager(projectId: string): Member | null;
   update(id: string, patch: Partial<Pick<Member, "displayName" | "role">>): Member;
+  /**
+   * T3（#50）成员状态机：在合法转换表内切换生命周期状态。
+   * 只更新 `status` 与 `updated_at`，**不物理删除成员、不动岗位(node_id)/历史/数据/
+   * 群组参与/运行状态/连接状态**（LIFE-MEM-01/02/03）。
+   * - 同态 = 幂等 no-op；非法转换 → ConflictError；未知状态 → InvalidArgumentError；
+   *   成员不存在 → NotFoundError；归档项目 → ArchivedError（复用 T1 归档写规则）。
+   */
+  setStatus(id: string, status: MemberLifecycleStatus): Member;
   delete(id: string): void;
 }
 
@@ -271,6 +280,23 @@ export interface RepositorySet {
 const MEMBER_ROLES: readonly MemberRole[] = ["manager", "normal"];
 const MEMBER_STATES: readonly MemberState[] = ["online", "offline", "waiting", "working"];
 const DELIVERY_STATUSES: readonly DeliveryStatus[] = ["pending", "delivered", "acked"];
+
+/** T3（#50）：成员生命周期枚举（与迁移 v5 的 CHECK 约束一致）。 */
+const MEMBER_LIFECYCLE_STATUSES: readonly MemberLifecycleStatus[] = ["active", "disabled", "pending"];
+
+/**
+ * T3（#50）状态机合法转换表（fail-closed：表外转换一律拒绝）。
+ *
+ * - `pending` 是创建时的「待激活」初态：可激活（→active）或暂停（→disabled），激活后不再回到 pending。
+ * - `active ↔ disabled` 是「暂停 / 恢复」闭环：disabled **只能先 re-enable 回 active**
+ *   （恢复岗位，LIFE-MEM-02），不能直接跳到 pending；active 也不能直接退回 pending。
+ * - 任何转换都不删除成员行（可恢复、不物理删除，LIFE-MEM-01）。
+ */
+const MEMBER_STATUS_TRANSITIONS: Readonly<Record<MemberLifecycleStatus, readonly MemberLifecycleStatus[]>> = {
+  active: ["disabled"],
+  disabled: ["active"],
+  pending: ["active", "disabled"],
+};
 
 /** 创建 repository 集合；同一 db 连接共享。 */
 export function createRepositories(db: Database.Database): RepositorySet {
@@ -668,6 +694,8 @@ interface MemberRow {
   display_name: string;
   role: string;
   node_id: string | null;
+  /** T3 #50：生命周期状态（迁移 v5 起恒存在，默认 active）。 */
+  status: string;
   created_at: string;
   updated_at: string;
 }
@@ -681,6 +709,7 @@ function toMember(row: MemberRow): Member {
     displayName: row.display_name,
     role: row.role as MemberRole,
     nodeId: row.node_id ?? null,
+    status: row.status as MemberLifecycleStatus,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -734,16 +763,20 @@ function createMembers(db: Database.Database): MembersRepository {
       if (!MEMBER_ROLES.includes(role)) {
         throw new InvalidArgumentError(`Member.role 必须是 manager 或 normal，收到：${String(input.role)}。`);
       }
+      const status: MemberLifecycleStatus = input.status ?? "active";
+      if (!MEMBER_LIFECYCLE_STATUSES.includes(status)) {
+        throw new InvalidArgumentError(`Member.status 必须是 active/disabled/pending，收到：${String(input.status)}。`);
+      }
       const at = nowIso();
       const id = newId();
       runInTransaction(db, () => {
         if (role === "manager") requireNoOtherManager(input.projectId, id);
         db
           .prepare(
-            `INSERT INTO members (id, project_id, agent_id, kind, display_name, role, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO members (id, project_id, agent_id, kind, display_name, role, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
-          .run(id, input.projectId, agentId, input.kind, displayName, role, at, at);
+          .run(id, input.projectId, agentId, input.kind, displayName, role, status, at, at);
       });
       return repo.get(id)!;
     },
@@ -788,6 +821,28 @@ function createMembers(db: Database.Database): MembersRepository {
           .prepare("UPDATE members SET display_name = ?, role = ?, updated_at = ? WHERE id = ?")
           .run(displayName, role, nowIso(), id);
       });
+      return repo.get(id)!;
+    },
+    setStatus(id, status) {
+      const existing = repo.get(id);
+      if (!existing) throw new NotFoundError(`Member ${id} 不存在。`);
+      if (!MEMBER_LIFECYCLE_STATUSES.includes(status)) {
+        throw new InvalidArgumentError(`Member.status 必须是 active/disabled/pending，收到：${String(status)}。`);
+      }
+      // T1 #48：归档 = 非活跃态，写路径在 repository 这一唯一边界拒绝（与 members.update 同位）。
+      requireProjectActive(db, existing.projectId, "修改项目成员状态");
+      // 同态幂等：重复暂停/恢复不报错（ORG-07 无需逐次确认），且不改动任何数据。
+      if (existing.status === status) return existing;
+      if (!MEMBER_STATUS_TRANSITIONS[existing.status].includes(status)) {
+        throw new ConflictError(
+          `成员状态不能从 ${existing.status} 直接转换为 ${status}；disabled 只能先 re-enable 回 active，pending 为创建时的初态。`,
+        );
+      }
+      // 只改 status 与 updated_at；岗位、历史、数据、群组参与、运行/连接状态一律不动
+      // （disable 保留历史与数据、re-enable 恢复岗位，LIFE-MEM-01/02/03）。
+      runInTransaction(db, () =>
+        db.prepare("UPDATE members SET status = ?, updated_at = ? WHERE id = ?").run(status, nowIso(), id),
+      );
       return repo.get(id)!;
     },
     delete(id) {
