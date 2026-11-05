@@ -25,6 +25,8 @@ export class SqliteDriver implements DbDriver {
 
   private readonly dataDir: string;
   private opened: { db: Database.Database; file: string } | null = null;
+  /** SAVEPOINT 计数器：用于嵌套事务（事务内再开事务，#61）。 */
+  private spCounter = 0;
 
   constructor(options: SqliteDriverOptions) {
     this.dataDir = options.dataDir;
@@ -65,12 +67,12 @@ export class SqliteDriver implements DbDriver {
     return this.handle.prepare(sql).all(...params) as T[];
   }
 
-  async exec(sql: string, params: readonly unknown[] = []): Promise<void> {
+  async exec(sql: string, params: readonly unknown[] = []): Promise<number> {
     if (params.length === 0) {
       this.handle.exec(sql);
-      return;
+      return 0;
     }
-    this.handle.prepare(sql).run(...params);
+    return this.handle.prepare(sql).run(...params).changes;
   }
 
   async transaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T> {
@@ -78,21 +80,34 @@ export class SqliteDriver implements DbDriver {
     const tx: DbTransaction = {
       query: async <R extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []) =>
         db.prepare(sql).all(...params) as R[],
-      exec: async (sql, params = []) => {
-        if (params.length === 0) db.exec(sql);
-        else db.prepare(sql).run(...params);
+      // 事务内 exec：返回影响行数，与 SQLite `changes` 对齐（#61）。
+      exec: async (sql, params: readonly unknown[] = []) => {
+        if (params.length === 0) {
+          db.exec(sql);
+          return 0;
+        }
+        return db.prepare(sql).run(...params).changes;
       },
     };
-    // better-sqlite3 同步执行；驱动层把 await 点都收敛在同一事件循环轮次内，
-    // 不存在跨 await 的并发写，BEGIN IMMEDIATE 语义保持不变。
-    db.exec(this.dialect.beginTransaction());
+    // 嵌套事务（事务内再开事务，#61）用 SAVEPOINT 实现，回滚时只回到保存点，
+    // 不影响外层；非嵌套走阶段 1 的 BEGIN IMMEDIATE 语义。
+    const nested = db.inTransaction;
+    const sp = nested ? `s${++this.spCounter}` : null;
+    if (nested) db.exec(`SAVEPOINT ${sp}`);
+    else db.exec(this.dialect.beginTransaction());
     try {
       const result = await fn(tx);
-      db.exec(this.dialect.commit());
+      if (nested) db.exec(`RELEASE SAVEPOINT ${sp}`);
+      else db.exec(this.dialect.commit());
       return result;
     } catch (error) {
       try {
-        db.exec(this.dialect.rollback());
+        if (nested) {
+          db.exec(`ROLLBACK TO SAVEPOINT ${sp}`);
+          db.exec(`RELEASE SAVEPOINT ${sp}`);
+        } else {
+          db.exec(this.dialect.rollback());
+        }
       } catch {
         // 事务可能已因错误终止，回滚语句本身失败时保留原始错误。
       }

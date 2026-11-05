@@ -5,8 +5,25 @@ import { createHash } from "node:crypto";
 export interface Migration {
   readonly version: number;
   readonly name: string;
-  /** 单条或多条 SQL 语句；在事务内执行。 */
+  /** 单条或多条 SQL 语句；在事务内执行。SQLite 运行路径使用。 */
   readonly up: string;
+  /**
+   * 可选：PostgreSQL 运行路径的等效 DDL。缺省时回退到 {@link Migration.up}。
+   * 用于方言差异（例如 SQLite 的 `json_valid/json_type` CHECK 在 PG 不可用，
+   * 见 #61）。两方言的 checksum 各自独立，跨方言不影响既有库。
+   */
+  readonly upPostgres?: string;
+}
+
+/**
+ * 解析某迁移在给定方言下的实际执行 SQL。
+ * PostgreSQL 且 migration 提供 `upPostgres` 时使用它，否则回退到 `up`。
+ */
+export function migrationSql(migration: Migration, dialect: "sqlite" | "postgres"): string {
+  if (dialect === "postgres" && migration.upPostgres !== undefined) {
+    return migration.upPostgres;
+  }
+  return migration.up;
 }
 
 /** 迁移版本表名。 */
@@ -58,10 +75,10 @@ export function runMigrations(db: Database.Database, migrations: readonly Migrat
   for (const migration of ordered) {
     const existing = applied.get(migration.version);
     if (existing === undefined) continue;
-    if (existing.checksum !== checksumOf(migration)) {
+    if (existing.checksum !== checksumOf(migrationSql(migration, "sqlite"))) {
       throw new MigrationError(
         `迁移 ${migration.version} "${migration.name}" 已应用（${existing.appliedAt}），` +
-          `但 SQL 内容与当前代码不一致（checksum ${existing.checksum} → ${checksumOf(migration)}）。` +
+          `但 SQL 内容与当前代码不一致（checksum ${existing.checksum} → ${checksumOf(migrationSql(migration, "sqlite"))}）。` +
           `已应用的迁移不可修改；请新增一条迁移，或删除本地数据目录后重新初始化。`,
       );
     }
@@ -89,11 +106,12 @@ function applyOne(db: Database.Database, migration: Migration): void {
   const insert = db.prepare(
     `INSERT INTO ${MIGRATION_TABLE} (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)`,
   );
+  const upSql = migrationSql(migration, "sqlite");
 
   db.exec("BEGIN IMMEDIATE");
   try {
-    db.exec(migration.up);
-    insert.run(migration.version, migration.name, checksumOf(migration), new Date().toISOString());
+    db.exec(upSql);
+    insert.run(migration.version, migration.name, checksumOf(upSql), new Date().toISOString());
     db.exec("COMMIT");
   } catch (error) {
     try {
@@ -152,7 +170,10 @@ export function validateAndSort(migrations: readonly Migration[]): readonly Migr
   return [...migrations].sort((a, b) => a.version - b.version);
 }
 
-/** 迁移内容的稳定校验和；F1（#46）导出给跨方言迁移运行器复用。 */
-export function checksumOf(migration: Migration): string {
-  return createHash("sha256").update(migration.up).digest("hex").slice(0, 16);
+/**
+ * 迁移内容的稳定校验和；F1（#46）导出给跨方言迁移运行器复用。
+ * 入参为已解析的 SQL（经 {@link migrationSql}），与 `up`/`upPostgres` 解耦。
+ */
+export function checksumOf(sql: string): string {
+  return createHash("sha256").update(sql).digest("hex").slice(0, 16);
 }

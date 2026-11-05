@@ -2,9 +2,9 @@
  * 持久化驱动抽象与连接工厂（F1 #46）。
  *
  * 目标：SQLite 与 PostgreSQL 双驱动可经配置切换（`dbDriver`，默认 SQLite），
- * 阶段 1 既有行为不回归。业务仓储仍直接持有 SQLite 句柄
- * （SQLiteDriver.handle），全量切 PG 与数据迁移由 M1（#54）完成；
- * 本层是 M1 的 expand 落点与回滚开关（改配置切回 sqlite 即回滚）。
+ * 阶段 1 既有行为不回归。业务仓储经本文件的 DbDriver 抽象访问持久化
+ * （#61），不再直接持有 SQLite 句柄；全量切 PG 与数据迁移由 M1（#54）完成；
+ * 本层是 #61 的落点与回滚开关（改配置切回 sqlite 即回滚）。
  *
  * Seam：本文件的 DbDriver 接口 + createDbDriver 工厂（ticket #46 确认的测试 seam）。
  */
@@ -22,8 +22,11 @@ export type DbRow = Record<string, unknown>;
 export interface DbTransaction {
   /** 读取查询；参数使用统一 `?` 占位符。 */
   query<T extends DbRow = DbRow>(sql: string, params?: readonly unknown[]): Promise<T[]>;
-  /** 执行语句（DDL/DML），不返回行。 */
-  exec(sql: string, params?: readonly unknown[]): Promise<void>;
+  /**
+   * 执行语句（DDL/DML），不返回行；返回值为影响行数（与 SQLite `changes` 对齐，
+   * 便于仓储层保留 `result.changes === 0` 这类「写未命中」判定）。
+   */
+  exec(sql: string, params?: readonly unknown[]): Promise<number>;
 }
 
 /** 持久化驱动公共接口：connect → migrate → query/transaction → close。 */
@@ -39,9 +42,12 @@ export interface DbDriver {
   migrationState(): Promise<{ version: number; applied: AppliedMigration[] }>;
   /** 读取查询；参数使用统一 `?` 占位符，由方言渲染。 */
   query<T extends DbRow = DbRow>(sql: string, params?: readonly unknown[]): Promise<T[]>;
-  /** 执行语句（DDL/DML），不返回行；多语句迁移由 migrate() 内部处理。 */
-  exec(sql: string, params?: readonly unknown[]): Promise<void>;
-  /** 单个写事务：fn  reject 即整体回滚并向上抛出。 */
+  /**
+   * 执行语句（DDL/DML），不返回行；返回值为影响行数（与 SQLite `changes` 对齐）。
+   * 多语句迁移由 migrate() 内部处理，本方法面向仓储层的单语句读写。
+   */
+  exec(sql: string, params?: readonly unknown[]): Promise<number>;
+  /** 单个写事务：fn  reject 即整体回滚并向上抛出。支持 SAVEPOINT 嵌套（#61）。 */
   transaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T>;
   /** 关闭连接/连接池。未连接或已关闭时静默返回（幂等）。 */
   close(): Promise<void>;
