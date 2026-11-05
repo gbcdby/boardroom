@@ -5,7 +5,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Logger } from "../logger.ts";
-import { createMcpCore, type Heartbeat } from "./core.ts";
+import type { Actor } from "../authz/authorize.ts";
+import { createMcpCore, type Heartbeat, type SessionBinding } from "./core.ts";
 import { createMcpServer } from "./server.ts";
 
 /** MCP Streamable HTTP 端点路径（挂在 F1 的同一 HTTP server 上）。 */
@@ -21,6 +22,11 @@ export interface McpTransportOptions {
   readonly db: Database;
   /** T7：防环/限流阈值（跨会话共享限流器）。缺省用 D5 默认值。 */
   readonly antiLoop?: import("./core.ts").AntiLoopRuntimeOptions;
+  /**
+   * T2（#49）：F2 守卫的「会话绑定 → Actor」装配口。省略时 core 用阶段 1 兼容映射
+   * （`members.role` 的 manager/normal → top_manager/member），既有行为不变。
+   */
+  readonly actorFor?: (binding: SessionBinding) => Actor;
 }
 
 export interface McpSessionsHandler {
@@ -101,6 +107,7 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
       db: options.db,
       memberKey: "http",
       ...(options.antiLoop ? { antiLoop: options.antiLoop } : {}),
+      ...(options.actorFor ? { authz: { actorFor: options.actorFor } } : {}),
     });
     const server = createMcpServer({ core, logger: options.logger });
     const session: HttpSession = { transport, server, core, lastActivity: Date.now() };

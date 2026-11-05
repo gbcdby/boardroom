@@ -4,13 +4,23 @@ import type Database from "better-sqlite3";
 import type { HeartbeatConfig } from "./config.ts";
 import { RepositoryError } from "./db/errors.ts";
 import { createRepositories, type RepositorySet } from "./db/repositories.ts";
-import type { Group, Member, McpSession, Message as DbMessage, Project } from "./db/types.ts";
+import type {
+  Group,
+  Member,
+  McpSession,
+  Message as DbMessage,
+  OrgNode,
+  OrgNodeRole,
+  Project,
+} from "./db/types.ts";
 import type { Logger } from "./logger.ts";
 import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "./chat/routing.ts";
 import { buildRoster } from "./chat/roster.ts";
 import { resetGroupConsecutiveCount } from "./mcp/core.ts";
 import { deriveEffectiveStatus } from "./status.ts";
 import {
+  AUTHZ_ROLES,
+  ROLE_CAPABILITIES,
   authorizeOrThrow,
   ForbiddenError,
   visibleGroups,
@@ -20,6 +30,7 @@ import {
   type GuardScope,
 } from "./authz/authorize.ts";
 import { actorForMember, ownerActor } from "./authz/actors.ts";
+import { noopOrgChangeRecorder, type OrgChangeRecorder } from "./org-change-hook.ts";
 
 /**
  * T1（#14）项目 / 群组 / 成员 HTTP API。
@@ -71,6 +82,11 @@ export interface T1ApiOptions {
    * 权限判定与拒绝码全部沿用 `authorize`，本模块不自行判断。
    */
   readonly resolveActor?: (resolution: ActorResolution) => Actor | null;
+  /**
+   * T5（#52）审计/撤销接口钩子：本票只在组织/占岗变更处调用，不写 audit_log。
+   * 省略时用空实现；T5 注入真实 recorder 即接上统一审计表与人的撤销权。
+   */
+  readonly orgChangeRecorder?: OrgChangeRecorder;
 }
 
 export interface T1ApiRouter {
@@ -128,6 +144,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
    * 之后的 `const` 不会被执行到（详见本文件底部的函数声明区）。
    */
   const pendingPurges = new Map<string, { token: string; expiresAt: number }>();
+
+  // T2 #49 / T5 #52：审计钩子缺省空实现。同样必须在提前 return 之前初始化（TDZ 坑）。
+  const orgChangeRecorder: OrgChangeRecorder = options.orgChangeRecorder ?? noopOrgChangeRecorder;
 
   /** 默认主体：阶段 1 的人（owner）；给定 memberId 时用其成员行推导静态角色。 */
   function resolveDefaultActor(r: RepositorySet, resolution: ActorResolution): Actor {
@@ -441,10 +460,16 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         const body = await readObjectBody(request);
         const name = requireString(body, "name");
         const participantMemberIds = optionalStringArray(body, "participantMemberIds");
-        // F2：建群组 = group:create（GROUP-03；下级 manager 限子树等 T2 注入节点数据后生效）。
+        // F2：建群组 = group:create（GROUP-03）。T2 #49：附上参与者岗位节点，
+        // 下级 manager 建群时由守卫的 subtree 边界判定「参与者必须全部落在本子树内」（ORG-05）。
         guard(r, request, "group:create", {
           projectId,
-          ...(participantMemberIds === undefined ? {} : { groupMemberIds: participantMemberIds }),
+          ...(participantMemberIds === undefined
+            ? {}
+            : {
+                groupMemberIds: participantMemberIds,
+                groupMemberNodeIds: nodeIdsOfMembers(r, participantMemberIds),
+              }),
         });
         const group = r.groups.create({
           projectId,
@@ -456,18 +481,27 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         return true;
       }
       if (method === "GET") {
-        // 端点级判定 + #48 行级收窄：`visibleGroups` 只留下主体可见的群组
-        // （参与的、或全项目岗位看到的全部）；不可见的群组**不出现**，不泄漏存在。
+        // 端点级判定 + 行级收窄：`visibleGroups` 只留下主体可见的群组
+        // （参与的、全项目岗位看到的全部、或 sub_manager 子树只读可见的）；不可见者不出现。
+        // T2 #49：附上 `memberNodeIds`（来自 members.node_id），group:view_subtree 才有判定依据；
+        // 升级库无组织数据时全部为 null，owner/普通成员的行为与阶段 1 一致。
         const { actor } = guard(r, request, "group:view", { projectId });
         const includeArchived = truthyParam(request, "includeArchived");
         const candidates = r.groups.listByProject(projectId, { includeArchived });
-        const visible = new Set(
-          visibleGroups(
-            actor,
-            candidates.map((g) => ({ id: g.id, projectId, memberIds: r.groups.participants(g.id) })),
-          ).map((g) => g.id),
+        const visible = visibleGroups(
+          actor,
+          candidates.map((g) => {
+            const memberIds = r.groups.participants(g.id);
+            return { id: g.id, projectId, memberIds, memberNodeIds: nodeIdsOfMembers(r, memberIds) };
+          }),
         );
-        writeJson(response, 200, { groups: candidates.filter((g) => visible.has(g.id)).map(groupView) });
+        const byId = new Map(visible.map((v) => [v.id, v.writable]));
+        writeJson(response, 200, {
+          groups: candidates
+            .filter((g) => byId.has(g.id))
+            // writable=false = 子树只读可见（可看元数据与历史，不唤醒、不能发言，AC-ORG-07）。
+            .map((g) => ({ ...groupView(g), writable: byId.get(g.id)! })),
+        });
         return true;
       }
       methodNotAllowed(response, ["GET", "POST"]);
@@ -504,12 +538,22 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       const groupId = decodeSegment(segments[2]!);
       if (method === "GET") {
         const group = requireGroup(r, groupId);
-        guard(r, request, "group:view", {
+        const facts = groupGuardFacts(r, groupId);
+        const { actor } = guard(r, request, "group:view", {
           projectId: group.projectId,
           groupId,
-          groupMemberIds: r.groups.participants(groupId),
+          ...facts,
         });
-        writeJson(response, 200, { group: groupView(group) });
+        // 只读可见性：复用 visibleGroups 的判定给出 writable，供 WebUI 区分「可参与/只读」。
+        const [visibility] = visibleGroups(actor, [
+          {
+            id: groupId,
+            projectId: group.projectId,
+            memberIds: facts.groupMemberIds,
+            memberNodeIds: facts.groupMemberNodeIds,
+          },
+        ]);
+        writeJson(response, 200, { group: groupView(group), writable: visibility?.writable ?? false });
         return true;
       }
       if (method === "DELETE") {
@@ -534,7 +578,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         guard(r, request, "group:view", {
           projectId: group.projectId,
           groupId,
-          groupMemberIds: r.groups.participants(groupId),
+          ...groupGuardFacts(r, groupId),
         });
         const participants = r.groups
           .participants(groupId)
@@ -573,11 +617,12 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           throw new RepositoryError("invalid_reference", `发送者 ${senderMemberId} 不是该群组参与者。`);
         }
         // F2：发言 = group:post，以发送者为主体（参与范围由 group_participants 判定）。
+        // T2 #49：group:post 是 participation 边界——子树只读可见性不会扩成发言权。
         guard(
           r,
           request,
           "group:post",
-          { projectId: group.projectId, groupId, groupMemberIds: r.groups.participants(groupId) },
+          { projectId: group.projectId, groupId, ...groupGuardFacts(r, groupId) },
           senderMemberId,
         );
 
@@ -618,11 +663,12 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       }
 
       if (method === "GET") {
-        // F2：历史读取 = group:view（可见性判定；阶段 1 人是 owner → 全部可见，行为不变）。
+        // F2：历史读取 = group:view。T2 #49：附上参与者岗位节点，
+        // sub_manager 对「参与者全部在子树内」的群组可读历史（只读，不唤醒、不能发言）。
         guard(r, request, "group:view", {
           projectId: group.projectId,
           groupId,
-          groupMemberIds: r.groups.participants(groupId),
+          ...groupGuardFacts(r, groupId),
         });
         const limitRaw = new URL(request.url ?? "/", "http://127.0.0.1").searchParams.get("limit");
         const limit = limitRaw === null ? 200 : Math.min(Math.max(Number(limitRaw) || 200, 1), 500);
@@ -634,6 +680,197 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       }
 
       methodNotAllowed(response, ["GET", "POST"]);
+      return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // T2（#49）组织树与角色（ORG-01..08 / AC-ORG-* / AC-PERM-01）
+    //
+    // 守卫一律用 `org:manage` / `member:manage`（subtree 边界）：scope.nodeId 是目标岗位，
+    // sub_manager 越出自己子树即 `out_of_subtree`（ORG-05）；owner / top_manager 全项目放行。
+    // 角色是 F2 的静态枚举（ROLE_CAPABILITIES），只读目录随组织树一起返回，供 WebUI 配置入口使用。
+    // 变更只经 T5 审计钩子（本票不写 audit_log）。
+    // -----------------------------------------------------------------------
+
+    // GET /api/projects/:id/org —— 组织树 + 占岗成员 + 角色能力点目录
+    if (segments.length === 4 && segments[0] === "api" && segments[1] === "projects" && segments[3] === "org") {
+      const projectId = decodeSegment(segments[2]!);
+      requireProject(r, projectId);
+      if (method === "GET") {
+        guard(r, request, "project:view", { projectId });
+        const nodes = r.org.listNodes(projectId);
+        const members = r.members.listByProject(projectId);
+        writeJson(response, 200, {
+          nodes: nodes.map((n) => orgNodeView(n, memberAtNode(r, projectId, n.id))),
+          rootId: r.org.getRootNode(projectId)?.id ?? null,
+          roles: roleCatalog(),
+          members: members.map(memberView),
+        });
+        return true;
+      }
+      methodNotAllowed(response, ["GET"]);
+      return true;
+    }
+
+    // POST /api/projects/:id/org/nodes —— 建岗位（根 = 顶层 manager；子岗位限管理子树）
+    if (
+      segments.length === 5 &&
+      segments[0] === "api" &&
+      segments[1] === "projects" &&
+      segments[3] === "org" &&
+      segments[4] === "nodes"
+    ) {
+      const projectId = decodeSegment(segments[2]!);
+      requireProject(r, projectId);
+      if (method === "POST") {
+        const body = await readObjectBody(request);
+        const parentId = optionalStringOrNull(body, "parentId") ?? null;
+        const name = requireString(body, "name");
+        const role = requireOrgNodeRole(body, "role");
+        const sortOrder = optionalSortOrder(body);
+        // ORG-05：新岗位的父节点必须落在调用者的管辖子树内（root 仅 owner/top_manager 可建）。
+        guard(r, request, "org:manage", { projectId, nodeId: parentId });
+        const node = r.org.createNode({
+          projectId,
+          parentId,
+          name,
+          role,
+          ...(sortOrder === undefined ? {} : { sortOrder }),
+        });
+        orgChangeRecorder.record({
+          projectId,
+          action: "node.create",
+          nodeId: node.id,
+          memberId: null,
+          detail: { parentId, role, name },
+        });
+        log.info("创建组织岗位", { projectId, nodeId: node.id, role });
+        writeJson(response, 201, { node: orgNodeView(node, null) });
+        return true;
+      }
+      methodNotAllowed(response, ["POST"]);
+      return true;
+    }
+
+    // POST /api/projects/:id/org/auto-place —— manager 自动分配新成员岗位（ORG-02/08）
+    if (
+      segments.length === 5 &&
+      segments[0] === "api" &&
+      segments[1] === "projects" &&
+      segments[3] === "org" &&
+      segments[4] === "auto-place"
+    ) {
+      const projectId = decodeSegment(segments[2]!);
+      requireProject(r, projectId);
+      if (method === "POST") {
+        const body = await readObjectBody(request);
+        const memberId = requireString(body, "memberId");
+        guard(r, request, "member:manage", { projectId });
+        const node = r.org.autoPlaceMember(projectId, memberId);
+        orgChangeRecorder.record({
+          projectId,
+          action: "member.auto_place",
+          nodeId: node?.id ?? null,
+          memberId,
+          detail: { placed: node !== null },
+        });
+        writeJson(response, 200, {
+          node: node ? orgNodeView(node, memberAtNode(r, projectId, node.id)) : null,
+        });
+        return true;
+      }
+      methodNotAllowed(response, ["POST"]);
+      return true;
+    }
+
+    // PUT / DELETE /api/org/nodes/:nodeId —— 改岗位（改名/角色/汇报线/排序）与删岗位
+    if (segments.length === 4 && segments[0] === "api" && segments[1] === "org" && segments[2] === "nodes") {
+      const nodeId = decodeSegment(segments[3]!);
+      const node = r.org.getNode(nodeId);
+      if (!node) throw new RepositoryError("not_found", `组织岗位 ${nodeId} 不存在。`);
+      if (method === "PUT") {
+        const body = await readObjectBody(request);
+        const name = body["name"] === undefined ? undefined : requireString(body, "name");
+        const role = optionalOrgNodeRole(body);
+        const parentId = optionalParentId(body);
+        const sortOrder = optionalSortOrder(body);
+        const patch: Partial<Pick<OrgNode, "name" | "role" | "parentId" | "sortOrder">> = {
+          ...(name === undefined ? {} : { name }),
+          ...(role === undefined ? {} : { role }),
+          ...(parentId === undefined ? {} : { parentId }),
+          ...(sortOrder === undefined ? {} : { sortOrder }),
+        };
+        guard(r, request, "org:manage", { projectId: node.projectId, nodeId: node.id });
+        // 改汇报线时，新的父节点也必须落在管辖子树内（防越级搬迁）。
+        if (parentId !== undefined && parentId !== null) {
+          guard(r, request, "org:manage", { projectId: node.projectId, nodeId: parentId });
+        }
+        const updated = r.org.updateNode(nodeId, patch);
+        orgChangeRecorder.record({
+          projectId: node.projectId,
+          action: "node.update",
+          nodeId,
+          memberId: null,
+          detail: { patch },
+        });
+        writeJson(response, 200, { node: orgNodeView(updated, memberAtNode(r, node.projectId, nodeId)) });
+        return true;
+      }
+      if (method === "DELETE") {
+        guard(r, request, "org:manage", { projectId: node.projectId, nodeId: node.id });
+        r.org.deleteNode(nodeId);
+        orgChangeRecorder.record({
+          projectId: node.projectId,
+          action: "node.delete",
+          nodeId,
+          memberId: null,
+          detail: {},
+        });
+        response.writeHead(204, { "cache-control": "no-store" });
+        response.end();
+        return true;
+      }
+      methodNotAllowed(response, ["PUT", "DELETE"]);
+      return true;
+    }
+
+    // PUT /api/org/nodes/:nodeId/assignee —— 成员占岗 / 腾岗（一人一岗、人可调整）
+    if (
+      segments.length === 5 &&
+      segments[0] === "api" &&
+      segments[1] === "org" &&
+      segments[2] === "nodes" &&
+      segments[4] === "assignee"
+    ) {
+      const nodeId = decodeSegment(segments[3]!);
+      const node = r.org.getNode(nodeId);
+      if (!node) throw new RepositoryError("not_found", `组织岗位 ${nodeId} 不存在。`);
+      if (method === "PUT") {
+        const body = await readObjectBody(request);
+        // memberId 为 null = 腾出该岗位当前占据者；否则把指定成员指派到该岗位。
+        const memberId = optionalStringOrNull(body, "memberId") ?? null;
+        guard(r, request, "member:manage", { projectId: node.projectId, nodeId: node.id });
+        let targetId = memberId;
+        if (targetId === null) {
+          const current = memberAtNode(r, node.projectId, nodeId);
+          if (!current) {
+            writeJson(response, 200, { member: null });
+            return true;
+          }
+          targetId = current.id;
+        }
+        const member = r.org.assignNode(targetId, memberId === null ? null : nodeId);
+        orgChangeRecorder.record({
+          projectId: node.projectId,
+          action: "node.assign",
+          nodeId,
+          memberId: targetId,
+          detail: { assigned: memberId !== null },
+        });
+        writeJson(response, 200, { member: memberView(member) });
+        return true;
+      }
+      methodNotAllowed(response, ["PUT"]);
       return true;
     }
 
@@ -851,6 +1088,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       kind: member.kind,
       displayName: member.displayName,
       role: member.role,
+      // T2 #49：占岗锚点（null = 未落位；阶段 1 升级库一律为 null）。
+      nodeId: member.nodeId,
       createdAt: member.createdAt,
       updatedAt: member.updatedAt,
     };
@@ -866,6 +1105,54 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       // T1 #48：归档时间（null = 未归档）。
       archivedAt: group.archivedAt,
     };
+  }
+
+  /** T2 #49：岗位节点视图，附带「谁占据该岗位」。 */
+  function orgNodeView(node: OrgNode, member: Member | null) {
+    return {
+      id: node.id,
+      projectId: node.projectId,
+      parentId: node.parentId,
+      name: node.name,
+      role: node.role,
+      sortOrder: node.sortOrder,
+      createdAt: node.createdAt,
+      updatedAt: node.updatedAt,
+      memberId: member?.id ?? null,
+      memberDisplayName: member?.displayName ?? null,
+    };
+  }
+
+  /** 某岗位当前的占据成员（一人一岗，至多一个）。 */
+  function memberAtNode(r: RepositorySet, projectId: string, nodeId: string): Member | null {
+    return r.members.listByProject(projectId).find((m) => m.nodeId === nodeId) ?? null;
+  }
+
+  /** T2 #49：角色目录（F2 静态枚举 + 能力点矩阵），WebUI 角色配置入口的数据来源。 */
+  function roleCatalog() {
+    return AUTHZ_ROLES.map((role) => ({
+      role,
+      capabilities: [...ROLE_CAPABILITIES[role]],
+      // owner 是人的内建全局主体，不建立组织岗位节点。
+      nodeRole: role !== "owner",
+    }));
+  }
+
+  /** 参与者各自的岗位节点（顺序与 memberIds 对齐）；未落位用 null（升级库全部 null）。 */
+  function nodeIdsOfMembers(r: RepositorySet, memberIds: readonly string[]): (string | null)[] {
+    return memberIds.map((id) => r.members.get(id)?.nodeId ?? null);
+  }
+
+  /**
+   * T2 #49：群组参与事实（成员 + 岗位节点），供 F2 守卫的 subtree 边界与
+   * `group:view_subtree` 只读可见性判定（ORG-03 / #32 / AC-ORG-07）。
+   */
+  function groupGuardFacts(r: RepositorySet, groupId: string): {
+    groupMemberIds: string[];
+    groupMemberNodeIds: (string | null)[];
+  } {
+    const groupMemberIds = r.groups.participants(groupId);
+    return { groupMemberIds, groupMemberNodeIds: nodeIdsOfMembers(r, groupMemberIds) };
   }
 
   /**
@@ -989,6 +1276,45 @@ function optionalRole(body: Record<string, unknown>): "manager" | "normal" | und
   if (value === undefined) return undefined;
   if (value !== "manager" && value !== "normal") {
     throw new InvalidArgumentError("role 必须是 manager 或 normal。");
+  }
+  return value;
+}
+
+/** T2 #49：岗位角色是静态枚举，且 owner（人）不建岗位节点。 */
+function isNodeRole(value: unknown): value is OrgNodeRole {
+  return value === "top_manager" || value === "sub_manager" || value === "member";
+}
+
+function requireOrgNodeRole(body: Record<string, unknown>, field: string): OrgNodeRole {
+  const value = body[field];
+  if (!isNodeRole(value)) {
+    throw new InvalidArgumentError(
+      `${field} 必须是 top_manager / sub_manager / member（owner 是人的内建角色，不建岗位）。`,
+    );
+  }
+  return value;
+}
+
+function optionalOrgNodeRole(body: Record<string, unknown>): OrgNodeRole | undefined {
+  const value = body["role"];
+  if (value === undefined) return undefined;
+  return requireOrgNodeRole(body, "role");
+}
+
+/** 区分「未提供」(undefined) 与「显式置空」(null)：后者表示把岗位移到根层（repository 会拒绝）。 */
+function optionalParentId(body: Record<string, unknown>): string | null | undefined {
+  const value = body["parentId"];
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value !== "string") throw new InvalidArgumentError("parentId 必须是字符串或 null。");
+  return value;
+}
+
+function optionalSortOrder(body: Record<string, unknown>): number | undefined {
+  const value = body["sortOrder"];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new InvalidArgumentError("sortOrder 必须是有限数字。");
   }
   return value;
 }

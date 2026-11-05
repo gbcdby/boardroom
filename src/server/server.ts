@@ -16,6 +16,9 @@ import { MCP_HTTP_PATH, createMcpSessionsHandler, type McpSessionsHandler } from
 import { createT1ApiRouter, type ActorResolution } from "./api.ts";
 import type { WsActorContext } from "./ws.ts";
 import type { Actor } from "./authz/authorize.ts";
+import type { SessionBinding } from "./mcp/core.ts";
+import { createOrgActorResolver } from "./authz/org-actors.ts";
+import type { OrgChangeRecorder } from "./org-change-hook.ts";
 import { buildStatusBoard } from "./status.ts";
 
 /** WebSocket 端点路径。 */
@@ -27,13 +30,18 @@ export class ServerStartupError extends Error {
 }
 
 /**
- * F2（#47）入口主体注入点。
- * 省略 = 阶段 1 单用户、无认证：HTTP/WS 的连接主体一律是「人（owner）」，守卫放行。
- * 接入认证或 T2 组织数据后在这里返回真实 Actor（含 nodeId / subtreeNodeIds）。
+ * F2（#47）入口主体注入点；T2（#49）默认装配真实组织数据。
+ *
+ * 省略 `authorization` 时，`startServer` 用 `createOrgActorResolver` 读真实
+ * `org_nodes` / `members.node_id`：有岗位数据就注入 `nodeId` / `subtreeNodeIds`；
+ * 升级库默认无组织数据时逐入口回退到阶段 1 兼容映射（人=owner），既有行为不变。
+ * 测试/未来认证可显式注入覆盖三个解析点。
  */
 export interface ServerAuthorization {
   readonly resolveHttpActor?: (resolution: ActorResolution) => Actor | null;
   readonly resolveWsActor?: (context: WsActorContext) => Actor | null;
+  /** MCP 会话绑定 → 带岗位与子树的 Actor（注入到 core 的 `authz.actorFor`）。 */
+  readonly resolveMcpActor?: (binding: SessionBinding) => Actor;
 }
 
 export interface StartServerOptions {
@@ -43,6 +51,8 @@ export interface StartServerOptions {
   readonly webRoot?: string;
   /** F2 权限守卫主体注入（默认阶段 1 人=owner，行为不变）。 */
   readonly authorization?: ServerAuthorization;
+  /** T5（#52）审计/撤销接口钩子；本票不写 audit_log，留装配口。 */
+  readonly orgChangeRecorder?: OrgChangeRecorder;
 }
 
 export interface RunningServer {
@@ -164,6 +174,16 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     log.warn("启动恢复清理失败", { error });
   }
 
+  // T2（#49）：把 F2 的纯权限结构接到真实 DB 数据。未显式注入 authorization 时，
+  // 三个入口统一用 org_nodes / members.node_id 装配 Actor；无组织数据的升级库
+  // 逐入口回退到阶段 1 兼容映射（人=owner），AC-CORE-* 行为不变。
+  const orgResolver = createOrgActorResolver(createRepositories(db));
+  const authorization: ServerAuthorization = options.authorization ?? {
+    resolveHttpActor: (resolution) => orgResolver.resolveHttpActor(resolution),
+    resolveWsActor: (context) => orgResolver.resolveWsActor(context),
+    resolveMcpActor: (binding) => orgResolver.actorForMcpBinding(binding),
+  };
+
   const webuiBuilt = await isWebUiBuilt(webRoot);
   if (!webuiBuilt) {
     log.warn("WebUI 构建产物缺失，静态页面将不可用", {
@@ -177,6 +197,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     heartbeat: config.heartbeat,
     db,
     antiLoop: { ...(config.antiLoop ? { config: config.antiLoop } : {}) },
+    ...(authorization.resolveMcpActor ? { actorFor: authorization.resolveMcpActor } : {}),
   });
   // T3：人的消息广播目标。hub 在 httpServer 之后创建，这里用晚绑定回调占位。
   let broadcastMessage: (message: import("./api.ts").MessageView) => void = () => {};
@@ -185,9 +206,8 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     logger,
     heartbeat: config.heartbeat,
     onMessage: (message) => broadcastMessage(message),
-    ...(options.authorization?.resolveHttpActor
-      ? { resolveActor: options.authorization.resolveHttpActor }
-      : {}),
+    ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}),
+    ...(options.orgChangeRecorder ? { orgChangeRecorder: options.orgChangeRecorder } : {}),
   });
 
   const httpServer = createServer((request, response) => {
@@ -242,9 +262,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     path: WS_PATH,
     heartbeat: config.heartbeat,
     logger,
-    ...(options.authorization?.resolveWsActor
-      ? { resolveActor: options.authorization.resolveWsActor }
-      : {}),
+    ...(authorization.resolveWsActor ? { resolveActor: authorization.resolveWsActor } : {}),
   });
 
   // T3：把人的消息通过 WebSocket 广播给 WebUI（阶段 1 WebUI = 人，可见全部群组消息）。
