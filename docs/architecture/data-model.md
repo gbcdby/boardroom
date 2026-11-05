@@ -1,8 +1,8 @@
 # 数据模型与持久化
 
 状态：已确认
-日期：2026-10-22（2026-11-05 补 T2 #49 组织树）
-来源：F2 #12（子 spec #2 §4/§6.5/§8.2）；决策 D1 #4、D2 #5；T2 #49（决策票 #24/#25/#26/#32）。
+日期：2026-10-22（2026-11-05 补 T2 #49 组织树、T3 #50 成员生命周期状态）
+来源：F2 #12（子 spec #2 §4/§6.5/§8.2）；决策 D1 #4、D2 #5；T2 #49（决策票 #24/#25/#26/#32）；T3 #50（决策票 #27/#28、spec #45 §6.3/§6.4）。
 
 本文描述服务端的持久化数据模型：实体、关系、约束、ID 方案、迁移策略与事务边界。它是长期有效的架构说明，供 T1–T7 与后续阶段复用；具体表结构以 `src/server/db/migrations/index.ts` 为准。
 
@@ -25,7 +25,7 @@ MemberStatus >─ Project + Member
 | --- | --- | --- |
 | **Agent** | 跨项目的全局身份 | `display_name`、`host_type`、`last_seen_at` |
 | **Project** | 协作容器；按项目作用域建模（阶段 2 起多项目并用） | `name`、`archived_at` |
-| **Member** | agent 或人在项目中的成员关系与岗位 | `project_id`、`agent_id`、`kind`、`role`、`node_id` |
+| **Member** | agent 或人在项目中的成员关系与岗位 | `project_id`、`agent_id`、`kind`、`role`、`node_id`、`status` |
 | **OrgNode** | 组织岗位节点（多层树，汇报线 = `parent_id`） | `project_id`、`parent_id`、`name`、`role`、`sort_order` |
 | **Group** | 项目内聊天空间（一项目多群组） | `project_id`、`name`、`archived_at` |
 | **group_participants** | 群组参与者（多对多关系表） | `group_id`、`member_id` |
@@ -76,8 +76,32 @@ MemberStatus >─ Project + Member
 - **阶段 1 兼容硬约束**：v3→v4 迁移只建结构、**不回填组织数据**，升级后的库默认无组织树；
   `resolveActor` 在无占岗数据时回退到 `members.role` 的 manager/normal → top_manager/member 兼容映射
   （默认人 = owner 全量能力点），因此 AC-CORE-* 不回归。
-- 成员生命周期状态机（T3 #50）、审计写入与撤销（T5 #52）、任务表（阶段 3）不属本票；
-  本票只在入口留 `OrgChangeRecorder` 接口钩子，不写 `audit_log`。
+- 成员生命周期状态（T3 #50，见 §1.6）迁移 v5 已在 `members.status` 落地；审计写入与撤销（T5 #52）、
+  任务表（阶段 3）不属本票；本票只在入口留 `OrgChangeRecorder` 接口钩子，不写 `audit_log`
+  （T3 的成员状态变更同样只调用该钩子，见 `src/server/org-change-hook.ts`）。
+
+### 1.6 成员生命周期状态（阶段 2 T3 #50）
+
+- `members.status`（迁移 v5）是「成员在不在岗」的**持久化标记**，静态枚举
+  `active / disabled / pending`（CHECK 约束 + `NOT NULL DEFAULT 'active'`）：
+  - `active`：正常在岗；`disabled`：已暂停/停用；`pending`：待激活（登记后尚未正式在岗）。
+- **与其它状态严格分开建模**（`AGENTS.md`「身份注册、连接心跳、工作状态、任务状态分开建模」）：
+  - `member_statuses.state`（online/offline/waiting/working）是项目成员**运行状态**；
+  - `mcp_sessions`（connected/disconnected + 心跳）是**连接状态**；
+  - `members.status` 是**生命周期/在岗状态**。断连不删除成员、不改写本列（LIFE-MEM-03），
+    在线/离线由连接与心跳表达，不复用本枚举。
+- **状态机**（唯一写入边界 `MembersRepository.setStatus`，`src/server/db/repositories.ts`）：
+  `active → disabled`（暂停）、`disabled → active`（re-enable 恢复岗位）、
+  `pending → active | disabled`（激活 / 暂停）；同态幂等，表外转换（如 `disabled → pending`）
+  抛 `ConflictError`，未知值 `InvalidArgumentError`，归档项目 `ArchivedError`（复用 T1 归档写规则）。
+- **可恢复、不物理删除**（LIFE-MEM-01/02）：disable 只改 `status` 与 `updated_at`，
+  成员行、身份(`agent_id`/`kind`/`display_name`)、`role`、岗位(`node_id`)、群组参与关系、
+  消息/投递历史、`member_statuses`、`mcp_sessions` 一行都不动；re-enable 回到 `active`，
+  岗位与数据原样恢复生效（不清除/重建 `org_nodes`）。
+- 老库升级（v4 → v5）只 `ALTER TABLE ADD COLUMN`，**默认 `active`、不回填业务数据**，
+  阶段 1 既有成员/入群链路行为不变（AC-CORE-* 由 `scripts/e2e-phase1.mjs` 回归）。
+- 状态变更在 HTTP 入口只调用 `OrgChangeRecorder` 钩子（`member.disable` / `member.enable` /
+  `member.status_change`），**不写 `audit_log`**（审计写入与撤销属 T5 #52）。
 
 ## 2. 稳定 ID 方案
 
@@ -112,9 +136,13 @@ MemberStatus >─ Project + Member
   - `4 org_tree_and_static_roles`：`org_nodes` 组织树、`members.node_id` 占岗锚点、
     `ux_org_nodes_single_root` / `ux_members_node` 唯一索引；移除与多层树冲突的旧
     `ux_members_project_manager`（T2 #49）。**不回填组织数据**，升级库默认无组织树。
+  - `5 member_lifecycle_status`：`members.status` 生命周期枚举（active/disabled/pending）、
+    CHECK 约束、`NOT NULL DEFAULT 'active'` 与 `ix_members_project_status` 索引（T3 #50）。
+    **只加列、默认 active、不回填**，升级库老成员一律 active（见 §1.6）。
   - F1 只建立 `schema_migrations` 版本表，无领域表。
 - 迁移 SQL 双方言中立（`ALTER TABLE ADD COLUMN` + 普通索引）；业务表按 PostgreSQL 方言重写属 M1 #54。
-- `schema.test.ts` 校验 `EXPECTED_VERSION = 4`、v2→v4 与 v3→v4 升级路径与旧数据不丢失。
+- `schema.test.ts` 校验 `EXPECTED_VERSION = 5`、v2→v5 / v3→v5 / v4→v5 升级路径、
+  `status` 列默认与 CHECK 约束、旧数据不丢失。
 
 ## 5. 事务与并发
 
@@ -145,7 +173,7 @@ MemberStatus >─ Project + Member
 | --- | --- |
 | `agents` | `create / get / list / update / touchLastSeen / delete / insertRaw` |
 | `projects` | `create / get / list({includeArchived}) / rename / archive / restore / previewPurge / purge / delete` |
-| `members` | `create / get / listByProject / getManager / update / delete` |
+| `members` | `create / get / listByProject / getManager / update / setStatus / delete`（T3 #50：`setStatus` 为生命周期状态机唯一写入边界） |
 | `org`（T2 #49） | `createNode / getNode / listNodes / getRootNode / subtreeNodeIds / updateNode / deleteNode / assignNode / autoPlaceMember / nodeOfMember` |
 | `groups` | `create / get / listByProject({includeArchived}) / archive / restore / previewPurge / purge / participants / addParticipant / removeParticipant / delete` |
 | `messages` | `create / get / listByGroup({afterSeq, limit})` |
@@ -164,6 +192,8 @@ MemberStatus >─ Project + Member
 - `groups.purge(id)`：该群组的 `message_deliveries` → `messages` → `group_participants` → `mcp_sessions`
   → `groups`。**`members` 与 `member_statuses` 不动**——这是与删项目的关键差别。
 - 任务、评论（阶段 3）与三层记忆（阶段 4）落库后按同一顺序补进清单；当前不声称已覆盖。
+- **T3 #50 复核**：成员生命周期状态不改变上述级联边界——删群组不动 `members`（含 `status`），
+  删项目清除其 `members`；任务/评论/记忆表尚未建表（决策票 #28），阶段 2 的级联清单即当前已落库范围。
 
 ## 8. 阶段 1 边界
 
