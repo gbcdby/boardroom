@@ -85,6 +85,12 @@ export interface WebSocketHub {
   humanPresenceCount(projectId: string): number;
   /** 某项目当前在线的人的 memberId 集合（测试用）。 */
   humanPresenceMembers(projectId: string): readonly string[];
+  /**
+   * T4（#51）：当前被客户端声明 presence 的项目集合。
+   * 用于归档项目的「按需快照」——归档项目默认不进周期快照（T1 unresolved），
+   * 仅当某客户端显式声明其 presence 时才推送，避免泄漏与非必要开销。
+   */
+  declaredProjectIds(): readonly string[];
   /** 关闭所有连接并释放升级监听。 */
   close(): Promise<void>;
 }
@@ -253,6 +259,13 @@ export function createWebSocketHub(options: WebSocketHubOptions): WebSocketHub {
         if (decl.projectId === projectId && decl.memberId !== null) ids.push(decl.memberId);
       }
       return ids;
+    },
+    declaredProjectIds() {
+      const ids = new Set<string>();
+      for (const decl of presence.values()) {
+        if (decl.projectId !== "") ids.add(decl.projectId);
+      }
+      return [...ids];
     },
     async close() {
       clearInterval(heartbeatTimer);

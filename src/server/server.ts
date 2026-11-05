@@ -291,7 +291,18 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   const statusRepos = createRepositories(db);
   const statusPublisher = (): void => {
     const nowDate = new Date();
-    for (const project of statusRepos.projects.list()) {
+    const projects = statusRepos.projects.list(); // 活跃项目（默认出周期快照）
+    const known = new Set(projects.map((p) => p.id));
+    // T4（#51）：归档项目默认不进周期快照（T1 unresolved / 归档=非活跃）。
+    // 仅当某 WebUI 客户端通过 presence 显式声明该归档项目时，才按需推送其快照，
+    // 触发条件由前端「显示已归档」开关切换 presence 产生。
+    const declared = new Set(hub.declaredProjectIds());
+    for (const pid of declared) {
+      if (known.has(pid)) continue;
+      const archived = statusRepos.projects.get(pid);
+      if (archived && archived.archivedAt !== null) projects.push(archived);
+    }
+    for (const project of projects) {
       try {
         const statuses = buildStatusBoard(statusRepos, project.id, {
           heartbeat: config.heartbeat,
