@@ -1,8 +1,8 @@
 # 数据模型与持久化
 
 状态：已确认
-日期：2026-10-22
-来源：F2 #12（子 spec #2 §4/§6.5/§8.2）；决策 D1 #4、D2 #5。
+日期：2026-10-22（2026-11-05 补 T2 #49 组织树）
+来源：F2 #12（子 spec #2 §4/§6.5/§8.2）；决策 D1 #4、D2 #5；T2 #49（决策票 #24/#25/#26/#32）。
 
 本文描述服务端的持久化数据模型：实体、关系、约束、ID 方案、迁移策略与事务边界。它是长期有效的架构说明，供 T1–T7 与后续阶段复用；具体表结构以 `src/server/db/migrations/index.ts` 为准。
 
@@ -11,6 +11,9 @@
 ```
 Agent (全局身份)
   └─< Member (项目成员关系, 项目级 role) >─ Project
+OrgNode (组织岗位, 树) ─┬─> Project
+  └─< 自关联 parent_id（汇报线）
+        └─< Member.node_id（占岗锚点）
 Group (项目内聊天空间) >─ Project
   └─< group_participants >─ Member
 Message >─ Group, Member(发送者)
@@ -22,7 +25,8 @@ MemberStatus >─ Project + Member
 | --- | --- | --- |
 | **Agent** | 跨项目的全局身份 | `display_name`、`host_type`、`last_seen_at` |
 | **Project** | 协作容器；按项目作用域建模（阶段 2 起多项目并用） | `name`、`archived_at` |
-| **Member** | agent 或人在项目中的成员关系与岗位 | `project_id`、`agent_id`、`kind`、`role` |
+| **Member** | agent 或人在项目中的成员关系与岗位 | `project_id`、`agent_id`、`kind`、`role`、`node_id` |
+| **OrgNode** | 组织岗位节点（多层树，汇报线 = `parent_id`） | `project_id`、`parent_id`、`name`、`role`、`sort_order` |
 | **Group** | 项目内聊天空间（一项目多群组） | `project_id`、`name`、`archived_at` |
 | **group_participants** | 群组参与者（多对多关系表） | `group_id`、`member_id` |
 | **Message** | 群组消息 | `group_id`、`sender_member_id`、`seq`、`body`、`mentions` |
@@ -41,11 +45,13 @@ MemberStatus >─ Project + Member
 - **Status 与 Agent 连接状态分开建模**：Status 是项目成员作用域的运行状态；Agent 连接状态是全局 MCP 会话层面、由心跳推导的瞬时状态。两者不共用表、不互相写入。
 - **与任务状态分开**：阶段 1 不实现任务；任务状态属于未来的 Task 实体，不复用 MemberStatus。
 
-### 1.3 项目级 role（D2）
+### 1.3 项目级 role（D2）与阶段 2 兼容投影
 
 - `members.role` 取值 `manager` / `normal`，默认 `normal`。
-- **每项目最多一个顶层 manager**：由部分唯一索引 `ux_members_project_manager ON members(project_id) WHERE role='manager'` 强制。不同项目各自可有一个 manager。
-- 阶段 1 只此两值；完整角色/权限矩阵留阶段 2。
+- 阶段 1 由部分唯一索引 `ux_members_project_manager ON members(project_id) WHERE role='manager'` 强制「每项目最多一个顶层 manager」。
+- **T2 #49（迁移 v4）已移除该索引**（与多层组织树冲突）。此后 `members.role` 只是**阶段 1 兼容投影**：
+  真实顶层岗位由组织树根节点（`org_nodes`，`role='top_manager'`）表达，「至多一个 legacy manager」的不变量
+  下沉到 `members` repository 应用层校验；占据/让出根节点时同步升降 `role`，保证升级路径与 T1 API 一致。
 
 ### 1.4 归档标记（阶段 2 #48）
 
@@ -54,6 +60,24 @@ MemberStatus >─ Project + Member
 - 读侧默认只取未归档行（列表带 `includeArchived` 可选放宽）；写侧在 repository 这一唯一写入边界拒绝
   （`ArchivedError` / code `archived`），HTTP 与 MCP 因此共享同一规则。
 - **归档 ≠ 删除**：永久删除由 repository 的 `purge` 显式级联清除（见 §7），与归档标记无关。
+
+### 1.5 组织树、角色与能力点（阶段 2 T2 #49）
+
+- `org_nodes` 表达「岗位 + 汇报线」：`parent_id` 自关联形成多层树（人 → 顶层 manager → 下级 manager / 成员），
+  **递归 CTE 现算子树**（SQLite 侧 `WITH RECURSIVE`，统一 `?` 占位符经 F1 方言抽象），不建闭包表。
+- 根节点（`parent_id IS NULL`）每项目最多一个（`ux_org_nodes_single_root`），该位置即唯一的顶层 manager 岗位；
+  空岗（无成员占据）允许存在。
+- **角色与岗位分离**：`org_nodes.role` 是静态枚举 `owner / top_manager / sub_manager / member`（与 F2
+  `AUTHZ_ROLES` 同值）；`owner` 是人的内建全局主体，不建节点。能力点不落库，由 F2 的
+  `ROLE_CAPABILITIES` / `CAPABILITY_BOUNDARY` 静态矩阵表达；`group:view_subtree` 让下级 manager 对
+  「参与者全部落在自己子树内」的群组只读可见（可看元数据与历史，不唤醒、不能发言，决策票 #32）。
+- `members.node_id` 是刚性外键锚点：`ON DELETE SET NULL` 保证删岗位只腾出岗位、成员保留；
+  `ux_members_node` 保证「一人一岗、一岗一实例」。删岗位时子树提升到父，不级联删。
+- **阶段 1 兼容硬约束**：v3→v4 迁移只建结构、**不回填组织数据**，升级后的库默认无组织树；
+  `resolveActor` 在无占岗数据时回退到 `members.role` 的 manager/normal → top_manager/member 兼容映射
+  （默认人 = owner 全量能力点），因此 AC-CORE-* 不回归。
+- 成员生命周期状态机（T3 #50）、审计写入与撤销（T5 #52）、任务表（阶段 3）不属本票；
+  本票只在入口留 `OrgChangeRecorder` 接口钩子，不写 `audit_log`。
 
 ## 2. 稳定 ID 方案
 
@@ -85,8 +109,12 @@ MemberStatus >─ Project + Member
   - `1 init_domain_model`：建立全部领域表、索引与外键（F2）。
   - `2 mcp_sessions_and_agent_identity`：Agent 全局身份唯一索引 + `mcp_sessions` 连接状态表（T2）。
   - `3 archive_flags_for_project_and_group`：项目/群组 `archived_at` 标记与列表索引（T1 #48）。
+  - `4 org_tree_and_static_roles`：`org_nodes` 组织树、`members.node_id` 占岗锚点、
+    `ux_org_nodes_single_root` / `ux_members_node` 唯一索引；移除与多层树冲突的旧
+    `ux_members_project_manager`（T2 #49）。**不回填组织数据**，升级库默认无组织树。
   - F1 只建立 `schema_migrations` 版本表，无领域表。
 - 迁移 SQL 双方言中立（`ALTER TABLE ADD COLUMN` + 普通索引）；业务表按 PostgreSQL 方言重写属 M1 #54。
+- `schema.test.ts` 校验 `EXPECTED_VERSION = 4`、v2→v4 与 v3→v4 升级路径与旧数据不丢失。
 
 ## 5. 事务与并发
 
@@ -118,6 +146,7 @@ MemberStatus >─ Project + Member
 | `agents` | `create / get / list / update / touchLastSeen / delete / insertRaw` |
 | `projects` | `create / get / list({includeArchived}) / rename / archive / restore / previewPurge / purge / delete` |
 | `members` | `create / get / listByProject / getManager / update / delete` |
+| `org`（T2 #49） | `createNode / getNode / listNodes / getRootNode / subtreeNodeIds / updateNode / deleteNode / assignNode / autoPlaceMember / nodeOfMember` |
 | `groups` | `create / get / listByProject({includeArchived}) / archive / restore / previewPurge / purge / participants / addParticipant / removeParticipant / delete` |
 | `messages` | `create / get / listByGroup({afterSeq, limit})` |
 | `deliveries` | `ensure / get / recordAttempt / listPending / delete` |
@@ -130,8 +159,8 @@ MemberStatus >─ Project + Member
 不只依赖外键级联，好让「确认清单里的计数」与「实际清除的行」一一对应，也便于 M1 按方言重写。
 
 - `projects.purge(id)`：`message_deliveries`（按项目）→ `messages`（按项目内群组）→ `group_participants`
-  → `groups` → `mcp_sessions` → `member_statuses` → `members` → `projects`。
-  全局 `agents` 不删（同一 agent 可在其他项目继续任职）。
+  → `groups` → `mcp_sessions` → `member_statuses` → `members` → **`org_nodes`（T2 #49，成员先删避免悬空占岗外键）**
+  → `projects`。`PurgeCounts` 增加 `orgNodes` 计数；全局 `agents` 不删（同一 agent 可在其他项目继续任职）。
 - `groups.purge(id)`：该群组的 `message_deliveries` → `messages` → `group_participants` → `mcp_sessions`
   → `groups`。**`members` 与 `member_statuses` 不动**——这是与删项目的关键差别。
 - 任务、评论（阶段 3）与三层记忆（阶段 4）落库后按同一顺序补进清单；当前不声称已覆盖。
