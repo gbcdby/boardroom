@@ -21,10 +21,12 @@ const DOMAIN_TABLES = [
   "mcp_sessions",
   // T2 #49：组织树岗位节点（决策票 #24：成员「占据」节点，汇报线 = parent_id）。
   "org_nodes",
+  // T5 #52：最小审计单表（append-only、无外键、项目/群组被删后痕迹仍在）。
+  "audit_log",
 ] as const;
 
-/** 期望的最高迁移版本（F2 v1 + T2 #15 v2 + T1 #48 v3 归档 + T2 #49 v4 组织树 + T3 #50 v5 成员状态）。 */
-const EXPECTED_VERSION = 5;
+/** 期望的最高迁移版本（F2 v1 + T2 #15 v2 + T1 #48 v3 归档 + T2 #49 v4 组织树 + T3 #50 v5 成员状态 + T5 #52 v6 审计）。 */
+const EXPECTED_VERSION = 6;
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-schema-"));
@@ -183,11 +185,11 @@ test("阶段 1 已有库（v2）升级到当前版本：补上归档列与组织
         T,
       );
 
-      // 2) 再跑当前迁移列表：只追加 v3、v4、v5，已有行保留、归档列初值为 NULL
+      // 2) 再跑当前迁移列表：只追加 v3、v4、v5、v6，已有行保留、归档列初值为 NULL
       const result = runMigrations(db, migrations);
       assert.deepEqual(
         result.applied.map((m) => m.version),
-        [3, 4, 5],
+        [3, 4, 5, 6],
       );
       assert.equal(result.version, EXPECTED_VERSION);
       assert.equal(
@@ -239,11 +241,11 @@ test("v3 库升级到当前版本（v4 组织树 + v5 成员状态）：旧数�
         .prepare("INSERT INTO members (id, project_id, kind, display_name, role, created_at, updated_at) VALUES (?, ?, 'human', ?, 'normal', ?, ?)")
         .run("m-nrm", "p-old", "老成员", T, T);
 
-      // 2) 执行当前迁移：只追加 v4（组织树）与 v5（成员状态）。
+      // 2) 执行当前迁移：追加 v4（组织树）、v5（成员状态）与 v6（audit_log 空表）。
       const result = runMigrations(db, migrations);
       assert.deepEqual(
         result.applied.map((m) => m.version),
-        [4, 5],
+        [4, 5, 6],
       );
       assert.equal(result.version, EXPECTED_VERSION);
 
@@ -315,11 +317,11 @@ test("v4 库升级到 v5：成员状态列默认 active、旧数据不丢、状�
         "INSERT INTO members (id, project_id, kind, display_name, role, created_at, updated_at) VALUES (?, ?, 'human', ?, 'normal', ?, ?)",
       ).run("m-old", "p-old", "老成员", T, T);
 
-      // 2) 追加 v5：只加列，不回填业务数据（默认 active），旧行可恢复读取。
+      // 2) 追加 v5、v6：v5 只加列不回填（默认 active），v6 建 audit_log 空表；旧行可恢复读取。
       const result = runMigrations(db, migrations);
       assert.deepEqual(
         result.applied.map((m) => m.version),
-        [5],
+        [5, 6],
       );
       assert.equal(result.version, EXPECTED_VERSION);
       assert.equal(
@@ -343,6 +345,61 @@ test("v4 库升级到 v5：成员状态列默认 active、旧数据不丢、状�
       db.prepare("UPDATE members SET status = 'active' WHERE id = ?").run("m-old");
 
       // 4) 幂等。
+      assert.deepEqual(runMigrations(db, migrations).applied, []);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("v5 库升级到 v6：audit_log 为空表、旧数据不丢、审计写入可用（#52 升级路径）", async () => {
+  await withTempDir(async (dir) => {
+    const { db } = openDatabase(dir);
+    try {
+      // 1) 跑到 v5（T3 #50 之后的现有库形态），留阶段 1 语义的旧成员（无 audit_log）。
+      runMigrations(
+        db,
+        migrations.filter((m) => m.version <= 5),
+      );
+      const T = "2026-01-01T00:00:00.000Z";
+      db.prepare("INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)").run("p-old", "老项目", T, T);
+      db.prepare(
+        "INSERT INTO members (id, project_id, kind, display_name, role, created_at, updated_at) VALUES (?, ?, 'human', ?, 'normal', ?, ?)",
+      ).run("m-old", "p-old", "老成员", T, T);
+
+      // 2) 追加 v6：只建 audit_log，不回填、不影响既有数据。
+      const result = runMigrations(db, migrations);
+      assert.deepEqual(result.applied.map((m) => m.version), [6]);
+      assert.equal(result.version, EXPECTED_VERSION);
+
+      // 3) v6 只建表、空表：项目被删除后审计痕迹才需要存活，升级路径上审计本就为空。
+      assert.equal((db.prepare("SELECT COUNT(*) AS c FROM audit_log").get() as { c: number }).c, 0);
+
+      // 4) 旧数据原样保留（#52 硬约束：既有数据不受影响）。
+      assert.equal(
+        (db.prepare("SELECT display_name FROM members WHERE id = ?").get("m-old") as { display_name: string })
+          .display_name,
+        "老成员",
+      );
+      assert.equal(
+        (db.prepare("SELECT status FROM members WHERE id = ?").get("m-old") as { status: string }).status,
+        "active",
+      );
+
+      // 5) 升级后的库上审计写入可用：append-only 行能落库且字段完整。
+      db.prepare(
+        `INSERT INTO audit_log
+           (id, project_id, actor_kind, actor_name, action, target_kind, target_id, target_name, created_at)
+         VALUES (?, ?, 'human', '人（owner）', 'member.add', 'member', ?, '老成员', ?)`,
+      ).run("a-1", "p-old", "m-old", T);
+      const row = db.prepare("SELECT * FROM audit_log WHERE id = ?").get("a-1") as Record<string, unknown>;
+      assert.equal(row.project_id, "p-old");
+      assert.equal(row.action, "member.add");
+      // 无外键：即便 projects 被删，审计行仍在（#30 设计兜底；此处仅验证列/表可用）。
+      db.prepare("DELETE FROM projects WHERE id = ?").run("p-old");
+      assert.equal((db.prepare("SELECT COUNT(*) AS c FROM audit_log").get() as { c: number }).c, 1);
+
+      // 6) 幂等。
       assert.deepEqual(runMigrations(db, migrations).applied, []);
     } finally {
       db.close();
