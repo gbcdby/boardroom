@@ -10,6 +10,8 @@ import type { Migration } from "../migrate.ts";
  * T2（#49）新增 `org_tree_and_static_roles`：`org_nodes` 组织树（岗位 + 汇报线）、
  * `members.node_id` 占岗锚点与「一人一岗」唯一索引；移除与多层树冲突的旧
  * `ux_members_project_manager`（决策票 #24；阶段 1 兼容语义下沉到 repository 应用层校验）。
+ * T3（#50）新增 `member_lifecycle_status`：`members.status` 生命周期枚举
+ * （active/disabled/pending），老库默认 active、可恢复、不物理删除。
  *
  * 规则：版本号递增，一旦应用就不可修改（runner 校验 checksum）；后续票只追加迁移。
  */
@@ -239,6 +241,26 @@ export const migrations: readonly Migration[] = [
       -- 保证升级路径与 e2e-phase1 行为不变。回填岗位**不自动执行**：
       -- 升级后的库默认无组织树数据（票面硬约束），由人经 WebUI/API 建立（ORG-08）。
       DROP INDEX ux_members_project_manager;
+    `,
+  },
+  {
+    version: 5,
+    name: "member_lifecycle_status",
+    up: `
+      -- T3（#50）成员生命周期状态（LIFE-MEM-01/02/03；决策票 #27）。
+      --
+      -- active / disabled / pending 是「成员在不在岗」的**持久化标记**：
+      --   active   = 正常在岗；
+      --   disabled = 已暂停/停用（保留身份、历史、数据、岗位与群组参与，不物理删除）；
+      --   pending  = 待激活（已登记、尚未正式在岗）。
+      -- 与 member_statuses（online/offline/waiting/working 运行状态）、mcp_sessions
+      -- （连接/心跳状态）分开建模：断连不删除成员、不改写本列（LIFE-MEM-03）。
+      -- 只加列 + CHECK + 列表索引：老库一律默认 active（阶段 1 行为不回归），
+      -- 不回填业务数据、不删任何行；disable/re-enable 的状态机在 members repository。
+      ALTER TABLE members ADD COLUMN status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'disabled', 'pending'));
+
+      CREATE INDEX ix_members_project_status ON members (project_id, status);
     `,
   },
 ];
