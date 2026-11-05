@@ -229,6 +229,10 @@ export interface MessagesRepository {
   create(input: NewMessage): Message;
   get(id: string): Message | null;
   listByGroup(groupId: string, options?: MessageListOptions): Message[];
+  /** T4（#51）：项目内消息总数（跨其全部群组），用于跨项目概览的「消息数」。 */
+  countByProject(projectId: string): number;
+  /** T4（#51）：项目内最近一条消息的时间（ISO），无消息则返回 null（用于「最近活跃」）。 */
+  latestByProject(projectId: string): string | null;
 }
 
 export interface DeliveriesRepository {
@@ -1141,6 +1145,22 @@ function createMessages(db: Database.Database): MessagesRepository {
           .prepare("SELECT * FROM messages WHERE group_id = ? AND seq > ? ORDER BY seq LIMIT ?")
           .all(groupId, afterSeq, limit) as MessageRow[]
       ).map(toMessage);
+    },
+    countByProject(projectId) {
+      const row = db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM messages m JOIN groups g ON g.id = m.group_id WHERE g.project_id = ?`,
+        )
+        .get(projectId) as { c: number };
+      return row.c;
+    },
+    latestByProject(projectId) {
+      const row = db
+        .prepare(
+          `SELECT MAX(m.created_at) AS t FROM messages m JOIN groups g ON g.id = m.group_id WHERE g.project_id = ?`,
+        )
+        .get(projectId) as { t: string | null };
+      return row.t;
     },
   };
 }
