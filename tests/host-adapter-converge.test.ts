@@ -246,7 +246,7 @@ test("AC-HOST-01：登记一个仅含适配模块的新宿主后，join 即成�
 
       const core = createMcpCore({ logger: silentLogger, db: ctx.db, memberKey: "ac-host-01" });
       try {
-        const r = core.join("s", {
+        const r = await core.join("s", {
           displayName: "TempHostMember",
           hostType: TEMP_ID as never,
           projectId: ctx.projectId,
@@ -255,12 +255,12 @@ test("AC-HOST-01：登记一个仅含适配模块的新宿主后，join 即成�
         assert.ok(r.memberId, "新宿主应成功入群（join 由注册表驱动，无需改 core）");
 
         // 能力默认未承诺：interrupt 取适配器缺省 unsupported。
-        const outcome = core.attemptInterrupt("s");
+        const outcome = await core.attemptInterrupt("s");
         assert.equal(outcome.result, "unsupported", "未声明能力的宿主 interrupt 默认 unsupported");
         assert.equal(getAdapter(TEMP_ID as never).capabilities.wakeIdle, false);
         assert.equal(getAdapter(TEMP_ID as never).capabilities.reconnect, "unsupported");
       } finally {
-        core.close();
+        await core.close();
       }
     } finally {
       // 清理全局注册表，避免污染其它用例。
@@ -273,15 +273,15 @@ test("AC-HOST-01：登记一个仅含适配模块的新宿主后，join 即成�
 test("AC-HOST-04：四宿主的 buildInterruptReason 均取自适配器 interruptReasonNote，无硬编码分支", async () => {
   await withCoreCtx(async (ctx) => {
     for (const hostType of KNOWN_HOSTS) {
-      const m = ctx.spawn(`t4-${hostType}`, `T4-${hostType}`, hostType);
+      const m = await ctx.spawn(`t4-${hostType}`, `T4-${hostType}`, hostType);
       // idle：reason 恒含 hostNote；running：按 unsupported 结果拼接 hostNote。
-      const idle = m.core.attemptInterrupt(m.sessionId);
+      const idle = await m.core.attemptInterrupt(m.sessionId);
       const note = getAdapter(hostType as never).interruptReasonNote ?? "宿主能力未知";
       assert.ok(
         idle.reason.includes(note),
         `${hostType} 的打断依据应包含适配器 interruptReasonNote（${note}）`,
       );
-      m.core.close();
+      await m.core.close();
     }
   });
 });
