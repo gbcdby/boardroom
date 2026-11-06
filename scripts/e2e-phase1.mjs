@@ -136,6 +136,12 @@ const config = {
   heartbeat: { intervalMs: 500, timeoutMs: 5000 },
   antiLoop: { maxConsecutiveAutoReplies: 6, maxWakesPerMinutePerMember: 20 },
   configFile: null,
+  // #61：允许经环境变量切到 PostgreSQL 复跑 e2e（缺省仍为 SQLite）。
+  // dbDriver=postgres 时必须同时提供 AGENT_STUDIO_PG_CONNECTION_STRING。
+  dbDriver: process.env["AGENT_STUDIO_DB_DRIVER"] === "postgres" ? "postgres" : "sqlite",
+  ...(process.env["AGENT_STUDIO_PG_CONNECTION_STRING"]
+    ? { pgConnectionString: process.env["AGENT_STUDIO_PG_CONNECTION_STRING"] }
+    : {}),
 };
 
 let server = await startServer({ config, logger: silentLogger });
@@ -153,8 +159,18 @@ try {
   const webHtml = await web.text();
   check("AC-CORE-01", "WebUI 首页可访问（返回 HTML）", web.status === 200 && /<html|<!doctype/i.test(webHtml),
     `GET / → ${web.status}, ${webHtml.length} bytes`);
-  check("AC-CORE-01", "数据库文件已初始化", (await import("node:fs")).existsSync(path.join(dir, "agent-studio.db")),
-    "data/agent-studio.db 存在");
+  // #61：SQLite 下「数据库文件已初始化」= 本地 db 文件存在；PostgreSQL 下无本地文件，
+  // 健康报告 status=ok 已证明连接可达且迁移完成，等价视为已初始化。
+  const dbInitialized =
+    config.dbDriver === "postgres"
+      ? health.json?.status === "ok"
+      : (await import("node:fs")).existsSync(path.join(dir, "agent-studio.db"));
+  check(
+    "AC-CORE-01",
+    "数据库已初始化",
+    dbInitialized,
+    config.dbDriver === "postgres" ? "PostgreSQL 连接健康（status=ok）" : "data/agent-studio.db 存在",
+  );
   check("AC-CORE-01", "MCP Streamable HTTP 端点存在", typeof server.mcpUrl === "string" && server.mcpUrl.endsWith("/mcp"),
     server.mcpUrl);
 

@@ -3,7 +3,6 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import type { AppConfig } from "./config.ts";
 import { createDbDriver, type DbDriver } from "./db/driver.ts";
-import { SqliteDriver } from "./db/drivers/sqlite.ts";
 import type { MigrationState } from "./db/migrate.ts";
 import { migrations } from "./db/migrations/index.ts";
 import { buildHealthReport } from "./health.ts";
@@ -120,7 +119,6 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     throw new ServerStartupError((error as Error).message);
   }
 
-  const db = (driver as SqliteDriver).handle;
   let migrationState: MigrationState;
   try {
     const result = await driver.migrate(migrations);
@@ -223,8 +221,8 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
         writeJson(response, 405, { error: "method_not_allowed" });
         return;
       }
-      const report = buildHealthReport({
-        db,
+      const report = await buildHealthReport({
+        db: driver,
         heartbeat: config.heartbeat,
         startedAt,
         migrationCount: migrations.length,

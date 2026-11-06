@@ -130,14 +130,12 @@ test("Member：每项目最多一个 manager", async () => {
       (error: unknown) => error instanceof ConflictError,
     );
 
-    // 提升第二个成员为 manager 也应失败。
+    // 提升第二个成员为 manager 也应失败（每项目最多一个顶层 manager，update 路径同样校验）。
     const normal = (await ((await (repos.members.create({ projectId: project.id, kind: "human", displayName: "普通" })))));
-    // TODO(#61 / foundation): Members.update() 未调用 requireNoOtherManager，
-    // 提升第二个成员为 manager 当前不会抛 ConflictError（与 create 的「每项目最多一个 manager」
-    // 不变量不一致）。该不变量仅在 create 路径由应用层校验，update 路径缺失，属 repositories.ts
-    // 设计缺口。待 foundation 在 update 补齐校验后，恢复为：
-    //   await assert.rejects(async () => repos.members.update(normal.id, { role: "manager" }), e => e instanceof ConflictError);
-    await repos.members.update(normal.id, { role: "manager" });
+    await assert.rejects(
+      async () => (await repos.members.update(normal.id, { role: "manager" })),
+      (error: unknown) => error instanceof ConflictError,
+    );
   });
 });
 

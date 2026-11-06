@@ -181,14 +181,10 @@ test("岗位指派：一人一岗、一岗一实例；跨项目拒绝（AC-ORG-0
 
     (await ((await (repos.org.assignNode(m1.id, root.id)))));
     assert.equal((await ((await (repos.members.get(m1.id)))))?.nodeId, root.id);
-    // 一岗一实例：同岗位第二次指派 → 冲突（#24 ux_members_node）。
-    // TODO(#61 / foundation): applyAssignment 直接走 ctx.exec，未把 ux_members_node 唯一约束
-    // 归一为 ConflictError（repository 层其它约束路径也未统一接入 normalizeError）。底层 SQLite
-    // 确实拒绝了重复占岗（UNIQUE constraint failed: members.node_id），不变量在 DB 层成立；
-    // 这里放宽校验：接受归一后的 ConflictError 或底层唯一约束错误，待 foundation 补齐归一后收紧。
+    // 一岗一实例：同岗位第二次指派 → 冲突（#24 ux_members_node，由 withTransaction 归一为 ConflictError）。
     await assert.rejects(
       async () => (await ((await (repos.org.assignNode(m2.id, root.id))))),
-      (e: unknown) => e instanceof ConflictError || (e instanceof Error && /UNIQUE constraint failed/i.test(e.message)),
+      (e: unknown) => e instanceof ConflictError,
     );
     // 一人一岗：改派即移动（成员只占一个岗位）。
     (await ((await (repos.org.assignNode(m1.id, a.id)))));
@@ -220,12 +216,12 @@ test("岗位指派同步阶段 1 兼容角色：占顶层岗者成为 legacy man
         (await ((await (repos.members.create({ projectId: project.id, kind: "human", displayName: "抢位者", role: "manager" }))))),
       (e: unknown) => e instanceof ConflictError,
     );
-    // TODO(#61 / foundation): 此处原本断言 Members.update(agentMember, { role: "manager" })
-    // 抛 ConflictError（与 create 路径「每项目最多一个 manager」一致）。但当前 update 路径未调用
-    // requireNoOtherManager，实际会 resolve，属 repositories.ts 设计缺口（与 repositories.test.ts
-    // 「每项目最多一个 manager」同源）。foundation 在 update 补齐校验后，恢复为：
-    //   await assert.rejects(async () => repos.members.update(agentMember.id, { role: "manager" }), e => e instanceof ConflictError);
-    await repos.members.update(agentMember.id, { role: "manager" });
+    // 直接把第二人升为 manager 必须被拒（与 create 路径「每项目最多一个 manager」一致）；
+    // 合法晋升需经 assignNode 到根岗位（同级事务内降旧 manager）。
+    await assert.rejects(
+      async () => (await repos.members.update(agentMember.id, { role: "manager" })),
+      (e: unknown) => e instanceof ConflictError,
+    );
 
     // 占据顶层岗位 → 同一事务内旧 manager 降 normal、新占岗者升 manager（兼容映射一致）。
     (await ((await (repos.org.assignNode(agentMember.id, root.id)))));

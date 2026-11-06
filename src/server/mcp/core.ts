@@ -809,27 +809,13 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         return { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false };
       }
 
-      const afterSeq = cursorToSeq(params.afterCursor);
-      const backlog = await (deliverableSince(binding, afterSeq));
-      if (backlog.length > 0) {
-        const delivered = await (markDelivered(binding, backlog));
-        // 立即拿到积压：不在等待循环中停留，跳过 waiting 直接进入 working（处理收到的消息）。
-        await (markWorking(binding));
-        log.debug("wait_drained_backlog", { memberId: binding.memberId, count: delivered.messages.length });
-        return {
-          ok: true,
-          status: "message",
-          messages: delivered.messages,
-          cursor: seqCursor(delivered.lastSeq),
-          drainedBacklog: true,
-        };
-      }
-
+      // #61/PG：先登记挂起等待（入队 pendingWaits + waitingMembers），再做任何异步读取。
+      // PostgreSQL 下 deliverableSince / markWaiting 是网络往返、延迟更大；若不先登记，
+      // 唤醒（resolveGroup）可能在等待登记前执行，导致消息漏投（SQLite 延迟小不易暴露）。
       waitingMembers.add(binding.memberId);
-      // 进入等待循环 = 显式「在等待」→ waiting（T4/AGENT-04）。
-      await (markWaiting(binding));
-      return await new Promise<WaitResult>((resolve) => {
-        const entry: PendingWait = {
+      let entry!: PendingWait;
+      const waitPromise = new Promise<WaitResult>((resolve) => {
+        entry = {
           ownerKey: memberKey,
           memberId: binding.memberId,
           groupId: binding.groupId,
@@ -853,7 +839,6 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
             drainedBacklog: false,
           }));
         }, timeoutMs);
-
         if (params.signal) {
           entry.abortListener = async () => {
             log.debug("wait_cancelled", { memberId: binding.memberId });
@@ -867,9 +852,35 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
           };
           params.signal.addEventListener("abort", entry.abortListener, { once: true });
         }
-
         pendingWaits.push(entry);
       });
+
+      const afterSeq = cursorToSeq(params.afterCursor);
+      const backlog = await (deliverableSince(binding, afterSeq));
+      if (backlog.length > 0) {
+        const delivered = await (markDelivered(binding, backlog));
+        // 立即拿到积压：不在等待循环中停留，跳过 waiting 直接进入 working（处理收到的消息）。
+        await (markWorking(binding));
+        log.debug("wait_drained_backlog", { memberId: binding.memberId, count: delivered.messages.length });
+        await (settle(entry, {
+          ok: true,
+          status: "message",
+          messages: delivered.messages,
+          cursor: seqCursor(delivered.lastSeq),
+          drainedBacklog: true,
+        }));
+        return {
+          ok: true,
+          status: "message",
+          messages: delivered.messages,
+          cursor: seqCursor(delivered.lastSeq),
+          drainedBacklog: true,
+        };
+      }
+
+      // 进入等待循环 = 显式「在等待」→ waiting（T4/AGENT-04）。
+      await (markWaiting(binding));
+      return await waitPromise;
     },
 
     async sendMessage(sessionId, params) {

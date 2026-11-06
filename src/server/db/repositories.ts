@@ -372,6 +372,10 @@ export function createRepositories(db: DbDriver): RepositorySet {
         active = tx;
         try {
           return await fn();
+        } catch (error) {
+          // #61：与原 runInTransaction 一致，事务体内错误归一化为 RepositoryError
+          // （唯一/主键冲突 → ConflictError，跨双方言），避免裸驱动错误逃逸。
+          throw normalizeError(error);
         } finally {
           active = prev;
         }
@@ -406,13 +410,16 @@ function normalizeError(error: unknown): RepositoryError {
   const err = error as { code?: string; message?: string };
   const code = err?.code ?? "";
   const message = err?.message ?? String(error);
-  if (code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT_PRIMARYKEY") {
+  // 唯一/主键冲突 → ConflictError（SQLite 与 PostgreSQL 双方言对齐）。
+  if (code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT_PRIMARYKEY" || code === "23505") {
     return new ConflictError(`唯一约束冲突：${message}`, error);
   }
-  if (code === "SQLITE_CONSTRAINT_FOREIGNKEY") {
+  // 外键冲突 → InvalidReferenceError。
+  if (code === "SQLITE_CONSTRAINT_FOREIGNKEY" || code === "23503") {
     return new InvalidReferenceError(`外键约束失败：${message}`, error);
   }
-  if (code.startsWith("SQLITE_CONSTRAINT")) {
+  // 其余约束（NOT NULL / CHECK 等）→ InvalidArgumentError。
+  if (code.startsWith("SQLITE_CONSTRAINT") || code === "23514" || code === "23502") {
     return new InvalidArgumentError(`约束校验失败：${message}`, error);
   }
   return new WriteFailedError(`写入数据库失败：${message}`, error);
@@ -884,12 +891,16 @@ function createMembers(ctx: RepoCtx): MembersRepository {
         patch.displayName === undefined ? existing.displayName : requireNonEmpty(patch.displayName, "Member.displayName");
       const role =
         patch.role === undefined ? existing.role : requireNonEmpty(patch.role, "Member.role");
-      await ctx.withTransaction(async () =>
-        ctx.exec(
+      await ctx.withTransaction(async () => {
+        if (role === "manager" && existing.role !== "manager") {
+          // 阶段 1 语义：每项目至多一个顶层 manager，提升第二名为 manager 必须拒绝。
+          await requireNoOtherManager(existing.projectId, id);
+        }
+        await ctx.exec(
           "UPDATE members SET display_name = ?, role = ?, updated_at = ? WHERE id = ?",
           [displayName, role, nowIso(), id],
-        ),
-      );
+        );
+      });
       return (await this.get(id))!;
     },
     async setStatus(id, status) {
@@ -1193,10 +1204,15 @@ function createMessages(ctx: RepoCtx): MessagesRepository {
     async listByGroup(groupId, options = {}) {
       const afterSeq = options.afterSeq ?? 0;
       const limit = options.limit ?? -1;
-      return (await ctx.query<MessageRow>(
-        "SELECT * FROM messages WHERE group_id = ? AND seq > ? ORDER BY seq LIMIT ?",
-        [groupId, afterSeq, limit],
-      )).map(toMessage);
+      const params: unknown[] = [groupId, afterSeq];
+      let sql = "SELECT * FROM messages WHERE group_id = ? AND seq > ? ORDER BY seq";
+      // #61/PG：SQLite 接受 LIMIT -1 表示「不限」，但 PostgreSQL 拒绝负数 LIMIT。
+      // 统一在 limit<=0 时省略 LIMIT 子句（两方言均支持）。
+      if (limit > 0) {
+        sql += " LIMIT ?";
+        params.push(limit);
+      }
+      return (await ctx.query<MessageRow>(sql, params)).map(toMessage);
     },
     async countByProject(projectId) {
       const row = await ctx.one<CountRow>(

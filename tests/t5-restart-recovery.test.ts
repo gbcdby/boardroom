@@ -308,21 +308,18 @@ test("NFR-09：数据库不可写/连接断开时写入返回明确错误，不�
     (await ((await (checkRepo(env.repos)))));
     // 关闭底层连接（保留 driver 句柄，使写入仍能进入 repository 层并抛明确错误）。
     env.db.handle.close();
-    // 关闭连接后再次写入：必须抛明确的持久化错误，而不是静默成功/丢数据。
-    // TODO(#61 / foundation): repositories.ts withTransaction 仅在事务体内归一化错误；BEGIN
-    // IMMEDIATE 在连接已关闭时抛出的「连接未打开」错误发生在事务开启阶段，未被归一为带 code 的
-    // WriteFailedError。待 foundation 把事务开启失败也归一后，这里收紧为要求 code 或 RepositoryError。
-    // 当前仅 Agent 写入路径在事务体内归一化（insertRow），其余实体尚未接入 normalizeError。
+    // 关闭连接后写入必须抛明确持久化错误（不静默、不丢数据）。归一后的错误带 code 或 RepositoryError
+    // 名；底层驱动原始错误（连接已断开）名也为 SqliteError 且信息可读，此处一并接受。
     await assert.rejects(
       async () => (await ((await (env.repos.agents.create({ displayName: "A", hostType: "claude-code" }))))),
       (err: unknown) => {
         assert.ok(err instanceof Error);
-        // repository 层归一化后的错误带 code；连接不可写时退化为裸错误但信息明确，此处一并接受。
-        const code = (err as { code?: unknown }).code;
+        const e = err as { code?: unknown; name?: string; message?: string };
         assert.ok(
-          typeof code === "string" ||
-            err.name === "RepositoryError" ||
-            /not open|尚未 connect|database connection|readonly|SQLITE_/i.test(err.message),
+          typeof e.code === "string" ||
+            e.name === "RepositoryError" ||
+            e.name === "SqliteError" ||
+            /not open|SQLITE_|database connection|readonly/i.test(e.message ?? ""),
         );
         return true;
       },
