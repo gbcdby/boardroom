@@ -9,7 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createLogger } from "../src/server/logger.ts";
 import { createMcpCore } from "../src/server/mcp/core.ts";
 import { createMcpServer } from "../src/server/mcp/server.ts";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -25,7 +25,7 @@ const silentLogger = createLogger({ level: "error", write: () => {} });
  */
 
 interface Ctx {
-  readonly db: Database.Database;
+  readonly db: SqliteDriver;
   readonly repos: RepositorySet;
   readonly projectId: string;
   readonly groupId: string;
@@ -33,15 +33,18 @@ interface Ctx {
 
 async function withDb<T>(fn: (ctx: Ctx) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-t3-"));
-  const { db } = openDatabase(dir);
+  const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
   runMigrations(db, migrations);
-  const repos = createRepositories(db);
-  const project = repos.projects.create({ name: "P" });
-  const group = repos.groups.create({ projectId: project.id, name: "G" });
+  const repos = createRepositories(driver);
+  const project = (await ((await (repos.projects.create({ name: "P" })))));
+  const group = (await ((await (repos.groups.create({ projectId: project.id, name: "G" })))));
   try {
-    return await fn({ db, repos, projectId: project.id, groupId: group.id });
+    return await fn({ db: driver, repos, projectId: project.id, groupId: group.id });
   } finally {
-    if (db.open) db.close();
+    await driver.close();
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -126,7 +129,7 @@ test("manager 被其他成员的未点名消息唤醒", async () => {
     const a = await spawn(ctx, "a");
     try {
       const mId = await join(ctx, m, "Manager");
-      ctx.repos.members.update(mId, { role: "manager" });
+      (await ((await (ctx.repos.members.update(mId, { role: "manager" })))));
       // 重新入群让绑定拿到 manager 角色（join 复用成员，重新读取 role 在 core 内已固化，
       // 因此这里再建一个 core 绑定也无必要：wake 判定每次都从 DB 读 roster role）。
       await join(ctx, a, "Alice");
@@ -164,7 +167,7 @@ test("发送者排除：自己等待时不会被自己刚发的消息唤醒", as
 test("未参与群组不可见：外部成员的历史读取不包含该群消息（无泄漏）", async () => {
   await withDb(async (ctx) => {
     // 另建一个群组；外部成员只在这个群，看不到原群消息。
-    const otherGroup = ctx.repos.groups.create({ projectId: ctx.projectId, name: "Other" });
+    const otherGroup = (await ((await (ctx.repos.groups.create({ projectId: ctx.projectId, name: "Other" })))));
     const a = await spawn(ctx, "a");
     const outsider = await spawn(ctx, "o");
     try {
@@ -203,12 +206,12 @@ test("普通 agent 的 read_history 只含自己发送 + 被 @；manager 含全�
       const aId = await join(ctx, a, "Alice");
       await join(ctx, b, "Bob");
       const mId = await join(ctx, m, "Manager");
-      ctx.repos.members.update(mId, { role: "manager" });
+      (await ((await (ctx.repos.members.update(mId, { role: "manager" })))));
 
       await a.call("send_message", { text: `只给 Bob @${(await (async () => {
         // 取 b 的 memberId
-        return ctx.repos.members.listByProject(ctx.projectId).find((x) => x.displayName === "Bob")!.id;
-      })())}`, mentions: [ctx.repos.members.listByProject(ctx.projectId).find((x) => x.displayName === "Bob")!.id] });
+        return (await ((await (ctx.repos.members.listByProject(ctx.projectId))))).find((x) => x.displayName === "Bob")!.id;
+      })())}`, mentions: [(await ((await (ctx.repos.members.listByProject(ctx.projectId))))).find((x) => x.displayName === "Bob")!.id] });
 
       const bHist = await b.call("read_history", {});
       const bTexts = (bHist["messages"] as Array<{ text: string }>).map((x) => x.text);
@@ -241,7 +244,7 @@ test("@all 通过 MCP 展开为在线参与者快照并唤醒在线普通 agent"
       const msg = (got["messages"] as Array<{ text: string; mentions: string[] }>)[0]!;
       assert.equal(msg.text, "通知 @all 开会");
       // @all 快照写入持久化 mentions（Bob 在快照里，Alice 是发送者被排除）。
-      assert.ok(msg.mentions.includes(ctx.repos.members.listByProject(ctx.projectId).find((x) => x.displayName === "Bob")!.id));
+      assert.ok(msg.mentions.includes((await ((await (ctx.repos.members.listByProject(ctx.projectId))))).find((x) => x.displayName === "Bob")!.id));
       assert.ok(!msg.mentions.includes(aId), "@all 快照不应包含发送者");
     } finally {
       await a.close();

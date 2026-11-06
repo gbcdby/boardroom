@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import type { RepoCtx } from "./db/repositories.ts";
 import { newId } from "./db/ids.ts";
 import type { Actor } from "./authz/authorize.ts";
 import type { OrgChange, OrgChangeAction } from "./org-change-hook.ts";
@@ -13,6 +13,9 @@ import type { OrgChange, OrgChangeAction } from "./org-change-hook.ts";
  * 本模块是纯数据 + 持久化 + 映射：不读 org_nodes/members 业务表、不实现反向业务写
  * （补偿事务在 api.ts 的撤销入口里用 T2/T3 既有仓储方法完成），因此不与 repositories
  * 形成运行时循环依赖。
+ *
+ * #61：持久化经 {@link RepoCtx}（基于 DbDriver 抽象）访问；SQLite 与 PostgreSQL 双方言
+ * 通过统一的 `?` 占位符切换，保持阶段 1 默认行为。
  */
 
 // ---------------------------------------------------------------------------
@@ -165,7 +168,7 @@ export interface AuditRow extends NewAuditRow {
   readonly reversedAt: string | null;
 }
 
-interface AuditRowDb {
+type AuditRowDb = {
   id: string;
   project_id: string;
   actor_kind: "human" | "agent" | "system";
@@ -182,7 +185,7 @@ interface AuditRowDb {
   reversed_at: string | null;
   reversed_by_audit_id: string | null;
   created_at: string;
-}
+};
 
 function toAuditRow(row: AuditRowDb): AuditRow {
   return {
@@ -264,41 +267,37 @@ export interface AuditFilter {
 }
 
 export interface AuditRepository {
-  append(row: NewAuditRow): AuditRow;
-  get(projectId: string, id: string): AuditRow | null;
-  list(projectId: string, filter?: AuditFilter): AuditRow[];
+  append(row: NewAuditRow): Promise<AuditRow>;
+  get(projectId: string, id: string): Promise<AuditRow | null>;
+  list(projectId: string, filter?: AuditFilter): Promise<AuditRow[]>;
   /** 回写原事件的两列（历史行除此之外永不改写）。 */
-  markReversed(projectId: string, id: string, reversedByAuditId: string, reversedAt: string): void;
+  markReversed(projectId: string, id: string, reversedByAuditId: string, reversedAt: string): Promise<void>;
 }
 
-/** 创建审计仓储；与其余仓储共享同一个 better-sqlite3 连接。 */
-export function createAuditRepository(db: Database.Database): AuditRepository {
-  const insert = db.prepare(
-    `INSERT INTO audit_log
+/** 创建审计仓储；与其余仓储共享同一个 DbDriver 连接。 */
+export function createAuditRepository(ctx: RepoCtx): AuditRepository {
+  const insertSql = `INSERT INTO audit_log
        (id, project_id, actor_kind, actor_member_id, actor_name, action,
         target_kind, target_id, target_name, changed, before, after, detail,
         reversed_at, reversed_by_audit_id, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
-  );
-  const getOne = db.prepare("SELECT * FROM audit_log WHERE project_id = ? AND id = ?");
-  const markReversedStmt = db.prepare(
-    "UPDATE audit_log SET reversed_at = ?, reversed_by_audit_id = ? WHERE project_id = ? AND id = ?",
-  );
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`;
+  const getOneSql = "SELECT * FROM audit_log WHERE project_id = ? AND id = ?";
+  const markReversedSql = "UPDATE audit_log SET reversed_at = ?, reversed_by_audit_id = ? WHERE project_id = ? AND id = ?";
 
   return {
-    append(row) {
-      insert.run(
+    async append(row) {
+      await ctx.exec(insertSql, [
         row.id, row.projectId, row.actorKind, row.actorMemberId, row.actorName, row.action,
         row.targetKind, row.targetId, row.targetName, row.changed, row.before, row.after,
         row.detail, row.reversedByAuditId, row.createdAt,
-      );
-      return toAuditRow(getOne.get(row.projectId, row.id) as AuditRowDb);
+      ]);
+      return toAuditRow((await ctx.one<AuditRowDb>(getOneSql, [row.projectId, row.id]))!);
     },
-    get(projectId, id) {
-      const row = getOne.get(projectId, id) as AuditRowDb | undefined;
+    async get(projectId, id) {
+      const row = await ctx.one<AuditRowDb>(getOneSql, [projectId, id]);
       return row ? toAuditRow(row) : null;
     },
-    list(projectId, filter = {}) {
+    async list(projectId, filter = {}) {
       const clauses = ["project_id = ?"];
       const params: unknown[] = [projectId];
       if (filter.action !== undefined) { clauses.push("action = ?"); params.push(filter.action); }
@@ -308,20 +307,20 @@ export function createAuditRepository(db: Database.Database): AuditRepository {
       const limit = Math.min(Math.max(filter.limit ?? 50, 1), 200);
       params.push(limit);
       const sql = `SELECT * FROM audit_log WHERE ${clauses.join(" AND ")} ORDER BY id DESC LIMIT ?`;
-      return (db.prepare(sql).all(...params) as AuditRowDb[]).map(toAuditRow);
+      return (await ctx.query<AuditRowDb>(sql, params)).map(toAuditRow);
     },
-    markReversed(projectId, id, reversedByAuditId, reversedAt) {
-      markReversedStmt.run(reversedAt, reversedByAuditId, projectId, id);
+    async markReversed(projectId, id, reversedByAuditId, reversedAt) {
+      await ctx.exec(markReversedSql, [reversedAt, reversedByAuditId, projectId, id]);
     },
   };
 }
 
 /** 写入一条审计事件（供 api.ts 直接埋点与 recorder 复用）。 */
-export function appendAuditEntry(
+export async function appendAuditEntry(
   repo: AuditRepository,
   entry: AuditEntry,
   opts: { readonly id?: string; readonly createdAt?: string } = {},
-): AuditRow {
+): Promise<AuditRow> {
   const beforeJson = serialize(entry.before);
   const afterJson = serialize(entry.after);
   const changed = entry.changed !== undefined ? entry.changed : diffChanged(entry.before, entry.after);
@@ -375,9 +374,9 @@ const HOOK_MAP: Readonly<
  * 把 T2/T3 预留的 noop 钩子换成真实 recorder：经 `StartServerOptions.orgChangeRecorder`
  * 默认注入即把组织/成员变更写入 audit_log，无需改动 T2/T3 的守卫与 repository。
  */
-export function createAuditRecorder(repo: AuditRepository): { record(change: OrgChange): void } {
+export function createAuditRecorder(repo: AuditRepository): { record(change: OrgChange): Promise<void> } {
   return {
-    record(change: OrgChange): void {
+    async record(change: OrgChange): Promise<void> {
       const mapped = HOOK_MAP[change.action];
       if (!mapped) return;
       // auto_place 在无组织树 / 成员已落位时是 no-op（不建新岗位），不产生审计行。
@@ -385,7 +384,7 @@ export function createAuditRecorder(repo: AuditRepository): { record(change: Org
       const actor: AuditActor = change.actor
         ? { kind: change.actor.kind, name: change.actor.name, ...(change.actor.memberId ? { memberId: change.actor.memberId } : {}) }
         : { kind: "system", name: "系统" };
-      appendAuditEntry(repo, {
+      await appendAuditEntry(repo, {
         projectId: change.projectId,
         actor,
         action: mapped.action,

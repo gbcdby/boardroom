@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { IncomingMessage } from "node:http";
 import type Database from "better-sqlite3";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -37,12 +37,15 @@ import type { OrgChangeRecorder } from "../src/server/org-change-hook.ts";
 
 async function withRepos<T>(fn: (repos: RepositorySet) => Promise<T> | T): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-orgauthz-"));
-  const { db }: { db: Database.Database } = openDatabase(dir);
+  const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
   try {
     runMigrations(db, migrations);
-    return await fn(createRepositories(db));
+    return await fn(createRepositories(driver));
   } finally {
-    if (db.open) db.close();
+    await driver.close();
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -61,18 +64,18 @@ function denyCode(actor: Actor, capability: Capability, scope: GuardScope): stri
 }
 
 /** 从真实 DB 组装「某群组」的可见性事实（参与者 + 各自岗位节点）。 */
-function guarded(repos: RepositorySet, groupId: string): GuardedGroup {
-  const memberIds = repos.groups.participants(groupId);
+async function guarded(repos: RepositorySet, groupId: string): Promise<GuardedGroup> {
+  const memberIds = (await ((await (repos.groups.participants(groupId)))));
   return {
     id: groupId,
-    projectId: repos.groups.get(groupId)!.projectId,
+    projectId: (await ((await (repos.groups.get(groupId)))))!.projectId,
     memberIds,
-    memberNodeIds: memberIds.map((id) => repos.members.get(id)?.nodeId ?? null),
+    memberNodeIds: (await Promise.all(memberIds.map(async (id) => (await (repos.members.get(id)))?.nodeId ?? null))),
   };
 }
 
-function groupScope(repos: RepositorySet, groupId: string): GuardScope {
-  const g = guarded(repos, groupId);
+async function groupScope(repos: RepositorySet, groupId: string): Promise<GuardScope> {
+  const g = (await ((await (guarded(repos, groupId)))));
   return {
     projectId: g.projectId,
     groupId: g.id,
@@ -82,28 +85,28 @@ function groupScope(repos: RepositorySet, groupId: string): GuardScope {
 }
 
 /** 建一棵测试树并占岗，返回节点与成员 id。 */
-function buildTree(repos: RepositorySet) {
-  const p = repos.projects.create({ name: "P" });
-  const root = repos.org.createNode({ projectId: p.id, parentId: null, name: "统筹", role: "top_manager" });
-  const a = repos.org.createNode({ projectId: p.id, parentId: root.id, name: "A 线", role: "sub_manager" });
-  const b = repos.org.createNode({ projectId: p.id, parentId: a.id, name: "B 岗", role: "member" });
-  const c = repos.org.createNode({ projectId: p.id, parentId: a.id, name: "C 岗", role: "member" });
-  const x = repos.org.createNode({ projectId: p.id, parentId: root.id, name: "X 岗", role: "member" });
+async function buildTree(repos: RepositorySet) {
+  const p = (await ((await (repos.projects.create({ name: "P" })))));
+  const root = (await ((await (repos.org.createNode({ projectId: p.id, parentId: null, name: "统筹", role: "top_manager" })))));
+  const a = (await ((await (repos.org.createNode({ projectId: p.id, parentId: root.id, name: "A 线", role: "sub_manager" })))));
+  const b = (await ((await (repos.org.createNode({ projectId: p.id, parentId: a.id, name: "B 岗", role: "member" })))));
+  const c = (await ((await (repos.org.createNode({ projectId: p.id, parentId: a.id, name: "C 岗", role: "member" })))));
+  const x = (await ((await (repos.org.createNode({ projectId: p.id, parentId: root.id, name: "X 岗", role: "member" })))));
 
-  const mk = (name: string): string => {
-    const agent = repos.agents.create({ displayName: name, hostType: "claude-code" });
-    return repos.members.create({ projectId: p.id, kind: "agent", agentId: agent.id, displayName: name }).id;
+  const mk = async (name: string): Promise<string> => {
+    const agent = (await ((await (repos.agents.create({ displayName: name, hostType: "claude-code" })))));
+    return (await ((await (repos.members.create({ projectId: p.id, kind: "agent", agentId: agent.id, displayName: name }))))).id;
   };
-  const mTop = mk("顶层");
-  const mSub = mk("下级");
-  const mB = mk("B");
-  const mC = mk("C");
-  const mX = mk("X");
-  repos.org.assignNode(mTop, root.id);
-  repos.org.assignNode(mSub, a.id);
-  repos.org.assignNode(mB, b.id);
-  repos.org.assignNode(mC, c.id);
-  repos.org.assignNode(mX, x.id);
+  const mTop = (await ((await (mk("顶层")))));
+  const mSub = (await ((await (mk("下级")))));
+  const mB = (await ((await (mk("B")))));
+  const mC = (await ((await (mk("C")))));
+  const mX = (await ((await (mk("X")))));
+  (await ((await (repos.org.assignNode(mTop, root.id)))));
+  (await ((await (repos.org.assignNode(mSub, a.id)))));
+  (await ((await (repos.org.assignNode(mB, b.id)))));
+  (await ((await (repos.org.assignNode(mC, c.id)))));
+  (await ((await (repos.org.assignNode(mX, x.id)))));
   return { p, root, a, b, c, x, mTop, mSub, mB, mC, mX };
 }
 
@@ -112,34 +115,34 @@ function buildTree(repos: RepositorySet) {
 // ---------------------------------------------------------------------------
 
 test("阶段 1 兼容：升级库无组织数据时 resolveActor 沿用 F2 兼容映射，行为不变", async () => {
-  await withRepos((repos) => {
-    const p = repos.projects.create({ name: "P" });
-    const mgrAgent = repos.agents.create({ displayName: "经理", hostType: "claude-code" });
-    const mgr = repos.members.create({
+  await withRepos(async (repos) => {
+    const p = (await ((await (repos.projects.create({ name: "P" })))));
+    const mgrAgent = (await ((await (repos.agents.create({ displayName: "经理", hostType: "claude-code" })))));
+    const mgr = (await ((await (repos.members.create({
       projectId: p.id,
       kind: "agent",
       agentId: mgrAgent.id,
       displayName: "经理",
       role: "manager",
-    });
-    const plainAgent = repos.agents.create({ displayName: "成员", hostType: "codex-cli" });
-    const plain = repos.members.create({
+    })))));
+    const plainAgent = (await ((await (repos.agents.create({ displayName: "成员", hostType: "codex-cli" })))));
+    const plain = (await ((await (repos.members.create({
       projectId: p.id,
       kind: "agent",
       agentId: plainAgent.id,
       displayName: "成员",
-    });
+    })))));
     const resolver = createOrgActorResolver(repos);
 
     // 未认证的人 = owner（全局主体可跨项目）。
-    assert.equal(resolver.resolveHttpActor(resolution(p.id))?.role, "owner");
-    assert.equal(resolver.resolveWsActor({ projectId: p.id, memberId: null })?.role, "owner");
+    assert.equal((await (resolver.resolveHttpActor(resolution(p.id))))?.role, "owner");
+    assert.equal((await (resolver.resolveWsActor({ projectId: p.id, memberId: null })))?.role, "owner");
     // legacy manager → top_manager；normal → member；nodeId/subtreeNodeIds 仍为 null。
-    const mgrActor = resolver.resolveHttpActor(resolution(p.id, mgr.id))!;
+    const mgrActor = (await (resolver.resolveHttpActor(resolution(p.id, mgr.id))))!;
     assert.equal(mgrActor.role, "top_manager");
     assert.equal(mgrActor.nodeId, null);
     assert.equal(mgrActor.subtreeNodeIds, null);
-    assert.equal(resolver.resolveHttpActor(resolution(p.id, plain.id))?.role, "member");
+    assert.equal((await (resolver.resolveHttpActor(resolution(p.id, plain.id))))?.role, "member");
     // MCP 会话绑定同样回退到阶段 1 兼容映射（manager → top_manager）。
     const binding = {
       sessionId: "s",
@@ -152,35 +155,35 @@ test("阶段 1 兼容：升级库无组织数据时 resolveActor 沿用 F2 兼�
       hostType: "claude-code" as const,
       mcpSessionId: "ms",
     };
-    assert.equal(resolver.actorForMcpBinding(binding).role, "top_manager");
-    assert.equal(resolver.actorForMcpBinding({ ...binding, role: "normal" }).role, "member");
+    assert.equal((await (resolver.actorForMcpBinding(binding))).role, "top_manager");
+    assert.equal((await (resolver.actorForMcpBinding({ ...binding, role: "normal" }))).role, "member");
   });
 });
 
 test("占岗成员由真实 org_nodes 装配 Actor：role / nodeId / 递归 CTE 子树", async () => {
-  await withRepos((repos) => {
-    const { p, a, b, c, mSub, mTop, mX } = buildTree(repos);
+  await withRepos(async (repos) => {
+    const { p, a, b, c, mSub, mTop, mX } = (await ((await (buildTree(repos)))));
     const resolver = createOrgActorResolver(repos);
 
-    const sub = orgActorForMember(repos, mSub)!;
+    const sub = (await (orgActorForMember(repos, mSub)))!;
     assert.equal(sub.role, "sub_manager");
     assert.equal(sub.nodeId, a.id);
     assert.deepEqual([...(sub.subtreeNodeIds ?? [])].sort(), [a.id, b.id, c.id].sort());
 
-    const top = orgActorForMember(repos, mTop)!;
+    const top = (await (orgActorForMember(repos, mTop)))!;
     assert.equal(top.role, "top_manager");
-    assert.equal(top.nodeId, repos.org.getRootNode(p.id)!.id);
+    assert.equal(top.nodeId, (await ((await (repos.org.getRootNode(p.id)))))!.id);
     // 顶层 manager 的管辖范围是 project（ROLE_REACH），子树数据仍可给出但不改变全项目范围。
     assert.equal(top.subtreeNodeIds?.length, 5);
 
     // 普通成员占 member 岗 → reach=own。
-    assert.equal(orgActorForMember(repos, mX)!.role, "member");
+    assert.equal((await (orgActorForMember(repos, mX)))!.role, "member");
     // HTTP / MCP 两个装配点拿到同一真实主体。
-    assert.equal(resolver.resolveHttpActor(resolution(p.id, mSub))?.role, "sub_manager");
-    assert.equal(resolver.resolveWsActor({ projectId: p.id, memberId: mSub })?.role, "sub_manager");
+    assert.equal((await (resolver.resolveHttpActor(resolution(p.id, mSub))))?.role, "sub_manager");
+    assert.equal((await (resolver.resolveWsActor({ projectId: p.id, memberId: mSub })))?.role, "sub_manager");
     const binding = {
       sessionId: "s",
-      agentId: repos.members.get(mSub)!.agentId!,
+      agentId: (await ((await (repos.members.get(mSub)))))!.agentId!,
       memberId: mSub,
       projectId: p.id,
       groupId: "g",
@@ -189,18 +192,18 @@ test("占岗成员由真实 org_nodes 装配 Actor：role / nodeId / 递归 CTE 
       hostType: "claude-code" as const,
       mcpSessionId: "ms",
     };
-    assert.equal(resolver.actorForMcpBinding(binding).role, "sub_manager");
+    assert.equal((await (resolver.actorForMcpBinding(binding))).role, "sub_manager");
   });
 });
 
 test("人（owner）即使占岗也保持内建全局主体，不降级为岗位角色", async () => {
-  await withRepos((repos) => {
-    const p = repos.projects.create({ name: "P" });
-    const root = repos.org.createNode({ projectId: p.id, parentId: null, name: "统筹", role: "top_manager" });
-    const human = repos.members.create({ projectId: p.id, kind: "human", displayName: "人" });
-    repos.org.assignNode(human.id, root.id);
-    assert.equal(orgActorForMember(repos, human.id), null);
-    assert.equal(createOrgActorResolver(repos).resolveHttpActor(resolution(p.id, human.id))?.role, "owner");
+  await withRepos(async (repos) => {
+    const p = (await ((await (repos.projects.create({ name: "P" })))));
+    const root = (await ((await (repos.org.createNode({ projectId: p.id, parentId: null, name: "统筹", role: "top_manager" })))));
+    const human = (await ((await (repos.members.create({ projectId: p.id, kind: "human", displayName: "人" })))));
+    (await ((await (repos.org.assignNode(human.id, root.id)))));
+    assert.equal((await (orgActorForMember(repos, human.id))), null);
+    assert.equal((await (createOrgActorResolver(repos).resolveHttpActor(resolution(p.id, human.id))))?.role, "owner");
   });
 });
 
@@ -209,12 +212,12 @@ test("人（owner）即使占岗也保持内建全局主体，不降级为岗位
 // ---------------------------------------------------------------------------
 
 test("AC-PERM-01：人 / 顶层 manager / 下级 manager / 普通 agent 的权限矩阵", async () => {
-  await withRepos((repos) => {
-    const { p, root, a, b, x, mTop, mSub, mX } = buildTree(repos);
+  await withRepos(async (repos) => {
+    const { p, root, a, b, x, mTop, mSub, mX } = (await ((await (buildTree(repos)))));
     const owner = ownerActor(p.id);
-    const top = orgActorForMember(repos, mTop)!;
-    const sub = orgActorForMember(repos, mSub)!;
-    const member = orgActorForMember(repos, mX)!;
+    const top = (await (orgActorForMember(repos, mTop)))!;
+    const sub = (await (orgActorForMember(repos, mSub)))!;
+    const member = (await (orgActorForMember(repos, mX)))!;
 
     // 人（owner）：全量能力点，含永久删除 / 撤销类特权。
     assert.equal(denyCode(owner, "org:manage", { projectId: p.id, nodeId: x.id }), null);
@@ -249,16 +252,16 @@ test("AC-PERM-01：人 / 顶层 manager / 下级 manager / 普通 agent 的权�
 // ---------------------------------------------------------------------------
 
 test("group:view_subtree：下级 manager 对子树内全员属该子树的群组只读可见", async () => {
-  await withRepos((repos) => {
-    const { p, a, b, c, x, mSub, mB, mC, mX, mTop } = buildTree(repos);
+  await withRepos(async (repos) => {
+    const { p, a, b, c, x, mSub, mB, mC, mX, mTop } = (await ((await (buildTree(repos)))));
     // g1：参与者全部在 sub_manager 子树内（b、c）；g2：含一个子树外成员（x）；
     // g3：sub_manager 自己是参与者 → 可写。
-    const g1 = repos.groups.create({ projectId: p.id, name: "子树内群", participantMemberIds: [mB, mC] });
-    const g2 = repos.groups.create({ projectId: p.id, name: "跨子树群", participantMemberIds: [mB, mX] });
-    const g3 = repos.groups.create({ projectId: p.id, name: "自己参与的群", participantMemberIds: [mSub, mB] });
+    const g1 = (await ((await (repos.groups.create({ projectId: p.id, name: "子树内群", participantMemberIds: [mB, mC] })))));
+    const g2 = (await ((await (repos.groups.create({ projectId: p.id, name: "跨子树群", participantMemberIds: [mB, mX] })))));
+    const g3 = (await ((await (repos.groups.create({ projectId: p.id, name: "自己参与的群", participantMemberIds: [mSub, mB] })))));
 
-    const sub = orgActorForMember(repos, mSub)!;
-    const visible = visibleGroups(sub, [guarded(repos, g1.id), guarded(repos, g2.id), guarded(repos, g3.id)]);
+    const sub = (await (orgActorForMember(repos, mSub)))!;
+    const visible = visibleGroups(sub, [(await ((await (guarded(repos, g1.id))))), (await ((await (guarded(repos, g2.id))))), (await ((await (guarded(repos, g3.id)))))]);
     const byId = new Map(visible.map((v) => [v.id, v.writable]));
     // 只读可见（看元数据与历史，不唤醒、不能发消息）→ writable=false。
     assert.equal(byId.get(g1.id), false, "子树内未参与群组应只读可见");
@@ -266,28 +269,28 @@ test("group:view_subtree：下级 manager 对子树内全员属该子树的群�
     assert.equal(byId.get(g3.id), true, "自己参与的群组可写");
 
     // 能力点判定：group:view / group:view_subtree 放行只读；group:post 仍要求参与资格。
-    assert.equal(denyCode(sub, "group:view", groupScope(repos, g1.id)), null);
-    assert.equal(denyCode(sub, "group:view_subtree", groupScope(repos, g1.id)), null);
-    assert.equal(denyCode(sub, "group:post", groupScope(repos, g1.id)), "not_a_member");
-    assert.equal(denyCode(sub, "group:view_subtree", groupScope(repos, g2.id)), "not_visible");
-    assert.equal(denyCode(sub, "group:view", groupScope(repos, g2.id)), "not_visible");
+    assert.equal(denyCode(sub, "group:view", (await ((await (groupScope(repos, g1.id)))))), null);
+    assert.equal(denyCode(sub, "group:view_subtree", (await ((await (groupScope(repos, g1.id)))))), null);
+    assert.equal(denyCode(sub, "group:post", (await ((await (groupScope(repos, g1.id)))))), "not_a_member");
+    assert.equal(denyCode(sub, "group:view_subtree", (await ((await (groupScope(repos, g2.id)))))), "not_visible");
+    assert.equal(denyCode(sub, "group:view", (await ((await (groupScope(repos, g2.id)))))), "not_visible");
 
     // 顶层 manager 与人可见全部群组（AC-ORG-07）；不因未参与而消失。
-    const top = orgActorForMember(repos, mTop)!;
-    assert.equal(visibleGroups(top, [guarded(repos, g2.id)]).length, 1);
-    assert.equal(visibleGroups(ownerActor(p.id), [guarded(repos, g1.id), guarded(repos, g2.id)]).length, 2);
+    const top = (await (orgActorForMember(repos, mTop)))!;
+    assert.equal(visibleGroups(top, [(await ((await (guarded(repos, g2.id)))))]).length, 1);
+    assert.equal(visibleGroups(ownerActor(p.id), [(await ((await (guarded(repos, g1.id))))), (await ((await (guarded(repos, g2.id)))))]).length, 2);
     // 普通成员只看自己参与的群组。
-    const plain = orgActorForMember(repos, mX)!;
-    assert.equal(visibleGroups(plain, [guarded(repos, g1.id)]).length, 0);
+    const plain = (await (orgActorForMember(repos, mX)))!;
+    assert.equal(visibleGroups(plain, [(await ((await (guarded(repos, g1.id)))))]).length, 0);
 
     // 子树边界来自递归 CTE：把 b 移到根节点下后，g1 不再「全员属子树」。
-    repos.org.updateNode(b.id, { parentId: repos.org.getRootNode(p.id)!.id });
-    const movedSub = orgActorForMember(repos, mSub)!;
-    assert.equal(denyCode(movedSub, "group:view_subtree", groupScope(repos, g1.id)), "not_visible");
+    (await ((await (repos.org.updateNode(b.id, { parentId: (await ((await (repos.org.getRootNode(p.id)))))!.id })))));
+    const movedSub = (await (orgActorForMember(repos, mSub)))!;
+    assert.equal(denyCode(movedSub, "group:view_subtree", (await ((await (groupScope(repos, g1.id)))))), "not_visible");
     assert.equal(denyCode(movedSub, "group:create", {
       projectId: p.id,
       groupMemberIds: [mB, mC],
-      groupMemberNodeIds: [repos.members.get(mB)!.nodeId, repos.members.get(mC)!.nodeId],
+      groupMemberNodeIds: [(await ((await (repos.members.get(mB)))))!.nodeId, (await ((await (repos.members.get(mC)))))!.nodeId],
     }), "out_of_subtree");
     // 记录 x/a 仅用于让树形清晰（避免未使用变量告警语义不清）。
     assert.ok(x.id && a.id && c.id);
@@ -359,10 +362,10 @@ test("HTTP：组织端点按真实主体执行子树边界（ORG-05 越级 403�
       orgChangeRecorder: recorder,
       // 用请求头选择「以某成员为主体」，主体由真实 DB 装配（nodeId/subtreeNodeIds）。
       authorization: {
-        resolveHttpActor: (r) => {
+        resolveHttpActor: async (r) => {
           const as = r.request.headers["x-member"];
           if (typeof as === "string" && reposForTest) {
-            const orgActor = orgActorForMember(reposForTest, as);
+            const orgActor = (await (orgActorForMember(reposForTest, as)));
             if (orgActor) return orgActor;
           }
           return ownerActor(r.projectId);
@@ -376,7 +379,7 @@ test("HTTP：组织端点按真实主体执行子树边界（ORG-05 越级 403�
       const pid: string = project.id;
 
       const mkMember = async (name: string): Promise<string> => {
-        const agent = repos.agents.create({ displayName: name, hostType: "claude-code" });
+        const agent = (await ((await (repos.agents.create({ displayName: name, hostType: "claude-code" })))));
         const created = await call(server, "POST", `/api/projects/${pid}/members`, {
           kind: "agent",
           agentId: agent.id,

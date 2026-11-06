@@ -6,11 +6,12 @@
  * 驱动层能力与迁移版本表基线；业务表按方言重写、既有数据搬迁与回滚脚本
  * 属于 M1（#54）。
  */
-import { Pool, type QueryResult } from "pg";
+import { Pool, type PoolClient, type QueryResult } from "pg";
 import {
   MIGRATION_TABLE,
   MigrationError,
   checksumOf,
+  migrationSql,
   validateAndSort,
   type AppliedMigration,
   type Migration,
@@ -35,6 +36,10 @@ export class PostgresDriver implements DbDriver {
   private readonly connectionString: string;
   private readonly schema: string | undefined;
   private pool: Pool | null = null;
+  /** 事务客户端栈：支持嵌套事务（事务内再开事务，#61）。 */
+  private txStack: PoolClient[] = [];
+  /** SAVEPOINT 计数器。 */
+  private spCounter = 0;
 
   constructor(options: PostgresDriverOptions) {
     this.connectionString = options.connectionString;
@@ -93,10 +98,11 @@ export class PostgresDriver implements DbDriver {
 
     for (const migration of ordered) {
       const existing = applied.get(migration.version);
-      if (existing !== undefined && existing.checksum !== checksumOf(migration)) {
+      const checksum = checksumOf(migrationSql(migration, "postgres"));
+      if (existing !== undefined && existing.checksum !== checksum) {
         throw new MigrationError(
           `迁移 ${migration.version} "${migration.name}" 已应用，但 SQL 内容与当前代码不一致` +
-            `（checksum ${existing.checksum} → ${checksumOf(migration)}）。` +
+            `（checksum ${existing.checksum} → ${checksum}）。` +
             `已应用的迁移不可修改；请新增一条迁移。`,
         );
       }
@@ -123,34 +129,63 @@ export class PostgresDriver implements DbDriver {
     return result.rows as T[];
   }
 
-  async exec(sql: string, params: readonly unknown[] = []): Promise<void> {
-    await this.requirePool().query(this.dialect.renderParameters(sql), [...params]);
+  async exec(sql: string, params: readonly unknown[] = []): Promise<number> {
+    const result = await this.requirePool().query(
+      this.dialect.renderParameters(sql),
+      [...params],
+    );
+    return result.rowCount ?? 0;
   }
 
   async transaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T> {
-    const client = await this.requirePool().connect();
+    const pool = this.requirePool();
+    // 嵌套事务（事务内再开事务，#61）：复用栈顶已持有事务的客户端，并用 SAVEPOINT
+    // 隔离；最外层才真正 BEGIN，并在结束后释放连接。
+    const nested = this.txStack.length > 0;
+    const client: PoolClient = nested
+      ? (this.txStack[this.txStack.length - 1] as PoolClient)
+      : await pool.connect();
     const render = (sql: string): string => this.dialect.renderParameters(sql);
+    const sp = nested ? `s${++this.spCounter}` : null;
     const tx: DbTransaction = {
       query: async <R extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []) =>
         (await client.query(render(sql), [...params])).rows as R[],
-      exec: async (sql, params = []) => {
-        await client.query(render(sql), [...params]);
+      // 事务内 exec：返回影响行数（与 SQLite `changes` 对齐，#61）。
+      exec: async (sql, params: readonly unknown[] = []) => {
+        const r = await client.query(render(sql), [...params]);
+        return r.rowCount ?? 0;
       },
     };
     try {
-      await client.query(this.dialect.beginTransaction());
-      const result = await fn(tx);
-      await client.query(this.dialect.commit());
-      return result;
-    } catch (error) {
+      if (nested) await client.query(`SAVEPOINT ${sp}`);
+      else await client.query(this.dialect.beginTransaction());
+      this.txStack.push(client);
       try {
-        await client.query(this.dialect.rollback());
-      } catch {
-        // 事务可能已因错误终止；保留原始错误。
+        const result = await fn(tx);
+        if (nested) await client.query(`RELEASE SAVEPOINT ${sp}`);
+        else await client.query(this.dialect.commit());
+        return result;
+      } catch (error) {
+        try {
+          if (nested) await client.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+          else await client.query(this.dialect.rollback());
+        } catch {
+          // 事务可能已因错误终止；保留原始错误。
+        }
+        throw error;
+      } finally {
+        this.txStack.pop();
+        if (!nested) {
+          try {
+            client.release();
+          } catch {
+            // 连接释放失败不影响已提交/回滚的结果。
+          }
+        }
       }
+    } catch (error) {
+      // 仅在未持有客户端时到达（pool.connect 失败）；无需释放。
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -164,14 +199,15 @@ export class PostgresDriver implements DbDriver {
 
   private async applyOne(migration: Migration): Promise<void> {
     const client = await this.requirePool().connect();
+    const upSql = migrationSql(migration, "postgres");
     try {
       await client.query(this.dialect.beginTransaction());
-      await client.query(migration.up); // 迁移脚本为无参多语句，走简单查询协议
+      await client.query(upSql); // 迁移脚本为无参多语句，走简单查询协议
       await client.query(
         this.dialect.renderParameters(
           `INSERT INTO ${MIGRATION_TABLE} (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)`,
         ),
-        [migration.version, migration.name, checksumOf(migration), new Date().toISOString()],
+        [migration.version, migration.name, checksumOf(upSql), new Date().toISOString()],
       );
       await client.query(this.dialect.commit());
     } catch (error) {

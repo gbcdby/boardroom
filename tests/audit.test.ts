@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -26,7 +26,7 @@ import type { OrgChange } from "../src/server/org-change-hook.ts";
  * T5（#52）最小审计。
  *
  * seam：
- * - 仓储段走 `createRepositories(db).audit`（与 `audit.ts` 同一边界），验证单表读写、
+ * - 仓储段走 `createRepositories(driver).audit`（与 `audit.ts` 同一边界），验证单表读写、
  *   截断、钩子映射、撤销不可用分类、以及「审计表不在 #28 级联注册表」——项目被 purge 后痕迹仍在。
  * - HTTP 段走 `/api` 公共边界（含 F2 `resolveHttpActor` 注入点），验证：经守卫的写入留痕、
  *   `audit:view` 行级可见（owner / 顶层 manager，普通成员 403）、人的 `org:revoke` 撤销权
@@ -45,15 +45,18 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 }
 
 async function withRepos<T>(
-  fn: (ctx: { repos: RepositorySet; db: Database.Database; dir: string }) => Promise<T>,
+  fn: (ctx: { repos: RepositorySet; db: Database.Database; driver: SqliteDriver; dir: string }) => Promise<T>,
 ): Promise<T> {
   return withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
     try {
       runMigrations(db, migrations);
-      return await fn({ repos: createRepositories(db), db, dir });
+      return await fn({ repos: createRepositories(driver), db, driver, dir });
     } finally {
-      if (db.open) db.close();
+      await driver.close();
     }
   });
 }
@@ -65,7 +68,7 @@ async function withRepos<T>(
 test("T5-AUDIT-REPO-01：append / get / list / markReversed 基本读写（append-only）", async () => {
   await withRepos(async ({ repos }) => {
     const projectId = "p1";
-    const row = appendAuditEntry(repos.audit, {
+    const row = await appendAuditEntry(repos.audit, {
       projectId,
       actor: { kind: "human", name: "人" },
       action: AUDIT_ACTIONS.member_add,
@@ -79,15 +82,15 @@ test("T5-AUDIT-REPO-01：append / get / list / markReversed 基本读写（appen
     assert.equal(row.projectId, projectId);
     assert.equal(row.actorKind, "human");
 
-    const got = repos.audit.get(projectId, row.id);
+    const got = (await ((await (repos.audit.get(projectId, row.id)))));
     assert.ok(got, "get 应命中");
     assert.equal(got!.id, row.id);
 
-    const listed = repos.audit.list(projectId);
+    const listed = (await ((await (repos.audit.list(projectId)))));
     assert.equal(listed.length, 1);
 
-    repos.audit.markReversed(projectId, row.id, "rev1", new Date().toISOString());
-    const after = repos.audit.get(projectId, row.id)!;
+    (await ((await (repos.audit.markReversed(projectId, row.id, "rev1", new Date().toISOString())))));
+    const after = (await ((await (repos.audit.get(projectId, row.id)))))!;
     assert.ok(after.reversedAt, "markReversed 应回写 reversed_at");
     assert.equal(after.reversedByAuditId, "rev1");
   });
@@ -108,10 +111,10 @@ test("T5-AUDIT-REPO-02：list 按 action / targetKind / targetId / limit 过滤"
         after: { id: `m${i}` },
       });
     }
-    assert.equal(repos.audit.list(projectId, { action: AUDIT_ACTIONS.member_add }).length, 3);
-    assert.equal(repos.audit.list(projectId, { targetKind: "member" }).length, 5);
-    assert.equal(repos.audit.list(projectId, { targetId: "m2" }).length, 1);
-    assert.equal(repos.audit.list(projectId, { limit: 2 }).length, 2);
+    assert.equal((await ((await (repos.audit.list(projectId, { action: AUDIT_ACTIONS.member_add }))))).length, 3);
+    assert.equal((await ((await (repos.audit.list(projectId, { targetKind: "member" }))))).length, 5);
+    assert.equal((await ((await (repos.audit.list(projectId, { targetId: "m2" }))))).length, 1);
+    assert.equal((await ((await (repos.audit.list(projectId, { limit: 2 }))))).length, 2);
   });
 });
 
@@ -146,8 +149,8 @@ test("T5-AUDIT-REPO-03：revokeUnavailableReason 分类（可逆 / 永久 / 状�
 });
 
 test("T5-AUDIT-REPO-04：createAuditRecorder 把 OrgChange 映射为审计行（含 before/after 与缺省退化）", async () => {
-  await withRepos(async ({ repos, db }) => {
-    const repo = createAuditRepository(db);
+  await withRepos(async ({ repos }) => {
+    const repo = repos.audit;
     const recorder = createAuditRecorder(repo);
     const projectId = "p1";
 
@@ -162,7 +165,7 @@ test("T5-AUDIT-REPO-04：createAuditRecorder 把 OrgChange 映射为审计行（
       before: { id: "m1", status: "active" },
       after: { id: "m1", status: "disabled" },
     } as OrgChange);
-    const paused = repo.list(projectId, { action: AUDIT_ACTIONS.member_pause });
+    const paused = await repo.list(projectId, { action: AUDIT_ACTIONS.member_pause });
     assert.equal(paused.length, 1, "member.disable → member_pause");
     assert.equal(paused[0]!.targetId, "m1");
     assert.equal(paused[0]!.actorKind, "human");
@@ -178,7 +181,7 @@ test("T5-AUDIT-REPO-04：createAuditRecorder 把 OrgChange 映射为审计行（
       before: null,
       after: { id: "n1" },
     } as OrgChange);
-    const created = repo.list(projectId, { action: AUDIT_ACTIONS.org_node_create });
+    const created = await repo.list(projectId, { action: AUDIT_ACTIONS.org_node_create });
     assert.equal(created.length, 1);
     assert.equal(created[0]!.actorKind, "system");
 
@@ -190,7 +193,7 @@ test("T5-AUDIT-REPO-04：createAuditRecorder 把 OrgChange 映射为审计行（
       memberId: "m2",
       detail: { placed: false },
     } as OrgChange);
-    assert.equal(repo.list(projectId, { action: AUDIT_ACTIONS.org_auto_place }).length, 0);
+    assert.equal((await repo.list(projectId, { action: AUDIT_ACTIONS.org_auto_place })).length, 0);
   });
 });
 
@@ -198,7 +201,7 @@ test("T5-AUDIT-REPO-05：字段超长截断并标记 truncated（截断事件不
   await withRepos(async ({ repos }) => {
     const projectId = "p1";
     const big = { data: "x".repeat(40 * 1024) };
-    const row = appendAuditEntry(repos.audit, {
+    const row = await appendAuditEntry(repos.audit, {
       projectId,
       actor: { kind: "human", name: "人" },
       action: AUDIT_ACTIONS.member_add,
@@ -208,7 +211,7 @@ test("T5-AUDIT-REPO-05：字段超长截断并标记 truncated（截断事件不
       before: big,
       after: null,
     });
-    const got = repos.audit.get(projectId, row.id)!;
+    const got = (await ((await (repos.audit.get(projectId, row.id)))))!;
     assert.ok(got.before && got.before.includes("truncated"), "超长字段应截断");
     const view = auditView(got);
     assert.equal((view.detail as { truncated?: boolean }).truncated, true);
@@ -218,14 +221,14 @@ test("T5-AUDIT-REPO-05：字段超长截断并标记 truncated（截断事件不
 
 test("T5-AUDIT-REPO-06：审计表不在 #28 级联注册表——项目被 purge 后审计痕迹仍在", async () => {
   await withRepos(async ({ repos }) => {
-    const project = repos.projects.create({ name: "生命周期项目" });
-    const agent = repos.agents.create({ displayName: "张三", hostType: "claude-code" });
-    const member = repos.members.create({
+    const project = (await ((await (repos.projects.create({ name: "生命周期项目" })))));
+    const agent = (await ((await (repos.agents.create({ displayName: "张三", hostType: "claude-code" })))));
+    const member = (await ((await (repos.members.create({
       projectId: project.id,
       kind: "agent",
       agentId: agent.id,
       displayName: "张三",
-    });
+    })))));
     appendAuditEntry(repos.audit, {
       projectId: project.id,
       actor: { kind: "human", name: "人" },
@@ -236,11 +239,11 @@ test("T5-AUDIT-REPO-06：审计表不在 #28 级联注册表——项目被 purg
       before: null,
       after: member,
     });
-    assert.equal(repos.audit.list(project.id).length, 1, "写入一条成员添加审计");
+    assert.equal((await ((await (repos.audit.list(project.id))))).length, 1, "写入一条成员添加审计");
 
     // 永久删除项目（二次确认后的清除：级联删成员/群组/消息，但 audit_log 不在注册表）。
-    repos.projects.purge(project.id);
-    assert.equal(repos.audit.list(project.id).length, 1, "项目删除后审计行仍存活");
+    (await ((await (repos.projects.purge(project.id)))));
+    assert.equal((await ((await (repos.audit.list(project.id))))).length, 1, "项目删除后审计行仍存活");
   });
 });
 
@@ -273,7 +276,7 @@ async function withServer<T>(
     },
     logger: silentLogger,
     authorization: {
-      resolveHttpActor: ({ request, projectId }) => {
+      resolveHttpActor: async ({ request, projectId }) => {
         const as = request.headers["x-as"];
         if (as === "manager") return actorFor(projectId ?? "", "top_manager", "human");
         if (as === "member") return actorFor(projectId ?? "", "member", "human");
@@ -480,7 +483,7 @@ test("T5-AUDIT-HTTP-08：截断事件（失去完整快照）不可撤销 → 40
   await withServer(async (server) => {
     const project = await createProject(server, "截断项目");
     // 直接注入一条被字段截断的审计行（模拟超大 before 快照被截断）。
-    server.database
+    (server.database as SqliteDriver).handle
       .prepare(
         `INSERT INTO audit_log
            (id, project_id, actor_kind, actor_member_id, actor_name, action,

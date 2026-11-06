@@ -9,7 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createLogger } from "../src/server/logger.ts";
 import { createMcpCore } from "../src/server/mcp/core.ts";
 import { createMcpServer } from "../src/server/mcp/server.ts";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -26,7 +26,7 @@ const silentLogger = createLogger({ level: "error", write: () => {} });
  */
 
 interface Ctx {
-  readonly db: Database.Database;
+  readonly db: SqliteDriver;
   readonly repos: RepositorySet;
   readonly projectId: string;
   readonly groupId: string;
@@ -34,15 +34,18 @@ interface Ctx {
 
 async function withDb<T>(fn: (ctx: Ctx) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-t6mcp-"));
-  const { db } = openDatabase(dir);
+  const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
   runMigrations(db, migrations);
-  const repos = createRepositories(db);
-  const project = repos.projects.create({ name: "P" });
-  const group = repos.groups.create({ projectId: project.id, name: "G" });
+  const repos = createRepositories(driver);
+  const project = (await ((await (repos.projects.create({ name: "P" })))));
+  const group = (await ((await (repos.groups.create({ projectId: project.id, name: "G" })))));
   try {
-    return await fn({ db, repos, projectId: project.id, groupId: group.id });
+    return await fn({ db: driver, repos, projectId: project.id, groupId: group.id });
   } finally {
-    if (db.open) db.close();
+    await driver.close();
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -144,8 +147,8 @@ test("忙碌失败路径：无法打断时消息留在队列，下一安全点 w
       // B 忙碌（working）期间 A 再发，消息只入队（不丢）。
       // T5 语义：listPending = 未 ack 的消息（含已投递未确认的 first + 新入队的 second）。
       await a.call("send_message", { text: "second", mentions: [bId] });
-      const pending = ctx.repos.deliveries.listPending(ctx.projectId, bId);
-      const pendingTexts = pending.map((d) => ctx.repos.messages.get(d.messageId)!.body);
+      const pending = (await ((await (ctx.repos.deliveries.listPending(ctx.projectId, bId)))));
+      const pendingTexts = await Promise.all(pending.map(async (d) => (await ((await (ctx.repos.messages.get(d.messageId)))))!.body));
       assert.ok(pendingTexts.includes("second"), "忙碌期间的消息必须保留在队列");
 
       // B 回到等待循环（下一安全点）→ 取走积压。"first" 未 ack，按 T5 至少一次语义可再次出现；

@@ -9,7 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createLogger } from "../src/server/logger.ts";
 import { createMcpCore } from "../src/server/mcp/core.ts";
 import { createMcpServer } from "../src/server/mcp/server.ts";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -25,7 +25,7 @@ const silentLogger = createLogger({ level: "error", write: () => {} });
  */
 
 interface TestContext {
-  readonly db: Database.Database;
+  readonly db: SqliteDriver;
   readonly dir: string;
   readonly repos: RepositorySet;
   readonly projectId: string;
@@ -34,15 +34,18 @@ interface TestContext {
 
 async function withDb<T>(fn: (ctx: TestContext) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-mcp-"));
-  const { db } = openDatabase(dir);
+  const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
   runMigrations(db, migrations);
-  const repos = createRepositories(db);
-  const project = repos.projects.create({ name: "P" });
-  const group = repos.groups.create({ projectId: project.id, name: "G" });
+  const repos = createRepositories(driver);
+  const project = (await ((await (repos.projects.create({ name: "P" })))));
+  const group = (await ((await (repos.groups.create({ projectId: project.id, name: "G" })))));
   try {
-    return await fn({ db, dir, repos, projectId: project.id, groupId: group.id });
+    return await fn({ db: driver, dir, repos, projectId: project.id, groupId: group.id });
   } finally {
-    if (db.open) db.close();
+    await driver.close();
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -181,16 +184,16 @@ test("join 声明身份并返回 memberId、agentId、heartbeat；持久化三�
 
       const memberId = String(payload["memberId"]);
       // 持久化：Agent（全局身份）、Member（项目成员）、McpSession（连接状态）、MemberStatus online。
-      assert.ok(ctx.repos.agents.get(String(payload["agentId"])));
-      const member = ctx.repos.members.get(memberId)!;
+      assert.ok((await ((await (ctx.repos.agents.get(String(payload["agentId"])))))));
+      const member = (await ((await (ctx.repos.members.get(memberId)))))!;
       assert.equal(member.kind, "agent");
       assert.equal(member.displayName, "Alice");
-      const sessions = ctx.repos.mcpSessions.listByProject(ctx.projectId).filter((s) => s.memberId === memberId);
+      const sessions = (await ((await (ctx.repos.mcpSessions.listByProject(ctx.projectId))))).filter((s) => s.memberId === memberId);
       assert.equal(sessions.length, 1);
       assert.equal(sessions[0]!.state, "connected");
-      assert.equal(ctx.repos.statuses.get(ctx.projectId, memberId)?.state, "online");
+      assert.equal((await ((await (ctx.repos.statuses.get(ctx.projectId, memberId)))))?.state, "online");
       // 群组参与者已加入。
-      assert.ok(ctx.repos.groups.participants(ctx.groupId).includes(memberId));
+      assert.ok((await ((await (ctx.repos.groups.participants(ctx.groupId))))).includes(memberId));
     } finally {
       await a.close();
     }
@@ -239,8 +242,8 @@ test("无效群组 / 无效项目入群返回 INVALID_ARGUMENT（不静默创建
       });
       assert.equal(badProject.payload.error?.code, "INVALID_ARGUMENT");
       // 没有任何成员/身份被创建。
-      assert.equal(ctx.repos.agents.list().length, 0);
-      assert.equal(ctx.repos.members.listByProject(ctx.projectId).length, 0);
+      assert.equal((await ((await (ctx.repos.agents.list())))).length, 0);
+      assert.equal((await ((await (ctx.repos.members.listByProject(ctx.projectId))))).length, 0);
     } finally {
       await a.close();
     }
@@ -269,7 +272,7 @@ test("身份唯一性：同名同宿主 agent 复用同一全局身份；同名�
       });
       assert.notEqual(third.payload["agentId"], agentId);
       // 全局只有一个 codex-cli Alice 和 一个 claude-code Alice 的 agent。
-      assert.equal(ctx.repos.agents.list().filter((ag) => ag.displayName === "Alice").length, 2);
+      assert.equal((await ((await (ctx.repos.agents.list())))).filter((ag) => ag.displayName === "Alice").length, 2);
     } finally {
       await s1.close();
       await s2.close();
@@ -313,7 +316,7 @@ test("heartbeat 刷新连接心跳与会话状态，不改成员运行状态", a
       assert.equal(beat.payload["state"], "connected");
       assert.equal(typeof beat.payload["lastHeartbeatAt"], "string");
       // 心跳不改运行状态：仍是 working。
-      assert.equal(ctx.repos.statuses.get(ctx.projectId, memberId)?.state, "working");
+      assert.equal((await ((await (ctx.repos.statuses.get(ctx.projectId, memberId)))))?.state, "working");
     } finally {
       await a.close();
     }
@@ -446,7 +449,7 @@ test("report_status 记录 waiting/working 并回显上下文（写入 MemberSta
     const memberId = String(res.payload["memberId"]);
     assert.match(memberId, /^[0-9A-Z]{26}$/);
     assert.equal(typeof res.payload["updatedAt"], "string");
-    assert.equal(ctx.repos.statuses.get(ctx.projectId, memberId)?.state, "working");
+    assert.equal((await ((await (ctx.repos.statuses.get(ctx.projectId, memberId)))))?.state, "working");
   });
 });
 
@@ -504,11 +507,11 @@ test("agent 断开连接后成员状态转为 offline（disconnect）", async ()
         displayName: "Alice", hostType: "claude-code", projectId: ctx.projectId, groupId: ctx.groupId,
       });
       const memberId = String(joined.payload["memberId"]);
-      assert.equal(ctx.repos.statuses.get(ctx.projectId, memberId)?.state, "online");
+      assert.equal((await ((await (ctx.repos.statuses.get(ctx.projectId, memberId)))))?.state, "online");
       // 模拟会话关闭：标记断开。
-      core.disconnect();
-      assert.equal(ctx.repos.statuses.get(ctx.projectId, memberId)?.state, "offline");
-      const sessions = ctx.repos.mcpSessions.listByProject(ctx.projectId).filter((s) => s.memberId === memberId);
+      await core.disconnect();
+      assert.equal((await ((await (ctx.repos.statuses.get(ctx.projectId, memberId)))))?.state, "offline");
+      const sessions = (await ((await (ctx.repos.mcpSessions.listByProject(ctx.projectId))))).filter((s) => s.memberId === memberId);
       assert.equal(sessions[0]!.state, "disconnected");
     } finally {
       await client.close();

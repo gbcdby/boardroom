@@ -9,7 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createLogger, type LogFields } from "../src/server/logger.ts";
 import { createMcpCore, resetGroupConsecutiveCount, resetSharedAntiLoopForTests, type AntiLoopRuntimeOptions } from "../src/server/mcp/core.ts";
 import { createMcpServer } from "../src/server/mcp/server.ts";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -26,7 +26,7 @@ import { createRepositories, type RepositorySet } from "../src/server/db/reposit
 const silent = createLogger({ level: "error", write: () => {} });
 
 interface Ctx {
-  readonly db: Database.Database;
+  readonly db: SqliteDriver;
   readonly repos: RepositorySet;
   readonly projectId: string;
   readonly groupId: string;
@@ -40,11 +40,14 @@ async function withDb<T>(
   overrides: { config?: Partial<AntiLoopRuntimeOptions["config"]>; captureLogs?: boolean } = {},
 ): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-t7-"));
-  const { db } = openDatabase(dir);
+  const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
   runMigrations(db, migrations);
-  const repos = createRepositories(db);
-  const project = repos.projects.create({ name: "P" });
-  const group = repos.groups.create({ projectId: project.id, name: "G" });
+  const repos = createRepositories(driver);
+  const project = (await ((await (repos.projects.create({ name: "P" })))));
+  const group = (await ((await (repos.groups.create({ projectId: project.id, name: "G" })))));
   let t = 1_700_000_000_000;
   const clock = { now: () => t, advance: (ms: number) => void (t += ms) };
   const logs: LogFields[] = [];
@@ -64,9 +67,9 @@ async function withDb<T>(
   // 每个用例一套全新的进程级共享限流器（模拟独立进程/重启），避免用例间状态泄漏。
   resetSharedAntiLoopForTests();
   try {
-    return await fn({ db, repos, projectId: project.id, groupId: group.id, clock, logs, antiLoop });
+    return await fn({ db: driver, repos, projectId: project.id, groupId: group.id, clock, logs, antiLoop });
   } finally {
-    if (db.open) db.close();
+    await driver.close();
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -125,21 +128,21 @@ async function join(ctx: Ctx, f: Fake, displayName: string, role?: "manager" | "
 }
 
 /** 造一条人类消息（模拟 WebUI 发送，不经过 MCP core）。返回 memberId。 */
-function sendHumanMessage(ctx: Ctx): string {
-  const existing = ctx.repos.members.listByProject(ctx.projectId).find((m) => m.kind === "human");
+async function sendHumanMessage(ctx: Ctx): Promise<string> {
+  const existing = (await ((await (ctx.repos.members.listByProject(ctx.projectId))))).find((m) => m.kind === "human");
   const member =
     existing ??
-    (() => {
-      const created = ctx.repos.members.create({
+    (await (async () => {
+      const created = (await ((await (ctx.repos.members.create({
         projectId: ctx.projectId,
         kind: "human",
         displayName: "Human",
         role: "normal",
-      });
-      ctx.repos.groups.addParticipant(ctx.groupId, created.id);
+      })))));
+      (await ((await (ctx.repos.groups.addParticipant(ctx.groupId, created.id)))));
       return created;
-    })();
-  ctx.repos.messages.create({ groupId: ctx.groupId, senderMemberId: member.id, body: "人类到场" });
+    })());
+  (await ((await (ctx.repos.messages.create({ groupId: ctx.groupId, senderMemberId: member.id, body: "人类到场" })))));
   // 与生产一致：人类消息重置该群组的连续自动回复计数（HTTP API 里做同样的事）。
   resetGroupConsecutiveCount(ctx.groupId);
   return member.id;

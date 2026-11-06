@@ -15,7 +15,6 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import path from "node:path";
 import { ConfigError, loadConfig, type HeartbeatConfig } from "../config.ts";
 import { createDbDriver } from "../db/driver.ts";
-import { SqliteDriver } from "../db/drivers/sqlite.ts";
 import { migrations } from "../db/migrations/index.ts";
 import { createLogger } from "../logger.ts";
 import { createMcpCore } from "./core.ts";
@@ -51,19 +50,12 @@ async function main(): Promise<void> {
     dataDir,
     ...(config?.pgConnectionString === undefined ? {} : { pgConnectionString: config.pgConnectionString }),
   });
-  if (!(driver instanceof SqliteDriver)) {
-    throw new ConfigError(
-      `stdio 暂不支持 dbDriver=postgres：阶段 1 业务仓储仍依赖 SQLite，` +
-        `PG 业务表切换与数据迁移由 M1（#54）交付。\n` +
-        `回滚方式：保持或改回 AGENT_STUDIO_DB_DRIVER=sqlite（默认值）。`,
-    );
-  }
   await driver.connect();
   await driver.migrate(migrations);
 
   const core = createMcpCore({
     logger,
-    db: driver.handle,
+    db: driver,
     memberKey: "stdio",
     ...(heartbeat === undefined ? {} : { heartbeat }),
     ...(config?.antiLoop ? { antiLoop: { config: config.antiLoop } } : {}),
@@ -71,7 +63,7 @@ async function main(): Promise<void> {
   const server = createMcpServer({ core, logger });
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  logger.info("mcp_stdio_connected", { pid: process.pid, database: driver.file });
+  logger.info("mcp_stdio_connected", { pid: process.pid, database: driver.kind });
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -94,7 +86,7 @@ async function main(): Promise<void> {
   }
 }
 
-await main().catch((error) => {
+await await (main()).catch((error) => {
   if (error instanceof ConfigError) {
     process.stderr.write(`配置无效：${error.message}\n`);
   } else {

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -203,37 +203,40 @@ test("心跳在 timeoutMs..2*timeoutMs 之间：仍在线但标记 heartbeatStal
 
 test("deriveProjectStatuses：按项目隔离成员状态，且人与 agent 区分", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-status-"));
-  let db: ReturnType<typeof openDatabase> | null = null;
+  let driver: SqliteDriver | null = null;
   try {
-    db = openDatabase(dir);
-    runMigrations(db.db, migrations);
-    const repos: RepositorySet = createRepositories(db.db);
+    driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const handle = driver.handle;
+    runMigrations(handle, migrations);
+    const repos: RepositorySet = createRepositories(driver);
     const now = new Date("2026-10-22T00:00:00.000Z");
 
-    const p1 = repos.projects.create({ name: "P1" });
-    const p2 = repos.projects.create({ name: "P2" });
-    const human1 = repos.members.create({ projectId: p1.id, kind: "human", displayName: "Human1" });
-    const a1 = repos.agents.create({ displayName: "Alice", hostType: "claude-code" });
-    const agent1 = repos.members.create({ projectId: p1.id, kind: "agent", agentId: a1.id, displayName: "Alice" });
-    const a2 = repos.agents.create({ displayName: "Bob", hostType: "codex-cli" });
-    const agent2 = repos.members.create({ projectId: p2.id, kind: "agent", agentId: a2.id, displayName: "Bob" });
+    const p1 = (await ((await (repos.projects.create({ name: "P1" })))));
+    const p2 = (await ((await (repos.projects.create({ name: "P2" })))));
+    const human1 = (await ((await (repos.members.create({ projectId: p1.id, kind: "human", displayName: "Human1" })))));
+    const a1 = (await ((await (repos.agents.create({ displayName: "Alice", hostType: "claude-code" })))));
+    const agent1 = (await ((await (repos.members.create({ projectId: p1.id, kind: "agent", agentId: a1.id, displayName: "Alice" })))));
+    const a2 = (await ((await (repos.agents.create({ displayName: "Bob", hostType: "codex-cli" })))));
+    const agent2 = (await ((await (repos.members.create({ projectId: p2.id, kind: "agent", agentId: a2.id, displayName: "Bob" })))));
 
-    repos.statuses.set(p1.id, human1.id, "online");
-    repos.statuses.set(p1.id, agent1.id, "waiting");
-    repos.statuses.set(p2.id, agent2.id, "working");
-    const g1 = repos.groups.create({ projectId: p1.id, name: "G1" });
-    const g2 = repos.groups.create({ projectId: p2.id, name: "G2" });
-    repos.mcpSessions.connect({
+    (await ((await (repos.statuses.set(p1.id, human1.id, "online")))));
+    (await ((await (repos.statuses.set(p1.id, agent1.id, "waiting")))));
+    (await ((await (repos.statuses.set(p2.id, agent2.id, "working")))));
+    const g1 = (await ((await (repos.groups.create({ projectId: p1.id, name: "G1" })))));
+    const g2 = (await ((await (repos.groups.create({ projectId: p2.id, name: "G2" })))));
+    (await ((await (repos.mcpSessions.connect({
       agentId: a1.id, projectId: p1.id, groupId: g1.id, memberId: agent1.id,
       displayName: "Alice", hostType: "claude-code",
-    });
-    repos.mcpSessions.connect({
+    })))));
+    (await ((await (repos.mcpSessions.connect({
       agentId: a2.id, projectId: p2.id, groupId: g2.id, memberId: agent2.id,
       displayName: "Bob", hostType: "codex-cli",
-    });
+    })))));
 
-    const p1Statuses = deriveProjectStatuses(repos, p1.id, { heartbeat: HEARTBEAT, now });
-    const p2Statuses = deriveProjectStatuses(repos, p2.id, { heartbeat: HEARTBEAT, now });
+    const p1Statuses = await deriveProjectStatuses(repos, p1.id, { heartbeat: HEARTBEAT, now });
+    const p2Statuses = await deriveProjectStatuses(repos, p2.id, { heartbeat: HEARTBEAT, now });
 
     assert.equal(p1Statuses.length, 2, "P1 有两个成员");
     assert.equal(p2Statuses.length, 1, "P2 只有一个成员");
@@ -247,7 +250,7 @@ test("deriveProjectStatuses：按项目隔离成员状态，且人与 agent 区�
     assert.equal(p1Statuses.some((s) => s.memberId === agent2.id), false);
     assert.equal(byId(p2Statuses, agent2.id).state, "working");
   } finally {
-    db?.db.close();
+    await driver?.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

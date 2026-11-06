@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type Database from "better-sqlite3";
+import type { DbDriver } from "./db/driver.ts";
 import type { HeartbeatConfig } from "./config.ts";
 import { RepositoryError } from "./db/errors.ts";
 import { createRepositories, type RepositorySet } from "./db/repositories.ts";
@@ -77,7 +77,7 @@ export interface ActorResolution {
 }
 
 export interface T1ApiOptions {
-  readonly db: Database.Database;
+  readonly db: DbDriver;
   readonly logger: Logger;
   /**
    * T3：人发送消息后，把消息广播给 WebUI（WebSocket）。可选：测试或无 WS 环境时省略。
@@ -94,7 +94,7 @@ export interface T1ApiOptions {
    * T2（#49）/ 未来多用户在此返回真实主体（含 `nodeId` / `subtreeNodeIds`），
    * 权限判定与拒绝码全部沿用 `authorize`，本模块不自行判断。
    */
-  readonly resolveActor?: (resolution: ActorResolution) => Actor | null;
+  readonly resolveActor?: (resolution: ActorResolution) => Promise<Actor | null>;
   /**
    * T5（#52）审计/撤销接口钩子：本票只在组织/占岗变更处调用，不写 audit_log。
    * 省略时用空实现；T5 注入真实 recorder 即接上统一审计表与人的撤销权。
@@ -162,9 +162,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   const orgChangeRecorder: OrgChangeRecorder = options.orgChangeRecorder ?? noopOrgChangeRecorder;
 
   /** 默认主体：阶段 1 的人（owner）；给定 memberId 时用其成员行推导静态角色。 */
-  function resolveDefaultActor(r: RepositorySet, resolution: ActorResolution): Actor {
+  async function resolveDefaultActor(r: RepositorySet, resolution: ActorResolution): Promise<Actor> {
     if (resolution.memberId) {
-      const member = r.members.get(resolution.memberId);
+      const member = (await (r.members.get(resolution.memberId)));
       if (member) return actorForMember(member);
     }
     return ownerActor(resolution.projectId);
@@ -178,21 +178,21 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
    * 返回判定里的 `conn` 是 #48 行级收窄的输入：列表端点据此只取主体被允许触碰的行
    * （NFR-PROJ-01 / 决策票 #37 的 conn-scoped 强制点），不依赖调用方自律。
    */
-  function guard(
+  async function guard(
     r: RepositorySet,
     request: IncomingMessage,
     capability: Capability,
     scope: GuardScope,
     memberId?: string,
-  ): { actor: Actor; decision: Extract<AuthorizeDecision, { allowed: true }> } {
+  ): Promise<{ actor: Actor; decision: Extract<AuthorizeDecision, { allowed: true }> }> {
     const resolution: ActorResolution = {
       request,
       projectId: scope.projectId ?? null,
       ...(memberId === undefined ? {} : { memberId }),
     };
     const actor = options.resolveActor
-      ? options.resolveActor(resolution)
-      : resolveDefaultActor(r, resolution);
+      ? await (options.resolveActor(resolution))
+      : await (resolveDefaultActor(r, resolution));
     if (actor === null || actor === undefined) {
       throw new ForbiddenError({
         allowed: false,
@@ -209,8 +209,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
    * `before/after` 传领域对象即可（成员 / 组织节点 / 项目 / 群组快照）；`null`
    * 表示「事前/事后不存在」（创建 / 删除类事件）。供组织与成员变更的补偿撤销使用。
    */
-  function recordAudit(actor: Actor, entry: Omit<AuditEntry, "actor">): AuditRow {
-    return appendAuditEntry(repos.audit, { actor: auditActorFrom(actor), ...entry });
+  async function recordAudit(actor: Actor, entry: Omit<AuditEntry, "actor">): Promise<AuditRow> {
+    return await (appendAuditEntry(repos.audit, { actor: auditActorFrom(actor), ...entry }));
   }
 
   /**
@@ -218,33 +218,33 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
    * 撤销＝复原 `before` 快照（建岗/删成员/删岗这类「存在性翻转」用 targetId 反向操作）。
    * 故意复用 T2/T3 现有的 repository 方法，不新增业务语义。
    */
-  function undoMemberOrgChange(r: RepositorySet, row: AuditRow): void {
+  async function undoMemberOrgChange(r: RepositorySet, row: AuditRow): Promise<void> {
     const action = row.action as AuditAction;
     const before = row.before as Member | OrgNode | null | undefined;
     const isMember = action.startsWith("member.");
     switch (action) {
       case AUDIT_ACTIONS.member_add:
-        r.members.delete(row.targetId);
+        (await (r.members.delete(row.targetId)));
         break;
       case AUDIT_ACTIONS.member_remove:
       case AUDIT_ACTIONS.member_pause:
       case AUDIT_ACTIONS.member_resume:
       case AUDIT_ACTIONS.member_status_change:
-        r.members.restoreRow(before as Member);
+        (await (r.members.restoreRow(before as Member)));
         break;
       case AUDIT_ACTIONS.org_node_create:
-        r.org.deleteNode(row.targetId);
+        (await (r.org.deleteNode(row.targetId)));
         break;
       case AUDIT_ACTIONS.org_node_delete:
       case AUDIT_ACTIONS.org_node_update:
-        r.org.restoreRow(before as OrgNode);
+        (await (r.org.restoreRow(before as OrgNode)));
         break;
       case AUDIT_ACTIONS.org_assign:
       case AUDIT_ACTIONS.org_auto_place:
-        r.org.assignNode(
+        (await (r.org.assignNode(
           row.targetId,
           isMember ? ((before as Member | undefined)?.nodeId ?? null) : null,
-        );
+        )));
         break;
       default:
         throw new HttpError(403, "action_not_revocable", `事件 ${action} 不可撤销。`);
@@ -255,33 +255,33 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
    * T5（#52）链式回滚：撤销一个「撤销事件」＝重放原变更（`after` 才是该恢复到的状态）。
    * 用于人撤销自己的撤销（#30 §3 的「撤销的撤销」）。
    */
-  function redoMemberOrgChange(r: RepositorySet, original: AuditRow): void {
+  async function redoMemberOrgChange(r: RepositorySet, original: AuditRow): Promise<void> {
     const action = original.action as AuditAction;
     const after = original.after as Member | OrgNode | null | undefined;
     const isMember = action.startsWith("member.");
     switch (action) {
       case AUDIT_ACTIONS.member_remove:
-        r.members.delete(original.targetId);
+        (await (r.members.delete(original.targetId)));
         break;
       case AUDIT_ACTIONS.member_add:
       case AUDIT_ACTIONS.member_pause:
       case AUDIT_ACTIONS.member_resume:
       case AUDIT_ACTIONS.member_status_change:
-        r.members.restoreRow(after as Member);
+        (await (r.members.restoreRow(after as Member)));
         break;
       case AUDIT_ACTIONS.org_node_delete:
-        r.org.deleteNode(original.targetId);
+        (await (r.org.deleteNode(original.targetId)));
         break;
       case AUDIT_ACTIONS.org_node_create:
       case AUDIT_ACTIONS.org_node_update:
-        r.org.restoreRow(after as OrgNode);
+        (await (r.org.restoreRow(after as OrgNode)));
         break;
       case AUDIT_ACTIONS.org_assign:
       case AUDIT_ACTIONS.org_auto_place:
-        r.org.assignNode(
+        (await (r.org.assignNode(
           original.targetId,
           isMember ? ((after as Member | undefined)?.nodeId ?? null) : null,
-        );
+        )));
         break;
       default:
         throw new HttpError(403, "action_not_revocable", `事件 ${action} 不可撤销。`);
@@ -338,28 +338,28 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       if (method === "POST") {
         const body = await readObjectBody(request);
         // F2：创建项目 = project:create（阶段 1 默认人=owner 放行；manager 无此能力点）。
-        guard(r, request, "project:create", {});
+        (await (guard(r, request, "project:create", {})));
         // #48 / PROJECT-02：可选「创建时指定」顶层 manager（已有全局 agent）；省略 = 留空待分配。
         const managerAgentId = optionalStringOrNull(body, "managerAgentId");
-        const project = r.projects.create({
+        const project = (await (r.projects.create({
           name: requireString(body, "name"),
           ...(managerAgentId === undefined ? {} : { managerAgentId }),
-        });
+        })));
         log.info("创建项目", { projectId: project.id });
-        writeJson(response, 201, { project: projectView(r, project) });
+        writeJson(response, 201, { project: (await (projectView(r, project))) });
         return true;
       }
       if (method === "GET") {
         // F2：跨项目清单 = overview:view（OVERVIEW-01：仅人 / 顶层 manager 可见）。
-        const { decision } = guard(r, request, "overview:view", {});
+        const { decision } = (await (guard(r, request, "overview:view", {})));
         const includeArchived = truthyParam(request, "includeArchived");
         // #48 行级收窄：绑定在某项目上的主体（agent 成员）只看得到自己那个项目；
         // 全局主体（阶段 1 的人）conn.projectId = null → 仍看到全部，行为不变。
         const boundProjectId = decision.conn.projectId;
-        const projects = r
-          .projects.list({ includeArchived })
+        const projects = (await (r
+          .projects.list({ includeArchived })))
           .filter((p) => boundProjectId === null || p.id === boundProjectId);
-        writeJson(response, 200, { projects: projects.map((p) => projectView(r, p)) });
+        writeJson(response, 200, { projects: (await Promise.all(projects.map(async (p) => (await (projectView(r, p)))))) });
         return true;
       }
       methodNotAllowed(response, ["GET", "POST"]);
@@ -370,9 +370,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     if (segments.length === 3 && segments[0] === "api" && segments[1] === "projects") {
       const projectId = decodeSegment(segments[2]!);
       if (method === "GET") {
-        const project = requireProject(r, projectId);
-        guard(r, request, "project:view", { projectId: project.id });
-        writeJson(response, 200, { project: projectView(r, project) });
+        const project = (await (requireProject(r, projectId)));
+        (await (guard(r, request, "project:view", { projectId: project.id })));
+        writeJson(response, 200, { project: (await (projectView(r, project))) });
         return true;
       }
       if (method === "DELETE") {
@@ -393,16 +393,16 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       (segments[3] === "archive" || segments[3] === "restore")
     ) {
       const projectId = decodeSegment(segments[2]!);
-      const project = requireProject(r, projectId);
+      const project = (await (requireProject(r, projectId)));
       if (method === "POST") {
         // 归档与恢复共用 `project:archive` 能力点：恢复 = 取消归档，权限同位。
         // 顶层 manager 可归档（LIFE-ARC-01），但矩阵里没有 project:purge → 不能永久删除。
-        const { actor } = guard(r, request, "project:archive", { projectId: project.id });
+        const { actor } = (await (guard(r, request, "project:archive", { projectId: project.id })));
         const next =
-          segments[3] === "archive" ? r.projects.archive(project.id) : r.projects.restore(project.id);
+          segments[3] === "archive" ? (await (r.projects.archive(project.id))) : (await (r.projects.restore(project.id)));
         log.info(segments[3] === "archive" ? "归档项目" : "恢复项目", { projectId });
         // T5 #52：归档/恢复本就是状态可逆，不进可撤销集；仍留痕供人查阅。
-        recordAudit(actor, {
+        await (recordAudit(actor, {
           projectId: project.id,
           action:
             segments[3] === "archive" ? AUDIT_ACTIONS.project_archive : AUDIT_ACTIONS.project_restore,
@@ -411,8 +411,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           targetName: project.name,
           before: project,
           after: next,
-        });
-        writeJson(response, 200, { project: projectView(r, next) });
+        }));
+        writeJson(response, 200, { project: (await (projectView(r, next))) });
         return true;
       }
       methodNotAllowed(response, ["POST"]);
@@ -427,15 +427,15 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       segments[3] === "members"
     ) {
       const projectId = decodeSegment(segments[2]!);
-      requireProject(r, projectId);
+      (await (requireProject(r, projectId)));
       if (method === "POST") {
         const body = await readObjectBody(request);
         const agentId = optionalStringOrNull(body, "agentId");
         const role = optionalRole(body);
         const status = optionalLifecycleStatus(body);
         // F2：增成员 = member:manage（ORG-07；下级 manager 的子树限制待 T2 注入节点数据）。
-        const { actor } = guard(r, request, "member:manage", { projectId });
-        const member = r.members.create({
+        const { actor } = (await (guard(r, request, "member:manage", { projectId })));
+        const member = (await (r.members.create({
           projectId,
           kind: requireMemberKind(body),
           displayName: requireString(body, "displayName"),
@@ -443,9 +443,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           ...(role === undefined ? {} : { role }),
           // T3 #50：可显式登记为 pending（待激活）；省略 = active（阶段 1 行为不变）。
           ...(status === undefined ? {} : { status }),
-        });
+        })));
         // T5 #52：成员新增可撤销（撤销＝删除），写审计。
-        recordAudit(actor, {
+        await (recordAudit(actor, {
           projectId,
           action: AUDIT_ACTIONS.member_add,
           targetKind: "member",
@@ -453,14 +453,14 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           targetName: member.displayName,
           before: null,
           after: member,
-        });
+        }));
         log.info("添加项目成员", { projectId, memberId: member.id });
         writeJson(response, 201, { member: memberView(member) });
         return true;
       }
       if (method === "GET") {
-        guard(r, request, "member:view", { projectId });
-        writeJson(response, 200, { members: r.members.listByProject(projectId).map(memberView) });
+        (await (guard(r, request, "member:view", { projectId })));
+        writeJson(response, 200, { members: (await (r.members.listByProject(projectId))).map(memberView) });
         return true;
       }
       methodNotAllowed(response, ["GET", "POST"]);
@@ -476,17 +476,17 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     ) {
       const projectId = decodeSegment(segments[2]!);
       const memberId = decodeSegment(segments[4]!);
-      requireProject(r, projectId);
+      (await (requireProject(r, projectId)));
       if (method === "DELETE") {
-        const member = r.members.get(memberId);
+        const member = (await (r.members.get(memberId)));
         if (!member || member.projectId !== projectId) {
           throw new RepositoryError("not_found", `成员 ${memberId} 不属于项目 ${projectId}。`);
         }
         // F2：移除成员 = member:manage。
-        const { actor } = guard(r, request, "member:manage", { projectId, memberId });
-        r.members.delete(memberId);
+        const { actor } = (await (guard(r, request, "member:manage", { projectId, memberId })));
+        (await (r.members.delete(memberId)));
         // T5 #52：成员移除可撤销（撤销＝按 before 复原整行），写审计。
-        recordAudit(actor, {
+        await (recordAudit(actor, {
           projectId,
           action: AUDIT_ACTIONS.member_remove,
           targetKind: "member",
@@ -494,7 +494,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           targetName: member.displayName,
           before: member,
           after: null,
-        });
+        }));
         log.info("移除项目成员", { projectId, memberId });
         response.writeHead(204, { "cache-control": "no-store" });
         response.end();
@@ -517,8 +517,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       const projectId = decodeSegment(segments[2]!);
       const memberId = decodeSegment(segments[4]!);
       const action = segments[5]!;
-      requireProject(r, projectId);
-      const member = r.members.get(memberId);
+      (await (requireProject(r, projectId)));
+      const member = (await (r.members.get(memberId)));
       if (!member || member.projectId !== projectId) {
         throw new RepositoryError("not_found", `成员 ${memberId} 不属于项目 ${projectId}。`);
       }
@@ -539,9 +539,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         status = requireLifecycleStatus(await readObjectBody(request));
         hookAction = "member.status_change";
       }
-      const { actor } = guard(r, request, "member:manage", { projectId, nodeId: member.nodeId });
+      const { actor } = (await (guard(r, request, "member:manage", { projectId, nodeId: member.nodeId })));
       const from = member.status;
-      const updated = r.members.setStatus(memberId, status);
+      const updated = (await (r.members.setStatus(memberId, status)));
       // T5 #52：经审计钩子写入 audit_log（含真实主体与 before/after 快照，供撤销复原）。
       orgChangeRecorder.record({
         projectId,
@@ -569,14 +569,14 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     ) {
       const projectId = decodeSegment(segments[2]!);
       const memberId = decodeSegment(segments[4]!);
-      requireProject(r, projectId);
-      const member = r.members.get(memberId);
+      (await (requireProject(r, projectId)));
+      const member = (await (r.members.get(memberId)));
       if (!member || member.projectId !== projectId) {
         throw new RepositoryError("not_found", `成员 ${memberId} 不属于项目 ${projectId}。`);
       }
       if (method === "GET") {
-        guard(r, request, "status:view", { projectId });
-        writeJson(response, 200, { memberStatus: memberStatusView(r, projectId, memberId) });
+        (await (guard(r, request, "status:view", { projectId })));
+        writeJson(response, 200, { memberStatus: (await (memberStatusView(r, projectId, memberId))) });
         return true;
       }
       methodNotAllowed(response, ["GET"]);
@@ -591,10 +591,10 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       segments[3] === "member-statuses"
     ) {
       const projectId = decodeSegment(segments[2]!);
-      requireProject(r, projectId);
+      (await (requireProject(r, projectId)));
       if (method === "GET") {
-        guard(r, request, "status:view", { projectId });
-        const list = r.members.listByProject(projectId).map((m) => memberStatusView(r, projectId, m.id));
+        (await (guard(r, request, "status:view", { projectId })));
+        const list = (await Promise.all((await (r.members.listByProject(projectId))).map(async (m) => (await (memberStatusView(r, projectId, m.id))))));
         writeJson(response, 200, { memberStatuses: list });
         return true;
       }
@@ -610,31 +610,31 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       segments[3] === "manager"
     ) {
       const projectId = decodeSegment(segments[2]!);
-      requireProject(r, projectId);
+      (await (requireProject(r, projectId)));
       if (method === "PUT") {
         const body = await readObjectBody(request);
         const memberId = requireString(body, "memberId");
-        const member = r.members.get(memberId);
+        const member = (await (r.members.get(memberId)));
         if (!member || member.projectId !== projectId) {
           throw new RepositoryError("not_found", `成员 ${memberId} 不属于项目 ${projectId}，无法指定为 manager。`);
         }
         // F2：指定/更换顶层 manager = org:manage（ORG-04：人可撤销、manager 在管辖范围内调整）。
-        guard(r, request, "org:manage", { projectId, memberId });
-        const current = r.members.getManager(projectId);
+        (await (guard(r, request, "org:manage", { projectId, memberId })));
+        const current = (await (r.members.getManager(projectId)));
         if (current && current.id !== memberId) {
           // 支持「更换」：事务内先把旧 manager 降为 normal，再把新成员升为 manager。
           // 顺序保证任一时刻最多一个 manager（部分唯一索引 ux_members_project_manager）。
-          r.transaction(() => {
-            r.members.update(current.id, { role: "normal" });
-            r.members.update(memberId, { role: "manager" });
-          });
+          (await (r.transaction(async () => {
+            (await (r.members.update(current.id, { role: "normal" })));
+            (await (r.members.update(memberId, { role: "manager" })));
+          })));
           log.info("更换项目 manager", { projectId, from: current.id, to: memberId });
         } else if (member.role !== "manager") {
           // 无现有 manager（或已指定同一成员）：仅提升该成员；留空创建后在此首次指定。
-          r.members.update(memberId, { role: "manager" });
+          (await (r.members.update(memberId, { role: "manager" })));
           log.info("指定项目 manager", { projectId, memberId });
         }
-        writeJson(response, 200, { project: projectView(r, r.projects.get(projectId)!) });
+        writeJson(response, 200, { project: (await (projectView(r, (await (r.projects.get(projectId)))!))) });
         return true;
       }
       methodNotAllowed(response, ["PUT"]);
@@ -649,27 +649,27 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       segments[3] === "groups"
     ) {
       const projectId = decodeSegment(segments[2]!);
-      requireProject(r, projectId);
+      (await (requireProject(r, projectId)));
       if (method === "POST") {
         const body = await readObjectBody(request);
         const name = requireString(body, "name");
         const participantMemberIds = optionalStringArray(body, "participantMemberIds");
         // F2：建群组 = group:create（GROUP-03）。T2 #49：附上参与者岗位节点，
         // 下级 manager 建群时由守卫的 subtree 边界判定「参与者必须全部落在本子树内」（ORG-05）。
-        guard(r, request, "group:create", {
+        (await (guard(r, request, "group:create", {
           projectId,
           ...(participantMemberIds === undefined
             ? {}
             : {
                 groupMemberIds: participantMemberIds,
-                groupMemberNodeIds: nodeIdsOfMembers(r, participantMemberIds),
+                groupMemberNodeIds: await (nodeIdsOfMembers(r, participantMemberIds)),
               }),
-        });
-        const group = r.groups.create({
+        })));
+        const group = (await (r.groups.create({
           projectId,
           name,
           ...(participantMemberIds === undefined ? {} : { participantMemberIds }),
-        });
+        })));
         log.info("创建群组", { projectId, groupId: group.id });
         writeJson(response, 201, { group: groupView(group) });
         return true;
@@ -679,15 +679,15 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         // （参与的、全项目岗位看到的全部、或 sub_manager 子树只读可见的）；不可见者不出现。
         // T2 #49：附上 `memberNodeIds`（来自 members.node_id），group:view_subtree 才有判定依据；
         // 升级库无组织数据时全部为 null，owner/普通成员的行为与阶段 1 一致。
-        const { actor } = guard(r, request, "group:view", { projectId });
+        const { actor } = (await (guard(r, request, "group:view", { projectId })));
         const includeArchived = truthyParam(request, "includeArchived");
-        const candidates = r.groups.listByProject(projectId, { includeArchived });
+        const candidates = (await (r.groups.listByProject(projectId, { includeArchived })));
         const visible = visibleGroups(
           actor,
-          candidates.map((g) => {
-            const memberIds = r.groups.participants(g.id);
-            return { id: g.id, projectId, memberIds, memberNodeIds: nodeIdsOfMembers(r, memberIds) };
-          }),
+          (await Promise.all(candidates.map(async (g) => {
+            const memberIds = (await (r.groups.participants(g.id)));
+            return { id: g.id, projectId, memberIds, memberNodeIds: await (nodeIdsOfMembers(r, memberIds)) };
+          }))),
         );
         const byId = new Map(visible.map((v) => [v.id, v.writable]));
         writeJson(response, 200, {
@@ -711,17 +711,17 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       (segments[3] === "archive" || segments[3] === "restore")
     ) {
       const groupId = decodeSegment(segments[2]!);
-      const group = requireGroup(r, groupId);
+      const group = (await (requireGroup(r, groupId)));
       if (method === "POST") {
         // 归档与恢复共用 `group:archive`（owner / 顶层 manager / 下级 manager 限子树）。
-        const { actor } = guard(r, request, "group:archive", { projectId: group.projectId, groupId });
-        const next = segments[3] === "archive" ? r.groups.archive(groupId) : r.groups.restore(groupId);
+        const { actor } = (await (guard(r, request, "group:archive", { projectId: group.projectId, groupId })));
+        const next = segments[3] === "archive" ? (await (r.groups.archive(groupId))) : (await (r.groups.restore(groupId)));
         log.info(segments[3] === "archive" ? "归档群组" : "恢复群组", {
           projectId: group.projectId,
           groupId,
         });
         // T5 #52：归档/恢复属状态可逆，不进可撤销集；仍留痕供人查阅。
-        recordAudit(actor, {
+        await (recordAudit(actor, {
           projectId: group.projectId,
           action: segments[3] === "archive" ? AUDIT_ACTIONS.group_archive : AUDIT_ACTIONS.group_restore,
           targetKind: "group",
@@ -729,7 +729,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           targetName: group.name,
           before: group,
           after: next,
-        });
+        }));
         writeJson(response, 200, { group: groupView(next) });
         return true;
       }
@@ -741,13 +741,13 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     if (segments.length === 3 && segments[0] === "api" && segments[1] === "groups") {
       const groupId = decodeSegment(segments[2]!);
       if (method === "GET") {
-        const group = requireGroup(r, groupId);
-        const facts = groupGuardFacts(r, groupId);
-        const { actor } = guard(r, request, "group:view", {
+        const group = (await (requireGroup(r, groupId)));
+        const facts = (await (groupGuardFacts(r, groupId)));
+        const { actor } = (await (guard(r, request, "group:view", {
           projectId: group.projectId,
           groupId,
           ...facts,
-        });
+        })));
         // 只读可见性：复用 visibleGroups 的判定给出 writable，供 WebUI 区分「可参与/只读」。
         const [visibility] = visibleGroups(actor, [
           {
@@ -776,17 +776,17 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       segments[3] === "participants"
     ) {
       const groupId = decodeSegment(segments[2]!);
-      const group = r.groups.get(groupId);
+      const group = (await (r.groups.get(groupId)));
       if (!group) throw new RepositoryError("not_found", `群组 ${groupId} 不存在。`);
       if (method === "GET") {
-        guard(r, request, "group:view", {
+        (await (guard(r, request, "group:view", {
           projectId: group.projectId,
           groupId,
-          ...groupGuardFacts(r, groupId),
-        });
-        const participants = r.groups
-          .participants(groupId)
-          .map((id) => r.members.get(id))
+          ...(await (groupGuardFacts(r, groupId))),
+        })));
+        const participants = (await Promise.all((await (r.groups
+          .participants(groupId)))
+          .map(async (id) => (await (r.members.get(id))))))
           .filter((m): m is Member => m !== null)
           .map(memberView);
         writeJson(response, 200, { participants });
@@ -804,7 +804,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       segments[3] === "messages"
     ) {
       const groupId = decodeSegment(segments[2]!);
-      const group = r.groups.get(groupId);
+      const group = (await (r.groups.get(groupId)));
       if (!group) throw new RepositoryError("not_found", `群组 ${groupId} 不存在。`);
 
       if (method === "POST") {
@@ -813,24 +813,24 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         const text = requireString(body, "text");
         const explicitMentions = optionalStringArray(body, "mentions") ?? [];
 
-        const sender = r.members.get(senderMemberId);
+        const sender = (await (r.members.get(senderMemberId)));
         if (!sender || sender.projectId !== group.projectId) {
           throw new RepositoryError("invalid_reference", `发送者 ${senderMemberId} 不属于该群组所在项目。`);
         }
-        if (!r.groups.participants(groupId).includes(senderMemberId)) {
+        if (!(await (r.groups.participants(groupId))).includes(senderMemberId)) {
           throw new RepositoryError("invalid_reference", `发送者 ${senderMemberId} 不是该群组参与者。`);
         }
         // F2：发言 = group:post，以发送者为主体（参与范围由 group_participants 判定）。
         // T2 #49：group:post 是 participation 边界——子树只读可见性不会扩成发言权。
-        guard(
+        (await (guard(
           r,
           request,
           "group:post",
-          { projectId: group.projectId, groupId, ...groupGuardFacts(r, groupId) },
+          { projectId: group.projectId, groupId, ...(await (groupGuardFacts(r, groupId))) },
           senderMemberId,
-        );
+        )));
 
-        const roster = buildRosterFor(r, groupId);
+        const roster = (await (buildRosterFor(r, groupId)));
         const parsed = parseMentions(text, roster);
         if (parsed.unknownNames.length > 0) {
           throw new RepositoryError("invalid_argument", `无法解析 @ 名称：${parsed.unknownNames.join("、")}。`);
@@ -847,17 +847,17 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         );
         const persistedMentions = [...new Set([...mentionIds, ...plan.allRecipients])];
 
-        const created = r.transaction(() => {
-          const message = r.messages.create({
+        const created = (await (r.transaction(async () => {
+          const message = (await (r.messages.create({
             groupId,
             senderMemberId,
             body: text,
             mentions: persistedMentions,
-          });
-          for (const memberId of plan.visible) r.deliveries.ensure(message.id, memberId);
+          })));
+          for (const memberId of plan.visible) (await (r.deliveries.ensure(message.id, memberId)));
           return message;
-        });
-        const view = messageView(r, created, plan);
+        })));
+        const view = (await (messageView(r, created, plan)));
         // T7：人类消息重置该群组的「连续自动回复」计数（防环恢复条件之一）。
         if (sender.kind === "human") resetGroupConsecutiveCount(groupId);
         log.info("发送群组消息", { groupId, messageId: created.id, senderMemberId, via: "http" });
@@ -869,17 +869,17 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       if (method === "GET") {
         // F2：历史读取 = group:view。T2 #49：附上参与者岗位节点，
         // sub_manager 对「参与者全部在子树内」的群组可读历史（只读，不唤醒、不能发言）。
-        guard(r, request, "group:view", {
+        (await (guard(r, request, "group:view", {
           projectId: group.projectId,
           groupId,
-          ...groupGuardFacts(r, groupId),
-        });
+          ...(await (groupGuardFacts(r, groupId))),
+        })));
         const limitRaw = new URL(request.url ?? "/", "http://127.0.0.1").searchParams.get("limit");
         const limit = limitRaw === null ? 200 : Math.min(Math.max(Number(limitRaw) || 200, 1), 500);
-        const all = r.messages.listByGroup(groupId);
+        const all = (await (r.messages.listByGroup(groupId)));
         const page = all.slice(Math.max(0, all.length - limit));
         // 人的视角：可见全部群组消息（阶段 1 单群组）。
-        writeJson(response, 200, { messages: page.map((m) => messageView(r, m)) });
+        writeJson(response, 200, { messages: (await Promise.all(page.map(async (m) => (await (messageView(r, m)))))) });
         return true;
       }
 
@@ -899,14 +899,14 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     // GET /api/projects/:id/org —— 组织树 + 占岗成员 + 角色能力点目录
     if (segments.length === 4 && segments[0] === "api" && segments[1] === "projects" && segments[3] === "org") {
       const projectId = decodeSegment(segments[2]!);
-      requireProject(r, projectId);
+      (await (requireProject(r, projectId)));
       if (method === "GET") {
-        guard(r, request, "project:view", { projectId });
-        const nodes = r.org.listNodes(projectId);
-        const members = r.members.listByProject(projectId);
+        (await (guard(r, request, "project:view", { projectId })));
+        const nodes = (await (r.org.listNodes(projectId)));
+        const members = (await (r.members.listByProject(projectId)));
         writeJson(response, 200, {
-          nodes: nodes.map((n) => orgNodeView(n, memberAtNode(r, projectId, n.id))),
-          rootId: r.org.getRootNode(projectId)?.id ?? null,
+          nodes: (await Promise.all(nodes.map(async (n) => orgNodeView(n, (await (memberAtNode(r, projectId, n.id))))))),
+          rootId: (await (r.org.getRootNode(projectId)))?.id ?? null,
           roles: roleCatalog(),
           members: members.map(memberView),
         });
@@ -925,7 +925,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       segments[4] === "nodes"
     ) {
       const projectId = decodeSegment(segments[2]!);
-      requireProject(r, projectId);
+      (await (requireProject(r, projectId)));
       if (method === "POST") {
         const body = await readObjectBody(request);
         const parentId = optionalStringOrNull(body, "parentId") ?? null;
@@ -933,14 +933,14 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         const role = requireOrgNodeRole(body, "role");
         const sortOrder = optionalSortOrder(body);
         // ORG-05：新岗位的父节点必须落在调用者的管辖子树内（root 仅 owner/top_manager 可建）。
-        const { actor } = guard(r, request, "org:manage", { projectId, nodeId: parentId });
-        const node = r.org.createNode({
+        const { actor } = (await (guard(r, request, "org:manage", { projectId, nodeId: parentId })));
+        const node = (await (r.org.createNode({
           projectId,
           parentId,
           name,
           role,
           ...(sortOrder === undefined ? {} : { sortOrder }),
-        });
+        })));
         // T5 #52：建岗可撤销（撤销＝删岗），写审计。
         orgChangeRecorder.record({
           projectId,
@@ -970,13 +970,13 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       segments[4] === "auto-place"
     ) {
       const projectId = decodeSegment(segments[2]!);
-      requireProject(r, projectId);
+      (await (requireProject(r, projectId)));
       if (method === "POST") {
         const body = await readObjectBody(request);
         const memberId = requireString(body, "memberId");
-        const { actor } = guard(r, request, "member:manage", { projectId });
-        const beforeMember = r.members.get(memberId);
-        const node = r.org.autoPlaceMember(projectId, memberId);
+        const { actor } = (await (guard(r, request, "member:manage", { projectId })));
+        const beforeMember = (await (r.members.get(memberId)));
+        const node = (await (r.org.autoPlaceMember(projectId, memberId)));
         // T5 #52：自动分配可撤销（撤销＝腾岗回 nodeId=null），写审计。
         orgChangeRecorder.record({
           projectId,
@@ -986,11 +986,11 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           actor: auditActorFrom(actor),
           targetName: node?.name ?? memberId,
           before: beforeMember ?? null,
-          after: node !== null ? r.members.get(memberId) : (beforeMember ?? null),
+          after: node !== null ? (await (r.members.get(memberId))) : (beforeMember ?? null),
           detail: { placed: node !== null },
         });
         writeJson(response, 200, {
-          node: node ? orgNodeView(node, memberAtNode(r, projectId, node.id)) : null,
+          node: node ? orgNodeView(node, (await (memberAtNode(r, projectId, node.id)))) : null,
         });
         return true;
       }
@@ -1001,7 +1001,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     // PUT / DELETE /api/org/nodes/:nodeId —— 改岗位（改名/角色/汇报线/排序）与删岗位
     if (segments.length === 4 && segments[0] === "api" && segments[1] === "org" && segments[2] === "nodes") {
       const nodeId = decodeSegment(segments[3]!);
-      const node = r.org.getNode(nodeId);
+      const node = (await (r.org.getNode(nodeId)));
       if (!node) throw new RepositoryError("not_found", `组织岗位 ${nodeId} 不存在。`);
       if (method === "PUT") {
         const body = await readObjectBody(request);
@@ -1015,12 +1015,12 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           ...(parentId === undefined ? {} : { parentId }),
           ...(sortOrder === undefined ? {} : { sortOrder }),
         };
-        const { actor } = guard(r, request, "org:manage", { projectId: node.projectId, nodeId: node.id });
+        const { actor } = (await (guard(r, request, "org:manage", { projectId: node.projectId, nodeId: node.id })));
         // 改汇报线时，新的父节点也必须落在管辖子树内（防越级搬迁）。
         if (parentId !== undefined && parentId !== null) {
-          guard(r, request, "org:manage", { projectId: node.projectId, nodeId: parentId });
+          (await (guard(r, request, "org:manage", { projectId: node.projectId, nodeId: parentId })));
         }
-        const updated = r.org.updateNode(nodeId, patch);
+        const updated = (await (r.org.updateNode(nodeId, patch)));
         // T5 #52：改岗可撤销（撤销＝按 before 复原整行），写审计。
         orgChangeRecorder.record({
           projectId: node.projectId,
@@ -1033,12 +1033,12 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           after: updated,
           detail: { patch },
         });
-        writeJson(response, 200, { node: orgNodeView(updated, memberAtNode(r, node.projectId, nodeId)) });
+        writeJson(response, 200, { node: orgNodeView(updated, (await (memberAtNode(r, node.projectId, nodeId)))) });
         return true;
       }
       if (method === "DELETE") {
-        const { actor } = guard(r, request, "org:manage", { projectId: node.projectId, nodeId: node.id });
-        r.org.deleteNode(nodeId);
+        const { actor } = (await (guard(r, request, "org:manage", { projectId: node.projectId, nodeId: node.id })));
+        (await (r.org.deleteNode(nodeId)));
         // T5 #52：删岗可撤销（撤销＝按 before 复原整行），写审计。
         orgChangeRecorder.record({
           projectId: node.projectId,
@@ -1068,24 +1068,24 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       segments[4] === "assignee"
     ) {
       const nodeId = decodeSegment(segments[3]!);
-      const node = r.org.getNode(nodeId);
+      const node = (await (r.org.getNode(nodeId)));
       if (!node) throw new RepositoryError("not_found", `组织岗位 ${nodeId} 不存在。`);
       if (method === "PUT") {
         const body = await readObjectBody(request);
         // memberId 为 null = 腾出该岗位当前占据者；否则把指定成员指派到该岗位。
         const memberId = optionalStringOrNull(body, "memberId") ?? null;
-        const { actor } = guard(r, request, "member:manage", { projectId: node.projectId, nodeId: node.id });
+        const { actor } = (await (guard(r, request, "member:manage", { projectId: node.projectId, nodeId: node.id })));
         let targetId = memberId;
         if (targetId === null) {
-          const current = memberAtNode(r, node.projectId, nodeId);
+          const current = (await (memberAtNode(r, node.projectId, nodeId)));
           if (!current) {
             writeJson(response, 200, { member: null });
             return true;
           }
           targetId = current.id;
         }
-        const beforeMember = r.members.get(targetId);
-        const member = r.org.assignNode(targetId, memberId === null ? null : nodeId);
+        const beforeMember = (await (r.members.get(targetId)));
+        const member = (await (r.org.assignNode(targetId, memberId === null ? null : nodeId)));
         // T5 #52：占岗/腾岗可撤销（撤销＝按 before 的 nodeId 复原占岗），写审计。
         orgChangeRecorder.record({
           projectId: node.projectId,
@@ -1113,22 +1113,22 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       segments[3] === "audit"
     ) {
       const projectId = decodeSegment(segments[2]!);
-      requireProject(r, projectId);
+      (await (requireProject(r, projectId)));
       if (method === "GET") {
         // F2：audit:view（owner + 顶层 manager）。阶段 1 默认人=owner 放行，行为不变。
-        guard(r, request, "audit:view", { projectId });
+        (await (guard(r, request, "audit:view", { projectId })));
         const url = new URL(request.url ?? "/", "http://127.0.0.1");
         const action = url.searchParams.get("action") ?? undefined;
         const targetKind = url.searchParams.get("targetKind") ?? undefined;
         const targetId = url.searchParams.get("targetId") ?? undefined;
         const rawLimit = url.searchParams.get("limit");
         const limit = rawLimit === null ? undefined : Number.parseInt(rawLimit, 10);
-        const rows = r.audit.list(projectId, {
+        const rows = (await (r.audit.list(projectId, {
           ...(action === undefined ? {} : { action }),
           ...(targetKind === undefined ? {} : { targetKind: targetKind as AuditTargetKind }),
           ...(targetId === undefined ? {} : { targetId }),
           ...(limit === undefined || Number.isNaN(limit) ? {} : { limit }),
-        });
+        })));
         writeJson(response, 200, { entries: rows.map(auditView) });
         return true;
       }
@@ -1145,12 +1145,12 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       segments[5] === "revoke"
     ) {
       const projectId = decodeSegment(segments[2]!);
-      requireProject(r, projectId);
+      (await (requireProject(r, projectId)));
       if (method === "POST") {
         const auditId = decodeSegment(segments[4]!);
         // F2：org:revoke 仅人（owner）。agent 主体在此被 authorize 直接拒绝（#30 §5）。
-        const { actor } = guard(r, request, "org:revoke", { projectId });
-        const row = r.audit.get(projectId, auditId);
+        const { actor } = (await (guard(r, request, "org:revoke", { projectId })));
+        const row = (await (r.audit.get(projectId, auditId)));
         if (!row) throw new RepositoryError("not_found", `审计事件 ${auditId} 不存在。`);
         if (row.reversedAt) {
           throw new RepositoryError("conflict", `审计事件 ${auditId} 已被撤销，不能重复撤销。`);
@@ -1172,20 +1172,20 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         if (row.action === AUDIT_ACTIONS.member_revoke || row.action === AUDIT_ACTIONS.org_revoke) {
           const originalId = row.reversedByAuditId;
           if (!originalId) throw new HttpError(409, "chain_broken", "撤销链断裂：缺少原始事件引用。");
-          const original = r.audit.get(projectId, originalId);
+          const original = (await (r.audit.get(projectId, originalId)));
           if (!original) throw new HttpError(409, "chain_broken", "撤销链断裂：原始事件已不存在。");
           originalForRedo = original;
           compensationAction = row.action;
         }
         let newRow!: AuditRow;
-        r.transaction(() => {
+        (await (r.transaction(async () => {
           if (originalForRedo) {
-            redoMemberOrgChange(r, originalForRedo);
+            (await (redoMemberOrgChange(r, originalForRedo)));
           } else {
-            undoMemberOrgChange(r, row);
+            (await (undoMemberOrgChange(r, row)));
           }
           // 写撤销记录（记录被撤销的原事件 id；本身仍可再被撤销＝链式）。
-          newRow = appendAuditEntry(repos.audit, {
+          newRow = await (appendAuditEntry(repos.audit, {
             projectId,
             actor: auditActorFrom(actor),
             action: compensationAction,
@@ -1196,9 +1196,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
             after: row.before,
             detail: { undoes: row.id, ...(originalForRedo ? { kind: "redo" } : { kind: "undo" }) },
             reversedByAuditId: row.id,
-          });
-          repos.audit.markReversed(projectId, row.id, newRow.id, at);
-        });
+          }));
+          (await (repos.audit.markReversed(projectId, row.id, newRow.id, at)));
+        })));
         writeJson(response, 200, { entry: auditView(newRow) });
         return true;
       }
@@ -1271,12 +1271,12 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    const { actor } = guard(r, request, flow.capability, flow.scope);
+    const { actor } = (await (guard(r, request, flow.capability, flow.scope)));
     const body = await readOptionalObjectBody(request);
     const confirm = typeof body["confirm"] === "string" ? (body["confirm"] as string) : null;
 
     if (confirm === null) {
-      const cascade = flow.preview();
+      const cascade = await flow.preview();
       const entry = issuePurgeConfirmation(flow.key);
       log.info(`${flow.event}：等待二次确认`, { cascade });
       writeJson(response, 409, {
@@ -1299,11 +1299,11 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       );
     }
 
-    const cleared = flow.execute();
+    const cleared = await flow.execute();
     log.info(`${flow.event}：已清除`, { cleared });
     // T5 #52：永久删除虽不可撤销，但必须留痕（项目/群组被删后审计行仍按无外键存活）。
     if (flow.audit) {
-      recordAudit(actor, {
+      await (recordAudit(actor, {
         projectId: flow.scope.projectId!,
         action: flow.audit.action,
         targetKind: flow.audit.targetKind,
@@ -1312,7 +1312,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         before: flow.audit.before(),
         after: null,
         detail: { cascade: cleared },
-      });
+      }));
     }
     response.writeHead(204, { "cache-control": "no-store" });
     response.end();
@@ -1325,7 +1325,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     response: ServerResponse,
     projectId: string,
   ): Promise<void> {
-    const project = requireProject(r, projectId);
+    const project = (await (requireProject(r, projectId)));
     await purgeWithConfirmation(
       r,
       {
@@ -1343,8 +1343,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           `永久删除项目「${project.name}」会级联清除它的群组、群聊消息、投递、成员与状态，且不可恢复。` +
           "确认无误后请带 confirmation.token 重新发起 DELETE。",
         event: "永久删除项目",
-        preview: () => r.projects.previewPurge(project.id),
-        execute: () => r.projects.purge(project.id),
+        preview: async () => (await (r.projects.previewPurge(project.id))),
+        execute: async () => (await (r.projects.purge(project.id))),
         // T5 #52：永久删除留痕（不可撤销）。
         audit: {
           action: AUDIT_ACTIONS.project_delete,
@@ -1369,7 +1369,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     response: ServerResponse,
     groupId: string,
   ): Promise<void> {
-    const group = requireGroup(r, groupId);
+    const group = (await (requireGroup(r, groupId)));
     await purgeWithConfirmation(
       r,
       {
@@ -1388,8 +1388,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           `永久删除群组「${group.name}」会清除它的群聊消息与参与者关系，且不可恢复；项目成员本身不受影响。` +
           "确认后请带 confirmation.token 重新发起 DELETE。",
         event: "永久删除群组",
-        preview: () => r.groups.previewPurge(group.id),
-        execute: () => r.groups.purge(group.id),
+        preview: async () => (await (r.groups.previewPurge(group.id))),
+        execute: async () => (await (r.groups.purge(group.id))),
         // T5 #52：永久删除留痕（不可撤销）。
         audit: {
           action: AUDIT_ACTIONS.group_delete,
@@ -1409,18 +1409,18 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   // -------------------------------------------------------------------------
 
   /** T3：从群组参与者构建路由 roster（在线以 connected MCP 会话为准，人视为在线）。 */
-  function buildRosterFor(r: RepositorySet, groupId: string): RoutingMember[] {
-    return buildRoster(r, groupId);
+  async function buildRosterFor(r: RepositorySet, groupId: string): Promise<RoutingMember[]> {
+    return (await (buildRoster(r, groupId)));
   }
 
   /** 消息视图（HTTP/WS 共用）。 */
-  function messageView(r: RepositorySet, message: DbMessage, plan?: { wake: readonly string[]; visible: readonly string[] }): MessageView {
-    const sender = r.members.get(message.senderMemberId);
+  async function messageView(r: RepositorySet, message: DbMessage, plan?: { wake: readonly string[]; visible: readonly string[] }): Promise<MessageView> {
+    const sender = (await (r.members.get(message.senderMemberId)));
     const resolvedPlan =
       plan ??
       resolveWakeAndVisibility(
         { senderMemberId: message.senderMemberId, mentionIds: message.mentions, mentionsAll: false },
-        buildRosterFor(r, message.groupId),
+        (await (buildRosterFor(r, message.groupId))),
       );
     return {
       id: message.id,
@@ -1436,16 +1436,16 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     };
   }
 
-  function projectView(r: RepositorySet, project: Project) {
-    const manager = r.members.getManager(project.id);
-    const members = r.members.listByProject(project.id);
-    const groups = r.groups.listByProject(project.id);
-    const messageCount = r.messages.countByProject(project.id);
-    const lastActivityAt = r.messages.latestByProject(project.id);
+  async function projectView(r: RepositorySet, project: Project) {
+    const manager = (await (r.members.getManager(project.id)));
+    const members = (await (r.members.listByProject(project.id)));
+    const groups = (await (r.groups.listByProject(project.id)));
+    const messageCount = (await (r.messages.countByProject(project.id)));
+    const lastActivityAt = (await (r.messages.latestByProject(project.id)));
     // T4（#51）：跨项目概览——聚合「运行状态 / 成员数 / 群组数 / 最近活跃」。
     // onlineCount 来自状态看板推导（WebSocket/会话在线）；人仅经 WS presence 在线，
     // 此处无 hub，故人按 offline 计（实时看板仍以 WS 推送为准）。
-    const statuses = buildStatusBoard(r, project.id, { heartbeat, now: new Date(), humanOnlineMemberIds: [] });
+    const statuses = (await (buildStatusBoard(r, project.id, { heartbeat, now: new Date(), humanOnlineMemberIds: [] })));
     const onlineCount = statuses.filter((s) => s.state !== "offline").length;
     const status: "active" | "idle" | "archived" =
       project.archivedAt !== null ? "archived" : onlineCount > 0 ? "active" : "idle";
@@ -1513,8 +1513,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   }
 
   /** 某岗位当前的占据成员（一人一岗，至多一个）。 */
-  function memberAtNode(r: RepositorySet, projectId: string, nodeId: string): Member | null {
-    return r.members.listByProject(projectId).find((m) => m.nodeId === nodeId) ?? null;
+  async function memberAtNode(r: RepositorySet, projectId: string, nodeId: string): Promise<Member | null> {
+    return (await (r.members.listByProject(projectId))).find((m) => m.nodeId === nodeId) ?? null;
   }
 
   /** T2 #49：角色目录（F2 静态枚举 + 能力点矩阵），WebUI 角色配置入口的数据来源。 */
@@ -1528,20 +1528,20 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   }
 
   /** 参与者各自的岗位节点（顺序与 memberIds 对齐）；未落位用 null（升级库全部 null）。 */
-  function nodeIdsOfMembers(r: RepositorySet, memberIds: readonly string[]): (string | null)[] {
-    return memberIds.map((id) => r.members.get(id)?.nodeId ?? null);
+  async function nodeIdsOfMembers(r: RepositorySet, memberIds: readonly string[]): Promise<(string | null)[]> {
+    return (await Promise.all(memberIds.map(async (id) => (await (r.members.get(id)))?.nodeId ?? null)));
   }
 
   /**
    * T2 #49：群组参与事实（成员 + 岗位节点），供 F2 守卫的 subtree 边界与
    * `group:view_subtree` 只读可见性判定（ORG-03 / #32 / AC-ORG-07）。
    */
-  function groupGuardFacts(r: RepositorySet, groupId: string): {
+  async function groupGuardFacts(r: RepositorySet, groupId: string): Promise<{
     groupMemberIds: string[];
     groupMemberNodeIds: (string | null)[];
-  } {
-    const groupMemberIds = r.groups.participants(groupId);
-    return { groupMemberIds, groupMemberNodeIds: nodeIdsOfMembers(r, groupMemberIds) };
+  }> {
+    const groupMemberIds = (await (r.groups.participants(groupId)));
+    return { groupMemberIds, groupMemberNodeIds: await (nodeIdsOfMembers(r, groupMemberIds)) };
   }
 
   /**
@@ -1554,10 +1554,10 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
    * - `lastHeartbeatAt`：最后一次心跳时间（连接层），供前端本地判定陈旧/心跳超时。
    * 两层始终分开存储；这里只是展示层推导，不写回、不互相落库。
    */
-  function memberStatusView(r: RepositorySet, projectId: string, memberId: string) {
-    const member = r.members.get(memberId);
-    const status = r.statuses.get(projectId, memberId);
-    const session = latestSession(r, projectId, memberId);
+  async function memberStatusView(r: RepositorySet, projectId: string, memberId: string) {
+    const member = (await (r.members.get(memberId)));
+    const status = (await (r.statuses.get(projectId, memberId)));
+    const session = (await (latestSession(r, projectId, memberId)));
     const effective = deriveEffectiveStatus({
       projectId,
       memberId,
@@ -1589,9 +1589,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   }
 
   /** 某成员最近一次 MCP 会话（含已断开历史）。 */
-  function latestSession(r: RepositorySet, projectId: string, memberId: string): McpSession | null {
+  async function latestSession(r: RepositorySet, projectId: string, memberId: string): Promise<McpSession | null> {
     let best: McpSession | null = null;
-    for (const s of r.mcpSessions.listByProject(projectId)) {
+    for (const s of (await (r.mcpSessions.listByProject(projectId)))) {
       if (s.memberId !== memberId) continue;
       if (best === null || `${s.connectedAt}|${s.updatedAt}` > `${best.connectedAt}|${best.updatedAt}`) best = s;
     }
@@ -1602,15 +1602,15 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   // 校验
   // -------------------------------------------------------------------------
 
-  function requireProject(r: RepositorySet, projectId: string): Project {
-    const project = r.projects.get(projectId);
+  async function requireProject(r: RepositorySet, projectId: string): Promise<Project> {
+    const project = (await (r.projects.get(projectId)));
     if (!project) throw new RepositoryError("not_found", `项目 ${projectId} 不存在。`);
     return project;
   }
 
   /** T1 #48：群组定位（归档/恢复/永久删除共用）；不存在 → 404。 */
-  function requireGroup(r: RepositorySet, groupId: string): Group {
-    const group = r.groups.get(groupId);
+  async function requireGroup(r: RepositorySet, groupId: string): Promise<Group> {
+    const group = (await (r.groups.get(groupId)));
     if (!group) throw new RepositoryError("not_found", `群组 ${groupId} 不存在。`);
     return group;
   }

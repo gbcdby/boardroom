@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createLogger } from "../src/server/logger.ts";
@@ -75,13 +75,16 @@ test("健康检查返回进程、数据库与迁移版本", async () => {
 test("健康检查反映已应用的迁移版本", async () => {
   await withTempDir(async (dir) => {
     // 先应用全部生产迁移，再追加一条探针迁移建表，交给 server 读取。
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
     const probeVersion = migrations.length + 1;
     runMigrations(db, [
       ...migrations,
       { version: probeVersion, name: "probe", up: "CREATE TABLE probe (id INTEGER PRIMARY KEY);" },
     ]);
-    db.close();
+    await driver.close();;
 
     const server = await startTestServer(dir);
     try {

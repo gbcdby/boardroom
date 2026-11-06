@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import type { Database } from "better-sqlite3";
+import type { DbDriver } from "../db/driver.ts";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -19,14 +19,14 @@ export interface McpTransportOptions {
   readonly logger: Logger;
   readonly heartbeat: Heartbeat;
   /** 持久化数据库；MCP 工具直接落 F2 repository（T2）。 */
-  readonly db: Database;
+  readonly db: DbDriver;
   /** T7：防环/限流阈值（跨会话共享限流器）。缺省用 D5 默认值。 */
   readonly antiLoop?: import("./core.ts").AntiLoopRuntimeOptions;
   /**
    * T2（#49）：F2 守卫的「会话绑定 → Actor」装配口。省略时 core 用阶段 1 兼容映射
    * （`members.role` 的 manager/normal → top_manager/member），既有行为不变。
    */
-  readonly actorFor?: (binding: SessionBinding) => Actor;
+  readonly actorFor?: (binding: SessionBinding) => Promise<Actor>;
 }
 
 export interface McpSessionsHandler {
@@ -67,6 +67,12 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
   const log = options.logger.child({ component: "mcp-http" });
   const sessions = new Map<string, HttpSession>();
   let closed = false;
+  /**
+   * #61：跟踪 fire-and-forget 的唤醒结算（wakeGroup → resolveGroup）承诺，
+   * 以便 `close()` 在关闭底层驱动前先排空在途的数据库操作，避免异步延迟
+   * （PostgreSQL 跨网络往返）导致查询在 `driver.close()` 之后才落地而崩溃。
+   */
+  const inflightWakes = new Set<Promise<unknown>>();
 
   function sweepIdle(): void {
     const now = Date.now();
@@ -84,8 +90,18 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
     if (!session) return;
     sessions.delete(sid);
     // 连接会话回收：把持久化的 MCP 会话标记为断开，并把成员运行状态置为 offline。
-    session.core.disconnect();
-    session.core.close();
+    // #61：必须 await，否则 disconnect 内的数据库写入会在 driver.close() 之后才落地
+    // （PostgreSQL 异步延迟放大该竞态），导致连接已关闭的查询崩溃。
+    try {
+      await session.core.disconnect();
+    } catch (error) {
+      log.warn("mcp_session_disconnect_failed", { error, sessionId: sid });
+    }
+    try {
+      await session.core.close();
+    } catch (error) {
+      log.warn("mcp_session_close_failed", { error, sessionId: sid });
+    }
     try {
       await session.server.close();
     } catch {
@@ -170,8 +186,17 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
 
     wakeGroup(groupId, wakeGate) {
       // 遍历所有 HTTP 会话（每个会话一个 core），只唤醒在该群组等待且被放行的成员。
+      // #61：承诺纳入 inflightWakes 跟踪，并就地兜错，避免 fire-and-forget 产生未处理 rejection。
       for (const session of sessions.values()) {
-        session.core.resolveGroup(groupId, wakeGate);
+        const wake = session.core
+          .resolveGroup(groupId, wakeGate)
+          .catch((error: unknown) => {
+            log.warn("resolveGroup 失败", { error, groupId });
+          });
+        inflightWakes.add(wake);
+        void wake.finally(() => {
+          inflightWakes.delete(wake);
+        });
       }
     },
 
@@ -179,6 +204,8 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
       if (closed) return;
       closed = true;
       clearInterval(sweepTimer);
+      // #61：先排空在途的唤醒结算，确保底层驱动关闭前所有数据库操作已落地。
+      await Promise.all([...inflightWakes]);
       const ids = [...sessions.keys()];
       await Promise.all(ids.map((sid) => disposeSession(sid)));
       log.info("mcp_http_closed", { sessionsClosed: ids.length });

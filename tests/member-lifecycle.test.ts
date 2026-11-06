@@ -6,7 +6,7 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
@@ -26,7 +26,7 @@ import type { Member } from "../src/server/db/types.ts";
  * T3（#50）成员生命周期。
  *
  * seam（票面确认）：**成员状态机 + 归档/删除守卫**。
- * - 本文件的 repository 段直接走 `createRepositories(db).members` 公共数据访问边界
+ * - 本文件的 repository 段直接走 `createRepositories(driver).members` 公共数据访问边界
  *   （与 `tests/repositories.test.ts` 同一 seam），验证状态机本身：枚举、转换、
  *   disable 保留历史/数据/岗位、re-enable 恢复岗位、非法转换拒绝、持久化、升级默认 active。
  * - HTTP 段走 `/api` 公共边界（含 F2 `resolveHttpActor` 注入点），验证守卫限制与
@@ -45,47 +45,50 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   }
 }
 
-/** 单一公共 seam：`createRepositories(db)`，与 repositories.test.ts 一致。 */
+/** 单一公共 seam：`createRepositories(driver)`，与 repositories.test.ts 一致。 */
 async function withRepos<T>(fn: (ctx: { repos: RepositorySet; db: Database.Database; dir: string }) => Promise<T>): Promise<T> {
   return withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    await driver.migrate(migrations);
+    const db = driver.handle;
     try {
       runMigrations(db, migrations);
-      return await fn({ repos: createRepositories(db), db, dir });
+      return await fn({ repos: createRepositories(driver), db, dir });
     } finally {
-      if (db.open) db.close();
+      await driver.close();
     }
   });
 }
 
 /** 造一个带岗位、群组参与、消息与运行状态的成员，用于「disable 保留历史与数据」。 */
-function seedMember(repos: RepositorySet): {
+async function seedMember(repos: RepositorySet): Promise<{
   projectId: string;
   member: Member;
   nodeId: string;
   groupId: string;
   messageId: string;
-} {
-  const project = repos.projects.create({ name: "生命周期项目" });
-  const agent = repos.agents.create({ displayName: "张三", hostType: "claude-code" });
-  const member = repos.members.create({
+}> {
+  const project = (await ((await (repos.projects.create({ name: "生命周期项目" })))));
+  const agent = (await ((await (repos.agents.create({ displayName: "张三", hostType: "claude-code" })))));
+  const member = (await ((await (repos.members.create({
     projectId: project.id,
     kind: "agent",
     agentId: agent.id,
     displayName: "张三",
-  });
-  const root = repos.org.createNode({
+  })))));
+  const root = (await ((await (repos.org.createNode({
     projectId: project.id,
     parentId: null,
     name: "统筹",
     role: "top_manager",
-  });
-  repos.org.assignNode(member.id, root.id);
-  const group = repos.groups.create({ projectId: project.id, name: "协作群", participantMemberIds: [member.id] });
-  const message = repos.messages.create({ groupId: group.id, senderMemberId: member.id, body: "历史消息" });
-  repos.deliveries.ensure(message.id, member.id);
-  repos.statuses.set(project.id, member.id, "working");
-  return { projectId: project.id, member: repos.members.get(member.id)!, nodeId: root.id, groupId: group.id, messageId: message.id };
+  })))));
+  (await ((await (repos.org.assignNode(member.id, root.id)))));
+  const group = (await ((await (repos.groups.create({ projectId: project.id, name: "协作群", participantMemberIds: [member.id] })))));
+  const message = (await ((await (repos.messages.create({ groupId: group.id, senderMemberId: member.id, body: "历史消息" })))));
+  (await ((await (repos.deliveries.ensure(message.id, member.id)))));
+  (await ((await (repos.statuses.set(project.id, member.id, "working")))));
+  return { projectId: project.id, member: (await ((await (repos.members.get(member.id)))))!, nodeId: root.id, groupId: group.id, messageId: message.id };
 }
 
 // ---------------------------------------------------------------------------
@@ -94,30 +97,30 @@ function seedMember(repos: RepositorySet): {
 
 test("LIFE-MEM-01：新建成员默认 active，可显式登记为 pending（枚举 active/disabled/pending）", async () => {
   await withRepos(async ({ repos }) => {
-    const project = repos.projects.create({ name: "P" });
-    const active = repos.members.create({ projectId: project.id, kind: "human", displayName: "甲" });
+    const project = (await ((await (repos.projects.create({ name: "P" })))));
+    const active = (await ((await (repos.members.create({ projectId: project.id, kind: "human", displayName: "甲" })))));
     assert.equal(active.status, "active", "老库/新建成员默认 active（阶段 1 行为不回归）");
 
-    const pending = repos.members.create({
+    const pending = (await ((await (repos.members.create({
       projectId: project.id,
       kind: "human",
       displayName: "乙",
       status: "pending",
-    });
+    })))));
     assert.equal(pending.status, "pending");
-    assert.equal(repos.members.get(pending.id)?.status, "pending", "状态必须落库可读");
+    assert.equal((await ((await (repos.members.get(pending.id)))))?.status, "pending", "状态必须落库可读");
   });
 });
 
 test("LIFE-MEM-01/02：disable 不物理删除、保留历史与数据与岗位；re-enable 恢复岗位", async () => {
   await withRepos(async ({ repos }) => {
-    const { projectId, member, nodeId, groupId, messageId } = seedMember(repos);
+    const { projectId, member, nodeId, groupId, messageId } = (await ((await (seedMember(repos)))));
 
-    const disabled = repos.members.setStatus(member.id, "disabled");
+    const disabled = (await ((await (repos.members.setStatus(member.id, "disabled")))));
     assert.equal(disabled.status, "disabled");
 
     // 不物理删除：成员行仍在，身份/展示名/角色/岗位锚点原样保留。
-    const stillThere = repos.members.get(member.id);
+    const stillThere = (await ((await (repos.members.get(member.id)))));
     assert.ok(stillThere, "disable 不得物理删除成员");
     assert.equal(stillThere.status, "disabled");
     assert.equal(stillThere.agentId, member.agentId);
@@ -125,112 +128,118 @@ test("LIFE-MEM-01/02：disable 不物理删除、保留历史与数据与岗位�
     assert.equal(stillThere.displayName, member.displayName);
     assert.equal(stillThere.role, member.role);
     assert.equal(stillThere.nodeId, nodeId, "disable 保留岗位锚点（node_id）");
-    assert.equal(repos.org.nodeOfMember(member.id)?.id, nodeId, "占岗数据仍在");
+    assert.equal((await ((await (repos.org.nodeOfMember(member.id)))))?.id, nodeId, "占岗数据仍在");
 
     // 保留历史与数据：群组参与关系、消息、投递、运行状态都不动。
-    assert.ok(repos.groups.participants(groupId).includes(member.id), "禁用的成员仍是群组参与者");
-    assert.equal(repos.messages.get(messageId)?.body, "历史消息");
-    assert.equal(repos.deliveries.get(messageId, member.id)?.memberId, member.id);
-    assert.equal(repos.statuses.get(projectId, member.id)?.state, "working", "运行状态与生命周期状态分开建模");
+    assert.ok((await ((await (repos.groups.participants(groupId))))).includes(member.id), "禁用的成员仍是群组参与者");
+    assert.equal((await ((await (repos.messages.get(messageId)))))?.body, "历史消息");
+    assert.equal((await ((await (repos.deliveries.get(messageId, member.id)))))?.memberId, member.id);
+    assert.equal((await ((await (repos.statuses.get(projectId, member.id)))))?.state, "working", "运行状态与生命周期状态分开建模");
 
     // re-enable 恢复岗位：回到 active，岗位/数据不变。
-    const enabled = repos.members.setStatus(member.id, "active");
+    const enabled = (await ((await (repos.members.setStatus(member.id, "active")))));
     assert.equal(enabled.status, "active");
     assert.equal(enabled.nodeId, nodeId, "re-enable 恢复岗位（node_id 不变且重新生效）");
-    assert.equal(repos.org.nodeOfMember(member.id)?.id, nodeId);
-    assert.ok(repos.groups.participants(groupId).includes(member.id));
-    assert.equal(repos.messages.get(messageId)?.body, "历史消息");
+    assert.equal((await ((await (repos.org.nodeOfMember(member.id)))))?.id, nodeId);
+    assert.ok((await ((await (repos.groups.participants(groupId))))).includes(member.id));
+    assert.equal((await ((await (repos.messages.get(messageId)))))?.body, "历史消息");
   });
 });
 
 test("状态机：合法转换表、幂等、非法转换被拒（fail-closed），未知状态 400", async () => {
   await withRepos(async ({ repos }) => {
-    const project = repos.projects.create({ name: "P" });
-    const active = repos.members.create({ projectId: project.id, kind: "human", displayName: "甲" });
+    const project = (await ((await (repos.projects.create({ name: "P" })))));
+    const active = (await ((await (repos.members.create({ projectId: project.id, kind: "human", displayName: "甲" })))));
 
     // active -> disabled -> active（暂停 / 恢复闭环）
-    assert.equal(repos.members.setStatus(active.id, "disabled").status, "disabled");
-    assert.equal(repos.members.setStatus(active.id, "active").status, "active");
+    assert.equal((await ((await (repos.members.setStatus(active.id, "disabled"))))).status, "disabled");
+    assert.equal((await ((await (repos.members.setStatus(active.id, "active"))))).status, "active");
     // 同态幂等（ORG-07 无需逐次确认，重复暂停不报错）
-    assert.equal(repos.members.setStatus(active.id, "active").status, "active");
-    assert.equal(repos.members.setStatus(active.id, "disabled").status, "disabled");
-    assert.equal(repos.members.setStatus(active.id, "disabled").status, "disabled");
+    assert.equal((await ((await (repos.members.setStatus(active.id, "active"))))).status, "active");
+    assert.equal((await ((await (repos.members.setStatus(active.id, "disabled"))))).status, "disabled");
+    assert.equal((await ((await (repos.members.setStatus(active.id, "disabled"))))).status, "disabled");
 
     // disabled -> pending 非法：必须先 re-enable 回 active（可恢复、不物理删除的约束）。
-    assert.throws(
-      () => repos.members.setStatus(active.id, "pending"),
+    await assert.rejects(
+      async () => (await ((await (repos.members.setStatus(active.id, "pending"))))),
       (error: unknown) => error instanceof ConflictError && error.code === "conflict",
     );
-    assert.equal(repos.members.get(active.id)?.status, "disabled", "非法转换不得改动现状");
+    assert.equal((await ((await (repos.members.get(active.id)))))?.status, "disabled", "非法转换不得改动现状");
 
     // pending -> active（激活）、pending -> disabled（暂停未激活成员）合法；active -> pending 非法。
-    const waiting = repos.members.create({
+    const waiting = (await ((await (repos.members.create({
       projectId: project.id,
       kind: "human",
       displayName: "乙",
       status: "pending",
-    });
-    assert.equal(repos.members.setStatus(waiting.id, "active").status, "active");
-    assert.throws(() => repos.members.setStatus(waiting.id, "pending"), (e: unknown) => e instanceof ConflictError);
+    })))));
+    assert.equal((await ((await (repos.members.setStatus(waiting.id, "active"))))).status, "active");
+    await assert.rejects(async () => (await ((await (repos.members.setStatus(waiting.id, "pending"))))), (e: unknown) => e instanceof ConflictError);
 
-    const waiting2 = repos.members.create({
+    const waiting2 = (await ((await (repos.members.create({
       projectId: project.id,
       kind: "human",
       displayName: "丙",
       status: "pending",
-    });
-    assert.equal(repos.members.setStatus(waiting2.id, "disabled").status, "disabled");
+    })))));
+    assert.equal((await ((await (repos.members.setStatus(waiting2.id, "disabled"))))).status, "disabled");
 
     // 未知状态与不存在的成员：明确错误，不静默。
-    assert.throws(
-      () => repos.members.setStatus(active.id, "bogus" as never),
+    await assert.rejects(
+      async () => (await ((await (repos.members.setStatus(active.id, "bogus" as never))))),
       (e: unknown) => e instanceof InvalidArgumentError && e.code === "invalid_argument",
     );
-    assert.throws(
-      () => repos.members.create({ projectId: project.id, kind: "human", displayName: "丁", status: "bogus" as never }),
+    await assert.rejects(
+      async () => (await ((await (repos.members.create({ projectId: project.id, kind: "human", displayName: "丁", status: "bogus" as never }))))),
       (e: unknown) => e instanceof InvalidArgumentError,
     );
-    assert.throws(() => repos.members.setStatus("no-such-member", "active"), (e: unknown) => e instanceof NotFoundError);
+    await assert.rejects(async () => (await ((await (repos.members.setStatus("no-such-member", "active"))))), (e: unknown) => e instanceof NotFoundError);
   });
 });
 
 test("状态机遵守 T1 归档写规则：归档项目内改成员状态被 ArchivedError 拒绝，恢复后放行", async () => {
   await withRepos(async ({ repos }) => {
-    const project = repos.projects.create({ name: "P" });
-    const member = repos.members.create({ projectId: project.id, kind: "human", displayName: "甲" });
-    repos.projects.archive(project.id);
-    assert.throws(
-      () => repos.members.setStatus(member.id, "disabled"),
+    const project = (await ((await (repos.projects.create({ name: "P" })))));
+    const member = (await ((await (repos.members.create({ projectId: project.id, kind: "human", displayName: "甲" })))));
+    (await ((await (repos.projects.archive(project.id)))));
+    await assert.rejects(
+      async () => (await ((await (repos.members.setStatus(member.id, "disabled"))))),
       (e: unknown) => e instanceof ArchivedError && e.code === "archived",
     );
-    repos.projects.restore(project.id);
-    assert.equal(repos.members.setStatus(member.id, "disabled").status, "disabled");
+    (await ((await (repos.projects.restore(project.id)))));
+    assert.equal((await ((await (repos.members.setStatus(member.id, "disabled"))))).status, "disabled");
   });
 });
 
 test("状态持久化：重启后（重开库）disabled 状态保留，不因进程边界回到 active", async () => {
   await withTempDir(async (dir) => {
-    const first = openDatabase(dir);
+    const firstDriver = new SqliteDriver({ dataDir: dir });
+    await firstDriver.connect();
+    await firstDriver.migrate(migrations);
+    const first = firstDriver.handle;
     let memberId = "";
     try {
-      runMigrations(first.db, migrations);
-      const repos = createRepositories(first.db);
-      const project = repos.projects.create({ name: "P" });
-      const member = repos.members.create({ projectId: project.id, kind: "human", displayName: "甲" });
+      runMigrations(first, migrations);
+      const repos = createRepositories(firstDriver);
+      const project = (await ((await (repos.projects.create({ name: "P" })))));
+      const member = (await ((await (repos.members.create({ projectId: project.id, kind: "human", displayName: "甲" })))));
       memberId = member.id;
-      repos.members.setStatus(memberId, "disabled");
+      (await ((await (repos.members.setStatus(memberId, "disabled")))));
     } finally {
-      first.db.close();
+      first.close();
     }
 
-    const second = openDatabase(dir);
+    const secondDriver = new SqliteDriver({ dataDir: dir });
+    await secondDriver.connect();
+    await secondDriver.migrate(migrations);
+    const second = secondDriver.handle;
     try {
-      runMigrations(second.db, migrations);
-      const repos = createRepositories(second.db);
-      assert.equal(repos.members.get(memberId)?.status, "disabled", "状态是持久化字段，不依赖进程内存");
-      assert.equal(repos.members.setStatus(memberId, "active").status, "active", "重启后仍可恢复");
+      runMigrations(second, migrations);
+      const repos = createRepositories(secondDriver);
+      assert.equal((await ((await (repos.members.get(memberId)))))?.status, "disabled", "状态是持久化字段，不依赖进程内存");
+      assert.equal((await ((await (repos.members.setStatus(memberId, "active"))))).status, "active", "重启后仍可恢复");
     } finally {
-      second.db.close();
+      second.close();
     }
   });
 });
@@ -418,7 +427,7 @@ test("守卫：顶层 manager 可暂停成员（ORG-07 无需确认）、可归�
     {
       logger: silentLogger,
       authorization: {
-        resolveHttpActor: ({ request, projectId }) => {
+        resolveHttpActor: async ({ request, projectId }) => {
           const as = request.headers["x-as"];
           if (as === "manager") return actorFor(projectId ?? "", "top_manager");
           if (as === "member") return actorFor(projectId ?? "", "member");

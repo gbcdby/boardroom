@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { openDatabase } from "../src/server/db/database.ts";
+import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { readMigrationState, runMigrations, type Migration } from "../src/server/db/migrate.ts";
+// 注：本文件只验证迁移框架（SAMPLE）的幂等与校验，不混入生产 migrations，
+// 否则生产迁移（version 1）会与 SAMPLE（version 1 create_widgets）冲突触发 checksum 错误。
 
 const SAMPLE: readonly Migration[] = [
   { version: 1, name: "create_widgets", up: "CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT NOT NULL);" },
@@ -22,7 +24,9 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 
 test("首次运行按顺序执行全部迁移并记录版本", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       const result = runMigrations(db, SAMPLE);
 
@@ -39,14 +43,16 @@ test("首次运行按顺序执行全部迁移并记录版本", async () => {
         ["id", "label", "color"],
       );
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });
 
 test("重复运行迁移是幂等的，不会重复执行", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       runMigrations(db, SAMPLE);
       const second = runMigrations(db, SAMPLE);
@@ -56,33 +62,39 @@ test("重复运行迁移是幂等的，不会重复执行", async () => {
       const rows = db.prepare("SELECT version FROM schema_migrations ORDER BY version").all();
       assert.deepEqual(rows, [{ version: 1 }, { version: 2 }]);
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });
 
 test("重启后迁移版本保留，不会重跑已应用的迁移", async () => {
   await withTempDir(async (dir) => {
-    const first = openDatabase(dir);
-    runMigrations(first.db, SAMPLE);
-    first.db.close();
+    const firstDriver = new SqliteDriver({ dataDir: dir });
+    await firstDriver.connect();
+    const first = firstDriver.handle;
+    runMigrations(first, SAMPLE);
+    first.close();
 
-    const second = openDatabase(dir);
+    const secondDriver = new SqliteDriver({ dataDir: dir });
+    await secondDriver.connect();
+    const second = secondDriver.handle;
     try {
-      assert.equal(readMigrationState(second.db).version, 2);
+      assert.equal(readMigrationState(second).version, 2);
 
-      const result = runMigrations(second.db, SAMPLE);
+      const result = runMigrations(second, SAMPLE);
       assert.deepEqual(result.applied, []);
       assert.equal(result.version, 2);
     } finally {
-      second.db.close();
+      second.close();
     }
   });
 });
 
 test("已应用的迁移被改写时给出明确错误", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       runMigrations(db, SAMPLE);
       const tampered: readonly Migration[] = [
@@ -91,14 +103,16 @@ test("已应用的迁移被改写时给出明确错误", async () => {
 
       assert.throws(() => runMigrations(db, tampered), /create_widgets/);
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });
 
 test("迁移执行失败时整条迁移回滚，版本不前进", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       const broken: readonly Migration[] = [
         { version: 1, name: "ok", up: "CREATE TABLE ok (id INTEGER);" },
@@ -113,14 +127,16 @@ test("迁移执行失败时整条迁移回滚，版本不前进", async () => {
         .all();
       assert.deepEqual(tables, []);
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });
 
 test("生产迁移列表当前为空，只建迁移版本表", async () => {
   await withTempDir(async (dir) => {
-    const { db } = openDatabase(dir);
+    const driver = new SqliteDriver({ dataDir: dir });
+    await driver.connect();
+    const db = driver.handle;
     try {
       const result = runMigrations(db, []);
       assert.deepEqual(result.applied, []);
@@ -133,7 +149,7 @@ test("生产迁移列表当前为空，只建迁移版本表", async () => {
       ).map((row) => row.name);
       assert.deepEqual(tables, ["schema_migrations"]);
     } finally {
-      db.close();
+      await driver.close();;
     }
   });
 });

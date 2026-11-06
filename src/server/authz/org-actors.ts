@@ -27,11 +27,11 @@ import type { SessionBinding } from "../mcp/core.ts";
  * 其余（人、未落位成员、owner 岗位）返回 `null`，调用方回退到阶段 1 兼容映射。
  * 这样 `resolveActor` 在升级路径上不会把「默认人」或其它既有主体悄悄换掉。
  */
-export function orgActorForMember(repos: RepositorySet, memberId: string): Actor | null {
-  const member = repos.members.get(memberId);
+export async function orgActorForMember(repos: RepositorySet, memberId: string): Promise<Actor | null> {
+  const member = (await (repos.members.get(memberId)));
   // 人（owner）是内建全局主体，高于 manager；不因占岗而降级为普通角色。
   if (!member || member.kind !== "agent" || member.nodeId === null) return null;
-  const node = repos.org.getNode(member.nodeId);
+  const node = (await (repos.org.getNode(member.nodeId)));
   if (!node || node.role === "owner") return null;
   return {
     actorId: member.id,
@@ -41,7 +41,7 @@ export function orgActorForMember(repos: RepositorySet, memberId: string): Actor
     projectId: member.projectId,
     nodeId: node.id,
     // 递归 CTE 现算：sub_manager 的子树边界（ORG-05）、group:view_subtree 只读范围共用。
-    subtreeNodeIds: repos.org.subtreeNodeIds(node.id),
+    subtreeNodeIds: (await (repos.org.subtreeNodeIds(node.id))),
     // 省略 reach：按 ROLE_REACH[role]（project / subtree / own）取默认管辖范围。
   };
 }
@@ -49,11 +49,11 @@ export function orgActorForMember(repos: RepositorySet, memberId: string): Actor
 /** 三处入口共用的主体解析集合，与 `ServerAuthorization` 一一对应。 */
 export interface OrgActorResolver {
   /** HTTP：未认证的人请求 = owner；带 memberId 的动作（发消息）按真实岗位解析。 */
-  resolveHttpActor(resolution: ActorResolution): Actor | null;
+  resolveHttpActor(resolution: ActorResolution): Promise<Actor | null>;
   /** WebSocket：presence 声明；未落位的成员仍按「默认人」处理，行为不变。 */
-  resolveWsActor(context: WsActorContext): Actor | null;
+  resolveWsActor(context: WsActorContext): Promise<Actor | null>;
   /** MCP：会话绑定（join 时确定）→ 带岗位与子树的 Actor。 */
-  actorForMcpBinding(binding: SessionBinding): Actor;
+  actorForMcpBinding(binding: SessionBinding): Promise<Actor>;
 }
 
 /**
@@ -63,24 +63,24 @@ export interface OrgActorResolver {
  */
 export function createOrgActorResolver(repos: RepositorySet): OrgActorResolver {
   return {
-    resolveHttpActor(resolution) {
+    async resolveHttpActor(resolution) {
       if (resolution.memberId !== undefined) {
-        const orgActor = orgActorForMember(repos, resolution.memberId);
+        const orgActor = (await (orgActorForMember(repos, resolution.memberId)));
         if (orgActor) return orgActor;
-        const member = repos.members.get(resolution.memberId);
+        const member = (await (repos.members.get(resolution.memberId)));
         if (member) return actorForMember(member);
       }
       return ownerActor(resolution.projectId);
     },
-    resolveWsActor({ projectId, memberId }) {
+    async resolveWsActor({ projectId, memberId }) {
       if (memberId !== null) {
-        const orgActor = orgActorForMember(repos, memberId);
+        const orgActor = (await (orgActorForMember(repos, memberId)));
         if (orgActor) return orgActor;
       }
       return ownerActor(projectId);
     },
-    actorForMcpBinding(binding) {
-      return orgActorForMember(repos, binding.memberId) ?? actorForSession(binding);
+    async actorForMcpBinding(binding) {
+      return (await (orgActorForMember(repos, binding.memberId))) ?? actorForSession(binding);
     },
   };
 }

@@ -1,7 +1,6 @@
-import type Database from "better-sqlite3";
+import type { DbDriver } from "./db/driver.ts";
 import type { HeartbeatConfig } from "./config.ts";
-import { readMigrationState, type MigrationState } from "./db/migrate.ts";
-import { probeReadWrite } from "./db/database.ts";
+import type { MigrationState } from "./db/migrate.ts";
 
 export type HealthStatus = "ok" | "degraded";
 
@@ -31,7 +30,7 @@ export interface HealthReport {
 }
 
 export interface HealthCheckOptions {
-  readonly db: Database.Database;
+  readonly db: DbDriver;
   readonly heartbeat: HeartbeatConfig;
   readonly startedAt: number;
   /** 代码中定义的迁移总数。 */
@@ -47,14 +46,17 @@ export interface HealthCheckOptions {
  * 至少反映：进程存活（能响应即存活）、数据库可读写、迁移版本。
  * 数据库异常时整体为 degraded，HTTP 层对应返回 503。
  */
-export function buildHealthReport(options: HealthCheckOptions): HealthReport {
+export async function buildHealthReport(options: HealthCheckOptions): Promise<HealthReport> {
   const now = options.now ?? (() => new Date());
 
   let database: DatabaseHealth;
   let migrations: MigrationHealth;
   try {
-    probeReadWrite(options.db);
-    const state: MigrationState = readMigrationState(options.db);
+    // #61：健康探针经 DbDriver 抽象，兼容 SQLite 与 PostgreSQL。
+    // SELECT 1 验证可读；空事务（BEGIN/COMMIT）验证可写能力；migrationState 验证迁移元数据。
+    await options.db.query("SELECT 1");
+    await options.db.transaction(async () => {});
+    const state: MigrationState = await options.db.migrationState();
     database = { status: "ok", writable: true };
     migrations = {
       version: state.version,

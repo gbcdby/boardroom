@@ -447,7 +447,7 @@ test("顶层 manager 可归档项目与群组，但不能发起永久删除（40
       logger: silentLogger,
       // F2 注入点：本用例按请求头切换主体，模拟「以顶层 manager 身份调用」与「以人身份调用」。
       authorization: {
-        resolveHttpActor: ({ request, projectId }) =>
+        resolveHttpActor: async ({ request, projectId }) =>
           request.headers["x-as"] === "manager" ? managerActor(projectId ?? "") : ownerActor(projectId),
       },
     },
@@ -544,7 +544,7 @@ test("列表按主体收窄：跨项目概览只有人/顶层 manager 问得到�
       // F2 注入点：同一服务里按请求头切换主体——人（owner）建数据，
       // 之后以「甲项目的普通成员 Alice」为主体读取列表，验证行级收窄。
       authorization: {
-        resolveHttpActor: ({ request, projectId }) => {
+        resolveHttpActor: async ({ request, projectId }) => {
           const as = request.headers["x-actor"];
           if (as === "member") {
             return {
