@@ -2,7 +2,7 @@
 
 > 保存跨会话仍有效的非显而易见知识：术语、踩坑、宿主差异和待验证假设。维护规则见 `AGENTS.md` 的「项目记忆」；原独立记忆技能已于 2026-11-10 退役。
 >
-> 不放在这里：宏观架构与架构决策 → `docs/architecture/`；开发流程决策 → `AGENTS.md` 或 issue；map、spec、ticket → GitHub Issues；过程材料 → `.agent-output/`。
+> 不放在这里：宏观架构与架构决策 → `docs/architecture/`；开发流程决策 → `AGENTS.md`、`docs/agent-workflow.md` 或 issue；map、spec、ticket → GitHub Issues；过程材料 → `.agent-output/`。
 >
 > 条目注明日期、适用范围和证据；未复现的推测放入「待验证」。软上限约 150 行，超出时合并重复、淘汰过时内容或升级。
 

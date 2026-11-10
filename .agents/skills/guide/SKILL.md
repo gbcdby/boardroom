@@ -21,7 +21,7 @@ disable-model-invocation: true
 3. 给一个首选入口、简短理由和一条可直接使用的提示。有实质差别时再补一个替代方案。
 4. 按真实宿主说明调用方式；未知时直接用技能名称，不猜命令格式。技能缺失或不受支持时说明限制，推荐现有办法，不假称已调用。
 
-持续交付用 `deliver`；已有 Spec 要拆任务用 `worker-plan-tickets`；执行指定 Ticket 用 `worker-implement`；想了解进度或设计变化用只读 `brief`。只有用户选择时才启动 `challenge`、`steer`、`setup` 等人工入口。
+主动按项目流程启动或恢复自动推进用 `auto`，只调整默认流程也可单独调用；持续调度由 `deliver` 承担。直接持续交付用 `deliver`；已有 Spec 要拆任务用 `worker-plan-tickets`；执行指定 Ticket 用 `worker-implement`；想了解进度或设计变化用只读 `brief`。只有用户选择时才启动 `auto`、`challenge`、`steer`、`setup` 等人工入口。
 
 setup 可选，任务不必经过所有 worker；没有 GitHub、Boardroom 或某项可选能力也可继续不受影响的工作。具体共享记录、工具和授权以项目为准。
 

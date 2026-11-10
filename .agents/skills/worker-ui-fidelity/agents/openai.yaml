@@ -1,5 +1,5 @@
 interface:
-  display_name: worker-ui-fidelity
+  display_name: 界面还原与验收
   short_description: 按确认基准检查或修正界面，以真实截图分别验证视觉、交互和动效
   default_prompt: 使用 $worker-ui-fidelity，读取已确认设计与项目合同，按任务要求检查或修正指定界面，以真实截图或连续片段取证，分别报告静态视觉、交互和动效结果。
   icon_small: assets/icon.svg

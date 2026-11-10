@@ -1,6 +1,6 @@
 {
   "schema_version": "work-suite/v1",
-  "suite_version": "0.4.3",
+  "suite_version": "0.5.0",
   "result_contract": "work-result/v1",
   "first_testbed": "boardroom",
   "independent_formal_skill": "worker-tla",
@@ -13,7 +13,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "af1b848aaa5ed0896417daa04301f2c929e581a6a9e27706cfe8877002443be7"
+          "sha256": "5df95fdfa9280a4a041ad3da16e9432e5b659184551c8ded2133ffc6d72792f4"
         },
         {
           "path": "agents/openai.yaml",
@@ -33,7 +33,7 @@
         },
         {
           "path": "references/local-concurrency.md",
-          "sha256": "534abca97e7633d97fc83e5b2fdd9eab2ec73c1763ce0f295fbdeb868b53232a"
+          "sha256": "83576ad20b51f0f20c1aa4a5fc3230bc4e55c58b34ba41cf90c20045a0425c3e"
         },
         {
           "path": "references/sources.md",
@@ -41,7 +41,7 @@
         },
         {
           "path": "references/work-contract.md",
-          "sha256": "69f896cc9f1dd7fd75774eda51bc46a739c1dc8c47578dea4f7e0c128da6dda3"
+          "sha256": "ad3a9a891ed78c0cd4be0718e4d31429e9919bf7586b8423ca8f9475ebb3b712"
         },
         {
           "path": "scripts/validate_result.py",
@@ -87,11 +87,11 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "b45d29cab6b677dd2b1e4c865cb71a580987c93add7232d91a5aefbb9b92a1b3"
+          "sha256": "08448b9d32555d8f2186c4c5f8e03d83c92b6c2c44ae024cb53d23bd39655ec3"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "3fc38b0cb5f1cb065696a4ab5022a7de7522db6f9e29238a36f8acb564ab3ca6"
+          "sha256": "b710639858aa5139065df0c8bd9c23247bf3af64ee181372e240e62b38bc3be6"
         },
         {
           "path": "assets/design.template.md",
@@ -99,7 +99,7 @@
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "e9301497fa98ef56aaca7ede0857b9a18dc06c34040f0679c609a6bf49b1d38b"
+          "sha256": "8936b24f674a1250d999e2c2b5901374fb4240426f32bd1ae340c352a90d617d"
         },
         {
           "path": "references/methods.md",
@@ -264,7 +264,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "f6326b202b8b7cff9565a345fbc197e13fe6820ba5e4747c87fa5ace90be83b7"
+          "sha256": "0bdffaf6c3182f9d4ef41700556829e1571a37a1499bd80634c68f411c53d42c"
         },
         {
           "path": "agents/openai.yaml",
@@ -272,7 +272,7 @@
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "fbb6c7314886573cd56c3f86884a65afe3b5f4ce4bf1ee6baeeeb1fa50aea7a4"
+          "sha256": "0cdb7990dea3ad89ead04743eeac2dc58c119fb0b8b4a01499a21237f155bc1a"
         },
         {
           "path": "assets/verification-result.md",
@@ -291,7 +291,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "5e9831af7f2fb21489147a9a451fd1c3c773a8411a57e3cf0cae11c142f741de"
+          "sha256": "13e4c8978f25dac3d31e306bffcaa176a5d2ffdf1f9452e5879593d591d1252e"
         },
         {
           "path": "agents/openai.yaml",
@@ -299,7 +299,7 @@
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "8936b24f674a1250d999e2c2b5901374fb4240426f32bd1ae340c352a90d617d"
+          "sha256": "fbb6c7314886573cd56c3f86884a65afe3b5f4ce4bf1ee6baeeeb1fa50aea7a4"
         },
         {
           "path": "assets/review-result.md",
@@ -318,15 +318,15 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "d00defd33df0abdd7bb31937916e88a32ae39b2c655a2fbc8134ce4321ca64f7"
+          "sha256": "c7d7b0a04da66493d49865eb4c2b2b7c7faa5006bf24195f1fb5fb7e6bac5b6e"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "3faddb1b416c32d67c3bc66d8b06a1f8dc02cf75ed6848dba9d0b74c30e1f4c8"
+          "sha256": "0eb4f17d86e5d1a7c0e1659ef7be8003b140d67c9d13a0c2ca9ef16d503e3250"
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "8936b24f674a1250d999e2c2b5901374fb4240426f32bd1ae340c352a90d617d"
+          "sha256": "72343cc4b66256ae7de8474c7cad14e711ad84a94c473732a44f96a56124c42d"
         },
         {
           "path": "assets/pr-body.template.md",
@@ -339,6 +339,10 @@
         {
           "path": "references/candidate-and-evidence.md",
           "sha256": "8f3edf727c19828b5a28e31e1ed802356db5747e79f78f25f60538208d09e506"
+        },
+        {
+          "path": "references/cleanup.md",
+          "sha256": "aa8742cc7303f974b3d1ca0ab96ae7824fd400e6b091680e3742c0e0d9cb8b28"
         },
         {
           "path": "references/result-contract.md",
@@ -415,15 +419,15 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "955d60aa2cff22f46ccb367bc883a41535107dcd7b6511584db371c954db7655"
+          "sha256": "d2b0c88b798a698f7ce189a75e44a26b175672326338c6d9bcdd82cc9a3e361e"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "7e8ba25597337956ae7e527a346fe7289adf09c92ec9654d0b1d817ecdb1e7d1"
+          "sha256": "7da14e6756cc3eaf16f5d3311bfe33c7b2d9ba8a20d0747eb92e728e5cfc03bb"
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "51a6923974188748638a424aa59b42b6afad2d910f910a1d43bb13ee10f3ce26"
+          "sha256": "9be88f8dd4c5e658961515c71389eafd45142ffa68bcae58e8dcff57d178ed91"
         },
         {
           "path": "assets/work-cancel.md",
@@ -518,8 +522,8 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "ef2fd1db58713676a5556d483b0317444068d0b93ebdd7866aef623a4dc9ba51",
-          "source_sha256": "ef80cb1ded07447cf8270ce1ac895baca7745b7ad1093849dd40fbe30ac99ed4",
+          "sha256": "c1923cc49e88dbb94f59bc7f24ab8b7ab2d21540f4116f13844d09154a3de947",
+          "source_sha256": "b1ebdbde4c3a2b0a94f7239116089c6604ab004170df69a214586e5fa03d6ac8",
           "transform": "add-disable-model-invocation"
         },
         {
@@ -551,8 +555,8 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "8d834b6773809ae8e17009a80fb7d5eae5b87416d66c0c12bfdc04668e905322",
-          "source_sha256": "e225bd3f247aa4cfa9472cd44cd4326f3c827219a780d937289d5e85b9488bbc",
+          "sha256": "3cbd19e9e12109d3eddb719967cf27a3e58a5e037a45194b16cc1c4168cb3bbd",
+          "source_sha256": "091c27b692bcb19eb5a9c9400ce35bcece5505f37096a9257459e15252ceafe8",
           "transform": "add-disable-model-invocation"
         },
         {
@@ -561,15 +565,15 @@
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "fbb6c7314886573cd56c3f86884a65afe3b5f4ce4bf1ee6baeeeb1fa50aea7a4"
+          "sha256": "9be88f8dd4c5e658961515c71389eafd45142ffa68bcae58e8dcff57d178ed91"
         },
         {
           "path": "assets/project-adapter.template.md",
-          "sha256": "e5b00b3934ea2b8491dcd3a890fb58380b25f4720cba59aa564da25143805909"
+          "sha256": "2b8f813f41bd8bec001f6f651027c4ab35b80bafff49564f79e3c69e8991a65b"
         },
         {
           "path": "references/harnesses.md",
-          "sha256": "9b5b2aefe07b2f31315551f4fbfd9cd4d07d6e34af3d581d52db2b5c3b5f4858"
+          "sha256": "b7799cd7677fb14b95f2b1bc885113374ab087d99cab0bac4e5fd8c1bbae9b3a"
         },
         {
           "path": "references/result-contract.md",
@@ -588,8 +592,8 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "2bb63117761d29da4a583b045e563073399a22f808712579323043e74b33b3dc",
-          "source_sha256": "1eb63525c22c9060ed61598eae6c90d68dd483bdf3a6825bbb107edd551ceedd",
+          "sha256": "ef5138d0fad4021ded581b47a298c5730bff997b160c98277313917508454b6e",
+          "source_sha256": "0fd10c7602679479d4c831d69d2f8a8da6c2d17d842a4fee6e01406838a0ac51",
           "transform": "add-disable-model-invocation"
         },
         {
@@ -598,11 +602,11 @@
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "d80a4c3e0fd2efa7af88433a53b25a92c78a644175c6669dd78fee50fb53acf6"
+          "sha256": "9be88f8dd4c5e658961515c71389eafd45142ffa68bcae58e8dcff57d178ed91"
         },
         {
           "path": "references/guide.md",
-          "sha256": "3422a6a80827ca1c1fe9637bac77babc025a5a0c071a338a040680843ac461bf"
+          "sha256": "f8dd20d99182b4f7ca2aafd0f590def646d713a1df0149a0e45f4845d8c90302"
         },
         {
           "path": "references/result-contract.md",
@@ -638,17 +642,17 @@
       ]
     },
     {
-      "name": "worker-design-direction",
-      "path": ".agents/skills/worker-design-direction",
+      "name": "worker-visual-design",
+      "path": ".agents/skills/worker-visual-design",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "f961ce9e8dfb5bab82473425c47ac84de1a362eac90682fda9ae12647e12fac1"
+          "sha256": "2793f8ab794149fc2888944d744b6442fffd4e719ba4a5443a085b3963a59181"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "1861474e10ea416cd0c068b2ea6fa2f22e61ec889ef4f98bbe3e81cebb33bd94"
+          "sha256": "4e83c77c30b547cc50c3c775fd954a692848f496149ba41337d93ae2f34ea349"
         },
         {
           "path": "assets/icon.svg",
@@ -656,7 +660,7 @@
         },
         {
           "path": "assets/learning-template/README.md",
-          "sha256": "6f514762c93e56629c036c7625ffec5a22117e2e600335eb44b2463137b5fac7"
+          "sha256": "cefb43913da35c98fb1319c355cf75c8c3e90bda87779e36f682ffeb485b67f4"
         },
         {
           "path": "assets/learning-template/context.md",
@@ -672,7 +676,7 @@
         },
         {
           "path": "assets/project-template/README.md",
-          "sha256": "fa947d3f69df0efced9580762b9a59fcc02e3a6b233cdf6e95d920914307291e"
+          "sha256": "b3d337d27bfcea5186b81fd426907a38c4ae83bdb478574909de173d0a8810cf"
         },
         {
           "path": "assets/project-template/brief.md",
@@ -819,11 +823,11 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "d0e16c70eb47fa6e83337f8ed3432260b3e0d01c6b5840624e8ae2ed88c5622b"
+          "sha256": "dc1e3c59e15ba5d5f784b989f3b8f0825e008e3bacf0af5ef798120638ee919d"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "a94dd6f002e2a266f1ebecdab3238fa10d2473610f6a1aef2f8cd0c0b6c0f53c"
+          "sha256": "435731cc22d6f971138a2f4ca1c29177baa6d28f4607d2f6b67fc88252488527"
         },
         {
           "path": "assets/fidelity-record.md",
@@ -872,6 +876,31 @@
         {
           "path": "tests/test_visual_review_gallery.py",
           "sha256": "9f42975d8d599240812abdd34c1ed48f62af0a9fb3afdb9817ba3e74f1d8e184"
+        }
+      ]
+    },
+    {
+      "name": "auto",
+      "path": ".agents/skills/auto",
+      "invocation": "explicit-user",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "87f667647b81dd31ce38b6aef48e9a2efc7f7794d106726f65635ed4e397d199",
+          "source_sha256": "c4606441d4fd1f122f6cb6cd9fc84d2bdda3591db1c5a8f85abbda14e2da6e06",
+          "transform": "add-disable-model-invocation"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "9c61b406a566616e66f7b1214ab614e014c2dcba9f22ddadf9faa778a4de9eb0"
+        },
+        {
+          "path": "assets/agent-workflow.template.md",
+          "sha256": "62191938c13bbc95d045f45efee6bfce7a36ecec2243eaf393cd1d63c1349350"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "72343cc4b66256ae7de8474c7cad14e711ad84a94c473732a44f96a56124c42d"
         }
       ]
     }

@@ -1,5 +1,5 @@
 interface:
-  display_name: 推进合并
+  display_name: 推进 PR 与合并
   short_description: 完成拉取请求、反馈修正、集成检查与已有授权内的合并，并核实实际状态
   default_prompt: 使用 $worker-land 推进这个候选的拉取请求与合并，核实审查、集成检查和实际平台状态。
   icon_small: assets/icon.svg

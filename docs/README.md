@@ -1,12 +1,13 @@
 # 文档目录
 
-本目录只保存宏观架构与范围文档；其他内容归属见下表。临时草稿、访谈记录、调研、原型和 agent 输出放在 `.agent-output/`。
+本目录保存宏观架构、范围与项目工作流程；其他内容归属见下表。临时草稿、访谈记录、调研、原型和 agent 输出放在 `.agent-output/`。
 
 ## 目录结构
 
 ```
 docs/
 ├── README.md
+├── agent-workflow.md       # 可调整的 Agent 工作流程
 ├── architecture/
 │   ├── agent-studio.md       # 产品宏观架构、范围与验收基线
 │   ├── data-model.md         # 持久化数据模型、ID 方案、迁移与事务
@@ -26,7 +27,8 @@ docs/
 | --- | --- |
 | 产品宏观架构、范围、领域模型、阶段、产品级需求与验收基线 | `docs/architecture/` |
 | 架构决策 | `docs/architecture/` 下的相应文档 |
-| 开发流程、工具、协作约定 | `AGENTS.md` 或 issue |
+| 开发门槛、工具、协作约定 | `AGENTS.md` 或 issue |
+| 可调整的 Agent 工作流程 | [agent-workflow.md](agent-workflow.md) |
 | decision map、详细 spec、子 spec、ticket、依赖与状态 | GitHub Issues |
 | 临时草稿、访谈、调研、原型、日志 | `.agent-output/` |
 | 跨会话项目记忆 | `CONTEXT.md` |
