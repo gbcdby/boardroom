@@ -25,6 +25,7 @@ import { createDbDriver } from "./driver.ts";
 import type { DbDriver, DbDriverOptions, DbRow, DbTransaction } from "./driver.ts";
 import type { Migration } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
+import { durableMessageDispatch } from "./migrations/message-dispatch.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -282,6 +283,7 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   PG_ORG_TREE_AND_STATIC_ROLES,
   PG_MEMBER_LIFECYCLE_STATUS,
   PG_INIT_AUDIT_LOG,
+  durableMessageDispatch,
 ];
 
 // ---------------------------------------------------------------------------

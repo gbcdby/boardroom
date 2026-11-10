@@ -182,10 +182,16 @@ export interface NewMessage {
   readonly mentions?: readonly string[];
   /** 可选：外部提供稳定 ID（如重放/幂等导入）；缺省时自动生成。 */
   readonly id?: string;
+  /** 发送成员作用域内的稳定请求 ID；缺省不去重，空字符串不写入数据库。 */
+  readonly clientMessageId?: string;
 }
 
 /** 投递状态。 */
 export type DeliveryStatus = "pending" | "delivered" | "acked";
+
+export type DeliveryWake =
+  | { readonly decision: "allowed"; readonly reason?: null }
+  | { readonly decision: "suppressed"; readonly reason: "consecutive_limit" | "rate_limited" };
 
 /** MessageDelivery：某消息对某成员的一次投递记录（去重键 message+member）。 */
 export interface MessageDelivery {
@@ -194,6 +200,9 @@ export interface MessageDelivery {
   readonly memberId: string;
   readonly projectId: string;
   readonly status: DeliveryStatus;
+  /** 发送时判定；null 表示不属于唤醒候选（旧数据也保留 null）。 */
+  readonly wakeDecision: "allowed" | "suppressed" | null;
+  readonly wakeSuppressedReason: "consecutive_limit" | "rate_limited" | null;
   readonly attemptCount: number;
   readonly firstDeliveredAt: string | null;
   readonly lastDeliveredAt: string | null;

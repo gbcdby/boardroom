@@ -7,6 +7,8 @@
  * 属于 M1（#54）。
  */
 import { Pool, type PoolClient, type QueryResult } from "pg";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { OperationQueue } from "../operation-queue.ts";
 import {
   MIGRATION_TABLE,
   MigrationError,
@@ -36,8 +38,8 @@ export class PostgresDriver implements DbDriver {
   private readonly connectionString: string;
   private readonly schema: string | undefined;
   private pool: Pool | null = null;
-  /** 事务客户端栈：支持嵌套事务（事务内再开事务，#61）。 */
-  private txStack: PoolClient[] = [];
+  /** 按异步调用链绑定连接；不相关请求不能共享另一个事务的客户端。 */
+  private readonly transactionScope = new AsyncLocalStorage<{ client: PoolClient; queue: OperationQueue }>();
   /** SAVEPOINT 计数器。 */
   private spCounter = 0;
 
@@ -125,67 +127,72 @@ export class PostgresDriver implements DbDriver {
   }
 
   async query<T extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []): Promise<T[]> {
-    const result = await this.requirePool().query(this.dialect.renderParameters(sql), [...params]);
+    const scope = this.transactionScope.getStore();
+    const execute = () => (scope?.client ?? this.requirePool()).query(this.dialect.renderParameters(sql), [...params]);
+    const result = await (scope ? scope.queue.run(execute) : execute());
     return result.rows as T[];
   }
 
   async exec(sql: string, params: readonly unknown[] = []): Promise<number> {
-    const result = await this.requirePool().query(
-      this.dialect.renderParameters(sql),
-      [...params],
-    );
+    const scope = this.transactionScope.getStore();
+    const execute = () => (scope?.client ?? this.requirePool()).query(this.dialect.renderParameters(sql), [...params]);
+    const result = await (scope ? scope.queue.run(execute) : execute());
     return result.rowCount ?? 0;
   }
 
   async transaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T> {
-    const pool = this.requirePool();
-    // 嵌套事务（事务内再开事务，#61）：复用栈顶已持有事务的客户端，并用 SAVEPOINT
-    // 隔离；最外层才真正 BEGIN，并在结束后释放连接。
-    const nested = this.txStack.length > 0;
-    const client: PoolClient = nested
-      ? (this.txStack[this.txStack.length - 1] as PoolClient)
-      : await pool.connect();
+    // 真正的嵌套调用复用当前异步上下文客户端；独立请求各自向池取连接。
+    // 并行兄弟子事务在父队列中串行，不能让一方回滚覆盖另一方的 SAVEPOINT。
+    const parent = this.transactionScope.getStore();
+    if (parent) return parent.queue.run(() => this.runTransaction(fn, parent.client, parent.queue));
+    const client = await this.requirePool().connect();
+    try { return await this.runTransaction(fn, client); }
+    finally { client.release(); }
+  }
+
+  private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, client: PoolClient, parent?: OperationQueue): Promise<T> {
+    const nested = parent !== undefined;
+    const queue = new OperationQueue(parent);
+    const enqueue = <R>(operation: () => Promise<R>): Promise<R> => {
+      const current = this.transactionScope.getStore()?.queue;
+      return (current?.isWithin(queue) ? current : queue).run(operation);
+    };
     const render = (sql: string): string => this.dialect.renderParameters(sql);
     const sp = nested ? `s${++this.spCounter}` : null;
     const tx: DbTransaction = {
       query: async <R extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []) =>
-        (await client.query(render(sql), [...params])).rows as R[],
+        enqueue(async () => (await client.query(render(sql), [...params])).rows as R[]),
       // 事务内 exec：返回影响行数（与 SQLite `changes` 对齐，#61）。
-      exec: async (sql, params: readonly unknown[] = []) => {
+      exec: async (sql, params: readonly unknown[] = []) => enqueue(async () => {
         const r = await client.query(render(sql), [...params]);
         return r.rowCount ?? 0;
-      },
+      }),
     };
     try {
       if (nested) await client.query(`SAVEPOINT ${sp}`);
       else await client.query(this.dialect.beginTransaction());
-      this.txStack.push(client);
+      const scope = { client, queue };
       try {
-        const result = await fn(tx);
+        const result = await this.transactionScope.run(scope, () => fn(tx));
+        await queue.drain();
         if (nested) await client.query(`RELEASE SAVEPOINT ${sp}`);
         else await client.query(this.dialect.commit());
         return result;
       } catch (error) {
+        await queue.drain();
         try {
-          if (nested) await client.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+          if (nested) {
+            await client.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+            await client.query(`RELEASE SAVEPOINT ${sp}`);
+          }
           else await client.query(this.dialect.rollback());
         } catch {
           // 事务可能已因错误终止；保留原始错误。
         }
         throw error;
-      } finally {
-        this.txStack.pop();
-        if (!nested) {
-          try {
-            client.release();
-          } catch {
-            // 连接释放失败不影响已提交/回滚的结果。
-          }
-        }
       }
-    } catch (error) {
-      // 仅在未持有客户端时到达（pool.connect 失败）；无需释放。
-      throw error;
+    } finally {
+      queue.close();
     }
   }
 

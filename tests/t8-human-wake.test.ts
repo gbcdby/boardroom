@@ -99,6 +99,13 @@ test("人的 HTTP 消息实时唤醒正在 MCP 等待中的 agent（T8 #21 修�
       assert.equal(sendRes.status, 201);
       const sent = ((await sendRes.json()) as { message: { id: string } }).message;
 
+      // 通知可丢失；提交时落库的唤醒事实必须足以让未来 dispatcher 恢复。
+      const deliveries = await server.database.query<{ member_id: string; wake_decision: string | null }>(
+        "SELECT member_id, wake_decision FROM message_deliveries WHERE message_id = ?", [sent.id],
+      );
+      assert.equal(deliveries.find((d) => d.member_id === memberId)?.wake_decision, "allowed");
+      assert.equal(deliveries.find((d) => d.member_id === humanMemberId)?.wake_decision, null);
+
       // 关键断言：等待应立即返回该消息，而不是等 5s 超时
       const waited = await wait;
       assert.equal(waited["status"], "message", "人的消息应实时唤醒等待中的 agent，而非超时");

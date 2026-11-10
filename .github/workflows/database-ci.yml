@@ -1,0 +1,74 @@
+name: 数据库与 SDK 集成验证
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: database-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  database-tests:
+    name: Node 24 · SQLite / PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: boardroom
+          # 仅用于本次 CI 临时容器，不使用仓库或用户凭据。
+          POSTGRES_PASSWORD: boardroom-ci-only
+          POSTGRES_DB: boardroom_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U boardroom -d boardroom_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: 检出本次验证候选
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: 准备 Node.js 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: 按锁文件安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 构建 WebUI
+        run: npm run build
+
+      - name: 全量测试（启用 PostgreSQL 门控用例）
+        env:
+          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: npm test
+
+      - name: SQLite SDK 端到端验证
+        env:
+          AGENT_STUDIO_DB_DRIVER: sqlite
+        run: npm run e2e
+
+      - name: PostgreSQL SDK 端到端验证
+        env:
+          AGENT_STUDIO_DB_DRIVER: postgres
+          AGENT_STUDIO_PG_CONNECTION_STRING: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: npm run e2e

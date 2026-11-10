@@ -1,4 +1,5 @@
 import type { Migration } from "../migrate.ts";
+import { durableMessageDispatch } from "./message-dispatch.ts";
 
 /**
  * 生产迁移列表。
@@ -422,4 +423,5 @@ export const migrations: readonly Migration[] = [
       CREATE INDEX ix_audit_project_action  ON audit_log (project_id, action);
     `,
   },
+  durableMessageDispatch,
 ];

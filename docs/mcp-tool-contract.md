@@ -154,13 +154,27 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 | `groupId` | string | 否（默认当前入群群组） | 目标群组。 |
 | `text` | string | 是 | 正文（非空，≤ 8000 字符）。正文中的 `@名称` / `@all` 由 T3 解析为稳定成员 ID / 在线快照。 |
 | `mentions` | string[] | 否 | 被 @ 的成员稳定 ID（必须是本群参与者）。与正文 `@` 合并去重。 |
-| `clientMessageId` | string | 否 | 客户端幂等键：相同 `clientMessageId` + 发送者只落一条。 |
+| `clientMessageId` | string | 否 | 客户端幂等键：相同非空 key + 发送者 Member 只落一条；持久保存，跨 MCP 会话和服务重启有效。缺省/空字符串不启用去重。 |
 
 出参：
 
 ```jsonc
 { "ok": true, "messageId": "msg_...", "createdAt": "...", "duplicate": false }
 ```
+
+相同 Member 复用非空 key 时返回首次提交的 `messageId`、`createdAt` 和 `duplicate: true`，
+即使后一次的正文或群组不同也不另存消息。key 不按群组隔离，不同项目的 Member 则各自独立；
+调用方应为每次新发送生成新 key，只在重试同一次发送时复用。key 随消息持久保存，永久清除消息后
+不再保留去重记录。重复请求不会再次消耗防环计数或发布消息通知。
+
+消息、key、可见成员的投递记录与本次唤醒判定在一个数据库事务内提交，通知在提交后发布。
+投递的 `wake_decision` 为 `allowed`、`suppressed` 或 `NULL`（没有请求唤醒），受抑制时保存原因；
+旧消息升级后保持 `NULL`，不反推过去的决定。MCP 保存经过 anti-loop 的实际判定，HTTP 人消息
+保留既有路由与计数重置规则。后续 dispatcher 可查询 `allowed` 且未 ACK 的记录；
+`suppressed` 和 `NULL` 仍按既有可见性支持主动 wait、补投和 ACK。本轮没有实现进程 dispatcher。
+
+当前 anti-loop 计数仍在内存中。如果注册计数后发生数据库回滚，计数可能保守多计一次；
+因此这里只保证消息与投递的原子提交，不声明限额消耗或外部业务副作用精确一次。
 
 错误：`INVALID_ARGUMENT`（含无法解析的 `@名称`，`details.unknownNames`）、`NOT_IN_GROUP`、
 `FORBIDDEN`（不在该群组）、`INTERNAL`。

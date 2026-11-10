@@ -30,6 +30,7 @@ import {
   type AntiLoop,
   type AntiLoopConfig,
   type WakeSuppressionReason,
+  type WakeDecision,
 } from "../chat/antiloop.ts";
 
 /**
@@ -436,8 +437,6 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   const pendingWaits: PendingWait[] = [];
   /** 每位成员最多一个并发等待。 */
   const waitingMembers = new Set<string>();
-  /** clientMessageId 幂等映射（进程内：send 时写入 messageId）。 */
-  const clientKeys = new Map<string, string>();
   let closed = false;
 
   const selfKey = (sessionId: string): string => `${memberKey}:${sessionId}`;
@@ -898,13 +897,12 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       await (guard(binding, "group:post", { projectId: binding.projectId, groupId }, "只能向当前入群的群组发送消息"));
 
       if (params.clientMessageId) {
-        const existingId = clientKeys.get(`${binding.memberId}:${params.clientMessageId}`);
-        if (existingId) {
-          const existing = await (repos.messages.get(existingId));
+        const existing = await repos.messages.findByClientKey(binding.memberId, params.clientMessageId);
+        if (existing) {
           return {
             ok: true,
-            messageId: existingId,
-            createdAt: existing?.createdAt ?? now().toISOString(),
+            messageId: existing.id,
+            createdAt: existing.createdAt,
             duplicate: true,
           };
         }
@@ -939,29 +937,52 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       // T5：消息落库与「可见成员的 pending 投递」在同一事务内完成，避免中途崩溃留下
       // 消息可见却无任何投递记录的半成品（NFR-01/NFR-09）。即便极端情况下缺失投递记录，
       // wait_for_messages 的 deliverableSince 仍按「未 acked」补投，不丢消息（见测试）。
-      let created: DbMessage;
+      let persisted: { message: DbMessage; duplicate: true } |
+        { message: DbMessage; duplicate: false; decision: WakeDecision };
       try {
-        created = await (repos.transaction(async () => {
+        persisted = await (repos.transaction(async () => {
+          // 事务外查重只是优化；并发请求必须在实际提交范围内再查，并由唯一索引兜底。
+          if (params.clientMessageId) {
+            const existing = await repos.messages.findByClientKey(binding.memberId, params.clientMessageId);
+            if (existing) return { message: existing, duplicate: true as const };
+          }
           const message = await (repos.messages.create({
             groupId,
             senderMemberId: binding.memberId,
             body: text,
             // 持久化解析后的稳定成员 ID（含 @all 快照），不存 @all 语义本身。
             mentions: persistedMentions,
+            ...(params.clientMessageId ? { clientMessageId: params.clientMessageId } : {}),
           }));
+          // 去重胜者才登记防环。判定与所有投递一起提交，通知只在提交成功后发出。
+          // 防环计数仍是进程内状态；后续写入回滚时可能保守多计一次，不撤销其他请求的计数。
+          const decision = antiLoop.registerMessage({
+            groupId,
+            senderKind: await senderKindOf(binding.memberId),
+            candidateWake: plan.wake,
+          });
+          const allowed = new Set(decision.allowed);
           // 为所有「可见」成员建立 pending 投递（含发送者自己，便于自身历史一致性）。
           // 只对 visible 建投递，保证未参与/不可见成员无投递记录（不泄漏）。
           for (const memberId of plan.visible) {
-            await (repos.deliveries.ensure(message.id, memberId));
+            const reason = decision.suppressed.get(memberId);
+            await repos.deliveries.ensure(message.id, memberId,
+              reason ? { decision: "suppressed", reason } :
+                allowed.has(memberId) ? { decision: "allowed" } : undefined);
           }
-          return message;
+          return { message, duplicate: false as const, decision };
         }));
       } catch (error) {
+        // 跨连接/进程竞争唯一键：失败事务已经回滚，再读取已提交胜者。
+        if (params.clientMessageId && error instanceof RepositoryError && error.code === "conflict") {
+          const existing = await repos.messages.findByClientKey(binding.memberId, params.clientMessageId);
+          if (existing) return { ok: true, messageId: existing.id, createdAt: existing.createdAt, duplicate: true };
+        }
         throw mapRepoError(error, { groupId, memberId: binding.memberId });
       }
-      if (params.clientMessageId) {
-        clientKeys.set(`${binding.memberId}:${params.clientMessageId}`, created.id);
-      }
+      const created = persisted.message;
+      if (persisted.duplicate) return { ok: true, messageId: created.id, createdAt: created.createdAt, duplicate: true };
+      const decision = persisted.decision;
       log.info("message_sent", {
         memberId: binding.memberId,
         groupId,
@@ -970,14 +991,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         visible: plan.visible,
       });
 
-      // T7：防环/限流。候选唤醒 = T3 wake 集合（已排除发送者）。防环器对「每群组连续自动
-      // 回复」和「每成员跨群唤醒速率」做门控，返回允许唤醒的成员；被抑制的成员其消息已
-      // 持久化（上面已建 pending 投递），不丢弃，等窗口重置/恢复后由 wait 补投。
-      const decision = antiLoop.registerMessage({
-        groupId,
-        senderKind: await (senderKindOf(binding.memberId)),
-        candidateWake: plan.wake,
-      });
+      // T7：报告本次已持久化的防环/限流判定。被抑制的 pending 投递继续保留，
+      // 主动 wait 可补投；不会因为发送重试而重新登记限流或发布相同唤醒提示。
       if (decision.suppressed.size > 0) {
         // 只记结构化元信息（原因、成员、计数），不记消息正文（NFR-05 / T7 可观察性）。
         const byReason: Record<WakeSuppressionReason, string[]> = { consecutive_limit: [], rate_limited: [] };
