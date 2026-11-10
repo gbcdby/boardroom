@@ -22,11 +22,3 @@
 ## 失败和超时
 
 队列失败或CI未完成不能标merged。合并已发生后的检查失败不能标“没有改动”。超时或响应丢失时查询实际副作用；不把相同HTTP请求重试当恰好一次保证。
-
-## 方法来源
-
-- Matt双轴审查与PR方法：https://github.com/mattpocock/skills/tree/4ae2317ddb22b046e26455e4f9c9b3aaaf62212d
-- pstack PR/Babysit/Shipping思想：https://github.com/cursor/plugins/tree/de8ee15dd1194627d21eb5fcd41cb1873208dabb/pstack
-- Addy等人的审查体系：https://claude.dev/blog/solving-code-review-at-anthropic/
-
-这是自有适配。pstack的Babysit可止于merge-ready，Shipping不等同于生产部署；不能因方法同名推断实际终点。

@@ -13,7 +13,7 @@ description: 跨项目、跨语言的交付总控。用于一份或多份 Spec�
 2. 复用已有工作记录。Spec 持续保存设计概览、共同约束、整体验收和 Ticket 目录；拆票后继续保留。目标清楚、影响局部且低风险的独立小改动，可在现有任务或 PR 中紧凑记录，不强制新建 Spec 或 Ticket。
 3. 固定 `spec_ref` 的位置与有效修订、当前 Tickets 和依赖来源；代码使用提交或完整工作树身份，不能仅靠分支名、旧聊天或工作编号识别内容。
 4. 读取 [共享记录与结果约定](references/work-contract.md)。沿用项目选定的权威来源；大功能或需要共同约束、依赖交接的工作，在分派实现前核对本批 Spec／Tickets 已实际保存并可读取。只有主目录、聊天分工或本地草案不算完成拆票。
-5. Boardroom 项目按需读取 [项目适配](references/boardroom-project.md)。初始化可选，没有运行 `setup` 也应先发现已有能力。
+5. 从当前项目发现检查、交付与协作能力；初始化可选，不要求先运行 `setup`。
 
 同仓多个 Spec 或写入者并行时，读取 [本地并行约定](references/local-concurrency.md)，复用共同活动记录；顺序工作不额外建立协调流程。
 
@@ -37,9 +37,9 @@ description: 跨项目、跨语言的交付总控。用于一份或多份 Spec�
 | 确定视觉方向、界面与组件规格 | `worker-visual-design` |
 | 把 Spec 拆成 Tickets，检查依赖与验收覆盖 | `worker-plan-tickets` |
 | 检查值得建模的并发、重试或恢复设计 | `worker-tla` |
-| 实现获分配的 Ticket，修正候选或集成改动 | `worker-implement` |
+| 实现 Ticket、修正候选或构建／CI/CD 配置 | `worker-implement` |
 | 按设计基准实现、修正或核对界面，检查连续动效 | `worker-ui-fidelity`；按任务区分修改与只读验收 |
-| 为指定候选取得运行与验收证据 | `worker-verify` |
+| 为指定候选取得运行、流水线与验收证据 | `worker-verify` |
 | 独立检查需求满足与项目标准 | `worker-review` |
 | 推进 PR、反馈、CI 与授权内合并 | `worker-land` |
 | 目标包含发布、部署与交付位置验收 | `worker-release` |
@@ -47,7 +47,7 @@ description: 跨项目、跨语言的交付总控。用于一份或多份 Spec�
 | 人需要掌握成果、架构变化或待决事项 | `brief` |
 | 有明确范围的方法评估或工作流改进 | `worker-improve-workflow` |
 
-按任务需要组合，不强制所有阶段、固定模型或并行数量。同一 Agent 可在单任务中使用不同 worker；整份 Spec 并行推进时区分总控和各 Ticket 实现者，并保持独立审查。
+按任务需要组合，不强制所有阶段、固定模型或并行数量。构建、CI/CD 配置只在目标需要时补齐，优先复用已有机制；没有远程 CI 或发布需求时，采用项目规定的本地检查与交付。同一 Agent 可在单任务中使用不同 worker；整份 Spec 并行推进时区分总控和各 Ticket 实现者，并保持独立审查。
 
 能力可以替换。缺少某个 Skill 时使用已授权的等价方法并说明实际执行者，不冒称已调用；使用第三方 Skill 前核对版本和调用条件。`auto / challenge / steer / setup / guide` 仅由用户主动发起，不进入自动路由，也不通过读文件或委托绕过限制。
 
@@ -105,4 +105,4 @@ description: 跨项目、跨语言的交付总控。用于一份或多份 Spec�
 
 接收方需要结构化记录时，使用 [结果模板](assets/work-result.template.json) 与 [work-result/v1 约定](references/work-contract.md)。`COMPLETE` 不扩大证据范围，只有到达约定终点才把整体工作标为已交付。
 
-可用 Python 3.10+ 运行 `scripts/validate_result.py` 校验记录结构；它不证明证据真实，也不执行调度或授予权限。方法借鉴见 [来源](references/sources.md)。
+可用 Python 3.10+ 运行 `scripts/validate_result.py` 校验记录结构；它不证明证据真实，也不执行调度或授予权限。

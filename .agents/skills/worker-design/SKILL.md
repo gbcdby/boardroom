@@ -57,5 +57,3 @@ Spec 保留目标与设计概览、共同约束、整体验收，以及 Ticket �
 后续若改变调用语义、原子性、状态归属、外部效果、环境假设或兼容承诺，标出受影响的 Spec、Tickets 与证据，重新评估相关部分。只改图形样式不改变设计验证状态。
 
 仅接收方需要时输出 `work-result/v1`：`schema_version/work_id/skill/outcome/subject/evidence/unresolved/changed_assumptions/next_action`。`subject` 含 `kind` 和真实修订身份 `id`；证据含 `id/locator/scope/status/producer/subject_id`。`next_action` 与 `evidence.scope` 为非空文本，`evidence/unresolved/changed_assumptions` 为数组。静态观察用 `OBSERVED`，历史实测保留对象和日期；跨对象材料标 `relation: background`，不伪装当前对象已通过。原工具报告可由交接层包装，无须改其格式。
-
-方法来源与调用边界见 [方法来源](references/methods.md)。
