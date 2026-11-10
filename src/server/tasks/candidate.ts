@@ -24,9 +24,11 @@ export async function captureReviewCandidate(input: { repoPath: string; fixedPoi
   catch { throw new TaskError("review_repository_unavailable", "仓库路径不存在或不可读取。"); }
   const commands: ReviewCommand[] = [];
   const environment: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
-  Object.assign(environment, { GIT_OPTIONAL_LOCKS: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: devNull, GIT_PAGER: "cat" });
+  Object.assign(environment, { GIT_OPTIONAL_LOCKS: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: devNull, GIT_PAGER: "cat",
+    GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "", GIT_TERMINAL_PROMPT: "0" });
   async function git(args: string[], maxBuffer = INVENTORY_LIMIT): Promise<Buffer> {
-    const argv = ["--no-pager", "-c", "core.fsmonitor=false", "-c", `core.hooksPath=${devNull}`, "-c", "core.untrackedCache=false", ...args];
+    const argv = ["--no-pager", "-c", "core.fsmonitor=false", "-c", `core.hooksPath=${devNull}`, "-c", "core.untrackedCache=false",
+      "-c", "log.showSignature=false", "-c", "protocol.allow=never", ...args];
     const startedAt = new Date().toISOString();
     try {
       const stdout = await new Promise<Buffer>((resolve, reject) => {
@@ -125,7 +127,7 @@ export async function captureReviewCandidate(input: { repoPath: string; fixedPoi
   if (diffBytes.length === 0) throw new TaskError("review_empty_diff", "fixed point 与候选没有差异，不能开始评审。");
   const diff = diffBytes.toString("utf8");
   if (!Buffer.from(diff, "utf8").equals(diffBytes)) throw new TaskError("review_unsupported_diff", "候选强制文本 diff 包含无效 UTF-8，无法完整表示；请调整文件编码或按二进制评审。");
-  const rawLog = (await git(["log", "-z", "--format=%H%x00%s", `--max-count=${COMMIT_LIMIT + 1}`, `${baseCommit}..${candidateCommit}`, "--"])).toString("utf8").split("\0");
+  const rawLog = (await git(["log", "--no-show-signature", "-z", "--format=%H%x00%s", `--max-count=${COMMIT_LIMIT + 1}`, `${baseCommit}..${candidateCommit}`, "--"])).toString("utf8").split("\0");
   if (rawLog.at(-1) === "") rawLog.pop();
   const commits: ReviewCandidate["commits"] = [];
   for (let i = 0; i < rawLog.length; i += 2) {

@@ -78,6 +78,42 @@ test("真实 SHA-256 对象仓库可采集，skip-worktree 明确拒绝", async 
   }, "sha256");
 });
 
+test("Git 外部程序 canary：log 签名校验不会执行仓库 gpg.program", async () => {
+  await fixture(async (dir, base) => {
+    const marker = path.join(dir, ".git", "gpg-ran");
+    const helper = path.join(dir, ".git", "gpg-probe");
+    await writeFile(helper, `#!/bin/sh\nprintf executed > '${marker}'\nexit 1\n`, { mode: 0o755 });
+    const original = await git(dir, "cat-file", "commit", "HEAD");
+    const signed = original.replace("\n\n", "\ngpgsig -----BEGIN PGP SIGNATURE-----\n canary\n -----END PGP SIGNATURE-----\n\n") + "\n";
+    const raw = path.join(dir, ".git", "signed-commit");
+    await writeFile(raw, signed);
+    const commit = await git(dir, "hash-object", "-t", "commit", "-w", raw);
+    await git(dir, "update-ref", "HEAD", commit);
+    await git(dir, "config", "log.showSignature", "true");
+    await git(dir, "config", "gpg.program", helper);
+    const candidate = await captureReviewCandidate({ repoPath: dir, fixedPoint: base });
+    assert.equal(candidate.candidateCommit, commit);
+    await assert.rejects(access(marker), { code: "ENOENT" });
+  });
+});
+
+test("Git 外部程序 canary：promisor 缺失对象拒绝，不懒拉取或启动 remote helper", async () => {
+  await fixture(async (dir, base) => {
+    const marker = path.join(dir, ".git", "remote-helper-ran");
+    const helper = path.join(dir, ".git", "remote-probe");
+    await writeFile(helper, `#!/bin/sh\nprintf executed > '${marker}'\nexit 1\n`, { mode: 0o755 });
+    const missing = await git(dir, "rev-parse", `${base}:README.md`);
+    await rm(path.join(dir, ".git", "objects", missing.slice(0, 2), missing.slice(2)));
+    await git(dir, "config", "remote.origin.url", `ext::${helper}`);
+    await git(dir, "config", "remote.origin.promisor", "true");
+    await git(dir, "config", "remote.origin.partialclonefilter", "blob:none");
+    await git(dir, "config", "extensions.partialClone", "origin");
+    await git(dir, "config", "protocol.ext.allow", "always");
+    await assert.rejects(captureReviewCandidate({ repoPath: dir, fixedPoint: base }), { reason: "review_git_failed" });
+    await assert.rejects(access(marker), { code: "ENOENT" });
+  });
+});
+
 test("候选限额不截断通过；强制文本 diff 的无效 UTF-8 明确拒绝", async () => {
   await fixture(async (dir, base) => {
     await writeFile(path.join(dir, "README.md"), "x".repeat(2 * 1024 * 1024 + 100));
