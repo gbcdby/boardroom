@@ -1,5 +1,0 @@
-interface:
-  display_name: "拆票"
-  short_description: "把已确认 spec 拆成纵向切片 ticket"
-policy:
-  allow_implicit_invocation: false

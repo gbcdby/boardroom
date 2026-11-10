@@ -1,5 +1,0 @@
-interface:
-  display_name: "单票实现"
-  short_description: "范围受控地实现一张 ticket，测试循环交给 tdd"
-policy:
-  allow_implicit_invocation: false

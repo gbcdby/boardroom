@@ -1,5 +1,0 @@
-interface:
-  display_name: "整份 Spec 实现"
-  short_description: "调度子 agent 按任务图执行整份 spec"
-policy:
-  allow_implicit_invocation: false

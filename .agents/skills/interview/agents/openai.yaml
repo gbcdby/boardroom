@@ -1,5 +1,0 @@
-interface:
-  display_name: "需求访谈"
-  short_description: "用设计树和 frontier 收敛需求"
-policy:
-  allow_implicit_invocation: false

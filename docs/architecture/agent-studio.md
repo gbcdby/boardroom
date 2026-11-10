@@ -7,7 +7,7 @@
 
 > 本文件保留产品级需求与验收基线；decision map、逐条需求拆分、依赖和状态以 GitHub Issues 为准。
 
-关联文档：`.agents/skills/code-review/SKILL.md`、`docs/README.md`
+关联文档：`.agents/skills/review-work/SKILL.md`、`docs/README.md`
 
 ## 1. 摘要
 
@@ -186,7 +186,7 @@ Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Code
 
 ### 6.7 双轴评审
 
-评审流程封装为 `.agents/skills/code-review/`，由评审位 agent 调用；两轴并行、报告格式与失败条件以该技能为准。
+评审流程由 `.agents/skills/review-work/` 承接，由评审位 agent 调用；以下条款是产品任务板的双轴评审要求，通用技能的报告格式与候选追踪按该技能执行。
 
 - **REVIEW-01**：reviewer 默认为评审位成员，任务可指定具体 reviewer。
 - **REVIEW-02**：平台校验 fixed point 并可解析，向 reviewer 提供 diff、commit 列表和相关元数据；无效 ref 或空 diff 在评审前失败。
