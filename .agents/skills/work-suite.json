@@ -1,6 +1,6 @@
 {
   "schema_version": "work-suite/v1",
-  "suite_version": "0.5.0",
+  "suite_version": "0.5.1",
   "result_contract": "work-result/v1",
   "first_testbed": "boardroom",
   "independent_formal_skill": "worker-tla",
@@ -13,7 +13,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "5df95fdfa9280a4a041ad3da16e9432e5b659184551c8ded2133ffc6d72792f4"
+          "sha256": "77dd9a841633eebff05b26839edb50b8ef42877c87dce8f8a071cab42eeb5667"
         },
         {
           "path": "agents/openai.yaml",
@@ -41,7 +41,7 @@
         },
         {
           "path": "references/work-contract.md",
-          "sha256": "ad3a9a891ed78c0cd4be0718e4d31429e9919bf7586b8423ca8f9475ebb3b712"
+          "sha256": "c3a048363224dba831bb90b42b6fcd7959cc13359c42732d8da32ca27879563b"
         },
         {
           "path": "scripts/validate_result.py",
@@ -237,7 +237,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "b644811b94e6eb5c8e469dd48b37965c7b71e84c45ae645d3e538c977c5ecb1e"
+          "sha256": "0b0d3424e5203d0c9f522bb998a33e17f142748250e7f25735bd6b70be78d127"
         },
         {
           "path": "agents/openai.yaml",
@@ -291,7 +291,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "13e4c8978f25dac3d31e306bffcaa176a5d2ffdf1f9452e5879593d591d1252e"
+          "sha256": "d954a9fdf3344ded0ce98cc787278341db5047f878d1738ab25a114cc0d5bdf6"
         },
         {
           "path": "agents/openai.yaml",
@@ -307,7 +307,7 @@
         },
         {
           "path": "references/review-protocol.md",
-          "sha256": "b33ddc63c32bff352aed62720a5e65f4814cd2cc6cf64edfe4a11327e83ae37d"
+          "sha256": "2369ae80d23623a862f34cec92a470fe462c6ee4e499784aa0d8a8166e005dae"
         }
       ]
     },
@@ -489,25 +489,25 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "d38cbc925cca0e0f0d4b6f3e024d9832bf735e763a237f232957f7727aa2d6a4",
-          "source_sha256": "640acd8b855b01564a8e722af87003ea95868011ea3dfb86475ba81d7f896a4e",
+          "sha256": "9e96159bc662e29ab8d9e93602c496834255ad2ab537c8c3ad0a2c5cff7de1e0",
+          "source_sha256": "9babca2ab0a9847b80506d64b6c7422e4104e1a12b3438ff652a8ae791159e17",
           "transform": "add-disable-model-invocation"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "21846aaf36c21113886167f1e08a3f9cbe7c75e19fd5ea3b862986899c42d287"
+          "sha256": "169b9af337dd1b52424ad8faf7cab14704eb89b8e8fb89c1430e5ba31be8b0b0"
         },
         {
           "path": "assets/discussion.template.md",
-          "sha256": "0134b8b5907b620b84d7bd3c2cd07a480b0902407be561dc0e0d49b91847c78a"
+          "sha256": "a8013d782a4f744a06ba53c9bc62e6afb29722960f6c30f7b3e29634642b38bf"
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "d80a4c3e0fd2efa7af88433a53b25a92c78a644175c6669dd78fee50fb53acf6"
+          "sha256": "e9301497fa98ef56aaca7ede0857b9a18dc06c34040f0679c609a6bf49b1d38b"
         },
         {
           "path": "references/methods.md",
-          "sha256": "e0d58469e02c65cf39eaa4067128bc29d379c4fd505799d7b1c8166e9d3be674"
+          "sha256": "1560d52f07d026a87f72564fba5190343530871f9047cae8800242d3d750459b"
         },
         {
           "path": "references/result-contract.md",
@@ -602,11 +602,11 @@
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "9be88f8dd4c5e658961515c71389eafd45142ffa68bcae58e8dcff57d178ed91"
+          "sha256": "51a6923974188748638a424aa59b42b6afad2d910f910a1d43bb13ee10f3ce26"
         },
         {
           "path": "references/guide.md",
-          "sha256": "f8dd20d99182b4f7ca2aafd0f590def646d713a1df0149a0e45f4845d8c90302"
+          "sha256": "33d70132e5fb4e3df2d2d2c2c164661c3d73ad9084437dbb4fec095a857c30cf"
         },
         {
           "path": "references/result-contract.md",
@@ -886,8 +886,8 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "87f667647b81dd31ce38b6aef48e9a2efc7f7794d106726f65635ed4e397d199",
-          "source_sha256": "c4606441d4fd1f122f6cb6cd9fc84d2bdda3591db1c5a8f85abbda14e2da6e06",
+          "sha256": "020d04db6645fff596fc3ad6ca96f8e75cd322019dce46b72ff65e6899e2b43c",
+          "source_sha256": "9e46f20e909fabd5a973de9656b4e41f03175e9b00e8ebf21d4aa75a9f37b419",
           "transform": "add-disable-model-invocation"
         },
         {
@@ -896,7 +896,7 @@
         },
         {
           "path": "assets/agent-workflow.template.md",
-          "sha256": "62191938c13bbc95d045f45efee6bfce7a36ecec2243eaf393cd1d63c1349350"
+          "sha256": "3c5d8a2afca2efb067ffd1294be8724980989f9e30b605884d24314c5dfc4888"
         },
         {
           "path": "assets/icon.svg",

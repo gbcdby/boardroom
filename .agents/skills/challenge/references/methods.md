@@ -2,6 +2,8 @@
 
 本技能独立编写，吸收以下方法，不依赖安装上游技能。
 
+- Matt Pocock 的 `wayfinder`：跨会话维护共享决策地图，区分已定方向、可提出的问题、尚未明确与范围外，随证据逐步展开。这里复用项目记录，决策问题与实现 Tickets 分开，不照搬专属标签、固定会话票数或必经访谈。
+  - https://github.com/mattpocock/skills/blob/4ae2317ddb22b046e26455e4f9c9b3aaaf62212d/skills/engineering/wayfinder/SKILL.md
 - Matt Pocock 的 `grill-me` / `grilling`：人工入口与可复用方法分开；先自行查证事实，按问题依赖组织讨论并提供推荐。这里按用户指定的深度收束，不要求穷尽设计树或把常规决定全部交给人。
   - https://github.com/mattpocock/skills/blob/4ae2317ddb22b046e26455e4f9c9b3aaaf62212d/skills/productivity/grill-me/SKILL.md
   - https://github.com/mattpocock/skills/blob/4ae2317ddb22b046e26455e4f9c9b3aaaf62212d/skills/productivity/grilling/SKILL.md
