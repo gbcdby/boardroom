@@ -1,7 +1,7 @@
 interface:
-  display_name: 一起推敲
-  short_description: 由你主动发起，查清事实、检验想法和比较关键取舍，保留必要分歧
-  default_prompt: 使用 $challenge 和我一起推敲这个想法，先查事实、检验假设，再给出简短建议和必要问题。
+  display_name: 一起梳理
+  short_description: 由你发起，查清事实、比较关键取舍，让大功能的方向和决定跨会话延续
+  default_prompt: 使用 $challenge 和我一起梳理这个大功能，先查事实，分批讨论关键取舍，把决定保存到现有共享记录，先不实现。
   icon_small: assets/icon.svg
   icon_large: assets/icon.svg
 policy:
