@@ -112,8 +112,9 @@ export function createRuntimeApi(options: {
       ? "backoff" : runner.lastErrorCode;
     const summary = view.binding.desiredState === "stopped"
       ? runner.exitConfirmed ? "stopped" : "stopping"
-      : unknownExit ? "queued" : runner.state === "running" ? "running"
-        : runner.state === "stopping" ? "stopping"
+      : unknownExit ? "queued" : runner.state === "stopping" ? "stopping"
+        : ["transport_lost", "permission_required", "protocol_invalid"].includes(runner.lastErrorCode ?? "") ? "error"
+          : runner.state === "running" ? "running"
           : runner.state === "failed" && !runner.nextRetryAt ? "error" : "queued";
     return { ...view, runner: { ...runner, hasSession: harnessSessionId !== null },
       status: { summary, reason, queuedCount: Number(counts?.queued ?? 0), suppressedCount: Number(counts?.suppressed ?? 0),

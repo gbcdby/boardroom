@@ -1,21 +1,21 @@
 import path from "node:path";
-import { homedir } from "node:os";
 import { access, realpath } from "node:fs/promises";
 import { constants, createReadStream } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { bootstrapPrompt, buildHostArguments, expectedPermissionMode, parseHostVersion } from "./adapters.ts";
 import { createHostOutputParser } from "./parser.ts";
-import { VERIFIED_HOST_PROFILES, type HostInstallation, type HostLaunchSnapshot, type HostLauncher, type HostPreflight, type HostReason, type ManagedBackend, type VerifiedHostProfile } from "./types.ts";
+import { VERIFIED_HOST_PROFILES, type HostInstallation, type HostLaunchSnapshot, type HostLauncher, type HostPreflight, type HostReason, type ManagedBackend, type ResolvedHostInstallation, type VerifiedHostProfile } from "./types.ts";
 import { linuxIsolationAvailable, prepareLinuxIsolation, spawnIsolatedProcess, validateWorkdir } from "../isolation/linux.ts";
 import { createPipeBridge } from "../isolation/pipe-bridge.ts";
 import { captureOwnedProcessIdentity, inspectOwnedProcess } from "./process-identity.ts";
+import { findNativeInstallation, resolveNativeInstallation } from "./native-installation.ts";
 
 export interface HostLauncherOptions {
   readonly stateRoot: string;
   /** 至少包含服务源码、DB/dataDir、配置文件与其他管理数据路径。 */
   readonly protectedPaths: readonly string[];
-  /** 只允许服务端受信装配。没有 profile 实测证据也不能仅凭此配置开启支持。 */
+  /** 只允许服务端配置受信二进制位置。认证/出口由已验收profile解析，不能从这里覆盖。 */
   readonly installations?: readonly HostInstallation[];
 }
 
@@ -28,12 +28,7 @@ export function createHostLauncher(options: HostLauncherOptions): HostLauncher {
   async function installationFor(backend: ManagedBackend): Promise<HostInstallation | undefined> {
     const configured = installations.get(backend);
     if (configured) return configured;
-    const executableName = backend === "claude-code" ? "claude" : backend === "codex-cli" ? "codex" : "dsh";
-    const candidates = [`/usr/local/bin/${executableName}`, `/usr/bin/${executableName}`, path.join(homedir(), ".local", "bin", executableName), ...(backend === "codex-cli" ? ["/opt/codex/bin/codex"] : [])];
-    for (const executable of candidates) {
-      try { await access(executable, constants.X_OK); return { backend, executable }; } catch { /* 只检查固定安装位置 */ }
-    }
-    return undefined;
+    return await findNativeInstallation(backend);
   }
 
   function valid(snapshot: HostLaunchSnapshot): boolean {
@@ -46,7 +41,7 @@ export function createHostLauncher(options: HostLauncherOptions): HostLauncher {
       && (snapshot.sessionId === undefined || /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,191}$/.test(snapshot.sessionId));
   }
 
-  async function inspect(snapshot: HostLaunchSnapshot): Promise<{ result: HostPreflight; installation?: HostInstallation; profile?: VerifiedHostProfile }> {
+  async function inspect(snapshot: HostLaunchSnapshot): Promise<{ result: HostPreflight; installation?: ResolvedHostInstallation; profile?: VerifiedHostProfile }> {
     const expected = expectedPermissionMode(snapshot);
     const denied = (reason: HostReason, hostVersion?: string, isolation: HostPreflight["isolation"] = "unverified") => ({
       result: { supported: false, reason, expectedPermissionMode: expected, isolation, ...(hostVersion ? { hostVersion } : {}) },
@@ -75,10 +70,15 @@ export function createHostLauncher(options: HostLauncherOptions): HostLauncher {
     try { if (await sha256(executable) !== profile.executableSha256) return denied("host_version_unsupported", version); }
     catch { return denied("host_version_unknown", version); }
     if (!await linuxIsolationAvailable()) return denied("isolation_unavailable", version, "unavailable");
-    // credentialMounts 必须由安装定义明确提供；不尝试从服务端 env 提取模型密钥。
-    if (!installation.credentialMounts?.length) return denied("login_required", version);
+    let resolved: ResolvedHostInstallation;
+    try { resolved = await resolveNativeInstallation({ backend: installation.backend, executable }, profile); }
+    catch (error) {
+      const reason = error instanceof Error && ["profile_unsupported", "config_invalid", "login_required"].includes(error.message)
+        ? error.message as HostReason : "login_required";
+      return denied(reason, version);
+    }
     return { result: { supported: true, reason: "supported", hostVersion: version, expectedPermissionMode: expected, isolation: "verified" },
-      installation: { ...installation, executable }, profile };
+      installation: resolved, profile };
   }
 
   return {
@@ -91,8 +91,8 @@ export function createHostLauncher(options: HostLauncherOptions): HostLauncher {
       const prepared = await prepareLinuxIsolation({
         executable: checked.installation.executable, argv: buildHostArguments(snapshot), prompt: bootstrapPrompt(snapshot),
         workdir: snapshot.config.workdir, stateRoot: options.stateRoot, bindingId: snapshot.bindingId,
-        protectedPaths: options.protectedPaths, egressHosts: checked.installation.egressHosts ?? [],
-        ...(checked.installation.credentialMounts ? { credentialMounts: checked.installation.credentialMounts } : {}),
+        protectedPaths: options.protectedPaths, egressHosts: checked.installation.egressHosts,
+        credentialMounts: checked.installation.credentialMounts,
       });
       let child;
       try { child = spawnIsolatedProcess(prepared); }
@@ -105,7 +105,7 @@ export function createHostLauncher(options: HostLauncherOptions): HostLauncher {
         ...(checked.profile.usageSchema ? { usageSchema: checked.profile.usageSchema } : {}),
         onEvent(event) { if (event.type === "ready") ready = true; emit(event); },
       });
-      const bridge = createPipeBridge(child, { egressHosts: checked.installation.egressHosts ?? [],
+      const bridge = createPipeBridge(child, { egressHosts: checked.installation.egressHosts,
         onStdout: chunk => parser.push(chunk), onInvalid: () => emit({ type: "protocol_invalid", reason: "invalid_schema" }) });
       // stderr 含 CLI 原始文本；只排空，不记录、不嵌入 Error.message。
       child.stderr?.on("data", () => {});

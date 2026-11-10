@@ -108,10 +108,18 @@ export interface OwnedProcessInspection {
 export interface HostInstallation {
   readonly backend: ManagedBackend;
   readonly executable: string;
+}
+
+/** 受信版本profile选择代码内固定策略，不能由Web传入路径、env或任意出口。 */
+export type NativeCredentialLayout = "claude-linux-user-login-v1";
+export type NativeEgressPolicy = "anthropic-api-oauth-v1";
+
+/** 仅由native resolver解析，不能用installation覆盖profile的认证与出口策略。 */
+export interface ResolvedHostInstallation extends HostInstallation {
   /** CLI 自有认证文件：只读挂载，不读取/复制/散列文件正文。 */
-  readonly credentialMounts?: readonly { readonly source: string; readonly destination: string }[];
+  readonly credentialMounts: readonly { readonly source: string; readonly destination: string }[];
   /** 固定 provider TLS 目的地；不接受 IP、通配符、非 443 端口。 */
-  readonly egressHosts?: readonly string[];
+  readonly egressHosts: readonly string[];
 }
 
 export interface VerifiedHostProfile {
@@ -123,6 +131,8 @@ export interface VerifiedHostProfile {
   readonly mode: "auto" | "bypassPermissions";
   readonly evidence: string;
   readonly isolationProfile: "linux-private-net-v1";
+  readonly nativeCredentialLayout: NativeCredentialLayout;
+  readonly egressPolicy: NativeEgressPolicy;
   readonly resumeVerified: boolean;
   readonly usageSchema?: VerifiedUsageSchema;
 }

@@ -45,7 +45,8 @@
 
 | 现象 | 原因 | 结论 / 做法 | 适用范围 | 证据 |
 | --- | --- | --- | --- | --- |
-| 原型 MCP server 在宿主被杀后日志暴涨到 1.2G | stderr 已断（EPIPE），`uncaughtException` 处理里又写 stderr，递归触发自身 | 日志写入必须 try/catch 包裹；EPIPE 单独短路，且对 uncaught 限次记录 | 任何 stdio MCP server | `.agent-output/d6-host-capability/` 修复前后对比 |
+| 原型 MCP server 在宿主被杀后日志暴涨到 1.2G；默认 stdout 断管还可导致进程退出 | 同步 try/catch 不捕获流的异步 error；向已断 stderr 递归记录错误会放大故障 | 同步写入捕获之外，默认异步流只装一个 error 监听器并共享健康计数；错误处理不递归写断开的流 | stdio MCP、服务默认日志 sink | 原型历史；2026-11-10 PR #90，`tests/logger.test.ts` 真实 EPIPE 回归 |
+| 托管 runner 正常安全停止被误记失败 | MCP 业务和 stop 控制帧共用匿名管道，先关 transport 会截断停止请求 | 先发自有 child 的安全点停止，真正 exited 后再关完整通道；意外 MCP 断连仅先关闭业务侧并记录 transport_lost，忙碌进程不按启动超时强杀 | `runtime/gateway.ts`、`runtime/supervisor.ts` | 2026-11-10 #89 / PR #90，独立真实隔离替身安全点探针 |
 | 已过时：旧入口的 model invocation 限制（2026-11-04 历史） | 当时的部分技能声明 `disable-model-invocation: true`；旧技能已于 2026-11-10 退役 | **2026-11-10 修订**：撤销原“直接读盘绕过限制”的做法。按当前 `AGENTS.md` 调用新体系；另行接入的技能仍须遵守其调用限制，不代用户作出未授权的决定 | 仅作历史提醒，不是当前入口或调用授权 | #31 历史；2026-11-10 技能迁移与 `AGENTS.md` 的「工作流与生效技能」 |
 | 给 `createT1ApiRouter` 加闭包内 `const` 状态（#48 永久删除待确认表）后，请求直接 500 `Cannot access 'pendingPurges' before initialization` | 该工厂函数**先 `return { handle }`**，后面的函数声明靠 hoisting 才能被调用；写在 `return` 之后的 `const`/`let` 永远不会初始化（TDZ） | 新增闭包状态必须声明在 `return` 之前（本仓库 `src/server/api.ts` 的结构就是「先 return，再写函数声明区」）；排查同类问题先看错误是否为 ReferenceError | `src/server/api.ts` 及其他「提前 return + 下方函数声明」的工厂 | 2026-11-04 #48 实现期；修复见同分支提交 |
 | 测试里 `await client.close(); await transport.terminateSession()` 之后，服务端 `mcp_sessions` 仍是 `connected`（成员一直 online） | MCP SDK `StreamableHTTPClientTransport.close()` 会 `abortController.abort()`；随后 `terminateSession()` 里的 DELETE fetch 用的正是这个**已 abort 的 signal**，DELETE 根本没到服务端，`onclose→core.disconnect()` 不触发 | 必须**先** `await transport.terminateSession()` 发 DELETE（触发服务端 onclose / 会话断开 / 运行状态回落 offline），**再** `await client.close()`。仅 `client.close()` 的既有清理顺序不适用于「要验证断开态」的用例 | 所有用 `StreamableHTTPClientTransport` 验证「断开/离线」的测试；仅做收尾清理时顺序无所谓 | 2026-11-05 #50 LIFE-MEM-03 用例调试；SDK `dist/esm/client/streamableHttp.js` `close()` / `terminateSession()` |
@@ -61,3 +62,4 @@
 | Codex CLI 的等待/打断/重连行为是否与 Claude Code 一致 | 决定能否对 Codex 承诺「安全点投递」和等待循环 | Codex 配额恢复后（约 2026-10-27）重跑 | 已验证（2026-11-03，0.166.0）：等待活唤醒与重连补投与 Claude 一致；打断同为 `unsupported` |
 | Claude Code `MCP_TOOL_TIMEOUT` / `MCP_TOOL_IDLE_TIMEOUT` 的默认值 | 决定单次等待时长上限的保守取值 | 显式设置环境变量做对照实验 | 待验证 |
 | 宿主被强制杀死（非优雅退出）后的 MCP 会话回收时延 | 决定服务端会话清理超时 | 杀进程后轮询服务端会话表 | 待验证 |
+| 托管原生 Claude 的 Auto、常驻、resume、认证刷新与用量 schema | 决定是否可填 `VERIFIED_HOST_PROFILES`；历史外部 MCP 证据不能替代 | 在已登录的实际 CLI/version/OS/模式下，经过相同文件/网络隔离验收 | 2026-11-10：官方2.1.322只完成版本/帮助/隔离内登录状态检查，当前未登录；支持表仍空，见 #86/#89/PR #90 |

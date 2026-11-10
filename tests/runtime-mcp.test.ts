@@ -161,6 +161,34 @@ databaseTest("R2 受控MCP不能选择其他身份/角色/群，授权拒绝保�
   } finally { await f.close(); }
 });
 
+databaseTest("R2 托管MCP在组织岗位降级及退群后动态撤销历史与参与者可见性", async (driver) => {
+  const f = await fixture(driver);
+  const contextOf = (result: Payload) => result["context"] as {
+    identity: { role: string }; visibility: { scope: string }; participants: { memberId: string }[];
+  };
+  try {
+    const root = await f.repos.org.createNode({ projectId: f.project.id, parentId: null, name: "统筹", role: "top_manager" });
+    const memberNode = await f.repos.org.createNode({ projectId: f.project.id, parentId: root.id, name: "成员岗位", role: "member" });
+    await f.repos.org.assignNode(f.view.binding.memberId, root.id);
+    const managed = await f.managed();
+    assert.equal(contextOf(await managed.join()).identity.role, "top_manager");
+    await f.humanMessage("受组织权限保护的历史");
+    await f.repos.org.assignNode(f.view.binding.memberId, memberNode.id);
+    await f.repos.groups.removeParticipant(f.group.id, f.view.binding.memberId);
+    assert.equal((await managed.call("read_history", {})).error?.code, "FORBIDDEN");
+    const downgraded = contextOf(await managed.join());
+    assert.equal(downgraded.identity.role, "member", "不能继续使用join时缓存的legacy manager角色");
+    assert.equal(downgraded.visibility.scope, "none");
+    assert.deepEqual(downgraded.participants, [], "撤销可见性后不能继续展示原群参与者");
+    // 使用现有管理入口恢复岗位/参与关系后，同一fence按新事实重新获得权限。
+    await f.repos.org.assignNode(f.view.binding.memberId, root.id);
+    await f.repos.groups.addParticipant(f.group.id, f.view.binding.memberId);
+    assert.equal(contextOf(await managed.join()).identity.role, "top_manager");
+    assert.equal((await managed.call("read_history", {})).ok, true);
+    assert.equal((await f.runtime.checkFence(managed.fence)).runner.generation, managed.fence.generation);
+  } finally { await f.close(); }
+});
+
 databaseTest("R2 旧generation挂起wait不会出队、ACK或覆盖新generation状态", async (driver) => {
   const f = await fixture(driver);
   try {

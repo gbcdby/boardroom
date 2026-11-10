@@ -52,6 +52,7 @@ class ControlledHost implements OwnedHostProcess {
 }
 
 async function fixture(options: { announceMode?: boolean; preflight?: HostPreflight; launchFails?: boolean; startupTimeoutMs?: number;
+  announcePermission?: "auto" | "manual"; checkPreflight?: HostLauncher["preflight"];
   processIdentity?: OwnedProcessIdentity; inspectPrevious?: NonNullable<HostLauncher["inspectPrevious"]> } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "runtime-supervisor-"));
   const db = new SqliteDriver({ dataDir: dir }); await db.connect(); await db.migrate(migrations);
@@ -72,7 +73,8 @@ async function fixture(options: { announceMode?: boolean; preflight?: HostPrefli
   let launches = 0;
   const launcher: HostLauncher = {
     ...(options.inspectPrevious ? { inspectPrevious: options.inspectPrevious } : {}),
-    async preflight() { return options.preflight ?? { supported: true, reason: "supported", expectedPermissionMode: "auto", isolation: "verified" }; },
+    async preflight(snapshot) { return options.checkPreflight ? options.checkPreflight(snapshot)
+      : options.preflight ?? { supported: true, reason: "supported", expectedPermissionMode: "auto", isolation: "verified" }; },
     async launch(snapshot, observer) {
       launches += 1;
       if (options.launchFails) throw new Error("synthetic-launch-failure");
@@ -80,7 +82,7 @@ async function fixture(options: { announceMode?: boolean; preflight?: HostPrefli
       const client = new Client({ name: "controlled-host", version: "test-only" });
       const host = new ControlledHost(snapshot, observer, client, options.processIdentity); hosts.push(host);
       await observer.onMcpTransport!(serverTransport); await client.connect(clientTransport);
-      if (options.announceMode !== false) observer.onEvent({ type: "ready", permissionMode: "auto" });
+      if (options.announceMode !== false) observer.onEvent({ type: "ready", permissionMode: options.announcePermission ?? "auto" });
       const joined = await host.call("join", { displayName: snapshot.identity!.displayName, hostType: snapshot.backend,
         projectId: snapshot.identity!.projectId, groupId: snapshot.identity!.groupId });
       assert.equal(joined.ok, true, JSON.stringify(joined));
@@ -125,6 +127,39 @@ test("R6 常驻已就绪runner在无待应用配置时保持等待，不将null 
   } finally { await f.close(); }
 });
 
+test("R6 preflight期间显式应用新权限配置，旧能力结果不能领取新配置", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const checked: HostLaunchSnapshot[] = [];
+  const f = await fixture({ announcePermission: "manual", checkPreflight: async snapshot => {
+    checked.push(snapshot);
+    if (checked.length === 1) { entered.resolve(); await release.promise; }
+    return { supported: true, reason: "supported", expectedPermissionMode: snapshot.config.permissionMode, isolation: "verified" };
+  } });
+  try {
+    const message = await f.enqueue(f.binding.id, "allowed", "新配置确认前保持排队");
+    const starting = f.start();
+    await entered.promise;
+    await f.runtime.updateBinding(f.binding.id, {
+      runtimeRevision: 1, bindingRevision: 1, overrides: { permissionMode: "manual" },
+    });
+    await f.runtime.intent(f.binding.id, "apply", undefined, { runtimeRevision: 1, bindingRevision: 2 });
+    release.resolve();
+    await starting;
+    await f.supervisor.tick();
+    await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.state === "running", "新配置应以匹配的权限判定就绪");
+    assert.deepEqual(checked.map(snapshot => snapshot.config.permissionMode), ["auto", "manual"]);
+    assert.equal(f.launches, 1, "过期preflight不能创建任何旧或新配置进程");
+    const view = (await f.runtime.getBinding(f.binding.id))!;
+    assert.equal(view.runner.generation, 1, "拒绝过期preflight时不能提前占用generation");
+    assert.equal(view.runner.applied!.config.permissionMode, "manual");
+    assert.equal(view.runner.permissionObserved, "manual");
+    assert.equal(view.runner.lastErrorCode, null, "不能拿旧expected auto把正确的manual误判为回落");
+    assert.equal((await f.repos.deliveries.get(message.id, f.binding.memberId))?.status, "pending");
+    assert.equal((await f.hosts[0]!.call("wait_for_messages", { timeoutMs: 100 })).status, "message");
+  } finally { release.resolve(); await f.close(); }
+});
+
 test("R6 启动超时只回收自有启动进程，已ready的忙碌轮次无运行硬超时", async () => {
   const unknown = await fixture({ announceMode: false, startupTimeoutMs: 100 });
   try {
@@ -139,6 +174,82 @@ test("R6 启动超时只回收自有启动进程，已ready的忙碌轮次无运
     ready.advance(10 * 60_000); await ready.supervisor.tick();
     assert.equal(host.forced, 0, "启动超时不得变成执行超时"); assert.equal(host.stops, 0);
   } finally { await ready.close(); }
+});
+
+test("R6 已就绪且正在处理的SDK连接断开立即离线，不误杀进程、清退避或确认投递", async () => {
+  const f = await fixture({ startupTimeoutMs: 100 });
+  try {
+    const host = (await f.start())!;
+    host.event({ type: "session", sessionId: "disconnect-preserved-session" });
+    const message = await f.enqueue(f.binding.id, "allowed");
+    assert.equal((await host.call("wait_for_messages", { timeoutMs: 100 })).status, "message");
+    await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.harnessSessionId !== null, "原宿主会话尚未保存");
+    const before = (await f.runtime.getBinding(f.binding.id))!;
+    assert.equal(before.runner.phase, "working");
+    assert.equal(before.runner.state, "running");
+    assert.equal(before.runner.attemptCount, 1);
+    assert.equal(f.gateways[0]!.joined, true);
+
+    // 关闭真实SDK transport，但受控进程句柄仍然存活，不能等同于 child.exited。
+    await host.client.close();
+    assert.equal(f.gateways[0]!.joined, false, "业务连接关闭应同步撤销joined事实");
+    await until(async () => (await f.repos.mcpSessions.listByProject(f.project.id))
+      .every(session => session.state === "disconnected"), "SDK断连必须更新持久MCP连接事实");
+    await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.lastErrorCode === "transport_lost", "runner必须说明连接丢失");
+    f.advance(6 * 60_000);
+    await f.supervisor.tick();
+    const disconnected = (await f.runtime.getBinding(f.binding.id))!;
+    assert.equal(disconnected.runner.owner, before.runner.owner, "没有真实退出证明不能让出Member所有权");
+    assert.equal(disconnected.runner.exitConfirmed, false);
+    assert.equal(disconnected.runner.state, "running", "进程状态仍反映尚未退出的自有进程");
+    assert.equal(disconnected.runner.attemptCount, before.runner.attemptCount, "断连后的时间不能计入连续健康期");
+    assert.equal(disconnected.runner.harnessSessionId, "disconnect-preserved-session");
+    assert.equal(disconnected.runner.lastErrorCode, "transport_lost");
+    assert.equal(host.stops, 0, "忙碌轮次没有安全点，不能发送安全停止");
+    assert.equal(host.forced, 0, "曾ready的进程不能重新触发启动硬超时");
+    assert.equal((await f.repos.deliveries.get(message.id, f.binding.memberId))?.status, "delivered");
+
+    host.finish(1);
+    await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.exitConfirmed, "实际退出后才应释放runner");
+    const exited = (await f.runtime.getBinding(f.binding.id))!;
+    assert.equal(exited.runner.owner, null);
+    assert.equal(exited.runner.lastErrorCode, "transport_lost");
+    assert.ok(exited.runner.nextRetryAt, "仍需按原失败计数退避重试");
+    assert.equal(exited.runner.harnessSessionId, "disconnect-preserved-session");
+    assert.equal((await f.repos.deliveries.get(message.id, f.binding.memberId))?.status, "delivered", "断连及退出都不能伪造业务ACK");
+  } finally { await f.close(); }
+});
+
+test("R6 空闲等待中的SDK连接断开结清wait并请求安全停止，真实退出前保留owner", async () => {
+  const f = await fixture();
+  try {
+    const host = (await f.start())!;
+    const waiting = host.call("wait_for_messages", { timeoutMs: 10_000 }).then(
+      () => "completed", () => "transport-closed");
+    await until(async () => f.gateways[0]!.pendingWaitCount === 1, "空闲wait没有挂起");
+    const owner = (await f.runtime.getBinding(f.binding.id))!.runner.owner;
+    await host.client.close();
+    assert.equal(await waiting, "transport-closed");
+    await until(async () => f.gateways[0]!.pendingWaitCount === 0, "断连应结清业务wait，不能等10秒超时");
+    await until(async () => host.stops === 1, "已知安全点应请求自有进程优雅停止");
+    const stopping = (await f.runtime.getBinding(f.binding.id))!;
+    assert.equal(f.gateways[0]!.joined, false);
+    assert.equal(stopping.runner.owner, owner);
+    assert.equal(stopping.runner.exitConfirmed, false);
+    assert.equal(stopping.runner.state, "stopping");
+    assert.equal(stopping.runner.lastErrorCode, "transport_lost");
+    assert.equal(stopping.binding.desiredState, "running", "连接故障不能改写用户运行意图");
+    assert.equal(host.forced, 0);
+    await f.supervisor.tick();
+    assert.equal(host.stops, 1, "同一断连的重复调度不能重复发停止指令");
+    assert.equal((await f.repos.mcpSessions.listByProject(f.project.id))[0]?.state, "disconnected");
+    host.finish();
+    await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.exitConfirmed, "安全停止也须等实际退出确认");
+    const exited = (await f.runtime.getBinding(f.binding.id))!;
+    assert.equal(exited.runner.owner, null);
+    assert.equal(exited.runner.lastErrorCode, "transport_lost", "优雅停止不能掩盖原断连原因");
+    assert.ok(exited.runner.nextRetryAt);
+  } finally { await f.close(); }
 });
 
 test("R6 unsupported保留running意图与队列，拉起失败退避且重复start不绕过", async () => {

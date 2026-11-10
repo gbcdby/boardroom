@@ -72,3 +72,44 @@ jobs:
           AGENT_STUDIO_DB_DRIVER: postgres
           AGENT_STUDIO_PG_CONNECTION_STRING: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
         run: npm run e2e
+
+  managed-web-browser:
+    name: Chromium · 托管 Agent 页面
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: 检出本次验证候选
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: 准备 Node.js 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: 安装并构建真实 WebUI
+        run: |
+          npm ci
+          npm run build
+
+      - name: 安装固定版本 Playwright 与 Chromium
+        run: |
+          python3 -m venv .agent-output/browser-venv
+          .agent-output/browser-venv/bin/python -m pip install playwright==1.62.0
+          .agent-output/browser-venv/bin/python -m playwright install --with-deps chromium
+
+      - name: 真实浏览器操作临时 SQLite 服务
+        run: .agent-output/browser-venv/bin/python scripts/e2e-managed-web.py --ci
+
+      - name: 保存浏览器截图与逐项报告
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: managed-web-browser-${{ github.run_attempt }}
+          path: .agent-output/managed-web-e2e/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7

@@ -31,6 +31,7 @@ interface ActiveRunner {
   child: OwnedHostProcess | null;
   joined: boolean;
   ready: boolean;
+  readyAt: number | null;
   safe: boolean;
   /** 本轮 owner 至少获得一次投递机会，避免旧未 ACK 投递使两群在首批前反复互让。 */
   delivered: boolean;
@@ -123,6 +124,7 @@ export function createRuntimeSupervisor(options: {
     if (item.ready || item.stopping || !item.joined || item.permission !== item.preflight.expectedPermissionMode) return;
     const view = await repo.markReady(item.fence, item.child?.pid);
     item.ready = true;
+    item.readyAt = now();
     await record(view, "ready", { attemptId: item.attemptId });
   }
 
@@ -161,6 +163,9 @@ export function createRuntimeSupervisor(options: {
         projectId: view.binding.projectId, groupId: view.binding.groupId, memberId: view.binding.memberId },
       async run(operation, fn) {
         if (item.stopping && operation !== "observe") throw new McpToolError("CONFLICT", "托管运行正在停止");
+        if ((operation === "consume" || operation === "write") && !item.joined) {
+          throw new McpToolError("CONFLICT", "托管 MCP 通道尚未就绪或已断开");
+        }
         if ((operation === "consume" || operation === "write") &&
           item.permission !== item.preflight.expectedPermissionMode) {
           throw new McpToolError("FORBIDDEN", "实际权限模式尚未确认，不能处理新业务");
@@ -198,6 +203,7 @@ export function createRuntimeSupervisor(options: {
         await record(view, "observation_warning", { reasonCode: "permission_required", attemptId: item.attemptId });
         break;
       case "failure":
+        if (item.stopping) break; // 已请求退出后的宿主输出不覆盖停止/启动超时的因果原因。
         item.failure = hostReason(event.reason);
         await repo.patchRunner(item.fence, { lastErrorCode: item.failure,
           ...(event.reason === "resume_failed" ? { sessionState: "invalid" } : {}) });
@@ -280,14 +286,23 @@ export function createRuntimeSupervisor(options: {
     if (!claimed) return;
     const item: ActiveRunner = { fence, attemptId: newId(), epochId: newId(), startedAt: now(),
       snapshot: launchSnapshot(claimed, owner, ""), preflight, gateway: null, child: null,
-      joined: false, ready: false, safe: false, delivered: false, stopping: false, yielded: false,
+      joined: false, ready: false, readyAt: null, safe: false, delivered: false, stopping: false, yielded: false,
       permission: "unknown", failure: null, eventChain: Promise.resolve(), completion: null };
     active.set(b.id, item);
     try {
       item.gateway = await (options.gatewayFactory ?? createRuntimeGateway)({ db: options.db, logger: options.logger,
         authority: authorityFor(item, claimed),
         ...(options.actorFor ? { actorFor: options.actorFor } : {}),
-        onJoined: async () => { item.joined = true; await maybeReady(item); } });
+        onJoined: async () => { item.joined = true; await maybeReady(item); },
+        onDisconnected: async () => {
+          item.joined = false;
+          if (!item.stopping && active.get(b.id) === item) {
+            item.failure ??= "transport_lost";
+            const disconnected = await repo.patchRunner(item.fence, { lastErrorCode: item.failure });
+            await record(disconnected, "observation_warning", { reasonCode: item.failure, attemptId: item.attemptId });
+          }
+          supervisor.notify();
+        } });
       const launch = item.snapshot;
       item.child = await options.launcher.launch(launch, {
         onMcpTransport: channel => item.gateway!.attach(channel),
@@ -353,7 +368,8 @@ export function createRuntimeSupervisor(options: {
         item.child?.forceStopOwned();
         continue;
       }
-      if (item.ready && item.failure === null && now() - item.startedAt >= 5 * 60_000 && view.runner.attemptCount > 0) {
+      if (item.ready && item.joined && item.gateway?.joined && item.failure === null && item.readyAt !== null
+        && now() - item.readyAt >= 5 * 60_000 && view.runner.attemptCount > 0) {
         await repo.resetFailures(item.fence);
       }
       const others = wakeable.some(w => w.memberId === item.fence.memberId && w.bindingId !== item.fence.bindingId)

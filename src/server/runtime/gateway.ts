@@ -24,15 +24,39 @@ export async function createRuntimeGateway(options: {
   authority: ManagedCoreAuthority;
   onJoined: () => Promise<void>;
   actorFor?: (binding: SessionBinding) => Promise<Actor>;
+  onDisconnected?: () => Promise<void>;
 }): Promise<RuntimeGateway> {
   const inflight = new Set<Promise<unknown>>();
   let core: McpCore | null = null;
   let mcp: ReturnType<typeof createMcpServer> | null = null;
   let transport: Transport | null = null;
   let joined = false;
+  let disconnected = false;
+  let normalClosing = false;
+  let businessClosing: Promise<void> | null = null;
+  let loss: Promise<void> | null = null;
   let closing: Promise<void> | null = null;
   const log = options.logger.child({ component: "managed-mcp" });
   const orgResolver = createOrgActorResolver(createRepositories(options.db));
+  function closeBusiness(): Promise<void> {
+    if (businessClosing) return businessClosing;
+    joined = false;
+    disconnected = true;
+    businessClosing = (async () => {
+      await core?.close();
+      await Promise.allSettled([...inflight]);
+      await core?.disconnect();
+    })();
+    return businessClosing;
+  }
+  function transportLost(): void {
+    if (normalClosing || loss) return;
+    joined = false;
+    disconnected = true;
+    // 业务通道失效不关闭共用的停止控制管道；忙碌进程继续由真实退出证明约束。
+    loss = (async () => { await options.onDisconnected?.(); await closeBusiness(); })()
+      .catch(() => { log.warn("managed_disconnect_observation_failed"); });
+  }
   return {
     get joined() { return joined; },
     get pendingWaitCount() { return core?.pendingWaitCount ?? 0; },
@@ -43,7 +67,7 @@ export async function createRuntimeGateway(options: {
         ...options.authority,
         run(operation, fn) {
           const promise = options.authority.run(operation, fn).then(async (result) => {
-            if (operation === "join") { joined = true; await options.onJoined(); }
+            if (operation === "join" && !disconnected && !normalClosing) { joined = true; await options.onJoined(); }
             return result;
           });
           inflight.add(promise);
@@ -55,20 +79,25 @@ export async function createRuntimeGateway(options: {
         memberKey: `managed:${newId()}`,
         authz: { actorFor: options.actorFor ?? (binding => orgResolver.actorForMcpBinding(binding)) } });
       mcp = createMcpServer({ core, logger: options.logger });
+      // SDK connect 会保留并链式调用已有 transport 回调，不覆盖其关闭清理。
+      const onclose = channel.onclose;
+      const onerror = channel.onerror;
+      channel.onclose = () => { onclose?.(); transportLost(); };
+      channel.onerror = error => { onerror?.(error); transportLost(); };
       await mcp.connect(channel);
     },
     async wake() {
-      if (closing || !core) return;
+      if (closing || disconnected || !core) return;
       try { await core.resolveGroup(options.authority.identity.groupId, new Set([options.authority.identity.memberId])); }
       catch { log.warn("managed_wake_failed"); }
     },
     close() {
       if (closing) return closing;
+      normalClosing = true;
       closing = (async () => {
-        await core?.close();
+        await loss;
+        await closeBusiness();
         await transport?.close();
-        await Promise.allSettled([...inflight]);
-        await core?.disconnect();
         await mcp?.close();
       })();
       return closing;
