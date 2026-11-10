@@ -196,21 +196,34 @@ function isSensitiveKey(key: string): boolean {
 function redactDiagnosticText(text: string): string {
   const safeText = text
     .replace(/\bpostgres(?:ql)?:\/\/[^\s"'<>]+/gi, REDACTED)
-    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, `$1${REDACTED}@`)
+    // 从固定分隔符开始，避免长 scheme 候选在每个字母/标点处重新扫描。
+    .replace(/(:\/\/)[^\s/@]+@/g, `$1${REDACTED}@`)
     .replace(/\b(Bearer|Basic)\s+[a-z0-9._~+/=-]+/gi, `$1 ${REDACTED}`);
-  const assignments = redactNamedValues(safeText, /(["']?)([a-z_][a-z0-9_.-]*)\1\s*[:=]\s*/gi, 2);
-  return redactNamedValues(assignments, /(--[a-z][a-z0-9-]*)\s+/gi, 1);
+  // 只从完整 token 的起点尝试；允许前导数字/标点，避免漏掉旧扫描能识别的凭据后缀。
+  const assignments = redactNamedValues(safeText, /(["']?)(?<![a-z0-9_.-])([a-z0-9_.-]+)\1\s*[:=]\s*/gi, 2);
+  return redactNamedValues(
+    assignments,
+    /(?<![a-z0-9-])([a-z0-9-]+)\s+/gi,
+    1,
+    // 完整 token 可能带前缀或额外横线；其中出现 CLI flag 且凭据后缀匹配才遮蔽值。
+    (key) => /--[a-z]/i.test(key) && isCredentialKey(key),
+  );
 }
 
 /**
  * 先扫描键；仅命中敏感键才跳过它的值。不能消费非敏感外层的整个值，
  * 否则 runtime={"password":"..."} 或 --verbose --token ... 会漏掉内层凭据。
  */
-function redactNamedValues(text: string, names: RegExp, keyIndex: number): string {
+function redactNamedValues(
+  text: string,
+  names: RegExp,
+  keyIndex: number,
+  isCredentialName: (key: string) => boolean = isCredentialKey,
+): string {
   let result = "";
   let copiedUntil = 0;
   for (let match = names.exec(text); match !== null; match = names.exec(text)) {
-    if (!isCredentialKey(match[keyIndex]!)) continue;
+    if (!isCredentialName(match[keyIndex]!)) continue;
     const valueStart = names.lastIndex;
     const valueEnd = diagnosticValueEnd(text, valueStart);
     if (valueEnd === valueStart) continue;

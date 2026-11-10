@@ -1,0 +1,13 @@
+interface:
+  display_name: 调整工作方向
+  short_description: 将你的明确裁决、改向、停点与暂停恢复要求落实到指定工作并核对结果
+  default_prompt: 使用 $steer-work 落实我对当前工作的决定，确认影响范围并核对实际生效状态。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  allow_implicit_invocation: false
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas

@@ -26,7 +26,7 @@ const DOMAIN_TABLES = [
 ] as const;
 
 /** 期望的最高迁移版本（F2 v1 + T2 #15 v2 + T1 #48 v3 归档 + T2 #49 v4 组织树 + T3 #50 v5 成员状态 + T5 #52 v6 审计）。 */
-const EXPECTED_VERSION = 6;
+const EXPECTED_VERSION = 7;
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-schema-"));
@@ -199,7 +199,7 @@ test("阶段 1 已有库（v2）升级到当前版本：补上归档列与组织
       const result = runMigrations(db, migrations);
       assert.deepEqual(
         result.applied.map((m) => m.version),
-        [3, 4, 5, 6],
+        [3, 4, 5, 6, 7],
       );
       assert.equal(result.version, EXPECTED_VERSION);
       assert.equal(
@@ -257,7 +257,7 @@ test("v3 库升级到当前版本（v4 组织树 + v5 成员状态）：旧数�
       const result = runMigrations(db, migrations);
       assert.deepEqual(
         result.applied.map((m) => m.version),
-        [4, 5, 6],
+        [4, 5, 6, 7],
       );
       assert.equal(result.version, EXPECTED_VERSION);
 
@@ -335,7 +335,7 @@ test("v4 库升级到 v5：成员状态列默认 active、旧数据不丢、状�
       const result = runMigrations(db, migrations);
       assert.deepEqual(
         result.applied.map((m) => m.version),
-        [5, 6],
+        [5, 6, 7],
       );
       assert.equal(result.version, EXPECTED_VERSION);
       assert.equal(
@@ -385,7 +385,7 @@ test("v5 库升级到 v6：audit_log 为空表、旧数据不丢、审计写入�
 
       // 2) 追加 v6：只建 audit_log，不回填、不影响既有数据。
       const result = runMigrations(db, migrations);
-      assert.deepEqual(result.applied.map((m) => m.version), [6]);
+      assert.deepEqual(result.applied.map((m) => m.version), [6, 7]);
       assert.equal(result.version, EXPECTED_VERSION);
 
       // 3) v6 只建表、空表：项目被删除后审计痕迹才需要存活，升级路径上审计本就为空。

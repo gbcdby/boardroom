@@ -5,7 +5,7 @@
 ## 已有约定
 
 - 根 AGENTS.md 与 CONTEXT.md 规定工作；宏观架构在 docs/architecture，详细 spec/ticket/依赖与状态在 GitHub Issues。
-- 临时材料放 .agent-output；生效 Skills 在 .agents/skills；.claude/skills 是软链接，不破坏。当前12项入口与退役清单以work-suite.json为准。
+- 临时材料放 .agent-output；生效 Skills 在 .agents/skills；.claude/skills 是软链接，不破坏。当前入口与退役清单以work-suite.json为准。
 - 项目是本地单用户、localhost、无认证，不自行扩大成远程多用户部署。
 - README 的阶段描述曾在核验基线存在过期内容，PR #78 已修订；新任务仍需核对源码，不能仅凭文档判断实际能力。
 - 当前实现采用 Node >=24、TypeScript、SQLite/可配置 PostgreSQL、HTTP/WebSocket/MCP、Vue 3。

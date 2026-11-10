@@ -854,7 +854,12 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
             body: text,
             mentions: persistedMentions,
           })));
-          for (const memberId of plan.visible) (await (r.deliveries.ensure(message.id, memberId)));
+          // 人的显式触发保留既有恢复语义；同时保存当前 HTTP 路径实际使用的 wake 集合。
+          const wakeMembers = new Set(plan.wake);
+          for (const memberId of plan.visible) {
+            await r.deliveries.ensure(message.id, memberId,
+              wakeMembers.has(memberId) ? { decision: "allowed" } : undefined);
+          }
           return message;
         })));
         const view = (await (messageView(r, created, plan)));

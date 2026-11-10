@@ -1,6 +1,6 @@
 {
   "schema_version": "work-suite/v1",
-  "suite_version": "0.2.0",
+  "suite_version": "0.3.0",
   "result_contract": "work-result/v1",
   "first_testbed": "boardroom",
   "independent_formal_skill": "tla-verify-design",
@@ -9,10 +9,11 @@
     {
       "name": "deliver-work",
       "path": ".agents/skills/deliver-work",
+      "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "d94629c09077e8f616f85972fe7a79fbd631df94fa8b3e56da40c199b7e86574"
+          "sha256": "09fe443e6bf2c30a78bd9fbb6b8737a78b175a7a3f8daeb15737006e541c400c"
         },
         {
           "path": "agents/openai.yaml",
@@ -20,7 +21,7 @@
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "8936b24f674a1250d999e2c2b5901374fb4240426f32bd1ae340c352a90d617d"
+          "sha256": "72343cc4b66256ae7de8474c7cad14e711ad84a94c473732a44f96a56124c42d"
         },
         {
           "path": "assets/work-result.template.json",
@@ -28,7 +29,7 @@
         },
         {
           "path": "references/boardroom-project.md",
-          "sha256": "2e7cf6bca05712314524a0b06a4ec5294181905836c3a2725b78d4217bb36a97"
+          "sha256": "ff7959e4f20bb373610a3c33aff90d413488f587dd43f52a3f2225265b8de709"
         },
         {
           "path": "references/sources.md",
@@ -47,6 +48,7 @@
     {
       "name": "frame-work",
       "path": ".agents/skills/frame-work",
+      "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
@@ -77,6 +79,7 @@
     {
       "name": "design-work",
       "path": ".agents/skills/design-work",
+      "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
@@ -107,6 +110,7 @@
     {
       "name": "tla-verify-design",
       "path": ".agents/skills/tla-verify-design",
+      "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
@@ -225,6 +229,7 @@
     {
       "name": "implement-work",
       "path": ".agents/skills/implement-work",
+      "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
@@ -251,6 +256,7 @@
     {
       "name": "verify-work",
       "path": ".agents/skills/verify-work",
+      "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
@@ -277,6 +283,7 @@
     {
       "name": "review-work",
       "path": ".agents/skills/review-work",
+      "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
@@ -303,6 +310,7 @@
     {
       "name": "land-work",
       "path": ".agents/skills/land-work",
+      "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
@@ -333,6 +341,7 @@
     {
       "name": "release-work",
       "path": ".agents/skills/release-work",
+      "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
@@ -359,10 +368,11 @@
     {
       "name": "brief-project",
       "path": ".agents/skills/brief-project",
+      "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "e5d8d202e1fba6971b025b65d709dacd5841c5e6afa50812f6ba54e69f882264"
+          "sha256": "2e9efa764e02e4b0964a5e7bb3d2c98d4095b60cf98b9f561b3f88e6dab2a8c7"
         },
         {
           "path": "agents/openai.yaml",
@@ -378,7 +388,7 @@
         },
         {
           "path": "references/methods.md",
-          "sha256": "3badd11f53710b86b7070db24d5d251aeb1e025806012421735bd155b0af50fa"
+          "sha256": "8634a6411899f0b14a94ffdd45a24f11144fb3e3725ce3ec88647b453f7d0a86"
         },
         {
           "path": "references/views.md",
@@ -389,10 +399,11 @@
     {
       "name": "work-in-room",
       "path": ".agents/skills/work-in-room",
+      "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "e4dddb31da47318dbe6b15f5018ca6e1f3d0e3749e9f879084eb29fd637ba5fb"
+          "sha256": "80b3613eddd133d29c13cb969bc3a5f44a0b515e87752b4aaeeb84e6317c9c9f"
         },
         {
           "path": "agents/openai.yaml",
@@ -400,7 +411,7 @@
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "d80a4c3e0fd2efa7af88433a53b25a92c78a644175c6669dd78fee50fb53acf6"
+          "sha256": "9be88f8dd4c5e658961515c71389eafd45142ffa68bcae58e8dcff57d178ed91"
         },
         {
           "path": "assets/work-cancel.md",
@@ -427,6 +438,7 @@
     {
       "name": "improve-workflow",
       "path": ".agents/skills/improve-workflow",
+      "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
@@ -453,6 +465,126 @@
           "sha256": "a64d25434766f3709f13f655c06c9bfef2ad9ef3d7d6335f0d0d75d7235da1b7"
         }
       ]
+    },
+    {
+      "name": "challenge-work",
+      "path": ".agents/skills/challenge-work",
+      "invocation": "explicit-user",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "390d06fbdac9af7c9010a0901d0c301d237b39733a36dead434394db02f457da",
+          "source_sha256": "a2a51475b7a5c597cb96fab8ea67ad36785e45ff48a536f03ceb0c72f0989998",
+          "transform": "add-disable-model-invocation"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "b6e5851a9da37b2ccec3165bc9bcca8edbb198bd1d7e92a26209353807ebf122"
+        },
+        {
+          "path": "assets/discussion.template.md",
+          "sha256": "0134b8b5907b620b84d7bd3c2cd07a480b0902407be561dc0e0d49b91847c78a"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "d80a4c3e0fd2efa7af88433a53b25a92c78a644175c6669dd78fee50fb53acf6"
+        },
+        {
+          "path": "references/methods.md",
+          "sha256": "e0d58469e02c65cf39eaa4067128bc29d379c4fd505799d7b1c8166e9d3be674"
+        }
+      ]
+    },
+    {
+      "name": "steer-work",
+      "path": ".agents/skills/steer-work",
+      "invocation": "explicit-user",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "72afe392215f358c6b5b9d84b236fbd25314c8d673258ad675822b5d6ea12925",
+          "source_sha256": "3eecac5a68b0bff62e6d811a5e05406d3266fce42d1004fa2b2fa61131469d73",
+          "transform": "add-disable-model-invocation"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "079aec242ecbb62aa8a28daa925749572375f4b99a980410c59d7b7745dabcff"
+        },
+        {
+          "path": "assets/decision-record.md",
+          "sha256": "e574a1df8ebbb02fdc83a9c1171f3df077eba01ec44fd6525e75ae6a173d1f67"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "fbb6c7314886573cd56c3f86884a65afe3b5f4ce4bf1ee6baeeeb1fa50aea7a4"
+        },
+        {
+          "path": "references/methods.md",
+          "sha256": "8bc021fab0ed0c37f28b913a51f30e974dad73afe7268fa780c1306da766abaa"
+        }
+      ]
+    },
+    {
+      "name": "setup-work",
+      "path": ".agents/skills/setup-work",
+      "invocation": "explicit-user",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "95f1ce56e4d23ded892be07af8ae40dcbded3acd39694a7955f90b6459250102",
+          "source_sha256": "76bc91a3d05dfeff0e6b7364e6d79dfc694ec115792d99444d614b769c2e76b4",
+          "transform": "add-disable-model-invocation"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "2596ecd95e10e48c738b0726e58d9da59cee8cb0b53b7de6b5e7d232e86d77b1"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "51a6923974188748638a424aa59b42b6afad2d910f910a1d43bb13ee10f3ce26"
+        },
+        {
+          "path": "assets/project-adapter.template.md",
+          "sha256": "c80ae7581a1dc10e4f806cb63d25d4fbb1a0ae71b74670e19b3a0d5217801a2e"
+        },
+        {
+          "path": "references/harnesses.md",
+          "sha256": "1c89f5bc9f899b8e8f6d4f88548bcbe2da9b4560dbaf2c2516893aad9f0aa70f"
+        },
+        {
+          "path": "references/sources.md",
+          "sha256": "b38b2b5816a58ec435d7b43603ca4b05673eb5dcb9ddbb315fb43d6ca5dffa3a"
+        }
+      ]
+    },
+    {
+      "name": "ask-work",
+      "path": ".agents/skills/ask-work",
+      "invocation": "explicit-user",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "f0c57d4e679ffed7283bea510d5dd261b4d93e865d062f47a54d5ee11d82f349",
+          "source_sha256": "61f5b1784948376448f9a0fc2eba26c5fd454c8c6ea3e41fd9a4e4ab7c9c1dca",
+          "transform": "add-disable-model-invocation"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "db325bba121f61d15bf87d60e34021eb0146c7019c76807f7eb0ebfee0947142"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "d80a4c3e0fd2efa7af88433a53b25a92c78a644175c6669dd78fee50fb53acf6"
+        },
+        {
+          "path": "references/guide.md",
+          "sha256": "c22c95ab2993db62d6bd738f4b4f886f440385e2f724c96b4d37b19b00d534c1"
+        },
+        {
+          "path": "references/sources.md",
+          "sha256": "73c399f28d96414923c7e2ce13f133786bd5f7af2e71ff784bee077ab406ea38"
+        }
+      ]
     }
   ],
   "retirement": {
@@ -474,5 +606,10 @@
     ],
     "last_legacy_commit": "eea2f06c72eb76e300cdd4d2270facb30c6cff49",
     "policy": "Removed from active skill discovery; recoverable through Git history. Current workflow is defined in AGENTS.md."
+  },
+  "export_policy": {
+    "canonical": "Personal skill content; OpenAI invocation policy in agents/openai.yaml.",
+    "user_entry_transform": "Add disable-model-invocation: true only to explicit-user SKILL frontmatter; retain body bytes.",
+    "verification": "Static metadata and resource equality are not proof of host runtime enforcement."
   }
 }

@@ -43,9 +43,37 @@ async function seedSqliteDir(dir: string): Promise<void> {
   try {
     await driver.migrate(migrations);
     seedSampleData((driver as SqliteDriver).handle);
+    // 迁移往返也必须保留 v7 的幂等键和唤醒事实，不能只验证全 NULL 的新列。
+    await driver.exec(
+      "UPDATE messages SET client_message_id = ? WHERE id = (SELECT id FROM messages ORDER BY id LIMIT 1)",
+      ["migration-request"],
+    );
+    await driver.exec(
+      "UPDATE message_deliveries SET wake_decision = 'allowed' WHERE id = (SELECT id FROM message_deliveries ORDER BY id LIMIT 1)",
+    );
+    await driver.exec(
+      "UPDATE message_deliveries SET wake_decision = 'suppressed', wake_suppressed_reason = 'rate_limited' WHERE id = 'md2'",
+    );
   } finally {
     await driver.close();
   }
+}
+
+async function assertDispatchValues(options: DbDriverOptions): Promise<void> {
+  const driver = createDbDriver(options);
+  await driver.connect();
+  try {
+    assert.deepEqual(await driver.query("SELECT id, client_message_id FROM messages ORDER BY id"), [
+      { id: "msg1", client_message_id: "migration-request" },
+      { id: "msg2", client_message_id: null },
+    ]);
+    assert.deepEqual(await driver.query(
+      "SELECT id, wake_decision, wake_suppressed_reason FROM message_deliveries ORDER BY id",
+    ), [
+      { id: "md1", wake_decision: "allowed", wake_suppressed_reason: null },
+      { id: "md2", wake_decision: "suppressed", wake_suppressed_reason: "rate_limited" },
+    ]);
+  } finally { await driver.close(); }
 }
 
 // 跨表外键依赖（自引用 org_nodes 由递归读取处理，此处不计入顺序约束）。
@@ -123,6 +151,8 @@ test("SQLite → SQLite：全量拷贝、一致性校验、源库只读、幂等
 
       const first = await migrateData(srcOpts, dstOpts, { snapshotSource: true });
       assert.equal(first.validation.ok, true);
+      await assertDispatchValues(srcOpts);
+      await assertDispatchValues(dstOpts);
 
       // 源库未改：行数仍为 11 张业务表全量。
       const srcCounts: Record<string, number> = {};
@@ -146,6 +176,7 @@ test("SQLite → SQLite：全量拷贝、一致性校验、源库只读、幂等
       const again = await migrateData(srcOpts, dstOpts);
       assert.equal(again.validation.ok, true);
       assert.deepEqual(again.perTableCounts, first.perTableCounts);
+      await assertDispatchValues(dstOpts);
     });
   });
 });
@@ -222,10 +253,12 @@ if (PG_URL !== undefined) {
           // 正向：SQLite → PG
           const fwd = await migrateData(srcOpts, pgOpts, { snapshotSource: true });
           assert.equal(fwd.validation.ok, true, "SQLite→PG 一致性校验应通过");
+          await assertDispatchValues(pgOpts);
 
           // 反向：PG → SQLite
           const rev = await migrateData(pgOpts, revOpts);
           assert.equal(rev.validation.ok, true, "PG→SQLite 一致性校验应通过");
+          await assertDispatchValues(revOpts);
 
           // 反向产物与原源库逐键一致（证明 PG 中转未丢失/改写数据）。
           const identity = await validateData(srcOpts, revOpts);

@@ -1,0 +1,239 @@
+{
+  "schema_version": 1,
+  "feature": "boardroom #66/#67 message dispatch persistence design",
+  "recorded_at": "2026-11-10",
+  "mode": "design",
+  "source_background": {
+    "remote_commit": "7d49da30bfcc657aa67b8b76052f7d24af7c326a",
+    "remote_tree": "9245092f9b10b7ab73f597ecbb0142491943d557",
+    "relation": "background only; current implementation has not been assessed by this model evidence"
+  },
+  "model": {
+    "path": "model/DurableMessage.tla",
+    "sha256": "831c9cfeee02af8a175e608a87475e47300222f15083af9708b7ea48643424d2"
+  },
+  "manifest": {
+    "path": "verification.json",
+    "sha256": "7521426ef1dec5e2a37c58bca46035672f2878a61d6cc808ae8a89fc6690ad0c"
+  },
+  "tool": {
+    "version": "TLA+ v1.7.4 / TLC 2.19",
+    "sha256": "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88",
+    "java_version": "OpenJDK 21.0.13",
+    "runner_path": ".agents/skills/tla-verify-design/scripts/run_tlc.py",
+    "runner_sha256": "ca5811a8cae5d31961185b0ba53868f3ea885a1ee614150d873d61044ff18f5a"
+  },
+  "assessment": {
+    "correct_profiles": "PASS_WITHIN_SCOPE",
+    "sensitivity": "4 independent expected counterexamples",
+    "reachability": "2 expected probe counterexamples",
+    "implementation_status": "NOT_ASSESSED",
+    "independent_model_review": "NOT_RUN",
+    "liveness": "NOT_CHECKED"
+  },
+  "scope": {
+    "workers": 2,
+    "attempts_per_worker_maximum": 2,
+    "service_crashes_maximum": 1,
+    "logical_member_keys": [
+      1,
+      2
+    ],
+    "recipient_decisions": [
+      "allowed",
+      "suppressed",
+      "visible-only"
+    ],
+    "deadlock_check": true,
+    "fairness_assumptions": [],
+    "search_constraints": false,
+    "symmetry_reduction": false,
+    "external_effects": "EXCLUDED",
+    "sql_isolation_and_sequence_allocation": "NOT_ASSESSED",
+    "anti_loop_budget_persistence": "EXCLUDED",
+    "runner_lease_and_harness_execution": "EXCLUDED"
+  },
+  "runs": [
+    {
+      "profile": "same-key",
+      "run_id": "3aaae0db-b107-4622-80c7-aaf0a005e750",
+      "started_at": "2026-11-10T09:47:34.236501+00:00",
+      "finished_at": "2026-11-10T09:47:36.997997+00:00",
+      "duration_seconds": 2.761528,
+      "status": "PASS_WITHIN_SCOPE",
+      "reason": "COMPLETE_MODEL_CHECK",
+      "completed": true,
+      "implementation_status": "NOT_ASSESSED",
+      "statistics": {
+        "generated_states": 5800,
+        "distinct_states": 1633,
+        "remaining_states": 0
+      },
+      "violated_invariants": [],
+      "config": "model/same-key.cfg",
+      "config_sha256": "3faa38b42302f23517f98a8301434f1619a61a930090c7e08b796ca36de9322d",
+      "log": "logs/same-key.log",
+      "log_sha256": "0efbf662ff0b98e169a83092a43736cf639838776807c48a51f28a8ecd2b429c"
+    },
+    {
+      "profile": "different-senders",
+      "run_id": "8b133fa1-975c-468d-b1c5-84306b76b312",
+      "started_at": "2026-11-10T09:47:34.234832+00:00",
+      "finished_at": "2026-11-10T09:47:38.254112+00:00",
+      "duration_seconds": 4.019331,
+      "status": "PASS_WITHIN_SCOPE",
+      "reason": "COMPLETE_MODEL_CHECK",
+      "completed": true,
+      "implementation_status": "NOT_ASSESSED",
+      "statistics": {
+        "generated_states": 121436,
+        "distinct_states": 22809,
+        "remaining_states": 0
+      },
+      "violated_invariants": [],
+      "config": "model/different-senders.cfg",
+      "config_sha256": "3a37754ae41982100e4f112249eb097818e57994ffa23b006967b24a3831926a",
+      "log": "logs/different-senders.log",
+      "log_sha256": "bc1ebe03241d3df41a880d2b3378d1193e6076bca3649d10ec8802409de0df3f"
+    },
+    {
+      "profile": "bug-split-commit",
+      "run_id": "3dd345c1-d2e9-48f8-8c58-0bebb7c4f5d7",
+      "started_at": "2026-11-10T09:47:34.261954+00:00",
+      "finished_at": "2026-11-10T09:47:36.804075+00:00",
+      "duration_seconds": 2.54224,
+      "status": "COUNTEREXAMPLE",
+      "reason": "PROPERTY_OR_DEADLOCK_VIOLATION",
+      "completed": false,
+      "implementation_status": "NOT_ASSESSED",
+      "statistics": {
+        "generated_states": 5,
+        "distinct_states": 5,
+        "remaining_states": 2
+      },
+      "violated_invariants": [
+        "CompleteEnvelope"
+      ],
+      "config": "model/bug-split-commit.cfg",
+      "config_sha256": "5ce56d34390d05dd7c60a2b2f7a561ff91fec2ce8fc1899ee5adf6043adc4ae0",
+      "log": "logs/bug-split-commit.log",
+      "log_sha256": "65b71a7caefe236ed3db8840d8cf8a5bdfee1423f4c623a11cd992f56ac8bf07"
+    },
+    {
+      "profile": "bug-stale-read",
+      "run_id": "d636695f-af28-4f9a-9210-2f763bbb932d",
+      "started_at": "2026-11-10T09:47:34.221066+00:00",
+      "finished_at": "2026-11-10T09:47:36.481081+00:00",
+      "duration_seconds": 2.260205,
+      "status": "COUNTEREXAMPLE",
+      "reason": "PROPERTY_OR_DEADLOCK_VIOLATION",
+      "completed": false,
+      "implementation_status": "NOT_ASSESSED",
+      "statistics": {
+        "generated_states": 73,
+        "distinct_states": 49,
+        "remaining_states": 32
+      },
+      "violated_invariants": [
+        "AtMostOneMessage"
+      ],
+      "config": "model/bug-stale-read.cfg",
+      "config_sha256": "4a933eec135732c8a56f9947d8929c306fc514a7cd39b7e90fc7e31ba122b6bc",
+      "log": "logs/bug-stale-read.log",
+      "log_sha256": "2b41f5d1f7570dc56d98ca74ac375bebbd1ff18d150dca085009c71872b38a75"
+    },
+    {
+      "profile": "bug-volatile-key",
+      "run_id": "089322e8-af05-4536-90cf-66d25f79322b",
+      "started_at": "2026-11-10T09:47:34.213387+00:00",
+      "finished_at": "2026-11-10T09:47:36.676293+00:00",
+      "duration_seconds": 2.462942,
+      "status": "COUNTEREXAMPLE",
+      "reason": "PROPERTY_OR_DEADLOCK_VIOLATION",
+      "completed": false,
+      "implementation_status": "NOT_ASSESSED",
+      "statistics": {
+        "generated_states": 573,
+        "distinct_states": 256,
+        "remaining_states": 141
+      },
+      "violated_invariants": [
+        "AtMostOneMessage"
+      ],
+      "config": "model/bug-volatile-key.cfg",
+      "config_sha256": "0c27d06bcc18d76f87adfbefa138956cfe2c3c83b105a4f95e3605bf5886fe2c",
+      "log": "logs/bug-volatile-key.log",
+      "log_sha256": "c4a7b9ec3f23b6586f87c987d59e9390d2e5834c7d4a61fe6f4205140916f259"
+    },
+    {
+      "profile": "bug-wake-filter",
+      "run_id": "e7550d99-17fe-456c-998e-5c7a973cb52e",
+      "started_at": "2026-11-10T09:47:34.232992+00:00",
+      "finished_at": "2026-11-10T09:47:36.520836+00:00",
+      "duration_seconds": 2.287884,
+      "status": "COUNTEREXAMPLE",
+      "reason": "PROPERTY_OR_DEADLOCK_VIOLATION",
+      "completed": false,
+      "implementation_status": "NOT_ASSESSED",
+      "statistics": {
+        "generated_states": 17,
+        "distinct_states": 14,
+        "remaining_states": 8
+      },
+      "violated_invariants": [
+        "OnlyAllowedWake"
+      ],
+      "config": "model/bug-wake-filter.cfg",
+      "config_sha256": "74eded7f44cf5889a7b9a0bab101b5c6e38d240da6f499800802bb19d6c7cdc6",
+      "log": "logs/bug-wake-filter.log",
+      "log_sha256": "f2c2440975a78001fac702077c5611cdcf0a99ff3945facb7dcbd852f5cdbaca"
+    },
+    {
+      "profile": "reach-concurrent-read",
+      "run_id": "5d188f17-c396-43c6-abc1-b908f3b70b47",
+      "started_at": "2026-11-10T09:47:34.232636+00:00",
+      "finished_at": "2026-11-10T09:47:36.593088+00:00",
+      "duration_seconds": 2.360504,
+      "status": "COUNTEREXAMPLE",
+      "reason": "PROPERTY_OR_DEADLOCK_VIOLATION",
+      "completed": false,
+      "implementation_status": "NOT_ASSESSED",
+      "statistics": {
+        "generated_states": 6,
+        "distinct_states": 6,
+        "remaining_states": 3
+      },
+      "violated_invariants": [
+        "NoConcurrentAbsentReads"
+      ],
+      "config": "model/reach-concurrent-read.cfg",
+      "config_sha256": "d5b452bcaaa7be37185f2a8545cb0656dc60266821676e3bdb7f2c2b93cf4bfc",
+      "log": "logs/reach-concurrent-read.log",
+      "log_sha256": "8e276d65ab4b8efbe780696722e44c491cb278f294392e6d14c4e3fda9866774"
+    },
+    {
+      "profile": "reach-recovery",
+      "run_id": "14d91055-2775-4526-b3e5-43af2368f065",
+      "started_at": "2026-11-10T09:47:34.258285+00:00",
+      "finished_at": "2026-11-10T09:47:36.938374+00:00",
+      "duration_seconds": 2.680134,
+      "status": "COUNTEREXAMPLE",
+      "reason": "PROPERTY_OR_DEADLOCK_VIOLATION",
+      "completed": false,
+      "implementation_status": "NOT_ASSESSED",
+      "statistics": {
+        "generated_states": 2148,
+        "distinct_states": 789,
+        "remaining_states": 314
+      },
+      "violated_invariants": [
+        "NoRecoveryWitness"
+      ],
+      "config": "model/reach-recovery.cfg",
+      "config_sha256": "a82c750302e1fd63917f6f44f5e8d6821081dfdce16a2be917f2c795f23f5a1e",
+      "log": "logs/reach-recovery.log",
+      "log_sha256": "acd182fbc390ea5aacdbaa43f90dba16b37b81683c329b21ac41ab1bd01a3e58"
+    }
+  ],
+  "provenance": "This compact record copies final runner facts and byte-identical model/config/log files. Original authoring attempts remain in the delivery working record; the initial type/precedence errors were corrected without reducing checked properties or fault/concurrency scope."
+}

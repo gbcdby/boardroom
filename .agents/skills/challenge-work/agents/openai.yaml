@@ -1,0 +1,13 @@
+interface:
+  display_name: 共同质询方案
+  short_description: 由你主动发起方案推敲，查清事实、比较取舍，并集中讨论关键分歧
+  default_prompt: 使用 $challenge-work 和我推敲这个方案，先查事实，优先讨论最影响结果的取舍。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  allow_implicit_invocation: false
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas

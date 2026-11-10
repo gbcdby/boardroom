@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createLogger } from "../src/server/logger.ts";
 
 interface CapturedLine {
@@ -204,5 +205,49 @@ test("嵌套诊断 JSON 的非敏感外层不会吞掉内部凭据（R-RUNTIME-L
     assert.equal(loggedError["code"], "CONFIG_INVALID");
     assert.match(String(loggedError["message"]), /^invalid /);
     assert.match(String(loggedError["message"]), /code=CONFIG_INVALID$/);
+  }
+});
+
+test("长普通诊断不会卡住日志调用，末尾凭据仍然遮蔽（R-PR80-STD-001）", () => {
+  // 使用独立进程的宽松超时保护事件循环；不依赖机器速度断言毫秒耗时。
+  const source = `
+    import assert from "node:assert/strict";
+    import { createLogger } from ${JSON.stringify(new URL("../src/server/logger.ts", import.meta.url).href)};
+    let record;
+    const logger = createLogger({ write: (line) => { record = JSON.parse(line); } });
+    const secret = "synthetic-long-diagnostic-secret";
+    for (const unit of ["x", "--a", "a-", "a."]) {
+      const prefix = unit.repeat(Math.ceil(256 * 1024 / unit.length));
+      const diagnostic = prefix + ' --token "' + secret + '" code=SAFE';
+      logger.error(diagnostic, { error: new Error(diagnostic) });
+      assert.equal(record.msg, prefix + ' --token [REDACTED] code=SAFE');
+      assert.equal(record.error.message, record.msg);
+      assert.equal(JSON.stringify(record).includes(secret), false);
+    }
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", source], {
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(result.error, undefined, String(result.error));
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("扫描起点优化保留带标点前缀的凭据与 URL 脱敏", () => {
+  const sink = capture();
+  const logger = createLogger({ write: sink.write });
+  const secret = "synthetic-token-boundary-secret";
+  const diagnostics = [
+    `prefix"token"="${secret}" code=SAFE`,
+    `.123provider_api_key=${secret} code=SAFE`,
+    `---token ${secret} code=SAFE`,
+    `prefix--token ${secret} code=SAFE`,
+    `.https://user:${secret}@example.test/api code=SAFE`,
+  ];
+  for (const diagnostic of diagnostics) {
+    logger.error(diagnostic);
+    const { raw, parsed } = sink.lines.at(-1)!;
+    assert.equal(raw.includes(secret), false);
+    assert.match(String(parsed["msg"]), /code=SAFE$/);
   }
 });

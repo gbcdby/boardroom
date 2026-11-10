@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-10",
+  "scope": "消息持久化、事务作用域、v7 迁移与 SQLite/PostgreSQL SDK 集成",
+  "pull_request": "https://github.com/gbcdby/boardroom/pull/81",
+  "tested_remote_commit": "0a86bc5e3c585b6e8ff09c254e082774429544d5",
+  "tested_remote_tree": "8818f714fe898963e39b107be08a69dcb81d6a74",
+  "local_review_commit": "dcad313ca0a4f0d7d33578960c94c4bc86c5e010",
+  "identity_check": "逐个 blob 核对：全部应用、测试与 CI 文件一致；本地 AGENTS 末尾曾多一个空行，已在证据提交中恢复上游原文。",
+  "ci": {
+    "url": "https://github.com/gbcdby/boardroom/actions/runs/42796729680",
+    "run_id": 42796729680,
+    "job_id": 129763702220,
+    "conclusion": "success",
+    "node": "v24.22.2",
+    "postgres": "16.15",
+    "typecheck": "PASS",
+    "build": "PASS",
+    "full_test": { "tests": 381, "pass": 381, "fail": 0, "skip": 0 },
+    "sqlite_sdk_e2e": { "pass": 29, "fail": 0 },
+    "postgres_sdk_e2e": { "pass": 29, "fail": 0 }
+  },
+  "local": {
+    "node": "v24.22.1",
+    "typecheck": "PASS",
+    "full_test": { "tests": 380, "pass": 373, "fail": 0, "skip": 7 },
+    "sqlite_sdk_e2e": { "pass": 29, "fail": 0 },
+    "postgres": "NOT_RUN_LOCALLY; 实际 PG 运行由上述 CI 提供"
+  },
+  "independent_reviews": {
+    "requirements_axis": "PASS",
+    "standards_axis": "PASS",
+    "findings": [
+      { "id": "R-MANAGED-TX-001", "status": "VERIFIED", "fix": "driver ALS 绑定跨仓储事务客户端" },
+      { "id": "R-MANAGED-TX-002", "status": "VERIFIED", "fix": "兄弟保存点整体排队并重入当前子作用域" },
+      { "id": "R-MESSAGE-MIG-001", "status": "VERIFIED", "fix": "SQLite/PG 数据搬运直接断言 key 与 wake 字段值" }
+    ],
+    "transaction_probes": { "regression_pass": 4, "scope_edge_pass": 2 },
+    "model_artifact_review": "仅核对范围、哈希、日志与结论一致；未做独立形式化模型复核"
+  },
+  "limits": [
+    "SDK 测试不等于真实 CLI harness 实测。",
+    "本轮没有实现 supervisor、runner、runtime 配置表或 WebUI 托管启动。",
+    "anti-loop 计数仍在进程内；回滚后可保守多计，不保证 quota 或外部副作用精确一次。",
+    "相邻 TLA 模型只提供有限安全性证据，不证明本实现。"
+  ]
+}
