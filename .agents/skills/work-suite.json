@@ -1,43 +1,43 @@
 {
   "schema_version": "work-suite/v1",
-  "suite_version": "0.3.1",
+  "suite_version": "0.4.0",
   "result_contract": "work-result/v1",
   "first_testbed": "boardroom",
-  "independent_formal_skill": "tla-verify-design",
+  "independent_formal_skill": "worker-tla",
   "runtime_guarantees": "Defined by actual project tools, not this registry.",
   "skills": [
     {
-      "name": "deliver-work",
-      "path": ".agents/skills/deliver-work",
+      "name": "deliver",
+      "path": ".agents/skills/deliver",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "09fe443e6bf2c30a78bd9fbb6b8737a78b175a7a3f8daeb15737006e541c400c"
+          "sha256": "b99272dd832a1cb80e73248d7b1196638f1b8189ee9597e6167534b7582d03d2"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "ee4528474f178e9ec8c239b04bde510fe2d0648da3252fcab3257e3d83de0b0b"
+          "sha256": "0d874371cc4373d32fcbf2d404bce5a60c894c1d0aa2d4c625a386ced0273f0d"
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "72343cc4b66256ae7de8474c7cad14e711ad84a94c473732a44f96a56124c42d"
+          "sha256": "51a6923974188748638a424aa59b42b6afad2d910f910a1d43bb13ee10f3ce26"
         },
         {
           "path": "assets/work-result.template.json",
-          "sha256": "77ac3f71f04dc665480a22ad42d2042afdaa877955b9aac0392780ebf007fd5e"
+          "sha256": "139b39a56dffba38cffb778e987b103d53b304563f36738568de3857e20ee6a2"
         },
         {
           "path": "references/boardroom-project.md",
-          "sha256": "ff7959e4f20bb373610a3c33aff90d413488f587dd43f52a3f2225265b8de709"
+          "sha256": "61558073d2aef7b073a2630647ccbf15f5ee6ccb97c5846fb6aadf8125402906"
         },
         {
           "path": "references/sources.md",
-          "sha256": "ac99e7e59747af372c131b1967500213577cd45a873b5fa8b589e18a595c19c6"
+          "sha256": "6e91558f3e1fc8bd4a21ececd3ea3391e59b843e9f7d0e4321a0ddbed672d668"
         },
         {
           "path": "references/work-contract.md",
-          "sha256": "30ebf38f3e7f9132b29cc2b1e36d3250285485bbaa323d11d597f09b5f8a0b8f"
+          "sha256": "69f896cc9f1dd7fd75774eda51bc46a739c1dc8c47578dea4f7e0c128da6dda3"
         },
         {
           "path": "scripts/validate_result.py",
@@ -46,25 +46,25 @@
       ]
     },
     {
-      "name": "frame-work",
-      "path": ".agents/skills/frame-work",
+      "name": "worker-investigate",
+      "path": ".agents/skills/worker-investigate",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "0b22483a84ca061d3fa81250d8713d637ddaa86d48e206a10534902ce25d14c4"
+          "sha256": "6bfa3fbe20e3cdb1e7f1f20511cb64c3dc1e32c2f71022737f21e45d14dd30d9"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "abc3fa0d8e06d722489edb2fbdc80225751e4b65e8f36be9765e06df32cfe51e"
+          "sha256": "beeac682f4357ed33b9163a5710207c5f28c09dc72c32c191fc6f2e6425dab81"
         },
         {
           "path": "assets/frame.template.md",
-          "sha256": "2b716ac5a01368ab1ac7ed95ecc09b758c0981099da6ff0cfe9b1c725ae7dd5c"
+          "sha256": "e77d89d62a08c8817ebcb04fc80ca507ee7da70f5eef38bbfb22c193288c48ce"
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "e9301497fa98ef56aaca7ede0857b9a18dc06c34040f0679c609a6bf49b1d38b"
+          "sha256": "0cdb7990dea3ad89ead04743eeac2dc58c119fb0b8b4a01499a21237f155bc1a"
         },
         {
           "path": "references/investigation.md",
@@ -77,21 +77,21 @@
       ]
     },
     {
-      "name": "design-work",
-      "path": ".agents/skills/design-work",
+      "name": "worker-design",
+      "path": ".agents/skills/worker-design",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "89cc377ee097fc1612844a64bc2bbce47cc7f77461a1b57ad005838e1e8b10a9"
+          "sha256": "b45d29cab6b677dd2b1e4c865cb71a580987c93add7232d91a5aefbb9b92a1b3"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "3610c55fb341eef3f162aee8a4852991726343dd773c369fd34e3c58851a5e66"
+          "sha256": "3fc38b0cb5f1cb065696a4ab5022a7de7522db6f9e29238a36f8acb564ab3ca6"
         },
         {
           "path": "assets/design.template.md",
-          "sha256": "d3c57566f92c10b6ffb7d59cfa65c1e9b8ec0fdb05aa63ceeb5887202aa16894"
+          "sha256": "f619d719d62fefe1b215fb6dfdc09ce5759d0986ddb4152a7e44ab5b970b2f6d"
         },
         {
           "path": "assets/icon.svg",
@@ -108,17 +108,17 @@
       ]
     },
     {
-      "name": "tla-verify-design",
-      "path": ".agents/skills/tla-verify-design",
+      "name": "worker-tla",
+      "path": ".agents/skills/worker-tla",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "50bcbb8f84d724ade4a7ffac3247d98cd9ecca591dd12074dd75b19f27f28dbb"
+          "sha256": "11e621abe7baaae53a9312d499ba492b6c03b1e3a21ad0d1b81826784b476c9f"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "d04b59d6f361cfc51e909e8113b62ed74e66ebd9815a6ae2c72acb41fbfe6a50"
+          "sha256": "fce5736dc63a75f4766c950d71f81564ba2cd328859a30df485c4b71ee53d518"
         },
         {
           "path": "assets/contract.template.md",
@@ -214,7 +214,7 @@
         },
         {
           "path": "scripts/fetch_tlc.py",
-          "sha256": "c7cf21b479dfe8bab76beb258b6a5d7731d3836f56d28ed3aa1ffdcc9714ef57"
+          "sha256": "d7053e024f28fba418dd3b4d94950528859b98629449c456b9becb373a5f3e9c"
         },
         {
           "path": "scripts/run_tlc.py",
@@ -227,17 +227,17 @@
       ]
     },
     {
-      "name": "implement-work",
-      "path": ".agents/skills/implement-work",
+      "name": "worker-implement",
+      "path": ".agents/skills/worker-implement",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "7cd3995c5821bc54a9254779447b35435692595c9d50366de9446dfec5cd40d3"
+          "sha256": "38cb26b04a1a6f0a212ecf97ddc3508845df665037de8f62c97ce6ded4264ddf"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "c8e337fbda3601c53ba947d5bdb9193cd76ce897dea452c5907e91ba94910843"
+          "sha256": "ade448373ebb82876729947115757c1a12da4ce74196b41eb68cbdd6d5757f4c"
         },
         {
           "path": "assets/icon.svg",
@@ -245,34 +245,34 @@
         },
         {
           "path": "assets/implementation-result.md",
-          "sha256": "d1c410196bf0b6cab3b36d1be36aee123ade6ab811bdc62b1fb91a5ff8a6b971"
+          "sha256": "f7c545583d45b5f80a5f1d4b0907db56f2bbdec1ee172acedae08f9501d465eb"
         },
         {
           "path": "references/execution-rules.md",
-          "sha256": "82e43a9db7e28bee4b72dbfb8eaa85dbf9e423a15db96101b62c4fe930385198"
+          "sha256": "c14010cf83ef2781d598e8ad29d38f92a6c77d42a40cdc084507f9238a94441f"
         }
       ]
     },
     {
-      "name": "verify-work",
-      "path": ".agents/skills/verify-work",
+      "name": "worker-verify",
+      "path": ".agents/skills/worker-verify",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "616bc66621df3c7b999715930a0b44e1caa2a3e6319ba30f49bad1b06e471e8b"
+          "sha256": "f6326b202b8b7cff9565a345fbc197e13fe6820ba5e4747c87fa5ace90be83b7"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "fd9daac521a8a1174a68083145b7b9d9dee17697994635e62301d0530d7f0904"
+          "sha256": "0c4dfb36bf4cc3df0466de41ce7c2f102dbe3da399f48ae3ea82a6089a019387"
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "72343cc4b66256ae7de8474c7cad14e711ad84a94c473732a44f96a56124c42d"
+          "sha256": "fbb6c7314886573cd56c3f86884a65afe3b5f4ce4bf1ee6baeeeb1fa50aea7a4"
         },
         {
           "path": "assets/verification-result.md",
-          "sha256": "ce2e6f7391578431a91dc13a8dcd9f48367bb3cd44f3c4e2785edbd832b2baf0"
+          "sha256": "89eab020db06848ec848ee74a37c2731f0f3b302e073653ad43e23cfa46362f7"
         },
         {
           "path": "references/evidence-rules.md",
@@ -281,44 +281,44 @@
       ]
     },
     {
-      "name": "review-work",
-      "path": ".agents/skills/review-work",
+      "name": "worker-review",
+      "path": ".agents/skills/worker-review",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "c23df5a81abb63e59a438e0022b1ca11d2ebe3f925d589322460923e48c0c2c9"
+          "sha256": "8399da61e424cc734f121f95824c490763718ff48cab563783adfd7bc226b884"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "eb17ff4bb4eeaf1d744bd5c376c0d17e09dea8bf18270d426da53d2aed783942"
+          "sha256": "1ad8d564d126dd2439f03cf12b9cf6a56bc8a74d89f54aed0ec0582a52a28f47"
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "0cdb7990dea3ad89ead04743eeac2dc58c119fb0b8b4a01499a21237f155bc1a"
+          "sha256": "d80a4c3e0fd2efa7af88433a53b25a92c78a644175c6669dd78fee50fb53acf6"
         },
         {
           "path": "assets/review-result.md",
-          "sha256": "b29d141d4f2cf1a4077dbadee893fd630afd45f8ce648a576907eefe73321c53"
+          "sha256": "8ed34652bd3e2b5d4ec96e959035bca5293f58e1cea2d283661ae10c38a0a29f"
         },
         {
           "path": "references/review-protocol.md",
-          "sha256": "5f86b83c3d0e29356fb09f3adce79cd2bc18b1656ae81f3ab50620bcab6f1406"
+          "sha256": "a38ac40fed138b34fb5e3f1420e510943851bbe3f9c0d51ca398be2e27926c6e"
         }
       ]
     },
     {
-      "name": "land-work",
-      "path": ".agents/skills/land-work",
+      "name": "worker-land",
+      "path": ".agents/skills/worker-land",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "c2d277f922c8f583bbe6acc6b9c8a78f288a8eb1668c5856db618d5a46697dbe"
+          "sha256": "d68502ce7107d233a9eda91a8bb6a4106143e8c9a37c7b4e504f1d574210d0f9"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "fc63b94b879fa222bf79303ed248d170323ae5bce6d9648881d543654bd86326"
+          "sha256": "3faddb1b416c32d67c3bc66d8b06a1f8dc02cf75ed6848dba9d0b74c30e1f4c8"
         },
         {
           "path": "assets/icon.svg",
@@ -330,26 +330,30 @@
         },
         {
           "path": "references/boardroom.md",
-          "sha256": "d8c28c5b452d93aa1979e46dafb6c2e0c9c9f75334625bcf193d16b1a4e32120"
+          "sha256": "e394c673fe9412823a7a7c796f47dcca2bbc0c6ec0edcf9b76457b00d4af0cc8"
         },
         {
           "path": "references/candidate-and-evidence.md",
           "sha256": "8f3edf727c19828b5a28e31e1ed802356db5747e79f78f25f60538208d09e506"
+        },
+        {
+          "path": "references/result-contract.md",
+          "sha256": "fc470ba7e3cef271d3ee6889ae295ac6f494b7a7f3ac2204fdec89b701595f32"
         }
       ]
     },
     {
-      "name": "release-work",
-      "path": ".agents/skills/release-work",
+      "name": "worker-release",
+      "path": ".agents/skills/worker-release",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "c99b30ad2cc621ac458e7b0c18d4bbf234a4d18aeb1049d8475fa79f4dda8878"
+          "sha256": "ed3dde263ce2d8d7068127f6093f1fae0535213f1d2089c07dc7bb318cf985c5"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "43c15042def4e61042aec7aba9aa85cafbb17353d3743cc6a67f03376f91a014"
+          "sha256": "14eec8b902c92d05b00b566ca3501b5a277b791a414ff872e2c110c6349c04e7"
         },
         {
           "path": "assets/icon.svg",
@@ -357,7 +361,7 @@
         },
         {
           "path": "assets/release-record.template.md",
-          "sha256": "b8d5c707f5156d7972046bc718da5d825820e2b669c50ca49170f19e1f81c03b"
+          "sha256": "9f7f2b5e29399d68d494b6a056ccee4e2979044d781261926ff40d9bd1864ec5"
         },
         {
           "path": "references/recovery.md",
@@ -366,21 +370,21 @@
       ]
     },
     {
-      "name": "brief-project",
-      "path": ".agents/skills/brief-project",
+      "name": "brief",
+      "path": ".agents/skills/brief",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "a1874acda92f1c1baaeeb05d5a1122f93a257ecaa5c82061731b091cd184054d"
+          "sha256": "64f9079d11acd7ef0031df4275746edf8f16c2948e4df2c0b0d1d92928d9be49"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "bf696d2c74e49857907afb25310f8f881666706ceb9df6937a946bdd38686f82"
+          "sha256": "60623b8f77c2b4250d8dbb39678526f8f8d026acf9e9121955f00b0f5b339c74"
         },
         {
           "path": "assets/brief.template.md",
-          "sha256": "3a245617f154482c4f8cc30046d2db83cb39adc267977d32772e042337768782"
+          "sha256": "d1ef1b60848dcf7600ae1b01efab8393aa9b9bdbf4cfac6c77031d0970f116df"
         },
         {
           "path": "assets/icon.svg",
@@ -391,27 +395,31 @@
           "sha256": "8634a6411899f0b14a94ffdd45a24f11144fb3e3725ce3ec88647b453f7d0a86"
         },
         {
+          "path": "references/result-contract.md",
+          "sha256": "e3f07c9592b712c253308e155c2203220de7f93f6797f529cdb91bcc87496472"
+        },
+        {
           "path": "references/views.md",
-          "sha256": "18c861a7acd0fa7c31d137dc7015719d8f1dbf4423c1883c9d95425e23dcc5fe"
+          "sha256": "82c25628b41b685d0ea69f66a3f5bfa4038f88e8a6c1e294eb14eb3acfae9268"
         }
       ]
     },
     {
-      "name": "work-in-room",
-      "path": ".agents/skills/work-in-room",
+      "name": "collaborate",
+      "path": ".agents/skills/collaborate",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "80b3613eddd133d29c13cb969bc3a5f44a0b515e87752b4aaeeb84e6317c9c9f"
+          "sha256": "1e01ae8e4ec075c0e950437903706f6b296b77e32f1c215fa2a1cbdac7fe6e8c"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "6cb9c69278bf2e5a2490d0bb4d32e6f81a799e6a4837fa493127c940bbd0363e"
+          "sha256": "7e8ba25597337956ae7e527a346fe7289adf09c92ec9654d0b1d817ecdb1e7d1"
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "9be88f8dd4c5e658961515c71389eafd45142ffa68bcae58e8dcff57d178ed91"
+          "sha256": "51a6923974188748638a424aa59b42b6afad2d910f910a1d43bb13ee10f3ce26"
         },
         {
           "path": "assets/work-cancel.md",
@@ -419,34 +427,34 @@
         },
         {
           "path": "assets/work-handoff.md",
-          "sha256": "de058ecb0d8a46651c29ceba785c55f13b5ecc48b6b74f594f913eece705c6ba"
+          "sha256": "7e4e7c23c0ac4245c0b5c8619939f2a0048c2f57f7acbc99485cda78a7d55cc7"
         },
         {
           "path": "assets/work-request.md",
-          "sha256": "433e82c98ae15fc4c02aa700d9dfa436c5a993d3a7d97014dfc4245cb63f78f4"
+          "sha256": "a94298db98db1ea4de0a5b1ace0177694d4a2e537ff00afac697c9c9d3a1a9e6"
         },
         {
           "path": "assets/work-result.json",
-          "sha256": "e568311615aac73108df8eab2713348af499b3fbe8e5a2f21f2464178989aacc"
+          "sha256": "0fedb44005587a32f1682f69ecc9a58bd8ca94da11e32e0017d66ec53030f706"
         },
         {
           "path": "references/boardroom.md",
-          "sha256": "df847be16957543683195e08cafe204b44a21d7b36e4614b1e0eafa2898d1ead"
+          "sha256": "79e0d9b9933ac7d0378a010f8c9a2af343622c9043223d6bdeff8ec1a3d2c5e4"
         }
       ]
     },
     {
-      "name": "improve-workflow",
-      "path": ".agents/skills/improve-workflow",
+      "name": "worker-improve-workflow",
+      "path": ".agents/skills/worker-improve-workflow",
       "invocation": "implicit-or-explicit",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "9357a8c67c6b1a5f62bd8ee93ba2748de47be182a08800930bb5d9f29bd7344e"
+          "sha256": "7e282d76600ec46f4a44475e7f774535789e803e7711d0f8a7993fdda657a4c5"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "44f9d912246401c42fecab51cde3666508579fbb96762fd0d0befb4d835b71e2"
+          "sha256": "e005db018c584e259fae82662d7a8ea26c04e0339380f118f7abf6931858dbd9"
         },
         {
           "path": "assets/icon.svg",
@@ -454,7 +462,7 @@
         },
         {
           "path": "assets/improvement.template.md",
-          "sha256": "ccb47ab8e6e8e86ae372927b5ba1b79af7d1e1d2129d19db9b59f96cf0aba062"
+          "sha256": "74903841d240d8fbe2e234e92f6d61834a23cae21817285fd9807760177c7f69"
         },
         {
           "path": "references/evaluation.md",
@@ -467,19 +475,19 @@
       ]
     },
     {
-      "name": "challenge-work",
-      "path": ".agents/skills/challenge-work",
+      "name": "challenge",
+      "path": ".agents/skills/challenge",
       "invocation": "explicit-user",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "390d06fbdac9af7c9010a0901d0c301d237b39733a36dead434394db02f457da",
-          "source_sha256": "a2a51475b7a5c597cb96fab8ea67ad36785e45ff48a536f03ceb0c72f0989998",
+          "sha256": "d38cbc925cca0e0f0d4b6f3e024d9832bf735e763a237f232957f7727aa2d6a4",
+          "source_sha256": "640acd8b855b01564a8e722af87003ea95868011ea3dfb86475ba81d7f896a4e",
           "transform": "add-disable-model-invocation"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "b6e5851a9da37b2ccec3165bc9bcca8edbb198bd1d7e92a26209353807ebf122"
+          "sha256": "21846aaf36c21113886167f1e08a3f9cbe7c75e19fd5ea3b862986899c42d287"
         },
         {
           "path": "assets/discussion.template.md",
@@ -492,23 +500,27 @@
         {
           "path": "references/methods.md",
           "sha256": "e0d58469e02c65cf39eaa4067128bc29d379c4fd505799d7b1c8166e9d3be674"
+        },
+        {
+          "path": "references/result-contract.md",
+          "sha256": "0cf531352eb9914eb333980515c8cd61fa94d33bbd68942d7a1e3ef809df83b0"
         }
       ]
     },
     {
-      "name": "steer-work",
-      "path": ".agents/skills/steer-work",
+      "name": "steer",
+      "path": ".agents/skills/steer",
       "invocation": "explicit-user",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "72afe392215f358c6b5b9d84b236fbd25314c8d673258ad675822b5d6ea12925",
-          "source_sha256": "3eecac5a68b0bff62e6d811a5e05406d3266fce42d1004fa2b2fa61131469d73",
+          "sha256": "ef2fd1db58713676a5556d483b0317444068d0b93ebdd7866aef623a4dc9ba51",
+          "source_sha256": "ef80cb1ded07447cf8270ce1ac895baca7745b7ad1093849dd40fbe30ac99ed4",
           "transform": "add-disable-model-invocation"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "079aec242ecbb62aa8a28daa925749572375f4b99a980410c59d7b7745dabcff"
+          "sha256": "e8c285b5ffaba3bea17d0d70ac7b4cccdafae9b8cae686407adf285f2a3527a4"
         },
         {
           "path": "assets/decision-record.md",
@@ -520,36 +532,44 @@
         },
         {
           "path": "references/methods.md",
-          "sha256": "8bc021fab0ed0c37f28b913a51f30e974dad73afe7268fa780c1306da766abaa"
+          "sha256": "c3d23b23f7bbe95220561672c0cc6682abc89d36d4ed9d90b8bf27eb5738b618"
+        },
+        {
+          "path": "references/result-contract.md",
+          "sha256": "4ef1bca24cd4f077110d96821bea653c250bea9876ffcbf1294f736442ad6f0c"
         }
       ]
     },
     {
-      "name": "setup-work",
-      "path": ".agents/skills/setup-work",
+      "name": "setup",
+      "path": ".agents/skills/setup",
       "invocation": "explicit-user",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "95f1ce56e4d23ded892be07af8ae40dcbded3acd39694a7955f90b6459250102",
-          "source_sha256": "76bc91a3d05dfeff0e6b7364e6d79dfc694ec115792d99444d614b769c2e76b4",
+          "sha256": "8d834b6773809ae8e17009a80fb7d5eae5b87416d66c0c12bfdc04668e905322",
+          "source_sha256": "e225bd3f247aa4cfa9472cd44cd4326f3c827219a780d937289d5e85b9488bbc",
           "transform": "add-disable-model-invocation"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "2596ecd95e10e48c738b0726e58d9da59cee8cb0b53b7de6b5e7d232e86d77b1"
+          "sha256": "fc66610b74920e25c4b05fca1b67cd3f2d5b2b1c6f9c4c24b046df1ff34ca9b9"
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "51a6923974188748638a424aa59b42b6afad2d910f910a1d43bb13ee10f3ce26"
+          "sha256": "fbb6c7314886573cd56c3f86884a65afe3b5f4ce4bf1ee6baeeeb1fa50aea7a4"
         },
         {
           "path": "assets/project-adapter.template.md",
-          "sha256": "c80ae7581a1dc10e4f806cb63d25d4fbb1a0ae71b74670e19b3a0d5217801a2e"
+          "sha256": "e5b00b3934ea2b8491dcd3a890fb58380b25f4720cba59aa564da25143805909"
         },
         {
           "path": "references/harnesses.md",
-          "sha256": "1c89f5bc9f899b8e8f6d4f88548bcbe2da9b4560dbaf2c2516893aad9f0aa70f"
+          "sha256": "9b5b2aefe07b2f31315551f4fbfd9cd4d07d6e34af3d581d52db2b5c3b5f4858"
+        },
+        {
+          "path": "references/result-contract.md",
+          "sha256": "88727b899fd2055a54452663207611cc22e83b66535b505571db9cbf8e81305b"
         },
         {
           "path": "references/sources.md",
@@ -558,31 +578,58 @@
       ]
     },
     {
-      "name": "ask-work",
-      "path": ".agents/skills/ask-work",
+      "name": "guide",
+      "path": ".agents/skills/guide",
       "invocation": "explicit-user",
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "f0c57d4e679ffed7283bea510d5dd261b4d93e865d062f47a54d5ee11d82f349",
-          "source_sha256": "61f5b1784948376448f9a0fc2eba26c5fd454c8c6ea3e41fd9a4e4ab7c9c1dca",
+          "sha256": "2bb63117761d29da4a583b045e563073399a22f808712579323043e74b33b3dc",
+          "source_sha256": "1eb63525c22c9060ed61598eae6c90d68dd483bdf3a6825bbb107edd551ceedd",
           "transform": "add-disable-model-invocation"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "db325bba121f61d15bf87d60e34021eb0146c7019c76807f7eb0ebfee0947142"
+          "sha256": "51d4a1197be6e4824279adf5fc364138baedac7df37ef621b36ab9ddd6b20ade"
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "d80a4c3e0fd2efa7af88433a53b25a92c78a644175c6669dd78fee50fb53acf6"
+          "sha256": "9be88f8dd4c5e658961515c71389eafd45142ffa68bcae58e8dcff57d178ed91"
         },
         {
           "path": "references/guide.md",
-          "sha256": "c22c95ab2993db62d6bd738f4b4f886f440385e2f724c96b4d37b19b00d534c1"
+          "sha256": "308e125d807bd4ebd5e6a46723a0b61fa14f40453b89a3b73647c50aca0668c6"
+        },
+        {
+          "path": "references/result-contract.md",
+          "sha256": "cac2e56465e446aeac49d2ffa4a5f003203e2cf40f2b6458525c4c203373ec4b"
         },
         {
           "path": "references/sources.md",
           "sha256": "73c399f28d96414923c7e2ce13f133786bd5f7af2e71ff784bee077ab406ea38"
+        }
+      ]
+    },
+    {
+      "name": "worker-plan-tickets",
+      "path": ".agents/skills/worker-plan-tickets",
+      "invocation": "implicit-or-explicit",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "1009ddf2317e174b3ddc3426981e76fc15c643d9309809fcfff37d5823fa9755"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "75e6d773e302eb211abca6867936efd2dcc1a3fe58f594061b81d43f8ece86c7"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "51a6923974188748638a424aa59b42b6afad2d910f910a1d43bb13ee10f3ce26"
+        },
+        {
+          "path": "assets/plan.template.md",
+          "sha256": "c2b1d6279095075b95a4373c00e98cdb44adde28c594c351a5cab24d5995609a"
         }
       ]
     }
@@ -611,5 +658,32 @@
     "canonical": "Personal skill content; OpenAI invocation policy in agents/openai.yaml.",
     "user_entry_transform": "Add disable-model-invocation: true only to explicit-user SKILL frontmatter; retain body bytes.",
     "verification": "Static metadata and resource equality are not proof of host runtime enforcement."
+  },
+  "entry_migration": {
+    "date": "2026-11-10",
+    "from_version": "0.3.1",
+    "to_version": "0.4.0",
+    "renamed_entries": {
+      "deliver-work": "deliver",
+      "frame-work": "worker-investigate",
+      "design-work": "worker-design",
+      "tla-verify-design": "worker-tla",
+      "implement-work": "worker-implement",
+      "verify-work": "worker-verify",
+      "review-work": "worker-review",
+      "land-work": "worker-land",
+      "release-work": "worker-release",
+      "brief-project": "brief",
+      "work-in-room": "collaborate",
+      "improve-workflow": "worker-improve-workflow",
+      "challenge-work": "challenge",
+      "steer-work": "steer",
+      "setup-work": "setup",
+      "ask-work": "guide"
+    },
+    "added": [
+      "worker-plan-tickets"
+    ],
+    "policy": "旧名称退出活动发现，不保留别名入口；历史版本由 Git 保留。Spec 与 Tickets 持续共享，worker 独立执行，人工入口独立保留。"
   }
 }

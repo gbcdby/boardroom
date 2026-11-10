@@ -1,0 +1,13 @@
+interface:
+  display_name: 项目近况
+  short_description: 用简短白话和必要的小图表说明成果、设计变化、卡点与实际待决事项
+  default_prompt: 使用 $brief 让我快速看懂项目近况，先说结果和影响，必要时用小表或关系图说明。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

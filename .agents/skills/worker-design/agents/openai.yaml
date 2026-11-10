@@ -1,0 +1,13 @@
+interface:
+  display_name: 设计方案
+  short_description: 明确行为与架构取舍，形成共享规格、共同约束和可检查的整体验收
+  default_prompt: 使用 $worker-design 完成这项设计，保留共享规格、关键取舍、行为约束和整体验收条件。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

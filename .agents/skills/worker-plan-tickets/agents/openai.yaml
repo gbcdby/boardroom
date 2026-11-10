@@ -1,0 +1,13 @@
+interface:
+  display_name: 拆分任务
+  short_description: 把共享规格拆为可执行任务，检查验收覆盖、依赖产物和并行写入边界
+  default_prompt: 使用 $worker-plan-tickets 将这份规格拆成任务，说明验收覆盖、依赖释放条件和并行冲突。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

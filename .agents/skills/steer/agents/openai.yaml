@@ -1,0 +1,13 @@
+interface:
+  display_name: 调整工作方向
+  short_description: 由你主动发起，把明确决定、范围变更或暂停恢复落实到指定工作并核实
+  default_prompt: 使用 $steer 将我的这项决定落实到指定工作，说明受影响范围并核对实际生效状态。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  allow_implicit_invocation: false
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas

@@ -1,0 +1,13 @@
+interface:
+  display_name: 形式化验证设计
+  short_description: 针对并发与状态风险建模，运行有限模型检查并交付可追溯的设计约束
+  default_prompt: 使用 $worker-tla 对这项有状态设计进行形式化建模与验证，说明反例、假设、实现义务和验证边界。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

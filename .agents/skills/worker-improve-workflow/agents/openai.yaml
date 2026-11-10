@@ -1,0 +1,13 @@
+interface:
+  display_name: 改进工作方法
+  short_description: 根据真实返工与能力变化评估工作方法，用可重放证据验证改进和边界
+  default_prompt: 使用 $worker-improve-workflow 分析这次工作问题，比较有限改进并用独立样例验证实际效果。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

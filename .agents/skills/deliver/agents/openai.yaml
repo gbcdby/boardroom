@@ -1,0 +1,13 @@
+interface:
+  display_name: 推进整体交付
+  short_description: 协调规格与任务的交付顺序，按真实依赖调度并推进到已授权的终点
+  default_prompt: 使用 $deliver 推进这项工作，按当前规格和任务依赖持续完成必要环节，并报告真实交付状态。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

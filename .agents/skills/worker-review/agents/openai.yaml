@@ -1,0 +1,13 @@
+interface:
+  display_name: 独立审查
+  short_description: 分别审查需求满足与项目标准，对设计或实现提出有依据且可收敛的问题
+  default_prompt: 使用 $worker-review 独立审查这个设计或实现，分别评估需求与项目标准，给出有证据的问题和覆盖范围。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true
