@@ -15,9 +15,9 @@
 
 ## 本套件的分发方式
 
-个人技能的规范源保留 `name`、`description` frontmatter；四个人工入口在 `agents/openai.yaml` 中声明 `allow_implicit_invocation: false`。
+个人技能的规范源保留 `name`、`description` frontmatter；人工专用入口在 `agents/openai.yaml` 中声明 `allow_implicit_invocation: false`。
 
-仓库导出为 `challenge`、`steer`、`setup`、`guide` 的 `SKILL.md` 增加 `disable-model-invocation: true`，正文保持一致。导出清单记录来源摘要、导出摘要和这项变换；其余入口继续允许按需选用。读取实际清单核对，不手工维护另一份版本表。
+仓库导出为 `auto`、`challenge`、`steer`、`setup`、`guide` 的 `SKILL.md` 增加 `disable-model-invocation: true`，正文保持一致。导出清单记录来源摘要、导出摘要和这项变换；其余入口继续允许按需选用。读取实际清单核对，不手工维护另一份版本表。
 
 导出到其他环境时使用该环境认可的安装或生成方式。不要修改只读的上游技能，不通过直接读文件执行来绕过宿主拒绝。
 

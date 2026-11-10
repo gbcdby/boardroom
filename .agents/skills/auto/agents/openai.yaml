@@ -1,0 +1,13 @@
+interface:
+  display_name: 自动驾驶
+  short_description: 由你启动，按项目可编辑流程持续推进目标，并在真实停点交回控制
+  default_prompt: 使用 $auto 按项目流程推进这项工作，沿用已有决定与授权，到达约定交付终点后完成收尾。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  allow_implicit_invocation: false
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
