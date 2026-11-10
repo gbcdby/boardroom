@@ -17,7 +17,9 @@ role: <本次职责与选用worker或等价方法>
 objective: <要得到的可验收结果>
 scope: <允许修改/读取的对象及边界>
 subject: <仓库/设计/模型/问题ID与固定版本>
-workspace: <隔离分支或工作区；无写入则写只读>
+workspace: <实际工作目录；并行写入使用独立目录，无写入则写只读>
+branch: <Git 分支；基线见 subject，非 Git 可省略>
+shared_resources: <实际使用的共享接口或环境及协调约定；无则省略>
 owner: <权威工作记录里已分配的负责人>
 authority_ref: <用户已有授权或委托记录；不附加权限>
 constraints: <预算、截止、依赖、禁止越过的边界>

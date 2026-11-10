@@ -1,6 +1,6 @@
 {
   "schema_version": "work-suite/v1",
-  "suite_version": "0.4.0",
+  "suite_version": "0.4.1",
   "result_contract": "work-result/v1",
   "first_testbed": "boardroom",
   "independent_formal_skill": "worker-tla",
@@ -13,7 +13,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "b99272dd832a1cb80e73248d7b1196638f1b8189ee9597e6167534b7582d03d2"
+          "sha256": "f972cf28c6181fe9ce3721cad61a24955f255ca5bd4f701a7467080c3a6a78d8"
         },
         {
           "path": "agents/openai.yaml",
@@ -30,6 +30,10 @@
         {
           "path": "references/boardroom-project.md",
           "sha256": "61558073d2aef7b073a2630647ccbf15f5ee6ccb97c5846fb6aadf8125402906"
+        },
+        {
+          "path": "references/local-concurrency.md",
+          "sha256": "534abca97e7633d97fc83e5b2fdd9eab2ec73c1763ce0f295fbdeb868b53232a"
         },
         {
           "path": "references/sources.md",
@@ -233,7 +237,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "38cb26b04a1a6f0a212ecf97ddc3508845df665037de8f62c97ce6ded4264ddf"
+          "sha256": "bf0cf35b053d4bbf900b9e764b29762bb443533df7f6f975d89f96239e63401e"
         },
         {
           "path": "agents/openai.yaml",
@@ -249,7 +253,7 @@
         },
         {
           "path": "references/execution-rules.md",
-          "sha256": "c14010cf83ef2781d598e8ad29d38f92a6c77d42a40cdc084507f9238a94441f"
+          "sha256": "2c6f7920db75ff0a78b7030aa6ef044830ad947e50ff5c21dffb016bd85c342c"
         }
       ]
     },
@@ -314,7 +318,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "d68502ce7107d233a9eda91a8bb6a4106143e8c9a37c7b4e504f1d574210d0f9"
+          "sha256": "d00defd33df0abdd7bb31937916e88a32ae39b2c655a2fbc8134ce4321ca64f7"
         },
         {
           "path": "agents/openai.yaml",
@@ -411,7 +415,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "1e01ae8e4ec075c0e950437903706f6b296b77e32f1c215fa2a1cbdac7fe6e8c"
+          "sha256": "955d60aa2cff22f46ccb367bc883a41535107dcd7b6511584db371c954db7655"
         },
         {
           "path": "agents/openai.yaml",
@@ -431,7 +435,7 @@
         },
         {
           "path": "assets/work-request.md",
-          "sha256": "a94298db98db1ea4de0a5b1ace0177694d4a2e537ff00afac697c9c9d3a1a9e6"
+          "sha256": "4080cdf49b3a104d0a2a28aa478bfb40c4854950bda6e2e294c3f50d13ed952c"
         },
         {
           "path": "assets/work-result.json",
@@ -617,7 +621,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "1009ddf2317e174b3ddc3426981e76fc15c643d9309809fcfff37d5823fa9755"
+          "sha256": "859538dd20b3d2984985d57f5549496b088bb8fa288cdb5adbeb7b7cc4a532df"
         },
         {
           "path": "agents/openai.yaml",
