@@ -171,7 +171,7 @@ onMounted(loadProjects);
         <h1>审计与撤销</h1>
         <p class="page-description">查看项目变更记录，撤销允许恢复的操作。</p>
       </div>
-      <button type="button" class="secondary" :disabled="busy || activeProjectId === null" @click="loadAudit()">刷新记录</button>
+      <button type="button" class="secondary" :disabled="busy" data-testid="audit-refresh" @click="activeProjectId === null ? loadProjects() : loadAudit()">刷新记录</button>
     </header>
 
     <p v-if="error" class="error" role="alert" data-testid="audit-error">{{ error }}</p>
@@ -186,14 +186,14 @@ onMounted(loadProjects);
         <label class="field audit-project-field" for="audit-project">
           项目
           <select id="audit-project" v-model="activeProjectId" :disabled="busy || projects.length === 0" @change="selectProject" data-testid="audit-project-select">
-            <option v-if="projects.length === 0" :value="null">暂无项目</option>
+            <option v-if="projects.length === 0" :value="null">{{ loading ? '正在加载项目…' : error ? '未能加载项目' : '暂无项目' }}</option>
             <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
           </select>
         </label>
       </div>
 
       <p v-if="loading" class="muted small" role="status">正在加载变更记录…</p>
-      <div v-else-if="projects.length === 0" class="empty-state">
+      <div v-else-if="projects.length === 0 && !error" class="empty-state">
         <h3>还没有项目</h3>
         <p>创建项目并开始协作后，变更记录会显示在这里。</p>
         <RouterLink to="/projects">前往项目与群组</RouterLink>

@@ -116,6 +116,7 @@ function usageValue(row: RuntimeUsageDto): string {
 /* Grid item 可收缩，窄屏表格的最小宽度由内部 table-scroll 承接。 */
 .binding-card { min-width: 0; border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem; background: var(--card-bg); }
 .binding-heading, .section-heading { display: flex; justify-content: space-between; align-items: center; gap: .8rem; flex-wrap: wrap; }
+.binding-heading > div { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 h3 { margin: 0; font-size: 1rem; } h4 { margin: 1.2rem 0 .65rem; font-size: .95rem; }
 .binding-heading p { margin: .2rem 0 0; }
 .summary { display: inline-flex; padding: .25rem .6rem; border-radius: 999px; background: var(--bg); font-size: .8rem; white-space: nowrap; border: 1px solid var(--border); }

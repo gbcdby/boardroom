@@ -66,7 +66,7 @@ def exercise(page, origin, records, output, report, capture_only):
             expect(page.locator("h1")).to_be_visible()
             page.wait_for_timeout(450)
             if name == "org":
-                page.get_by_label("项目", exact=True).select_option(project_id)
+                page.locator("select").first.select_option(project_id)
             elif name == "audit":
                 page.get_by_test_id("audit-project-select").select_option(project_id)
             elif name == "projects":
@@ -215,7 +215,7 @@ def exercise(page, origin, records, output, report, capture_only):
     expect(page.get_by_test_id("project-detail")).to_contain_text("浏览器操作创建的项目")
     report["checks"].append("UI-05: 真实项目/成员/群组创建、成功反馈与取消永久删除")
     page.goto(origin + "/org")
-    page.get_by_label("项目", exact=True).select_option(project_id)
+    page.locator("#org-project").select_option(project_id)
     page.get_by_test_id("org-edit-node").first.click()
     editor = page.get_by_role("region", name="编辑岗位：项目统筹", exact=True)
     editor.get_by_label("岗位名称", exact=True).fill("协作统筹")

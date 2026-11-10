@@ -151,6 +151,23 @@ test("审计撤销仅提交一次，刷新列表后仍显示成功反馈", async
   });
 });
 
+test("审计初始读取失败不冒充空项目，刷新可恢复", async () => {
+  let available = false;
+  await withPage("AuditView", (url) => {
+    if (url.includes("/audit")) return json({ entries: [auditEntry] });
+    return available ? json({ projects: [project] }) : json({ error: { code: "write_failed", message: "读取暂不可用" } }, 503);
+  }, async (container) => {
+    assert.match(textOf(byTestId(container, "audit-error")), /读取暂不可用/);
+    assert.doesNotMatch(textOf(container), /还没有项目/);
+    assert.equal(byTestId(container, "audit-refresh").props.disabled, false);
+    available = true;
+    await byTestId(container, "audit-refresh").props.onClick();
+    await settle();
+    assert.match(textOf(byTestId(container, "audit-list")), /小林/);
+    assert.equal(find(container, (entry) => entry.props["data-testid"] === "audit-error"), undefined);
+  });
+});
+
 test("项目详情并行加载时，先完成的一项不会提前开放写入控件", async () => {
   const members = deferred<Response>();
   await withPage("ProjectsView", (url) => {
