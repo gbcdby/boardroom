@@ -1,0 +1,13 @@
+interface:
+  display_name: 调查需求与问题
+  short_description: 调查想法与问题反馈，核实事实并明确范围、验收条件和待决事项
+  default_prompt: 使用 $frame-work 调查这项需求或反馈，给出有证据的范围、验收条件与下一步。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

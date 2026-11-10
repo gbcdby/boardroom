@@ -1,0 +1,13 @@
+interface:
+  display_name: 自主推进交付
+  short_description: 按目标组织调查设计实现验证与交付，保留证据并集中处理关键决策
+  default_prompt: 使用 $deliver-work 推进这项工作，在已有授权内完成目标并交付可核查结果。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

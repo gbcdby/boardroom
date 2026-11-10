@@ -1,0 +1,13 @@
+interface:
+  display_name: 参与房间协作
+  short_description: 在授权房间协调跨模型工作、可靠收信与交接，保持权限和证据边界清楚
+  default_prompt: 使用 $work-in-room 在已授权房间分配并完成当前协作，记录真实能力、验收证据和下一次交接。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

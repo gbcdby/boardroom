@@ -6,7 +6,7 @@
 
 Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Codex CLI 等作为保留各自上下文与身份的独立成员参与；人在 WebUI 中参与群聊、设定组织架构、管理任务和记忆。
 
-当前处于需求/方案阶段。产品基线见 `docs/architecture/agent-studio.md`；decision map、详细 spec、ticket、依赖与状态以 GitHub Issues 为准。技术栈为 Node/TypeScript + PostgreSQL + WebSocket + MCP + Vue 3，默认 localhost、单用户、无认证；架构基线支持未来远程/多用户（V1 仍单用户/无认证，具体范围待立项重评）。
+当前已实现聊天与 MCP 主链路，以及多项目、组织、成员生命周期和审计等能力；当前入口与限制见 `README.md`，产品基线见 `docs/architecture/agent-studio.md`。decision map、详细 spec、ticket、依赖与状态以 GitHub Issues 为准。技术栈为 Node/TypeScript + SQLite（默认，可配置 PostgreSQL）+ WebSocket + MCP + Vue 3，默认 localhost、单用户、无认证；架构基线支持未来远程/多用户（V1 仍单用户/无认证，具体范围待立项重评）。
 
 ## 工作约定
 
@@ -17,7 +17,10 @@ Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Code
 
 ### 项目记忆
 
-- 开始非平凡任务前查阅 `CONTEXT.md`；它只记非显而易见、跨会话有效的事实。维护规则见 `project-memory` 技能。
+- 开始非平凡任务前查阅 `CONTEXT.md` 的相关章节；关键结论仍回到当前代码、正式文档或实测证据核对。
+- 只记录非显而易见、跨会话有效的项目事实。先搜索已有条目，优先局部更新与去重；每条注明日期、适用范围和证据，未复现的推断放入「待验证」。
+- 修改前重新读取，保留其他 agent 的有效内容；修正过时结论注明日期、理由与替代来源。区分产品要求与当前实测行为，不用其一冒充另一。
+- 保持约 150 行的软上限；稳定决策归正式文档或 issue，任务状态归 GitHub Issues，过程记录归 `.agent-output/`，不记录凭据。任务结束时仅在有值得长期保留的新事实时更新。
 
 ### 技能目录
 
@@ -25,23 +28,67 @@ Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Code
 - Codex 元数据放在每个技能的 `agents/openai.yaml`。
 - 技能尽量保持项目无关；项目专属约定写入「项目适配」。
 
-### 工作流
+### 工作流与生效技能
 
-大型未知探索先用 `decision-map` 画图；普通需求澄清用 `interview`。
+boardroom 是跨项目、跨语言技能体系的首个试验场，当前使用下面这套 12 个技能。版本、内容摘要和退役清单见 `.agents/skills/work-suite.json`。这些文件提供工作方法与交接约定；真实工具、权限、任务归属和外部结果仍由项目已有系统决定。
 
-| 步骤 | 技能 | 产出 |
-| --- | --- | --- |
-| 固化需求 | `to-spec` | 主 spec，再子 spec；一次一份 |
-| 拆票 | `to-tickets` | ticket，挂 `ready-for-agent` |
-| 实现 | `implement` / `implement-spec` | 代码；测试循环由 `tdd` 承担 |
-| 评审 | `code-review` | 标准轴 + 需求轴报告 |
-| 交付 | `pr` | PR 描述与 PR（评审通过 ready / 待评审 draft） |
+2026-11-10 起，旧的 `code-review`、`decision-map`、`handoff`、`implement`、`implement-spec`、`interview`、`pr`、`project-memory`、`prototype`、`research`、`tdd`、`to-spec`、`to-tickets` 全部从生效技能目录退役，历史内容保留在 Git 中。它们不再是本仓库的调用入口或流程前置条件。
 
-`to-spec`、`to-tickets`、`implement`、`implement-spec`、`interview`、`decision-map`、`handoff` 需用户显式触发；`code-review`、`pr`、`tdd`、`research`、`prototype`、`project-memory` 可在流程内自动调用。`implement-spec` 只做调度，实现由子 agent 完成。
+日常用 `deliver-work` 推进已授权目标，用只读 `brief-project` 掌握架构、行为、累计变化与必要决定。其余技能按实际缺口使用，不要求每项任务经历全部步骤。
 
-辅助技能：`research` 查事实、`prototype` 试方案、`project-memory` 维护 `CONTEXT.md`、`handoff` 做交接。
+| 技能 | 职责 |
+| --- | --- |
+| `deliver-work` | 识别终点、组织依赖、推进、恢复与交付回执 |
+| `frame-work` | 调查想法、反馈与改进，明确事实、范围和验收 |
+| `design-work` | 行为、职责、接口、架构变化与验证路径 |
+| `tla-verify-design` | 独立承担设计与 TLA+/TLC 验证，交出实现义务 |
+| `implement-work` | 按契约实现与获得小步反馈 |
+| `verify-work` | 执行当前候选所需的实际检查并保存证据 |
+| `review-work` | 独立检查需求与标准，覆盖完整 WIP 与复审增量 |
+| `land-work` | PR、反馈、CI、集成候选及已有授权内的合并 |
+| `release-work` | 目标包含发布或部署时，完成产物与目标位置验收 |
+| `brief-project` | 只读呈现事实、证据、累计架构变化与决策 |
+| `work-in-room` | 跨 harness 协作、可靠收信、分工、交接与取消 |
+| `improve-workflow` | 将漏检、误报或协作失效转成有证据的流程改进 |
 
-简单任务可跳过 spec 与拆票：有代码改动的按 `tdd` 实现，然后 `code-review` → `pr` 创建 PR。评审不可跳过。
+根据用户目标和已有授权调用当前技能，不要求用户逐项启动流程。调查与原型由 `frame-work` / `design-work` 按需开展；规格与切片由问题契约、设计决定和 `deliver-work` 的依赖管理承接；交接由 `deliver-work` / `work-in-room` 承接；项目记忆按上节维护。需要独立判断时使用独立执行者，不固定要求某个模型品牌或强制所有实现都交给子 agent。
+
+如果另行接入 Matt、pstack 或其他第三方技能，先确认它实际可用及其调用契约；不能通过直接读盘绕过 invocation 限制，也不能声称已经调用未运行的组件。固定历史版本的来源链接仅用于追溯方法，不恢复已退役入口。
+
+### 实现、审查与交付要求
+
+- 简单任务可直接使用简短验收条件，不强制 spec 与拆票。行为变更按 `implement-work` 小步实现；缺陷先建立来自目标行为的可重复失败，沿用已确认的测试边界，以公共行为和独立期望验证，不把实现值复制成测试期望。
+- 在既有契约与授权内自主选择必要验证入口；影响产品行为、架构边界或已有验收约定时先解决相应设计问题。文档等低风险变更采用事实、链接与语法检查，不新建逐字镜像测试。
+- 变更交付前必须由 `review-work` 或符合相同范围的独立审查检查需求轴与标准轴；覆盖完整候选和相关复审增量。作者检查不冒充独立审查，不能跳过必要评审。
+- `land-work` 按真实状态创建或更新 PR：必要审查与检查完成时 ready，尚有缺口时 draft。合并须有用户当前请求或既有有效授权，并满足仓库实际门禁；授权已覆盖当前候选时继续执行，不重复申请。合并后回读 PR 与目标分支，不能把入队或请求成功记成已合并。
+- 不自动 force-push，不因合并顺带关票、删除分支或部署。ticket 由 `deliver-work` 生命周期负责人在验收及必要审查完成、关票授权有效时协调更新；PR 不使用 `Closes #N`。目标含发布或部署时由 `release-work` 继续完成对应验收。
+
+跨技能交接使用 `work-result/v1` 或等价紧凑文本；格式细节与校验器位于 `deliver-work`。共同字段为 work_id、skill、outcome、subject、evidence、unresolved、changed_assumptions、next_action。独立工具的原始报告保留，由外层交接封装。阶段完成、模型通过、运行通过、PR ready、实际合并和目标环境验收分别记录。小改动只做与风险有关的检查，不生成无关模型或逐字镜像测试。
+
+房间接入先读取 `work-in-room/references/boardroom.md` 并核对当前 schema。当前 MCP 仅有 join、wait_for_messages、send_message、acknowledge_message、report_status、heartbeat、read_history。没有原子任务领取、租约、启动 harness 或合并工具时，使用外部权威记录、明确协调者和隔离工作区；这只是协作约定，不是运行时锁。
+
+默认把成果、关键变化、证据缺口和必要决定聚合给人，不要求逐条阅读 Agent 对话。复用已有有效授权；简报、消息 ACK、模型多数同意和人的沉默均不创建新批准。
+
+### GitHub Issues 约定
+
+旧技能退役后，既有 Issues 的项目语义继续保留；以下规则由新体系使用，不依赖旧入口。
+
+- 标题沿用 `[主 spec]`、`[子 spec]`、`[ticket]`、`[决策地图]`、`[决策]`。ticket 短号（如 F1、T1）放在前缀后，issue 编号不复用、不重排。
+- 既有主 spec → 一层子 spec → ticket、决策地图 → 决策票的父子关系与双向链接保留。新建同类记录沿用该结构，子 spec 不自行扩大父 spec 范围，ticket 关联需求/验收 ID 与 `blocked_by`。简单任务可以使用当前请求与简短契约，不为满足结构额外制造 spec 或票。
+- 每个开放 spec / ticket 最多一个就绪标签；不使用 `in-progress`、`phase:*`、`type:*` 标签表示进度或层级。这是仓库 Issues 约定，不改变产品 Task 状态枚举。
+
+| 标签 | 当前含义 |
+| --- | --- |
+| `needs-info` | 缺少影响推进的信息或决定；未解决的规格草案使用此标签。单纯依赖其他票用 `blocked_by`，不冒充信息缺口。 |
+| `ready-for-agent` | 仅用于规格与验收明确的 ticket；执行前还须核对依赖、已有负责人及实际授权。spec 不使用此标签。 |
+| `ready-for-human` | 当前确实需要人的评审、裁决、合并决定或实测；已有授权可继续的动作不重复制造人工待办。 |
+| `wontfix` | 已决定不再实施、已取代或已放弃；在有效关票授权下关闭。 |
+
+- 已接受的 spec 保持开放且不挂就绪标签，正文保留接受依据；标签缺失本身不是批准。拆票、子票完成不自动关闭 spec；只有相关工作完成且不再维护时，按授权关闭。ticket 完成须达到约定终点并完成必要审查；关闭时移除就绪标签。
+- 依赖优先使用平台原生 blocking 关系，没有时在正文维护 `blocked_by`；不能仅按编号或文件不重叠判断可并行。assignee 表示约定的生命周期负责人，不提供原子领取或租约保证。
+- 决策地图使用 `decision:map`；决策票使用 `decision:research`、`decision:prototype`、`decision:interview`、`decision:task`，不叠加上述就绪标签。按标签识别类别，标签与正文冲突时先核对并修正；关闭决策票时移除 `decision:*`，在地图保留结论摘要与链接。
+- 决策标签保留分类意义，旧入口以标签固定 AFK/HITL、每次仅推进一票的规则随技能退役。research / prototype 可在范围内自主调查与实验；interview 只提出现有证据不能替代的人的判断，不代答；task 按正文和授权处理。
+- 创建标签、改派、关闭或批量修改 Issues 都核对当前任务的实际授权，不由标签、技能调用或摘要自动取得权限。
 
 ### 正式文档与归档
 

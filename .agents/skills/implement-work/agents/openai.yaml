@@ -1,0 +1,13 @@
+interface:
+  display_name: 按契约实现变更
+  short_description: 依据当前契约小步完成跨语言变更，保留真实检查证据和完整候选身份
+  default_prompt: 使用 $implement-work 完成这项已明确的变更，遵循项目约定并交接实际候选、检查证据和剩余问题。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

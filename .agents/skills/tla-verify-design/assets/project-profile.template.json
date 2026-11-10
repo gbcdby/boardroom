@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "project_name": "REPLACE_WITH_PROJECT_NAME",
+  "feature": "REPLACE_WITH_FEATURE",
+  "mode": "design",
+  "root": ".",
+  "source_revision": "UNASSESSED",
+  "source_snapshot": {
+    "covered_files_and_symbols": [],
+    "content_digests": {},
+    "working_changes_included": "UNASSESSED",
+    "last_aligned_baseline": "NONE"
+  },
+  "implementation_languages": [],
+  "runtime_and_versions": [],
+  "execution_model": {
+    "actors": [],
+    "process_and_thread_boundaries": [],
+    "scheduling_and_cancellation": [],
+    "atomic_operations_with_evidence": []
+  },
+  "persistence": {
+    "stores": [],
+    "transaction_and_isolation_guarantees": [],
+    "uniqueness_and_durability": []
+  },
+  "communication": {
+    "delivery_order_and_duplication": [],
+    "retry_identity": [],
+    "timeouts_and_uncertain_outcomes": [],
+    "failure_and_recovery_scope": []
+  },
+  "semantic_differences": {
+    "integers_and_overflow": "UNKNOWN",
+    "memory_visibility": "UNKNOWN",
+    "time_and_clocks": "UNKNOWN",
+    "serialization_and_equality": "UNKNOWN",
+    "exceptions_and_partial_effects": "UNKNOWN"
+  },
+  "commands": {
+    "test": {"id": "test", "argv": [], "cwd": ".", "timeout_seconds": 120, "environment": "local-test"},
+    "targeted_regression": {"id": "targeted-regression", "argv": [], "cwd": ".", "timeout_seconds": 120, "environment": "local-test"}
+  },
+  "source_evidence": [],
+  "unknowns": [],
+  "notes": "Design/check/align documentation only. Commands describe downstream capabilities; this skill does not implement or run project tests. In design without source, record proposed semantics and unresolved obligations. Source identity must include relevant working changes and new files, or content snapshots without Git. Empty arrays are unassessed, not evidence that no risk exists."
+}
