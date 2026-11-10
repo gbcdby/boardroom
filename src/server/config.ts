@@ -146,7 +146,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<AppCo
 function parseDbDriver(value: unknown): DbDriverKind {
   if (value === "sqlite" || value === "postgres") return value;
   throw new ConfigError(
-    `dbDriver 必须是 "sqlite" 或 "postgres"，收到：${JSON.stringify(value)}。` +
+    `dbDriver 必须是 "sqlite" 或 "postgres"。` +
       `请修改 AGENT_STUDIO_DB_DRIVER 或配置文件中的 dbDriver 字段。`,
   );
 }
@@ -160,7 +160,7 @@ function parseDbDriver(value: unknown): DbDriverKind {
 function parsePgConnectionString(value: unknown, dbDriver: DbDriverKind): string | undefined {
   if (value !== undefined && (typeof value !== "string" || value.trim() === "")) {
     throw new ConfigError(
-      `pgConnectionString 必须是非空字符串，收到：${JSON.stringify(value)}。` +
+      `pgConnectionString 必须是非空字符串。` +
         `请修改 AGENT_STUDIO_PG_CONNECTION_STRING 或配置文件中的 pgConnectionString 字段。`,
     );
   }
@@ -191,9 +191,10 @@ async function readConfigFile(configFile: string, required: boolean): Promise<Js
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch (error) {
+  } catch {
+    // JSON.parse 的异常可包含配置原文；配置中可能有 PG 凭据，不能转发该文本。
     throw new ConfigError(
-      `配置文件 ${configFile} 不是合法 JSON：${(error as Error).message}。` +
+      `配置文件 ${configFile} 不是合法 JSON。` +
         `请修正 JSON 语法，或参考 config.example.json。`,
     );
   }
@@ -213,7 +214,7 @@ function pick(...candidates: readonly unknown[]): unknown {
 
 function resolveDataDir(cwd: string, value: unknown): string {
   if (typeof value !== "string" || value.trim() === "") {
-    throw new ConfigError(`dataDir 必须是非空字符串，收到：${JSON.stringify(value)}。`);
+    throw new ConfigError("dataDir 必须是非空字符串。请修改 AGENT_STUDIO_DATA_DIR 或配置文件中的 dataDir 字段。");
   }
   return path.resolve(cwd, value);
 }
@@ -222,7 +223,7 @@ function parsePort(value: unknown): number {
   const port = parsePositiveInt("port", value);
   if (port > 65_535) {
     throw new ConfigError(
-      `port 必须介于 1 和 65535 之间，收到：${String(value)}。` +
+      `port 必须介于 1 和 65535 之间，收到：${port}。` +
         `请修改 AGENT_STUDIO_PORT 或配置文件中的 port 字段。`,
     );
   }
@@ -232,7 +233,7 @@ function parsePort(value: unknown): number {
 function parsePositiveInt(field: string, value: unknown): number {
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) {
-    throw new ConfigError(`${field} 必须是正整数，收到：${JSON.stringify(value)}。`);
+    throw new ConfigError(`${field} 必须是正整数。请修改相应环境变量或配置字段。`);
   }
   return parsed;
 }

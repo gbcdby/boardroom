@@ -201,3 +201,38 @@ test("dbDriver=postgres 但缺少 PG 连接串时报错并给出恢复路径", a
     });
   });
 });
+
+test("无效配置值不回显到错误消息，保留字段与修复指引", async () => {
+  await withTempDir(async (dir) => {
+    const canary = "synthetic-config-secret";
+    const cases = [
+      { field: "pgConnectionString", value: { password: canary } },
+      { field: "dbDriver", value: canary },
+      { field: "dataDir", value: { token: canary } },
+      { field: "port", value: canary },
+    ];
+    for (const { field, value } of cases) {
+      await writeFile(path.join(dir, "config.json"), JSON.stringify({ [field]: value }));
+      await assert.rejects(loadConfig({ cwd: dir, env: {} }), (error: Error) => {
+        assert.equal(error.name, "ConfigError");
+        assert.equal(error.message.includes(canary), false);
+        assert.equal(error.message.includes(field), true);
+        return true;
+      });
+    }
+  });
+});
+
+test("JSON 语法错误不回显解析器附带的配置原文", async () => {
+  await withTempDir(async (dir) => {
+    const canary = "CONFIGCANARY";
+    await writeFile(path.join(dir, "config.json"), canary);
+    await assert.rejects(loadConfig({ cwd: dir, env: {} }), (error: Error) => {
+      assert.equal(error.name, "ConfigError");
+      assert.equal(error.message.includes(canary), false);
+      assert.match(error.message, /JSON/);
+      assert.match(error.message, /config\.example\.json/);
+      return true;
+    });
+  });
+});
