@@ -1,6 +1,6 @@
 {
   "schema_version": "work-suite/v1",
-  "suite_version": "0.3.0",
+  "suite_version": "0.3.1",
   "result_contract": "work-result/v1",
   "first_testbed": "boardroom",
   "independent_formal_skill": "tla-verify-design",
@@ -372,15 +372,15 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "2e9efa764e02e4b0964a5e7bb3d2c98d4095b60cf98b9f561b3f88e6dab2a8c7"
+          "sha256": "a1874acda92f1c1baaeeb05d5a1122f93a257ecaa5c82061731b091cd184054d"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "333b8e5b5dab03bc3c8d51939e38076676e0303fcb3064c34f67b39c2f02757b"
+          "sha256": "bf696d2c74e49857907afb25310f8f881666706ceb9df6937a946bdd38686f82"
         },
         {
           "path": "assets/brief.template.md",
-          "sha256": "aea5c0e562623f11d1335489c3e72da6c4f3985b1a02b5875ed685912ac6fe2a"
+          "sha256": "3a245617f154482c4f8cc30046d2db83cb39adc267977d32772e042337768782"
         },
         {
           "path": "assets/icon.svg",
@@ -392,7 +392,7 @@
         },
         {
           "path": "references/views.md",
-          "sha256": "2ddbf00f359e33b7d1effabd66131b81f31acedfedb2286a2834122cee2d0770"
+          "sha256": "18c861a7acd0fa7c31d137dc7015719d8f1dbf4423c1883c9d95425e23dcc5fe"
         }
       ]
     },

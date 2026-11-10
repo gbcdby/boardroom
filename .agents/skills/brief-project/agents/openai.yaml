@@ -1,7 +1,7 @@
 interface:
-  display_name: 项目图景与决策
-  short_description: 只读呈现项目行为、架构累计变化、有效证据与需要人判断的事项
-  default_prompt: 使用 $brief-project 只读汇总当前项目的成果、行为与架构变化、证据和待决事项。
+  display_name: 项目近况
+  short_description: 用简短白话和必要图表说明进展、设计变化、卡点及需要你决定的事
+  default_prompt: 使用 $brief-project 给我一份简短项目近况：做成了什么、设计哪里变了、卡在哪里、是否需要我决定；适合时用图表，依据放在相关结论旁。
   icon_small: assets/icon.svg
   icon_large: assets/icon.svg
 policy:
