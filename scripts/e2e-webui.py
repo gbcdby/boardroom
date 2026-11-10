@@ -28,6 +28,11 @@ def seed(page, origin):
         project = request(page, origin, "POST", "/api/projects", {"name": name})["project"]
         pid = project["id"]
         members = [request(page, origin, "POST", f"/api/projects/{pid}/members", {"kind": "human", "displayName": label})["member"] for label in ["林可", "陈一"]]
+        request(page, origin, "POST", f"/api/projects/{pid}/members", {"kind": "human", "displayName": "尚未加入群组的成员"})
+        root_node = request(page, origin, "POST", f"/api/projects/{pid}/org/nodes", {"name": "项目统筹", "role": "top_manager"})["node"]
+        child = request(page, origin, "POST", f"/api/projects/{pid}/org/nodes", {"name": "产品设计", "role": "member", "parentId": root_node["id"]})["node"]
+        request(page, origin, "PUT", f"/api/org/nodes/{root_node['id']}/assignee", {"memberId": members[0]["id"]})
+        request(page, origin, "PUT", f"/api/org/nodes/{child['id']}/assignee", {"memberId": members[1]["id"]})
         groups = [request(page, origin, "POST", f"/api/projects/{pid}/groups", {"name": label, "participantMemberIds": [m["id"] for m in members]})["group"] for label in ["产品协作", "设计讨论"]]
         for group, text in zip(groups, ["新的协作从这里开始。\n先整理目标，再一起推进。", "这条消息只属于设计讨论。"]):
             request(page, origin, "POST", f"/api/groups/{group['id']}/messages", {"senderMemberId": members[0]["id"], "text": text})
@@ -60,6 +65,14 @@ def exercise(page, origin, records, output, report, capture_only):
             page.goto(origin + path)
             expect(page.locator("h1")).to_be_visible()
             page.wait_for_timeout(450)
+            if name == "org":
+                page.get_by_label("项目", exact=True).select_option(project_id)
+            elif name == "audit":
+                page.get_by_test_id("audit-project-select").select_option(project_id)
+            elif name == "projects":
+                page.get_by_test_id("project-list").get_by_role("button", name=records[0]["project"]["name"], exact=True).click()
+            if name in ("org", "audit", "projects"):
+                page.wait_for_timeout(250)
             key = f"{name}-{width}-{theme}"
             report["layouts"].append(layout(page, key, strict=not capture_only))
             page.screenshot(path=str(output / f"{key}.png"), full_page=True, animations="disabled")
@@ -102,6 +115,21 @@ def exercise(page, origin, records, output, report, capture_only):
     expect(draft).to_be_visible()
     expect(draft).to_have_js_property("tagName", "TEXTAREA")
     expect(page.get_by_test_id("chat-sender")).not_to_have_value("")
+    expect(draft).to_be_enabled()
+    expect(page.get_by_test_id("chat-sender").locator("option")).to_have_count(2)
+    def fail_participants(route):
+        route.fulfill(status=503, content_type="application/json", body=json.dumps({"error": {"code": "ui_test_unavailable", "message": "测试参与者读取失败"}}))
+    participant_url = f"**/api/groups/{group_b}/participants"
+    page.route(participant_url, fail_participants)
+    page.get_by_test_id("chat-group").select_option(group_b)
+    expect(page.get_by_test_id("chat-error")).to_be_visible()
+    expect(draft).to_be_disabled()
+    page.unroute(participant_url, fail_participants)
+    page.get_by_role("button", name="重新加载", exact=True).click()
+    expect(draft).to_be_enabled()
+    page.get_by_test_id("chat-group").select_option(group_a)
+    expect(draft).to_be_enabled()
+    report["checks"].append("UI-04: 发送身份仅含群参与者，读取失败不可发送且支持重试")
     before = request(page, origin, "GET", f"/api/groups/{group_a}/messages")["messages"]
     draft.fill("输入法确认不应发送")
     draft.dispatch_event("compositionstart", {"data": "确认"})
@@ -138,7 +166,7 @@ def exercise(page, origin, records, output, report, capture_only):
 
     def fail_send(route):
         if route.request.method == "POST":
-            route.fulfill(status=503, content_type="application/json", body=json.dumps({"error": "ui_test_write_unavailable", "message": "测试写入失败"}))
+            route.fulfill(status=503, content_type="application/json", body=json.dumps({"error": {"code": "ui_test_write_unavailable", "message": "测试写入失败"}}))
         else:
             route.continue_()
     page.route("**/api/groups/*/messages", fail_send)
@@ -180,11 +208,25 @@ def exercise(page, origin, records, output, report, capture_only):
     page.get_by_test_id("participant-picker").get_by_role("checkbox").first.check()
     page.get_by_test_id("create-group").click()
     expect(page.get_by_test_id("group-list")).to_contain_text("浏览器创建群组")
+    page.get_by_test_id("project-actions").locator("summary").click()
     page.get_by_test_id("purge-project").click()
     expect(page.get_by_test_id("project-purge-confirm")).to_be_visible()
     page.get_by_test_id("cancel-purge-project").click()
     expect(page.get_by_test_id("project-detail")).to_contain_text("浏览器操作创建的项目")
     report["checks"].append("UI-05: 真实项目/成员/群组创建、成功反馈与取消永久删除")
+    page.goto(origin + "/org")
+    page.get_by_label("项目", exact=True).select_option(project_id)
+    page.get_by_test_id("org-edit-node").first.click()
+    editor = page.get_by_role("region", name="编辑岗位：项目统筹", exact=True)
+    editor.get_by_label("岗位名称", exact=True).fill("协作统筹")
+    editor.get_by_role("button", name="改名", exact=True).click()
+    expect(page.get_by_test_id("notice")).to_contain_text("岗位已改名")
+    expect(page.get_by_test_id("org-node-list")).to_contain_text("协作统筹")
+    page.goto(origin + "/audit")
+    page.get_by_test_id("audit-project-select").select_option(project_id)
+    page.get_by_test_id("audit-revoke").first.click()
+    expect(page.get_by_test_id("audit-notice")).to_contain_text("已撤销")
+    report["checks"].append("UI-05: 组织按需编辑、实际改名与审计撤销")
     assert not errors, f"页面JavaScript错误: {errors}"
     report["status"] = "PASS"
 

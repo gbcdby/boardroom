@@ -9,6 +9,7 @@ const projects = ref<ProjectDto[]>([]);
 const activeProjectId = ref<string | null>(null);
 const groups = ref<GroupDto[]>([]);
 const members = ref<MemberDto[]>([]);
+const participants = ref<MemberDto[]>([]);
 const activeGroupId = ref<string | null>(null);
 const senderId = ref<string | null>(null);
 const messages = ref<MessageDto[]>([]);
@@ -34,9 +35,12 @@ let historyRequest = 0;
 let contextRevision = 0;
 let draftRevision = 0;
 
+const activeProject = computed(() => projects.value.find((p) => p.id === activeProjectId.value) ?? null);
 const activeGroup = computed(() => groups.value.find((g) => g.id === activeGroupId.value) ?? null);
-const humanMembers = computed(() => members.value.filter((m) => m.kind === "human" && m.status === "active"));
-const canCompose = computed(() => !!activeGroup.value && activeGroup.value.writable !== false && senderId.value !== null);
+const humanMembers = computed(() => participants.value.filter((m) => m.kind === "human" && m.status === "active"));
+const isArchived = computed(() => activeProject.value?.archivedAt != null || activeGroup.value?.archivedAt != null);
+// 群组列表的 writable 属于读取列表的默认主体；实际发言以选中的人类参与者为主体。
+const canCompose = computed(() => !!activeProject.value && !!activeGroup.value && !isArchived.value && !historyLoading.value && humanMembers.value.some((member) => member.id === senderId.value));
 const canSend = computed(() => canCompose.value && !sending.value && !historyLoading.value && draft.value.trim() !== "");
 const wsLabel = computed(() => wsState.value === "open" ? "实时已连接" : wsState.value === "connecting" ? "正在连接" : "连接中断，正在重连");
 
@@ -76,7 +80,6 @@ async function loadProject(projectId: string): Promise<void> {
     if (disposed || request !== projectRequest || activeProjectId.value !== projectId) return;
     groups.value = groupResult.groups;
     members.value = memberResult.members;
-    senderId.value = humanMembers.value[0]?.id ?? null;
     const requested = queryValue(route.query["groupId"]);
     activeGroupId.value = groups.value.find((g) => g.id === requested)?.id ?? groups.value[0]?.id ?? null;
   } catch (err) {
@@ -101,12 +104,19 @@ async function loadHistory(groupId: string): Promise<void> {
   loadError.value = null;
   error.value = null;
   try {
-    const result = await api.listMessages(groupId);
+    // 消息与参与者共用请求版本，迟到的旧群回包不能恢复旧发送身份。
+    const [result, participantResult] = await Promise.all([api.listMessages(groupId), api.listParticipants(groupId)]);
     if (disposed || request !== historyRequest || activeGroupId.value !== groupId) return;
+    participants.value = participantResult.participants;
+    if (!humanMembers.value.some((member) => member.id === senderId.value)) {
+      senderId.value = humanMembers.value[0]?.id ?? null;
+    }
     // 保留读取历史期间已经到达的实时消息，避免较早的快照覆盖新消息。
     mergeMessages(result.messages);
   } catch (err) {
     if (!disposed && request === historyRequest && activeGroupId.value === groupId) {
+      participants.value = [];
+      senderId.value = null;
       error.value = errorMessage(err);
       loadError.value = "history";
     }
@@ -247,6 +257,8 @@ watch(activeGroupId, (id) => {
   historyRequest += 1;
   contextRevision += 1;
   messages.value = [];
+  participants.value = [];
+  senderId.value = null;
   draft.value = "";
   composing.value = false;
   error.value = null;
@@ -318,8 +330,8 @@ onBeforeUnmount(() => {
       </label>
       <label class="field">
         发送身份
-        <select v-model="senderId" :disabled="projectLoading || humanMembers.length === 0 || sending" data-testid="chat-sender">
-          <option v-if="humanMembers.length === 0" :value="null">暂无可用身份</option>
+        <select v-model="senderId" :disabled="projectLoading || historyLoading || humanMembers.length === 0 || sending" data-testid="chat-sender">
+          <option v-if="humanMembers.length === 0" :value="null">{{ historyLoading ? '正在加载参与者…' : '暂无可用身份' }}</option>
           <option v-for="member in humanMembers" :key="member.id" :value="member.id">{{ member.displayName }}</option>
         </select>
       </label>
@@ -354,8 +366,9 @@ onBeforeUnmount(() => {
       </div>
       <button v-if="newMessages" type="button" class="latest-button" @click="scrollToLatest">查看新消息 ↓</button>
 
-      <p v-if="activeGroup?.writable === false" class="notice" role="status">当前群组为只读，可查看历史消息。</p>
-      <p v-else-if="humanMembers.length === 0" class="notice" role="status">请先在「项目与群组」添加或恢复一个人的成员身份，再发送消息。</p>
+      <p v-if="isArchived" class="notice" role="status">{{ activeProject?.archivedAt ? '当前项目' : '当前群组' }}已归档，可查看历史消息。</p>
+      <p v-else-if="historyLoading" class="notice" role="status">正在加载当前群组的消息与参与者…</p>
+      <p v-else-if="humanMembers.length === 0 && !loadError" class="notice" role="status">当前群组没有在岗的人类参与者，暂时无法发送消息。</p>
 
       <form class="composer" @submit.prevent="send">
         <label class="field" for="chat-message">消息</label>
@@ -367,7 +380,7 @@ onBeforeUnmount(() => {
         <div class="mention-picker" data-testid="chat-member-picker">
           <span class="muted small">提及</span>
           <button type="button" class="text-button" :disabled="!canCompose" data-testid="chat-mention-all" @click="insertAll">@all</button>
-          <button v-for="member in members" :key="member.id" type="button" class="text-button" :disabled="!canCompose" @click="insertMention(member)">@{{ member.displayName }}</button>
+          <button v-for="member in participants" :key="member.id" type="button" class="text-button" :disabled="!canCompose" @click="insertMention(member)">@{{ member.displayName }}</button>
         </div>
       </form>
     </section>

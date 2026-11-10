@@ -41,7 +41,10 @@ const showArchived = ref(false);
 const pendingProjectPurge = ref<ProjectPurgeConfirmation | null>(null);
 const pendingGroupPurge = ref<GroupPurgeConfirmation | null>(null);
 
-const busy = ref(false);
+const pendingRequests = ref(0);
+const loading = ref(true);
+const loadingProject = ref(false);
+const busy = computed(() => pendingRequests.value > 0 || loading.value || loadingProject.value);
 const error = ref<string | null>(null);
 const notice = ref<string | null>(null);
 
@@ -59,9 +62,9 @@ function clearMessages(): void {
   notice.value = null;
 }
 
-async function run<T>(fn: () => Promise<T>, success?: string): Promise<T | null> {
-  clearMessages();
-  busy.value = true;
+async function run<T>(fn: () => Promise<T>, success?: string, preserveFeedback = false): Promise<T | null> {
+  if (!preserveFeedback) clearMessages();
+  pendingRequests.value++;
   try {
     const result = await fn();
     if (success !== undefined) notice.value = success;
@@ -70,21 +73,31 @@ async function run<T>(fn: () => Promise<T>, success?: string): Promise<T | null>
     error.value = err instanceof ApiError ? err.message : (err as Error).message;
     return null;
   } finally {
-    busy.value = false;
+    pendingRequests.value--;
   }
 }
 
 async function loadProjects(): Promise<void> {
-  const result = await run(() => api.listProjects({ includeArchived: showArchived.value }));
-  if (!result) return;
-  projects.value = result.projects;
-  if (activeProjectId.value === null || !projects.value.some((p) => p.id === activeProjectId.value)) {
-    activeProjectId.value = projects.value[0]?.id ?? null;
+  loading.value = true;
+  try {
+    const result = await run(() => api.listProjects({ includeArchived: showArchived.value }), undefined, true);
+    if (!result) return;
+    projects.value = result.projects;
+    if (activeProjectId.value === null || !projects.value.some((p) => p.id === activeProjectId.value)) {
+      activeProjectId.value = projects.value[0]?.id ?? null;
+      newGroupSelection.value = [];
+      pendingProjectPurge.value = null;
+      pendingGroupPurge.value = null;
+    }
+    await loadActiveProject();
+  } finally {
+    loading.value = false;
   }
-  await loadActiveProject();
 }
 
 async function toggleShowArchived(): Promise<void> {
+  if (busy.value) return;
+  clearMessages();
   showArchived.value = !showArchived.value;
   await loadProjects();
 }
@@ -98,27 +111,33 @@ async function loadActiveProject(): Promise<void> {
     statuses.value = {};
     return;
   }
-  const [memberResult, groupResult] = await Promise.all([
-    run(() => api.listMembers(projectId)),
-    run(() => api.listGroups(projectId, { includeArchived: showArchived.value })),
-  ]);
-  if (memberResult) members.value = memberResult.members;
-  if (groupResult) {
-    groups.value = groupResult.groups;
-    await loadParticipants();
+  loadingProject.value = true;
+  try {
+    const [memberResult, groupResult] = await Promise.all([
+      run(() => api.listMembers(projectId), undefined, true),
+      run(() => api.listGroups(projectId, { includeArchived: showArchived.value }), undefined, true),
+    ]);
+    if (activeProjectId.value !== projectId) return;
+    if (memberResult) members.value = memberResult.members;
+    if (groupResult) {
+      groups.value = groupResult.groups;
+      await loadParticipants(projectId);
+    }
+    await loadStatuses();
+  } finally {
+    loadingProject.value = false;
   }
-  await loadStatuses();
 }
 
-async function loadParticipants(): Promise<void> {
+async function loadParticipants(projectId: string): Promise<void> {
   const map: Record<string, MemberDto[]> = {};
   await Promise.all(
     groups.value.map(async (group) => {
-      const result = await run(() => api.listParticipants(group.id));
+      const result = await run(() => api.listParticipants(group.id), undefined, true);
       map[group.id] = result?.participants ?? [];
     }),
   );
-  participants.value = map;
+  if (activeProjectId.value === projectId) participants.value = map;
 }
 
 async function loadStatuses(): Promise<void> {
@@ -127,21 +146,31 @@ async function loadStatuses(): Promise<void> {
     statuses.value = {};
     return;
   }
-  const result = await run(() => api.listMemberStatuses(projectId));
-  if (!result) return;
+  const result = await run(() => api.listMemberStatuses(projectId), undefined, true);
+  if (!result || activeProjectId.value !== projectId) return;
   const map: Record<string, MemberStatusDto> = {};
   for (const status of result.memberStatuses) map[status.memberId] = status;
   statuses.value = map;
 }
 
 async function selectProject(projectId: string): Promise<void> {
-  if (activeProjectId.value === projectId) return;
+  if (busy.value || activeProjectId.value === projectId) return;
+  clearMessages();
   activeProjectId.value = projectId;
   newGroupSelection.value = [];
+  newMemberName.value = "";
+  newGroupName.value = "";
+  members.value = [];
+  groups.value = [];
+  participants.value = {};
+  statuses.value = {};
+  pendingProjectPurge.value = null;
+  pendingGroupPurge.value = null;
   await loadActiveProject();
 }
 
 async function createProject(): Promise<void> {
+  if (busy.value) return;
   const name = newProjectName.value.trim();
   if (name === "") {
     error.value = "项目名称不能为空。";
@@ -155,6 +184,7 @@ async function createProject(): Promise<void> {
 }
 
 async function addMember(): Promise<void> {
+  if (busy.value) return;
   const projectId = activeProjectId.value;
   const name = newMemberName.value.trim();
   if (projectId === null) return;
@@ -169,13 +199,14 @@ async function addMember(): Promise<void> {
 }
 
 async function removeMember(member: MemberDto): Promise<void> {
+  if (busy.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
   const result = await run(
     () => api.removeMember(projectId, member.id),
     `成员「${member.displayName}」已移除。`,
   );
-  if (result === null && error.value === null) return;
+  if (result === null) return;
   newGroupSelection.value = newGroupSelection.value.filter((id) => id !== member.id);
   await loadActiveProject();
 }
@@ -194,6 +225,7 @@ function lifecycleLabel(member: MemberDto): string {
 
 /** T3 #50：暂停 / 恢复成员（无需逐次确认；可恢复、不物理删除）。 */
 async function toggleMemberStatus(member: MemberDto): Promise<void> {
+  if (busy.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
   const toActive = member.status !== "active";
@@ -208,6 +240,7 @@ async function toggleMemberStatus(member: MemberDto): Promise<void> {
 }
 
 async function assignManager(member: MemberDto): Promise<void> {
+  if (busy.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
   const result = await run(
@@ -225,6 +258,7 @@ function toggleGroupSelection(memberId: string): void {
 }
 
 async function createGroup(): Promise<void> {
+  if (busy.value) return;
   const projectId = activeProjectId.value;
   const name = newGroupName.value.trim();
   if (projectId === null) return;
@@ -247,6 +281,7 @@ async function createGroup(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function archiveProject(): Promise<void> {
+  if (busy.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
   const result = await run(() => api.archiveProject(projectId), "项目已归档（可恢复）。");
@@ -255,6 +290,7 @@ async function archiveProject(): Promise<void> {
 }
 
 async function restoreProject(): Promise<void> {
+  if (busy.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
   const result = await run(() => api.restoreProject(projectId), "项目已恢复。");
@@ -264,6 +300,7 @@ async function restoreProject(): Promise<void> {
 
 /** 第一刀：只取级联清单与确认凭据，不删除；清单显示在确认面板里等人点「确认永久删除」。 */
 async function requestProjectPurge(): Promise<void> {
+  if (busy.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
   const outcome = await run(() => api.purgeProject(projectId));
@@ -273,12 +310,14 @@ async function requestProjectPurge(): Promise<void> {
 }
 
 async function confirmProjectPurge(): Promise<void> {
+  if (busy.value) return;
   const confirmation = pendingProjectPurge.value;
   if (confirmation === null) return;
   const outcome = await run(() => api.purgeProject(confirmation.projectId, confirmation.token));
   if (!outcome) return;
   pendingProjectPurge.value = null;
   if (outcome.state === "deleted") {
+    notice.value = "项目已永久删除。";
     activeProjectId.value = null;
     await loadProjects();
   }
@@ -290,18 +329,21 @@ function cancelProjectPurge(): void {
 }
 
 async function archiveGroup(group: GroupDto): Promise<void> {
+  if (busy.value) return;
   const result = await run(() => api.archiveGroup(group.id), `群组「${group.name}」已归档（可恢复）。`);
   if (!result) return;
   await loadActiveProject();
 }
 
 async function restoreGroup(group: GroupDto): Promise<void> {
+  if (busy.value) return;
   const result = await run(() => api.restoreGroup(group.id), `群组「${group.name}」已恢复。`);
   if (!result) return;
   await loadActiveProject();
 }
 
 async function requestGroupPurge(group: GroupDto): Promise<void> {
+  if (busy.value) return;
   const outcome = await run(() => api.purgeGroup(group.id));
   if (!outcome) return;
   if (outcome.state === "confirmation_required") pendingGroupPurge.value = outcome.confirmation;
@@ -309,11 +351,13 @@ async function requestGroupPurge(group: GroupDto): Promise<void> {
 }
 
 async function confirmGroupPurge(): Promise<void> {
+  if (busy.value) return;
   const confirmation = pendingGroupPurge.value;
   if (confirmation === null) return;
   const outcome = await run(() => api.purgeGroup(confirmation.groupId, confirmation.token));
   if (!outcome) return;
   pendingGroupPurge.value = null;
+  if (outcome.state === "deleted") notice.value = "群组已永久删除。";
   await loadActiveProject();
 }
 
@@ -375,474 +419,223 @@ onMounted(() => void loadProjects());
 </script>
 
 <template>
-  <section class="card">
-    <h1>项目</h1>
-    <p class="muted">
-      创建一个项目，在项目内添加成员、指定一个顶层 manager，并创建带参与者的群组。
-      项目之间数据隔离；归档可恢复，永久删除需要你二次确认。
-      真实 agent 成员由 MCP 入群（后续），本页管理已存在的成员。
-    </p>
+  <section class="page projects-page">
+    <header class="page-header">
+      <div>
+        <h1>项目与群组</h1>
+        <p class="page-description">把成员和对话放在同一个项目中，让协作井然有序。</p>
+      </div>
+    </header>
 
-    <p v-if="error" class="error" data-testid="error">{{ error }}</p>
-    <p v-if="notice" class="notice" data-testid="notice">{{ notice }}</p>
+    <p v-if="error" class="error" role="alert" data-testid="error">{{ error }}</p>
+    <p v-if="notice" class="notice" role="status" data-testid="notice">{{ notice }}</p>
 
-    <!-- 新建项目 -->
-    <form class="row" @submit.prevent="createProject">
-      <input v-model="newProjectName" placeholder="新项目名称" data-testid="new-project-name" />
-      <button type="submit" :disabled="busy" data-testid="create-project">创建项目</button>
-      <button
-        type="button"
-        :disabled="busy"
-        class="chip"
-        data-testid="toggle-archived"
-        @click="toggleShowArchived"
-      >
-        {{ showArchived ? "隐藏已归档" : "显示已归档" }}
-      </button>
-    </form>
-
-    <!-- 项目切换 -->
-    <div v-if="projects.length > 0" class="tabs" data-testid="project-list">
-      <button
-        v-for="project in projects"
-        :key="project.id"
-        type="button"
-        class="tab"
-        :class="{ active: project.id === activeProjectId }"
-        @click="selectProject(project.id)"
-      >
-        {{ project.name }}<template v-if="project.archivedAt">（已归档）</template>
-      </button>
-    </div>
+    <section class="panel project-picker" aria-labelledby="project-picker-title" :aria-busy="loading">
+      <div class="section-heading">
+        <h2 id="project-picker-title">我的项目 <span class="count">{{ projects.length }}</span></h2>
+        <button type="button" class="text-button" :disabled="busy" :aria-pressed="showArchived" data-testid="toggle-archived" @click="toggleShowArchived">
+          {{ showArchived ? "隐藏已归档" : "显示已归档" }}
+        </button>
+      </div>
+      <div v-if="projects.length > 0" class="project-tabs" role="group" aria-label="选择项目" data-testid="project-list">
+        <button v-for="project in projects" :key="project.id" type="button" class="project-tab" :class="{ active: project.id === activeProjectId }" :aria-pressed="project.id === activeProjectId" :disabled="busy" @click="selectProject(project.id)">
+          {{ project.name }}<span v-if="project.archivedAt" class="muted small"> · 已归档</span>
+        </button>
+      </div>
+      <p v-if="loading && projects.length === 0" class="muted small" role="status">正在加载项目…</p>
+      <form class="project-create" @submit.prevent="createProject">
+        <label class="field" for="new-project-name">新项目名称<input id="new-project-name" v-model="newProjectName" :disabled="busy" required placeholder="例如：产品研发" data-testid="new-project-name" /></label>
+        <button type="submit" class="primary" :disabled="busy" data-testid="create-project">创建项目</button>
+      </form>
+    </section>
 
     <template v-if="activeProject">
-      <div class="panel" data-testid="project-detail">
-        <h2>
-          {{ activeProject.name }}
-          <span v-if="activeProject.archivedAt" class="badge" data-testid="project-archived-badge">已归档</span>
-        </h2>
-        <p class="muted small">项目 ID：<code>{{ activeProject.id }}</code></p>
-        <p class="small"><RouterLink :to="{ path: '/runtimes', query: { projectId: activeProject.id } }">管理本项目的托管 Agent</RouterLink></p>
-        <p data-testid="manager-line">
-          顶层 manager：
-          <strong v-if="manager" data-testid="manager-name">{{ manager.displayName }}</strong>
-          <span v-else class="muted">（未指定，可稍后指定）</span>
-        </p>
-
-        <!-- T1 #48：项目生命周期 -->
-        <div class="row" data-testid="project-lifecycle">
-          <button
-            v-if="!activeProject.archivedAt"
-            type="button"
-            :disabled="busy"
-            data-testid="archive-project"
-            @click="archiveProject"
-          >
-            归档项目
-          </button>
-          <button
-            v-else
-            type="button"
-            :disabled="busy"
-            data-testid="restore-project"
-            @click="restoreProject"
-          >
-            恢复项目
-          </button>
-          <button
-            type="button"
-            :disabled="busy"
-            class="danger"
-            data-testid="purge-project"
-            @click="requestProjectPurge"
-          >
-            永久删除项目
-          </button>
-        </div>
-
-        <div v-if="pendingProjectPurge" class="confirm" data-testid="project-purge-confirm">
-          <h3>确认永久删除项目「{{ pendingProjectPurge.projectName }}」？</h3>
-          <p class="muted small">
-            这一步不可恢复，并且会级联清除该项目下的以下内容（任务与记忆分别属于阶段 3、4，尚未落库）：
-          </p>
-          <ul class="small">
-            <li>群组：{{ pendingProjectPurge.cascade.groups }} 个</li>
-            <li>成员：{{ pendingProjectPurge.cascade.members }} 个</li>
-            <li>群聊消息：{{ pendingProjectPurge.cascade.messages }} 条（投递记录 {{ pendingProjectPurge.cascade.deliveries }} 条）</li>
-            <li>成员状态：{{ pendingProjectPurge.cascade.memberStatuses }} 条</li>
-            <li>MCP 会话记录：{{ pendingProjectPurge.cascade.mcpSessions }} 条</li>
-          </ul>
-          <p class="muted small">确认凭据在 {{ pendingProjectPurge.expiresAt }} 后失效。</p>
-          <div class="row">
-            <button
-              type="button"
-              :disabled="busy"
-              class="danger"
-              data-testid="confirm-purge-project"
-              @click="confirmProjectPurge"
-            >
-              确认永久删除
-            </button>
-            <button type="button" data-testid="cancel-purge-project" @click="cancelProjectPurge">取消</button>
+      <section class="panel project-summary" aria-labelledby="active-project-title" data-testid="project-detail">
+        <div class="section-heading">
+          <div>
+            <h2 id="active-project-title">{{ activeProject.name }} <span v-if="activeProject.archivedAt" class="badge" data-testid="project-archived-badge">已归档</span></h2>
+            <p class="muted small" data-testid="manager-line">顶层 manager：<strong v-if="manager" data-testid="manager-name">{{ manager.displayName }}</strong><span v-else>未指定</span></p>
           </div>
+          <RouterLink :to="{ path: '/runtimes', query: { projectId: activeProject.id } }">管理托管 Agent <span aria-hidden="true">↗</span></RouterLink>
         </div>
-      </div>
-
-      <!-- 成员 -->
-      <div class="panel">
-        <h3>成员</h3>
-        <p class="muted small">
-          成员生命周期与在线状态分开建模：暂停（已暂停）保留历史、数据与岗位，可随时恢复；
-          断连不删除成员，也不改写这里的生命周期状态。
-        </p>
-        <form class="row" @submit.prevent="addMember">
-          <input v-model="newMemberName" placeholder="成员显示名（人）" data-testid="new-member-name" />
-          <button type="submit" :disabled="busy" data-testid="add-member">添加成员</button>
-        </form>
-        <p v-if="members.length === 0" class="muted">暂无成员。</p>
-        <ul v-else class="list" data-testid="member-list">
-          <li v-for="member in members" :key="member.id" class="list-item">
-            <span>
-              <span class="dot" :class="isOnline(member.id) ? 'online' : 'offline'" data-testid="online-dot"></span>
-              {{ member.displayName }}
-              <span class="badge">{{ member.kind === "human" ? "人" : "agent" }}</span>
-              <span v-if="member.role === 'manager'" class="badge manager">manager</span>
-              <!-- T3 #50：生命周期状态（active/disabled/pending），与右侧在线/运行状态分开。 -->
-              <span class="badge lifecycle" :class="`lifecycle-${member.status}`" data-testid="member-lifecycle-status">
-                {{ lifecycleLabel(member) }}
-              </span>
-              <span v-if="member.kind === 'agent'" class="badge state" data-testid="member-state">
-                {{ connectionLabel(member.id) }} / {{ stateLabel(member.id) }}
-              </span>
-            </span>
-            <span class="actions">
-              <button
-                type="button"
-                :disabled="busy || member.role === 'manager'"
-                @click="assignManager(member)"
-              >
-                设为 manager
-              </button>
-              <button
-                type="button"
-                :disabled="busy"
-                data-testid="toggle-member-status"
-                @click="toggleMemberStatus(member)"
-              >
-                {{ member.status === "active" ? "暂停成员" : "恢复成员" }}
-              </button>
-              <button type="button" :disabled="busy" class="danger" @click="removeMember(member)">
-                移除
-              </button>
-            </span>
-          </li>
-        </ul>
-      </div>
-
-      <!-- 成员在线状态（T2 基础展示；完整状态看板在 T4） -->
-      <div class="panel">
-        <h3>成员在线状态</h3>
-        <p class="muted small">
-          在线以 MCP 连接/心跳为准（不靠终端画面推断）：连接状态来自全局 MCP 会话，运行状态（等待/工作）来自成员显式上报。
-        </p>
-        <button type="button" :disabled="busy" data-testid="refresh-status" @click="loadStatuses">刷新状态</button>
-        <p v-if="members.length === 0" class="muted">暂无成员。</p>
-        <ul v-else class="list" data-testid="status-list">
-          <li v-for="member in members" :key="member.id" class="list-item">
-            <span>
-              <span class="dot" :class="isOnline(member.id) ? 'online' : 'offline'"></span>
-              {{ member.displayName }}
-            </span>
-            <span class="small" data-testid="status-detail">
-              {{ connectionLabel(member.id) }} · {{ stateLabel(member.id) }}
-              <template v-if="staleLabel(member.id)">
-                · <span class="bad">{{ staleLabel(member.id) }}</span>
-              </template>
-            </span>
-          </li>
-        </ul>
-      </div>
-
-      <!-- 群组 -->
-      <div class="panel">
-        <h3>群组</h3>
-        <div class="row">
-          <input v-model="newGroupName" placeholder="新群组名称" data-testid="new-group-name" />
-        </div>
-        <fieldset class="participants-picker" data-testid="participant-picker">
-          <legend>参与者（只能从项目成员中选择）</legend>
-          <p v-if="members.length === 0" class="muted small">先添加成员，才能选择参与者。</p>
-          <label v-for="member in members" :key="member.id" class="checkbox">
-            <input
-              type="checkbox"
-              :checked="newGroupSelection.includes(member.id)"
-              @change="toggleGroupSelection(member.id)"
-            />
-            {{ member.displayName }}
-          </label>
-        </fieldset>
-        <button type="button" :disabled="busy" data-testid="create-group" @click="createGroup">
-          创建群组
-        </button>
-
-        <p v-if="groups.length === 0" class="muted">暂无群组。</p>
-        <ul v-else class="list" data-testid="group-list">
-          <li v-for="group in groups" :key="group.id" class="list-item column">
-            <strong>
-              {{ group.name }}
-              <span v-if="group.archivedAt" class="badge" data-testid="group-archived-badge">已归档</span>
-              <!-- T2 #49 / #32：writable=false = 子树只读可见（可看元数据与历史，不唤醒、不能发消息）。 -->
-              <span v-if="group.writable === false" class="badge" data-testid="group-readonly-badge">只读可见</span>
-            </strong>
-            <span class="small muted">参与者：{{ participantNames(group.id) }}</span>
-            <span class="actions" data-testid="group-lifecycle">
-              <RouterLink :to="{ path: '/runtimes', query: { projectId: group.projectId, groupId: group.id } }">托管 Agent</RouterLink>
-              <button
-                v-if="!group.archivedAt"
-                type="button"
-                :disabled="busy"
-                data-testid="archive-group"
-                @click="archiveGroup(group)"
-              >
-                归档群组
-              </button>
-              <button
-                v-else
-                type="button"
-                :disabled="busy"
-                data-testid="restore-group"
-                @click="restoreGroup(group)"
-              >
-                恢复群组
-              </button>
-              <button
-                type="button"
-                :disabled="busy"
-                class="danger"
-                data-testid="purge-group"
-                @click="requestGroupPurge(group)"
-              >
-                永久删除群组
-              </button>
-            </span>
-          </li>
-        </ul>
-
-        <div v-if="pendingGroupPurge" class="confirm" data-testid="group-purge-confirm">
-          <h3>确认永久删除群组「{{ pendingGroupPurge.groupName }}」？</h3>
-          <p class="muted small">这一步不可恢复。删群组只清除群聊与参与者关系，项目成员本身保留。</p>
-          <ul class="small">
-            <li>群聊消息：{{ pendingGroupPurge.cascade.messages }} 条（投递记录 {{ pendingGroupPurge.cascade.deliveries }} 条）</li>
-            <li>参与者关系：{{ pendingGroupPurge.cascade.participants }} 条</li>
-            <li>MCP 会话记录：{{ pendingGroupPurge.cascade.mcpSessions }} 条</li>
-          </ul>
-          <div class="row">
-            <button
-              type="button"
-              :disabled="busy"
-              class="danger"
-              data-testid="confirm-purge-group"
-              @click="confirmGroupPurge"
-            >
-              确认永久删除
-            </button>
-            <button type="button" data-testid="cancel-purge-group" @click="cancelGroupPurge">取消</button>
+        <p v-if="activeProject.archivedAt" class="muted small">项目已归档。恢复项目后，可以继续添加成员与群组。</p>
+        <details class="project-management" data-testid="project-actions">
+          <summary>项目管理</summary>
+          <p class="muted small project-id">项目 ID：<code>{{ activeProject.id }}</code></p>
+          <div class="actions" data-testid="project-lifecycle">
+            <button v-if="!activeProject.archivedAt" type="button" class="secondary" :disabled="busy" data-testid="archive-project" @click="archiveProject">归档项目</button>
+            <button v-else type="button" class="secondary" :disabled="busy" data-testid="restore-project" @click="restoreProject">恢复项目</button>
+            <button type="button" :disabled="busy" class="text-button danger" data-testid="purge-project" @click="requestProjectPurge">永久删除项目</button>
           </div>
-        </div>
+          <p class="muted small">归档可恢复；永久删除会清除项目数据，并需要再次确认。</p>
+          <div v-if="pendingProjectPurge" class="confirm" role="region" aria-labelledby="project-purge-title" data-testid="project-purge-confirm">
+            <h3 id="project-purge-title">确认永久删除项目「{{ pendingProjectPurge.projectName }}」？</h3>
+            <p class="muted small">此操作不可恢复，将同时删除以下内容：</p>
+            <ul class="small">
+              <li>群组：{{ pendingProjectPurge.cascade.groups }} 个</li>
+              <li>成员：{{ pendingProjectPurge.cascade.members }} 个</li>
+              <li>群聊消息：{{ pendingProjectPurge.cascade.messages }} 条（投递记录 {{ pendingProjectPurge.cascade.deliveries }} 条）</li>
+              <li>成员状态：{{ pendingProjectPurge.cascade.memberStatuses }} 条</li>
+              <li>MCP 会话记录：{{ pendingProjectPurge.cascade.mcpSessions }} 条</li>
+            </ul>
+            <p class="muted small">确认凭据在 {{ pendingProjectPurge.expiresAt }} 后失效。</p>
+            <div class="actions">
+              <button type="button" class="secondary" :disabled="busy" data-testid="cancel-purge-project" @click="cancelProjectPurge">取消</button>
+              <button type="button" :disabled="busy" class="danger" data-testid="confirm-purge-project" @click="confirmProjectPurge">确认永久删除</button>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <p v-if="loadingProject" class="muted small" role="status">正在更新项目内容…</p>
+      <div class="project-columns" :aria-busy="loadingProject">
+        <section class="panel members-panel" aria-labelledby="members-title">
+          <div class="section-heading"><h2 id="members-title">成员 <span class="count">{{ members.length }}</span></h2></div>
+          <p class="muted small section-description">添加人类成员，Agent 可通过 CLI 接入项目。</p>
+          <form class="inline-create" @submit.prevent="addMember">
+            <label class="field" for="new-member-name">成员显示名<input id="new-member-name" v-model="newMemberName" :disabled="busy || !!activeProject.archivedAt" required placeholder="填写成员名称" data-testid="new-member-name" /></label>
+            <button type="submit" class="secondary" :disabled="busy || !!activeProject.archivedAt" data-testid="add-member">添加成员</button>
+          </form>
+          <div v-if="members.length === 0 && !loadingProject" class="empty-state compact-empty"><p>暂无成员。添加第一位成员，开始协作。</p></div>
+          <ul v-else class="member-list" data-testid="member-list">
+            <li v-for="member in members" :key="member.id" class="member-item">
+              <div class="member-info">
+                <span class="member-avatar" aria-hidden="true">{{ member.displayName.slice(0, 1) }}</span>
+                <div class="member-copy">
+                  <div class="member-title"><strong>{{ member.displayName }}</strong><span class="badge">{{ member.kind === "human" ? "人" : "agent" }}</span><span v-if="member.role === 'manager'" class="badge manager">manager</span></div>
+                  <div class="member-meta">
+                    <span class="dot" :class="isOnline(member.id) ? 'online' : 'offline'" :aria-label="isOnline(member.id) ? '已连接' : '未在线'" data-testid="online-dot"></span>
+                    <span class="badge lifecycle" :class="`lifecycle-${member.status}`" data-testid="member-lifecycle-status">{{ lifecycleLabel(member) }}</span>
+                    <span v-if="member.kind === 'agent'" class="small muted" data-testid="member-state">{{ connectionLabel(member.id) }} / {{ stateLabel(member.id) }}</span>
+                  </div>
+                </div>
+              </div>
+              <details class="member-manage" data-testid="member-management">
+                <summary>管理成员</summary>
+                <div class="actions member-actions">
+                  <button type="button" class="secondary" :disabled="busy || member.role === 'manager' || !!activeProject.archivedAt" @click="assignManager(member)">设为 manager</button>
+                  <button type="button" class="secondary" :disabled="busy || !!activeProject.archivedAt" data-testid="toggle-member-status" @click="toggleMemberStatus(member)">{{ member.status === "active" ? "暂停成员" : "恢复成员" }}</button>
+                  <button type="button" class="text-button danger" :disabled="busy || !!activeProject.archivedAt" @click="removeMember(member)">移除</button>
+                </div>
+              </details>
+            </li>
+          </ul>
+
+          <details class="status-disclosure" data-testid="member-status-details">
+            <summary>成员在线状态</summary>
+            <div class="status-description"><p class="muted small">连接与在线状态独立于成员是否在岗。暂停会保留历史、数据与岗位，可随时恢复。</p><button type="button" class="text-button" :disabled="busy" data-testid="refresh-status" @click="clearMessages(); loadStatuses()">刷新状态</button></div>
+            <p v-if="members.length === 0" class="muted small">暂无成员。</p>
+            <ul v-else class="status-list" data-testid="status-list">
+              <li v-for="member in members" :key="member.id"><span>{{ member.displayName }}</span><span class="small muted" data-testid="status-detail">{{ connectionLabel(member.id) }} · {{ stateLabel(member.id) }}<template v-if="staleLabel(member.id)"> · <span class="bad">{{ staleLabel(member.id) }}</span></template></span></li>
+            </ul>
+          </details>
+        </section>
+
+        <section class="panel groups-panel" aria-labelledby="groups-title">
+          <div class="section-heading"><h2 id="groups-title">群组 <span class="count">{{ groups.length }}</span></h2></div>
+          <p class="muted small section-description">按协作主题建群，为每个群组选择参与者。</p>
+          <details class="create-section" data-testid="group-create" :open="groups.length === 0">
+            <summary>创建群组</summary>
+            <form class="group-create" @submit.prevent="createGroup">
+              <label class="field" for="new-group-name">群组名称<input id="new-group-name" v-model="newGroupName" :disabled="busy || !!activeProject.archivedAt" required placeholder="例如：设计讨论" data-testid="new-group-name" /></label>
+              <fieldset class="participants-picker" :disabled="busy || !!activeProject.archivedAt" data-testid="participant-picker">
+                <legend>参与者</legend>
+                <p v-if="members.length === 0" class="muted small">先添加成员，才能选择参与者。</p>
+                <label v-for="member in members" :key="member.id" class="participant-option"><input type="checkbox" :checked="newGroupSelection.includes(member.id)" @change="toggleGroupSelection(member.id)" />{{ member.displayName }}</label>
+              </fieldset>
+              <div class="actions"><button type="submit" class="secondary" :disabled="busy || !!activeProject.archivedAt" data-testid="create-group">创建群组</button><span class="muted small">已选 {{ newGroupSelection.length }} 位参与者</span></div>
+            </form>
+          </details>
+          <div v-if="groups.length === 0 && !loadingProject" class="empty-state compact-empty"><p>暂无群组。创建一个群组，把相关讨论放在一起。</p></div>
+          <ul v-else class="group-list" data-testid="group-list">
+            <li v-for="group in groups" :key="group.id" class="group-item">
+              <div class="group-heading"><strong>{{ group.name }}</strong><span v-if="group.archivedAt" class="badge" data-testid="group-archived-badge">已归档</span><span v-if="group.writable === false" class="badge" data-testid="group-readonly-badge">只读可见</span></div>
+              <p class="small muted group-participants">参与者：{{ participantNames(group.id) }}</p>
+              <div class="actions group-links"><RouterLink :to="{ path: '/chat', query: { projectId: group.projectId, groupId: group.id } }">进入群聊 <span aria-hidden="true">↗</span></RouterLink><RouterLink :to="{ path: '/runtimes', query: { projectId: group.projectId, groupId: group.id } }">托管 Agent</RouterLink></div>
+              <details class="group-management" data-testid="group-management">
+                <summary>群组管理</summary>
+                <div class="actions" data-testid="group-lifecycle">
+                  <button v-if="!group.archivedAt" type="button" class="secondary" :disabled="busy" data-testid="archive-group" @click="archiveGroup(group)">归档群组</button>
+                  <button v-else type="button" class="secondary" :disabled="busy" data-testid="restore-group" @click="restoreGroup(group)">恢复群组</button>
+                  <button type="button" class="text-button danger" :disabled="busy" data-testid="purge-group" @click="requestGroupPurge(group)">永久删除群组</button>
+                </div>
+              </details>
+            </li>
+          </ul>
+
+          <div v-if="pendingGroupPurge" class="confirm" role="region" aria-labelledby="group-purge-title" data-testid="group-purge-confirm">
+            <h3 id="group-purge-title">确认永久删除群组「{{ pendingGroupPurge.groupName }}」？</h3>
+            <p class="muted small">此操作不可恢复。删除群组会清除群聊与参与者关系，项目成员仍会保留。</p>
+            <ul class="small">
+              <li>群聊消息：{{ pendingGroupPurge.cascade.messages }} 条（投递记录 {{ pendingGroupPurge.cascade.deliveries }} 条）</li>
+              <li>参与者关系：{{ pendingGroupPurge.cascade.participants }} 条</li>
+              <li>MCP 会话记录：{{ pendingGroupPurge.cascade.mcpSessions }} 条</li>
+            </ul>
+            <div class="actions"><button type="button" class="secondary" :disabled="busy" data-testid="cancel-purge-group" @click="cancelGroupPurge">取消</button><button type="button" :disabled="busy" class="danger" data-testid="confirm-purge-group" @click="confirmGroupPurge">确认永久删除</button></div>
+          </div>
+        </section>
       </div>
     </template>
-    <p v-else class="muted">还没有项目，创建第一个项目开始。</p>
+    <div v-else-if="!loading && !error" class="panel empty-state"><h2>开始第一个项目</h2><p>在上方填写项目名称，然后添加成员、创建群组。</p></div>
   </section>
 </template>
 
 <style scoped>
-.row {
-  display: flex;
-  gap: 0.5rem;
-  margin: 0.75rem 0;
-  flex-wrap: wrap;
-}
-
-input {
-  padding: 0.4rem 0.6rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--card-bg);
-  color: var(--fg);
-  min-width: 200px;
-}
-
-button {
-  padding: 0.4rem 0.8rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--card-bg);
-  color: var(--fg);
-  cursor: pointer;
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-button.danger {
-  color: var(--bad);
-}
-
-.tabs {
-  display: flex;
-  gap: 0.35rem;
-  flex-wrap: wrap;
-  margin: 1rem 0;
-}
-
-.tab {
-  border-radius: 999px;
-}
-
-.tab.active {
-  background: rgba(37, 99, 235, 0.14);
-  color: var(--accent);
-  border-color: var(--accent);
-}
-
-.panel {
-  border-top: 1px solid var(--border);
-  padding-top: 0.75rem;
-  margin-top: 1rem;
-}
-
-.panel h2,
-.panel h3 {
-  margin: 0.25rem 0;
-}
-
-.list {
-  list-style: none;
-  padding: 0;
-  margin: 0.5rem 0 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-}
-
-.list-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
-
-/* T1 #48：永久删除的二次确认面板（红边提示不可恢复）。 */
-.confirm {
-  margin: 0.75rem 0 0;
-  padding: 0.75rem 1rem;
-  border: 1px solid var(--bad);
-  border-radius: 8px;
-  background: rgba(220, 38, 38, 0.06);
-}
-
-.confirm h3 {
-  margin: 0 0 0.35rem;
-  font-size: 1rem;
-}
-
-.confirm ul {
-  margin: 0.25rem 0 0.5rem;
-  padding-left: 1.25rem;
-}
-
-.chip {
-  border-radius: 999px;
-}
-
-.list-item.column {
-  flex-direction: column;
-  align-items: flex-start;
-}
-
-.actions {
-  display: flex;
-  gap: 0.35rem;
-}
-
-.badge {
-  font-size: 0.72rem;
-  padding: 0.05rem 0.4rem;
-  border-radius: 999px;
-  background: rgba(127, 127, 127, 0.18);
-  margin-left: 0.25rem;
-}
-
-.badge.manager {
-  background: rgba(37, 99, 235, 0.18);
-  color: var(--accent);
-}
-
-.badge.state {
-  background: rgba(127, 127, 127, 0.12);
-  color: var(--muted);
-}
-
-/* T3 #50：生命周期状态徽章（暂停红、待激活黄、在岗沿用中性色）。 */
-.badge.lifecycle-disabled {
-  background: rgba(220, 38, 38, 0.16);
-  color: var(--bad);
-}
-
-.badge.lifecycle-pending {
-  background: rgba(234, 179, 8, 0.18);
-}
-
-.dot {
-  display: inline-block;
-  width: 0.5rem;
-  height: 0.5rem;
-  border-radius: 50%;
-  margin-right: 0.3rem;
-  vertical-align: middle;
-}
-
-.dot.online {
-  background: var(--ok);
-}
-
-.dot.offline {
-  background: var(--muted);
-}
-
-.participants-picker {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.5rem 0.75rem;
-  margin: 0.5rem 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-}
-
-.participants-picker legend {
-  font-size: 0.8rem;
-  color: var(--muted);
-  padding: 0 0.25rem;
-}
-
-.checkbox {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-}
-
-.checkbox input {
-  min-width: auto;
-}
-
-.notice {
-  color: var(--ok);
-  margin-top: 1rem;
-}
+.projects-page > .panel, .project-columns { margin-top: 1.25rem; }
+.section-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .75rem 1rem; }
+.section-heading h2 { margin: 0; font-size: 1.05rem; overflow-wrap: anywhere; }
+.section-heading p { margin: .35rem 0 0; }
+.section-heading > div { min-width: 0; }
+.count { color: var(--muted); font-size: .85rem; font-weight: 400; margin-left: .35rem; }
+.project-tabs { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1rem; }
+.project-tab { max-width: 100%; text-align: left; overflow-wrap: anywhere; background: var(--surface-subtle); }
+.project-tab.active { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+.project-create, .inline-create { display: flex; align-items: end; flex-wrap: wrap; gap: .75rem; margin-top: 1.25rem; }
+.project-create .field { flex: 1; max-width: 25rem; min-width: min(100%, 15rem); }
+.inline-create .field { flex: 1; min-width: min(100%, 10rem); }
+.project-columns { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 1.25rem; align-items: start; }
+.project-columns > .panel { min-width: 0; }
+.project-management { border-top: 1px solid var(--border); padding-top: .9rem; margin-top: 1rem; }
+.project-id { overflow-wrap: anywhere; }
+summary { cursor: pointer; font-size: .85rem; color: var(--muted); min-height: 2rem; align-content: center; }
+summary::marker { color: var(--muted); }
+.section-description { margin: .5rem 0 0; }
+.member-list, .group-list, .status-list { list-style: none; padding: 0; margin: 1rem 0 0; }
+.member-item, .group-item { padding: 1rem 0; border-top: 1px solid var(--border); min-width: 0; }
+.member-item:first-child, .group-item:first-child { border-top: 0; }
+.member-info { display: flex; align-items: start; gap: .75rem; }
+.member-avatar { flex: 0 0 2rem; height: 2rem; display: grid; place-items: center; border-radius: 50%; background: var(--surface-subtle); color: var(--muted); font-size: .85rem; }
+.member-copy { min-width: 0; flex: 1; }
+.member-title, .member-meta, .group-heading { display: flex; align-items: center; flex-wrap: wrap; gap: .35rem; overflow-wrap: anywhere; }
+.member-meta { margin-top: .35rem; }
+.member-title strong, .group-heading strong { min-width: 0; overflow-wrap: anywhere; }
+.member-meta .badge { font-size: .75rem; }
+.manager { color: var(--accent); background: var(--accent-soft); }
+.lifecycle-disabled { color: var(--bad); }
+.lifecycle-pending { color: var(--warn); }
+.member-manage { margin: .5rem 0 0 2.75rem; }
+.member-actions { margin-top: .5rem; }
+.dot { width: .4rem; height: .4rem; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+.dot.online { background: var(--ok); }
+.status-disclosure { margin-top: .5rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+.status-description p { margin: .5rem 0; }
+.status-list li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .35rem .75rem; padding: .65rem 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.create-section { margin-top: 1rem; padding: .75rem 1rem; background: var(--surface-subtle); border-radius: 10px; }
+.create-section summary { color: var(--fg); font-weight: 500; }
+.group-create { display: grid; gap: .85rem; padding-top: .75rem; }
+.participants-picker { display: flex; flex-wrap: wrap; gap: .5rem .85rem; min-width: 0; padding: .65rem 0 0; margin: 0; border: 0; }
+.participants-picker legend { padding: 0; font-size: .85rem; }
+.participants-picker p { margin: 0; }
+.participant-option { display: inline-flex; align-items: center; gap: .35rem; font-size: .85rem; min-height: 2rem; overflow-wrap: anywhere; }
+.participant-option input { flex: 0 0 auto; }
+.group-participants { margin: .5rem 0 .75rem; overflow-wrap: anywhere; }
+.group-links { font-size: .85rem; gap: 1rem; }
+.group-management { margin-top: .65rem; }
+.group-management .actions { margin-top: .5rem; }
+.confirm { margin-top: 1rem; padding: 1rem; border: 1px solid var(--bad); border-radius: 10px; background: var(--card-bg); overflow-wrap: anywhere; }
+.confirm h3 { font-size: 1rem; margin: 0 0 .5rem; }
+.confirm ul { padding-left: 1.15rem; }
+.compact-empty { padding: 1.25rem .5rem; }
+@media (max-width: 1100px) { .project-columns { grid-template-columns: 1fr; } }
+@media (max-width: 620px) { .project-create .field { max-width: none; width: 100%; flex-basis: 100%; } .project-tabs { gap: .4rem; } .member-manage { margin-left: 0; } }
 </style>
