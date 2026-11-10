@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { setImmediate } from "node:timers/promises";
+import { setImmediate, setTimeout as delay } from "node:timers/promises";
 import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import type { DbRow } from "../src/server/db/driver.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
@@ -153,4 +153,27 @@ test("初始聊天查询已取空快照时到达的唤醒，仍在当前 wait �
     assert.equal(result.drainedBacklog, false);
     assert.equal(f.core.pendingWaitCount, 0);
   } finally { release(); f.db.query = originalQuery; await f.close(); }
+});
+
+test("慢于轮询间隔的空查询不会使已到期的 wait 无限重新排队", async () => {
+  const f = await fixture();
+  const originalQuery = f.db.query.bind(f.db);
+  let reads = 0;
+  f.db.query = async <T extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []): Promise<T[]> => {
+    const rows = await originalQuery<T>(sql, params);
+    if (sql.includes("FROM work_events") && sql.includes("delivery_state") && sql.includes("ORDER BY")) {
+      reads++;
+      // 查询本身完成且释放真实 DB 队列，仅让响应晚于 1 秒轮询周期。
+      await delay(1100);
+    }
+    return rows;
+  };
+  const controller = new AbortController();
+  const rescue = setTimeout(() => controller.abort(), 4000);
+  try {
+    const result = await f.core.waitForMessages("worker", { timeoutMs: 100, signal: controller.signal });
+    assert.equal(result.status, "timeout", "必须自行到期，而非依赖救援取消");
+    assert.ok(reads <= 2, "到期后只收束已有读取和一次最终检查");
+    assert.equal(f.core.pendingWaitCount, 0);
+  } finally { clearTimeout(rescue); controller.abort(); f.db.query = originalQuery; await f.close(); }
 });

@@ -308,6 +308,7 @@ interface PendingWait {
   readonly resolve: (result: WaitResult) => void;
   readonly settled: () => void;
   done: boolean;
+  deadlineReached: boolean;
   timer: NodeJS.Timeout | null;
   pollTimer: NodeJS.Timeout | null;
   draining: Promise<boolean> | null;
@@ -763,8 +764,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   }
 
   /** 串行结算同一次等待，工作事件不会扩大聊天的 mention 唤醒范围。 */
-  async function drainWait(entry: PendingWait, binding: SessionBinding, input: WaitDrainRequest): Promise<boolean> {
-    if (entry.done) return false;
+  async function drainWait(entry: PendingWait, binding: SessionBinding, input: WaitDrainRequest, finalCheck = false): Promise<boolean> {
+    if (entry.done || (entry.deadlineReached && !finalCheck)) return false;
     // 正在读取的快照可能早于新通知。最多保留积压、聊天唤醒、工作通知各一次重扫；
     // 保留各自的唤醒限制，不能用工作轮询覆盖聊天唤醒，也不能放宽 anti-loop 门控。
     if (!entry.drainRequests.some(request => request.drainedBacklog === input.drainedBacklog
@@ -988,6 +989,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
             }
           },
           done: false,
+          deadlineReached: false,
           timer: null,
           pollTimer: null,
           draining: null,
@@ -995,9 +997,13 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
           abortListener: null,
         };
         entry.timer = setTimeout(async () => {
+          // 到期后不再接收新重扫，收束已有有限队列和一次最终检查。
+          // 不强行中断 DB 查询，但慢查询也不能被每秒 poll 无限续期。
+          entry.deadlineReached = true;
+          if (entry.pollTimer) clearInterval(entry.pollTimer);
           log.debug("wait_timeout", { memberId: binding.memberId, timeoutMs });
           try {
-            if (await drainWait(entry, binding, { drainedBacklog: false, workOnly: true })) return;
+            if (await drainWait(entry, binding, { drainedBacklog: false, workOnly: true }, true)) return;
             await settle(entry, { ok: true, status: "timeout", messages: [], cursor: await lastDeliveredCursor(binding), drainedBacklog: false });
           } catch (error) {
             log.warn("wait_work_event_check_failed", { error, memberId: binding.memberId });
