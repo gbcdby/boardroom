@@ -125,7 +125,9 @@ try {
     assert.equal(task.state, "in-progress"); assert.equal(detail.reports.length, 2);
     assert.ok(detail.history.some(item => item.detail.previousDecision?.verdict === "pass"));
   });
-  const output = { status: "PASS", driver: config.dbDriver, checks, realModelReview: "NOT_RUN", baseCommit, candidateCommit };
+  const applicationCommit = (await exec("git", ["rev-parse", "HEAD"], { cwd: process.cwd() })).stdout.trim();
+  const applicationTree = (await exec("git", ["rev-parse", "HEAD^{tree}"], { cwd: process.cwd() })).stdout.trim();
+  const output = { status: "PASS", applicationCommit, applicationTree, driver: config.dbDriver, checks, realModelReview: "NOT_RUN", baseCommit, candidateCommit };
   await mkdir(".agent-output/tasks-e2e", { recursive: true });
   await writeFile(`.agent-output/tasks-e2e/${config.dbDriver}.json`, JSON.stringify(output, null, 2));
   console.log(JSON.stringify(output, null, 2));

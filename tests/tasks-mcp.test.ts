@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
+import type { DbRow } from "../src/server/db/driver.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories } from "../src/server/db/repositories.ts";
 import { createMcpCore } from "../src/server/mcp/core.ts";
@@ -91,4 +92,65 @@ test("MCP 重建 core 后 join 重投未 ACK 事件，不能用 projectId 或 ac
     await assert.rejects(recovered.taskOperation("restored", "read", { projectId: "other", taskId: task.id }), error => (error as { code: string }).code === "FORBIDDEN");
     await assert.rejects(recovered.taskOperation("restored", "read", { taskId: task.id, actor: "owner" }), error => (error as { code: string }).code === "INVALID_ARGUMENT");
   } finally { await recovered?.close(); await f.close(); }
+});
+
+test("任务事件兑现同一次等待时保留 afterCursor，不重复投递游标前的未 ACK 消息", async () => {
+  const f = await fixture();
+  try {
+    await f.core.sendMessage("manager", { text: "已读取但尚未ACK的旧消息", mentions: [f.worker.memberId] });
+    const earlier = await f.core.waitForMessages("worker", { timeoutMs: 100 });
+    assert.equal(earlier.messages.length, 1);
+    const waiting = f.core.waitForMessages("worker", { timeoutMs: 2000, afterCursor: earlier.cursor! });
+    for (let i = 0; i < 100 && f.core.pendingWaitCount === 0; i++) await setImmediate();
+    const task = await f.create();
+    const event = await waiting;
+    assert.equal(event.status, "work");
+    assert.deepEqual(event.messages, []);
+    assert.equal(event.workEvents?.[0]?.taskId, task.id);
+    await f.core.taskOperation("worker", "ack_work_event", { eventId: event.workEvents![0]!.id });
+    assert.equal(f.core.pendingWaitCount, 0);
+    assert.equal((await f.core.waitForMessages("worker", { timeoutMs: 10, afterCursor: earlier.cursor! })).status, "timeout");
+  } finally { await f.close(); }
+});
+
+test("初始聊天查询已取空快照时到达的唤醒，仍在当前 wait 内重扫并投递", async () => {
+  const f = await fixture();
+  const originalQuery = f.db.query.bind(f.db);
+  let captured!: () => void;
+  let release!: () => void;
+  const snapshot = new Promise<void>(resolve => { captured = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let armed = true;
+  f.db.query = async <T extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []): Promise<T[]> => {
+    const rows = await originalQuery<T>(sql, params);
+    // 暂停真实 SQL 的响应；驱动队列已释放，新消息可实际提交。
+    if (armed && sql.startsWith("SELECT * FROM messages WHERE group_id = ? AND seq > ? ORDER BY seq")) {
+      armed = false;
+      assert.equal(rows.length, 0);
+      captured();
+      await gate;
+    }
+    return rows;
+  };
+  try {
+    const waiting = f.core.waitForMessages("worker", { timeoutMs: 1000 });
+    await snapshot;
+    const sending = f.core.sendMessage("manager", { text: "查询快照之后到达", mentions: [f.worker.memberId] });
+    let inserted = false;
+    for (let i = 0; i < 100; i++) {
+      const rows = await originalQuery("SELECT COUNT(*) AS count FROM messages");
+      if (Number(rows[0]?.count) > 0) { inserted = true; break; }
+      await setImmediate();
+    }
+    assert.equal(inserted, true);
+    await setImmediate();
+    await setImmediate();
+    release();
+    const sent = await sending;
+    const result = await waiting;
+    assert.equal(result.status, "message");
+    assert.deepEqual(result.messages.map(message => message.id), [sent.messageId]);
+    assert.equal(result.drainedBacklog, false);
+    assert.equal(f.core.pendingWaitCount, 0);
+  } finally { release(); f.db.query = originalQuery; await f.close(); }
 });

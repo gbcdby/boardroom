@@ -40,7 +40,7 @@ function isCurrent(projectId: string, id: string, generation: number): boolean {
 function reportsOf(round: ReviewRound) { return detail.value?.reports.filter((report) => report.roundId === round.id) ?? []; }
 function roundState(state: ReviewRound["state"]): string { return ({ ready: "等待 reviewer 接手", running: "评审进行中", reported: "两轴报告已提交，等待裁决", decided: "已裁决", failed: "候选准备失败", superseded: "已被后续修改取代" })[state]; }
 function actionLabel(action: string): string {
-  return ({ "task.created": "创建任务", "task.updated": "修改任务", "task.transitioned": "变更状态", "task.commented": "添加评论", "task.review_started": "提交评审", "task.review_decided": "评审裁决", "task.review_reported": "提交评审报告" } as Record<string, string>)[action] ?? action;
+  return ({ "task.created": "创建任务", "task.updated": "修改任务", "task.transitioned": "变更状态", "task.commented": "添加评论", "task.review_started": "提交评审", "task.review_begun": "开始双轴评审", "task.review_decided": "评审裁决", "task.review_reported": "提交评审报告" } as Record<string, string>)[action] ?? action;
 }
 
 async function load(preserveDraft = true): Promise<void> {

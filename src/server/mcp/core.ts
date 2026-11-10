@@ -294,16 +294,24 @@ export const MAX_HISTORY_LIMIT = 100;
 export const DEFAULT_HISTORY_LIMIT = 20;
 
 /** 挂起中的等待（运行时对象，不落库）。 */
+interface WaitDrainRequest {
+  readonly drainedBacklog: boolean;
+  readonly workOnly?: boolean;
+  readonly wakeOnly?: boolean;
+}
+
 interface PendingWait {
   readonly ownerKey: string;
   readonly memberId: string;
   readonly groupId: string;
+  readonly afterSeq: number | undefined;
   readonly resolve: (result: WaitResult) => void;
   readonly settled: () => void;
   done: boolean;
   timer: NodeJS.Timeout | null;
   pollTimer: NodeJS.Timeout | null;
   draining: Promise<boolean> | null;
+  readonly drainRequests: WaitDrainRequest[];
   abortListener: (() => void) | null;
 }
 
@@ -737,6 +745,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   async function settle(entry: PendingWait, result: WaitResult): Promise<void> {
     if (entry.done) return;
     entry.done = true;
+    entry.drainRequests.length = 0;
     if (entry.timer) clearTimeout(entry.timer);
     if (entry.pollTimer) clearInterval(entry.pollTimer);
     const idx = pendingWaits.indexOf(entry);
@@ -754,39 +763,49 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   }
 
   /** 串行结算同一次等待，工作事件不会扩大聊天的 mention 唤醒范围。 */
-  async function drainWait(entry: PendingWait, binding: SessionBinding, input: {
-    afterSeq?: number; drainedBacklog: boolean; workOnly?: boolean; wakeOnly?: boolean;
-  }): Promise<boolean> {
+  async function drainWait(entry: PendingWait, binding: SessionBinding, input: WaitDrainRequest): Promise<boolean> {
     if (entry.done) return false;
+    // 正在读取的快照可能早于新通知。最多保留积压、聊天唤醒、工作通知各一次重扫；
+    // 保留各自的唤醒限制，不能用工作轮询覆盖聊天唤醒，也不能放宽 anti-loop 门控。
+    if (!entry.drainRequests.some(request => request.drainedBacklog === input.drainedBacklog
+      && request.workOnly === input.workOnly && request.wakeOnly === input.wakeOnly)) {
+      entry.drainRequests.push(input);
+    }
     if (entry.draining) return await entry.draining;
+    async function drainSnapshot(input: WaitDrainRequest): Promise<boolean> {
+      const access = await taskAccess(binding);
+      const available = await withAccess(binding, "observe", () => tasks.listWorkEvents(access, binding.projectId));
+      if (input.workOnly && available.length === 0) return false;
+      let messages = await deliverableSince(binding, entry.afterSeq);
+      if (input.wakeOnly && available.length === 0) {
+        const roster = await buildRosterFor(binding.groupId);
+        messages = messages.filter(message => resolveWakeAndVisibility({ senderMemberId: message.senderMemberId,
+          mentionIds: message.mentions, mentionsAll: false }, roster).wake.includes(binding.memberId));
+      }
+      if (entry.done || (messages.length === 0 && available.length === 0)) return false;
+      const delivered = await withAccess(binding, "consume", async () => {
+        if (entry.done) return null;
+        const workEvents = available.length ? await tasks.deliverWorkEvents(access, binding.projectId) : [];
+        const batch = messages.length ? await markDelivered(binding, messages) : null;
+        if (workEvents.length && !batch && options.managed) await options.managed.onDelivery();
+        return { workEvents, batch };
+      });
+      if (!delivered || entry.done) return false;
+      if (!delivered.batch && delivered.workEvents.length === 0) return false;
+      await settle(entry, { ok: true, status: delivered.batch ? "message" : "work",
+        messages: delivered.batch?.messages ?? [],
+        cursor: delivered.batch ? seqCursor(delivered.batch.lastSeq) : await lastDeliveredCursor(binding),
+        drainedBacklog: input.drainedBacklog,
+        ...(delivered.workEvents.length ? { workEvents: delivered.workEvents } : {}),
+      });
+      return true;
+    }
     const pending = (async () => {
       try {
-        const access = await taskAccess(binding);
-        const available = await withAccess(binding, "observe", () => tasks.listWorkEvents(access, binding.projectId));
-        if (input.workOnly && available.length === 0) return false;
-        let messages = await deliverableSince(binding, input.afterSeq);
-        if (input.wakeOnly && available.length === 0) {
-          const roster = await buildRosterFor(binding.groupId);
-          messages = messages.filter(message => resolveWakeAndVisibility({ senderMemberId: message.senderMemberId,
-            mentionIds: message.mentions, mentionsAll: false }, roster).wake.includes(binding.memberId));
+        while (!entry.done && entry.drainRequests.length > 0) {
+          if (await drainSnapshot(entry.drainRequests.shift()!)) return true;
         }
-        if (entry.done || (messages.length === 0 && available.length === 0)) return false;
-        const delivered = await withAccess(binding, "consume", async () => {
-          if (entry.done) return null;
-          const workEvents = available.length ? await tasks.deliverWorkEvents(access, binding.projectId) : [];
-          const batch = messages.length ? await markDelivered(binding, messages) : null;
-          if (workEvents.length && !batch && options.managed) await options.managed.onDelivery();
-          return { workEvents, batch };
-        });
-        if (!delivered || entry.done) return false;
-        if (!delivered.batch && delivered.workEvents.length === 0) return false;
-        await settle(entry, { ok: true, status: delivered.batch ? "message" : "work",
-          messages: delivered.batch?.messages ?? [],
-          cursor: delivered.batch ? seqCursor(delivered.batch.lastSeq) : await lastDeliveredCursor(binding),
-          drainedBacklog: input.drainedBacklog,
-          ...(delivered.workEvents.length ? { workEvents: delivered.workEvents } : {}),
-        });
-        return true;
+        return false;
       } finally { entry.draining = null; }
     })();
     entry.draining = pending;
@@ -953,6 +972,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       // #61/PG：先登记挂起等待（入队 pendingWaits + waitingMembers），再做任何异步读取。
       // PostgreSQL 下 deliverableSince / markWaiting 是网络往返、延迟更大；若不先登记，
       // 唤醒（resolveGroup）可能在等待登记前执行，导致消息漏投（SQLite 延迟小不易暴露）。
+      const afterSeq = cursorToSeq(params.afterCursor);
       waitingMembers.add(binding.memberId);
       let entry!: PendingWait;
       const waitPromise = new Promise<WaitResult>((resolve) => {
@@ -960,6 +980,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
           ownerKey: memberKey,
           memberId: binding.memberId,
           groupId: binding.groupId,
+          afterSeq,
           resolve,
           settled: () => {
             if (entry.abortListener && params.signal) {
@@ -970,6 +991,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
           timer: null,
           pollTimer: null,
           draining: null,
+          drainRequests: [],
           abortListener: null,
         };
         entry.timer = setTimeout(async () => {
@@ -1001,9 +1023,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         pendingWaits.push(entry);
       });
 
-      const afterSeq = cursorToSeq(params.afterCursor);
       try {
-        await drainWait(entry, binding, { ...(afterSeq === undefined ? {} : { afterSeq }), drainedBacklog: true });
+        await drainWait(entry, binding, { drainedBacklog: true });
       } catch (error) {
         await settle(entry, { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false });
         throw error;
