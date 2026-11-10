@@ -55,5 +55,3 @@ disable-model-invocation: true
 简短说明决定、影响、已生效部分、未落实部分与下一负责人。按需使用 [决定记录](assets/decision-record.md)；写入失败时提供待保存内容和真实状态。
 
 只有接收方需要 JSON 时读取 [机器交接](references/result-contract.md)。记录、传递和实际生效分别报告，本次介入完成不表示整个项目完成。
-
-方法来源见 [方法来源](references/methods.md)。

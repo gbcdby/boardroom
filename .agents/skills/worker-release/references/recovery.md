@@ -14,13 +14,3 @@
 ## 最小恢复计划
 
 记录触发条件、可执行动作、实际授权、目标版本、数据前提、谁负责、如何确认恢复、哪些结果不可撤销。不要假设有备份、feature flag或回滚API；逐项核实。
-
-## 来源与适配
-
-参考pstack Shipping对外部结果回读的思想：
-https://github.com/cursor/plugins/tree/de8ee15dd1194627d21eb5fcd41cb1873208dabb/pstack
-
-参考Addy等对分层检查与快速恢复的讨论：
-https://claude.dev/blog/solving-code-review-at-anthropic/
-
-这里扩展为通用产物/发布/部署契约，不声称上游Shipping本身负责所有生产部署，也不照搬其宿主与工具要求。
