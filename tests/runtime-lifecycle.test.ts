@@ -143,6 +143,9 @@ for (const change of ["项目归档", "群归档", "成员停用"] as const) {
         const before = (await f.runtime.getBinding(f.binding.id))!;
         await f.runtime.updateDefaults(f.created.runtime.id, 1, { workdir: f.dir, systemPrompt: "保存但未应用的新指令" });
         await f.scope(change, false);
+        assert.equal((await host.call("acknowledge_message", { messageId: queued.id })).ok, false, "安全点收尾不授予失资格范围 ACK 权限");
+        assert.equal((await host.call("send_message", { text: "不能写入失资格范围" })).ok, false);
+        assert.equal((await host.call("read_history", {})).ok, false, "消费入口仍需运行资格");
         await f.supervisor.tick();
         assert.equal(host.forced, 0, "资格变化不能强杀在途轮次");
         if (phase === "working") assert.equal(host.stops, 0, "忙碌期间只等待下一个安全点");
@@ -258,4 +261,43 @@ for (const change of ["项目归档", "群归档", "成员停用"] as const) {
       assert.equal(f.preflightCalls.get(f.binding.id), 1);
     } finally { await f.close(); }
   });
+
+  for (const failure of ["auth_required", "process_exit"] as const) {
+    test(`R2 ${change}与恢复保留既有${failure}原因及重试门禁`, async () => {
+      const f = await fixture();
+      try {
+        const host = await f.start();
+        const queued = await f.message("失败后仍需处理的消息");
+        if (failure === "auth_required") {
+          host.event({ type: "failure", reason: "login_required" });
+          await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.lastErrorCode === failure, "宿主失败原因应持久化");
+        }
+        host.finish();
+        await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.exitConfirmed, "子进程退出应落库");
+        await f.supervisor.tick();
+        const failed = (await f.runtime.getBinding(f.binding.id))!;
+        assert.equal(failed.runner.lastErrorCode, failure);
+        if (failure === "auth_required") assert.equal(failed.runner.nextRetryAt, null);
+        else assert.ok(failed.runner.nextRetryAt, "意外退出应有持久退避");
+
+        for (const active of [false, true]) {
+          await f.scope(change, active);
+          await f.supervisor.tick();
+          await f.supervisor.tick();
+          const unchanged = (await f.runtime.getBinding(f.binding.id))!;
+          assert.equal(unchanged.runner.lastErrorCode, failure);
+          assert.equal(unchanged.runner.nextRetryAt, failed.runner.nextRetryAt);
+          assert.equal(unchanged.runner.attemptCount, failed.runner.attemptCount);
+          assert.equal(unchanged.binding.desiredState, "running");
+          assert.equal(unchanged.runner.applied!.digest, failed.runner.applied!.digest);
+          assert.equal(f.hosts.length, 1, "恢复资格不能绕过人工 retry 或已有退避期限");
+        }
+        assert.equal((await f.repos.deliveries.get(queued.id, f.binding.memberId))!.status, "pending");
+        if (failure === "auth_required") await f.runtime.intent(f.binding.id, "retry");
+        else f.advance(1001);
+        await f.supervisor.tick();
+        await until(async () => f.hosts.length === 2 && (await f.runtime.getBinding(f.binding.id))!.runner.state === "running", "真实重试条件满足后才重新启动");
+      } finally { await f.close(); }
+    });
+  }
 }
