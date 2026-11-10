@@ -1,0 +1,13 @@
+interface:
+  display_name: 接入项目工作流
+  short_description: 首次接入或环境变化时核对项目工具与约定，建立最小适配并保留已有设置
+  default_prompt: 使用 $setup-work 将已安装的工作技能接入当前项目，复用现有约定，只补必要缺口。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  allow_implicit_invocation: false
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
