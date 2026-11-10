@@ -114,6 +114,7 @@ export type Capability =
   // T5（#52）最小审计：查看（可分配，默认人 + top_manager）与撤销（人内建特权）。
   | "audit:view"
   | "org:revoke"
+  | "runtime:manage"
   | "session:heartbeat";
 
 /**
@@ -151,6 +152,7 @@ const CAPABILITY_BOUNDARY: Readonly<Record<Capability, BoundaryKind>> = {
   // T5 #52：审计查看/撤销都是项目级动作（具体谁能做由矩阵 + 主体类别决定）。
   "audit:view": "project",
   "org:revoke": "project",
+  "runtime:manage": "project",
   "session:heartbeat": "self",
 };
 
@@ -188,6 +190,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
     // T5 #52：人（owner）独占审计查看与撤销（#30 §5：org:revoke 为人内建特权）。
     "audit:view",
     "org:revoke",
+    "runtime:manage",
   ]),
   top_manager: new Set<Capability>([
     "project:view",
@@ -304,6 +307,9 @@ export function authorize(actor: Actor, capability: Capability, scope: GuardScop
   // 即便角色矩阵里挂了该点位，agent 主体也一律拒绝，保证撤销不可越权。
   if (capability === "org:revoke" && actor.kind !== "human") {
     return deny("forbidden", capability, "org:revoke 仅人（owner）可持有，agent 主体一律拒绝。");
+  }
+  if (capability === "runtime:manage" && actor.kind !== "human") {
+    return deny("forbidden", capability, "托管配置和生命周期仅由人管理。");
   }
 
   if (scope.conn?.groupIds && scope.groupId !== undefined && !scope.conn.groupIds.includes(scope.groupId)) {

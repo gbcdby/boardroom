@@ -1,12 +1,29 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createLogger } from "../src/server/logger.ts";
 
 interface CapturedLine {
   readonly raw: string;
   readonly parsed: Record<string, unknown>;
 }
+
+test("真实默认stdout异步EPIPE不中止进程，父子logger共享失败计数", { timeout: 5000 }, async () => {
+  const moduleUrl = new URL("../src/server/logger.ts", import.meta.url).href;
+  const script = `import {createLogger} from ${JSON.stringify(moduleUrl)};
+    const logger = createLogger(); const child = logger.child({component:'probe'});
+    process.stdin.resume(); process.stdin.on('end', () => {
+      child.info('fixed_event');
+      setTimeout(() => process.stderr.write(JSON.stringify({parent:logger.health(), child:child.health()})), 25);
+    });`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["pipe", "pipe", "pipe"] });
+  let stderr = ""; child.stderr.setEncoding("utf8"); child.stderr.on("data", chunk => { stderr += chunk; });
+  const ended = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+  child.stdout.destroy(); child.stdin.end();
+  assert.equal(await ended, 0, stderr);
+  const result = JSON.parse(stderr) as { parent: { writeFailures: number }; child: { writeFailures: number } };
+  assert.ok(result.parent.writeFailures >= 1); assert.deepEqual(result.parent, result.child);
+});
 
 function capture(): { lines: CapturedLine[]; write: (chunk: string) => void } {
   const lines: CapturedLine[] = [];
@@ -113,6 +130,21 @@ test("写入端抛错（如管道断开）不会让日志调用抛错", () => {
   });
 
   assert.doesNotThrow(() => logger.info("断管"));
+  assert.equal(logger.health().writeFailures, 1);
+});
+
+test("logger 健康计数在父子实例共享，快照不可反向修改计数", () => {
+  const logger = createLogger({ write: () => { throw new Error("private-sink-detail"); } });
+  const child = logger.child({ component: "runtime" });
+  child.info("runtime-event");
+  logger.warn("runtime-warning");
+  assert.deepEqual(logger.health(), { writeFailures: 2, serializationFailures: 0 });
+  assert.deepEqual(child.health(), logger.health());
+  const snapshot = logger.health() as { writeFailures: number };
+  snapshot.writeFailures = 99;
+  assert.equal(child.health().writeFailures, 2);
+  child.info("unsupported-value", { n: 1n });
+  assert.deepEqual(logger.health(), { writeFailures: 3, serializationFailures: 1 });
 });
 
 test("运行配置、凭据环境变量和原始进程输出不进入日志，诊断元数据保留", () => {

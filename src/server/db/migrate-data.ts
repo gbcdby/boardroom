@@ -26,6 +26,9 @@ import type { DbDriver, DbDriverOptions, DbRow, DbTransaction } from "./driver.t
 import type { Migration } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { durableMessageDispatch } from "./migrations/message-dispatch.ts";
+import { managedRuntime } from "./migrations/runtime.ts";
+import { runtimeObservabilityMigration } from "./migrations/runtime-observability.ts";
+import { runtimeProcessIdentityMigration } from "./migrations/runtime-process-identity.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -72,6 +75,13 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
   { name: "member_statuses", keyColumns: ["project_id", "member_id"] },
   { name: "mcp_sessions", keyColumns: ["id"] },
   { name: "audit_log", keyColumns: ["id"] },
+  { name: "agent_runtimes", keyColumns: ["id"] },
+  { name: "agent_runtime_bindings", keyColumns: ["id"] },
+  { name: "agent_runner_states", keyColumns: ["binding_id"] },
+  { name: "agent_runtime_members", keyColumns: ["member_id"] },
+  { name: "agent_runtime_events", keyColumns: ["id"] },
+  { name: "agent_runtime_observation_meta", keyColumns: ["id"] },
+  { name: "agent_runtime_usage_snapshots", keyColumns: ["id"] },
 ];
 
 /** 清空目标表时使用的反向顺序（子表先于父表），避免删除触发外键冲突。 */
@@ -284,6 +294,9 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   PG_MEMBER_LIFECYCLE_STATUS,
   PG_INIT_AUDIT_LOG,
   durableMessageDispatch,
+  managedRuntime,
+  runtimeObservabilityMigration,
+  runtimeProcessIdentityMigration,
 ];
 
 // ---------------------------------------------------------------------------

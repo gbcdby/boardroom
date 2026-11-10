@@ -1,5 +1,8 @@
 import type { Migration } from "../migrate.ts";
 import { durableMessageDispatch } from "./message-dispatch.ts";
+import { managedRuntime } from "./runtime.ts";
+import { runtimeObservabilityMigration } from "./runtime-observability.ts";
+import { runtimeProcessIdentityMigration } from "./runtime-process-identity.ts";
 
 /**
  * 生产迁移列表。
@@ -424,4 +427,7 @@ export const migrations: readonly Migration[] = [
     `,
   },
   durableMessageDispatch,
+  managedRuntime,
+  runtimeObservabilityMigration,
+  runtimeProcessIdentityMigration,
 ];

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { RouterLink, useRoute } from "vue-router";
 import {
   ApiError,
   api,
@@ -18,6 +19,8 @@ import {
  * - @：输入 `@显示名` / `@all`（服务端解析，非法 @ 报错）。也可从成员列表点选插入 @。
  */
 
+const route = useRoute();
+const queryValue = (value: unknown): string => typeof value === "string" ? value : "";
 const projects = ref<ProjectDto[]>([]);
 const activeProjectId = ref<string | null>(null);
 const groups = ref<GroupDto[]>([]);
@@ -58,15 +61,18 @@ async function loadProjects(): Promise<void> {
   if (!result) return;
   projects.value = result.projects;
   if (activeProjectId.value === null && projects.value.length > 0) {
-    activeProjectId.value = projects.value[0]!.id;
+    const requested = queryValue(route.query["projectId"]);
+    activeProjectId.value = projects.value.find((project) => project.id === requested)?.id ?? projects.value[0]!.id;
   }
 }
 
 async function loadProject(projectId: string): Promise<void> {
   const [g, m] = await Promise.all([run(() => api.listGroups(projectId)), run(() => api.listMembers(projectId))]);
+  if (activeProjectId.value !== projectId) return;
   if (g) groups.value = g.groups;
   if (m) members.value = m.members;
-  activeGroupId.value = groups.value[0]?.id ?? null;
+  const requested = queryValue(route.query["groupId"]);
+  activeGroupId.value = groups.value.find((group) => group.id === requested)?.id ?? groups.value[0]?.id ?? null;
   senderId.value = humanMembers.value[0]?.id ?? null;
 }
 
@@ -150,6 +156,14 @@ watch(activeProjectId, (id) => {
 watch(activeGroupId, (id) => {
   if (id !== null) void loadHistory(id);
 });
+watch(() => route.query, (query) => {
+  const projectId = queryValue(query["projectId"]);
+  const groupId = queryValue(query["groupId"]);
+  if (projectId && projects.value.some((project) => project.id === projectId)) {
+    if (activeProjectId.value !== projectId) activeProjectId.value = projectId;
+    else if (groups.value.some((group) => group.id === groupId)) activeGroupId.value = groupId;
+  }
+});
 
 onMounted(async () => {
   await loadProjects();
@@ -192,6 +206,7 @@ onBeforeUnmount(() => {
         </select>
       </label>
       <span class="muted small" data-testid="chat-ws">WS：{{ wsState }}</span>
+      <RouterLink v-if="activeProjectId" :to="{ path: '/runtimes', query: { projectId: activeProjectId, ...(activeGroupId ? { groupId: activeGroupId } : {}) } }" class="small">管理托管 Agent</RouterLink>
     </div>
 
     <div v-if="activeGroupId === null" class="muted">暂无群组，请先在「项目与群组」中创建。</div>
