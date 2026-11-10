@@ -12,7 +12,9 @@ const root = await mkdtemp(path.join(tmpdir(), "boardroom-managed-web-"));
 const workdir = path.join(root, "workdir");
 const dataDir = path.join(root, "data");
 const missingExecutable = path.join(root, "missing-cli", "claude");
-const webRoot = path.resolve(import.meta.dirname, "../dist/web");
+const webRoot = process.env.AGENT_STUDIO_WEBUI_TEST_ROOT
+  ? path.resolve(process.env.AGENT_STUDIO_WEBUI_TEST_ROOT)
+  : path.resolve(import.meta.dirname, "../dist/web");
 let server;
 let closing;
 

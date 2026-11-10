@@ -74,7 +74,7 @@ jobs:
         run: npm run e2e
 
   managed-web-browser:
-    name: Chromium · 托管 Agent 页面
+    name: Chromium · 工作台与托管 Agent 页面
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -82,6 +82,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -104,12 +105,30 @@ jobs:
       - name: 真实浏览器操作临时 SQLite 服务
         run: .agent-output/browser-venv/bin/python scripts/e2e-managed-web.py --ci
 
+      - name: 保存主线页面对照截图
+        if: github.event_name == 'pull_request'
+        env:
+          WEBUI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          mkdir -p .agent-output/ui-before
+          git archive "$WEBUI_BASE_SHA" src/web | tar -x -C .agent-output/ui-before
+          cp package.json .agent-output/ui-before/package.json
+          ln -s "$PWD/node_modules" .agent-output/ui-before/node_modules
+          node_modules/.bin/vite build --config .agent-output/ui-before/src/web/vite.config.ts
+          .agent-output/browser-venv/bin/python scripts/e2e-webui.py --capture-only --web-root .agent-output/ui-before/dist/web --artifacts .agent-output/webui-before
+
+      - name: 工作台真实浏览器交互与布局验证
+        run: .agent-output/browser-venv/bin/python scripts/e2e-webui.py
+
       - name: 保存浏览器截图与逐项报告
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: managed-web-browser-${{ github.run_attempt }}
-          path: .agent-output/managed-web-e2e/
+          path: |
+            .agent-output/managed-web-e2e/
+            .agent-output/webui-e2e/
+            .agent-output/webui-before/
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7

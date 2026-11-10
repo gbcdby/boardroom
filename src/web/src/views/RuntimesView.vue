@@ -247,10 +247,10 @@ onBeforeUnmount(() => { disposed = true; ++refreshSequence; if (polling) clearIn
 </script>
 
 <template>
-  <section class="runtime-page">
-    <header class="runtime-page-heading"><div><h1>托管 Agent</h1><p class="muted">管理真实 CLI 的群组绑定、配置和运行状态。</p></div><div class="actions"><button type="button" :disabled="busy || loading" @click="refresh(true)">{{ loading ? '刷新中…' : '刷新' }}</button><button type="button" class="primary" :disabled="busy || formOpen" data-testid="open-runtime-create" @click="openCreate">创建托管 Agent</button></div></header>
+  <section class="page runtime-page">
+    <header class="page-header"><div><h1>托管 Agent</h1><p class="page-description">配置你的协作助手，掌握每个群组的运行情况。</p></div><div class="actions"><button type="button" :disabled="busy || loading" @click="refresh(true)">{{ loading ? '刷新中…' : '刷新' }}</button><button type="button" class="primary" :disabled="busy || formOpen" data-testid="open-runtime-create" @click="openCreate">创建托管 Agent</button></div></header>
     <p v-if="error" class="error" role="alert" data-testid="runtime-error">{{ error }}</p>
-    <p v-if="notice" class="success-notice" role="status" data-testid="runtime-notice">{{ notice }}</p>
+    <p v-if="notice" class="notice" role="status" data-testid="runtime-notice">{{ notice }}</p>
     <p v-if="refreshWarning" class="muted small" role="status">{{ refreshWarning }}</p>
 
     <form v-if="createOpen" id="runtime-editor" class="card runtime-form" data-testid="runtime-create-form" @submit.prevent="create">
@@ -288,26 +288,20 @@ onBeforeUnmount(() => { disposed = true; ++refreshSequence; if (polling) clearIn
 </template>
 
 <style scoped>
-.runtime-page-heading, .runtime-entry-heading { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
-h1 { margin: 0; font-size: 1.5rem; } h2 { margin: 0 0 .5rem; font-size: 1.05rem; }
-.runtime-page-heading p, .runtime-entry-heading p { margin: .35rem 0; }
-.actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
-button { padding: .5rem .75rem; border: 1px solid var(--border); border-radius: 6px; background: var(--card-bg); color: var(--fg); cursor: pointer; font: inherit; font-size: .82rem; }
-button:disabled { opacity: .45; cursor: not-allowed; } button.primary { background: var(--accent); color: white; border-color: var(--accent); } button.danger { color: var(--bad); }
+.runtime-entry-heading { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+.runtime-entry-heading > div { min-width: 0; }.runtime-entry-heading h2 { margin-bottom: .5rem; }
+.runtime-entry-heading p { margin: .35rem 0; }
 .runtime-form, .runtime-entry, .empty-state { margin-top: 1.25rem; }
 .runtime-form { scroll-margin-top: 1rem; }
 .runtime-form h2 { font-size: 1.1rem; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; margin: 1rem 0; }
-.field { display: flex; flex-direction: column; gap: .35rem; font-size: .85rem; min-width: 0; }
-.field input, .field select { padding: .6rem .7rem; border: 1px solid var(--border); border-radius: 6px; color: var(--fg); background: var(--card-bg); font: inherit; width: 100%; }
 .form-actions { margin-top: 1.2rem; }
 .advanced-settings { margin-top: 1rem; border: 1px solid var(--border); border-radius: 6px; padding: .8rem; }
 .advanced-settings legend { font-size: .8rem; color: var(--muted); }.checkbox-label { display: flex; align-items: center; gap: .45rem; font-size: .9rem; }
 .runtime-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem; margin: 1.5rem 0 1rem; }
-.runtime-filters .field { min-width: 170px; }.runtime-filters p { margin: 0 0 .3rem auto; text-align: right; }
+.runtime-filters .field { min-width: 0; flex: 0 1 240px; max-width: 100%; }.runtime-filters p { margin: 0 0 .3rem auto; text-align: right; }
 .backend-tag { display: inline-block; font-size: .72rem; font-weight: 400; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: .15rem .4rem; vertical-align: middle; margin-left: .4rem; }
 .binding-list { display: grid; gap: 1rem; margin-top: 1rem; }.workdir { overflow-wrap: anywhere; }
-.success-notice { border-left: 3px solid var(--ok); background: rgba(21, 127, 59, .07); padding: .75rem; font-size: .87rem; }
 .runtime-dialog { width: min(520px, calc(100% - 2rem)); border: 1px solid var(--border); border-radius: 10px; padding: 1.4rem; color: var(--fg); background: var(--card-bg); }
 .runtime-dialog::backdrop { background: rgba(0, 0, 0, .4); }.runtime-dialog p { font-size: .9rem; }.runtime-dialog .actions { justify-content: flex-end; margin-top: 1.2rem; }
 @media (max-width: 620px) { .form-grid { grid-template-columns: 1fr; }.runtime-filters p { text-align: left; margin-left: 0; }.runtime-entry { padding: 1rem; } }
