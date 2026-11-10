@@ -18,6 +18,7 @@ interface PinnedDescriptor {
 }
 
 interface PinnedPath { readonly descriptor: PinnedDescriptor; readonly suffix: readonly string[]; }
+/** root/point 暂存原始字节的 latin1 表示，只有被 FD 引用的记录才解释为文件路径。 */
 interface MountRecord { readonly device: bigint; readonly root: string; readonly point: string; }
 interface FilesystemLocation { readonly device: bigint; readonly path: string; }
 type RootConstraint = { readonly protectedPaths: readonly PinnedPath[] } |
@@ -49,7 +50,10 @@ function overlaps(a: string, b: string): boolean {
   return a === b || a === "/" || b === "/" || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
-function unescapeMountPath(value: string): string {
+function unescapeMountPath(raw: string): string {
+  const bytes = Buffer.from(raw, "latin1");
+  const value = bytes.toString("utf8");
+  if (!Buffer.from(value).equals(bytes)) unsafe();
   if (/\\(?!040|011|012|134)/.test(value)) unsafe();
   const decoded = value.replace(/\\(040|011|012|134)/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8)));
   if (!path.posix.isAbsolute(decoded) || decoded.includes("\0")) unsafe();
@@ -57,9 +61,8 @@ function unescapeMountPath(value: string): string {
 }
 
 async function readMounts(): Promise<Map<string, MountRecord>> {
-  const bytes = await readFile("/proc/self/mountinfo");
-  const contents = bytes.toString("utf8");
-  if (!Buffer.from(contents).equals(bytes)) unsafe();
+  // 无关挂载可以有非 UTF-8 名称或 nsfs 的 net:[inode] 根，不能使普通工作目录误拒。
+  const contents = (await readFile("/proc/self/mountinfo")).toString("latin1");
   const mounts = new Map<string, MountRecord>();
   for (const line of contents.split("\n")) {
     if (!line) continue;
@@ -72,7 +75,7 @@ async function readMounts(): Promise<Map<string, MountRecord>> {
     if (major > 0xffff_ffffn || minor > 0xffff_ffffn) unsafe();
     // Linux dev_t 编码；将 mountinfo 的设备号与同一 FD 的 fstat.dev 相互核对。
     const encoded = (minor & 0xffn) | ((major & 0xfffn) << 8n) | ((minor & ~0xffn) << 12n) | ((major & ~0xfffn) << 32n);
-    mounts.set(id, { device: encoded, root: unescapeMountPath(root), point: unescapeMountPath(point) });
+    mounts.set(id, { device: encoded, root, point });
   }
   if (mounts.size === 0) unsafe();
   return mounts;
@@ -95,10 +98,12 @@ async function locate(pinned: PinnedDescriptor, mounts: ReadonlyMap<string, Moun
   if (metadata.dev !== pinned.dev || metadata.ino !== pinned.ino || metadata.nlink === 0n || await mountId(pinned.handle) !== pinned.mountId) unsafe();
   const mount = mounts.get(pinned.mountId);
   if (!mount || mount.device !== metadata.dev) unsafe();
+  // 相关记录仍须是可确定的文件路径；不忽略 opaque root 或非法编码。
+  const root = unescapeMountPath(mount.root); const point = unescapeMountPath(mount.point);
   const current = await descriptorPath(pinned.handle);
-  if (current !== mount.point && !(mount.point === "/" || current.startsWith(`${mount.point}/`))) unsafe();
-  const relative = path.posix.relative(mount.point, current);
-  const result = { device: mount.device, path: path.posix.join(mount.root, relative) };
+  if (current !== point && !(point === "/" || current.startsWith(`${point}/`))) unsafe();
+  const relative = path.posix.relative(point, current);
+  const result = { device: mount.device, path: path.posix.join(root, relative) };
   if (await descriptorPath(pinned.handle) !== current || await mountId(pinned.handle) !== pinned.mountId) unsafe();
   return result;
 }

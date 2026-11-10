@@ -21,8 +21,8 @@ let mountNamespaceProbe: Promise<boolean> | undefined;
 function mountNamespaceAvailable(): Promise<boolean> {
   return mountNamespaceProbe ??= exec("/usr/bin/unshare", ["--user", "--map-root-user", "--mount", "--fork", "/bin/true"], { timeout: 3000, env: SAFE_ENV }).then(() => true, () => false);
 }
-async function inMountNamespace(source: string): Promise<Record<string, unknown>> {
-  const result = await exec("/usr/bin/unshare", ["--user", "--map-root-user", "--mount", "--fork", "--kill-child=SIGKILL", process.execPath, "--input-type=module", "-e", source],
+async function inMountNamespace(source: string, network = false): Promise<Record<string, unknown>> {
+  const result = await exec("/usr/bin/unshare", ["--user", "--map-root-user", "--mount", ...(network ? ["--net"] : []), "--fork", "--kill-child=SIGKILL", process.execPath, "--input-type=module", "-e", source],
     { timeout: 15_000, maxBuffer: 16_384, encoding: "utf8", env: SAFE_ENV });
   return JSON.parse(result.stdout);
 }
@@ -416,4 +416,50 @@ test("R3 放行前按原 FD 的当前位置复核，移入保护目录的工作�
     await assert.rejects(prepared.verifyWritableBoundary(), unsafe);
     await f.unchanged();
   } finally { await prepared?.cleanup(); await f.close(); }
+});
+
+test("R3 无关 nsfs 和非 UTF-8 挂载不影响普通树，相关特殊挂载仍失败关闭", { ...linuxOnly, timeout: 20_000 }, async t => {
+  try { await exec("/usr/bin/unshare", ["--user", "--map-root-user", "--mount", "--net", "--fork", "/bin/true"], { timeout: 3000, env: SAFE_ENV }); }
+  catch { t.skip("当前环境不能建立真实 mount/net namespace；不模拟特殊挂载记录"); return; }
+  const f = await fixture();
+  try {
+    const unrelated = path.join(f.root, "namespace-file"); const nested = path.join(f.workdir, "namespace-file");
+    const ordinary = path.join(f.root, "ordinary-mount-source"); await mkdir(ordinary);
+    await writeFile(unrelated, ""); await writeFile(nested, "");
+    const bytesMount = "import os, subprocess, sys\np=os.fsencode(sys.argv[1])+b'/opaque-\\xff'\nif sys.argv[2]=='mount':\n os.mkdir(p)\n subprocess.run([b'/usr/bin/mount',b'--bind',os.fsencode(sys.argv[3]),p],check=True)\nelse:\n subprocess.run([b'/usr/bin/umount',p],check=True)\n";
+    const probe = `
+      import {execFileSync} from 'node:child_process';import {open,readFile} from 'node:fs/promises';
+      import {validateWorkdirFilesystemBoundary} from ${JSON.stringify(new URL("../src/server/runtime/isolation/linux.ts", import.meta.url).href)};
+      const root=${JSON.stringify(f.root)},workdir=${JSON.stringify(f.workdir)},protectedPaths=${JSON.stringify(f.input.protectedPaths)},unrelated=${JSON.stringify(unrelated)},nested=${JSON.stringify(nested)};
+      const env=${JSON.stringify(SAFE_ENV)},result={};let outsideMounted=false,bytesMounted=false,nestedMounted=false;
+      const check=async paths=>{try{await validateWorkdirFilesystemBoundary(workdir,paths);return 'accepted'}catch(e){return e.message}};
+      const mount=target=>execFileSync('/usr/bin/mount',['--bind','/proc/self/ns/net',target],{env});
+      const unmount=target=>execFileSync('/usr/bin/umount',[target],{env});
+      execFileSync('/usr/bin/mount',['--make-rprivate','/'],{env});
+      try{
+        result.before=await check(protectedPaths);mount(unrelated);outsideMounted=true;
+        const handle=await open(unrelated,0x200000);
+        try{
+          const id=(await readFile('/proc/self/fdinfo/'+handle.fd,'utf8')).match(/^mnt_id:\\s+(\\d+)$/m)[1];
+          const record=(await readFile('/proc/self/mountinfo','utf8')).split('\\n').map(line=>line.split(' ')).find(fields=>fields[0]===id);
+          result.opaqueNsfs=record[record.indexOf('-')+1]==='nsfs'&&!record[3].startsWith('/');
+        }finally{await handle.close()}
+        result.unrelated=await check(protectedPaths);
+        execFileSync('/usr/bin/python3',['-c',${JSON.stringify(bytesMount)},root,'mount',${JSON.stringify(ordinary)}],{env});bytesMounted=true;
+        const raw=await readFile('/proc/self/mountinfo');result.nonUtf8MountRecord=!Buffer.from(raw.toString('utf8')).equals(raw);
+        result.unrelatedNonUtf8=await check(protectedPaths);
+        mount(nested);nestedMounted=true;result.nested=await check(protectedPaths);unmount(nested);nestedMounted=false;
+        result.protected=await check([unrelated]);
+        execFileSync('/usr/bin/python3',['-c',${JSON.stringify(bytesMount)},root,'unmount',${JSON.stringify(ordinary)}],{env});bytesMounted=false;
+        unmount(unrelated);outsideMounted=false;result.after=await check(protectedPaths);
+      }finally{
+        if(nestedMounted)unmount(nested);
+        if(bytesMounted)execFileSync('/usr/bin/python3',['-c',${JSON.stringify(bytesMount)},root,'unmount',${JSON.stringify(ordinary)}],{env});
+        if(outsideMounted)unmount(unrelated);
+      }
+      console.log(JSON.stringify(result));`;
+    assert.deepEqual(await inMountNamespace(probe, true), { before: "accepted", opaqueNsfs: true, unrelated: "accepted", nonUtf8MountRecord: true,
+      unrelatedNonUtf8: "accepted", nested: "workdir_unsafe", protected: "workdir_unsafe", after: "accepted" });
+    await f.unchanged();
+  } finally { await f.close(); }
 });
