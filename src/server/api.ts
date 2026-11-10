@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DbDriver } from "./db/driver.ts";
 import type { HeartbeatConfig } from "./config.ts";
@@ -213,79 +214,122 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     return await (appendAuditEntry(repos.audit, { actor: auditActorFrom(actor), ...entry }));
   }
 
-  /**
-   * T5（#52）撤销补偿：把一条可逆的「成员 / 组织变更」事件反向执行。
-   * 撤销＝复原 `before` 快照（建岗/删成员/删岗这类「存在性翻转」用 targetId 反向操作）。
-   * 故意复用 T2/T3 现有的 repository 方法，不新增业务语义。
-   */
-  async function undoMemberOrgChange(r: RepositorySet, row: AuditRow): Promise<void> {
-    const action = row.action as AuditAction;
-    const before = row.before as Member | OrgNode | null | undefined;
-    const isMember = action.startsWith("member.");
-    switch (action) {
-      case AUDIT_ACTIONS.member_add:
-        (await (r.members.delete(row.targetId)));
-        break;
-      case AUDIT_ACTIONS.member_remove:
-      case AUDIT_ACTIONS.member_pause:
-      case AUDIT_ACTIONS.member_resume:
-      case AUDIT_ACTIONS.member_status_change:
-        (await (r.members.restoreRow(before as Member)));
-        break;
-      case AUDIT_ACTIONS.org_node_create:
-        (await (r.org.deleteNode(row.targetId)));
-        break;
-      case AUDIT_ACTIONS.org_node_delete:
-      case AUDIT_ACTIONS.org_node_update:
-        (await (r.org.restoreRow(before as OrgNode)));
-        break;
-      case AUDIT_ACTIONS.org_assign:
-      case AUDIT_ACTIONS.org_auto_place:
-        (await (r.org.assignNode(
-          row.targetId,
-          isMember ? ((before as Member | undefined)?.nodeId ?? null) : null,
-        )));
-        break;
-      default:
-        throw new HttpError(403, "action_not_revocable", `事件 ${action} 不可撤销。`);
+  /** 审计列存储 JSON 文本；只解码一次，损坏/双重编码快照不能进入补偿写入。 */
+  function decodeAuditSnapshot(value: string | null): Record<string, unknown> | null {
+    if (value === null) return null;
+    let parsed: unknown;
+    try { parsed = JSON.parse(value); }
+    catch { throw new RepositoryError("invalid_argument", "审计快照不是有效 JSON，无法撤销。"); }
+    if (parsed === null) return null;
+    if (typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new RepositoryError("invalid_argument", "审计快照必须是对象或 null，无法撤销。");
+    }
+    return parsed as Record<string, unknown>;
+  }
+
+  function snapshotError(): never {
+    throw new RepositoryError("invalid_argument", "审计快照字段不完整或与事件目标不一致，无法撤销。");
+  }
+
+  function snapshotText(value: unknown): value is string {
+    return typeof value === "string" && value.trim() !== "";
+  }
+
+  function snapshotReference(value: unknown): value is string | null {
+    return value === null || snapshotText(value);
+  }
+
+  function memberSnapshot(value: Record<string, unknown> | null, row: AuditRow, memberId: string): Member | null {
+    if (value === null) return null;
+    if (value.id !== memberId || value.projectId !== row.projectId || !snapshotText(value.displayName) ||
+      !snapshotText(value.createdAt) || !snapshotText(value.updatedAt) || !snapshotReference(value.nodeId) ||
+      !snapshotReference(value.agentId) || (value.kind !== "human" && value.kind !== "agent") ||
+      (value.role !== "manager" && value.role !== "normal") ||
+      (value.status !== "active" && value.status !== "disabled" && value.status !== "pending") ||
+      (value.kind === "human" ? value.agentId !== null : value.agentId === null)) snapshotError();
+    return value as unknown as Member;
+  }
+
+  function nodeSnapshot(value: Record<string, unknown> | null, row: AuditRow): OrgNode | null {
+    if (value === null) return null;
+    if (value.id !== row.targetId || value.projectId !== row.projectId || !snapshotText(value.name) ||
+      !snapshotText(value.createdAt) || !snapshotText(value.updatedAt) || !snapshotReference(value.parentId) ||
+      (value.role !== "top_manager" && value.role !== "sub_manager" && value.role !== "member") || !Number.isInteger(value.sortOrder) ||
+      ((value.parentId === null) !== (value.role === "top_manager"))) snapshotError();
+    return value as unknown as OrgNode;
+  }
+
+  async function requireSnapshotNode(r: RepositorySet, projectId: string, nodeId: string | null): Promise<void> {
+    if (nodeId === null) return;
+    const node = await r.org.getNode(nodeId);
+    if (!node || node.projectId !== projectId) {
+      throw new RepositoryError("invalid_reference", "审计快照引用的岗位不存在或不属于当前项目。");
     }
   }
 
-  /**
-   * T5（#52）链式回滚：撤销一个「撤销事件」＝重放原变更（`after` 才是该恢复到的状态）。
-   * 用于人撤销自己的撤销（#30 §3 的「撤销的撤销」）。
-   */
-  async function redoMemberOrgChange(r: RepositorySet, original: AuditRow): Promise<void> {
-    const action = original.action as AuditAction;
-    const after = original.after as Member | OrgNode | null | undefined;
-    const isMember = action.startsWith("member.");
-    switch (action) {
-      case AUDIT_ACTIONS.member_remove:
-        (await (r.members.delete(original.targetId)));
-        break;
-      case AUDIT_ACTIONS.member_add:
-      case AUDIT_ACTIONS.member_pause:
-      case AUDIT_ACTIONS.member_resume:
-      case AUDIT_ACTIONS.member_status_change:
-        (await (r.members.restoreRow(after as Member)));
-        break;
-      case AUDIT_ACTIONS.org_node_delete:
-        (await (r.org.deleteNode(original.targetId)));
-        break;
-      case AUDIT_ACTIONS.org_node_create:
-      case AUDIT_ACTIONS.org_node_update:
-        (await (r.org.restoreRow(after as OrgNode)));
-        break;
-      case AUDIT_ACTIONS.org_assign:
-      case AUDIT_ACTIONS.org_auto_place:
-        (await (r.org.assignNode(
-          original.targetId,
-          isMember ? ((after as Member | undefined)?.nodeId ?? null) : null,
-        )));
-        break;
-      default:
-        throw new HttpError(403, "action_not_revocable", `事件 ${action} 不可撤销。`);
+  /** 复用既有补偿语义，所有形状、目标及引用检查均在写入前完成。 */
+  async function applyMemberOrgSnapshot(r: RepositorySet, row: AuditRow, redo: boolean): Promise<void> {
+    const before = decodeAuditSnapshot(row.before);
+    const after = decodeAuditSnapshot(row.after);
+    const project = await r.projects.get(row.projectId);
+    if (!project) throw new RepositoryError("not_found", "审计所属项目不存在。");
+    if (project.archivedAt) throw new RepositoryError("archived", "请先恢复项目，再撤销变更。");
+
+    if (row.action === AUDIT_ACTIONS.org_assign || row.action === AUDIT_ACTIONS.org_auto_place) {
+      // assign 的 targetId 是成员；auto_place 的 targetId 是岗位，但 before/after 均为成员快照。
+      const memberId = row.action === AUDIT_ACTIONS.org_auto_place ? after?.id : row.targetId;
+      if (!snapshotText(memberId) || row.targetKind !== (row.action === AUDIT_ACTIONS.org_auto_place ? "node" : "member")) snapshotError();
+      const previous = memberSnapshot(before, row, memberId);
+      const next = memberSnapshot(after, row, memberId);
+      if (!previous || !next || (row.action === AUDIT_ACTIONS.org_auto_place && next.nodeId !== row.targetId)) snapshotError();
+      const member = await r.members.get(memberId);
+      if (!member || member.projectId !== row.projectId) throw new RepositoryError("invalid_reference", "审计目标成员不存在或不属于当前项目。");
+      const target = redo ? next : previous;
+      await requireSnapshotNode(r, row.projectId, target.nodeId);
+      await r.org.assignNode(memberId, target.nodeId);
+      return;
     }
+
+    if (row.action === AUDIT_ACTIONS.member_add || row.action === AUDIT_ACTIONS.member_remove ||
+      row.action === AUDIT_ACTIONS.member_pause || row.action === AUDIT_ACTIONS.member_resume ||
+      row.action === AUDIT_ACTIONS.member_status_change) {
+      if (row.targetKind !== "member") snapshotError();
+      const previous = memberSnapshot(before, row, row.targetId);
+      const next = memberSnapshot(after, row, row.targetId);
+      if (row.action === AUDIT_ACTIONS.member_add ? previous !== null || next === null :
+        row.action === AUDIT_ACTIONS.member_remove ? previous === null || next !== null : previous === null || next === null) snapshotError();
+      const current = await r.members.get(row.targetId);
+      if (current && current.projectId !== row.projectId) throw new RepositoryError("invalid_reference", "审计目标成员不属于当前项目。");
+      const target = redo ? next : previous;
+      if (target === null) await r.members.delete(row.targetId);
+      else {
+        await requireSnapshotNode(r, row.projectId, target.nodeId);
+        await r.members.restoreRow(target);
+      }
+      return;
+    }
+
+    if (row.action === AUDIT_ACTIONS.org_node_create || row.action === AUDIT_ACTIONS.org_node_delete ||
+      row.action === AUDIT_ACTIONS.org_node_update) {
+      if (row.targetKind !== "node") snapshotError();
+      const previous = nodeSnapshot(before, row);
+      const next = nodeSnapshot(after, row);
+      if (row.action === AUDIT_ACTIONS.org_node_create ? previous !== null || next === null :
+        row.action === AUDIT_ACTIONS.org_node_delete ? previous === null || next !== null : previous === null || next === null) snapshotError();
+      const current = await r.org.getNode(row.targetId);
+      if (current && current.projectId !== row.projectId) throw new RepositoryError("invalid_reference", "审计目标岗位不属于当前项目。");
+      const target = redo ? next : previous;
+      if (target === null) await r.org.deleteNode(row.targetId);
+      else {
+        await requireSnapshotNode(r, row.projectId, target.parentId);
+        if (target.parentId !== null && (target.parentId === target.id || (await r.org.subtreeNodeIds(target.id)).includes(target.parentId))) {
+          throw new RepositoryError("invalid_reference", "恢复此岗位会形成循环汇报关系，无法撤销。");
+        }
+        await r.org.restoreRow(target);
+      }
+      return;
+    }
+    throw new RepositoryError("invalid_argument", `事件 ${row.action} 不支持补偿。`);
   }
 
   /** 撤销被拒绝时的中文说明（前端据此置灰并说明原因）。 */
@@ -1179,16 +1223,22 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           if (!originalId) throw new HttpError(409, "chain_broken", "撤销链断裂：缺少原始事件引用。");
           const original = (await (r.audit.get(projectId, originalId)));
           if (!original) throw new HttpError(409, "chain_broken", "撤销链断裂：原始事件已不存在。");
+          if (original.projectId !== row.projectId || original.targetId !== row.targetId || original.targetKind !== row.targetKind) {
+            throw new RepositoryError("invalid_reference", "撤销链引用的事件目标不一致。");
+          }
           originalForRedo = original;
           compensationAction = row.action;
         }
         let newRow!: AuditRow;
         (await (r.transaction(async () => {
-          if (originalForRedo) {
-            (await (redoMemberOrgChange(r, originalForRedo)));
-          } else {
-            (await (undoMemberOrgChange(r, row)));
-          }
+          const latest = await r.audit.get(projectId, row.id);
+          if (!latest || latest.reversedAt) throw new RepositoryError("conflict", "该审计事件已被撤销，不能重复撤销。");
+          // 先解码补偿自身的快照，不能先改业务数据再发现审计数据损坏。
+          const compensationBefore = decodeAuditSnapshot(row.after);
+          const compensationAfter = decodeAuditSnapshot(row.before);
+          if (originalForRedo && (!isDeepStrictEqual(compensationBefore, decodeAuditSnapshot(originalForRedo.before)) ||
+            !isDeepStrictEqual(compensationAfter, decodeAuditSnapshot(originalForRedo.after)))) snapshotError();
+          await applyMemberOrgSnapshot(r, originalForRedo ?? row, originalForRedo !== null);
           // 写撤销记录（记录被撤销的原事件 id；本身仍可再被撤销＝链式）。
           newRow = await (appendAuditEntry(repos.audit, {
             projectId,
@@ -1197,8 +1247,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
             targetKind: row.targetKind,
             targetId: row.targetId,
             targetName: row.targetName,
-            before: row.after,
-            after: row.before,
+            before: compensationBefore,
+            after: compensationAfter,
             detail: { undoes: row.id, ...(originalForRedo ? { kind: "redo" } : { kind: "undo" }) },
             reversedByAuditId: row.id,
           }));
