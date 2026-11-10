@@ -1,0 +1,13 @@
+interface:
+  display_name: 组织协作
+  short_description: 核实协作工具与身份，处理跨模型任务交接、消息、隔离、取消与恢复
+  default_prompt: 使用 $collaborate 在已授权范围内组织这项协作，核实真实能力、任务归属和结果交接。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

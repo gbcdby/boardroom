@@ -1,0 +1,13 @@
+interface:
+  display_name: 发布与验收
+  short_description: 把明确来源的产物发布到授权目标，并核实真实运行版本和交付验收
+  default_prompt: 使用 $worker-release 完成这次已授权的发布，绑定来源、产物与环境，核实运行版本和验收结果。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

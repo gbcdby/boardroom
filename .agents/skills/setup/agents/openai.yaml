@@ -1,0 +1,13 @@
+interface:
+  display_name: 接入项目
+  short_description: 由你主动发起，复用项目约定并核实工具，补齐共享规格和任务协作所需适配
+  default_prompt: 使用 $setup 将已安装的工作技能接入当前项目，复用现有约定，只补必要缺口。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  allow_implicit_invocation: false
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas

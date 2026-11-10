@@ -1,0 +1,77 @@
+# 共享工作记录与结果约定 v1
+
+## 权威来源
+
+复用项目已有 Issue、任务系统或文件，不强制迁移载体或新建数据库。详细模型、diff、检查日志与 PR 保留为专业产物，工作记录引用它们。
+
+| 使用方式 | Spec / Tickets / 依赖的来源 |
+| --- | --- |
+| 无 Boardroom | GitHub Issues 或项目已有共享记录 |
+| Boardroom 通信，外部任务系统管理 | 外部记录；房间消息与看板引用它 |
+| Boardroom 已实现并启用原生管理 | 经实际能力核验并明确选定的原生记录 |
+
+每类事实只有一个权威来源：代码内容看实际候选，合并看仓库平台，运行版本看目标环境。选择不同后端或同步视图不允许无规则双写；切换来源时明确当前修订、迁移范围和旧视图的处理方式。
+
+## Spec、Ticket 与执行记录
+
+这些是逻辑字段，可映射现有正文、评论、平台关系或等价紧凑文本，不要求使用 JSON。
+
+- **Spec**：`spec_ref`（共享位置与有效修订）、目标与范围、设计概览、共同约束、稳定验收 ID、Ticket 目录、依赖图和整体验收要求。拆票后继续维护；重大变更保留决定出处及替代关系。
+- **Ticket**：`ticket_ref`、`spec_ref`、`acceptance_ids`、具体目标、`scope`、`depends_on`、`deliverables`、`completion_condition`、当前负责人及工作区。共享约束引用 Spec，票内只补本任务细节。
+- **执行记录**：稳定 `work_id`、本次 `run_id`、实际执行者与角色、所用 Spec 修订和候选、操作结果、证据、阻塞与恢复所需信息。重试沿用工作身份，不用新编号掩盖未知副作用。
+
+依赖关系在一处维护，Spec 图和各 Ticket 的相关依赖是同一来源的投影。每条 `depends_on` 明确前置任务或产物、适用版本和释放条件，例如接口约定已确认、指定候选检查通过或变更已合并；不能仅写“等上一张票”。
+
+释放依赖不必等同关票。约定的阶段产物满足条件后可以供下游使用，Ticket 是否结束仍按其交付终点判断；所有 Tickets 结束也不能替代 Spec 的最终集成验收。
+
+版本变化时重评受影响的约束、Tickets、产物与证据，保留复用理由。目录与消息中的旧状态不覆盖新记录；恢复先核对有效修订、当前归属和真实外部结果。
+
+## 调度与授权
+
+每项工作明确 `goal`、`delivery_target`、验收、`authorization_ref`、当前 owner、写入范围、预算和停止条件。可采用 active、waiting_decision、blocked、delivered、cancelled 等项目状态；角色结果与整体交付状态分别记录。
+
+owner、assignee、标签和聊天确认是约定字段，不是原子锁。工具不支持原子领取或版本保护时，由明确协调者分配隔离工作区，同一可写对象串行交接；归属冲突先核对，不能直接接管未知操作。
+
+批准与质量证据分别处理，按范围沿用有效授权。设计接受、阅读简报、合并许可和发布许可不能互相推导；既有决定继续适用时不重复请求确认。
+
+## 阶段结果 work-result/v1
+
+仅在接收方需要机器交接时使用；面向人的状态说明保持白话简短。字段见 `assets/work-result.template.json`，外部工具原报告保持不变，由交接层引用和封装。
+
+必需字段：`schema_version`、`work_id`、`skill`、`outcome`、`subject`、`evidence`、`unresolved`、`changed_assumptions`、`next_action`。`next_action` 与 `evidence.scope` 是非空文本，结构化详情放扩展字段。
+
+| outcome | 含义 |
+| --- | --- |
+| COMPLETE | 当前职责已交出所需产物，不扩大为整体交付或实现正确 |
+| PASS / FAIL | 声明范围内的检查通过或发现违约，附实际证据 |
+| INCONCLUSIVE | 现有证据不足或结果仍未知，不能因预算耗尽写成通过 |
+| BLOCKED | 缺少明确前置条件、权限或依赖 |
+| NOT_RUN | 尚未执行所述检查或动作 |
+
+`subject.kind` 可为 design、model、workspace、commit、integration_candidate、artifact、deployment、project_view 或 workflow。`subject.id` 使用包含真实版本的不可变身份；按需补 `base_id`、`contract_id`、`environment_id`、`worktree_digest`。完整工作树含相关暂存、未暂存与未跟踪内容；多仓或多产物记录组合身份。
+
+每条 `evidence` 包含 `id`、`locator`、`scope`、`status`、`producer`、`subject_id`，按需加 `kind`、`observed_at`、`environment_id`、`relation`。直接证据默认 `relation: direct`；跨对象或历史材料保留原 `subject_id` 并标 `background`，不能改写成当前运行结果。
+
+`status` 保留来源原意。静态观察用 `OBSERVED` 与 `kind: source_inspection`，历史实测用 `HISTORICAL`；需要时另加范围明确的 `assessment`。CLI completed、模型范围内通过、未执行或工具错误均不自动成为真实环境 PASS。
+
+跨版本复用时另记录针对当前对象的适用性核验，引用旧证据与 `transfer_basis`；它只证明声明范围仍适用，不扩展原运行覆盖。缺少记录只能说明无法确认，不能推断检查从未执行。
+
+## 证据和终点
+
+候选、相关基线、契约、配置、环境、工具或授权前提变化时，重新评估相关证据；无需无差别重跑无关检查。合并前核对实际集成候选，多个独立 PR 通过不自动证明组合通过。
+
+- investigated / designed：约定调查或设计产物完成，缺口已说明。
+- verified：指定候选在约定范围得到必要验证。
+- pr_ready：当前 PR 满足约定就绪条件，尚不代表合并。
+- merged：平台确认目标分支包含结果，完成项目规定的主线检查。
+- published：指定产物在约定渠道可获取。
+- deployed：目标环境实际运行指定产物与配置。
+- accepted：在实际交付位置通过约定验收。
+
+工具返回、退出码和状态图标必须对应上述实际事实。
+
+## 人的决定与阅读视图
+
+需要决定时保留问题、已有事实、推荐及主要代价、替代方案、适用范围和等待后果；只展开会改变判断的信息。范围、前提与权限后果仍兼容时复用旧决定。
+
+`observed_at` 表示观察时间，`accepted_baseline` 表示明确接受的设计；简报不推进接受基线，也不授予权限。保持所有重要未知、阻塞和实质待决事项可见，普通进展按需展开。

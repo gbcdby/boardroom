@@ -129,7 +129,7 @@ HTTP、MCP 与业务仓储已通过统一 `DbDriver` 接入两种数据库，选
 
 ## 进一步阅读
 
-- [工作技能使用指南](.agents/skills/ask-work/references/guide.md)：从一个目标开始，按需接入项目、理解方案和主动介入；不要求逐项运行所有技能。
+- [工作技能使用指南](.agents/skills/guide/references/guide.md)：从一个目标开始，按需接入项目、理解方案和主动介入；不要求逐项运行所有技能。
 - [文档目录与内容归属](docs/README.md)：区分架构、接口、历史验收与详细工单。
 - [AGENTS.md](AGENTS.md)、[CONTEXT.md](CONTEXT.md)：贡献约定、跨会话事实与宿主差异；历史阶段描述需结合当前实现阅读。
 - 源码入口：[后端启动](src/server/server.ts)、[业务 API](src/server/api.ts)、[MCP](src/server/mcp)、[WebUI](src/web/src)、[自动化测试](tests)。

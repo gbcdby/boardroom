@@ -56,7 +56,7 @@ java -Xmx512m -XX:+UseParallelGC -cp "$BOARDROOM_TLC_JAR" tlc2.TLC \
 也可在仓库根使用项目已存在的受控执行器，输出放到新的 `.agent-output/` 子目录：
 
 ```bash
-python3 .agents/skills/tla-verify-design/scripts/run_tlc.py \
+python3 .agents/skills/worker-tla/scripts/run_tlc.py \
   --manifest evidence/message-dispatch/verification.json \
   --profile same-key --jar "$BOARDROOM_TLC_JAR" \
   --out .agent-output/message-dispatch-recheck/same-key

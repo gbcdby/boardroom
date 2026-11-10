@@ -1,0 +1,13 @@
+interface:
+  display_name: 实现指定任务
+  short_description: 依据有效规格实现指定任务或明确范围，小步修改并保留真实检查证据
+  default_prompt: 使用 $worker-implement 完成这个任务，核对有效规格和依赖产物，交回实际候选、检查证据和剩余问题。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

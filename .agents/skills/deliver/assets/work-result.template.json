@@ -1,0 +1,18 @@
+{
+  "schema_version": "work-result/v1",
+  "work_id": "WORK-EXAMPLE",
+  "skill": "deliver",
+  "outcome": "NOT_RUN",
+  "subject": {
+    "kind": "workspace",
+    "id": "REPLACE_WITH_ACTUAL_CONTENT_ID",
+    "base_id": "REPLACE_WITH_ACTUAL_BASE",
+    "contract_id": "REPLACE_WITH_CONTRACT"
+  },
+  "evidence": [],
+  "unresolved": [
+    "示例模板，尚未执行"
+  ],
+  "changed_assumptions": [],
+  "next_action": "读取项目约定并固定当前候选"
+}

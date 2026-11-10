@@ -1,0 +1,13 @@
+interface:
+  display_name: 技能使用向导
+  short_description: 由你主动发起，根据当前情境推荐合适入口，并提供简短可直接使用的提示
+  default_prompt: 使用 $guide 解释我现在该用哪个工作技能，给一个推荐入口、理由和可直接使用的提示。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  allow_implicit_invocation: false
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas

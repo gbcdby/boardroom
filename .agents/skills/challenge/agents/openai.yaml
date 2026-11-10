@@ -1,0 +1,13 @@
+interface:
+  display_name: 一起推敲
+  short_description: 由你主动发起，查清事实、检验想法和比较关键取舍，保留必要分歧
+  default_prompt: 使用 $challenge 和我一起推敲这个想法，先查事实、检验假设，再给出简短建议和必要问题。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  allow_implicit_invocation: false
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas

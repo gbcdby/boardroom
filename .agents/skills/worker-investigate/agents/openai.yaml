@@ -1,0 +1,13 @@
+interface:
+  display_name: 调查问题
+  short_description: 查清想法或反馈的事实、原因、范围与验收条件，留下可追溯依据
+  default_prompt: 使用 $worker-investigate 调查这项想法或反馈，明确事实、影响范围、验收条件和剩余未知。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true
