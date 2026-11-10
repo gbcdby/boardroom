@@ -1,6 +1,6 @@
 {
   "schema_version": "work-suite/v1",
-  "suite_version": "0.4.1",
+  "suite_version": "0.4.2",
   "result_contract": "work-result/v1",
   "first_testbed": "boardroom",
   "independent_formal_skill": "worker-tla",
@@ -237,7 +237,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "bf0cf35b053d4bbf900b9e764b29762bb443533df7f6f975d89f96239e63401e"
+          "sha256": "b644811b94e6eb5c8e469dd48b37965c7b71e84c45ae645d3e538c977c5ecb1e"
         },
         {
           "path": "agents/openai.yaml",
@@ -253,7 +253,7 @@
         },
         {
           "path": "references/execution-rules.md",
-          "sha256": "2c6f7920db75ff0a78b7030aa6ef044830ad947e50ff5c21dffb016bd85c342c"
+          "sha256": "ab74d2dda8fce6684c9e0f458b4d3bb17c4b9d4a96c98b8cb78e26fba55863cd"
         }
       ]
     },
@@ -291,7 +291,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "8399da61e424cc734f121f95824c490763718ff48cab563783adfd7bc226b884"
+          "sha256": "5e9831af7f2fb21489147a9a451fd1c3c773a8411a57e3cf0cae11c142f741de"
         },
         {
           "path": "agents/openai.yaml",
@@ -299,15 +299,15 @@
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "d80a4c3e0fd2efa7af88433a53b25a92c78a644175c6669dd78fee50fb53acf6"
+          "sha256": "8936b24f674a1250d999e2c2b5901374fb4240426f32bd1ae340c352a90d617d"
         },
         {
           "path": "assets/review-result.md",
-          "sha256": "8ed34652bd3e2b5d4ec96e959035bca5293f58e1cea2d283661ae10c38a0a29f"
+          "sha256": "da9523708475c23519cd49e45f68f689a437d74a78cb03ec8aa73770180d8e30"
         },
         {
           "path": "references/review-protocol.md",
-          "sha256": "a38ac40fed138b34fb5e3f1420e510943851bbe3f9c0d51ca398be2e27926c6e"
+          "sha256": "b33ddc63c32bff352aed62720a5e65f4814cd2cc6cf64edfe4a11327e83ae37d"
         }
       ]
     },

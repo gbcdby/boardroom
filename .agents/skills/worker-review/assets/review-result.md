@@ -21,10 +21,10 @@ outcome: <PASS | FAIL | INCONCLUSIVE | BLOCKED | NOT_RUN>
 
 ## 分轴结论
 
-| Axis | Outcome | 依据 | 覆盖及缺口 |
-| --- | --- | --- | --- |
-| requirements | <PASS / FAIL / INCONCLUSIVE / NOT_RUN> | <当前契约> | <范围> |
-| standards | <PASS / FAIL / INCONCLUSIVE / NOT_RUN> | <实际标准> | <范围> |
+| Axis | Outcome | 审查者／独立性 | 依据 | 覆盖及缺口 |
+| --- | --- | --- | --- | --- |
+| requirements | <PASS / FAIL / INCONCLUSIVE / NOT_RUN> | <实际执行者与上下文关系> | <当前契约> | <范围> |
+| standards | <PASS / FAIL / INCONCLUSIVE / NOT_RUN> | <实际执行者与上下文关系> | <实际标准> | <范围> |
 
 ## Findings
 
