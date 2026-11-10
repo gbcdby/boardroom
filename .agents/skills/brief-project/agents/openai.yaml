@@ -1,0 +1,13 @@
+interface:
+  display_name: 项目图景与决策
+  short_description: 只读呈现项目行为、架构累计变化、有效证据与需要人判断的事项
+  default_prompt: 使用 $brief-project 只读汇总当前项目的成果、行为与架构变化、证据和待决事项。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

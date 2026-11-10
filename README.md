@@ -1,142 +1,134 @@
-# Agent Studio
+# Agent Studio（boardroom）
 
-本地运行的跨 Agent 协作平台。Claude Code、Codex CLI 等作为保留各自上下文与身份的独立成员参与；人在 WebUI 中参与群聊、设定组织架构、管理任务和记忆。
+本地运行的跨 Agent 协作平台。独立运行的 Claude Code、Codex CLI、DeepSeek Harness（DSH）通过 MCP 参与项目群聊，人在 WebUI 中管理项目、成员与组织，并参与对话。
 
-当前处于工程骨架阶段（阶段 1 / F1 #11）：只提供本地服务启动、配置加载、结构化日志、SQLite 连接与迁移 runner、HTTP + WebSocket、健康检查与 Vue 3 WebUI 空壳。项目/群组/聊天/状态等业务在后续票实现。
+技术栈：Node.js **>= 24**、TypeScript、Vue 3 + Vite、WebSocket、MCP；默认使用 SQLite，可配置 PostgreSQL。服务固定绑定 **`127.0.0.1`，单用户、无身份认证**，仅适用于可信的本地环境。
 
-- 技术栈：Node.js LTS + TypeScript、SQLite（better-sqlite3）、WebSocket（ws）、Vue 3 + Vite。
-- 仅绑定 `127.0.0.1`，**无认证、不暴露公网**，仅供单机单人使用。
+## 当前实现范围
+
+当前代码包含聊天与 MCP 主链路，以及多项目、组织、成员生命周期和审计功能。下表依据当前路由与实现整理；产品后续规划见[架构与范围基线](docs/architecture/agent-studio.md)，详细 spec 和进度以项目 Issues 为准。
+
+| 能力 / 入口 | 当前范围 | 详细说明 |
+| --- | --- | --- |
+| 项目与群组 `/projects` | 多项目、多群组、成员与参与者管理、顶层 manager 指定；项目/群组归档与恢复、二次确认后永久删除 | [项目与群组 API](docs/t1-project-group-api.md) |
+| 成员生命周期 `/projects` | 暂停与恢复成员，保留历史、数据与岗位；与在线/离线状态分开 | [成员生命周期](docs/t3-member-lifecycle.md) |
+| 群聊 `/chat` | 人与 agent 发消息、`@` / `@all`、历史持久化、按成员范围投递与确认 | [聊天与路由](docs/t3-chat-and-routing.md) |
+| 状态看板 `/status` | 项目成员在线/离线、等待/工作、断线与陈旧状态，WebSocket 更新 | [状态与心跳](docs/t4-status-and-heartbeat.md) |
+| 组织与角色 `/org` | 组织树、岗位、汇报线、成员占岗，以及静态角色与能力范围 | [权限守卫](docs/f2-authorize-guard.md)、[页面实现](src/web/src/views/OrgView.vue) |
+| 审计与撤销 `/audit` | 变更记录、由人撤销可逆的成员/组织变更；永久删除不可撤销，归档/恢复使用对应正向操作 | [审计页面](src/web/src/views/AuditView.vue) |
+| 跨项目概览 `/status` | 展示各项目状态、成员/群组/消息/在线人数、最近活动与归档筛选；数据来自 `GET /api/projects` | [状态页实现](src/web/src/views/StatusBoardView.vue)、[HTTP 实现](src/server/api.ts) |
+
+首页 `/` 目前展示健康与连接信息，仍保留早期“工程骨架”文案；跨项目概览请打开 `/status`。`/settings` 仍是占位页。**任务板、任务认领/调度和三层记忆尚未提供**，不应把架构规划当作当前能力。页面入口以[路由表](src/web/src/router.ts)为准。
 
 ## 快速开始
 
-环境要求：Node.js **>= 24**（`package.json` 的 `engines`）。
+在仓库根目录运行；首次安装需要 Node.js >= 24 与 npm：
 
 ```bash
-npm install
-npm run build && npm start
+npm ci
+npm start
 ```
 
-`npm start` 的 `prestart` 会先构建 WebUI（等价于 `npm run build`），随后启动服务。启动成功后可访问：
+依赖已安装时直接 `npm start`。它先通过 `prestart` 构建 WebUI 到 `dist/web`，再由 Node 运行 `src/server/index.ts`，无需另行预构建后端。脚本定义见 [package.json](package.json)。
 
-- 健康检查：<http://127.0.0.1:4317/api/health>
-- WebUI：<http://127.0.0.1:4317/>
-- WebSocket：`ws://127.0.0.1:4317/ws`
-
-首次启动会自动创建数据目录 `./data` 并初始化 SQLite（`data/agent-studio.db`）。这些运行时数据已被 `.gitignore` 忽略，不进入仓库。
-
-### 常用脚本
-
-| 命令 | 说明 |
+| 入口 | 默认地址 |
 | --- | --- |
-| `npm run build && npm start` | 一条命令构建 WebUI 并启动服务 |
-| `npm start` | 构建 WebUI（`prestart`）后启动服务 |
-| `npm run dev:server` | 以 `--watch` 方式启动后端（不构建 WebUI） |
-| `npm run dev:web` | 启动 Vite 开发服务器（默认 5173，代理 `/api`、`/ws` 到后端 4317） |
-| `npm test` | 运行全部自动化测试（`node --test`） |
-| `npm run typecheck` | 后端 `tsc` + 前端 `vue-tsc` 类型检查 |
+| WebUI | <http://127.0.0.1:4317/> |
+| 健康检查 | <http://127.0.0.1:4317/api/health> |
+| WebSocket | `ws://127.0.0.1:4317/ws` |
+| MCP（Streamable HTTP） | `http://127.0.0.1:4317/mcp` |
 
-## 配置
+默认首次启动会创建 `data/agent-studio.db` 并应用数据库迁移；后续启动校验已应用迁移并执行新增迁移。数据目录相对进程工作目录解析，重启要保留同一份数据。当前迁移定义见[迁移列表](src/server/db/migrations/index.ts)。
 
-配置来源优先级：**默认值 → 配置文件 → 环境变量**（环境变量优先，覆盖配置文件）。
+### 从 WebUI 到 agent 入群
 
-- 配置文件位置：`$AGENT_STUDIO_CONFIG` 指向的文件；未设置时读取 `<cwd>/config.json`（不存在则跳过）。
-- 可参考仓库根目录的 `config.example.json`。
+1. 打开 `/projects`，创建项目，添加自己的「人」成员，再创建含该成员的群组。从项目标题下方复制项目 ID，作为 `projectId`。
+2. 打开 `/chat`，选择该项目与群组，从页面底部「当前群组」旁复制群组 ID，作为 `groupId`。
+3. 将宿主的 MCP 服务配置为上面的 Streamable HTTP 地址；具体命令与 DSH 配置见 [MCP 接入指南](docs/getting-started-mcp.md)。
+4. 让 agent 显式调用 `join`；真实 agent 身份由 MCP 入群产生，需要时再在 WebUI 指定顶层 manager。
+5. 在 `/chat` 选择发言人成员；让 agent 持续调用 `wait_for_messages`，收到消息后处理并 `acknowledge_message`，再进入下一次等待。
 
-| 配置项 | 环境变量 | 配置文件字段 | 默认值 | 说明 |
-| --- | --- | --- | --- | --- |
-| 端口 | `AGENT_STUDIO_PORT` | `port` | `4317` | HTTP + WebSocket 监听端口，仅绑定 `127.0.0.1` |
-| 数据目录 | `AGENT_STUDIO_DATA_DIR` | `dataDir` | `data` | SQLite 数据库与运行时数据所在目录（相对 cwd 解析为绝对路径） |
-| 持久化驱动 | `AGENT_STUDIO_DB_DRIVER` | `dbDriver` | `sqlite` | F1（#46）连接工厂选择的驱动：`sqlite` / `postgres`。业务仓储在 M1（#54）迁移前仍仅支持 SQLite，配置为 `postgres` 时服务启动即快速失败并给出回滚指引 |
-| PG 连接串 | `AGENT_STUDIO_PG_CONNECTION_STRING` | `pgConnectionString` | — | `dbDriver=postgres` 时必填：`postgres://user:password@host:port/database`；缺失时启动报 ConfigError |
-| 心跳间隔 | `AGENT_STUDIO_HEARTBEAT_INTERVAL_MS` | `heartbeat.intervalMs` | `10000`（10s） | WebSocket 心跳发送间隔，D4 默认值 |
-| 心跳超时 | `AGENT_STUDIO_HEARTBEAT_TIMEOUT_MS` | `heartbeat.timeoutMs` | `30000`（30s） | 超过该时长未收到心跳即判定断线，D4 默认值 |
-| 日志级别 | `AGENT_STUDIO_LOG_LEVEL` | — | `info` | `debug` / `info` / `warn` / `error` |
-
-约束：`heartbeat.timeoutMs` 必须大于 `heartbeat.intervalMs`，否则启动报错（否则每个心跳周期都会误判超时）。
-
-示例（`config.json`）：
+例如 `join` 参数（替换项目与群组 ID，`hostType` 对应实际宿主）：
 
 ```json
 {
-  "port": 4317,
-  "dataDir": "data",
-  "heartbeat": { "intervalMs": 10000, "timeoutMs": 30000 }
+  "displayName": "Codex",
+  "hostType": "codex-cli",
+  "projectId": "<项目ID>",
+  "groupId": "<群组ID>"
 }
 ```
 
-用环境变量临时覆盖，例如换端口：
+服务注册了 `join`、`wait_for_messages`、`send_message`、`acknowledge_message`、`report_status`、`heartbeat`、`read_history` 七个工具。参数、游标、可见范围和错误格式见 [MCP 工具契约](docs/mcp-tool-contract.md)；当前注册以[工具实现](src/server/mcp/server.ts)为准。每个 MCP 会话绑定一个项目/群组，连接成功不等于已经入群。
+
+另有 [stdio 入口](src/server/mcp/stdio.ts)：由宿主运行 `node /绝对路径/src/server/mcp/stdio.ts`。它独立打开数据库，必须与 Web 服务使用同一存储配置（SQLite 使用相同的绝对数据目录）。**共享数据库不会共享进程内唤醒通知**；跨进程新消息需在再次调用 `wait_for_messages` 时读取积压。需要 WebUI 发消息及时结束挂起等待时，使用同一服务上的 Streamable HTTP。
+
+## 配置与存储
+
+优先级为 **默认值 → 配置文件 → 环境变量**。`AGENT_STUDIO_CONFIG` 可指定配置文件；未设置时读取 `<cwd>/config.json`，默认文件不存在则使用默认值。参考 [config.example.json](config.example.json)，实际解析规则见 [config.ts](src/server/config.ts)。
+
+| 配置字段 | 环境变量 | 默认值 / 说明 |
+| --- | --- | --- |
+| `port` | `AGENT_STUDIO_PORT` | `4317`，只绑定 `127.0.0.1` |
+| `dataDir` | `AGENT_STUDIO_DATA_DIR` | `data`，SQLite 数据目录，相对 cwd 解析 |
+| `dbDriver` | `AGENT_STUDIO_DB_DRIVER` | `sqlite`；可选 `postgres` |
+| `pgConnectionString` | `AGENT_STUDIO_PG_CONNECTION_STRING` | 无；选择 `postgres` 时必填 |
+| `heartbeat.intervalMs` | `AGENT_STUDIO_HEARTBEAT_INTERVAL_MS` | `10000` ms |
+| `heartbeat.timeoutMs` | `AGENT_STUDIO_HEARTBEAT_TIMEOUT_MS` | `30000` ms，必须大于间隔 |
+| `antiLoop.maxConsecutiveAutoReplies` | `AGENT_STUDIO_MAX_CONSECUTIVE_AUTO_REPLIES` | `6`，每群组连续自动回复阈值 |
+| `antiLoop.maxWakesPerMinutePerMember` | `AGENT_STUDIO_MAX_WAKES_PER_MINUTE_PER_MEMBER` | `20`，每成员每分钟唤醒上限 |
+| — | `AGENT_STUDIO_LOG_LEVEL` | `info`；可选 `debug` / `info` / `warn` / `error` |
+
+临时换端口：`AGENT_STUDIO_PORT=5000 npm start`。PostgreSQL 需先备好可连接的数据库，例如：
 
 ```bash
-AGENT_STUDIO_PORT=5000 npm start
+AGENT_STUDIO_DB_DRIVER=postgres \
+AGENT_STUDIO_PG_CONNECTION_STRING='postgres://user:password@127.0.0.1:5432/agent_studio' \
+npm start
 ```
 
-## 健康检查
+HTTP、MCP 与业务仓储已通过统一 `DbDriver` 接入两种数据库，选择 PostgreSQL 不再被启动入口直接拒绝。**切换驱动不会搬迁已有数据**；迁移、校验、回滚命令见[数据迁移 CLI](scripts/migrate-data.ts)（`npm run db:migrate -- ...`）。其中迁移默认清空目标业务表，应按脚本说明使用独立目标库。存储设计见[数据模型](docs/architecture/data-model.md)。
 
-`GET /api/health` 返回 JSON，包含：
+`/api/health` 提供数据库探针、迁移版本、心跳配置与 `webui.built`；数据库异常时返回 HTTP 503。`status: "ok"` 不能替代 MCP、浏览器操作或模型能力验收。常见问题：
 
-- `status`：`ok` 或 `degraded`（数据库异常时为 `degraded`，HTTP 状态码 503）。
-- `uptimeSeconds`、`serverTime`：进程存活与时间。
-- `database`：`{ status, writable }`，反映数据库是否可读写（启动时用临时表探测）。
-- `migrations`：`{ version, applied, pending }`，已应用迁移的最高版本、条数、待应用数。
-- `heartbeat`：当前生效的心跳配置。
-- `webui.built`：WebUI 构建产物是否就位。
+- 端口占用：停止占用进程或修改 `AGENT_STUDIO_PORT`。
+- SQLite 数据目录不可写：将 `AGENT_STUDIO_DATA_DIR` 指向可写目录。
+- 配置或 PG 连接失败：检查配置文件、连接串、数据库服务与权限。
+- `webui.built: false`：运行 `npm run build`，或使用下面的前端开发服务器。
 
-```bash
-curl -s http://127.0.0.1:4317/api/health
-# {"status":"ok","uptimeSeconds":5.7,"serverTime":"...","database":{"status":"ok","writable":true},
-#  "migrations":{"version":0,"applied":0,"pending":0},"heartbeat":{"intervalMs":10000,"timeoutMs":30000},"webui":{"built":true}}
-```
+## 开发与检查
 
-## 数据与迁移
+| 命令 | 作用 |
+| --- | --- |
+| `npm run dev:server` | 后端 watch 模式；不构建 WebUI |
+| `npm run dev:web` | Vite 开发服务器，端口 5173；另一个终端需运行后端 |
+| `npm run build` | 仅构建 WebUI，产物位于 `dist/web` |
+| `npm run typecheck` | 后端 `tsc` 与前端 `vue-tsc` |
+| `npm test` | Node 自动化测试，包括 API、MCP SDK、存储及页面构建/深链检查 |
+| `npm run e2e` | 本地 HTTP 服务 + 两个 MCP SDK 客户端的链路检查；先运行 `npm run build` |
 
-- **持久化驱动抽象（F1 #46）**：`src/server/db/driver.ts` 定义 `DbDriver`（connect / migrate / query / exec / transaction / close）与连接工厂 `createDbDriver`；SQLite 与 PostgreSQL 双驱动经 `dbDriver` 配置切换，默认 SQLite，阶段 1 行为不回归。SQL 方言差异（`?`→`$n` 占位符、事务语句、类型/自增/JSON/时间戳映射、迁移版本表 DDL）收敛在 `src/server/db/dialect.ts`。阶段 1 业务仓储仍直接持有 SQLite 句柄（`SqliteDriver.handle`），PG 业务表重写、数据迁移与回滚脚本属于 M1（#54）；「回滚」当前指把配置切回 `sqlite`。
-- SQLite 连接参数：WAL 日志模式、`synchronous = NORMAL`、外键开启、`busy_timeout = 5000`。
-- 迁移 runner：版本号单调递增，每条迁移在独立事务内执行；已应用迁移记录在 `schema_migrations` 表并校验 checksum，已应用的迁移不可改写。
-- **幂等**：重复启动不会重复执行已应用的迁移；迁移版本与数据目录在重启后保留。
-- F1 建立迁移版本表 `schema_migrations`；F2（#12）起迁移 `1 init_domain_model` 建立全部领域表（agents/projects/members/groups/group_participants/messages/message_deliveries/member_statuses）及其索引、外键与约束。数据模型、ID 方案与事务说明见 [`docs/architecture/data-model.md`](docs/architecture/data-model.md)。
+开发代理把 `/api`、`/ws` 固定转到后端 4317；修改后端端口时也要调整 [Vite 代理](src/web/vite.config.ts)。MCP 客户端直接连接后端 `/mcp`。
 
-## 日志
+真实 PostgreSQL 测试需显式设置 `AGENT_STUDIO_PG_TEST_URL` 后运行 `npm test`；使用专用测试库。缺少 PG 配置时，相关用例会跳过或不注册，默认测试通过不证明 PG 运行路径已验收。`npm run e2e` 默认用 SQLite，可通过 `AGENT_STUDIO_DB_DRIVER=postgres` 和 `AGENT_STUDIO_PG_CONNECTION_STRING` 切换。
 
-- 结构化输出：每行一个 JSON 对象（`time`、`level`、`msg` 及附加字段），默认写 stdout。
-- 不记录敏感内容：按键名脱敏（`token`、`password`、`authorization`、`content`/`body`/`text`/`prompt` 等消息正文与密钥替换为 `[REDACTED]`）。日志只记录 ID、长度等元数据，不记录完整消息正文或密钥。
-- 写入失败（如 stdout 管道断开）不会抛错，避免日志拖垮进程。
+**SDK 检查不会启动真实模型或 harness**，也不覆盖浏览器中的完整人工操作。脚本输出中关于 Claude/Codex 的历史措辞，不应当作本次真实宿主验收。历史宿主结果见 [2026-11-03 验收报告](docs/t8-acceptance-report.md)与 [DSH 证据索引](evidence/real-host-retest/README.md)，适用范围如下：
 
-## 错误与恢复
+| 宿主 / 历史版本 | 已有历史记录 | 当前保守边界 |
+| --- | --- | --- |
+| Claude Code 2.1.233、Codex CLI 0.166.0 | 报告记录 Streamable HTTP 入群、等待中投递、双向 `@`、重连补积压；原始输出部分为本地留档 | 不构成本轮或其他版本的真实模型验收 |
+| DSH 0.2.1-rc.5 | 仓库保留入群与活跃等待中收消息的输出；当时使用 `hostType=other` | 当前已注册 `dsh`；重连、空闲唤醒与打断仍按未支持处理 |
 
-- **端口冲突**：启动时报 `端口 <port> 已被占用`，恢复方式为停止占用进程（`lsof -i :<port>`）或通过 `AGENT_STUDIO_PORT` / 配置文件换端口。
-- **数据目录不可写**：启动时报 `无法创建/打开数据目录`，含 `EACCES` 等错误码；可通过 `AGENT_STUDIO_DATA_DIR` 指向可写目录。
-- **配置无效**：缺失/非法 JSON 文件、非法端口、心跳超时不大于间隔等都会给出明确中文错误与恢复路径，进程以非零码退出。
+## 必须理解的限制
 
-## 已知限制（阶段 1 / F1）
+- **无身份认证**：角色/组织权限守卫已实现，但不构成互联网安全边界。不要公开或转发服务端口；消息正文会持久化，日志脱敏不等于数据加密。
+- **无自动入群、持续调度或空闲宿主唤醒保证**：服务端只能结算已经挂起的等待调用。WebSocket 更新、消息入库、消息进入模型上下文、开始新执行轮次是不同事件。
+- **当前内置适配器均将打断声明为 `unsupported`**：消息保留到下一安全点（再次等待）投递；`@` 标记本身不代表精确定向唤醒。详见[安全点与打断](docs/t6-interrupt-and-safe-point.md)。
+- **至少一次投递**：客户端应按稳定 `messageId` 去重并确认。`@all` 按发送时在线参与者展开，不承诺对当时离线的普通成员补投；详见[积压与重连](docs/t5-backlog-and-reconnect.md)。
+- **防环/限流计数在内存中**：重启后重置；被抑制的实时唤醒不代表消息被丢弃。详见[防环与限流](docs/t7-antiloop-and-rate-limit.md)。
+- **宿主能力按证据声明**：`other` 是保守兜底，注册适配器不等于完成真实宿主验收；当前声明见[适配器目录](src/server/mcp/adapters)。
 
-- 仅绑定 `127.0.0.1`，无认证，不支持公网、多用户或云端部署。
-- WebUI 仅为空壳页面与占位路由；业务页面在后续票实现。
-- F2 已实现领域表与 repository 数据访问层；MCP server 及项目/群组/聊天/状态业务在后续票实现。
-- 生产迁移当前版本为 `1`（`init_domain_model`）；空库首次启动即全部应用。
+## 进一步阅读
 
-## 目录结构
-
-```
-src/server/        后端：配置、日志、SQLite、迁移、HTTP、WebSocket、健康检查
-src/server/db/     SQLite 连接、迁移 runner 与列表、稳定 ID、领域类型、repository 层
-src/web/           Vue 3 WebUI（Vite 构建，产物输出到 dist/web）
-tests/             自动化测试（node --test）
-docs/              宏观架构与范围文档（详细 spec 见 GitHub Issues）
-```
-
-## 测试
-
-```bash
-npm test          # 全部自动化测试
-npm run typecheck # 类型检查
-```
-
-PostgreSQL 驱动冒烟默认跳过（无 PG 环境不影响 `npm test`）；需要时显式开启：
-
-```bash
-# 专用一次性冒烟容器（示例）：
-docker run -d --name boardroom-pg-f1-smoke -e POSTGRES_PASSWORD=smokepw -p 15432:5432 postgres:16-alpine
-AGENT_STUDIO_PG_TEST_URL=postgres://postgres:smokepw@127.0.0.1:15432/postgres npm test
-```
-
-测试覆盖：配置加载与覆盖优先级、日志结构化与脱敏、SQLite 连接与迁移幂等/回滚、HTTP 健康检查与静态页、WebSocket welcome/ping-pong/广播/非法帧；F2 领域 schema/索引/外键、稳定 ID、各实体 CRUD、项目/群组隔离、每项目唯一 manager、消息稳定 ID 去重、投递去重与至少一次投递、状态按项目成员作用域、写入失败明确错误、事务回滚、重启持久化与 WAL 读写并发；F1 驱动接口/连接工厂（双驱动切换、失败路径脱敏、方言渲染与类型映射）、PostgreSQL 冒烟（基线迁移幂等、checksum 防篡改、参数渲染、JSONB/BOOLEAN/自增/时间戳往返、事务回滚、schema 隔离，经 `AGENT_STUDIO_PG_TEST_URL` 开启）。
+- [文档目录与内容归属](docs/README.md)：区分架构、接口、历史验收与详细工单。
+- [AGENTS.md](AGENTS.md)、[CONTEXT.md](CONTEXT.md)：贡献约定、跨会话事实与宿主差异；历史阶段描述需结合当前实现阅读。
+- 源码入口：[后端启动](src/server/server.ts)、[业务 API](src/server/api.ts)、[MCP](src/server/mcp)、[WebUI](src/web/src)、[自动化测试](tests)。

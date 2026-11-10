@@ -6,7 +6,7 @@
 
 Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Codex CLI 等作为保留各自上下文与身份的独立成员参与；人在 WebUI 中参与群聊、设定组织架构、管理任务和记忆。
 
-当前处于需求/方案阶段。产品基线见 `docs/architecture/agent-studio.md`；decision map、详细 spec、ticket、依赖与状态以 GitHub Issues 为准。技术栈为 Node/TypeScript + PostgreSQL + WebSocket + MCP + Vue 3，默认 localhost、单用户、无认证；架构基线支持未来远程/多用户（V1 仍单用户/无认证，具体范围待立项重评）。
+当前已实现聊天与 MCP 主链路，以及多项目、组织、成员生命周期和审计等能力；当前入口与限制见 `README.md`，产品基线见 `docs/architecture/agent-studio.md`。decision map、详细 spec、ticket、依赖与状态以 GitHub Issues 为准。技术栈为 Node/TypeScript + SQLite（默认，可配置 PostgreSQL）+ WebSocket + MCP + Vue 3，默认 localhost、单用户、无认证；架构基线支持未来远程/多用户（V1 仍单用户/无认证，具体范围待立项重评）。
 
 ## 工作约定
 
@@ -42,6 +42,35 @@ Agent Studio 是一个本地运行的跨 Agent 协作平台。Claude Code、Code
 辅助技能：`research` 查事实、`prototype` 试方案、`project-memory` 维护 `CONTEXT.md`、`handoff` 做交接。
 
 简单任务可跳过 spec 与拆票：有代码改动的按 `tdd` 实现，然后 `code-review` → `pr` 创建 PR。评审不可跳过。
+
+### 通用技能体系试运行
+
+boardroom 是跨项目、跨语言技能体系的首个试验场。新入口存放在同一 `.agents/skills/` 下，版本和内容摘要见 `.agents/skills/work-suite.json`。这些文件提供工作方法与交接约定；真实工具、权限、任务归属和外部结果仍由项目已有系统决定。
+
+日常用 `deliver-work` 推进已授权目标，用只读 `brief-project` 掌握架构、行为、累计变化与必要决定。其余技能按实际缺口使用，不要求每项任务经历全部步骤。
+
+| 技能 | 职责 |
+| --- | --- |
+| `deliver-work` | 识别终点、组织依赖、推进、恢复与交付回执 |
+| `frame-work` | 调查想法、反馈与改进，明确事实、范围和验收 |
+| `design-work` | 行为、职责、接口、架构变化与验证路径 |
+| `tla-verify-design` | 独立承担设计与 TLA+/TLC 验证，交出实现义务 |
+| `implement-work` | 按契约实现与获得小步反馈 |
+| `verify-work` | 执行当前候选所需的实际检查并保存证据 |
+| `review-work` | 独立检查需求与标准，覆盖完整 WIP 与复审增量 |
+| `land-work` | PR、反馈、CI、集成候选及已有授权内的合并 |
+| `release-work` | 目标包含发布或部署时，完成产物与目标位置验收 |
+| `brief-project` | 只读呈现事实、证据、累计架构变化与决策 |
+| `work-in-room` | 跨 harness 协作、可靠收信、分工、交接与取消 |
+| `improve-workflow` | 将漏检、误报或协作失效转成有证据的流程改进 |
+
+沿用现有用户触发限制、TDD 前置条件、评审与 PR 规则。调用原技能前核对其实际契约；不能通过直接读盘绕过 invocation 限制。用户选择原入口时遵循该入口，新技能不伪称已经调用未运行的 Matt 或 pstack 组件，也不替原技能补造批准。
+
+跨技能交接使用 `work-result/v1` 或等价紧凑文本；格式细节与校验器位于 `deliver-work`。共同字段为 work_id、skill、outcome、subject、evidence、unresolved、changed_assumptions、next_action。独立工具的原始报告保留，由外层交接封装。阶段完成、模型通过、运行通过、PR ready、实际合并和目标环境验收分别记录。小改动只做与风险有关的检查，不生成无关模型或逐字镜像测试。
+
+房间接入先读取 `work-in-room/references/boardroom.md` 并核对当前 schema。当前 MCP 仅有 join、wait_for_messages、send_message、acknowledge_message、report_status、heartbeat、read_history。没有原子任务领取、租约、启动 harness 或合并工具时，使用外部权威记录、明确协调者和隔离工作区；这只是协作约定，不是运行时锁。
+
+默认把成果、关键变化、证据缺口和必要决定聚合给人，不要求逐条阅读 Agent 对话。复用已有有效授权；简报、消息 ACK、模型多数同意和人的沉默均不创建新批准。
 
 ### 正式文档与归档
 

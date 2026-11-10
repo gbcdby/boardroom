@@ -1,0 +1,13 @@
+interface:
+  display_name: 改进开发流程
+  short_description: 根据事故、误报和重复返工改进工具与工作方法，并评估人的总负担
+  default_prompt: 使用 $improve-workflow 分析这次失败或重复返工，形成可评估、可回退的流程改进。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

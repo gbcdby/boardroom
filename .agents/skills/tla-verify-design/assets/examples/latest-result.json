@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "feature": "latest-result",
+  "tool": {
+    "version": "v1.7.4 / TLC 2.19",
+    "sha256": "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  },
+  "model": {
+    "root": ".",
+    "entry": "LatestResult.tla"
+  },
+  "requirements": [
+    {
+      "id": "R1",
+      "statement": "ResultMatchesLatestAccepted",
+      "properties": [
+        "ResultMatchesLatestAccepted"
+      ]
+    },
+    {
+      "id": "R2",
+      "statement": "All finite attempts/responses eventually complete under the stated assumptions.",
+      "properties": [
+        "EventuallyDone"
+      ]
+    }
+  ],
+  "profiles": {
+    "bug": {
+      "config": "LatestResult-bug.cfg",
+      "timeout_seconds": 30,
+      "workers": 1,
+      "heap_mb": 256,
+      "expected_invariants": [
+        "TypeOK",
+        "ResultMatchesLatestAccepted"
+      ],
+      "expected_properties": [
+        "EventuallyDone"
+      ],
+      "checks_deadlock": true,
+      "scope": {
+        "Requests": [
+          1,
+          2
+        ],
+        "arrival_order": "All orders",
+        "faults": "No permanent response loss",
+        "meaning": "Keep the highest revision among responses already delivered, not among requests issued.",
+        "variant": "bug"
+      },
+      "assumptions": [
+        "Each pending response is eventually processed (weak fairness).",
+        "Revision comparison preserves the real implementation ordering."
+      ]
+    },
+    "fixed": {
+      "config": "LatestResult-fixed.cfg",
+      "timeout_seconds": 30,
+      "workers": 1,
+      "heap_mb": 256,
+      "expected_invariants": [
+        "TypeOK",
+        "ResultMatchesLatestAccepted"
+      ],
+      "expected_properties": [
+        "EventuallyDone"
+      ],
+      "checks_deadlock": true,
+      "scope": {
+        "Requests": [
+          1,
+          2
+        ],
+        "arrival_order": "All orders",
+        "faults": "No permanent response loss",
+        "meaning": "Keep the highest revision among responses already delivered, not among requests issued.",
+        "variant": "fixed"
+      },
+      "assumptions": [
+        "Each pending response is eventually processed (weak fairness).",
+        "Revision comparison preserves the real implementation ordering."
+      ]
+    }
+  }
+}

@@ -1,0 +1,458 @@
+{
+  "schema_version": "work-suite/v1",
+  "suite_version": "0.1.0",
+  "result_contract": "work-result/v1",
+  "first_testbed": "boardroom",
+  "independent_formal_skill": "tla-verify-design",
+  "runtime_guarantees": "Defined by actual project tools, not this registry.",
+  "skills": [
+    {
+      "name": "deliver-work",
+      "path": ".agents/skills/deliver-work",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "d94629c09077e8f616f85972fe7a79fbd631df94fa8b3e56da40c199b7e86574"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "ee4528474f178e9ec8c239b04bde510fe2d0648da3252fcab3257e3d83de0b0b"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "72343cc4b66256ae7de8474c7cad14e711ad84a94c473732a44f96a56124c42d"
+        },
+        {
+          "path": "assets/work-result.template.json",
+          "sha256": "77ac3f71f04dc665480a22ad42d2042afdaa877955b9aac0392780ebf007fd5e"
+        },
+        {
+          "path": "references/boardroom-project.md",
+          "sha256": "caf72fd3500142fd59728c70b26709ede969308c5b53183408b9281d1e33aea4"
+        },
+        {
+          "path": "references/sources.md",
+          "sha256": "ac99e7e59747af372c131b1967500213577cd45a873b5fa8b589e18a595c19c6"
+        },
+        {
+          "path": "references/work-contract.md",
+          "sha256": "30ebf38f3e7f9132b29cc2b1e36d3250285485bbaa323d11d597f09b5f8a0b8f"
+        },
+        {
+          "path": "scripts/validate_result.py",
+          "sha256": "1faf385a3d1809fb09379ad8ff0bb5c55bf8f9006a28db23058b6fa1d9455743"
+        }
+      ]
+    },
+    {
+      "name": "frame-work",
+      "path": ".agents/skills/frame-work",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "0b22483a84ca061d3fa81250d8713d637ddaa86d48e206a10534902ce25d14c4"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "abc3fa0d8e06d722489edb2fbdc80225751e4b65e8f36be9765e06df32cfe51e"
+        },
+        {
+          "path": "assets/frame.template.md",
+          "sha256": "2b716ac5a01368ab1ac7ed95ecc09b758c0981099da6ff0cfe9b1c725ae7dd5c"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "e9301497fa98ef56aaca7ede0857b9a18dc06c34040f0679c609a6bf49b1d38b"
+        },
+        {
+          "path": "references/investigation.md",
+          "sha256": "bea0eeb9e091abf13df955af64e510ccd142c2684df1c58d1ceff83fbb40d60d"
+        },
+        {
+          "path": "references/methods.md",
+          "sha256": "f18fb93aaf9255f0c29d1bf243f29953f042dbf556bbce1efd0a4c26a798dbc3"
+        }
+      ]
+    },
+    {
+      "name": "design-work",
+      "path": ".agents/skills/design-work",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "89cc377ee097fc1612844a64bc2bbce47cc7f77461a1b57ad005838e1e8b10a9"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "3610c55fb341eef3f162aee8a4852991726343dd773c369fd34e3c58851a5e66"
+        },
+        {
+          "path": "assets/design.template.md",
+          "sha256": "d3c57566f92c10b6ffb7d59cfa65c1e9b8ec0fdb05aa63ceeb5887202aa16894"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "e9301497fa98ef56aaca7ede0857b9a18dc06c34040f0679c609a6bf49b1d38b"
+        },
+        {
+          "path": "references/methods.md",
+          "sha256": "743a4d3ea8b90e53e9ea38cc7ccecc01b96333dfce7d1261b624dbd294e855b8"
+        },
+        {
+          "path": "references/visual-semantics.md",
+          "sha256": "354f5fd5665940cda729687baa613aaa44e73615700645809dd50d51eadc7543"
+        }
+      ]
+    },
+    {
+      "name": "tla-verify-design",
+      "path": ".agents/skills/tla-verify-design",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "50bcbb8f84d724ade4a7ffac3247d98cd9ecca591dd12074dd75b19f27f28dbb"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "d04b59d6f361cfc51e909e8113b62ed74e66ebd9815a6ae2c72acb41fbfe6a50"
+        },
+        {
+          "path": "assets/contract.template.md",
+          "sha256": "fa38ad97ab77643ae18d0746d33433e774ea1981e8e5e3d0cef0194d0b958b58"
+        },
+        {
+          "path": "assets/examples/IdempotentEffect-bug.cfg",
+          "sha256": "c93738f21990ecc74bfc4ff363e992ffc8c8fb52d2bb47d66932d9ddc798d5b1"
+        },
+        {
+          "path": "assets/examples/IdempotentEffect-fixed.cfg",
+          "sha256": "050c4130dca67eafaa586b2bc46ec86895f665eb8c7ac14d1c2e1756ef81b1c7"
+        },
+        {
+          "path": "assets/examples/IdempotentEffect.tla",
+          "sha256": "051a71a46992dcfccb791f473d17178aa08430b0524b2e8dcd73535b9b46fb41"
+        },
+        {
+          "path": "assets/examples/LatestResult-bug.cfg",
+          "sha256": "12f162430b8635f5f53d14b61532837678c30e926c4b9b5e10130d591e842b5e"
+        },
+        {
+          "path": "assets/examples/LatestResult-fixed.cfg",
+          "sha256": "ac6ade53f76800874239db1c55573689dd1ca5ab52ccfcbafd26815f1747ee0f"
+        },
+        {
+          "path": "assets/examples/LatestResult.tla",
+          "sha256": "056fb1be63588e9edf6d36984d0084a22a8868930151b4613d59bb073a426064"
+        },
+        {
+          "path": "assets/examples/idempotency.json",
+          "sha256": "5a86b0f2b265d35c74f2fd7ef19a6a43e10044dc97e8391b64ddbc81a92bf44c"
+        },
+        {
+          "path": "assets/examples/latest-result.json",
+          "sha256": "780c9d1d17bc749e4a0478df469e96bb4011e180158bb542c799ef472b5b928a"
+        },
+        {
+          "path": "assets/handoff.template.md",
+          "sha256": "bba6230f6ee8f066f24ae5d6e22ab4c66fac04451dc1818fe54ff96668e41841"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "8936b24f674a1250d999e2c2b5901374fb4240426f32bd1ae340c352a90d617d"
+        },
+        {
+          "path": "assets/implementation-map.template.md",
+          "sha256": "fc9dcd699d7116ecb4c0de868c1fba991c05d1663de738462f3cc777c267d6f1"
+        },
+        {
+          "path": "assets/project-profile.template.json",
+          "sha256": "4b928bcc9203d3f7a4c8b930667f385722b6214058e3ae980603afaea69ff3ca"
+        },
+        {
+          "path": "assets/report.template.md",
+          "sha256": "998462d7fbd733b450c6a80479688effe9e2af3b70520b193374fff9374e41cd"
+        },
+        {
+          "path": "assets/toolchain.json",
+          "sha256": "6d892493bf6d33acda7fd0ba084023b7d3a71fedff7693b24c2cbc3ceb17d4ca"
+        },
+        {
+          "path": "assets/verification.template.json",
+          "sha256": "8ad1247be8cdabff5799a69e89f44ce853196b61a898b034b4a9f4567fde7d59"
+        },
+        {
+          "path": "references/execution.md",
+          "sha256": "80e236842739b3f6e4862acb7ddc8e421d7b50c82584c40b607d3265abe5b881"
+        },
+        {
+          "path": "references/handoff.md",
+          "sha256": "240daa096ff723d8fedd2d8565ddf92ceccd3c1236fb9e40ecd6228f06324936"
+        },
+        {
+          "path": "references/modeling.md",
+          "sha256": "71e47f63be815e5857e9a6bec50bb0f9143d25565d13df09709a354f6ad2365d"
+        },
+        {
+          "path": "references/project-adapter.md",
+          "sha256": "8e054913529986dc3a581d901f3147f71d5413a16a7ed16a569b3cd118644de4"
+        },
+        {
+          "path": "references/pstack-license.txt",
+          "sha256": "bc957ca6bee02792566a1a028d105e02e247c6e77cf057061674273da77b200e"
+        },
+        {
+          "path": "references/review.md",
+          "sha256": "e24720fa69b95f142bd3c2cf38c6018852aa16e80ab017b5a3c7295d19611628"
+        },
+        {
+          "path": "references/upstream-sources.md",
+          "sha256": "3acb9002b2d6ff37811f524593b8c540cc8a1d57eb65875a22cc63c07e35fc8c"
+        },
+        {
+          "path": "scripts/fetch_tlc.py",
+          "sha256": "c7cf21b479dfe8bab76beb258b6a5d7731d3836f56d28ed3aa1ffdcc9714ef57"
+        },
+        {
+          "path": "scripts/run_tlc.py",
+          "sha256": "ca5811a8cae5d31961185b0ba53868f3ea885a1ee614150d873d61044ff18f5a"
+        },
+        {
+          "path": "scripts/test_runner.py",
+          "sha256": "15b17ad7924a75a66a1f26f4689a06f0dd6ea5c4e63e16dd05046f3fb9c98ca8"
+        }
+      ]
+    },
+    {
+      "name": "implement-work",
+      "path": ".agents/skills/implement-work",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "7cd3995c5821bc54a9254779447b35435692595c9d50366de9446dfec5cd40d3"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "c8e337fbda3601c53ba947d5bdb9193cd76ce897dea452c5907e91ba94910843"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "8936b24f674a1250d999e2c2b5901374fb4240426f32bd1ae340c352a90d617d"
+        },
+        {
+          "path": "assets/implementation-result.md",
+          "sha256": "d1c410196bf0b6cab3b36d1be36aee123ade6ab811bdc62b1fb91a5ff8a6b971"
+        },
+        {
+          "path": "references/execution-rules.md",
+          "sha256": "82e43a9db7e28bee4b72dbfb8eaa85dbf9e423a15db96101b62c4fe930385198"
+        }
+      ]
+    },
+    {
+      "name": "verify-work",
+      "path": ".agents/skills/verify-work",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "616bc66621df3c7b999715930a0b44e1caa2a3e6319ba30f49bad1b06e471e8b"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "fd9daac521a8a1174a68083145b7b9d9dee17697994635e62301d0530d7f0904"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "72343cc4b66256ae7de8474c7cad14e711ad84a94c473732a44f96a56124c42d"
+        },
+        {
+          "path": "assets/verification-result.md",
+          "sha256": "ce2e6f7391578431a91dc13a8dcd9f48367bb3cd44f3c4e2785edbd832b2baf0"
+        },
+        {
+          "path": "references/evidence-rules.md",
+          "sha256": "66df286200d704e0322ca8caef152e20f4b5a732781a3538c84a33cc7593dfff"
+        }
+      ]
+    },
+    {
+      "name": "review-work",
+      "path": ".agents/skills/review-work",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "c23df5a81abb63e59a438e0022b1ca11d2ebe3f925d589322460923e48c0c2c9"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "eb17ff4bb4eeaf1d744bd5c376c0d17e09dea8bf18270d426da53d2aed783942"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "0cdb7990dea3ad89ead04743eeac2dc58c119fb0b8b4a01499a21237f155bc1a"
+        },
+        {
+          "path": "assets/review-result.md",
+          "sha256": "b29d141d4f2cf1a4077dbadee893fd630afd45f8ce648a576907eefe73321c53"
+        },
+        {
+          "path": "references/review-protocol.md",
+          "sha256": "5f86b83c3d0e29356fb09f3adce79cd2bc18b1656ae81f3ab50620bcab6f1406"
+        }
+      ]
+    },
+    {
+      "name": "land-work",
+      "path": ".agents/skills/land-work",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "c2d277f922c8f583bbe6acc6b9c8a78f288a8eb1668c5856db618d5a46697dbe"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "fc63b94b879fa222bf79303ed248d170323ae5bce6d9648881d543654bd86326"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "fbb6c7314886573cd56c3f86884a65afe3b5f4ce4bf1ee6baeeeb1fa50aea7a4"
+        },
+        {
+          "path": "assets/pr-body.template.md",
+          "sha256": "6b204710f6a0eb08618b7445bad8d2b69bdab8b3daf0cdcfba7ca1568a512070"
+        },
+        {
+          "path": "references/boardroom.md",
+          "sha256": "5a4d99cce2a7da319659b8c024185a1b1a06951d163338431504e2b1e2bf97c7"
+        },
+        {
+          "path": "references/candidate-and-evidence.md",
+          "sha256": "8f3edf727c19828b5a28e31e1ed802356db5747e79f78f25f60538208d09e506"
+        }
+      ]
+    },
+    {
+      "name": "release-work",
+      "path": ".agents/skills/release-work",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "c99b30ad2cc621ac458e7b0c18d4bbf234a4d18aeb1049d8475fa79f4dda8878"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "43c15042def4e61042aec7aba9aa85cafbb17353d3743cc6a67f03376f91a014"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "72343cc4b66256ae7de8474c7cad14e711ad84a94c473732a44f96a56124c42d"
+        },
+        {
+          "path": "assets/release-record.template.md",
+          "sha256": "b8d5c707f5156d7972046bc718da5d825820e2b669c50ca49170f19e1f81c03b"
+        },
+        {
+          "path": "references/recovery.md",
+          "sha256": "4d65da6cfd1db285dadf06fb3b2f873dbfcb93944cd8fdea245b59055a40a352"
+        }
+      ]
+    },
+    {
+      "name": "brief-project",
+      "path": ".agents/skills/brief-project",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "e5d8d202e1fba6971b025b65d709dacd5841c5e6afa50812f6ba54e69f882264"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "333b8e5b5dab03bc3c8d51939e38076676e0303fcb3064c34f67b39c2f02757b"
+        },
+        {
+          "path": "assets/brief.template.md",
+          "sha256": "aea5c0e562623f11d1335489c3e72da6c4f3985b1a02b5875ed685912ac6fe2a"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "e9301497fa98ef56aaca7ede0857b9a18dc06c34040f0679c609a6bf49b1d38b"
+        },
+        {
+          "path": "references/methods.md",
+          "sha256": "3badd11f53710b86b7070db24d5d251aeb1e025806012421735bd155b0af50fa"
+        },
+        {
+          "path": "references/views.md",
+          "sha256": "2ddbf00f359e33b7d1effabd66131b81f31acedfedb2286a2834122cee2d0770"
+        }
+      ]
+    },
+    {
+      "name": "work-in-room",
+      "path": ".agents/skills/work-in-room",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "e4dddb31da47318dbe6b15f5018ca6e1f3d0e3749e9f879084eb29fd637ba5fb"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "6cb9c69278bf2e5a2490d0bb4d32e6f81a799e6a4837fa493127c940bbd0363e"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "d80a4c3e0fd2efa7af88433a53b25a92c78a644175c6669dd78fee50fb53acf6"
+        },
+        {
+          "path": "assets/work-cancel.md",
+          "sha256": "91a811dbc04071528449e9870153245239c92d2022a4e224f3d8510fb414cafb"
+        },
+        {
+          "path": "assets/work-handoff.md",
+          "sha256": "de058ecb0d8a46651c29ceba785c55f13b5ecc48b6b74f594f913eece705c6ba"
+        },
+        {
+          "path": "assets/work-request.md",
+          "sha256": "433e82c98ae15fc4c02aa700d9dfa436c5a993d3a7d97014dfc4245cb63f78f4"
+        },
+        {
+          "path": "assets/work-result.json",
+          "sha256": "e568311615aac73108df8eab2713348af499b3fbe8e5a2f21f2464178989aacc"
+        },
+        {
+          "path": "references/boardroom.md",
+          "sha256": "df847be16957543683195e08cafe204b44a21d7b36e4614b1e0eafa2898d1ead"
+        }
+      ]
+    },
+    {
+      "name": "improve-workflow",
+      "path": ".agents/skills/improve-workflow",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "9357a8c67c6b1a5f62bd8ee93ba2748de47be182a08800930bb5d9f29bd7344e"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "44f9d912246401c42fecab51cde3666508579fbb96762fd0d0befb4d835b71e2"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "72343cc4b66256ae7de8474c7cad14e711ad84a94c473732a44f96a56124c42d"
+        },
+        {
+          "path": "assets/improvement.template.md",
+          "sha256": "ccb47ab8e6e8e86ae372927b5ba1b79af7d1e1d2129d19db9b59f96cf0aba062"
+        },
+        {
+          "path": "references/evaluation.md",
+          "sha256": "39f4c689e95737b1664b73364d32eae637862f7fa3dbe4a55d53890d6ee5bde5"
+        },
+        {
+          "path": "references/methods.md",
+          "sha256": "a64d25434766f3709f13f655c06c9bfef2ad9ef3d7d6335f0d0d75d7235da1b7"
+        }
+      ]
+    }
+  ]
+}

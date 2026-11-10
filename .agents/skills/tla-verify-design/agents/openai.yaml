@@ -1,0 +1,13 @@
+interface:
+  display_name: TLA+ 设计与形式化验证
+  short_description: 跨项目、跨语言的设计建模、TLC 检查与实现约束交接
+  default_prompt: 使用 $tla-verify-design 设计并验证当前状态流程，交付性质、假设、TLC 证据与实现约束，后续实现由我另行安排。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

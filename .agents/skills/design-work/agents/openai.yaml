@@ -1,0 +1,13 @@
+interface:
+  display_name: 行为与系统设计
+  short_description: 设计可理解的行为与架构契约，通过实验解决不确定性并规划验证
+  default_prompt: 使用 $design-work 设计这项变化的行为、架构和验证路径，交付可独立使用的契约。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

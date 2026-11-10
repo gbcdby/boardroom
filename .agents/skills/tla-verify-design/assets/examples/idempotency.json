@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "feature": "idempotency",
+  "tool": {
+    "version": "v1.7.4 / TLC 2.19",
+    "sha256": "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  },
+  "model": {
+    "root": ".",
+    "entry": "IdempotentEffect.tla"
+  },
+  "requirements": [
+    {
+      "id": "R1",
+      "statement": "AtMostOnce",
+      "properties": [
+        "AtMostOnce"
+      ]
+    },
+    {
+      "id": "R2",
+      "statement": "All finite attempts/responses eventually complete under the stated assumptions.",
+      "properties": [
+        "EventuallyDone"
+      ]
+    }
+  ],
+  "profiles": {
+    "bug": {
+      "config": "IdempotentEffect-bug.cfg",
+      "timeout_seconds": 30,
+      "workers": 1,
+      "heap_mb": 256,
+      "expected_invariants": [
+        "TypeOK",
+        "AtMostOnce"
+      ],
+      "expected_properties": [
+        "EventuallyDone"
+      ],
+      "checks_deadlock": true,
+      "scope": {
+        "Clients": [
+          "c1",
+          "c2"
+        ],
+        "attempts_per_client": 1,
+        "faults": "No crashes or permanent failure",
+        "atomic_commit": "Fixed variant requires conditional record and local effect in one atomic commit",
+        "variant": "bug"
+      },
+      "assumptions": [
+        "Every continuously enabled client step is eventually scheduled (weak fairness).",
+        "One logical effect identity is shared across attempts."
+      ]
+    },
+    "fixed": {
+      "config": "IdempotentEffect-fixed.cfg",
+      "timeout_seconds": 30,
+      "workers": 1,
+      "heap_mb": 256,
+      "expected_invariants": [
+        "TypeOK",
+        "AtMostOnce"
+      ],
+      "expected_properties": [
+        "EventuallyDone"
+      ],
+      "checks_deadlock": true,
+      "scope": {
+        "Clients": [
+          "c1",
+          "c2"
+        ],
+        "attempts_per_client": 1,
+        "faults": "No crashes or permanent failure",
+        "atomic_commit": "Fixed variant requires conditional record and local effect in one atomic commit",
+        "variant": "fixed"
+      },
+      "assumptions": [
+        "Every continuously enabled client step is eventually scheduled (weak fairness).",
+        "One logical effect identity is shared across attempts."
+      ]
+    }
+  }
+}
