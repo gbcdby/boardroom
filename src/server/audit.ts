@@ -53,6 +53,13 @@ export const AUDIT_ACTIONS = {
   task_review_reported: "task.review_reported",
   task_review_decided: "task.review_decided",
   task_settings_updated: "task.settings_updated",
+  memory_updated: "memory.updated",
+  memory_summary_requested: "memory.summary_requested",
+  memory_summary_begun: "memory.summary_begun",
+  memory_summary_completed: "memory.summary_completed",
+  memory_summary_failed: "memory.summary_failed",
+  memory_summary_conflicted: "memory.summary_conflicted",
+  memory_summary_cancelled: "memory.summary_cancelled",
 } as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[keyof typeof AUDIT_ACTIONS];
@@ -125,7 +132,7 @@ export function isTruncated(row: { before: string | null; after: string | null }
 // 形状
 // ---------------------------------------------------------------------------
 
-export type AuditTargetKind = "member" | "node" | "role" | "capability" | "group" | "project" | "task";
+export type AuditTargetKind = "member" | "node" | "role" | "capability" | "group" | "project" | "task" | "memory";
 
 /** 审计主体快照（不依赖 JOIN；人的变更一律记录，agent 记其成员 id）。 */
 export interface AuditActor {

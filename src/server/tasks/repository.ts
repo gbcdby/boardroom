@@ -28,7 +28,7 @@ export interface TasksRepository {
   addReport(report: ReviewReport): Promise<ReviewReport>; // UNIQUE(round_id, axis)，同内容幂等，异内容冲突
   listReports(projectId: string, taskId: string, roundId?: string): Promise<ReviewReport[]>;
   enqueueWorkEvent(event: WorkEvent): Promise<WorkEvent>; // UNIQUE(recipient_member_id,event_key)
-  listUnackedWorkEvents(projectId: string, memberId: string, limit?: number): Promise<WorkEvent[]>;
+  listUnackedWorkEvents(projectId: string, memberId: string, limit?: number, options?: { contextGroupId?: string }): Promise<WorkEvent[]>;
   markWorkEventsDelivered(projectId: string, memberId: string, ids: string[], at: string): Promise<WorkEvent[]>;
   acknowledgeWorkEvent(projectId: string, memberId: string, id: string, at: string): Promise<{ event: WorkEvent; alreadyAcknowledged: boolean }>;
 }
@@ -50,7 +50,7 @@ type ReportRow = {
 type CommentRow = { id: string; task_id: string; project_id: string; kind: TaskComment["kind"]; author: string; body: string; created_at: string; review_report_id: string | null };
 type HistoryRow = { id: string; task_id: string; project_id: string; action: string; actor: string; task_revision: number; detail: string; created_at: string };
 type LinkRow = { task_id: string; message_id: string; group_id: string; created_at: string };
-type EventRow = { id: string; project_id: string; recipient_member_id: string; task_id: string | null; kind: WorkEvent["kind"];
+type EventRow = { context_group_id?: string | null; id: string; project_id: string; recipient_member_id: string; task_id: string | null; kind: WorkEvent["kind"];
   event_key: string; payload: string; delivery_state: WorkEvent["deliveryState"]; attempts: number; created_at: string;
   first_delivered_at: string | null; last_delivered_at: string | null; acked_at: string | null };
 
@@ -98,6 +98,7 @@ function toLink(row: LinkRow): TaskMessageLink {
 
 function toEvent(row: EventRow): WorkEvent {
   return { id: row.id, projectId: row.project_id, recipientMemberId: row.recipient_member_id, taskId: row.task_id,
+    ...(row.context_group_id == null ? {} : { contextGroupId: row.context_group_id }),
     kind: row.kind, eventKey: row.event_key, payload: JSON.parse(row.payload), deliveryState: row.delivery_state, attempts: row.attempts,
     createdAt: row.created_at, firstDeliveredAt: row.first_delivered_at, lastDeliveredAt: row.last_delivered_at, ackedAt: row.acked_at };
 }
@@ -321,25 +322,39 @@ export function createTasksRepository(ctx: RepoCtx): TasksRepository {
         await requireMember(event.projectId, event.recipientMemberId);
         if (event.kind.startsWith("task.") && event.taskId === null) throw new InvalidReferenceError("任务事件必须引用真实任务。");
         if (event.taskId !== null) await requireTask(event.projectId, event.taskId);
+        const memorySchema = Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 12"));
+        if (event.contextGroupId != null) {
+          if (!memorySchema || !await ctx.one("SELECT id FROM groups WHERE id = ? AND project_id = ? AND archived_at IS NULL", [event.contextGroupId, event.projectId])) {
+            throw new InvalidReferenceError("工作事件 contextGroupId 必须为同项目 active 群组。");
+          }
+        }
+        if (event.kind === 'memory.summary_requested') {
+          if (!memorySchema || event.taskId !== null || Object.keys(event.payload).some(key => !['requestId', 'requestRevision', 'trigger'].includes(key))) throw new InvalidArgumentError("记忆通知只允许必要请求引用，不包含正文或 prompt。");
+          const request = await ctx.one<{ project_id: string; recipient_member_id: string; context_group_id: string | null; revision: number; trigger: string }>("SELECT project_id, recipient_member_id, context_group_id, revision, trigger FROM memory_summary_requests WHERE id = ?", [event.payload.requestId]);
+          if (!request || request.project_id !== event.projectId || request.recipient_member_id !== event.recipientMemberId
+            || request.context_group_id !== (event.contextGroupId ?? null) || request.revision !== event.payload.requestRevision || request.trigger !== event.payload.trigger) throw new InvalidReferenceError("记忆通知必须引用同范围的真实请求。");
+        }
         if (event.deliveryState !== "pending" || event.attempts !== 0 || event.firstDeliveredAt !== null || event.lastDeliveredAt !== null || event.ackedAt !== null) {
           throw new InvalidArgumentError("新工作事件必须处于尚未投递的初始状态。");
         }
         await ctx.exec(`INSERT INTO work_events (id, project_id, recipient_member_id, task_id, kind, event_key, payload, delivery_state,
-          attempts, created_at, first_delivered_at, last_delivered_at, acked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          attempts, created_at, first_delivered_at, last_delivered_at, acked_at${memorySchema ? ", context_group_id" : ""}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${memorySchema ? ", ?" : ""})
           ON CONFLICT (recipient_member_id, event_key) DO NOTHING`,
           [event.id, event.projectId, event.recipientMemberId, event.taskId, event.kind, event.eventKey, json(event.payload), event.deliveryState,
-            event.attempts, event.createdAt, event.firstDeliveredAt, event.lastDeliveredAt, event.ackedAt]);
+            event.attempts, event.createdAt, event.firstDeliveredAt, event.lastDeliveredAt, event.ackedAt, ...(memorySchema ? [event.contextGroupId ?? null] : [])]);
         const saved = (await ctx.one<EventRow>("SELECT * FROM work_events WHERE recipient_member_id = ? AND event_key = ?", [event.recipientMemberId, event.eventKey]))!;
-        if (saved.project_id !== event.projectId || saved.task_id !== event.taskId || saved.kind !== event.kind || !isDeepStrictEqual(JSON.parse(saved.payload), event.payload)) {
+        if (saved.project_id !== event.projectId || saved.task_id !== event.taskId || (saved.context_group_id ?? null) !== (event.contextGroupId ?? null) || saved.kind !== event.kind || !isDeepStrictEqual(JSON.parse(saved.payload), event.payload)) {
           throw new ConflictError("工作事件幂等键已用于不同内容。");
         }
         return toEvent(saved);
       });
     },
-    async listUnackedWorkEvents(projectId, memberId, limit = 100) {
+    async listUnackedWorkEvents(projectId, memberId, limit = 100, options = {}) {
       if (!Number.isSafeInteger(limit) || limit < 1) throw new InvalidArgumentError("事件数量必须为正整数。");
-      return (await ctx.query<EventRow>("SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND delivery_state <> 'acked' ORDER BY created_at, id LIMIT ?",
-        [projectId, memberId, limit])).map(toEvent);
+      const memorySchema = Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 12"));
+      const groupFilter = memorySchema ? (options.contextGroupId === undefined ? " AND context_group_id IS NULL" : " AND (context_group_id IS NULL OR context_group_id = ?)") : "";
+      return (await ctx.query<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND delivery_state <> 'acked'${groupFilter} ORDER BY created_at, id LIMIT ?`,
+        [projectId, memberId, ...(memorySchema && options.contextGroupId !== undefined ? [options.contextGroupId] : []), limit])).map(toEvent);
     },
     async markWorkEventsDelivered(projectId, memberId, ids, at) {
       return ctx.withTransaction(async () => {

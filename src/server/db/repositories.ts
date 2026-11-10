@@ -1,3 +1,4 @@
+import { createMemoryRepository, type MemoryRepository } from "../memory/repository.ts";
 import type { DbDriver, DbTransaction, DbRow } from "./driver.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
@@ -285,6 +286,8 @@ export interface DeliveriesRepository {
    * 重连补发才能重投「已投递但未确认」的消息（NFR-02）；只有 acked 才视为不需要再投。
    */
   listPending(projectId: string, memberId: string): Promise<MessageDelivery[]>;
+  /** 仅真实 MCP wait 返回消息的内部投递边界调用；ACK/历史读取不得使用。 */
+  markMcpDelivered(messageId: string, memberId: string, at?: string): Promise<MessageDelivery>;
   /** 可自动触发的持久化积压；ACK 与唤醒判定分别过滤，不重新评估历史抑制。 */
   listWakeable(projectId: string, memberId: string): Promise<MessageDelivery[]>;
   delete(messageId: string, memberId: string): Promise<void>;
@@ -341,6 +344,7 @@ export interface RepositorySet {
   /** T5（#52）：最小审计单表仓储（append-only + 撤销两列回写）。 */
   readonly audit: AuditRepository;
   readonly tasks: TasksRepository;
+  readonly memory: MemoryRepository;
   /** 在单个写事务内运行 fn；失败回滚并抛出归一化后的错误。 */
   transaction<T>(fn: () => Promise<T>): Promise<T>;
 }
@@ -419,6 +423,7 @@ export function createRepositories(db: DbDriver): RepositorySet {
     mcpSessions: createMcpSessions(ctx),
     audit: createAuditRepository(ctx),
     tasks: createTasksRepository(ctx),
+    memory: createMemoryRepository(ctx),
     transaction: ctx.withTransaction,
   };
 }
@@ -1359,6 +1364,7 @@ type DeliveryRow = {
   wake_suppressed_reason: MessageDelivery["wakeSuppressedReason"];
   attempt_count: number;
   first_delivered_at: string | null;
+  first_mcp_delivered_at?: string | null;
   last_delivered_at: string | null;
   acked_at: string | null;
   created_at: string;
@@ -1376,6 +1382,7 @@ function toDelivery(row: DeliveryRow): MessageDelivery {
     wakeSuppressedReason: row.wake_suppressed_reason,
     attemptCount: row.attempt_count,
     firstDeliveredAt: row.first_delivered_at,
+    firstMcpDeliveredAt: row.first_mcp_delivered_at ?? null,
     lastDeliveredAt: row.last_delivered_at,
     ackedAt: row.acked_at,
     createdAt: row.created_at,
@@ -1435,6 +1442,24 @@ function createDeliveries(ctx: RepoCtx): DeliveriesRepository {
            WHERE message_id = ? AND member_id = ?`,
           [status, firstDelivered, timestamp, ackedAt, timestamp, messageId, memberId],
         );
+        return toDelivery((await getRow(messageId, memberId))!);
+      });
+    },
+    async markMcpDelivered(messageId, memberId, at) {
+      return ctx.withTransaction(async () => {
+        const timestamp = at ?? nowIso();
+        const source = await ctx.one(`SELECT m.id FROM messages m JOIN groups g ON g.id = m.group_id
+          JOIN members mem ON mem.project_id = g.project_id
+          WHERE m.id = ? AND mem.id = ? AND mem.kind = 'agent' AND mem.status = 'active'`, [messageId, memberId]);
+        if (!source) throw new InvalidReferenceError("真实 MCP 投递必须引用同项目的 active Agent 成员与消息。");
+        await requireGroupActive(ctx, (await ctx.one<GroupIdRow>("SELECT group_id FROM messages WHERE id = ?", [messageId]))!.group_id, "投递消息");
+        await repo.ensure(messageId, memberId);
+        await ctx.exec(`UPDATE message_deliveries SET
+          first_mcp_delivered_at = COALESCE(first_mcp_delivered_at, ?),
+          status = CASE WHEN status = 'acked' THEN 'acked' ELSE 'delivered' END,
+          attempt_count = attempt_count + 1,
+          first_delivered_at = COALESCE(first_delivered_at, ?), last_delivered_at = ?, updated_at = ?
+          WHERE message_id = ? AND member_id = ?`, [timestamp, timestamp, timestamp, timestamp, messageId, memberId]);
         return toDelivery((await getRow(messageId, memberId))!);
       });
     },
