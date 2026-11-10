@@ -270,8 +270,8 @@ export interface AuditRepository {
   append(row: NewAuditRow): Promise<AuditRow>;
   get(projectId: string, id: string): Promise<AuditRow | null>;
   list(projectId: string, filter?: AuditFilter): Promise<AuditRow[]>;
-  /** 回写原事件的两列（历史行除此之外永不改写）。 */
-  markReversed(projectId: string, id: string, reversedByAuditId: string, reversedAt: string): Promise<void>;
+  /** 仅首次回写原事件，竞争失败返回 false；调用者须回滚整个补偿事务。 */
+  markReversed(projectId: string, id: string, reversedByAuditId: string, reversedAt: string): Promise<boolean>;
 }
 
 /** 创建审计仓储；与其余仓储共享同一个 DbDriver 连接。 */
@@ -282,7 +282,7 @@ export function createAuditRepository(ctx: RepoCtx): AuditRepository {
         reversed_at, reversed_by_audit_id, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`;
   const getOneSql = "SELECT * FROM audit_log WHERE project_id = ? AND id = ?";
-  const markReversedSql = "UPDATE audit_log SET reversed_at = ?, reversed_by_audit_id = ? WHERE project_id = ? AND id = ?";
+  const markReversedSql = "UPDATE audit_log SET reversed_at = ?, reversed_by_audit_id = ? WHERE project_id = ? AND id = ? AND reversed_at IS NULL";
 
   return {
     async append(row) {
@@ -310,7 +310,7 @@ export function createAuditRepository(ctx: RepoCtx): AuditRepository {
       return (await ctx.query<AuditRowDb>(sql, params)).map(toAuditRow);
     },
     async markReversed(projectId, id, reversedByAuditId, reversedAt) {
-      await ctx.exec(markReversedSql, [reversedAt, reversedByAuditId, projectId, id]);
+      return (await ctx.exec(markReversedSql, [reversedAt, reversedByAuditId, projectId, id])) === 1;
     },
   };
 }

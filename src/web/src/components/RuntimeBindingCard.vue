@@ -53,21 +53,18 @@ function usageValue(row: RuntimeUsageDto): string {
       <div><dt>托管进程</dt><dd>{{ runnerLabels[view.runner.state] }}</dd><span class="muted small">{{ view.runner.phase === 'working' ? '轮次处理中' : view.runner.phase === 'idle' ? '位于等待安全点' : '当前轮次未知' }}</span></div>
       <div><dt>MCP 连接</dt><dd>{{ view.status.member?.connection === 'connected' ? '已连接' : view.status.member?.connection === 'disconnected' ? '已断开' : '尚无连接' }}</dd><span v-if="view.status.member?.stale" class="warning-text small">连接状态陈旧</span></div>
       <div><dt>成员状态</dt><dd>{{ view.status.member ? memberLabels[view.status.member.state] : '尚无运行信号' }}</dd><span v-if="view.status.member?.heartbeatTimedOut" class="warning-text small">心跳超时</span></div>
-      <div><dt>唤醒记录</dt><dd>允许且未 ACK {{ view.status.queuedCount }} · 抑制且未 ACK {{ view.status.suppressedCount }}</dd></div>
-      <div><dt>累计投递记录</dt><dd>待投递 {{ view.status.deliveryCounts.pending }} · 已投递待 ACK {{ view.status.deliveryCounts.delivered }} · 已 ACK {{ view.status.deliveryCounts.acked }}</dd><span class="muted small">投递与 ACK 是消息事实，不代表任务完成。</span></div>
-      <div><dt>实际权限模式</dt><dd data-testid="runtime-permission-observed">{{ actualMode }}</dd><span class="muted small">配置请求：{{ permissionLabels[requestMode] ?? '未知' }}</span></div>
     </dl>
+    <p class="small muted permission-line">实际权限：<span data-testid="runtime-permission-observed">{{ actualMode }}</span> · 配置请求：{{ permissionLabels[requestMode] ?? '未知' }}</p>
     <p v-if="view.runner.nextRetryAt" class="small muted">下次重试资格检查：{{ timeLabel(view.runner.nextRetryAt) }}</p>
     <p v-if="view.status.summary === 'stopping'" class="small warning-text">已保存停止意图，等待安全点与对应进程退出确认。</p>
     <p v-if="view.pendingChanges" class="pending-notice" data-testid="runtime-pending">有已保存的待应用配置。正在运行的进程继续使用原配置，显式应用后于安全点重启。</p>
 
     <div class="binding-actions">
-      <button type="button" :disabled="busy || view.binding.desiredState === 'running'" data-testid="runtime-start" @click="emit('action', 'start')">启动</button>
-      <button type="button" :disabled="busy || isStopped(view)" data-testid="runtime-stop" @click="emit('action', 'stop')">停止</button>
-      <button type="button" :disabled="busy || !view.pendingChanges" data-testid="runtime-apply" @click="emit('action', 'apply')">应用并重启</button>
-      <button type="button" :disabled="busy || view.binding.desiredState !== 'running' || view.status.summary === 'running' || view.status.summary === 'stopping'" data-testid="runtime-retry" @click="emit('action', 'retry')">重试</button>
+      <button v-if="view.binding.desiredState !== 'running'" type="button" class="primary" :disabled="busy" data-testid="runtime-start" @click="emit('action', 'start')">启动</button>
+      <button v-else type="button" :disabled="busy || isStopped(view)" data-testid="runtime-stop" @click="emit('action', 'stop')">停止</button>
+      <button v-if="view.pendingChanges" type="button" :disabled="busy" data-testid="runtime-apply" @click="emit('action', 'apply')">应用并重启</button>
+      <button v-if="view.binding.desiredState === 'running' && view.status.summary !== 'running' && view.status.summary !== 'stopping'" type="button" :disabled="busy" data-testid="runtime-retry" @click="emit('action', 'retry')">重试</button>
       <button type="button" :disabled="busy" data-testid="runtime-edit-binding" @click="emit('edit')">群组配置</button>
-      <button type="button" :disabled="busy" @click="emit('action', 'new-session')">新建会话{{ view.binding.desiredState === 'running' ? '并重启' : '并启动' }}</button>
     </div>
     <div class="binding-secondary">
       <button type="button" class="text-button" :aria-expanded="expanded" @click="toggleDetails">{{ expanded ? '收起配置与观测' : '配置与运行观测' }}</button>
@@ -76,6 +73,10 @@ function usageValue(row: RuntimeUsageDto): string {
     </div>
 
     <div v-if="expanded" class="binding-details">
+      <dl class="delivery-grid">
+        <div><dt>唤醒记录</dt><dd>允许且未 ACK {{ view.status.queuedCount }} · 抑制且未 ACK {{ view.status.suppressedCount }}</dd></div>
+        <div><dt>累计投递记录</dt><dd>待投递 {{ view.status.deliveryCounts.pending }} · 已投递待 ACK {{ view.status.deliveryCounts.delivered }} · 已 ACK {{ view.status.deliveryCounts.acked }}</dd><span class="muted small">投递与 ACK 是消息事实，不代表任务完成。</span></div>
+      </dl>
       <h4>配置与继承来源</h4>
       <div class="table-scroll"><table>
         <thead><tr><th>配置项</th><th>已应用值</th><th>已保存的有效值</th><th>来源</th></tr></thead>
@@ -83,6 +84,7 @@ function usageValue(row: RuntimeUsageDto): string {
       </table></div>
       <p class="small muted">已保存：全局 v{{ view.runtime.revision }} / 群组 v{{ view.binding.revision }}；已应用：{{ view.runner.applied ? `全局 v${view.runner.applied.versions.runtimeRevision} / 群组 v${view.runner.applied.versions.bindingRevision}` : '尚未应用' }}。</p>
       <p class="small muted">独立会话：{{ view.runner.hasSession ? '存在可关联的宿主会话' : '尚无会话句柄' }} · {{ view.runner.sessionState === 'invalid' ? '续接不可用' : view.runner.sessionState === 'resumable' ? '可尝试续接' : view.runner.sessionState === 'reset' ? '等待新会话' : '未确认可续接' }}。续接不恢复在途工具，未确认消息可能再次投递。</p>
+      <button type="button" :disabled="busy" @click="emit('action', 'new-session')">新建会话{{ view.binding.desiredState === 'running' ? '并重启' : '并启动' }}</button>
       <p v-if="view.status.capability" class="small muted">CLI 版本：{{ view.status.capability.hostVersion ?? '未知' }} · 隔离状态：{{ view.status.capability.isolation === 'verified' ? '已验证' : view.status.capability.isolation === 'unavailable' ? '不可用' : '尚未验证' }}</p>
 
       <div class="section-heading"><h4>最近运行记录</h4><button type="button" class="text-button" :disabled="loading" @click="loadObservations">{{ loading ? '读取中…' : '刷新记录' }}</button></div>
@@ -112,24 +114,25 @@ function usageValue(row: RuntimeUsageDto): string {
 
 <style scoped>
 /* Grid item 可收缩，窄屏表格的最小宽度由内部 table-scroll 承接。 */
-.binding-card { min-width: 0; border: 1px solid var(--border); border-radius: 8px; padding: 1rem; background: var(--card-bg); }
-.binding-heading, .section-heading { display: flex; justify-content: space-between; align-items: center; gap: .8rem; }
+.binding-card { min-width: 0; border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem; background: var(--card-bg); }
+.binding-heading, .section-heading { display: flex; justify-content: space-between; align-items: center; gap: .8rem; flex-wrap: wrap; }
+.binding-heading > div { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 h3 { margin: 0; font-size: 1rem; } h4 { margin: 1.2rem 0 .65rem; font-size: .95rem; }
 .binding-heading p { margin: .2rem 0 0; }
 .summary { display: inline-flex; padding: .25rem .6rem; border-radius: 999px; background: var(--bg); font-size: .8rem; white-space: nowrap; border: 1px solid var(--border); }
-.running { color: var(--ok); } .error { color: var(--bad); } .queued, .stopping { color: #a16412; }
+.running { color: var(--ok); } .summary.error { color: var(--bad); margin: 0; } .queued, .stopping { color: var(--warn); }
 .reason { font-size: .85rem; overflow-wrap: anywhere; margin-bottom: .65rem; }
 .reason code { font-size: .7rem; }
 .capability-notice, .pending-notice { padding: .65rem .8rem; background: rgba(175, 122, 25, .09); border-left: 3px solid #b78730; border-radius: 4px; font-size: .82rem; }
 .pending-notice { background: rgba(37, 99, 235, .07); border-color: var(--accent); }
-.runtime-state-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; margin: 1rem 0; }
+.runtime-state-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; margin: 1.3rem 0 .7rem; }
+.delivery-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 1rem; }
+.permission-line { margin-bottom: 1.2rem; }
 dt { color: var(--muted); font-size: .78rem; } dd { margin: .15rem 0 0; font-size: .87rem; overflow-wrap: anywhere; }
-.warning-text { color: #a16412; }
+.warning-text { color: var(--warn); }
 .binding-actions, .binding-secondary { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
 .binding-secondary { justify-content: flex-start; margin-top: .9rem; font-size: .8rem; gap: 1rem; }
-button { padding: .45rem .65rem; border: 1px solid var(--border); border-radius: 6px; background: var(--card-bg); color: var(--fg); cursor: pointer; font: inherit; font-size: .8rem; }
-button:disabled { opacity: .45; cursor: not-allowed; }
-.text-button { border: 0; padding: 0; color: var(--accent); background: transparent; }
+.text-button { padding-inline: .3rem; }
 .danger { color: var(--bad); margin-left: auto; }
 .binding-details { border-top: 1px solid var(--border); margin-top: 1rem; padding-top: .2rem; }
 .table-scroll { overflow-x: auto; }
@@ -141,5 +144,6 @@ th { font-weight: 500; color: var(--muted); } td { max-width: 230px; }
 .event-list li { display: grid; grid-template-columns: 150px 1fr; gap: .6rem; padding: .5rem 0; border-bottom: 1px solid var(--border); }
 .event-list time { color: var(--muted); } .event-list strong { font-weight: 500; }
 .usage-note { display: block; color: var(--muted); font-size: .73rem; margin-top: .15rem; }
-@media (max-width: 620px) { .runtime-state-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .event-list li { grid-template-columns: 1fr; gap: .2rem; } table { min-width: 480px; } }
+@media (max-width: 1000px) { .runtime-state-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+@media (max-width: 620px) { .binding-card { padding: 1rem; }.delivery-grid { grid-template-columns: 1fr; }.event-list li { grid-template-columns: 1fr; gap: .2rem; } table { min-width: 480px; } }
 </style>

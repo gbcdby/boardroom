@@ -76,14 +76,14 @@ function render(entry: StatusBoardEntry): Omit<Row, "entry"> {
 
 <template>
   <div class="status-board" data-testid="status-board">
-    <p v-if="entries.length === 0" class="muted">暂无成员。</p>
+    <p v-if="entries.length === 0" class="empty-state muted">暂无成员状态。添加成员或等待连接后，状态会显示在这里。</p>
     <ul v-else class="board-list" data-testid="status-board-list">
       <li v-for="row in rows" :key="row.entry.memberId" class="board-item" data-testid="status-board-item">
         <span class="who">
-          <span class="dot" :class="row.dotClass" data-testid="board-dot"></span>
+          <span class="dot" :class="row.dotClass" data-testid="board-dot" aria-hidden="true"></span>
           <span class="name">{{ row.entry.displayName }}</span>
           <span class="badge" :class="row.entry.kind === 'human' ? 'human' : 'agent'">
-            {{ row.entry.kind === "human" ? "人" : "agent" }}
+            {{ row.entry.kind === "human" ? "人" : "Agent" }}
           </span>
         </span>
         <span class="state" :class="row.dotClass" data-testid="board-state">{{ row.stateLabel }}</span>
@@ -105,30 +105,37 @@ function render(entry: StatusBoardEntry): Omit<Row, "entry"> {
   margin: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
+  gap: 0;
 }
 
 .board-item {
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: minmax(0, 1fr) minmax(72px, auto) minmax(110px, auto);
   align-items: center;
   gap: 0.75rem;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  padding: 1rem 0;
+  border-bottom: 1px solid var(--border);
 }
 
+.board-item:last-child { border-bottom: 0; }
+
 .who {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  gap: 0.4rem;
+  gap: 0.5rem;
+  min-width: 0;
+  flex-wrap: wrap;
 }
+
+.name { font-weight: 500; overflow-wrap: anywhere; min-width: 0; }
+.state { font-size: 0.85rem; font-weight: 500; }
 
 .dot {
   display: inline-block;
   width: 0.55rem;
   height: 0.55rem;
   border-radius: 50%;
+  flex: 0 0 auto;
 }
 
 .dot.online {
@@ -144,7 +151,7 @@ function render(entry: StatusBoardEntry): Omit<Row, "entry"> {
 }
 
 .dot.working {
-  background: #d97706;
+  background: var(--warn);
 }
 
 .state.online {
@@ -160,23 +167,16 @@ function render(entry: StatusBoardEntry): Omit<Row, "entry"> {
 }
 
 .state.working {
-  color: #d97706;
-}
-
-.badge {
-  font-size: 0.72rem;
-  padding: 0.05rem 0.4rem;
-  border-radius: 999px;
-  background: rgba(127, 127, 127, 0.18);
+  color: var(--warn);
 }
 
 .badge.human {
-  background: rgba(37, 99, 235, 0.16);
+  background: var(--accent-soft);
   color: var(--accent);
 }
 
 .badge.agent {
-  background: rgba(127, 127, 127, 0.18);
+  background: var(--surface-subtle);
 }
 
 .stale {
@@ -184,6 +184,12 @@ function render(entry: StatusBoardEntry): Omit<Row, "entry"> {
 }
 
 .meta {
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+@media (max-width: 720px) {
+  .board-item { grid-template-columns: minmax(0, 1fr) auto; gap: 0.5rem; }
+  .meta { grid-column: 1 / -1; text-align: left; margin-left: 1rem; }
 }
 </style>

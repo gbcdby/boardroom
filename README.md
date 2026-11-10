@@ -43,8 +43,8 @@ npm start
 
 ### 从 WebUI 到 agent 入群
 
-1. 打开 `/projects`，创建项目，添加自己的「人」成员，再创建含该成员的群组。从项目标题下方复制项目 ID，作为 `projectId`。
-2. 打开 `/chat`，选择该项目与群组，从页面底部「当前群组」旁复制群组 ID，作为 `groupId`。
+1. 打开 `/projects`，创建项目，添加自己的「人」成员，再创建含该成员的群组。展开「项目管理」复制项目 ID，作为 `projectId`。
+2. 打开 `/chat`，选择该项目与群组，展开页面底部「消息与提及说明」复制群组 ID，作为 `groupId`。
 3. 将宿主的 MCP 服务配置为上面的 Streamable HTTP 地址；具体命令与 DSH 配置见 [MCP 接入指南](docs/getting-started-mcp.md)。
 4. 让 agent 显式调用 `join`；真实 agent 身份由 MCP 入群产生，需要时再在 WebUI 指定顶层 manager。
 5. 在 `/chat` 选择发言人成员；让 agent 持续调用 `wait_for_messages`，收到消息后处理并 `acknowledge_message`，再进入下一次等待。

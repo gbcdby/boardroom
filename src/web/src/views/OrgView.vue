@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
+import { RouterLink } from "vue-router";
 import {
   ApiError,
   api,
@@ -25,7 +26,10 @@ const projects = ref<ProjectDto[]>([]);
 const activeProjectId = ref<string | null>(null);
 const snapshot = ref<OrgSnapshot | null>(null);
 
-const busy = ref(false);
+const loading = ref(true);
+const mutating = ref(false);
+const busy = computed(() => loading.value || mutating.value);
+const editingNodeId = ref<string | null>(null);
 const error = ref<string | null>(null);
 const notice = ref<string | null>(null);
 
@@ -35,7 +39,7 @@ const newNodeName = ref("");
 const newNodeRole = ref<NodeRole>("member");
 const newNodeParentId = ref("");
 const unplacedMemberId = ref("");
-/** 节点 id → 当前编辑值（每次刷新重置为库里的真实值）。 */
+/** 节点 id → 当前编辑值；逐项保存时保留其他尚未提交的字段。 */
 const nameEdits = ref<Record<string, string>>({});
 const roleEdits = ref<Record<string, string>>({});
 const parentEdits = ref<Record<string, string>>({});
@@ -57,25 +61,31 @@ function clearMessages(): void {
 }
 
 async function refresh(): Promise<void> {
-  if (activeProjectId.value === null) {
+  const projectId = activeProjectId.value;
+  if (projectId === null) {
     snapshot.value = null;
     return;
   }
-  snapshot.value = await api.getOrg(activeProjectId.value);
+  const previousNodes = new Map(nodes.value.map((node) => [node.id, node]));
+  const result = await api.getOrg(projectId);
+  if (activeProjectId.value !== projectId) return;
+  snapshot.value = result;
   const names: Record<string, string> = {};
   const roleValues: Record<string, string> = {};
   const parents: Record<string, string> = {};
   const assigns: Record<string, string> = {};
   for (const node of snapshot.value.nodes) {
-    names[node.id] = node.name;
-    roleValues[node.id] = node.role;
-    parents[node.id] = node.parentId ?? "";
-    assigns[node.id] = node.memberId ?? "";
+    const previous = previousNodes.get(node.id);
+    names[node.id] = keepDraft(nameEdits.value[node.id], previous?.name, node.name);
+    roleValues[node.id] = keepDraft(roleEdits.value[node.id], previous?.role, node.role);
+    parents[node.id] = keepDraft(parentEdits.value[node.id], previous ? previous.parentId ?? "" : undefined, node.parentId ?? "");
+    assigns[node.id] = keepDraft(assignEdits.value[node.id], previous ? previous.memberId ?? "" : undefined, node.memberId ?? "");
   }
   nameEdits.value = names;
   roleEdits.value = roleValues;
   parentEdits.value = parents;
   assignEdits.value = assigns;
+  if (!nodes.value.some((node) => node.id === editingNodeId.value)) editingNodeId.value = null;
   if (!nodes.value.some((n) => n.id === newNodeParentId.value)) {
     newNodeParentId.value = root.value?.id ?? "";
   }
@@ -84,17 +94,28 @@ async function refresh(): Promise<void> {
   }
 }
 
-async function act<T>(fn: () => Promise<T>, success: string): Promise<void> {
+function keepDraft(draft: string | undefined, previous: string | undefined, saved: string): string {
+  return draft !== undefined && previous !== undefined && draft !== previous ? draft : saved;
+}
+
+async function act<T>(fn: () => Promise<T>, success: string): Promise<boolean> {
+  if (busy.value) return false;
   clearMessages();
-  busy.value = true;
+  mutating.value = true;
   try {
     await fn();
-    await refresh();
     notice.value = success;
+    try {
+      await refresh();
+    } catch (err) {
+      error.value = `变更已保存，但刷新失败：${err instanceof Error ? err.message : String(err)}`;
+    }
+    return true;
   } catch (err) {
     error.value = err instanceof ApiError ? err.message : (err as Error).message;
+    return false;
   } finally {
-    busy.value = false;
+    mutating.value = false;
   }
 }
 
@@ -106,11 +127,23 @@ onMounted(async () => {
     await refresh();
   } catch (err) {
     error.value = err instanceof ApiError ? err.message : (err as Error).message;
+  } finally {
+    loading.value = false;
   }
 });
 
-function selectProject(): void {
-  void act(async () => {}, "已切换项目");
+async function selectProject(): Promise<void> {
+  clearMessages();
+  editingNodeId.value = null;
+  snapshot.value = null;
+  loading.value = true;
+  try {
+    await refresh();
+  } catch (err) {
+    error.value = err instanceof ApiError ? err.message : (err as Error).message;
+  } finally {
+    loading.value = false;
+  }
 }
 
 function requireProject(): string {
@@ -140,7 +173,7 @@ function createRoot(): void {
   );
 }
 
-function createChild(): void {
+async function createChild(): Promise<void> {
   const name = newNodeName.value.trim();
   if (name === "") {
     error.value = "请填写岗位名称。";
@@ -151,11 +184,19 @@ function createChild(): void {
     error.value = "请选择上级岗位。";
     return;
   }
-  void act(
+  const created = await act(
     () => api.createOrgNode(requireProject(), { parentId, name, role: newNodeRole.value }),
     `已建立岗位「${name}」`,
   );
-  newNodeName.value = "";
+  if (created) newNodeName.value = "";
+}
+
+function roleLabel(role: string): string {
+  return ({ owner: "全局所有者", top_manager: "顶层 manager", sub_manager: "下级 manager", member: "协作成员" } as Record<string, string>)[role] ?? role;
+}
+
+function parentName(node: OrgNodeDto): string {
+  return nodes.value.find((parent) => parent.id === node.parentId)?.name ?? "顶层岗位";
 }
 
 function rename(node: OrgNodeDto): void {
@@ -194,213 +235,108 @@ function autoPlace(): void {
 </script>
 
 <template>
-  <section class="card">
-    <h1>组织与角色</h1>
-    <p class="muted">
-      组织树由岗位组成：根节点是唯一的顶层 manager，下级 manager 管理各自子树。
-      角色是静态枚举、岗位是角色在节点上的实例；能力点由统一权限矩阵给出。
-    </p>
+  <section class="page org-page">
+    <header class="page-header">
+      <div><h1>组织与角色</h1><p class="page-description">明确岗位、汇报关系和成员分工。</p></div>
+      <label class="field org-project-field" for="org-project">项目<select id="org-project" v-model="activeProjectId" :disabled="busy || projects.length === 0" @change="selectProject"><option v-if="projects.length === 0" :value="null">暂无项目</option><option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option></select></label>
+    </header>
 
-    <p v-if="error" class="error" data-testid="error">{{ error }}</p>
-    <p v-if="notice" class="notice ok" data-testid="notice">{{ notice }}</p>
+    <p v-if="error" class="error" role="alert" data-testid="error">{{ error }}</p>
+    <p v-if="notice" class="notice" role="status" data-testid="notice">{{ notice }}</p>
+    <p v-if="loading" class="muted small" role="status">正在加载组织信息…</p>
+    <div v-else-if="projects.length === 0 && !error" class="panel empty-state"><h2>还没有项目</h2><p>创建项目后，就可以安排岗位与成员。</p><RouterLink to="/projects">前往项目与群组</RouterLink></div>
 
-    <div class="row">
-      <label class="small">
-        项目
-        <select v-model="activeProjectId" :disabled="busy" @change="selectProject">
-          <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
-        </select>
-      </label>
-      <span v-if="projects.length === 0" class="muted small">暂无项目，请先在「项目与群组」创建。</span>
-    </div>
-
-    <div v-if="activeProjectId !== null">
-      <!-- 建立组织树（ORG-08：人可独立创建） -->
-      <div class="panel">
-        <h2>组织树</h2>
-        <form v-if="root === null" class="row" @submit.prevent="createRoot">
-          <input v-model="rootName" aria-label="顶层岗位名称" placeholder="顶层岗位名称" />
-          <button type="submit" :disabled="busy">建立顶层 manager 岗位</button>
-        </form>
-
+    <template v-if="activeProjectId !== null && snapshot">
+      <section class="panel org-tree-panel" aria-labelledby="org-tree-title" :aria-busy="busy">
+        <div class="section-heading"><div><h2 id="org-tree-title">组织树</h2><p class="muted small">{{ nodes.length }} 个岗位 · {{ unplacedMembers.length }} 位成员待分配</p></div></div>
+        <div v-if="root === null" class="root-setup">
+          <h3>先建立一个统筹岗位</h3><p class="muted small">顶层 manager 负责整个项目。建立岗位后，可以再指派成员。</p>
+          <form class="inline-form" @submit.prevent="createRoot"><label class="field" for="root-name">顶层岗位名称<input id="root-name" v-model="rootName" :disabled="busy" aria-label="顶层岗位名称" placeholder="例如：项目统筹" /></label><button type="submit" class="primary" :disabled="busy">建立顶层 manager 岗位</button></form>
+        </div>
         <template v-else>
-          <form class="row" @submit.prevent="createChild">
-            <input v-model="newNodeName" aria-label="新岗位名称" placeholder="新岗位名称" />
-            <select v-model="newNodeRole" aria-label="新岗位角色">
-              <option v-for="r in childRoles" :key="r.role" :value="r.role">{{ r.role }}</option>
-            </select>
-            <select v-model="newNodeParentId" aria-label="上级岗位">
-              <option v-for="n in nodes" :key="n.id" :value="n.id">{{ n.name }}</option>
-            </select>
-            <button type="submit" :disabled="busy">新增下级岗位</button>
-          </form>
+          <details class="new-node" data-testid="org-create-node">
+            <summary>新增下级岗位</summary>
+            <form class="new-node-form" @submit.prevent="createChild">
+              <label class="field" for="new-node-name">岗位名称<input id="new-node-name" v-model="newNodeName" :disabled="busy" required aria-label="新岗位名称" placeholder="例如：产品设计" /></label>
+              <label class="field" for="new-node-role">角色<select id="new-node-role" v-model="newNodeRole" :disabled="busy" aria-label="新岗位角色"><option v-for="r in childRoles" :key="r.role" :value="r.role">{{ roleLabel(r.role) }}</option></select></label>
+              <label class="field" for="new-node-parent">上级岗位<select id="new-node-parent" v-model="newNodeParentId" :disabled="busy" aria-label="上级岗位"><option v-for="n in nodes" :key="n.id" :value="n.id">{{ n.name }}</option></select></label>
+              <button type="submit" class="primary" :disabled="busy">新增下级岗位</button>
+            </form>
+          </details>
 
-          <ul class="list" data-testid="org-node-list">
-            <li v-for="node in nodes" :key="node.id" class="list-item column">
-              <div class="row">
-                <span :style="{ paddingLeft: `${depthOf(node) * 1.25}rem` }">
-                  <strong>{{ node.name }}</strong>
-                  <span class="badge">{{ node.role }}</span>
-                  <span v-if="node.parentId === null" class="badge manager">顶层</span>
-                  <span v-if="node.memberDisplayName" class="badge state">占岗：{{ node.memberDisplayName }}</span>
-                  <span v-else class="badge state">空岗</span>
-                </span>
+          <ul class="node-list" data-testid="org-node-list">
+            <li v-for="node in nodes" :key="node.id" class="node-item" :style="{ '--node-depth': Math.min(depthOf(node), 4) }">
+              <div class="node-summary">
+                <span class="node-mark" aria-hidden="true">{{ node.parentId === null ? '统' : '岗' }}</span>
+                <div class="node-copy"><div class="node-title"><strong>{{ node.name }}</strong><span class="badge">{{ roleLabel(node.role) }}</span><span v-if="node.parentId === null" class="badge manager">顶层</span></div><p class="muted small"><span>{{ node.memberDisplayName ? `成员：${node.memberDisplayName}` : '空岗 · 待指派成员' }}</span><span v-if="node.parentId !== null"> · 上级：{{ parentName(node) }}</span></p></div>
+                <button type="button" class="text-button" :disabled="busy" :aria-expanded="editingNodeId === node.id" :aria-controls="`node-editor-${node.id}`" data-testid="org-edit-node" @click="editingNodeId = editingNodeId === node.id ? null : node.id">{{ editingNodeId === node.id ? '收起编辑' : '编辑岗位' }}</button>
               </div>
-              <div class="row">
-                <input v-model="nameEdits[node.id]" aria-label="岗位名称" />
-                <button type="button" :disabled="busy" @click="rename(node)">改名</button>
-                <select v-model="roleEdits[node.id]" aria-label="岗位角色">
-                  <option v-for="r in roles.filter((x) => x.nodeRole)" :key="r.role" :value="r.role">
-                    {{ r.role }}
-                  </option>
-                </select>
-                <button type="button" :disabled="busy || node.parentId === null" @click="changeRole(node)">
-                  设角色
-                </button>
-              </div>
-              <div class="row">
-                <select v-model="parentEdits[node.id]" aria-label="上级岗位">
-                  <option value="">（调整为上级）</option>
-                  <option v-for="n in nodes.filter((x) => x.id !== node.id)" :key="n.id" :value="n.id">
-                    {{ n.name }}
-                  </option>
-                </select>
-                <button type="button" :disabled="busy" @click="changeParent(node)">调整汇报线</button>
-                <select v-model="assignEdits[node.id]" aria-label="指派成员">
-                  <option value="">（选择成员）</option>
-                  <option v-for="m in members" :key="m.id" :value="m.id">{{ m.displayName }}</option>
-                </select>
-                <button type="button" :disabled="busy" @click="assign(node, assignEdits[node.id] || null)">
-                  指派 / 腾出
-                </button>
-                <button type="button" :disabled="busy" class="danger" @click="remove(node)">删除岗位</button>
+              <div v-if="editingNodeId === node.id" :id="`node-editor-${node.id}`" class="node-editor" :aria-label="`编辑岗位：${node.name}`" role="region">
+                <p class="muted small editor-hint">每项单独保存，其他未保存的修改会保留在编辑区。</p>
+                <div class="editor-grid">
+                  <form class="editor-field" @submit.prevent="rename(node)"><label class="field" :for="`node-name-${node.id}`">岗位名称<input :id="`node-name-${node.id}`" v-model="nameEdits[node.id]" :disabled="busy" required aria-label="岗位名称" /></label><button type="submit" class="secondary" :disabled="busy">改名</button></form>
+                  <form class="editor-field" @submit.prevent="changeRole(node)"><label class="field" :for="`node-role-${node.id}`">岗位角色<select :id="`node-role-${node.id}`" v-model="roleEdits[node.id]" :disabled="busy || node.parentId === null" aria-label="岗位角色"><option v-for="r in roles.filter((x) => x.nodeRole)" :key="r.role" :value="r.role">{{ roleLabel(r.role) }}</option></select></label><button type="submit" class="secondary" :disabled="busy || node.parentId === null">设角色</button></form>
+                  <form class="editor-field" @submit.prevent="changeParent(node)"><label class="field" :for="`node-parent-${node.id}`">上级岗位<select :id="`node-parent-${node.id}`" v-model="parentEdits[node.id]" :disabled="busy" aria-label="上级岗位"><option value="">（选择上级岗位）</option><option v-for="n in nodes.filter((x) => x.id !== node.id)" :key="n.id" :value="n.id">{{ n.name }}</option></select></label><button type="submit" class="secondary" :disabled="busy">调整汇报线</button></form>
+                  <form class="editor-field" @submit.prevent="assign(node, assignEdits[node.id] || null)"><label class="field" :for="`node-member-${node.id}`">指派成员<select :id="`node-member-${node.id}`" v-model="assignEdits[node.id]" :disabled="busy" aria-label="指派成员"><option value="">腾出岗位（不指派成员）</option><option v-for="m in members" :key="m.id" :value="m.id">{{ m.displayName }}</option></select></label><button type="submit" class="secondary" :disabled="busy">{{ assignEdits[node.id] ? '指派成员' : '腾出岗位' }}</button></form>
+                </div>
+                <div class="node-danger"><p class="muted small">删除岗位后，下级岗位会移交给上级，成员身份和历史保留。</p><button type="button" class="text-button danger" :disabled="busy" @click="remove(node)">删除岗位</button></div>
               </div>
             </li>
           </ul>
         </template>
-      </div>
+      </section>
 
-      <!-- manager 自动分配新成员岗位（ORG-02/08） -->
-      <div class="panel">
-        <h2>自动分配新成员</h2>
-        <p class="muted small">
-          项目已建组织树时，manager 可把未落位成员自动安排到根下新建的 member 岗位；人可再调整。
-          项目未建树时不自动造树（兼容阶段 1 升级路径）。
-        </p>
-        <div class="row">
-          <select v-model="unplacedMemberId" aria-label="未落位成员">
-            <option value="">（选择未落位成员）</option>
-            <option v-for="m in unplacedMembers" :key="m.id" :value="m.id">{{ m.displayName }}</option>
-          </select>
-          <button type="button" :disabled="busy || unplacedMemberId === ''" @click="autoPlace">
-            自动分配岗位
-          </button>
-        </div>
-      </div>
+      <section class="panel placement-panel" aria-labelledby="placement-title">
+        <div><h2 id="placement-title">自动分配新成员</h2><p class="muted small">在顶层 manager 下建立成员岗位，之后可以继续调整。</p></div>
+        <div v-if="root === null" class="muted small">请先建立组织树，再自动分配岗位。</div>
+        <p v-else-if="unplacedMembers.length === 0" class="muted small">所有成员都已分配岗位。</p>
+        <div v-else class="inline-form"><label class="field" for="unplaced-member">待分配成员<select id="unplaced-member" v-model="unplacedMemberId" :disabled="busy" aria-label="未落位成员"><option value="">选择待分配成员</option><option v-for="m in unplacedMembers" :key="m.id" :value="m.id">{{ m.displayName }}</option></select></label><button type="button" class="secondary" :disabled="busy || unplacedMemberId === ''" @click="autoPlace">自动分配岗位</button></div>
+      </section>
 
-      <!-- 角色配置入口：静态角色与能力点目录（#25/#26/#32） -->
-      <div class="panel">
-        <h2>角色与能力点</h2>
-        <p class="muted small">
-          角色为静态枚举，能力点矩阵由服务端统一守卫维护；owner（人）是内建全局主体，不建岗位。
-          下级 manager 默认持有 <code>group:view_subtree</code>：对子树内全员属该子树的群组只读可见。
-        </p>
-        <ul class="list" data-testid="role-catalog">
-          <li v-for="r in roles" :key="r.role" class="list-item column">
-            <strong>
-              {{ r.role }}
-              <span v-if="!r.nodeRole" class="badge">内建主体 · 不建岗</span>
-            </strong>
-            <span class="small muted">{{ r.capabilities.join("、") }}</span>
-          </li>
-        </ul>
-      </div>
-    </div>
+      <details class="panel role-reference" data-testid="org-role-reference">
+        <summary>角色与能力点</summary>
+        <p class="muted small">角色决定岗位可以执行的操作。owner（人）为内建全局主体，不需要建立岗位。下级 manager 的 <code>group:view_subtree</code> 可查看参与者均在其子树内的群组，但不代表加入群组或获得发言权限。</p>
+        <ul class="role-list" data-testid="role-catalog"><li v-for="r in roles" :key="r.role"><div><strong>{{ roleLabel(r.role) }}</strong><span class="muted small">{{ r.role }}</span><span v-if="!r.nodeRole" class="badge">内建主体 · 不建岗</span></div><p class="muted small">{{ r.capabilities.join('、') || '无额外能力点' }}</p></li></ul>
+      </details>
+    </template>
   </section>
 </template>
 
 <style scoped>
-.row {
-  display: flex;
-  gap: 0.5rem;
-  margin: 0.5rem 0;
-  flex-wrap: wrap;
-  align-items: center;
-}
-
-input,
-select {
-  padding: 0.4rem 0.6rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--card-bg);
-  color: var(--fg);
-  min-width: 140px;
-}
-
-button {
-  padding: 0.4rem 0.8rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--card-bg);
-  color: var(--fg);
-  cursor: pointer;
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-button.danger {
-  color: var(--bad);
-}
-
-.panel {
-  border-top: 1px solid var(--border);
-  padding-top: 0.75rem;
-  margin-top: 1rem;
-}
-
-.list {
-  list-style: none;
-  padding: 0;
-  margin: 0.5rem 0 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-}
-
-.list-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
-
-.list-item.column {
-  flex-direction: column;
-  align-items: flex-start;
-}
-
-.badge {
-  font-size: 0.72rem;
-  padding: 0.05rem 0.4rem;
-  border-radius: 999px;
-  background: rgba(127, 127, 127, 0.18);
-  margin-left: 0.25rem;
-}
-
-.badge.manager {
-  background: rgba(37, 99, 235, 0.18);
-  color: var(--accent);
-}
-
-.badge.state {
-  background: rgba(127, 127, 127, 0.12);
-  color: var(--muted);
-}
+.org-project-field { width: min(100%, 18rem); }
+.org-page > .panel { margin-top: 1.25rem; }
+.section-heading h2, .placement-panel h2 { font-size: 1.05rem; margin: 0; }
+.section-heading p, .placement-panel p { margin: .35rem 0 0; }
+.root-setup { padding: 1rem 0 .5rem; }
+.root-setup h3 { font-size: 1rem; font-weight: 500; }
+.inline-form { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; margin-top: 1rem; }
+.inline-form .field { min-width: min(100%, 14rem); flex: 1; max-width: 24rem; }
+.new-node { margin-top: 1rem; padding: .75rem 1rem; border-radius: 10px; background: var(--surface-subtle); }
+summary { cursor: pointer; min-height: 2rem; align-content: center; font-size: .9rem; font-weight: 500; }
+summary::marker { color: var(--muted); }
+.new-node-form { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1fr) auto; gap: .75rem; align-items: end; margin-top: .85rem; }
+.node-list { list-style: none; margin: 1rem 0 0; padding: 0; }
+.node-item { min-width: 0; border-top: 1px solid var(--border); }
+.node-item:first-child { border-top: 0; }
+.node-summary { display: flex; align-items: center; flex-wrap: wrap; gap: .75rem; padding: 1.05rem 0 1.05rem calc(var(--node-depth) * 1rem); }
+.node-mark { display: grid; place-items: center; flex: 0 0 2rem; height: 2rem; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); font-size: .85rem; }
+.node-copy { flex: 1; min-width: min(100%, 8rem); overflow-wrap: anywhere; }
+.node-title { display: flex; align-items: center; flex-wrap: wrap; gap: .4rem; }
+.node-title strong { overflow-wrap: anywhere; min-width: 0; }
+.node-copy p { margin: .4rem 0 0; }
+.manager { color: var(--accent); background: var(--accent-soft); }
+.node-editor { border-radius: 10px; padding: 1.15rem; margin: 0 0 1rem; background: var(--surface-subtle); }
+.editor-hint { margin: 0 0 1rem; }
+.editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem 1.5rem; }
+.editor-field { display: flex; align-items: end; flex-wrap: wrap; gap: .6rem; min-width: 0; }
+.editor-field .field { min-width: min(100%, 10rem); flex: 1; }
+.node-danger { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .65rem 1rem; border-top: 1px solid var(--border); margin-top: 1rem; padding-top: 1rem; }
+.node-danger p { margin: 0; flex: 1; min-width: min(100%, 12rem); }
+.role-reference > p { max-width: 78ch; line-height: 1.7; }
+.role-list { padding: 0; margin: 1rem 0 0; list-style: none; }
+.role-list li { padding: .85rem 0; border-top: 1px solid var(--border); }
+.role-list li > div { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.role-list p { margin: .4rem 0 0; line-height: 1.7; overflow-wrap: anywhere; }
+@media (max-width: 1100px) { .new-node-form { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 700px) { .editor-grid, .new-node-form { grid-template-columns: 1fr; } .node-summary { padding-inline-start: calc(var(--node-depth) * .5rem); } .org-project-field, .inline-form .field { width: 100%; max-width: none; } }
 </style>

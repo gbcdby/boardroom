@@ -12,7 +12,9 @@ const root = await mkdtemp(path.join(tmpdir(), "boardroom-managed-web-"));
 const workdir = path.join(root, "workdir");
 const dataDir = path.join(root, "data");
 const missingExecutable = path.join(root, "missing-cli", "claude");
-const webRoot = path.resolve(import.meta.dirname, "../dist/web");
+const webRoot = process.env.AGENT_STUDIO_WEBUI_TEST_ROOT
+  ? path.resolve(process.env.AGENT_STUDIO_WEBUI_TEST_ROOT)
+  : path.resolve(import.meta.dirname, "../dist/web");
 let server;
 let closing;
 
@@ -45,7 +47,7 @@ try {
       installations: [{ backend: "claude-code", executable: missingExecutable }] }),
   });
   const repos = createRepositories(server.database);
-  const project = await repos.projects.create({ name: "浏览器验收项目" });
+  const project = await repos.projects.create({ name: "BoardroomLongProjectName".repeat(5) });
   const group = await repos.groups.create({ projectId: project.id, name: "研发验收群" });
   process.stdout.write(`${JSON.stringify({ url: server.url, workdir, projectId: project.id,
     groupId: group.id, hostScenario: "missing-configured-cli" })}\n`);
