@@ -23,6 +23,8 @@ docs/
 
 ## 内容归属
 
+任务与评审的状态、权限、MCP 入口及验证方式见 [tasks-and-review.md](tasks-and-review.md)。
+
 | 内容 | 位置 |
 | --- | --- |
 | 产品宏观架构、范围、领域模型、阶段、产品级需求与验收基线 | `docs/architecture/` |

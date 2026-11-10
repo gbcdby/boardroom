@@ -1,4 +1,5 @@
 import test from "node:test";
+import { EXPECTED_MCP_TOOL_NAMES } from "./helpers/mcp-contract.ts";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -133,7 +134,7 @@ async function withTwoMembers<T>(
   });
 }
 
-test("工具列表符合契约：固定 6 工具 + heartbeat", async () => {
+test("工具列表符合公开契约：聊天、心跳、任务与工作事件", async () => {
   await withDb(async (ctx) => {
     const core = createMcpCore({ logger: silentLogger, db: ctx.db });
     const server = createMcpServer({ core, logger: silentLogger });
@@ -144,15 +145,7 @@ test("工具列表符合契约：固定 6 工具 + heartbeat", async () => {
     try {
       const { tools } = await client.listTools();
       const names = tools.map((tool) => tool.name).sort();
-      assert.deepEqual(names, [
-        "acknowledge_message",
-        "heartbeat",
-        "join",
-        "read_history",
-        "report_status",
-        "send_message",
-        "wait_for_messages",
-      ]);
+      assert.deepEqual(names, EXPECTED_MCP_TOOL_NAMES);
       for (const tool of tools) {
         assert.equal(typeof tool.description, "string");
         assert.ok(tool.description && tool.description.length > 0, `${tool.name} 必须有描述`);

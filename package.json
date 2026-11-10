@@ -16,6 +16,7 @@
     "build": "npm run build:web",
     "build:web": "vite build --config src/web/vite.config.ts",
     "e2e": "node scripts/e2e-phase1.mjs",
+    "e2e:tasks": "node scripts/e2e-tasks.mjs",
     "db:migrate": "node scripts/migrate-data.ts",
     "test": "node --test \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit -p tsconfig.json && vue-tsc --noEmit -p src/web/tsconfig.json"

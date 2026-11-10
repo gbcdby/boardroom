@@ -1,125 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { compileScript, parse } from "@vue/compiler-sfc";
-import ts from "typescript";
-import { createRenderer, nextTick } from "vue";
-import { createMemoryHistory, createRouter } from "vue-router";
+import { nextTick } from "vue";
+import { byTestId, deferred, find, json, settle, textOf, withPage as renderPage, type UiElement } from "./helpers/web-ui.ts";
 
-// 真实编译 Vue 页面并通过渲染后的控件事件验证请求与反馈，不替代浏览器布局验收。
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-interface Element {
-  type: string;
-  text: string;
-  props: Record<string, any>;
-  children: Element[];
-  parent: Element | null;
-  value: unknown;
-  selected: boolean;
-  selectedIndex: number;
-  options: Element[];
-  listeners: Record<string, ((event: unknown) => void)[]>;
-  getRootNode: () => Element;
-  addEventListener: (name: string, listener: (event: unknown) => void) => void;
-}
-const element = (type: string, text = ""): Element => ({
-  type, text, props: {}, children: [], parent: null, value: "", selected: false, listeners: {},
-  get options() { return this.children.filter((child) => child.type === "option"); },
-  get selectedIndex() { return this.options.findIndex((option) => option.selected); },
-  set selectedIndex(index) { this.options.forEach((option, position) => { option.selected = position === index; }); },
-  getRootNode() { return this.parent?.getRootNode() ?? this; },
-  addEventListener(name, listener) { (this.listeners[name] ??= []).push(listener); },
-});
-const renderer = createRenderer<Element, Element>({
-  createElement: (type) => element(type),
-  createText: (text) => element("#text", text),
-  createComment: (text) => element("#comment", text),
-  setText: (node, text) => { node.text = text; },
-  setElementText: (node, text) => { node.text = text; node.children = []; },
-  patchProp: (node, key, _previous, value) => { node.props[key] = value; if (key === "value") node.value = value; },
-  parentNode: (node) => node.parent,
-  nextSibling: (node) => node.parent?.children[node.parent.children.indexOf(node) + 1] ?? null,
-  insert(node, parent, anchor = null) {
-    if (node.parent) node.parent.children.splice(node.parent.children.indexOf(node), 1);
-    node.parent = parent;
-    const index = anchor ? parent.children.indexOf(anchor) : -1;
-    parent.children.splice(index < 0 ? parent.children.length : index, 0, node);
-  },
-  remove(node) { if (node.parent) node.parent.children.splice(node.parent.children.indexOf(node), 1); },
-});
-
-function textOf(node: Element): string { return node.text + node.children.map(textOf).join(""); }
-function find(node: Element, predicate: (node: Element) => boolean): Element | undefined {
-  if (predicate(node)) return node;
-  return node.children.map((child) => find(child, predicate)).find(Boolean);
-}
-function byTestId(node: Element, id: string): Element {
-  const result = find(node, (entry) => entry.props["data-testid"] === id);
-  assert.ok(result, `找不到控件 ${id}`);
-  return result;
-}
-async function settle(): Promise<void> {
-  for (let index = 0; index < 4; index++) { await new Promise((resolve) => setImmediate(resolve)); await nextTick(); }
-}
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
+function withPage(name: string, respond: (url: string, init: RequestInit | undefined) => Promise<Response> | Response, check: (container: UiElement) => Promise<void>): Promise<void> {
+  return renderPage(name, respond, check, { path: name === "ProjectsView" ? "/projects" : `/projects/project-1/${name === "OrgView" ? "org" : "audit"}` });
 }
 
-async function withPage(
-  name: string,
-  respond: (url: string, init: RequestInit | undefined) => Promise<Response> | Response,
-  check: (container: Element) => Promise<void>,
-): Promise<void> {
-  const directory = await mkdtemp(path.join(tmpdir(), "boardroom-management-ui-"));
-  const previousFetch = globalThis.fetch;
-  const globals = globalThis as any;
-  const previousDocument = globals.Document;
-  const previousShadowRoot = globals.ShadowRoot;
-  globals.Document = class {};
-  globals.ShadowRoot = class {};
-  globalThis.fetch = (input, init) => Promise.resolve(respond(String(input), init));
-  let app: ReturnType<typeof renderer.createApp> | undefined;
-  try {
-    const filename = path.join(root, "src/web/src/views", `${name}.vue`);
-    const { descriptor } = parse(await readFile(filename, "utf8"), { filename });
-    const script = compileScript(descriptor, {
-      id: name,
-      inlineTemplate: true,
-      templateOptions: { compilerOptions: { hoistStatic: false } },
-    });
-    let source = ts.transpileModule(script.content, {
-      compilerOptions: { target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.ESNext },
-    }).outputText;
-    for (const dependency of ["vue", "vue-router"]) {
-      source = source.replaceAll(new RegExp(`from ["']${dependency}["']`, "g"), `from "${import.meta.resolve(dependency)}"`);
-    }
-    source = source.replaceAll(/from ["']\.\.\/api\/client\.ts["']/g, `from "${pathToFileURL(path.join(root, "src/web/src/api/client.ts")).href}"`);
-    const compiled = path.join(directory, "view.mjs");
-    await writeFile(compiled, source);
-    const component = (await import(pathToFileURL(compiled).href)).default;
-    const container = element("root");
-    const router = createRouter({ history: createMemoryHistory(), routes: [{ path: "/:pathMatch(.*)*", component: { render: () => null } }] });
-    await router.push("/");
-    app = renderer.createApp(component);
-    app.use(router);
-    app.mount(container);
-    await settle();
-    await check(container);
-  } finally {
-    app?.unmount();
-    globalThis.fetch = previousFetch;
-    if (previousDocument === undefined) delete globals.Document; else globals.Document = previousDocument;
-    if (previousShadowRoot === undefined) delete globals.ShadowRoot; else globals.ShadowRoot = previousShadowRoot;
-    await rm(directory, { recursive: true, force: true });
-  }
-}
-
-const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 const project = { id: "project-1", name: "界面验收", manager: null, archivedAt: null };
 const auditEntry = {
   id: "audit-1", projectId: project.id, action: "member.add", targetKind: "member", targetName: "小林", targetId: "member-1",

@@ -135,10 +135,12 @@ export class ApiError extends Error {
   override readonly name = "ApiError";
   readonly code: string;
   readonly status: number;
+  readonly reason: string | undefined;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, reason?: string) {
     super(message);
     this.status = status;
+    this.reason = reason;
     this.code = code;
   }
 }
@@ -160,11 +162,12 @@ export async function request<T>(method: string, path: string, body?: unknown): 
   }
 
   if (!response.ok) {
-    const error = (payload as { error?: { code?: string; message?: string } } | null)?.error;
+    const error = (payload as { error?: { code?: string; message?: string; reason?: string } } | null)?.error;
     throw new ApiError(
       response.status,
       error?.code ?? "unknown_error",
       error?.message ?? `请求失败（HTTP ${response.status}）`,
+      error?.reason,
     );
   }
   return payload as T;
@@ -175,6 +178,14 @@ export async function request<T>(method: string, path: string, body?: unknown): 
  * 项目清群组/群聊/投递/成员/状态/会话；群组只清群聊与参与者关系（成员保留）。
  */
 export interface ProjectPurgeCascade {
+  taskSettings: number;
+  tasks: number;
+  taskComments: number;
+  taskHistory: number;
+  taskMessageLinks: number;
+  reviewRounds: number;
+  reviewReports: number;
+  workEvents: number;
   groups: number;
   members: number;
   /** T2 #49：随项目一起清除的组织岗位节点数。 */
@@ -186,6 +197,7 @@ export interface ProjectPurgeCascade {
 }
 
 export interface GroupPurgeCascade {
+  taskMessageLinks: number;
   messages: number;
   deliveries: number;
   participants: number;

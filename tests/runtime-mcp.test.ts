@@ -18,6 +18,9 @@ import { createMcpCore } from "../src/server/mcp/core.ts";
 import { createMcpServer } from "../src/server/mcp/server.ts";
 import { createLogger } from "../src/server/logger.ts";
 import type { RuntimeBindingView } from "../src/server/runtime/types.ts";
+import { createTaskService } from "../src/server/tasks/service.ts";
+import { ownerActor } from "../src/server/authz/actors.ts";
+import { McpToolError } from "../src/server/mcp/errors.ts";
 
 const logger = createLogger({ level: "error", write: () => {} });
 const PG_URL = process.env["AGENT_STUDIO_PG_TEST_URL"];
@@ -68,9 +71,13 @@ async function fixture(driver?: DbDriver) {
   async function managed(v: RuntimeBindingView = view) {
     await runtime.intent(v.binding.id, "start");
     const fence = await runtime.claim(v.binding.id, `supervisor-${randomBytes(6).toString("hex")}`);
-    const gateway = await createRuntimeGateway({ db, logger, onJoined: async () => {}, authority: {
+    let joined = false;
+    const gateway = await createRuntimeGateway({ db, logger, onJoined: async () => { joined = true; }, authority: {
       identity: { displayName: v.runtime.name, hostType: v.runtime.backend, projectId: v.binding.projectId, groupId: v.binding.groupId, memberId: v.binding.memberId },
-      run: (operation, fn) => runtime.withFence(fence, fn, { requireRunningIntent: operation === "consume" }),
+      run: (operation, fn) => {
+        if ((operation === "write" || operation === "consume") && !joined) throw new McpToolError("CONFLICT", "托管 MCP 通道尚未就绪");
+        return runtime.withFence(fence, fn, { requireRunningIntent: operation === "consume" });
+      },
       beforeWait: async () => (await runtime.checkFence(fence)).binding.desiredState === "running",
       onDelivery: async () => { await runtime.patchRunner(fence, { phase: "working" }); },
     } });
@@ -100,6 +107,34 @@ databaseTest("R2 真实MCP保持普通external join，托管预留成员的公�
     const ordinary = await external.call("join", { displayName: "external", hostType: "other", projectId: f.project.id, groupId: f.group.id });
     assert.equal(ordinary.ok, true);
     assert.equal((await external.call("send_message", { text: "普通接入仍可发言" })).ok, true);
+  } finally { await f.close(); }
+});
+
+databaseTest("任务通知在托管 join 就绪后投递，旧 generation 无法确认或修改任务", async (driver) => {
+  const f = await fixture(driver);
+  try {
+    const agent = await f.repos.agents.create({ displayName: "评审成员", hostType: "other" });
+    const reviewer = await f.repos.members.create({ projectId: f.project.id, kind: "agent", agentId: agent.id, displayName: "评审成员" });
+    const service = createTaskService({ repos: f.repos });
+    const task = await service.create({ actor: ownerActor(f.project.id) }, f.project.id, {
+      title: "托管任务", body: "保持所有权边界", assigneeMemberId: f.view.binding.memberId, reviewerMemberId: reviewer.id,
+    });
+    const managed = await f.managed();
+    const joined = await managed.join();
+    assert.equal(joined.ok, true, JSON.stringify(joined));
+    const events = joined["workEvents"] as { id: string; taskId: string }[];
+    assert.equal(events[0]?.taskId, task.id);
+    assert.equal((await f.runtime.checkFence(managed.fence)).runner.phase, "working");
+    assert.equal((await managed.call("transition_task", { taskId: task.id, expectedRevision: 1, state: "in-progress" })).ok, true);
+    await f.runtime.markExit(managed.fence, { exitCode: 0 });
+    for (const session of await f.repos.mcpSessions.listByProject(f.project.id)) await f.repos.mcpSessions.disconnect(session.id, new Date().toISOString());
+    const next = await f.runtime.claim(f.view.binding.id, "replacement-tasks");
+    assert.equal((await managed.call("acknowledge_work_event", { eventId: events[0]!.id })).error?.code, "CONFLICT");
+    assert.equal((await managed.call("comment_task", { taskId: task.id, body: "失效运行写入" })).error?.code, "CONFLICT");
+    const pending = await f.repos.tasks.listUnackedWorkEvents(f.project.id, f.view.binding.memberId);
+    assert.equal(pending[0]?.id, events[0]?.id);
+    assert.equal((await f.repos.tasks.listComments(f.project.id, task.id)).length, 0);
+    assert.equal((await f.runtime.checkFence(next)).runner.generation, next.generation);
   } finally { await f.close(); }
 });
 async function externalBindingRace(driver?: DbDriver) {

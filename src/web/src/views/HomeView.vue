@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { RouterLink } from "vue-router";
 import AppIcon from "../components/AppIcon.vue";
-import { api, type ProjectDto } from "../api/client.ts";
+import { projectPath, useCurrentProject } from "../composables/useCurrentProject.ts";
 interface HealthReport {
   status: "ok" | "degraded"; uptimeSeconds: number; serverTime: string;
   database: { status: string; writable: boolean; error?: string };
@@ -11,8 +11,9 @@ interface HealthReport {
 }
 const health = ref<HealthReport | null>(null);
 const healthError = ref<string | null>(null);
-const projects = ref<ProjectDto[]>([]);
-const projectError = ref<string | null>(null);
+const context = useCurrentProject();
+const projects = computed(() => context.projects.value.filter((project) => project.archivedAt === null));
+const projectError = context.error;
 const loading = ref(true);
 const refreshing = ref(false);
 const connection = ref<"connecting" | "connected" | "disconnected">("connecting");
@@ -43,7 +44,7 @@ async function refresh(): Promise<void> {
   refreshing.value = true;
   await Promise.allSettled([
     refreshHealth(),
-    api.listProjects().then((result) => { if (!disposed) { projects.value = result.projects; projectError.value = null; } }).catch((error: Error) => { if (!disposed) projectError.value = error.message; }),
+    context.refreshProjects(),
   ]);
   if (!disposed) { loading.value = false; refreshing.value = false; }
 }
@@ -84,7 +85,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
         <div class="section-heading"><h2 id="projects-title">你的项目</h2><button type="button" class="text-button" :disabled="refreshing" @click="refresh">{{ refreshing ? '刷新中…' : '刷新' }}</button></div>
         <p v-if="loading" class="muted loading-state" role="status">正在读取项目…</p>
         <div v-else-if="!projectError && projects.length === 0" class="empty-state"><span class="empty-icon"><AppIcon name="folder" :size="30" /></span><h3>从一个项目开始</h3><p>添加成员，创建群组，开始你的第一段协作。</p><RouterLink to="/projects" class="secondary">创建第一个项目<AppIcon name="arrow" :size="16" /></RouterLink></div>
-        <ul v-else class="home-projects"><li v-for="project in projects" :key="project.id"><RouterLink :to="{ path: '/chat', query: { projectId: project.id } }" class="home-project-link"><span class="project-monogram">{{ project.name.slice(0, 1) }}</span><span class="project-copy"><strong>{{ project.name }}</strong><span>{{ project.memberCount ?? 0 }} 位成员<span aria-hidden="true"> · </span>{{ project.groupCount ?? 0 }} 个群组</span></span><span class="project-activity"><span class="badge" :class="{ ok: project.status === 'active' }">{{ project.status === 'active' ? '活跃' : '空闲' }}</span><small>{{ recentActivity(project.lastActivityAt) }}</small></span><AppIcon name="chevron" :size="16" /></RouterLink></li></ul>
+        <ul v-else class="home-projects"><li v-for="project in projects" :key="project.id"><RouterLink :to="projectPath(project.id)" class="home-project-link"><span class="project-monogram">{{ project.name.slice(0, 1) }}</span><span class="project-copy"><strong>{{ project.name }}</strong><span>{{ project.memberCount ?? 0 }} 位成员<span aria-hidden="true"> · </span>{{ project.groupCount ?? 0 }} 个群组</span></span><span class="project-activity"><span class="badge" :class="{ ok: project.status === 'active' }">{{ project.status === 'active' ? '活跃' : '空闲' }}</span><small>{{ recentActivity(project.lastActivityAt) }}</small></span><AppIcon name="chevron" :size="16" /></RouterLink></li></ul>
         <RouterLink v-if="projects.length" to="/projects" class="manage-projects">管理项目与群组<AppIcon name="arrow" :size="15" /></RouterLink>
       </section>
       <section class="quick-access" aria-labelledby="quick-access-title"><h2 id="quick-access-title">继续工作</h2><RouterLink v-for="item in shortcuts" :key="item.to" :to="item.to" class="shortcut"><span class="shortcut-icon"><AppIcon :name="item.icon" :size="21" /></span><span><strong>{{ item.title }}</strong><small>{{ item.detail }}</small></span><AppIcon name="chevron" :size="16" /></RouterLink><p class="quick-note">每个项目都有自己的成员、群组和协作记录。</p></section>

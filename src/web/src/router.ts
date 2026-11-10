@@ -7,6 +7,9 @@ import OrgView from "./views/OrgView.vue";
 import AuditView from "./views/AuditView.vue";
 import RuntimesView from "./views/RuntimesView.vue";
 import PlaceholderView from "./views/PlaceholderView.vue";
+import TasksView from "./views/TasksView.vue";
+import TaskDetailView from "./views/TaskDetailView.vue";
+import { useCurrentProject } from "./composables/useCurrentProject.ts";
 
 /**
  * 阶段 1 的 WebUI 路由。
@@ -22,14 +25,24 @@ export const router = createRouter({
   routes: [
     { path: "/", name: "home", component: HomeView },
     { path: "/projects", name: "projects", component: ProjectsView },
-    { path: "/org", name: "org", component: OrgView },
-    { path: "/audit", name: "audit", component: AuditView },
+    { path: "/projects/:projectId/overview", name: "project-overview", component: ProjectsView, meta: { projectSection: "overview", title: "项目概览" } },
+    { path: "/projects/:projectId/members", name: "project-members", component: ProjectsView, meta: { projectSection: "members", title: "成员" } },
+    { path: "/projects/:projectId/org", name: "project-org", component: OrgView, meta: { projectSection: "org", title: "组织与角色" } },
+    { path: "/projects/:projectId/audit", name: "project-audit", component: AuditView, meta: { projectSection: "audit", title: "审计与撤销" } },
+    { path: "/projects/:projectId/chat/:groupId?", name: "project-chat", component: ChatView, meta: { projectSection: "chat", title: "群聊" } },
+    { path: "/projects/:projectId/status", name: "project-status", component: StatusBoardView, meta: { projectSection: "status", title: "状态看板" } },
+    { path: "/projects/:projectId/tasks", name: "project-tasks", component: TasksView, meta: { projectSection: "tasks", title: "任务" } },
+    { path: "/projects/:projectId/tasks/:taskId", name: "task-detail", component: TaskDetailView, meta: { projectSection: "tasks", title: "任务详情" } },
+    { path: "/org", name: "org", component: OrgView, meta: { projectSection: "org" } },
+    { path: "/audit", name: "audit", component: AuditView, meta: { projectSection: "audit" } },
     { path: "/runtimes", name: "runtimes", component: RuntimesView },
-    { path: "/chat", name: "chat", component: ChatView },
-    { path: "/status", name: "status", component: StatusBoardView },
+    { path: "/chat", name: "chat", component: ChatView, meta: { projectSection: "chat" } },
+    { path: "/status", name: "status", component: StatusBoardView, meta: { projectSection: "status" } },
+    { path: "/tasks", name: "tasks", component: TasksView, meta: { projectSection: "tasks" } },
     { path: "/groups", name: "groups", redirect: "/chat" },
-    { path: "/members", name: "members", redirect: "/status" },
+    { path: "/members", name: "members", component: ProjectsView, meta: { projectSection: "members" } },
     { path: "/settings", name: "settings", component: PlaceholderView, props: { title: "设置" } },
     { path: "/:pathMatch(.*)*", name: "not-found", component: PlaceholderView, props: { title: "页面不存在" } },
   ],
 });
+useCurrentProject().installRouter(router);

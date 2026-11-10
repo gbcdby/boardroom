@@ -19,6 +19,7 @@ import type { Logger } from "./logger.ts";
 import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "./chat/routing.ts";
 import { buildRoster } from "./chat/roster.ts";
 import { resetGroupConsecutiveCount } from "./mcp/core.ts";
+import { createTaskService } from "./tasks/service.ts";
 import { buildStatusBoard, deriveEffectiveStatus } from "./status.ts";
 import {
   AUTHZ_ROLES,
@@ -144,6 +145,7 @@ const PURGE_CONFIRM_TTL_MS = 5 * 60 * 1000;
 export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   const { db, logger } = options;
   const repos = createRepositories(db);
+  const tasks = createTaskService({ repos });
   const log = logger.child({ component: "api" });
   const heartbeat: HeartbeatConfig = options.heartbeat ?? { intervalMs: 10_000, timeoutMs: 30_000 };
   const now = options.now ?? (() => new Date());
@@ -824,11 +826,11 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       const group = (await (r.groups.get(groupId)));
       if (!group) throw new RepositoryError("not_found", `群组 ${groupId} 不存在。`);
       if (method === "GET") {
-        (await (guard(r, request, "group:view", {
+        await guard(r, request, "group:view", {
           projectId: group.projectId,
           groupId,
           ...(await (groupGuardFacts(r, groupId))),
-        })));
+        });
         const participants = (await Promise.all((await (r.groups
           .participants(groupId)))
           .map(async (id) => (await (r.members.get(id))))))
@@ -919,16 +921,20 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       if (method === "GET") {
         // F2：历史读取 = group:view。T2 #49：附上参与者岗位节点，
         // sub_manager 对「参与者全部在子树内」的群组可读历史（只读，不唤醒、不能发言）。
-        (await (guard(r, request, "group:view", {
+        const { actor } = await guard(r, request, "group:view", {
           projectId: group.projectId,
           groupId,
           ...(await (groupGuardFacts(r, groupId))),
-        })));
+        });
         const limitRaw = new URL(request.url ?? "/", "http://127.0.0.1").searchParams.get("limit");
         const limit = limitRaw === null ? 200 : Math.min(Math.max(Number(limitRaw) || 200, 1), 500);
         const all = (await (r.messages.listByGroup(groupId)));
-        const page = all.slice(Math.max(0, all.length - limit));
-        // 人的视角：可见全部群组消息（阶段 1 单群组）。
+        const visible: DbMessage[] = [];
+        for (const message of all) {
+          if (actor.kind === "human" || await tasks.canReadLinkedMessage({ actor }, group.projectId, message.id)) visible.push(message);
+        }
+        const page = visible.slice(Math.max(0, visible.length - limit));
+        // 人保留群组全量视角；成员与 MCP 共用关联任务 + 群组权限边界。
         writeJson(response, 200, { messages: (await Promise.all(page.map(async (m) => (await (messageView(r, m)))))) });
         return true;
       }
