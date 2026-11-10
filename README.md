@@ -72,6 +72,8 @@ npm start
 
 **当前发行候选未包含任何通过真实验收的托管 CLI profile，实际启动保持拒绝。** 已实现绑定专用 MCP、Linux 文件/网络隔离与原生 CLI 参数适配；普通外部 MCP 的历史验收不等于托管运行验证。`VERIFIED_HOST_PROFILES` 只有在同一 CLI 版本、二进制、OS、架构和权限模式的登录、常驻收发、安全点停止、resume、管理面隔离与用量作用域实测通过后才能增加。Codex CLI / DSH 托管执行仍为 unsupported。验收跟踪见 [#86](https://github.com/gbcdby/boardroom/issues/86) 与 [#89](https://github.com/gbcdby/boardroom/issues/89)。
 
+当前 Linux 隔离实现要求可用的 user/network namespace 和已核对的 bubblewrap 0.12.0。工作目录及持久会话目录会在启动前检查；含多重硬链接的普通文件、特殊文件或嵌套挂载会以 `workdir_unsafe` 拒绝启动，合法的项目内硬链接也需先处理。通过其他挂载位置映射到受保护服务或数据目录的工作根同样被拒绝。启动检查限制目录深度 128、两目录合计 250,000 个条目，无法完成检查时也拒绝启动。目录仍直接用于实时编辑。结构化认证失败显示需要登录，消息继续保留；在 CLI 外部完成登录后，再显式重试。
+
 调度依据数据库中的 `allowed` 且未 ACK 投递；提交后的通知只是提示，轮询可恢复丢失提示。`suppressed` 和旧 `NULL` 不触发主动唤醒，仍可在 agent 主动等待时按原可见性读取。同一 Member 的不同群绑定串行运行；跨项目 Member 独立。重启不会把 PID、租约过期或历史 connected 当成在线/退出证明。旧进程归属或退出无法确认时显示等待确认，不启动重叠实例。
 
 运行观测只保存白名单元数据，默认保留 7 天、实例总量最多 10,000 条、单条 2 KiB；裁剪、存储或日志失败会显示观测不完整。用量保留来源、宿主版本、作用域、覆盖范围和可靠性，未知显示未知；不同来源不合成总账，金额始终是 CLI 估算。原始参数、环境、prompt、stdout/stderr 和 transcript 不进入运行事件。

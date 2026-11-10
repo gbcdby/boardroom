@@ -43,7 +43,13 @@ export function createHostOutputParser(options: HostParserOptions) {
       if (status === "observed") emit({ type: "ready", permissionMode: mode });
       return;
     }
-    // 不从 assistant/user 正文或任意 nested key 猜权限、会话、错误或成本。
+    // Claude 的认证失败是 assistant 顶层枚举，末尾 result 仍可能为 success + is_error。
+    // 只接受已确认字段；不从正文、stderr 或任意 nested key 猜错误原因。
+    if (value.type === "assistant" && value.error === "authentication_failed") {
+      emit({ type: "failure", reason: "login_required" });
+      return;
+    }
+    // 不从 assistant/user 正文或任意 nested key 猜权限、会话或成本。
     if (value.type !== "result") return;
     if (validId(value.session_id)) emit({ type: "session", sessionId: value.session_id });
     if (Array.isArray(value.permission_denials) && value.permission_denials.length > 0) {

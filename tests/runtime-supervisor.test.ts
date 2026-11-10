@@ -14,6 +14,7 @@ import { createRuntimeObservability } from "../src/server/runtime/observability.
 import { createRuntimeSupervisor } from "../src/server/runtime/supervisor.ts";
 import { createRuntimeGateway, type RuntimeGateway } from "../src/server/runtime/gateway.ts";
 import { createLogger } from "../src/server/logger.ts";
+import { createHostOutputParser } from "../src/server/runtime/hosts/parser.ts";
 import type { HostEvent, HostLauncher, HostLaunchSnapshot, HostPreflight, OwnedHostProcess, OwnedProcessIdentity, OwnedProcessInspection } from "../src/server/runtime/hosts/types.ts";
 
 type Observer = Parameters<HostLauncher["launch"]>[1];
@@ -51,7 +52,7 @@ class ControlledHost implements OwnedHostProcess {
   call(name: string, args: Record<string, unknown>) { return call(this.client, name, args); }
 }
 
-async function fixture(options: { announceMode?: boolean; preflight?: HostPreflight; launchFails?: boolean; startupTimeoutMs?: number;
+async function fixture(options: { announceMode?: boolean; preflight?: HostPreflight; launchFails?: boolean; launchError?: string; startupTimeoutMs?: number;
   announcePermission?: "auto" | "manual"; checkPreflight?: HostLauncher["preflight"];
   processIdentity?: OwnedProcessIdentity; inspectPrevious?: NonNullable<HostLauncher["inspectPrevious"]> } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "runtime-supervisor-"));
@@ -78,6 +79,7 @@ async function fixture(options: { announceMode?: boolean; preflight?: HostPrefli
     async launch(snapshot, observer) {
       launches += 1;
       if (options.launchFails) throw new Error("synthetic-launch-failure");
+      if (options.launchError) throw new Error(options.launchError);
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const client = new Client({ name: "controlled-host", version: "test-only" });
       const host = new ControlledHost(snapshot, observer, client, options.processIdentity); hosts.push(host);
@@ -166,6 +168,9 @@ test("R6 启动超时只回收自有启动进程，已ready的忙碌轮次无运
     const host = (await unknown.start())!; unknown.advance(101); await unknown.supervisor.tick();
     assert.equal(host.forced, 1); assert.equal(host.stops, 0);
     assert.equal((await unknown.runtime.getBinding(unknown.binding.id))!.runner.exitConfirmed, false);
+    host.event({ type: "failure", reason: "login_required" }); host.finish(1);
+    await until(async () => (await unknown.runtime.getBinding(unknown.binding.id))!.runner.exitConfirmed, "超时进程退出未确认");
+    assert.equal((await unknown.runtime.getBinding(unknown.binding.id))!.runner.lastErrorCode, "startup_timeout", "迟到宿主错误不能改写启动超时");
   } finally { await unknown.close(); }
   const ready = await fixture({ startupTimeoutMs: 100 });
   try {
@@ -273,6 +278,95 @@ test("R6 unsupported保留running意图与队列，拉起失败退避且重复st
     assert.equal(failed.launches, 3, "显式retry允许立即重新尝试，不与幂等start混用");
   } finally { await failed.close(); }
 });
+
+for (const disconnectFirst of [false, true]) {
+  test(`R6 认证失败${disconnectFirst ? "晚于" : "早于"}SDK断连仍保留原因与消息，只接受显式重试`, async () => {
+    const f = await fixture();
+    try {
+      const host = (await f.start())!;
+      await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.state === "running", "runner 未就绪");
+      const message = await f.enqueue(f.binding.id, "allowed", "认证失败不能确认此消息");
+      if (disconnectFirst) await host.client.close();
+      const parser = createHostOutputParser({ backend: "claude-code", version: "2.1.322", expectedPermissionMode: "auto", onEvent: event => host.event(event) });
+      parser.push('{"type":"system","subtype":"init","permissionMode":"auto"}\n');
+      parser.push('{"type":"assistant","error":"authentication_failed"}\n');
+      parser.push('{"type":"result","subtype":"success","is_error":true}\n');
+      parser.end();
+      if (!disconnectFirst) await host.client.close();
+      host.finish(1);
+      await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.exitConfirmed, "认证失败须等待进程退出确认");
+      const view = (await f.runtime.getBinding(f.binding.id))!;
+      assert.equal(view.runner.lastErrorCode, "auth_required");
+      assert.equal(view.runner.nextRetryAt, null);
+      assert.equal(view.runner.owner, null);
+      assert.equal(view.binding.desiredState, "running");
+      assert.equal((await f.repos.deliveries.get(message.id, f.binding.memberId))?.status, "pending");
+      f.advance(24 * 60 * 60_000); await f.supervisor.tick();
+      await f.runtime.intent(f.binding.id, "start"); await f.supervisor.tick();
+      assert.equal(f.launches, 1, "轮询和重复 start 不得热重试认证失败");
+      await f.runtime.intent(f.binding.id, "retry"); await f.supervisor.tick();
+      assert.equal(f.launches, 2, "用户处理登录后可显式重试");
+    } finally { await f.close(); }
+  });
+}
+
+test("R6 空闲断连已开始安全停止后，迟到的认证失败仍禁止自动重试", async () => {
+  const f = await fixture();
+  try {
+    const host = (await f.start())!;
+    await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.state === "running", "runner 未就绪");
+    assert.equal((await host.call("wait_for_messages", { timeoutMs: 10 })).status, "timeout");
+    assert.equal((await f.runtime.getBinding(f.binding.id))!.runner.phase, "idle");
+    await host.client.close(); await f.supervisor.tick();
+    await until(async () => host.stops === 1, "断连没有触发安全停止");
+    assert.equal((await f.runtime.getBinding(f.binding.id))!.runner.lastErrorCode, "transport_lost");
+    const parser = createHostOutputParser({ backend: "claude-code", version: "2.1.322", expectedPermissionMode: "auto", onEvent: event => host.event(event) });
+    parser.push('{"type":"assistant","error":"authentication_failed"}\n');
+    parser.push('{"type":"result","subtype":"success","is_error":true}\n');
+    parser.end(); host.finish(1);
+    await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.exitConfirmed, "真实退出未确认");
+    const view = (await f.runtime.getBinding(f.binding.id))!;
+    assert.equal(view.runner.lastErrorCode, "auth_required");
+    assert.equal(view.runner.nextRetryAt, null);
+    f.advance(24 * 60 * 60_000); await f.supervisor.tick();
+    assert.equal(f.launches, 1);
+  } finally { await f.close(); }
+});
+
+test("R6 显式停止后的认证输出保留停止意图与原退出原因", async () => {
+  const f = await fixture();
+  try {
+    const host = (await f.start())!;
+    assert.equal((await host.call("wait_for_messages", { timeoutMs: 10 })).status, "timeout");
+    await f.runtime.intent(f.binding.id, "stop"); await f.supervisor.tick();
+    assert.equal(host.stops, 1);
+    host.event({ type: "failure", reason: "login_required" }); host.finish(1);
+    await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.exitConfirmed, "停止后退出未确认");
+    const view = (await f.runtime.getBinding(f.binding.id))!;
+    assert.equal(view.binding.desiredState, "stopped");
+    assert.equal(view.runner.lastErrorCode, null);
+    assert.equal(view.runner.nextRetryAt, null);
+  } finally { await f.close(); }
+});
+
+for (const [launchError, expected] of [["workdir_unsafe", "configuration_invalid"], ["login_required", "auth_required"], ["profile_unsupported", "profile_unsupported"]] as const) {
+  test(`R6 preflight 之后的 ${launchError} 拒绝不能退化为可重试资源错误`, async () => {
+    const f = await fixture({ launchError });
+    try {
+      await f.start();
+      const view = (await f.runtime.getBinding(f.binding.id))!;
+      assert.equal(view.runner.lastErrorCode, expected);
+      assert.equal(view.runner.nextRetryAt, null);
+      assert.equal(view.runner.exitConfirmed, true);
+      assert.equal(view.runner.owner, null);
+      f.advance(24 * 60 * 60_000); await f.supervisor.tick();
+      await f.runtime.intent(f.binding.id, "start"); await f.supervisor.tick();
+      assert.equal(f.launches, 1);
+      await f.runtime.intent(f.binding.id, "retry"); await f.supervisor.tick();
+      assert.equal(f.launches, 2);
+    } finally { await f.close(); }
+  });
+}
 
 test("R6 无提交提示也能在轮询后投递持久allowed消息", async () => {
   const f = await fixture();

@@ -54,7 +54,7 @@ export function hostReason(reason: string): RuntimeReasonCode {
     case "host_not_installed": return "executable_missing";
     case "login_required": return "auth_required";
     case "workdir_invalid": return "workdir_unavailable";
-    case "protected_path_overlap": case "config_invalid": return "configuration_invalid";
+    case "protected_path_overlap": case "config_invalid": case "workdir_unsafe": return "configuration_invalid";
     case "permission_mode_unknown": case "permission_mode_fallback": return "permission_required";
     case "resume_failed": return "protocol_invalid";
     case "launch_failed": return "resource_unavailable";
@@ -63,6 +63,10 @@ export function hostReason(reason: string): RuntimeReasonCode {
     case "isolation_unavailable": return "profile_unsupported";
     default: return "unknown";
   }
+}
+
+function requiresExplicitRetry(reason: string | null): boolean {
+  return reason !== null && ["auth_required", "permission_required", "configuration_invalid", "profile_unsupported", "protocol_invalid"].includes(reason);
 }
 
 export function launchSnapshot(view: RuntimeBindingView, owner: string, socketPath: string): HostLaunchSnapshot {
@@ -210,12 +214,16 @@ export function createRuntimeSupervisor(options: {
         // 一次操作拒绝不是整轮结束，不 ACK、不杀进程、不清空队列。
         await record(view, "observation_warning", { reasonCode: "permission_required", attemptId: item.attemptId });
         break;
-      case "failure":
-        if (item.stopping) break; // 已请求退出后的宿主输出不覆盖停止/启动超时的因果原因。
-        item.failure = hostReason(event.reason);
+      case "failure": {
+        const reason = hostReason(event.reason);
+        // 断连触发的安全停止仍可收到更具体的认证/配置失败；不能因此回到自动重试。
+        // 用户停止、启动超时等已有原因仍保留，不被迟到输出改写。
+        if (item.stopping && !(item.failure === "transport_lost" && view.binding.desiredState === "running" && requiresExplicitRetry(reason))) break;
+        item.failure = reason;
         await repo.patchRunner(item.fence, { lastErrorCode: item.failure,
           ...(event.reason === "resume_failed" ? { sessionState: "invalid" } : {}) });
         break;
+      }
       case "protocol_invalid":
         await record(view, "observation_warning", { reasonCode: "protocol_invalid", attemptId: item.attemptId });
         break;
@@ -241,7 +249,7 @@ export function createRuntimeSupervisor(options: {
     const view = await repo.getBinding(item.fence.bindingId);
     if (!view) { active.delete(item.fence.bindingId); return; }
     const deliberate = item.stopping && item.failure === null;
-    const retryable = !deliberate && !["auth_required", "permission_required", "configuration_invalid", "profile_unsupported", "protocol_invalid"].includes(item.failure ?? "");
+    const retryable = !deliberate && !requiresExplicitRetry(item.failure);
     const retryAt = retryable && !closing && view.binding.desiredState === "running"
       ? new Date(now() + retryDelay(view.runner.attemptCount, options.random)).toISOString() : null;
     const reason = deliberate ? null : item.failure ?? "process_exit";
@@ -287,8 +295,7 @@ export function createRuntimeSupervisor(options: {
       return;
     }
     // 非重试失败只等明确 retry/apply，不通过每秒 tick 热循环。
-    if (view.runner.lastErrorCode && !view.runner.nextRetryAt &&
-      ["auth_required", "permission_required", "protocol_invalid", "configuration_invalid"].includes(view.runner.lastErrorCode)) return;
+    if (!view.runner.nextRetryAt && requiresExplicitRetry(view.runner.lastErrorCode)) return;
     let fence: RunnerFence;
     try { fence = await repo.claim(b.id, owner, { expectedIntentRevision: b.intentRevision,
       expectedConfigDigest: (b.requestedSnapshot ?? view.runner.applied ?? view.effective).digest }); }
@@ -339,13 +346,20 @@ export function createRuntimeSupervisor(options: {
       if (item.stopping) item.child.stopAtSafePoint();
       await record(claimed, "spawned", { attemptId: item.attemptId, attempt: claimed.runner.attemptCount });
       await record(claimed, "dispatch.scheduled", { attemptId: item.attemptId });
-    } catch {
+    } catch (error) {
+      await item.eventChain;
+      // launch 会重检能力与文件边界。只映射固定原因，不能把原始异常正文写入观测。
+      const classified = hostReason(error instanceof Error ? error.message : "");
+      const reason = classified === "unknown" ? "resource_unavailable" : classified;
+      if (requiresExplicitRetry(reason) || item.failure === null) item.failure = reason;
       await item.gateway?.close();
-      if (item.child) { item.failure = "resource_unavailable"; item.child.forceStopOwned(); return; }
+      if (item.child) { item.child.forceStopOwned(); return; }
       active.delete(b.id);
-      const retryAt = new Date(now() + retryDelay(claimed.runner.attemptCount, options.random)).toISOString();
-      await repo.markExit(fence, { errorCode: "resource_unavailable", retryAt });
-      await record(claimed, "retry_scheduled", { reasonCode: "resource_unavailable", retryAt: Date.parse(retryAt), attemptId: item.attemptId });
+      const retryAt = requiresExplicitRetry(item.failure) ? null
+        : new Date(now() + retryDelay(claimed.runner.attemptCount, options.random)).toISOString();
+      const final = await repo.markExit(fence, { errorCode: item.failure, retryAt });
+      await record(final, retryAt ? "retry_scheduled" : "exited", { reasonCode: item.failure,
+        ...(retryAt ? { retryAt: Date.parse(retryAt) } : {}), attemptId: item.attemptId });
     }
   }
 
@@ -362,7 +376,7 @@ export function createRuntimeSupervisor(options: {
         const inspection = await options.launcher.inspectPrevious(runner.processIdentity);
         if (inspection.status !== "wrapper_exited") continue;
         const fence = { bindingId: view.binding.id, memberId: view.binding.memberId, owner: runner.owner, generation: runner.generation };
-        const nonRetry = ["auth_required", "permission_required", "configuration_invalid", "profile_unsupported", "protocol_invalid"].includes(runner.lastErrorCode ?? "")
+        const nonRetry = requiresExplicitRetry(runner.lastErrorCode)
           || runner.sessionState === "invalid";
         const reason = view.binding.desiredState === "stopped" ? null
           : nonRetry ? runner.lastErrorCode ?? "protocol_invalid" : "process_exit";

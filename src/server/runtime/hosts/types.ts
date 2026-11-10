@@ -27,7 +27,7 @@ export interface HostLaunchSnapshot {
 
 export type HostReason =
   | "supported" | "host_not_installed" | "host_version_unknown" | "host_version_unsupported"
-  | "profile_unsupported" | "isolation_unavailable" | "workdir_invalid" | "protected_path_overlap"
+  | "profile_unsupported" | "isolation_unavailable" | "workdir_invalid" | "workdir_unsafe" | "protected_path_overlap"
   | "config_invalid" | "login_required" | "launch_failed" | "permission_mode_unknown"
   | "permission_mode_fallback" | "resume_failed" | "protocol_invalid" | "usage_unavailable";
 

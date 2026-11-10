@@ -6,7 +6,7 @@ import { execFile } from "node:child_process";
 import { bootstrapPrompt, buildHostArguments, expectedPermissionMode, parseHostVersion } from "./adapters.ts";
 import { createHostOutputParser } from "./parser.ts";
 import { VERIFIED_HOST_PROFILES, type HostInstallation, type HostLaunchSnapshot, type HostLauncher, type HostPreflight, type HostReason, type ManagedBackend, type ResolvedHostInstallation, type VerifiedHostProfile } from "./types.ts";
-import { linuxIsolationAvailable, prepareLinuxIsolation, spawnIsolatedProcess, validateWorkdir } from "../isolation/linux.ts";
+import { linuxIsolationAvailable, prepareLinuxIsolation, spawnIsolatedProcess, validateWorkdir, validateWorkdirFilesystemBoundary } from "../isolation/linux.ts";
 import { createPipeBridge } from "../isolation/pipe-bridge.ts";
 import { captureOwnedProcessIdentity, inspectOwnedProcess } from "./process-identity.ts";
 import { findNativeInstallation, resolveNativeInstallation } from "./native-installation.ts";
@@ -47,8 +47,14 @@ export function createHostLauncher(options: HostLauncherOptions): HostLauncher {
       result: { supported: false, reason, expectedPermissionMode: expected, isolation, ...(hostVersion ? { hostVersion } : {}) },
     });
     if (!valid(snapshot)) return denied("config_invalid");
-    try { await validateWorkdir(snapshot.config.workdir, [...options.protectedPaths, options.stateRoot]); }
-    catch (error) { return denied(error instanceof Error && error.message === "protected_path_overlap" ? "protected_path_overlap" : "workdir_invalid"); }
+    try {
+      const canonical = await validateWorkdir(snapshot.config.workdir, [...options.protectedPaths, options.stateRoot]);
+      if (process.platform === "linux") await validateWorkdirFilesystemBoundary(canonical, [...options.protectedPaths, options.stateRoot]);
+    } catch (error) {
+      const reason = error instanceof Error && ["protected_path_overlap", "workdir_unsafe"].includes(error.message)
+        ? error.message as HostReason : "workdir_invalid";
+      return denied(reason);
+    }
     const installation = await installationFor(snapshot.backend);
     if (!installation || !path.isAbsolute(installation.executable)) return denied("host_not_installed");
     let version: string | undefined;
@@ -99,11 +105,16 @@ export function createHostLauncher(options: HostLauncherOptions): HostLauncher {
       catch { await prepared.cleanup(); throw new Error("launch_failed"); }
       let alive = true;
       let ready = false;
+      let failureObserved = false;
       const emit: typeof observer.onEvent = event => { try { observer.onEvent(event); } catch { /* 观察者故障不泄漏原始输出 */ } };
       const parser = createHostOutputParser({ backend: snapshot.backend, version: checked.result.hostVersion,
         expectedPermissionMode: checked.result.expectedPermissionMode,
         ...(checked.profile.usageSchema ? { usageSchema: checked.profile.usageSchema } : {}),
-        onEvent(event) { if (event.type === "ready") ready = true; emit(event); },
+        onEvent(event) {
+          if (event.type === "ready") ready = true;
+          if (event.type === "failure") failureObserved = true;
+          emit(event);
+        },
       });
       const bridge = createPipeBridge(child, { egressHosts: checked.installation.egressHosts,
         onStdout: chunk => parser.push(chunk), onInvalid: () => emit({ type: "protocol_invalid", reason: "invalid_schema" }) });
@@ -115,14 +126,20 @@ export function createHostLauncher(options: HostLauncherOptions): HostLauncher {
           alive = false;
           bridge.close();
           parser.end();
-          if (code !== 0 && !ready) emit({ type: "failure", reason: snapshot.sessionId ? "resume_failed" : "launch_failed" });
+          if (code !== 0 && !ready && !failureObserved) emit({ type: "failure", reason: snapshot.sessionId ? "resume_failed" : "launch_failed" });
           void prepared.cleanup().finally(() => { emit({ type: "exit", code, signal }); resolve({ code, signal }); });
         });
       });
       const stop = (signal: "SIGTERM" | "SIGKILL") => { if (alive && child.exitCode === null && child.signalCode === null) child.kill(signal); };
       const processIdentity = await captureOwnedProcessIdentity(child);
-      try { await observer.onMcpTransport(bridge.transport); await bridge.start(); }
-      catch { stop("SIGKILL"); await exited; throw new Error("launch_failed"); }
+      try {
+        await observer.onMcpTransport(bridge.transport);
+        await prepared.verifyWritableBoundary();
+        await bridge.start();
+      } catch (error) {
+        stop("SIGKILL"); await exited;
+        throw new Error(error instanceof Error && error.message === "workdir_unsafe" ? "workdir_unsafe" : "launch_failed");
+      }
       return { ...(child.pid ? { pid: child.pid } : {}), ...(processIdentity ? { processIdentity } : {}), exited,
         stopAtSafePoint: () => { if (alive) void bridge.stopAtSafePoint().catch(() => emit({ type: "failure", reason: "launch_failed" })); },
         forceStopOwned: () => stop("SIGKILL") };

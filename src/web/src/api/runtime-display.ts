@@ -19,6 +19,7 @@ const reasonLabels: Record<string, string> = {
   host_version_unsupported: "此 CLI 版本尚未通过托管验收", profile_unsupported: "此版本与权限档尚未通过托管验收",
   isolation_unavailable: "当前环境无法建立所需隔离", protected_path_overlap: "工作目录与受保护目录重叠",
   workdir_invalid: "工作目录不可用", workdir_unavailable: "工作目录不可用",
+  workdir_unsafe: "工作目录或会话目录未通过文件安全检查，请检查链接、特殊文件、挂载及目录规模",
   auth_required: "请先在 CLI 完成登录，再重试", login_required: "请先在 CLI 完成登录，再重试",
   permission_required: "操作被权限策略拒绝，请检查所需权限", permission_mode_unknown: "尚未确认实际权限模式",
   permission_mode_fallback: "CLI 的实际权限模式与请求不一致", identity_conflict: "同一成员已有其他连接或运行所有者",

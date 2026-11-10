@@ -173,11 +173,11 @@ def exercise(page, fixture: dict, artifacts: Path, report: dict) -> None:
     state = api(page, origin, f"/api/runtime-bindings/{binding_id}")["binding"]
     assert state["binding"]["desiredState"] == "running"
     assert state["status"]["capability"]["supported"] is False
-    assert state["status"]["capability"]["reason"] in ("host_not_installed", "host_version_unknown", "host_version_unsupported", "profile_unsupported", "unsupported_harness")
+    assert state["status"]["capability"]["reason"] == "host_version_unknown"
     assert state["runner"]["state"] == "stopped" and state["runner"]["generation"] == 0 and state["runner"]["pid"] is None
     assert state["runner"]["applied"] is None and state["status"]["summary"] != "running"
     expect(page.get_by_role("button", name="删除配置", exact=True)).to_be_disabled()
-    passed("R5-3-production-unsupported", "默认生产 launcher 拒绝未验证宿主；显示原因，无 CLI 模型轮次或受管进程。")
+    passed("R5-3-production-unsupported", "真实生产 launcher 拒绝缺失的 CLI 安装；显示原因，无 CLI 模型轮次或受管进程。")
     screenshot("05-unsupported-desktop.png")
 
     mutation(page, "POST", binding_url + "/actions", card.get_by_test_id("runtime-stop").click)
@@ -231,7 +231,8 @@ def main() -> int:
         fixture = json.loads(line)
         parsed = urlsplit(fixture["url"])
         assert parsed.scheme == "http" and parsed.hostname == "127.0.0.1" and parsed.port
-        assert fixture["verifiedHostProfiles"] == 0
+        assert fixture["hostScenario"] == "missing-configured-cli"
+        report["hostScenario"] = fixture["hostScenario"]
         with sync_playwright() as playwright:
             try:
                 browser = playwright.chromium.launch(headless=True)

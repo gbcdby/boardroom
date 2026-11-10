@@ -75,6 +75,7 @@ test("R3 profile必须声明已知认证与出口策略，Codex/dsh和任意URL�
 });
 
 test("R3 installation附加任意mount/env/endpoint不能覆盖profile固定策略", async () => {
+  const profilesBefore = structuredClone(VERIFIED_HOST_PROFILES);
   const f = await fixture();
   try {
     await writeFile(f.credentials, SENTINEL, { mode: 0o600 });
@@ -85,12 +86,13 @@ test("R3 installation附加任意mount/env/endpoint不能覆盖profile固定策�
     assert.equal(resolved.credentialMounts[0]?.source, f.credentials);
     assert.deepEqual(resolved.egressHosts, ["api.anthropic.com", "claude.ai", "platform.claude.com"]);
     assert(!JSON.stringify(resolved).includes(SENTINEL));
-    assert.equal(VERIFIED_HOST_PROFILES.length, 0, "策略测试不能把生产宿主声明为supported");
+    assert.deepEqual(VERIFIED_HOST_PROFILES, profilesBefore, "合成策略解析不能改变已验证支持表");
   } finally { await f.close(); }
 });
 
 test("R3 合成原生登录文件在真实隔离HOME只读可见，服务端token/endpoint/env不继承", { timeout: 20_000 }, async t => {
   if (!await linuxIsolationAvailable()) { t.skip("隔离原语不可用；不把解析测试当作真实挂载通过"); return; }
+  const profilesBefore = structuredClone(VERIFIED_HOST_PROFILES);
   const f = await fixture();
   try {
     await writeFile(f.credentials, SENTINEL, { mode: 0o600 });
@@ -131,6 +133,6 @@ test("R3 合成原生登录文件在真实隔离HOME只读可见，服务端toke
     });
     assert.deepEqual(JSON.parse(result.stdout), { nativeReadable: true, readOnly: true, envClean: true, home: true, configDir: true, fixedProxy: true });
     assert.equal(await readFile(f.credentials, "utf8"), SENTINEL);
-    assert.equal(VERIFIED_HOST_PROFILES.length, 0);
+    assert.deepEqual(VERIFIED_HOST_PROFILES, profilesBefore, "隔离canary不能改变已验证支持表");
   } finally { await f.close(); }
 });
