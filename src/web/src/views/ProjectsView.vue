@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
+import { RouterLink } from "vue-router";
 import {
   ApiError,
   api,
@@ -421,6 +422,7 @@ onMounted(() => void loadProjects());
           <span v-if="activeProject.archivedAt" class="badge" data-testid="project-archived-badge">已归档</span>
         </h2>
         <p class="muted small">项目 ID：<code>{{ activeProject.id }}</code></p>
+        <p class="small"><RouterLink :to="{ path: '/runtimes', query: { projectId: activeProject.id } }">管理本项目的托管 Agent</RouterLink></p>
         <p data-testid="manager-line">
           顶层 manager：
           <strong v-if="manager" data-testid="manager-name">{{ manager.displayName }}</strong>
@@ -594,6 +596,7 @@ onMounted(() => void loadProjects());
             </strong>
             <span class="small muted">参与者：{{ participantNames(group.id) }}</span>
             <span class="actions" data-testid="group-lifecycle">
+              <RouterLink :to="{ path: '/runtimes', query: { projectId: group.projectId, groupId: group.id } }">托管 Agent</RouterLink>
               <button
                 v-if="!group.archivedAt"
                 type="button"

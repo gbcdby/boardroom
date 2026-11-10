@@ -83,7 +83,7 @@ export interface T1ApiOptions {
    * T3：人发送消息后，把消息广播给 WebUI（WebSocket）。可选：测试或无 WS 环境时省略。
    * 广播范围（阶段 1）＝ 人在 WebUI 的视角（可见全部群组消息）。
    */
-  readonly onMessage?: (message: MessageView) => void;
+  readonly onMessage?: (message: MessageView) => void | Promise<void>;
   /** D4 心跳配置；用于把连接层心跳时间推导为有效状态（T4）。默认 10s/30s。 */
   readonly heartbeat?: HeartbeatConfig;
   /** 服务端时钟；供测试注入 fake timers。默认 `() => new Date()`。 */
@@ -866,7 +866,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         // T7：人类消息重置该群组的「连续自动回复」计数（防环恢复条件之一）。
         if (sender.kind === "human") resetGroupConsecutiveCount(groupId);
         log.info("发送群组消息", { groupId, messageId: created.id, senderMemberId, via: "http" });
-        options.onMessage?.(view);
+        await options.onMessage?.(view);
         writeJson(response, 201, { message: view });
         return true;
       }

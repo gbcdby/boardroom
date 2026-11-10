@@ -24,6 +24,8 @@ import {
 } from "../authz/authorize.ts";
 import { actorForSession } from "../authz/actors.ts";
 import { getAdapter, isRegistered, listAdapterIds } from "./adapters/index.ts";
+import { createRuntimeRepository } from "../runtime/repository.ts";
+import { notifyMessageCommit } from "../runtime/dispatch-events.ts";
 import {
   createAntiLoop,
   DEFAULT_ANTI_LOOP_CONFIG,
@@ -361,6 +363,16 @@ export interface AntiLoopRuntimeOptions {
   readonly now?: () => number;
 }
 
+/** 只能由父 supervisor 的专用传输注入；工具参数不能提供此授权。 */
+export interface ManagedCoreAuthority {
+  readonly identity: JoinParams & { readonly memberId: string };
+  run<T>(operation: "join" | "observe" | "write" | "consume" | "disconnect", fn: () => Promise<T>): Promise<T>;
+  /** wait 边界决定是否允许下一轮；false 返回取消且不投递新消息。 */
+  beforeWait(): Promise<boolean>;
+  /** 与投递同一短事务执行，记录离开安全点。 */
+  onDelivery(): Promise<void>;
+}
+
 export interface McpCoreOptions {
   readonly logger: Logger;
   readonly db: DbDriver;
@@ -381,6 +393,7 @@ export interface McpCoreOptions {
    * T2（#49）落 `org_nodes` 后在这里注入岗位节点与子树范围，守卫与调用点不必再改。
    */
   readonly authz?: McpAuthzOptions;
+  readonly managed?: ManagedCoreAuthority;
 }
 
 export interface McpAuthzOptions {
@@ -429,6 +442,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   const memberKey = options.memberKey ?? "default";
 
   const repos: RepositorySet = createRepositories(options.db);
+  const runtimes = createRuntimeRepository(options.db);
   /** T7：进程级共享的防环/限流器。 */
   const antiLoop = getSharedAntiLoop(options.antiLoop);
   /** 会话键 → 绑定（运行时对象，进程内维护；持久化部分在 mcp_sessions/members/agents）。 */
@@ -440,6 +454,24 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   let closed = false;
 
   const selfKey = (sessionId: string): string => `${memberKey}:${sessionId}`;
+
+  async function withAccess<T>(binding: SessionBinding | null,
+    operation: "join" | "observe" | "write" | "consume" | "disconnect", fn: () => Promise<T>): Promise<T> {
+    try {
+      if (options.managed) return await options.managed.run(operation, fn);
+      if (binding) return await runtimes.withMemberLock(binding.memberId, async () => {
+        await runtimes.assertExternalJoinAllowed(binding.memberId);
+        return await fn();
+      });
+      return await fn();
+    } catch (error) {
+      if (error instanceof McpToolError) throw error;
+      if (error instanceof RepositoryError && error.code === "conflict") {
+        throw new McpToolError("CONFLICT", "运行所有权已变化或成员已由托管运行时预留");
+      }
+      throw error;
+    }
+  }
 
   // -------------------------------------------------------------------------
   // 持久化辅助
@@ -491,6 +523,12 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
           member = await (repos.members.update(member.id, { displayName }));
         }
 
+        // external join 与托管预留必须锁定同一 Member，防止 PG 检查后竞争。
+        return await runtimes.withMemberLock(member.id, async () => {
+        if (!options.managed) await runtimes.assertExternalJoinAllowed(member.id);
+        else if (options.managed.identity.memberId !== member.id) {
+          throw new McpToolError("FORBIDDEN", "托管通道不能切换成员身份");
+        }
         // 3) 群组参与者（幂等）。
         await (repos.groups.addParticipant(groupId, member.id));
 
@@ -508,6 +546,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         await (repos.statuses.set(projectId, member.id, "online"));
 
         return { agentId, member, session };
+        });
       }));
     } catch (error) {
       throw mapRepoError(error, { projectId, groupId, displayName, hostType });
@@ -516,7 +555,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
   async function touchSession(mcpSessionId: string): Promise<void> {
     try {
-      await (repos.mcpSessions.heartbeat(mcpSessionId, now().toISOString()));
+      const binding = [...bindings.values()].find((item) => item.mcpSessionId === mcpSessionId) ?? null;
+      await withAccess(binding, "observe", () => repos.mcpSessions.heartbeat(mcpSessionId, now().toISOString()));
     } catch (error) {
       log.warn("mcp_session_heartbeat_failed", { error, mcpSessionId });
     }
@@ -578,7 +618,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    */
   async function markWaiting(binding: SessionBinding): Promise<void> {
     try {
-      await (repos.statuses.set(binding.projectId, binding.memberId, "waiting"));
+      await withAccess(binding, "observe", () => repos.statuses.set(binding.projectId, binding.memberId, "waiting"));
     } catch (error) {
       log.warn("status_waiting_write_failed", { error, memberId: binding.memberId });
     }
@@ -586,7 +626,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
   async function markWorking(binding: SessionBinding): Promise<void> {
     try {
-      await (repos.statuses.set(binding.projectId, binding.memberId, "working"));
+      await withAccess(binding, "observe", () => repos.statuses.set(binding.projectId, binding.memberId, "working"));
     } catch (error) {
       log.warn("status_working_write_failed", { error, memberId: binding.memberId });
     }
@@ -633,16 +673,20 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     binding: SessionBinding,
     messages: DbMessage[],
   ): Promise<{ messages: Message[]; lastSeq: number }> {
+    return await withAccess(binding, "consume", async () => {
     const result: Message[] = [];
     for (const message of messages) {
       try {
         await (repos.deliveries.recordAttempt(message.id, binding.memberId, "delivered"));
       } catch (error) {
+        if (options.managed) throw error;
         log.warn("delivery_record_failed", { error, messageId: message.id });
       }
       result.push(toMessage(message));
     }
+    if (options.managed) await options.managed.onDelivery();
     return { messages: result, lastSeq: messages[messages.length - 1]!.seq };
+    });
   }
 
   /** 某成员最后一条非 pending 消息的游标（timeout/cancelled 时回显 afterCursor）。 */
@@ -699,7 +743,12 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         return plan.wake.includes(binding.memberId);
       });
       if (wakeMessages.length === 0) continue;
-      const delivered = await (markDelivered(binding, wakeMessages));
+      let delivered: { messages: Message[]; lastSeq: number };
+      try { delivered = await markDelivered(binding, wakeMessages); } catch (error) {
+        await settle(entry, { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false });
+        if (options.managed) continue;
+        throw error;
+      }
       await (settle(entry, {
         ok: true,
         status: "message",
@@ -739,6 +788,14 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
   const core: McpCore = {
     async join(sessionId, params) {
+      if (options.managed) {
+        const expected = options.managed.identity;
+        if (params.displayName !== expected.displayName || params.hostType !== expected.hostType ||
+          params.projectId !== expected.projectId || params.groupId !== expected.groupId ||
+          (params.role !== undefined && params.role !== (expected.role ?? "normal"))) {
+          throw new McpToolError("FORBIDDEN", "托管通道仅允许当前绑定身份");
+        }
+      }
       if (closed) throw new McpToolError("INTERNAL", "服务端正在关闭");
       const displayName = params.displayName.trim();
       if (displayName.length === 0 || displayName.length > MAX_DISPLAY_NAME_LENGTH) {
@@ -796,6 +853,10 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
     async waitForMessages(sessionId, params) {
       const binding = bindingFor(sessionId);
+      if (options.managed && !await options.managed.beforeWait()) {
+        return { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false };
+      }
+      await withAccess(binding, "observe", async () => {});
       const timeoutMs = params.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
       if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_WAIT_TIMEOUT_MS) {
         throw invalidArgument(`timeoutMs 必须是 1–${MAX_WAIT_TIMEOUT_MS} 的整数`, { timeoutMs });
@@ -855,9 +916,16 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       });
 
       const afterSeq = cursorToSeq(params.afterCursor);
-      const backlog = await (deliverableSince(binding, afterSeq));
-      if (backlog.length > 0) {
-        const delivered = await (markDelivered(binding, backlog));
+      let backlog: DbMessage[];
+      let delivered: { messages: Message[]; lastSeq: number } | undefined;
+      try {
+        backlog = await deliverableSince(binding, afterSeq);
+        if (backlog.length > 0) delivered = await markDelivered(binding, backlog);
+      } catch (error) {
+        await settle(entry, { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false });
+        throw error;
+      }
+      if (delivered) {
         // 立即拿到积压：不在等待循环中停留，跳过 waiting 直接进入 working（处理收到的消息）。
         await (markWorking(binding));
         log.debug("wait_drained_backlog", { memberId: binding.memberId, count: delivered.messages.length });
@@ -884,6 +952,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
     async sendMessage(sessionId, params) {
       const binding = bindingFor(sessionId);
+      await withAccess(binding, "write", async () => {});
       await (touchSession(binding.mcpSessionId));
       const text = params.text;
       if (typeof text !== "string" || text.trim().length === 0) {
@@ -940,7 +1009,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       let persisted: { message: DbMessage; duplicate: true } |
         { message: DbMessage; duplicate: false; decision: WakeDecision };
       try {
-        persisted = await (repos.transaction(async () => {
+        persisted = await withAccess(binding, "write", () => repos.transaction(async () => {
           // 事务外查重只是优化；并发请求必须在实际提交范围内再查，并由唯一索引兜底。
           if (params.clientMessageId) {
             const existing = await repos.messages.findByClientKey(binding.memberId, params.clientMessageId);
@@ -983,6 +1052,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       const created = persisted.message;
       if (persisted.duplicate) return { ok: true, messageId: created.id, createdAt: created.createdAt, duplicate: true };
       const decision = persisted.decision;
+      await notifyMessageCommit(options.db, created.id);
       log.info("message_sent", {
         memberId: binding.memberId,
         groupId,
@@ -1201,9 +1271,10 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       const at = now().toISOString();
       for (const binding of bindings.values()) {
         try {
-          await (repos.mcpSessions.disconnect(binding.mcpSessionId, at));
-          // 连接断开 → 成员运行状态 off（online/waiting/working 都视为离线）。
-          await (repos.statuses.set(binding.projectId, binding.memberId, "offline"));
+          await withAccess(binding, "disconnect", async () => {
+            await repos.mcpSessions.disconnect(binding.mcpSessionId, at);
+            await repos.statuses.set(binding.projectId, binding.memberId, "offline");
+          });
         } catch (error) {
           log.warn("mcp_session_disconnect_failed", { error, mcpSessionId: binding.mcpSessionId });
         }
@@ -1214,7 +1285,17 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   const registration: CoreInternals = { core, resolveGroup: resolveGroupInternal };
   activeRegistrations.add(registration);
 
-  return core;
+  // 短工具整体与 fence 检查处于同一事务；长等待在真正出队时再次检查。
+  return {
+    ...core,
+    join: (sid, params) => withAccess(null, "join", () => core.join(sid, params)),
+    acknowledgeMessage: (sid, id) => withAccess(bindingFor(sid), "write", () => core.acknowledgeMessage(sid, id)),
+    reportStatus: (sid, params) => withAccess(bindingFor(sid), "observe", () => core.reportStatus(sid, params)),
+    heartbeat: (sid) => withAccess(bindingFor(sid), "observe", () => core.heartbeat(sid)),
+    readHistory: (sid, params) => withAccess(bindingFor(sid), "consume", () => core.readHistory(sid, params)),
+    attemptInterrupt: (sid, params) => withAccess(bindingFor(sid), "observe", () => core.attemptInterrupt(sid, params)),
+    get pendingWaitCount() { return core.pendingWaitCount; },
+  };
 
   // -------------------------------------------------------------------------
   // 会话绑定

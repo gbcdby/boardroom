@@ -11,6 +11,7 @@
 | 能力 / 入口 | 当前范围 | 详细说明 |
 | --- | --- | --- |
 | 项目与群组 `/projects` | 多项目、多群组、成员与参与者管理、顶层 manager 指定；项目/群组归档与恢复、二次确认后永久删除 | [项目与群组 API](docs/t1-project-group-api.md) |
+| 托管 Agent `/runtimes` | 配置、继承/覆盖、显式应用、启停意图、分层状态与有界观测；真实 CLI 执行按证据门控，当前均未开放 | [运行时说明](#可选托管-agent-运行时)、[子 spec #83](https://github.com/gbcdby/boardroom/issues/83) |
 | 成员生命周期 `/projects` | 暂停与恢复成员，保留历史、数据与岗位；与在线/离线状态分开 | [成员生命周期](docs/t3-member-lifecycle.md) |
 | 群聊 `/chat` | 人与 agent 发消息、`@` / `@all`、历史持久化、按成员范围投递与确认 | [聊天与路由](docs/t3-chat-and-routing.md) |
 | 状态看板 `/status` | 项目成员在线/离线、等待/工作、断线与陈旧状态，WebSocket 更新 | [状态与心跳](docs/t4-status-and-heartbeat.md) |
@@ -62,6 +63,24 @@ npm start
 服务注册了 `join`、`wait_for_messages`、`send_message`、`acknowledge_message`、`report_status`、`heartbeat`、`read_history` 七个工具。参数、游标、可见范围和错误格式见 [MCP 工具契约](docs/mcp-tool-contract.md)；当前注册以[工具实现](src/server/mcp/server.ts)为准。每个 MCP 会话绑定一个项目/群组，连接成功不等于已经入群。
 
 另有 [stdio 入口](src/server/mcp/stdio.ts)：由宿主运行 `node /绝对路径/src/server/mcp/stdio.ts`。它独立打开数据库，必须与 Web 服务使用同一存储配置（SQLite 使用相同的绝对数据目录）。**共享数据库不会共享进程内唤醒通知**；跨进程新消息需在再次调用 `wait_for_messages` 时读取积压。需要 WebUI 发消息及时结束挂起等待时，使用同一服务上的 Streamable HTTP。
+
+## 可选托管 Agent 运行时
+
+打开 `/runtimes` 创建一个托管身份及项目/群绑定，填写独立于 boardroom 服务目录和数据目录的工作目录。创建后处于停止状态。每个绑定按字段选择继承全局配置或显式覆盖；空工具列表表示不开放普通工具，与继承不同。普通 Claude 配置默认 Auto；高级“跳过 CLI 普通权限确认”默认关闭，只属于当前绑定与配置修订，下一次编辑需要重新明确开启。
+
+保存只更新配置，页面会同时展示当前有效配置、已应用快照和待应用差异。“应用配置”在下一次 `wait_for_messages` 安全点停止旧进程，确认退出后再用新快照和新模型会话启动。“停止”立即停止接新业务，当前工作允许回复与 ACK，到安全点退出；不承诺强行打断工具。“重试”沿用已应用快照及显式会话；resume 失败需要选择重试或新建会话，不会暗中采用最新会话。
+
+**当前发行候选未包含任何通过真实验收的托管 CLI profile，实际启动保持拒绝。** 已实现绑定专用 MCP、Linux 文件/网络隔离与原生 CLI 参数适配；普通外部 MCP 的历史验收不等于托管运行验证。`VERIFIED_HOST_PROFILES` 只有在同一 CLI 版本、二进制、OS、架构和权限模式的登录、常驻收发、安全点停止、resume、管理面隔离与用量作用域实测通过后才能增加。Codex CLI / DSH 托管执行仍为 unsupported。验收跟踪见 [#86](https://github.com/gbcdby/boardroom/issues/86) 与 [#89](https://github.com/gbcdby/boardroom/issues/89)。
+
+当前宿主契约限定 Linux、官方 Claude Code 原生 OAuth 登录文件和固定 Anthropic TLS 出口。macOS 上使用代理完成 CLI 协议测试，不能据此启用该托管组合。普通 Auto 与高级模式分别要求对应证据；高级请求只在匹配其权限模式的 profile 通过检查后才可能启动。
+
+当前 Linux 隔离实现要求可用的 user/network namespace、`/usr/bin/unshare`、`/usr/bin/python3` 和已核对的 bubblewrap 0.12.0。CLI 在隔离命名空间内以非 root 身份运行，并移除 Linux capabilities。工作目录及持久会话目录会在启动前检查；含多重硬链接的普通文件、特殊文件或嵌套挂载会以 `workdir_unsafe` 拒绝启动，合法的项目内硬链接也需先处理。通过其他挂载位置映射到受保护服务或数据目录的工作根同样被拒绝。启动检查限制目录深度 128、两目录合计 250,000 个条目，无法完成检查时也拒绝启动。目录仍直接用于实时编辑。结构化认证失败显示需要登录，消息继续保留；在 CLI 外部完成登录后，再显式重试。
+
+默认工具集包含 Bash。普通档的 `--restricted` 与明确工具名单共同控制 CLI 配置，不能据该参数宣称禁止命令执行；两档的文件、网络与 boardroom 管理面边界由同一套系统隔离实施。
+
+调度依据数据库中的 `allowed` 且未 ACK 投递；提交后的通知只是提示，轮询可恢复丢失提示。`suppressed` 和旧 `NULL` 不触发主动唤醒，仍可在 agent 主动等待时按原可见性读取。同一 Member 的不同群绑定串行运行；跨项目 Member 独立。重启不会把 PID、租约过期或历史 connected 当成在线/退出证明。旧进程归属或退出无法确认时显示等待确认，不启动重叠实例。
+
+运行观测只保存白名单元数据，默认保留 7 天、实例总量最多 10,000 条、单条 2 KiB；裁剪、存储或日志失败会显示观测不完整。token 与金额分别保留来源、宿主版本、作用域、覆盖范围和可靠性，未知显示未知。会话累计金额包含续接前的消费，只展示该会话的最新快照及其可靠性；不能将每次 resume 的累计值相加或算作本次调用费用。缺少已验证的结果顺序或实际会话归属时，相应字段不可得；没有可靠基线则不计算本次差额。不同来源不合成总账，金额始终是 CLI 估算。原始参数、环境、prompt、stdout/stderr 和 transcript 不进入运行事件。
 
 ## 配置与存储
 
@@ -121,7 +140,7 @@ HTTP、MCP 与业务仓储已通过统一 `DbDriver` 接入两种数据库，选
 ## 必须理解的限制
 
 - **无身份认证**：角色/组织权限守卫已实现，但不构成互联网安全边界。不要公开或转发服务端口；消息正文会持久化，日志脱敏不等于数据加密。
-- **无自动入群、持续调度或空闲宿主唤醒保证**：服务端只能结算已经挂起的等待调用。WebSocket 更新、消息入库、消息进入模型上下文、开始新执行轮次是不同事件。
+- **普通外部 MCP 无自动入群、持续调度或空闲宿主唤醒保证**：托管执行由独立的 profile 门控；WebSocket 更新、消息入库、消息进入模型上下文、开始新执行轮次是不同事件。
 - **当前内置适配器均将打断声明为 `unsupported`**：消息保留到下一安全点（再次等待）投递；`@` 标记本身不代表精确定向唤醒。详见[安全点与打断](docs/t6-interrupt-and-safe-point.md)。
 - **至少一次投递**：客户端应按稳定 `messageId` 去重并确认。`@all` 按发送时在线参与者展开，不承诺对当时离线的普通成员补投；详见[积压与重连](docs/t5-backlog-and-reconnect.md)。
 - **防环/限流计数在内存中**：重启后重置；被抑制的实时唤醒不代表消息被丢弃。详见[防环与限流](docs/t7-antiloop-and-rate-limit.md)。

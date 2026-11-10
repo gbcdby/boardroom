@@ -86,11 +86,15 @@ const FK_DEPS: Record<string, string[]> = {
   message_deliveries: ["messages", "members", "projects"],
   member_statuses: ["projects", "members"],
   mcp_sessions: ["agents", "projects", "groups", "members"],
+  agent_runtimes: ["agents"],
+  agent_runtime_bindings: ["agent_runtimes", "projects", "groups", "members"],
+  agent_runner_states: ["agent_runtime_bindings"],
+  agent_runtime_members: ["agent_runtimes", "projects", "members", "agent_runtime_bindings"],
 };
 
-test("业务表清单：11 张表、不含 schema_migrations、外键顺序合法", () => {
+test("业务表清单：18 张表、不含 schema_migrations、外键顺序合法", () => {
   const names = BUSINESS_TABLES.map((t) => t.name);
-  assert.equal(names.length, 11);
+  assert.equal(names.length, 18);
   assert.ok(!names.includes("schema_migrations"));
   for (const expected of [
     "agents",
@@ -104,6 +108,13 @@ test("业务表清单：11 张表、不含 schema_migrations、外键顺序合�
     "member_statuses",
     "mcp_sessions",
     "audit_log",
+    "agent_runtimes",
+    "agent_runtime_bindings",
+    "agent_runner_states",
+    "agent_runtime_members",
+    "agent_runtime_events",
+    "agent_runtime_observation_meta",
+    "agent_runtime_usage_snapshots",
   ]) {
     assert.ok(names.includes(expected), `缺少业务表 ${expected}`);
   }
@@ -154,7 +165,7 @@ test("SQLite → SQLite：全量拷贝、一致性校验、源库只读、幂等
       await assertDispatchValues(srcOpts);
       await assertDispatchValues(dstOpts);
 
-      // 源库未改：行数仍为 11 张业务表全量。
+      // 源库未改：全部业务表的行数保持一致。
       const srcCounts: Record<string, number> = {};
       const srcDriver = createDbDriver(srcOpts);
       await srcDriver.connect();
@@ -218,7 +229,7 @@ test("回滚：清空目标业务表，源库不受影响；可重新迁移恢�
       await migrateData(srcOpts, dstOpts);
 
       const rb = await rollbackTarget(dstOpts);
-      assert.equal(rb.clearedTables.length, 11);
+      assert.equal(rb.clearedTables.length, 18);
 
       // 目标业务表已清空，校验失败。
       const afterRollback = await validateData(srcOpts, dstOpts);

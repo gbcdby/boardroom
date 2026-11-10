@@ -32,6 +32,10 @@ MemberStatus >─ Project + Member
 | **Message** | 群组消息 | `group_id`、`sender_member_id`、`seq`、`body`、`mentions` |
 | **MessageDelivery** | 某消息对某成员的投递记录 | `message_id`、`member_id`、`status`、`attempt_count` |
 | **MemberStatus** | 项目成员运行状态 | `project_id`、`member_id`、`state` |
+| **AgentRuntime** | 全局托管配置，关联既有 Agent 身份层 | `agent_id`、`defaults_json`、`config_version`、`revision` |
+| **RuntimeBinding** | 一个 runtime 在项目/群的显式绑定和启动意图 | `runtime_id`、`project_id`、`group_id`、`member_id`、`overrides_json`、`desired_state` |
+| **RunnerState / RuntimeMember** | 进程观察状态与同 Member 唯一运行权 | `lease_owner`、`generation`、`applied_json`、`exit_confirmed`、`process_identity_json` |
+| **RuntimeEvent / UsageSnapshot** | 有界诊断历史及独立累计用量基线 | 白名单事件、来源/版本/作用域/epoch、序号、覆盖与可靠性 |
 
 ### 1.1 Agent vs Member（D1）
 
@@ -103,6 +107,16 @@ MemberStatus >─ Project + Member
 - 状态变更在 HTTP 入口只调用 `OrgChangeRecorder` 钩子（`member.disable` / `member.enable` /
   `member.status_change`），**不写 `audit_log`**（审计写入与撤销属 T5 #52）。
 
+### 1.7 可选托管运行时
+
+托管配置不复用 Agent、Member、MCP session 或成员工作状态。创建配置原子建立新身份和绑定，初态停止；既有外部身份不被按显示名接管。配置默认值和显式覆盖分别持久化，保存只递增修订；明确应用捕获版本快照，正常恢复继续使用已应用快照。高级权限策略绑定到配置修订，下一次编辑默认失效。
+
+`agent_runtime_members` 是成员级 reservation 与 owner/generation 的串行点。同 Member 不同群一次只有一个 runner；跨项目 Member 独立。MCP 入群、出队、ACK、回复和状态回写都检查受信通道身份及 fence。租约过期不等于进程已退出；跨重启恢复需验证 launcher 协议、系统 boot ID、PID namespace 和 start ticks，只有确认旧 wrapper 及其隔离树退出后才以旧 fence/身份/过期租约原子释放。PID 本身只作展示，绝不用于杀旧进程。
+
+删除或永久清除配置关联范围必须先停止、确认退出并释放 owner。普通配置删除保留 Agent/Member 身份和消息历史；项目/群永久清除仍按原范围执行，并清理相应绑定。运行观测历史独立于业务消息与审计，轮转不回填投递、ACK 或成员状态；用量累计基线独立于事件轮转，避免把首次、回退或断档的累计值误作新增消耗。
+
+各用量指标独立声明 invocation 或 session 作用域。会话累计快照使用绑定与实际已关联宿主 SID 导出的内部引用，跨进程续接保留同一 scope/epoch；公开观测不保存原 SID。已验证结果帧的来源序号与 runner generation 一起决定顺序，新 generation 可从序号 0 开始，重放或旧代次不能覆盖较新快照。同会话累计回退会持续标记不可靠；明确新会话才建立独立计数，未知基线不生成差额。该顺序与可靠性信息保留在既有快照 payload，不新增计费表或迁移。
+
 ## 2. 稳定 ID 方案
 
 - 采用 **UUIDv7 值编码为 26 位 Crockford Base32**（ULID 形状），实现见 `src/server/db/ids.ts`。
@@ -140,9 +154,13 @@ MemberStatus >─ Project + Member
     CHECK 约束、`NOT NULL DEFAULT 'active'` 与 `ix_members_project_status` 索引（T3 #50）。
     **只加列、默认 active、不回填**，升级库老成员一律 active（见 §1.6）。
   - F1 只建立 `schema_migrations` 版本表，无领域表。
-- 迁移 SQL 双方言中立（`ALTER TABLE ADD COLUMN` + 普通索引）；业务表按 PostgreSQL 方言重写属 M1 #54。
-- `schema.test.ts` 校验 `EXPECTED_VERSION = 5`、v2→v5 / v3→v5 / v4→v5 升级路径、
-  `status` 列默认与 CHECK 约束、旧数据不丢失。
+  - `6 init_audit_log`：组织/成员生命周期最小审计。
+  - `7 durable_message_dispatch`：持久化发送幂等键及 allowed/suppressed/NULL 唤醒决定。
+  - `8 managed_runtime_configuration_and_ownership`：托管配置、绑定、成员 reservation 与 runner 状态。
+  - `9 managed_runtime_observability`：事件、观测健康计数与用量快照。
+  - `10 managed_runtime_process_identity`：追加只读恢复使用的内核进程身份；老行保持 NULL，不推断旧所有权。
+- 生产迁移保持 SQLite/PostgreSQL 可执行；跨驱动搬运使用 `migrate-data.ts` 的对应目标 DDL、列复制与逐表校验。托管表、已应用快照、进程归属和观测基线均在搬运范围内。
+- `schema.test.ts` 校验当前版本及老库升级，`runtime-repository.test.ts` 与 `migrate-data.test.ts` 检查非空配置、投递和所有权的保留。只读内核核验不依赖迁移重造 PID。
 
 ## 5. 事务与并发
 

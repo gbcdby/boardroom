@@ -171,7 +171,7 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 投递的 `wake_decision` 为 `allowed`、`suppressed` 或 `NULL`（没有请求唤醒），受抑制时保存原因；
 旧消息升级后保持 `NULL`，不反推过去的决定。MCP 保存经过 anti-loop 的实际判定，HTTP 人消息
 保留既有路由与计数重置规则。后续 dispatcher 可查询 `allowed` 且未 ACK 的记录；
-`suppressed` 和 `NULL` 仍按既有可见性支持主动 wait、补投和 ACK。本轮没有实现进程 dispatcher。
+`suppressed` 和 `NULL` 仍按既有可见性支持主动 wait、补投和 ACK。托管运行时的 dispatcher 查询该持久化决定，普通外部 MCP 的等待行为继续独立保持。
 
 当前 anti-loop 计数仍在内存中。如果注册计数后发生数据库回滚，计数可能保守多计一次；
 因此这里只保证消息与投递的原子提交，不声明限额消耗或外部业务副作用精确一次。

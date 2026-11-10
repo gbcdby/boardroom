@@ -5,6 +5,7 @@ import ChatView from "./views/ChatView.vue";
 import StatusBoardView from "./views/StatusBoardView.vue";
 import OrgView from "./views/OrgView.vue";
 import AuditView from "./views/AuditView.vue";
+import RuntimesView from "./views/RuntimesView.vue";
 import PlaceholderView from "./views/PlaceholderView.vue";
 
 /**
@@ -23,6 +24,7 @@ export const router = createRouter({
     { path: "/projects", name: "projects", component: ProjectsView },
     { path: "/org", name: "org", component: OrgView },
     { path: "/audit", name: "audit", component: AuditView },
+    { path: "/runtimes", name: "runtimes", component: RuntimesView },
     { path: "/chat", name: "chat", component: ChatView },
     { path: "/status", name: "status", component: StatusBoardView },
     { path: "/groups", name: "groups", redirect: "/chat" },

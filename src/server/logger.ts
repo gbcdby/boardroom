@@ -89,9 +89,35 @@ export interface Logger {
   error(msg: string, fields?: LogFields): void;
   /** 派生一个携带固定字段的 logger。 */
   child(base: LogFields): Logger;
+  /** 所有派生 logger 共用的 sink 健康计数；不包含错误原文。 */
+  health(): LoggerHealth;
+}
+
+export interface LoggerHealth {
+  readonly writeFailures: number;
+  readonly serializationFailures: number;
+}
+
+// 默认 stdout 是共享异步流；error 事件不会被 write() 外的 try/catch 捕获。
+// 只安装一个监听器，所有默认 logger 共用失败事实，避免 child logger 重复监听。
+let stdoutHealth: { writeFailures: number } | null = null;
+function defaultStdoutHealth(): { writeFailures: number } {
+  if (!stdoutHealth) {
+    stdoutHealth = { writeFailures: 0 };
+    process.stdout.on("error", () => { stdoutHealth!.writeFailures += 1; });
+  }
+  return stdoutHealth;
 }
 
 export function createLogger(options: LoggerOptions = {}): Logger {
+  return createLoggerWithHealth(options, { writeFailures: 0, serializationFailures: 0 });
+}
+
+function createLoggerWithHealth(
+  options: LoggerOptions,
+  health: { writeFailures: number; serializationFailures: number },
+): Logger {
+  const streamHealth = options.write === undefined ? defaultStdoutHealth() : null;
   const write = options.write ?? ((chunk: string) => void process.stdout.write(chunk));
   const threshold = LEVEL_WEIGHT[options.level ?? "info"];
   const base = options.base ?? {};
@@ -114,6 +140,7 @@ export function createLogger(options: LoggerOptions = {}): Logger {
       line = `${JSON.stringify(record)}\n`;
     } catch {
       // 循环引用或 BigInt 等：退化为只保留元信息，绝不抛错。
+      health.serializationFailures += 1;
       line = `${JSON.stringify({
         time: record["time"],
         level,
@@ -126,6 +153,7 @@ export function createLogger(options: LoggerOptions = {}): Logger {
       write(line);
     } catch {
       // EPIPE / 已关闭的 sink：日志写入失败不得影响主流程。
+      health.writeFailures += 1;
     }
   }
 
@@ -134,7 +162,8 @@ export function createLogger(options: LoggerOptions = {}): Logger {
     info: (msg, fields) => emit("info", msg, fields),
     warn: (msg, fields) => emit("warn", msg, fields),
     error: (msg, fields) => emit("error", msg, fields),
-    child: (extra) => createLogger({ ...options, base: { ...base, ...extra } }),
+    child: (extra) => createLoggerWithHealth({ ...options, base: { ...base, ...extra } }, health),
+    health: () => ({ ...health, writeFailures: health.writeFailures + (streamHealth?.writeFailures ?? 0) }),
   };
 }
 

@@ -111,6 +111,9 @@ export interface PurgeCounts {
   readonly deliveries: number;
   readonly memberStatuses: number;
   readonly mcpSessions: number;
+  readonly agentRuntimeBindings: number;
+  readonly agentRunnerStates: number;
+  readonly agentRuntimeMembers: number;
 }
 
 /** 群组级联清单（#48）：删群组只清群聊与参与者关系，**不动成员本身**。 */
@@ -119,6 +122,9 @@ export interface GroupPurgeCounts {
   readonly deliveries: number;
   readonly participants: number;
   readonly mcpSessions: number;
+  readonly agentRuntimeBindings: number;
+  readonly agentRunnerStates: number;
+  readonly agentRuntimeMembers: number;
 }
 
 export interface ProjectsRepository {
@@ -491,6 +497,7 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
     const r = (await ctx.one(sql, [projectId])) as CountRow | undefined;
     return Number(r?.c ?? 0);
   };
+  const managed = await hasRuntimeSchema(ctx);
   return {
     groups: await count("SELECT COUNT(*) AS c FROM groups WHERE project_id = ?"),
     members: await count("SELECT COUNT(*) AS c FROM members WHERE project_id = ?"),
@@ -501,6 +508,9 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
     deliveries: await count("SELECT COUNT(*) AS c FROM message_deliveries WHERE project_id = ?"),
     memberStatuses: await count("SELECT COUNT(*) AS c FROM member_statuses WHERE project_id = ?"),
     mcpSessions: await count("SELECT COUNT(*) AS c FROM mcp_sessions WHERE project_id = ?"),
+    agentRuntimeBindings: managed ? await count("SELECT COUNT(*) AS c FROM agent_runtime_bindings WHERE project_id = ?") : 0,
+    agentRunnerStates: managed ? await count("SELECT COUNT(*) AS c FROM agent_runner_states WHERE binding_id IN (SELECT id FROM agent_runtime_bindings WHERE project_id = ?)") : 0,
+    agentRuntimeMembers: managed ? await count("SELECT COUNT(*) AS c FROM agent_runtime_members WHERE project_id = ?") : 0,
   };
 }
 
@@ -513,6 +523,7 @@ async function groupPurgeCounts(ctx: RepoCtx, groupId: string): Promise<GroupPur
     const r = (await ctx.one(sql, [groupId])) as CountRow | undefined;
     return Number(r?.c ?? 0);
   };
+  const managed = await hasRuntimeSchema(ctx);
   return {
     messages: await count("SELECT COUNT(*) AS c FROM messages WHERE group_id = ?"),
     deliveries: await count(
@@ -520,7 +531,45 @@ async function groupPurgeCounts(ctx: RepoCtx, groupId: string): Promise<GroupPur
     ),
     participants: await count("SELECT COUNT(*) AS c FROM group_participants WHERE group_id = ?"),
     mcpSessions: await count("SELECT COUNT(*) AS c FROM mcp_sessions WHERE group_id = ?"),
+    agentRuntimeBindings: managed ? await count("SELECT COUNT(*) AS c FROM agent_runtime_bindings WHERE group_id = ?") : 0,
+    agentRunnerStates: managed ? await count("SELECT COUNT(*) AS c FROM agent_runner_states WHERE binding_id IN (SELECT id FROM agent_runtime_bindings WHERE group_id = ?)") : 0,
+    agentRuntimeMembers: managed ? await count(`SELECT COUNT(*) AS c FROM agent_runtime_members rm
+      WHERE rm.member_id IN (SELECT member_id FROM agent_runtime_bindings WHERE group_id = ?)
+        AND (SELECT COUNT(*) FROM agent_runtime_bindings b WHERE b.member_id = rm.member_id) = 1`) : 0,
   };
+}
+
+/** 迁移测试允许暂时操作旧库；升级后的正常运行总是具备 v8。 */
+async function hasRuntimeSchema(ctx: RepoCtx): Promise<boolean> {
+  return (await ctx.one("SELECT version FROM schema_migrations WHERE version = 8")) !== undefined;
+}
+
+/**
+ * 永久删除与 runner claim 共用成员行写锁。lease 过期仍须等待真正退出，
+ * 不能通过项目/成员级联删除绕过「先停止托管配置」。父级锁也阻止并发新增绑定。
+ */
+async function requireManagedStopped(ctx: RepoCtx, kind: "project" | "group" | "member", id: string): Promise<void> {
+  if (!await hasRuntimeSchema(ctx)) return;
+  if (kind === "project") await ctx.exec("UPDATE projects SET updated_at = updated_at WHERE id = ?", [id]);
+  if (kind === "group") {
+    const group = await ctx.one<GroupIdRow & ProjectIdRow>("SELECT project_id FROM groups WHERE id = ?", [id]);
+    if (group) await ctx.exec("UPDATE projects SET updated_at = updated_at WHERE id = ?", [group.project_id]);
+    await ctx.exec("UPDATE groups SET updated_at = updated_at WHERE id = ?", [id]);
+  }
+  const column = kind === "project" ? "project_id" : kind === "group" ? "group_id" : "member_id";
+  const members = await ctx.query<MemberIdRow>(`SELECT DISTINCT member_id FROM agent_runtime_bindings WHERE ${column} = ? ORDER BY member_id`, [id]);
+  for (const member of members) await ctx.exec("UPDATE members SET updated_at = updated_at WHERE id = ?", [member.member_id]);
+  const active = await ctx.one(`SELECT b.id FROM agent_runtime_bindings b
+    JOIN agent_runner_states s ON s.binding_id = b.id WHERE b.${column} = ?
+      AND (b.desired_state <> 'stopped' OR s.lease_owner IS NOT NULL OR s.exit_confirmed <> 1
+        OR s.state NOT IN ('stopped', 'failed')) LIMIT 1`, [id]);
+  if (active) throw new ConflictError("runtime_must_stop_first");
+}
+
+async function cleanOrphanRuntimeMembers(ctx: RepoCtx): Promise<void> {
+  if (!await hasRuntimeSchema(ctx)) return;
+  await ctx.exec(`DELETE FROM agent_runtime_members WHERE binding_id IS NULL
+    AND NOT EXISTS (SELECT 1 FROM agent_runtime_bindings b WHERE b.member_id = agent_runtime_members.member_id)`);
 }
 
 function toAgent(row: AgentRow): Agent {
@@ -608,12 +657,16 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
         patch.displayName === undefined ? existing.displayName : requireNonEmpty(patch.displayName, "Agent.displayName");
       const hostType =
         patch.hostType === undefined ? existing.hostType : requireNonEmpty(patch.hostType, "Agent.hostType");
-      await ctx.withTransaction(async () =>
-        ctx.exec(
+      await ctx.withTransaction(async () => {
+        if ((displayName !== existing.displayName || hostType !== existing.hostType) && await hasRuntimeSchema(ctx)
+          && await ctx.one("SELECT id FROM agent_runtimes WHERE agent_id = ?", [id])) {
+          throw new ConflictError("runtime_identity_immutable");
+        }
+        await ctx.exec(
           "UPDATE agents SET display_name = ?, host_type = ?, updated_at = ? WHERE id = ?",
           [displayName, hostType, nowIso(), id],
-        ),
-      );
+        );
+      });
       return (await this.get(id))!;
     },
     async touchLastSeen(id, at) {
@@ -741,8 +794,9 @@ function createProjects(ctx: RepoCtx): ProjectsRepository {
     },
     async purge(id) {
       if (!(await this.get(id))) throw new NotFoundError(`Project ${id} 不存在。`);
-      const counts = await projectPurgeCounts(ctx, id);
-      await ctx.withTransaction(async () => {
+      return ctx.withTransaction(async () => {
+        await requireManagedStopped(ctx, "project", id);
+        const counts = await projectPurgeCounts(ctx, id);
         // 显式「子 → 父」顺序，而不是只依赖外键级联：清单与实际清除的行必须一一对得上，
         // 也让 PG 重写（M1 #54）时不依赖特定级联顺序。
         await ctx.exec("DELETE FROM message_deliveries WHERE project_id = ?", [id]);
@@ -762,12 +816,15 @@ function createProjects(ctx: RepoCtx): ProjectsRepository {
         await ctx.exec("DELETE FROM org_nodes WHERE project_id = ?", [id]);
         const removed = await ctx.exec("DELETE FROM projects WHERE id = ?", [id]);
         if (removed === 0) throw new NotFoundError(`Project ${id} 不存在。`);
+        return counts;
       });
-      return counts;
     },
     async delete(id) {
-      const result = await ctx.exec("DELETE FROM projects WHERE id = ?", [id]);
-      if (result === 0) throw new NotFoundError(`Project ${id} 不存在。`);
+      await ctx.withTransaction(async () => {
+        await requireManagedStopped(ctx, "project", id);
+        const result = await ctx.exec("DELETE FROM projects WHERE id = ?", [id]);
+        if (result === 0) throw new NotFoundError(`Project ${id} 不存在。`);
+      });
     },
   };
 }
@@ -934,8 +991,11 @@ function createMembers(ctx: RepoCtx): MembersRepository {
       return (await this.get(id))!;
     },
     async delete(id) {
-      const result = await ctx.exec("DELETE FROM members WHERE id = ?", [id]);
-      if (result === 0) throw new NotFoundError(`成员 ${id} 不存在。`);
+      await ctx.withTransaction(async () => {
+        await requireManagedStopped(ctx, "member", id);
+        const result = await ctx.exec("DELETE FROM members WHERE id = ?", [id]);
+        if (result === 0) throw new NotFoundError(`成员 ${id} 不存在。`);
+      });
     },
     async restoreRow(member) {
       await ctx.exec(
@@ -1056,8 +1116,9 @@ function createGroups(ctx: RepoCtx): GroupsRepository {
     },
     async purge(id) {
       if (!(await repo.get(id))) throw new NotFoundError(`Group ${id} 不存在。`);
-      const counts = await groupPurgeCounts(ctx, id);
-      await ctx.withTransaction(async () => {
+      return ctx.withTransaction(async () => {
+        await requireManagedStopped(ctx, "group", id);
+        const counts = await groupPurgeCounts(ctx, id);
         // 只清「群聊 + 参与者关系」（LIFE-ARC-02）：投递记录随消息一起清，
         // 会话记录随群组一起清；**members 与 member_statuses 一行都不动**。
         await ctx.exec(
@@ -1070,8 +1131,9 @@ function createGroups(ctx: RepoCtx): GroupsRepository {
         await ctx.exec("DELETE FROM mcp_sessions WHERE group_id = ?", [id]);
         const removed = await ctx.exec("DELETE FROM groups WHERE id = ?", [id]);
         if (removed === 0) throw new NotFoundError(`Group ${id} 不存在。`);
+        await cleanOrphanRuntimeMembers(ctx);
+        return counts;
       });
-      return counts;
     },
     async participants(groupId) {
       return (await ctx.query<MemberIdRow>(
@@ -1109,8 +1171,12 @@ function createGroups(ctx: RepoCtx): GroupsRepository {
       );
     },
     async delete(id) {
-      const result = await ctx.exec("DELETE FROM groups WHERE id = ?", [id]);
-      if (result === 0) throw new NotFoundError(`Group ${id} 不存在。`);
+      await ctx.withTransaction(async () => {
+        await requireManagedStopped(ctx, "group", id);
+        const result = await ctx.exec("DELETE FROM groups WHERE id = ?", [id]);
+        if (result === 0) throw new NotFoundError(`Group ${id} 不存在。`);
+        await cleanOrphanRuntimeMembers(ctx);
+      });
     },
   };
   return repo;

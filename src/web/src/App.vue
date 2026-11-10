@@ -8,6 +8,7 @@ const navigation = [
   { to: "/audit", label: "审计与撤销" },
   { to: "/chat", label: "群聊" },
   { to: "/status", label: "状态看板" },
+  { to: "/runtimes", label: "托管 Agent" },
   { to: "/settings", label: "设置" },
 ];
 </script>
