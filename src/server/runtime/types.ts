@@ -167,6 +167,8 @@ export interface RuntimeRepository {
   list(): Promise<RuntimeView[]>;
   getBinding(id: string): Promise<RuntimeBindingView | null>;
   listBindings(filter?: { projectId?: string; groupId?: string; memberId?: string }): Promise<RuntimeBindingView[]>;
+  /** 调度资格观察；不改变 desired/applied/sid，真正领取/消费仍在 fence 事务内复核。 */
+  isScopeActive(bindingId: string): Promise<boolean>;
   updateDefaults(id: string, expectedRevision: number, defaults: Partial<RuntimeConfig> & Pick<RuntimeConfig, "workdir">): Promise<RuntimeView>;
   addBinding(runtimeId: string, input: NewRuntimeBinding, expectedRuntimeRevision?: number): Promise<RuntimeBindingView>;
   updateBinding(id: string, input: UpdateRuntimeBinding): Promise<RuntimeBindingView>;
@@ -187,7 +189,7 @@ export interface RuntimeRepository {
   recoverExited(fence: RunnerFence, expectedIdentity: OwnedProcessIdentity, exit: RunnerExit): Promise<RuntimeBindingView>;
   markExit(fence: RunnerFence, exit: RunnerExit): Promise<RuntimeBindingView>;
   /** 无进程所有权时记录排队原因；不可覆盖活跃 generation。 */
-  queued(id: string, reason: string, retryAt?: string | null): Promise<RuntimeBindingView>;
+  queued(id: string, reason: string | null, retryAt?: string | null): Promise<RuntimeBindingView>;
   listWakeable(): Promise<WakeableRuntimeBinding[]>;
   /** 与 MCP join 共用成员行锁；允许嵌入现有 DbDriver 事务。 */
   withMemberLock<T>(memberId: string, fn: () => Promise<T>): Promise<T>;

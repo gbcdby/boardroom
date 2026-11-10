@@ -366,7 +366,7 @@ export interface AntiLoopRuntimeOptions {
 /** 只能由父 supervisor 的专用传输注入；工具参数不能提供此授权。 */
 export interface ManagedCoreAuthority {
   readonly identity: JoinParams & { readonly memberId: string };
-  run<T>(operation: "join" | "observe" | "write" | "consume", fn: () => Promise<T>): Promise<T>;
+  run<T>(operation: "join" | "observe" | "write" | "consume" | "disconnect", fn: () => Promise<T>): Promise<T>;
   /** wait 边界决定是否允许下一轮；false 返回取消且不投递新消息。 */
   beforeWait(): Promise<boolean>;
   /** 与投递同一短事务执行，记录离开安全点。 */
@@ -456,7 +456,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   const selfKey = (sessionId: string): string => `${memberKey}:${sessionId}`;
 
   async function withAccess<T>(binding: SessionBinding | null,
-    operation: "join" | "observe" | "write" | "consume", fn: () => Promise<T>): Promise<T> {
+    operation: "join" | "observe" | "write" | "consume" | "disconnect", fn: () => Promise<T>): Promise<T> {
     try {
       if (options.managed) return await options.managed.run(operation, fn);
       if (binding) return await runtimes.withMemberLock(binding.memberId, async () => {
@@ -853,10 +853,10 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
     async waitForMessages(sessionId, params) {
       const binding = bindingFor(sessionId);
-      await withAccess(binding, "observe", async () => {});
       if (options.managed && !await options.managed.beforeWait()) {
         return { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false };
       }
+      await withAccess(binding, "observe", async () => {});
       const timeoutMs = params.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
       if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_WAIT_TIMEOUT_MS) {
         throw invalidArgument(`timeoutMs 必须是 1–${MAX_WAIT_TIMEOUT_MS} 的整数`, { timeoutMs });
@@ -1271,7 +1271,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       const at = now().toISOString();
       for (const binding of bindings.values()) {
         try {
-          await withAccess(binding, "observe", async () => {
+          await withAccess(binding, "disconnect", async () => {
             await repos.mcpSessions.disconnect(binding.mcpSessionId, at);
             await repos.statuses.set(binding.projectId, binding.memberId, "offline");
           });

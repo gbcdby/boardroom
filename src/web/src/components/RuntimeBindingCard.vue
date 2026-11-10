@@ -111,7 +111,8 @@ function usageValue(row: RuntimeUsageDto): string {
 </template>
 
 <style scoped>
-.binding-card { border: 1px solid var(--border); border-radius: 8px; padding: 1rem; background: var(--card-bg); }
+/* Grid item 可收缩，窄屏表格的最小宽度由内部 table-scroll 承接。 */
+.binding-card { min-width: 0; border: 1px solid var(--border); border-radius: 8px; padding: 1rem; background: var(--card-bg); }
 .binding-heading, .section-heading { display: flex; justify-content: space-between; align-items: center; gap: .8rem; }
 h3 { margin: 0; font-size: 1rem; } h4 { margin: 1.2rem 0 .65rem; font-size: .95rem; }
 .binding-heading p { margin: .2rem 0 0; }

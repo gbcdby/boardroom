@@ -140,15 +140,22 @@ export function createRuntimeSupervisor(options: {
   }
 
   async function beforeWait(item: ActiveRunner): Promise<boolean> {
+    // 到达 wait 是自有进程的安全点事实，不授予已归档/停用范围的新业务权限。
+    const view = await repo.checkFence(item.fence, { requireActiveScope: false });
     item.safe = true;
-    const view = await repo.checkFence(item.fence);
     await repo.patchRunner(item.fence, { phase: "idle" });
+    if (!await repo.isScopeActive(item.fence.bindingId)) {
+      item.readyAt = null;
+      if (view.runner.lastErrorCode === null) await repo.patchRunner(item.fence, { lastErrorCode: "scope_inactive" });
+      setImmediate(() => { void requestSafeStop(item).catch(() => log.warn("runtime_safe_stop_failed")); });
+      return false;
+    }
     const wakeable = await repo.listWakeable();
     const others = wakeable.some(w => w.memberId === item.fence.memberId && w.bindingId !== item.fence.bindingId)
       && (item.delivered || !wakeable.some(w => w.bindingId === item.fence.bindingId));
     const changed = (view.binding.requestedSnapshot !== null &&
       view.binding.requestedSnapshot.digest !== view.runner.applied?.digest) || view.binding.resetSessionRequested;
-    if (closing || view.binding.desiredState === "stopped" || changed || others ||
+    if (closing || item.stopping || view.binding.desiredState === "stopped" || changed || others ||
       item.permission !== item.preflight.expectedPermissionMode || item.failure !== null) {
       // 不在当前工具/事务中等待自身 gateway 关闭，避免等待自己的死锁。
       setImmediate(() => { void requestSafeStop(item, others).catch(() => log.warn("runtime_safe_stop_failed")); });
@@ -162,7 +169,7 @@ export function createRuntimeSupervisor(options: {
       identity: { displayName: view.runtime.name, hostType: view.runtime.backend,
         projectId: view.binding.projectId, groupId: view.binding.groupId, memberId: view.binding.memberId },
       async run(operation, fn) {
-        if (item.stopping && operation !== "observe") throw new McpToolError("CONFLICT", "托管运行正在停止");
+        if (item.stopping && operation !== "observe" && operation !== "disconnect") throw new McpToolError("CONFLICT", "托管运行正在停止");
         if ((operation === "consume" || operation === "write") && !item.joined) {
           throw new McpToolError("CONFLICT", "托管 MCP 通道尚未就绪或已断开");
         }
@@ -170,7 +177,8 @@ export function createRuntimeSupervisor(options: {
           item.permission !== item.preflight.expectedPermissionMode) {
           throw new McpToolError("FORBIDDEN", "实际权限模式尚未确认，不能处理新业务");
         }
-        return await repo.withFence(item.fence, fn, { requireRunningIntent: operation === "consume" });
+        return await repo.withFence(item.fence, fn, { requireRunningIntent: operation === "consume",
+          requireActiveScope: operation !== "disconnect" });
       },
       beforeWait: () => beforeWait(item),
       async onDelivery() {
@@ -251,6 +259,17 @@ export function createRuntimeSupervisor(options: {
   async function start(view: RuntimeBindingView): Promise<void> {
     const b = view.binding;
     if (b.desiredState !== "running" || !view.runner.exitConfirmed || view.runner.owner) return;
+    if (!await repo.isScopeActive(b.id)) {
+      // 暂停只影响资格；保留原失败原因、退避、已应用快照和显式会话。
+      if (view.runner.lastErrorCode === null) {
+        const queued = await repo.queued(b.id, "scope_inactive", view.runner.nextRetryAt);
+        await record(queued, "dispatch.queued", { reasonCode: "scope_inactive" });
+      }
+      return;
+    }
+    if (view.runner.lastErrorCode === "scope_inactive") {
+      await repo.queued(b.id, null, view.runner.nextRetryAt);
+    }
     if (view.runner.nextRetryAt && Date.parse(view.runner.nextRetryAt) > now()) return;
     if (view.runner.sessionState === "invalid" && !view.binding.resetSessionRequested) return;
     // preflight 校验下一次将取得的 generation；初始数据库行的 generation 是 0。
@@ -359,27 +378,44 @@ export function createRuntimeSupervisor(options: {
     for (const item of [...active.values()]) {
       const view = views.find(v => v.binding.id === item.fence.bindingId);
       if (!view) continue;
-      try { await repo.renew(item.fence); }
-      catch { if (item.safe) await requestSafeStop(item); continue; }
-      if (!item.ready && now() - item.startedAt >= (options.startupTimeoutMs ?? 30_000) && !item.stopping) {
-        item.failure = "startup_timeout";
-        item.stopping = true;
-        await item.gateway?.close();
-        item.child?.forceStopOwned();
-        continue;
-      }
-      if (item.ready && item.joined && item.gateway?.joined && item.failure === null && item.readyAt !== null
-        && now() - item.readyAt >= 5 * 60_000 && view.runner.attemptCount > 0) {
-        await repo.resetFailures(item.fence);
-      }
-      const others = wakeable.some(w => w.memberId === item.fence.memberId && w.bindingId !== item.fence.bindingId)
-        && (item.delivered || !wakeable.some(w => w.bindingId === item.fence.bindingId));
-      const changed = (view.binding.requestedSnapshot !== null &&
-        view.binding.requestedSnapshot.digest !== view.runner.applied?.digest) || view.binding.resetSessionRequested;
-      if (item.safe && (closing || view.binding.desiredState === "stopped" || changed || others || item.failure !== null)) {
-        await requestSafeStop(item, others);
-      } else if (item.ready && item.safe && wakeable.some(w => w.bindingId === item.fence.bindingId)) {
-        await item.gateway?.wake();
+      try {
+        try { await repo.renew(item.fence); }
+        catch { if (item.safe) await requestSafeStop(item); continue; }
+        if (!item.ready && now() - item.startedAt >= (options.startupTimeoutMs ?? 30_000) && !item.stopping) {
+          item.failure = "startup_timeout";
+          item.stopping = true;
+          await item.gateway?.close();
+          item.child?.forceStopOwned();
+          continue;
+        }
+        if (!await repo.isScopeActive(item.fence.bindingId)) {
+          item.readyAt = null;
+          if (view.runner.lastErrorCode === null) await repo.patchRunner(item.fence, { lastErrorCode: "scope_inactive" });
+          if (item.safe) await requestSafeStop(item);
+          continue;
+        }
+        if (view.runner.lastErrorCode === "scope_inactive" && item.failure === null) {
+          await repo.patchRunner(item.fence, { lastErrorCode: null });
+        }
+        if (item.ready && item.joined && item.gateway?.joined && item.failure === null && item.readyAt === null) {
+          item.readyAt = now();
+        }
+        if (item.ready && item.joined && item.gateway?.joined && item.failure === null && item.readyAt !== null
+          && now() - item.readyAt >= 5 * 60_000 && view.runner.attemptCount > 0) {
+          await repo.resetFailures(item.fence);
+        }
+        const others = wakeable.some(w => w.memberId === item.fence.memberId && w.bindingId !== item.fence.bindingId)
+          && (item.delivered || !wakeable.some(w => w.bindingId === item.fence.bindingId));
+        const changed = (view.binding.requestedSnapshot !== null &&
+          view.binding.requestedSnapshot.digest !== view.runner.applied?.digest) || view.binding.resetSessionRequested;
+        if (item.safe && (closing || view.binding.desiredState === "stopped" || changed || others || item.failure !== null)) {
+          await requestSafeStop(item, others);
+        } else if (item.ready && item.safe && wakeable.some(w => w.bindingId === item.fence.bindingId)) {
+          await item.gateway?.wake();
+        }
+      } catch {
+        // 资格可在任意 await 间改变；某个绑定失败不能饿死其他 Member 的调度。
+        log.warn("runtime_binding_reconcile_failed", { bindingId: item.fence.bindingId });
       }
     }
     if (closing) return;
@@ -390,7 +426,10 @@ export function createRuntimeSupervisor(options: {
       const by = yielded.get(b.binding.memberId) === b.binding.id && wakeable.some(w => w.memberId === b.binding.memberId && w.bindingId !== b.binding.id);
       return Number(ay) - Number(by) || (rank.get(a.binding.id) ?? "~").localeCompare(rank.get(b.binding.id) ?? "~") || a.binding.id.localeCompare(b.binding.id);
     });
-    for (const view of candidates) await start(view);
+    for (const view of candidates) {
+      try { await start(view); }
+      catch { log.warn("runtime_binding_start_failed", { bindingId: view.binding.id }); }
+    }
   }
 
   const supervisor: RuntimeSupervisor = {

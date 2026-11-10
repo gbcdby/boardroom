@@ -196,6 +196,15 @@ export function createRuntimeRepository(db: DbDriver, options: { now?: () => Dat
   }
 
   const api: RuntimeRepository = {
+    async isScopeActive(id) {
+      const view = await api.getBinding(id);
+      if (!view) return false;
+      try { await assertActive(view); return true; }
+      catch (error) {
+        if (error instanceof ArchivedError || error instanceof ConflictError && error.message === "runtime_member_inactive") return false;
+        throw error;
+      }
+    },
     async create(input) {
       const backend = validateRuntimeBackend(input?.backend);
       const name = validateRuntimeName(input?.name);

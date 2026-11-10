@@ -108,7 +108,9 @@ export function createRuntimeApi(options: {
       FROM message_deliveries d JOIN messages m ON m.id = d.message_id
       WHERE d.member_id = ? AND m.group_id = ?`, [view.binding.memberId, view.binding.groupId]))[0];
     const unknownExit = !runner.exitConfirmed && (!runner.leaseExpiresAt || Date.parse(runner.leaseExpiresAt) <= Date.now());
-    const reason = unknownExit ? "awaiting_exit" : runner.nextRetryAt && Date.parse(runner.nextRetryAt) > Date.now()
+    const scopeActive = await repo.isScopeActive(view.binding.id);
+    const reason = unknownExit ? "awaiting_exit" : !scopeActive ? "scope_inactive"
+      : runner.nextRetryAt && Date.parse(runner.nextRetryAt) > Date.now()
       ? "backoff" : runner.lastErrorCode;
     const summary = view.binding.desiredState === "stopped"
       ? runner.exitConfirmed ? "stopped" : "stopping"

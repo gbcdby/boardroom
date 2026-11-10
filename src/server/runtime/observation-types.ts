@@ -15,7 +15,7 @@ export const RUNTIME_REASON_CODES = [
   "protocol_invalid", "unknown", "configuration_invalid", "busy", "backoff",
   "consecutive_limit", "rate_limited", "stopping", "awaiting_exit", "lease_conflict",
   "schema_unverified", "usage_missing", "baseline_unknown", "cumulative_reset",
-  "partial_usage", "out_of_order", "observations_incomplete", "history_truncated",
+  "partial_usage", "out_of_order", "observations_incomplete", "history_truncated", "scope_inactive",
 ] as const;
 export type RuntimeReasonCode = (typeof RUNTIME_REASON_CODES)[number];
 

@@ -26,6 +26,7 @@ const reasonLabels: Record<string, string> = {
   resource_unavailable: "本机资源暂不可用", provider_rate_limited: "供应商暂时限流", protocol_invalid: "宿主输出不符合已验证格式",
   config_invalid: "运行配置不可用", configuration_invalid: "运行配置不可用", launch_failed: "启动失败",
   busy: "同一成员正在处理其他轮次", backoff: "正在等待重试时间", stopping: "正在等待安全点和进程退出",
+  scope_inactive: "项目或群组已归档，或成员已停用；等待恢复后再运行",
   awaiting_exit: "尚未确认上一进程退出", previous_exit_unknown: "尚未确认上一进程退出", lease_conflict: "等待运行所有权",
   runtime_previous_exit_unknown: "尚未确认上一进程退出", runtime_member_owned: "同一成员已有运行所有者",
   runtime_retry_backoff: "正在等待重试时间", consecutive_limit: "连续自动回复达到上限", rate_limited: "自动唤醒频率达到上限",
