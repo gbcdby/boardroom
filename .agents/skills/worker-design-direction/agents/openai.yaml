@@ -1,0 +1,13 @@
+interface:
+  display_name: worker-design-direction
+  short_description: 基于参考与共享规范设计美术方向、界面和组件规格，沉淀可复用决定
+  default_prompt: 使用 $worker-design-direction，沿用项目共享 Spec 和已确认设计，完成本次美术或界面规格，并按授权记录决定、复用入口与待验证项。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

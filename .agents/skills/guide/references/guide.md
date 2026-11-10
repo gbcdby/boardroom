@@ -8,7 +8,7 @@
 
 `deliver` 负责持续推进和调度，按需要选 worker。只要调查、设计或拆票时，直接说明终点；已有授权能继续时，不逐阶段重复确认。
 
-## 17 个入口怎样分工
+## 入口怎样分工
 
 协调与观察：
 
@@ -24,9 +24,11 @@
 | --- | --- |
 | `worker-investigate` | 查证问题、目标、范围与未知 |
 | `worker-design` | 行为、架构、共同约束与设计概览 |
+| `worker-design-direction` | 美术方向、界面与组件规格，已确认设计的记录和复用 |
 | `worker-plan-tickets` | 可执行 Tickets、依赖图与验收覆盖 |
 | `worker-tla` | 设计模型、TLC 检查、反例及适用假设 |
 | `worker-implement` | 指定 Ticket 的实际修改和必要自查 |
+| `worker-ui-fidelity` | 按确认基准实现或修正界面，或只读核对视觉、交互与连续动效 |
 | `worker-verify` | 指定候选与环境的真实检查证据 |
 | `worker-review` | 独立审查需求和项目标准，跟进修正 |
 | `worker-land` | PR、审查反馈、CI、冲突与授权内合并 |
@@ -44,6 +46,8 @@ Spec 始终保留设计概览、共同约束、整体验收和任务目录／依
 | 只拆任务 | “用 worker-plan-tickets 拆解这份 Spec，明确依赖和完成条件，先不执行。” |
 | 推进整份 Spec | “用 deliver 调度这份 Spec 的 Tickets，目标到合并，暂不发布。” |
 | 只做一张票 | “用 worker-implement 完成 T3，遵守 Spec 当前版本，交回候选和检查证据。” |
+| 改进界面设计 | “用 worker-design-direction 看现有界面和参考，提出两项优先改进，先不写代码。” |
+| 对照设计验收 | “用 worker-ui-fidelity 对照确认图检查当前页面，先不修改，分别说明视觉和交互结果。” |
 
 不使用 Boardroom 时，可用 GitHub Issues 或项目已有 tracker 保存 Spec、Tickets 和依赖。使用房间时，可让 Boardroom 负责协作、GitHub 保存权威记录；未来原生 Spec／任务板实际可用后再选择切换。每类事实只有一个权威来源，房间消息引用它。
 

@@ -1,6 +1,6 @@
 {
   "schema_version": "work-suite/v1",
-  "suite_version": "0.4.2",
+  "suite_version": "0.4.3",
   "result_contract": "work-result/v1",
   "first_testbed": "boardroom",
   "independent_formal_skill": "worker-tla",
@@ -13,7 +13,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "f972cf28c6181fe9ce3721cad61a24955f255ca5bd4f701a7467080c3a6a78d8"
+          "sha256": "af1b848aaa5ed0896417daa04301f2c929e581a6a9e27706cfe8877002443be7"
         },
         {
           "path": "agents/openai.yaml",
@@ -598,11 +598,11 @@
         },
         {
           "path": "assets/icon.svg",
-          "sha256": "9be88f8dd4c5e658961515c71389eafd45142ffa68bcae58e8dcff57d178ed91"
+          "sha256": "d80a4c3e0fd2efa7af88433a53b25a92c78a644175c6669dd78fee50fb53acf6"
         },
         {
           "path": "references/guide.md",
-          "sha256": "308e125d807bd4ebd5e6a46723a0b61fa14f40453b89a3b73647c50aca0668c6"
+          "sha256": "3422a6a80827ca1c1fe9637bac77babc025a5a0c071a338a040680843ac461bf"
         },
         {
           "path": "references/result-contract.md",
@@ -634,6 +634,244 @@
         {
           "path": "assets/plan.template.md",
           "sha256": "c2b1d6279095075b95a4373c00e98cdb44adde28c594c351a5cab24d5995609a"
+        }
+      ]
+    },
+    {
+      "name": "worker-design-direction",
+      "path": ".agents/skills/worker-design-direction",
+      "invocation": "implicit-or-explicit",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "f961ce9e8dfb5bab82473425c47ac84de1a362eac90682fda9ae12647e12fac1"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "1861474e10ea416cd0c068b2ea6fa2f22e61ec889ef4f98bbe3e81cebb33bd94"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "49315dda7125ec5fc77ef5f2b96126d8b2121c6e72944b4702972e90f321d3ee"
+        },
+        {
+          "path": "assets/learning-template/README.md",
+          "sha256": "6f514762c93e56629c036c7625ffec5a22117e2e600335eb44b2463137b5fac7"
+        },
+        {
+          "path": "assets/learning-template/context.md",
+          "sha256": "d9cc101eb36fb8af61197f96c5b7093f1c103d6abccd7b991a5bbd1053060434"
+        },
+        {
+          "path": "assets/learning-template/decisions.md",
+          "sha256": "3542998ab8ca969cd4c1f140c50b79b6851b72f50755442a05fec3a35f76c5e3"
+        },
+        {
+          "path": "assets/learning-template/preferences.md",
+          "sha256": "3808aa7a036314c3079bb28c19c826d33b7791ddb1b4af72eea9f2d123c2e21d"
+        },
+        {
+          "path": "assets/project-template/README.md",
+          "sha256": "fa947d3f69df0efced9580762b9a59fcc02e3a6b233cdf6e95d920914307291e"
+        },
+        {
+          "path": "assets/project-template/brief.md",
+          "sha256": "25a0536d745c1314fe0db0c8b05507eb06481e8a9eb7e6d60516b76dc0e3045a"
+        },
+        {
+          "path": "assets/project-template/guidelines/characters.md",
+          "sha256": "aea4328aef3dbc6dad1d5dd1bbbdb003eb9771110bd90a136ea24c4f04dada1b"
+        },
+        {
+          "path": "assets/project-template/guidelines/color.md",
+          "sha256": "8f7ec0ddee2f1fae095ca5d12513e575625fdc2c7c665a04f470832bfe2ba6b7"
+        },
+        {
+          "path": "assets/project-template/guidelines/consistency.md",
+          "sha256": "e761cfd805bdefc8e660b105cb37a71c73d569869f3b6427107ba508b0be1d5b"
+        },
+        {
+          "path": "assets/project-template/guidelines/environments.md",
+          "sha256": "feee0d6ea83d60a669f8a6ae94698e1f784a83f315af54c9e05713b9b9e549dc"
+        },
+        {
+          "path": "assets/project-template/guidelines/motion.md",
+          "sha256": "062140399274e4a9fd45204169307e85ccb0d5c9dd7923299ef3b1dc3631efdc"
+        },
+        {
+          "path": "assets/project-template/guidelines/overview.md",
+          "sha256": "79330449ef55b00290a9f4f6b09d3c1f9389ee1aec4971e212e911ca0df362c3"
+        },
+        {
+          "path": "assets/project-template/guidelines/ui-visual.md",
+          "sha256": "77dab5e9799cad705836ca6d1763f2c41dc7b3726798a6b90644f9d1eac1eeff"
+        },
+        {
+          "path": "assets/project-template/project.json",
+          "sha256": "46f4fe47ca0bd3b6e844126994e3dbf03349b95399dadb8e49e0051f77ac204b"
+        },
+        {
+          "path": "assets/project-template/references/catalog.md",
+          "sha256": "8c8cbc94afd33b872df0a276682c0991a46674634600eb4945ec2f1519be715a"
+        },
+        {
+          "path": "assets/project-template/references/manifest.json",
+          "sha256": "e704c1b9994bf27e474a86362fa20d0a4980489dbbb3c3a9fa3cc992989c11b0"
+        },
+        {
+          "path": "assets/validation-template/color-evaluation.md",
+          "sha256": "359a87e6a969fbc6f2d948174b548b393a5ad02a79e55bcee6ab2a11c266d89a"
+        },
+        {
+          "path": "assets/validation-template/design-decision.md",
+          "sha256": "d9c7ed3cea1e1932ceee21094493711ecf4268df5138c418afc064ab83d18ca3"
+        },
+        {
+          "path": "assets/validation-template/style-review.md",
+          "sha256": "3b1fe4b17fca01b76d1bd962d41708e025686690ce0d21f1f27c39dda809cdbc"
+        },
+        {
+          "path": "assets/validation-template/visual-experiment.md",
+          "sha256": "71ebb58a4eac297b43cc204e732deda006360eb44eb850e0374576b0728f9453"
+        },
+        {
+          "path": "references/color-material.md",
+          "sha256": "5302d32057d444e1b02ad4d35178864ddecc6398972f637e2877486f507d972b"
+        },
+        {
+          "path": "references/color-systems.md",
+          "sha256": "8ed27e28f1057917e0e8760ba350239eb17d73a58cfe0de0e5f4bbd493badf5f"
+        },
+        {
+          "path": "references/evaluation-lab.md",
+          "sha256": "bf185c8064bcda1389bfdc999a0794d3064f33383f18dffac09890bec432324a"
+        },
+        {
+          "path": "references/game-case-index.json",
+          "sha256": "a850030b2b120081c56aca2464dcab29a885383afd00ab205a533e716fa0c563"
+        },
+        {
+          "path": "references/game-case-library.md",
+          "sha256": "ce9c7cf96e303dc927fb27317738c33df6519758a6d6b2ccee1e28539c1676b3"
+        },
+        {
+          "path": "references/game-ui-ux-patterns.md",
+          "sha256": "3d9f7f0e645530c5100615e2f7f54b4559332a35d2e516667a915af8c61a63bb"
+        },
+        {
+          "path": "references/interface-design.md",
+          "sha256": "ecdaf81e68775fd289fe3b153891853ff3a3b5184423e1ee887e011eecacca53"
+        },
+        {
+          "path": "references/interface-validation.md",
+          "sha256": "9fb4862bbf09d119705ac3fe4cb34e33e2d12231b67c6c8dba9077c946789a5f"
+        },
+        {
+          "path": "references/iteration.md",
+          "sha256": "795d4f22fbcfa1100d24193d2aca1e923859d378167ef26af5343d80bebbfea8"
+        },
+        {
+          "path": "references/project-layout.md",
+          "sha256": "6a81a884a47837ec515c8bd45148a79a5be7f46d3735c83834e8fabf3ddda391"
+        },
+        {
+          "path": "references/project-learning.md",
+          "sha256": "c30fef95f54452ac3952e14494bbee4abdf876974f739c6786161a497895e786"
+        },
+        {
+          "path": "references/reference-analysis.md",
+          "sha256": "84d0426dc373b678609c9df4bd5668e990e6a1270cabf7f13b25e37ce04e3ef2"
+        },
+        {
+          "path": "references/ui-ux-decision-playbook.md",
+          "sha256": "c874d1b094d56f546d87081fb1a0be199aa64d00418893eed5f0b37f6da3d490"
+        },
+        {
+          "path": "references/validation.md",
+          "sha256": "c0b19db9c2aeab1dc391968659d1d0630747f0650bfbc3bfb142c19e6a653b5b"
+        },
+        {
+          "path": "references/visual-grammar.md",
+          "sha256": "e264270a2bbc26d86e99863e6ce8cfde2805ddeebedaed2643a3dfb47af1530f"
+        },
+        {
+          "path": "references/visual-ux.md",
+          "sha256": "c1e5569cd16cdbe8eb8c01c70b9f96fae0569edf9e28c8c66acd5caacd2fcdbc"
+        },
+        {
+          "path": "scripts/art_direction.py",
+          "sha256": "5f35db91f607483b4f36e271aef46e94fe3ccdbe7d9c89ff7ede91f667ea4cfa"
+        },
+        {
+          "path": "scripts/color_check.py",
+          "sha256": "5313190920d3b43b0daf1f32f54df1be3a3d441915ecd34d6eeef71de131a1e5"
+        },
+        {
+          "path": "tests/test_workflows.py",
+          "sha256": "95ce4a8bfde31f195d5bac1cefa94816a06650c88bc831579bd481adb37043b8"
+        }
+      ]
+    },
+    {
+      "name": "worker-ui-fidelity",
+      "path": ".agents/skills/worker-ui-fidelity",
+      "invocation": "implicit-or-explicit",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sha256": "d0e16c70eb47fa6e83337f8ed3432260b3e0d01c6b5840624e8ae2ed88c5622b"
+        },
+        {
+          "path": "agents/openai.yaml",
+          "sha256": "a94dd6f002e2a266f1ebecdab3238fa10d2473610f6a1aef2f8cd0c0b6c0f53c"
+        },
+        {
+          "path": "assets/fidelity-record.md",
+          "sha256": "e82c5587bf71dc58c88acda79bd179b6b12da3fad1d575224440336b2e459701"
+        },
+        {
+          "path": "assets/icon.svg",
+          "sha256": "fbb6c7314886573cd56c3f86884a65afe3b5f4ce4bf1ee6baeeeb1fa50aea7a4"
+        },
+        {
+          "path": "references/acceptance-checklist.md",
+          "sha256": "296baf3646a8f86ae82327cf1c87421861614bd0aa6f301cc06c0a7fe1cb29b7"
+        },
+        {
+          "path": "references/comparison.md",
+          "sha256": "a08d9792b77460679ac68d4391c83afa47082d4a785329aec79e64cc6d929607"
+        },
+        {
+          "path": "references/evidence-bundle.md",
+          "sha256": "1c73bed4263ed1bda5d4a15cf3ccb3d8fd49be96d7aa4609e94bcff47f07aecc"
+        },
+        {
+          "path": "references/motion-validation.md",
+          "sha256": "8aedaded17dcef3dfd2365794ece6db0b6ecfafca155dde1eb9ddef1818672fc"
+        },
+        {
+          "path": "scripts/compare_screenshots.py",
+          "sha256": "e6eaa3efdae19e5cceb1d298333a3a26a84fbdb6e76a9c7b27b5a18805420b8a"
+        },
+        {
+          "path": "scripts/visual_review_bundle.py",
+          "sha256": "d6a4f495342c64894abeeaa532103c537ce7c9f151eb509d2626080eb5af2b4a"
+        },
+        {
+          "path": "scripts/visual_review_gallery.py",
+          "sha256": "b7c861a07e844eba1bde4e74abb79944bb94d3b13e5f37c1db5bcdbd3613cdd4"
+        },
+        {
+          "path": "tests/test_compare_screenshots.py",
+          "sha256": "fd07c716dc5a5d1c5f3507418afba76c4b41bdf4965084fecf95ab9b76578d27"
+        },
+        {
+          "path": "tests/test_visual_review_bundle.py",
+          "sha256": "742994889a2c650d90470b4e41c457099e16d39e185124f4d2008017fa022070"
+        },
+        {
+          "path": "tests/test_visual_review_gallery.py",
+          "sha256": "9f42975d8d599240812abdd34c1ed48f62af0a9fb3afdb9817ba3e74f1d8e184"
         }
       ]
     }

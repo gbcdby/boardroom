@@ -23,9 +23,11 @@ description: 跨项目、跨语言的交付总控。用于一份或多份 Spec�
 | --- | --- |
 | 查明问题、事实与范围 | `worker-investigate` |
 | 明确行为、接口与架构 | `worker-design` |
+| 确定视觉方向、界面与组件规格 | `worker-design-direction` |
 | 把 Spec 拆成 Tickets，检查依赖与验收覆盖 | `worker-plan-tickets` |
 | 检查值得建模的并发、重试或恢复设计 | `worker-tla` |
 | 实现获分配的 Ticket，修正候选或集成改动 | `worker-implement` |
+| 按设计基准实现、修正或核对界面，检查连续动效 | `worker-ui-fidelity`；按任务区分修改与只读验收 |
 | 为指定候选取得运行与验收证据 | `worker-verify` |
 | 独立检查需求满足与项目标准 | `worker-review` |
 | 推进 PR、反馈、CI 与授权内合并 | `worker-land` |

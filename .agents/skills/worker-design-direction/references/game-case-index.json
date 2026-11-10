@@ -1,0 +1,397 @@
+{
+  "source_study": "20-game-ui-ux-study.html",
+  "original_review_date": "2026-10-22",
+  "packaging_date": "2026-10-23",
+  "source_visual_assets_not_redistributed": true,
+  "cases": [
+    {
+      "id": "GAME01",
+      "title": "Monument Valley 2 · 纪念碑谷 2",
+      "evidence_scope": "ustwo 项目页中第二代介绍与 1 张明确标注为第二代的官方场景图；没有体验完整关卡。",
+      "limits": "官方场景图不是完整 HUD 审计；不能以它证明复杂养成首页也应无标签、无数字。",
+      "patterns": [
+        "GP01",
+        "GP02",
+        "GP03"
+      ],
+      "reviewed_visual_count": 1,
+      "sources": [
+        {
+          "label": "ustwo · Monument Valley 项目说明",
+          "url": "https://ustwo.com/work/monument-valley/"
+        }
+      ]
+    },
+    {
+      "id": "GAME02",
+      "title": "Alto’s Odyssey · 阿尔托的奥德赛",
+      "evidence_scope": "2018 官方媒体包的 Description、Features、Zen Mode 与 2 张原尺寸截图；未播放 GIF、未测试触控。",
+      "limits": "只要业务存在真实截止与消耗，就不能借 Zen Mode 隐藏必要事实；不要把一次触控当作所有功能只能一步完成。",
+      "patterns": [
+        "GP03",
+        "GP04",
+        "GP12"
+      ],
+      "reviewed_visual_count": 2,
+      "sources": [
+        {
+          "label": "Alto’s Odyssey · Press Kit",
+          "url": "https://altosodyssey.com/press/"
+        }
+      ]
+    },
+    {
+      "id": "GAME03",
+      "title": "Prune",
+      "evidence_scope": "官方网站截图及官方支持页 How do I play / How do I win；2 图均查看。",
+      "limits": "剪枝适合空间操作；精确数量分配还需要数字输入或快捷选择，不能只靠自由划动。",
+      "patterns": [
+        "GP04",
+        "GP05",
+        "GP10"
+      ],
+      "reviewed_visual_count": 2,
+      "sources": [
+        {
+          "label": "Prune · 官方网站",
+          "url": "https://prunegame.com/"
+        },
+        {
+          "label": "Prune · Support",
+          "url": "https://prunegame.com/support"
+        }
+      ]
+    },
+    {
+      "id": "GAME04",
+      "title": "Gorogoa · 画中世界",
+      "evidence_scope": "发行商游戏说明与 2 张官方四格画面；没有执行谜题组合。",
+      "limits": "探索性重排是谜题的一部分，固定高频入口不应为了惊喜频繁换位。",
+      "patterns": [
+        "GP03",
+        "GP06",
+        "GP11"
+      ],
+      "reviewed_visual_count": 2,
+      "sources": [
+        {
+          "label": "Annapurna · Gorogoa",
+          "url": "https://www.annapurna.com/interactive/gorogoa"
+        },
+        {
+          "label": "Annapurna · Gorogoa 官方画廊",
+          "url": "https://annapurnainteractive.com/en/games/gorogoa"
+        }
+      ]
+    },
+    {
+      "id": "GAME05",
+      "title": "Florence",
+      "evidence_scope": "发行商正文与 4 张配图，包括标题图、叙事画面和内嵌手机操作画面；未逐章试玩。",
+      "limits": "一次性叙事互动不等于每天提交都该加入新手势、拼图或长演出。",
+      "patterns": [
+        "GP04",
+        "GP05",
+        "GP12"
+      ],
+      "reviewed_visual_count": 4,
+      "sources": [
+        {
+          "label": "Annapurna · Florence",
+          "url": "https://annapurnainteractive.com/en/games/florence"
+        }
+      ]
+    },
+    {
+      "id": "GAME06",
+      "title": "GRIS",
+      "evidence_scope": "开发商介绍与 3 张官方场景截图，含红粉、灰蓝粉橙和深蓝场景；未体验整段能力解锁。",
+      "limits": "氛围场景可以少字，但精确的消耗、进度与错误不能靠颜色叙事表达。",
+      "patterns": [
+        "GP02",
+        "GP03",
+        "GP12"
+      ],
+      "reviewed_visual_count": 3,
+      "sources": [
+        {
+          "label": "Nomada Studio · GRIS",
+          "url": "https://nomada.studio/gris-game/"
+        }
+      ]
+    },
+    {
+      "id": "GAME07",
+      "title": "Sky: Children of the Light · 光·遇",
+      "evidence_scope": "2020 年开发者访谈全文相关段落与 2 张场景配图；未测试当前版本的社交树或手势。",
+      "limits": "2020 年案例不是当前完整操作规范；合作目标也不能变成强迫社交或靠内疚促活。",
+      "patterns": [
+        "GP02",
+        "GP10",
+        "GP12"
+      ],
+      "reviewed_visual_count": 2,
+      "sources": [
+        {
+          "label": "Behind the Design: Sky: Children of the Light",
+          "url": "https://developer.apple.com/news/?id=zm47it7t"
+        }
+      ]
+    },
+    {
+      "id": "GAME08",
+      "title": "Spiritfarer · 灵魂摆渡人",
+      "evidence_scope": "开发商游戏页、创意总监介绍，以及 2 张建造／获取反馈画面。",
+      "limits": "不要照搬横屏侧栏宽度，也不能把绿色预览当作所有项目已具备合法性校验。",
+      "patterns": [
+        "GP01",
+        "GP05",
+        "GP07"
+      ],
+      "reviewed_visual_count": 2,
+      "sources": [
+        {
+          "label": "Thunder Lotus · Spiritfarer",
+          "url": "https://thunderlotusgames.com/games/spiritfarer/"
+        },
+        {
+          "label": "Spiritfarer, A Cozy Management Game About Dying",
+          "url": "https://blog.playstation.com/2019/06/09/spiritfarer-a-cozy-management-game-about-dying-comes-to-ps4-next-year/"
+        }
+      ]
+    },
+    {
+      "id": "GAME09",
+      "title": "Dordogne",
+      "evidence_scope": "发行商发布文章、官网画廊中的 3 张图，含实际拍摄工具界面；未查看完整收集册流程。",
+      "limits": "不把照片、录音或收集册机制自动添加为目标项目的新功能；也不把浓水彩直接铺到小字后面。",
+      "patterns": [
+        "GP02",
+        "GP03",
+        "GP06"
+      ],
+      "reviewed_visual_count": 3,
+      "sources": [
+        {
+          "label": "Focus · Dordogne 官方画廊",
+          "url": "https://www.focus-entmt.com/en/games/dordogne"
+        },
+        {
+          "label": "Your journey in Dordogne starts on June 13",
+          "url": "https://www.focus-entmt.com/en/news/your-journey-in-dordogne-starts-on-june-13"
+        }
+      ]
+    },
+    {
+      "id": "GAME10",
+      "title": "Unpacking",
+      "evidence_scope": "官网介绍、完整 Accessibility 分区和 2 张图；正文经公开 HTML 取得，网页阅读器超时。",
+      "limits": "案例中的“任意摆放”不能变成资源和网络校验随意通过；设备支持分别核对。",
+      "patterns": [
+        "GP04",
+        "GP10",
+        "GP12"
+      ],
+      "reviewed_visual_count": 2,
+      "sources": [
+        {
+          "label": "Witch Beam · Unpacking",
+          "url": "https://www.unpackinggame.com/"
+        }
+      ]
+    },
+    {
+      "id": "GAME11",
+      "title": "Townscaper",
+      "evidence_scope": "发行商页面与 2 张官方城镇图；没有实际使用浏览器试玩。",
+      "limits": "自动补全适合有清楚限制的构造；装备或资源不能静默代玩家作有代价决定。",
+      "patterns": [
+        "GP03",
+        "GP04",
+        "GP09"
+      ],
+      "reviewed_visual_count": 2,
+      "sources": [
+        {
+          "label": "Raw Fury · Townscaper",
+          "url": "https://rawfury.com/games/townscaper/"
+        }
+      ]
+    },
+    {
+      "id": "GAME12",
+      "title": "Dorfromantik",
+      "evidence_scope": "开发商官网和 Presskit 的描述、Features；2 张官方游玩／教程选择画面。",
+      "limits": "不将无限创作模式变成所有游戏都应取消目标；静帧不能证明放置预览与撤销的完整规则。",
+      "patterns": [
+        "GP06",
+        "GP11",
+        "GP12"
+      ],
+      "reviewed_visual_count": 2,
+      "sources": [
+        {
+          "label": "Toukana · Dorfromantik Presskit",
+          "url": "https://www.toukana.com/dorfromantik/presskit"
+        }
+      ]
+    },
+    {
+      "id": "GAME13",
+      "title": "Terra Nil",
+      "evidence_scope": "发行商 Steam 页 About This Game 及 2 张截图；商店图可能反映更新版本，不虚构同一局时间序列。",
+      "limits": "生态恢复没有证明目标项目的进度按同一算法计算；温湿度指标也不是所有游戏应有的组件。",
+      "patterns": [
+        "GP01",
+        "GP05",
+        "GP08"
+      ],
+      "reviewed_visual_count": 2,
+      "sources": [
+        {
+          "label": "Terra Nil · 发行商 Steam 商店页",
+          "url": "https://store.steampowered.com/app/1593030/Terra_Nil/"
+        }
+      ]
+    },
+    {
+      "id": "GAME14",
+      "title": "TUNIC",
+      "evidence_scope": "主创说明书文章、官方发行信息与 3 张场景／手册局部；文章原图两次访问失败，改选另一公开官方画廊的不同图。",
+      "limits": "费用、提交结果、授权状态和恢复动作必须直白；不能把谜语式说明推广为通用 UX。",
+      "patterns": [
+        "GP02",
+        "GP11"
+      ],
+      "reviewed_visual_count": 3,
+      "sources": [
+        {
+          "label": "The creation of Tunic’s invaluable in-game manual",
+          "url": "https://blog.playstation.com/?p=370009"
+        },
+        {
+          "label": "PlayStation · TUNIC",
+          "url": "https://www.playstation.com/en-us/games/tunic/"
+        }
+      ]
+    },
+    {
+      "id": "GAME15",
+      "title": "Hades",
+      "evidence_scope": "开发商页面、2019 年 Beefy Update 正文和 3 张官方历史截图，图内版本为 V0.23698 / V0.19569；不代表当前发行版全界面。",
+      "limits": "高频爆闪和红色暗角服务战斗压力，不作为治愈首页的成功标准。",
+      "patterns": [
+        "GP01",
+        "GP03",
+        "GP05"
+      ],
+      "reviewed_visual_count": 3,
+      "sources": [
+        {
+          "label": "Supergiant · Hades 官方页面与历史画廊",
+          "url": "https://www.supergiantgames.com/games/hades/"
+        },
+        {
+          "label": "Get Pumped for The Beefy Update",
+          "url": "https://www.supergiantgames.com/blog/get-pumped-for-the-beefy-update/"
+        }
+      ]
+    },
+    {
+      "id": "GAME16",
+      "title": "Persona 5 Royal · 女神异闻录 5 皇家版",
+      "evidence_scope": "PlayStation 官方 2020 标记图 3 张，含演出、日常与对话；Atlus 页面不可读，不声称看过操作手册。",
+      "limits": "没有看过的菜单动画不评价其效率；也不将红黑、锐角和手柄键位迁移到不同题材和输入方式的产品。",
+      "patterns": [
+        "GP02",
+        "GP03",
+        "GP06"
+      ],
+      "reviewed_visual_count": 3,
+      "sources": [
+        {
+          "label": "PlayStation · Persona 5 Royal",
+          "url": "https://www.playstation.com/en-us/games/persona-5-royal/"
+        }
+      ]
+    },
+    {
+      "id": "GAME17",
+      "title": "Hearthstone · 炉石传说",
+      "evidence_scope": "2019 年开发者 Smart Deck Builder 文章和 2 张文章配图；第一张为牌组前后合成图，第二张为概念插图。",
+      "limits": "“能组出”不等于“最优”，推荐也不应成为静默消耗、自动换装或强制购买。",
+      "patterns": [
+        "GP07",
+        "GP09"
+      ],
+      "reviewed_visual_count": 2,
+      "sources": [
+        {
+          "label": "Developer Insights: Smart Deck Builder",
+          "url": "https://news.blizzard.com/en-gb/article/22938500/developer-insights-smart-deck-builder"
+        }
+      ]
+    },
+    {
+      "id": "GAME18",
+      "title": "Genshin Impact · 原神（4.5 养成指引）",
+      "evidence_scope": "HoYoverse 开发者 2024 年 4.5 介绍；3 份图片，其中天赋界面两份仅分辨率不同，另有养成指引界面。",
+      "limits": "热门使用不是对每个玩家都最优；截图里的类别和数值不能变成目标游戏的属性或装备规则。",
+      "patterns": [
+        "GP07",
+        "GP08",
+        "GP09",
+        "GP11"
+      ],
+      "reviewed_visual_count": 3,
+      "sources": [
+        {
+          "label": "Genshin Impact Version 4.5 · Character Enhancement",
+          "url": "https://blog.playstation.com/2024/03/05/20230306-genshinimpact/"
+        }
+      ]
+    },
+    {
+      "id": "GAME19",
+      "title": "Dead Space（2023 画面与系列历史 UI）",
+      "evidence_scope": "2023 重制版官方 2 图；补读 Dead Space 3 的官方手册 HUD/RIG 段落作历史机制依据，不把该手册当作重制版合同。",
+      "limits": "沉浸式显示并非总比固定面板好；历史不暂停背包的规则不迁移到目标项目的分配确认窗。",
+      "patterns": [
+        "GP02",
+        "GP05",
+        "GP06"
+      ],
+      "reviewed_visual_count": 2,
+      "sources": [
+        {
+          "label": "PlayStation · Dead Space (2023)",
+          "url": "https://www.playstation.com/en-za/games/dead-space/"
+        },
+        {
+          "label": "Dead Space 3 · Xbox 360 官方手册",
+          "url": "https://eaassets-a.akamaihd.net/eahelp/manuals/dead-space-3-manuals_Microsoft%20XBOX360.pdf"
+        }
+      ]
+    },
+    {
+      "id": "GAME20",
+      "title": "stitch.",
+      "evidence_scope": "2023 年 Apple 开发者访谈与 1 张含两个手机画面的官方配图；不是当前全部设置审计。",
+      "limits": "不能从宣传合成图推算真实触控尺寸或宣称已达到对比度标准；数字边缘仍需目标设备检查。",
+      "patterns": [
+        "GP02",
+        "GP03",
+        "GP10"
+      ],
+      "reviewed_visual_count": 1,
+      "sources": [
+        {
+          "label": "Behind the Design: stitch.",
+          "url": "https://developer.apple.com/news/?id=mc4d1ufa"
+        }
+      ]
+    }
+  ],
+  "details": "game-case-library.md",
+  "evidence_note": "原上传包的历史研究索引；原报告及视觉原件未随包提供，采用前按需要复核来源。"
+}
