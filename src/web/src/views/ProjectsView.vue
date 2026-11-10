@@ -549,7 +549,7 @@ onMounted(() => void loadProjects());
           <div v-if="groups.length === 0 && !loadingProject" class="empty-state compact-empty"><p>暂无群组。创建一个群组，把相关讨论放在一起。</p></div>
           <ul v-else class="group-list" data-testid="group-list">
             <li v-for="group in groups" :key="group.id" class="group-item">
-              <div class="group-heading"><strong>{{ group.name }}</strong><span v-if="group.archivedAt" class="badge" data-testid="group-archived-badge">已归档</span><span v-if="group.writable === false" class="badge" data-testid="group-readonly-badge">只读可见</span></div>
+              <div class="group-heading"><strong>{{ group.name }}</strong><span v-if="group.archivedAt" class="badge" data-testid="group-archived-badge">已归档</span><span v-if="group.writable === false && !(participants[group.id] ?? []).some(m => m.kind === 'human' && m.status === 'active')" class="badge" data-testid="group-readonly-badge">只读可见</span></div>
               <p class="small muted group-participants">参与者：{{ participantNames(group.id) }}</p>
               <div class="actions group-links"><RouterLink :to="{ path: '/chat', query: { projectId: group.projectId, groupId: group.id } }">进入群聊 <span aria-hidden="true">↗</span></RouterLink><RouterLink :to="{ path: '/runtimes', query: { projectId: group.projectId, groupId: group.id } }">托管 Agent</RouterLink></div>
               <details class="group-management" data-testid="group-management">

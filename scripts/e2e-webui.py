@@ -73,6 +73,8 @@ def exercise(page, origin, records, output, report, capture_only):
                 page.get_by_test_id("project-list").get_by_role("button", name=records[0]["project"]["name"], exact=True).click()
             if name in ("org", "audit", "projects"):
                 page.wait_for_timeout(250)
+            if name == "projects" and not capture_only:
+                expect(page.get_by_test_id("group-readonly-badge")).to_have_count(0)
             key = f"{name}-{width}-{theme}"
             report["layouts"].append(layout(page, key, strict=not capture_only))
             page.screenshot(path=str(output / f"{key}.png"), full_page=True, animations="disabled")
@@ -226,6 +228,8 @@ def exercise(page, origin, records, output, report, capture_only):
     page.get_by_test_id("audit-project-select").select_option(project_id)
     page.get_by_test_id("audit-revoke").first.click()
     expect(page.get_by_test_id("audit-notice")).to_contain_text("已撤销")
+    nodes = request(page, origin, "GET", f"/api/projects/{project_id}/org")["nodes"]
+    assert any(node["name"] == "项目统筹" and node["parentId"] is None for node in nodes), "岗位改名没有被真正撤销"
     report["checks"].append("UI-05: 组织按需编辑、实际改名与审计撤销")
     assert not errors, f"页面JavaScript错误: {errors}"
     report["status"] = "PASS"
