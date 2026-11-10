@@ -4,6 +4,8 @@
  * 让既有 repository/HTTP/MCP 调用点在 M1 迁移前保持不变。
  */
 import type Database from "better-sqlite3";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { OperationQueue } from "../operation-queue.ts";
 import { openDatabase } from "../database.ts";
 import {
   readMigrationState,
@@ -27,6 +29,13 @@ export class SqliteDriver implements DbDriver {
   private opened: { db: Database.Database; file: string } | null = null;
   /** SAVEPOINT 计数器：用于嵌套事务（事务内再开事务，#61）。 */
   private spCounter = 0;
+  private readonly transactionScope = new AsyncLocalStorage<OperationQueue>();
+  private readonly operations = new OperationQueue();
+
+  /** 单连接顶层操作排队；只有同一异步调用链中的操作才属于嵌套事务。 */
+  private serialize<T>(operation: () => Promise<T>): Promise<T> {
+    return (this.transactionScope.getStore() ?? this.operations).run(operation);
+  }
 
   constructor(options: SqliteDriverOptions) {
     this.dataDir = options.dataDir;
@@ -64,43 +73,57 @@ export class SqliteDriver implements DbDriver {
   }
 
   async query<T extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []): Promise<T[]> {
-    return this.handle.prepare(sql).all(...params) as T[];
+    return this.serialize(async () => this.handle.prepare(sql).all(...params) as T[]);
   }
 
   async exec(sql: string, params: readonly unknown[] = []): Promise<number> {
-    if (params.length === 0) {
-      this.handle.exec(sql);
-      return 0;
-    }
-    return this.handle.prepare(sql).run(...params).changes;
+    return this.serialize(async () => {
+      if (params.length === 0) {
+        this.handle.exec(sql);
+        return 0;
+      }
+      return this.handle.prepare(sql).run(...params).changes;
+    });
   }
 
   async transaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T> {
+    const parent = this.transactionScope.getStore();
+    return this.serialize(() => this.runTransaction(fn, parent));
+  }
+
+  private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, parent?: OperationQueue): Promise<T> {
     const db = this.handle;
+    const nested = parent !== undefined;
+    const scope = new OperationQueue(parent);
+    const enqueue = <R>(operation: () => Promise<R>): Promise<R> => {
+      const current = this.transactionScope.getStore();
+      return (current?.isWithin(scope) ? current : scope).run(operation);
+    };
     const tx: DbTransaction = {
       query: async <R extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []) =>
-        db.prepare(sql).all(...params) as R[],
+        enqueue(async () => db.prepare(sql).all(...params) as R[]),
       // 事务内 exec：返回影响行数，与 SQLite `changes` 对齐（#61）。
-      exec: async (sql, params: readonly unknown[] = []) => {
+      exec: async (sql, params: readonly unknown[] = []) => enqueue(async () => {
         if (params.length === 0) {
           db.exec(sql);
           return 0;
         }
         return db.prepare(sql).run(...params).changes;
-      },
+      }),
     };
     // 嵌套事务（事务内再开事务，#61）用 SAVEPOINT 实现，回滚时只回到保存点，
     // 不影响外层；非嵌套走阶段 1 的 BEGIN IMMEDIATE 语义。
-    const nested = db.inTransaction;
     const sp = nested ? `s${++this.spCounter}` : null;
     if (nested) db.exec(`SAVEPOINT ${sp}`);
     else db.exec(this.dialect.beginTransaction());
     try {
-      const result = await fn(tx);
+      const result = await this.transactionScope.run(scope, () => fn(tx));
+      await scope.drain();
       if (nested) db.exec(`RELEASE SAVEPOINT ${sp}`);
       else db.exec(this.dialect.commit());
       return result;
     } catch (error) {
+      await scope.drain();
       try {
         if (nested) {
           db.exec(`ROLLBACK TO SAVEPOINT ${sp}`);
@@ -112,14 +135,16 @@ export class SqliteDriver implements DbDriver {
         // 事务可能已因错误终止，回滚语句本身失败时保留原始错误。
       }
       throw error;
+    } finally {
+      scope.close();
     }
   }
 
   async close(): Promise<void> {
-    if (this.opened !== null && this.opened.db.open) {
-      this.opened.db.close();
-    }
-    this.opened = null;
+    await this.serialize(async () => {
+      if (this.opened !== null && this.opened.db.open) this.opened.db.close();
+      this.opened = null;
+    });
   }
 }
 

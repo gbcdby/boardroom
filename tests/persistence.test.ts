@@ -89,13 +89,19 @@ test("WAL 模式：读写并发下写入不阻塞读取", async () => {
       const repos = createRepositories(driver);
       const project = (await ((await (repos.projects.create({ name: "P" })))));
 
-      // 同一进程内开启一个写事务，期间读取另一路径仍可完成（WAL 读不阻塞）。
-      db.exec("BEGIN IMMEDIATE");
-      (await ((await (repos.members.create({ projectId: project.id, kind: "human", displayName: "写入中" })))));
-      // 在写事务未提交时，回滚点外读取应能看到旧快照而不报 SQLITE_BUSY。
-      const during = (await ((await (repos.projects.list()))));
-      assert.ok(during.some((p) => p.id === project.id));
-      db.exec("ROLLBACK");
+      // 独立连接才验证 WAL 的旧快照读取；同一连接手写 BEGIN 会绕过异步事务所有权。
+      const reader = new SqliteDriver({ dataDir: dir });
+      await reader.connect();
+      try {
+        const readRepos = createRepositories(reader);
+        await assert.rejects(repos.transaction(async () => {
+          await repos.members.create({ projectId: project.id, kind: "human", displayName: "写入中" });
+          const during = await readRepos.projects.list();
+          assert.ok(during.some((p) => p.id === project.id));
+          assert.equal((await readRepos.members.listByProject(project.id)).length, 0, "独立读连接不能看到未提交成员");
+          throw new Error("wal-rollback");
+        }), /wal-rollback/);
+      } finally { await reader.close(); }
 
       // 回滚后成员写入应被撤销。
       assert.equal((await ((await (repos.members.listByProject(project.id))))).length, 0);

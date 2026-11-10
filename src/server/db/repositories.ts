@@ -1,4 +1,5 @@
 import type { DbDriver, DbTransaction, DbRow } from "./driver.ts";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   ArchivedError,
   ConflictError,
@@ -16,6 +17,7 @@ import {
 import type {
   Agent,
   DeliveryStatus,
+  DeliveryWake,
   Group,
   McpSession,
   McpSessionState,
@@ -246,6 +248,7 @@ export interface GroupsRepository {
 export interface MessagesRepository {
   create(input: NewMessage): Promise<Message>;
   get(id: string): Promise<Message | null>;
+  findByClientKey(senderMemberId: string, clientMessageId: string): Promise<Message | null>;
   listByGroup(groupId: string, options?: MessageListOptions): Promise<Message[]>;
   /** T4（#51）：项目内消息总数（跨其全部群组），用于跨项目概览的「消息数」。 */
   countByProject(projectId: string): Promise<number>;
@@ -255,7 +258,7 @@ export interface MessagesRepository {
 
 export interface DeliveriesRepository {
   /** 确保 (message, member) 的投递记录存在（不存在则建 pending）；幂等去重。 */
-  ensure(messageId: string, memberId: string): Promise<MessageDelivery>;
+  ensure(messageId: string, memberId: string, wake?: DeliveryWake): Promise<MessageDelivery>;
   get(messageId: string, memberId: string): Promise<MessageDelivery | null>;
   /** 记录一次投递尝试并更新状态；不存在则先 ensure。 */
   recordAttempt(messageId: string, memberId: string, status: DeliveryStatus, at?: string): Promise<MessageDelivery>;
@@ -266,6 +269,8 @@ export interface DeliveriesRepository {
    * 重连补发才能重投「已投递但未确认」的消息（NFR-02）；只有 acked 才视为不需要再投。
    */
   listPending(projectId: string, memberId: string): Promise<MessageDelivery[]>;
+  /** 可自动触发的持久化积压；ACK 与唤醒判定分别过滤，不重新评估历史抑制。 */
+  listWakeable(projectId: string, memberId: string): Promise<MessageDelivery[]>;
   delete(messageId: string, memberId: string): Promise<void>;
 }
 
@@ -356,28 +361,31 @@ const MEMBER_STATUS_TRANSITIONS: Readonly<Record<MemberLifecycleStatus, readonly
 
 /** 创建 repository 集合；同一 db 连接共享。所有仓储经 {@link RepoCtx} 访问持久化。 */
 export function createRepositories(db: DbDriver): RepositorySet {
-  // 当前生效的事务会话：事务内切换到 DbTransaction，事务外回落到顶层 DbDriver。
-  // 这让仓储方法在事务回调内自动使用同一个事务连接（支持 SAVEPOINT 嵌套，#61）。
-  let active: DbTransaction = db;
+  // 只有当前异步调用链才能使用自己的事务会话；其它请求回落到顶层 DbDriver。
+  // 不再用共享闭包变量，避免请求交错时把已回滚/未提交连接交给另一请求。
+  const transactionScope = new AsyncLocalStorage<{ tx: DbTransaction; active: boolean }>();
+  const active = (): DbTransaction => {
+    const scope = transactionScope.getStore();
+    return scope?.active ? scope.tx : db;
+  };
 
   const ctx: RepoCtx = {
     query: <T extends DbRow = DbRow>(sql: string, params?: readonly unknown[]): Promise<T[]> =>
-      active.query<T>(sql, params),
-    exec: (sql: string, params?: readonly unknown[]): Promise<number> => active.exec(sql, params),
+      active().query<T>(sql, params),
+    exec: (sql: string, params?: readonly unknown[]): Promise<number> => active().exec(sql, params),
     one: async <T extends DbRow = DbRow>(sql: string, params?: readonly unknown[]): Promise<T | undefined> =>
-      (await active.query<T>(sql, params))[0],
+      (await active().query<T>(sql, params))[0],
     withTransaction: <T>(fn: () => Promise<T>): Promise<T> =>
       db.transaction(async (tx: DbTransaction) => {
-        const prev = active;
-        active = tx;
+        const scope = { tx, active: true };
         try {
-          return await fn();
+          return await transactionScope.run(scope, fn);
         } catch (error) {
           // #61：与原 runInTransaction 一致，事务体内错误归一化为 RepositoryError
           // （唯一/主键冲突 → ConflictError，跨双方言），避免裸驱动错误逃逸。
           throw normalizeError(error);
         } finally {
-          active = prev;
+          scope.active = false;
         }
       }),
   };
@@ -388,7 +396,7 @@ export function createRepositories(db: DbDriver): RepositorySet {
     members: createMembers(ctx),
     org: createOrg(ctx),
     groups: createGroups(ctx),
-    messages: createMessages(ctx),
+    messages: createMessages(ctx, db.kind),
     deliveries: createDeliveries(ctx),
     statuses: createStatuses(ctx),
     mcpSessions: createMcpSessions(ctx),
@@ -1134,13 +1142,13 @@ function toMessage(row: MessageRow): Message {
   };
 }
 
-function createMessages(ctx: RepoCtx): MessagesRepository {
+function createMessages(ctx: RepoCtx, driverKind: DbDriver["kind"]): MessagesRepository {
   return {
     async create(input) {
       // 前置校验：错误必须明确，不留给数据库外键泛化报错。
       return ctx.withTransaction(async () => {
         const group = await ctx.one<ProjectIdRow>(
-          "SELECT project_id FROM groups WHERE id = ?",
+          `SELECT project_id FROM groups WHERE id = ?${driverKind === "postgres" ? " FOR UPDATE" : ""}`,
           [input.groupId],
         );
         if (!group) throw new InvalidReferenceError(`群组 ${input.groupId} 不存在，无法发送消息。`);
@@ -1188,9 +1196,9 @@ function createMessages(ctx: RepoCtx): MessagesRepository {
         const seq = Number(maxRow?.max ?? 0) + 1;
         const at = nowIso();
         await ctx.exec(
-          `INSERT INTO messages (id, group_id, sender_member_id, seq, body, mentions, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [id, input.groupId, input.senderMemberId, seq, body, JSON.stringify(mentions), at],
+          `INSERT INTO messages (id, group_id, sender_member_id, seq, body, mentions, created_at, client_message_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [id, input.groupId, input.senderMemberId, seq, body, JSON.stringify(mentions), at, input.clientMessageId || null],
         );
 
         const row = await ctx.one<MessageRow>("SELECT * FROM messages WHERE id = ?", [id]);
@@ -1199,6 +1207,13 @@ function createMessages(ctx: RepoCtx): MessagesRepository {
     },
     async get(id) {
       const row = await ctx.one<MessageRow>("SELECT * FROM messages WHERE id = ?", [id]);
+      return row ? toMessage(row) : null;
+    },
+    async findByClientKey(senderMemberId, clientMessageId) {
+      const row = await ctx.one<MessageRow>(
+        "SELECT * FROM messages WHERE sender_member_id = ? AND client_message_id = ?",
+        [senderMemberId, clientMessageId],
+      );
       return row ? toMessage(row) : null;
     },
     async listByGroup(groupId, options = {}) {
@@ -1241,6 +1256,8 @@ type DeliveryRow = {
   member_id: string;
   project_id: string;
   status: string;
+  wake_decision: MessageDelivery["wakeDecision"];
+  wake_suppressed_reason: MessageDelivery["wakeSuppressedReason"];
   attempt_count: number;
   first_delivered_at: string | null;
   last_delivered_at: string | null;
@@ -1256,6 +1273,8 @@ function toDelivery(row: DeliveryRow): MessageDelivery {
     memberId: row.member_id,
     projectId: row.project_id,
     status: row.status as DeliveryStatus,
+    wakeDecision: row.wake_decision,
+    wakeSuppressedReason: row.wake_suppressed_reason,
     attemptCount: row.attempt_count,
     firstDeliveredAt: row.first_delivered_at,
     lastDeliveredAt: row.last_delivered_at,
@@ -1272,7 +1291,7 @@ function createDeliveries(ctx: RepoCtx): DeliveriesRepository {
     ctx.one<DeliveryRow>(getRowSql, [messageId, memberId]);
 
   const repo: DeliveriesRepository = {
-    async ensure(messageId, memberId) {
+    async ensure(messageId, memberId, wake) {
       return ctx.withTransaction(async () => {
         const existing = await getRow(messageId, memberId);
         if (existing) return toDelivery(existing);
@@ -1287,9 +1306,11 @@ function createDeliveries(ctx: RepoCtx): DeliveriesRepository {
         await ctx.exec(
           `INSERT INTO message_deliveries
              (id, message_id, member_id, project_id, status, attempt_count,
-              first_delivered_at, last_delivered_at, acked_at, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, ?, ?)`,
-          [id, messageId, memberId, member.project_id, at, at],
+              first_delivered_at, last_delivered_at, acked_at, created_at, updated_at,
+              wake_decision, wake_suppressed_reason)
+           VALUES (?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, ?, ?, ?, ?)`,
+          [id, messageId, memberId, member.project_id, at, at,
+            wake?.decision ?? null, wake?.decision === "suppressed" ? wake.reason : null],
         );
         return toDelivery((await getRow(messageId, memberId))!);
       });
@@ -1324,6 +1345,14 @@ function createDeliveries(ctx: RepoCtx): DeliveriesRepository {
            JOIN messages m ON m.id = d.message_id
           WHERE d.project_id = ? AND d.member_id = ? AND d.status <> 'acked'
           ORDER BY m.group_id, m.seq`,
+        [projectId, memberId],
+      )).map(toDelivery);
+    },
+    async listWakeable(projectId, memberId) {
+      return (await ctx.query<DeliveryRow>(
+        `SELECT d.* FROM message_deliveries d JOIN messages m ON m.id = d.message_id
+          WHERE d.project_id = ? AND d.member_id = ? AND d.status <> 'acked'
+            AND d.wake_decision = 'allowed' ORDER BY m.group_id, m.seq`,
         [projectId, memberId],
       )).map(toDelivery);
     },

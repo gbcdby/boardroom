@@ -1,0 +1,466 @@
+{
+  "schema_version": 1,
+  "feature": "boardroom #66/#67 durable message envelope",
+  "tool": {
+    "version": "v1.7.4 / TLC 2.19",
+    "sha256": "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  },
+  "model": {
+    "root": "model",
+    "entry": "DurableMessage.tla"
+  },
+  "requirements": [
+    {
+      "id": "DMSG-01",
+      "statement": "一个发送者的同一 client key 最多提交一条消息",
+      "properties": [
+        "AtMostOneMessage"
+      ]
+    },
+    {
+      "id": "DMSG-02",
+      "statement": "消息、持久化 key 和全部投递决策为原子 envelope",
+      "properties": [
+        "CompleteEnvelope",
+        "DurableKeyMatches",
+        "HintAfterCommit"
+      ]
+    },
+    {
+      "id": "DMSG-03",
+      "statement": "重复返回同一个已提交消息，不再发布通知",
+      "properties": [
+        "StableReply",
+        "AtMostOneHint"
+      ]
+    },
+    {
+      "id": "DMSG-04",
+      "statement": "runner 只能选 allowed 且未 ACK；抑制仍可主动 ACK",
+      "properties": [
+        "OnlyAllowedWake",
+        "CompleteEnvelope"
+      ]
+    }
+  ],
+  "profiles": {
+    "same-key": {
+      "config": "same-key.cfg",
+      "timeout_seconds": 45,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": [
+        "TypeOK",
+        "AtMostOneMessage",
+        "CompleteEnvelope",
+        "StableReply",
+        "DurableKeyMatches",
+        "OnlyAllowedWake",
+        "AtMostOneHint",
+        "HintAfterCommit"
+      ],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "workers": 2,
+        "logical_sender_keys": 1,
+        "recipient_decisions": [
+          "allowed",
+          "suppressed",
+          "visible-only"
+        ],
+        "global_crashes": 1,
+        "maximum_attempts_per_worker": 2,
+        "faults": [
+          "before commit",
+          "after commit before notification",
+          "restart",
+          "concurrent stale reads"
+        ],
+        "liveness": "NOT_CHECKED",
+        "purpose": "safety model check",
+        "exclusions": [
+          "actual database isolation",
+          "SQL numeric sequence allocation",
+          "harness execution",
+          "external effects",
+          "anti-loop budget persistence",
+          "arbitrary sender population"
+        ]
+      },
+      "assumptions": [
+        "Correct profile atomically commits message, durable request identity and all delivery wake decisions.",
+        "Concurrent requests recheck the authoritative unique identity at commit; each transaction has isolated asynchronous ownership.",
+        "Completed database commit survives the modelled process crash.",
+        "Notification can be lost at crash; polling uses only persisted allowed and unacknowledged deliveries.",
+        "No fairness or eventual completion claim is made."
+      ]
+    },
+    "different-senders": {
+      "config": "different-senders.cfg",
+      "timeout_seconds": 45,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": [
+        "TypeOK",
+        "AtMostOneMessage",
+        "CompleteEnvelope",
+        "StableReply",
+        "DurableKeyMatches",
+        "OnlyAllowedWake",
+        "AtMostOneHint",
+        "HintAfterCommit"
+      ],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "workers": 2,
+        "logical_sender_keys": 2,
+        "recipient_decisions": [
+          "allowed",
+          "suppressed",
+          "visible-only"
+        ],
+        "global_crashes": 1,
+        "maximum_attempts_per_worker": 2,
+        "faults": [
+          "before commit",
+          "after commit before notification",
+          "restart",
+          "concurrent stale reads"
+        ],
+        "liveness": "NOT_CHECKED",
+        "purpose": "safety model check",
+        "exclusions": [
+          "actual database isolation",
+          "SQL numeric sequence allocation",
+          "harness execution",
+          "external effects",
+          "anti-loop budget persistence",
+          "arbitrary sender population"
+        ]
+      },
+      "assumptions": [
+        "Correct profile atomically commits message, durable request identity and all delivery wake decisions.",
+        "Concurrent requests recheck the authoritative unique identity at commit; each transaction has isolated asynchronous ownership.",
+        "Completed database commit survives the modelled process crash.",
+        "Notification can be lost at crash; polling uses only persisted allowed and unacknowledged deliveries.",
+        "No fairness or eventual completion claim is made."
+      ]
+    },
+    "bug-split-commit": {
+      "config": "bug-split-commit.cfg",
+      "timeout_seconds": 45,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": [
+        "TypeOK",
+        "AtMostOneMessage",
+        "CompleteEnvelope",
+        "StableReply",
+        "DurableKeyMatches",
+        "OnlyAllowedWake",
+        "AtMostOneHint",
+        "HintAfterCommit"
+      ],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "workers": 2,
+        "logical_sender_keys": 1,
+        "recipient_decisions": [
+          "allowed",
+          "suppressed",
+          "visible-only"
+        ],
+        "global_crashes": 1,
+        "maximum_attempts_per_worker": 2,
+        "faults": [
+          "before commit",
+          "after commit before notification",
+          "restart",
+          "concurrent stale reads"
+        ],
+        "liveness": "NOT_CHECKED",
+        "purpose": "negative sensitivity variant",
+        "exclusions": [
+          "actual database isolation",
+          "SQL numeric sequence allocation",
+          "harness execution",
+          "external effects",
+          "anti-loop budget persistence",
+          "arbitrary sender population"
+        ]
+      },
+      "assumptions": [
+        "Correct profile atomically commits message, durable request identity and all delivery wake decisions.",
+        "Concurrent requests recheck the authoritative unique identity at commit; each transaction has isolated asynchronous ownership.",
+        "Completed database commit survives the modelled process crash.",
+        "Notification can be lost at crash; polling uses only persisted allowed and unacknowledged deliveries.",
+        "No fairness or eventual completion claim is made."
+      ]
+    },
+    "bug-stale-read": {
+      "config": "bug-stale-read.cfg",
+      "timeout_seconds": 45,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": [
+        "TypeOK",
+        "AtMostOneMessage",
+        "CompleteEnvelope",
+        "StableReply",
+        "DurableKeyMatches",
+        "OnlyAllowedWake",
+        "AtMostOneHint",
+        "HintAfterCommit"
+      ],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "workers": 2,
+        "logical_sender_keys": 1,
+        "recipient_decisions": [
+          "allowed",
+          "suppressed",
+          "visible-only"
+        ],
+        "global_crashes": 1,
+        "maximum_attempts_per_worker": 2,
+        "faults": [
+          "before commit",
+          "after commit before notification",
+          "restart",
+          "concurrent stale reads"
+        ],
+        "liveness": "NOT_CHECKED",
+        "purpose": "negative sensitivity variant",
+        "exclusions": [
+          "actual database isolation",
+          "SQL numeric sequence allocation",
+          "harness execution",
+          "external effects",
+          "anti-loop budget persistence",
+          "arbitrary sender population"
+        ]
+      },
+      "assumptions": [
+        "Correct profile atomically commits message, durable request identity and all delivery wake decisions.",
+        "Concurrent requests recheck the authoritative unique identity at commit; each transaction has isolated asynchronous ownership.",
+        "Completed database commit survives the modelled process crash.",
+        "Notification can be lost at crash; polling uses only persisted allowed and unacknowledged deliveries.",
+        "No fairness or eventual completion claim is made."
+      ]
+    },
+    "bug-volatile-key": {
+      "config": "bug-volatile-key.cfg",
+      "timeout_seconds": 45,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": [
+        "TypeOK",
+        "AtMostOneMessage",
+        "CompleteEnvelope",
+        "StableReply",
+        "DurableKeyMatches",
+        "OnlyAllowedWake",
+        "AtMostOneHint",
+        "HintAfterCommit"
+      ],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "workers": 2,
+        "logical_sender_keys": 1,
+        "recipient_decisions": [
+          "allowed",
+          "suppressed",
+          "visible-only"
+        ],
+        "global_crashes": 1,
+        "maximum_attempts_per_worker": 2,
+        "faults": [
+          "before commit",
+          "after commit before notification",
+          "restart",
+          "concurrent stale reads"
+        ],
+        "liveness": "NOT_CHECKED",
+        "purpose": "negative sensitivity variant",
+        "exclusions": [
+          "actual database isolation",
+          "SQL numeric sequence allocation",
+          "harness execution",
+          "external effects",
+          "anti-loop budget persistence",
+          "arbitrary sender population"
+        ]
+      },
+      "assumptions": [
+        "Correct profile atomically commits message, durable request identity and all delivery wake decisions.",
+        "Concurrent requests recheck the authoritative unique identity at commit; each transaction has isolated asynchronous ownership.",
+        "Completed database commit survives the modelled process crash.",
+        "Notification can be lost at crash; polling uses only persisted allowed and unacknowledged deliveries.",
+        "No fairness or eventual completion claim is made."
+      ]
+    },
+    "reach-concurrent-read": {
+      "config": "reach-concurrent-read.cfg",
+      "timeout_seconds": 45,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": [
+        "TypeOK",
+        "AtMostOneMessage",
+        "CompleteEnvelope",
+        "StableReply",
+        "DurableKeyMatches",
+        "OnlyAllowedWake",
+        "AtMostOneHint",
+        "HintAfterCommit",
+        "NoConcurrentAbsentReads"
+      ],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "workers": 2,
+        "logical_sender_keys": 1,
+        "recipient_decisions": [
+          "allowed",
+          "suppressed",
+          "visible-only"
+        ],
+        "global_crashes": 1,
+        "maximum_attempts_per_worker": 2,
+        "faults": [
+          "before commit",
+          "after commit before notification",
+          "restart",
+          "concurrent stale reads"
+        ],
+        "liveness": "NOT_CHECKED",
+        "purpose": "reachability counterexample probe",
+        "exclusions": [
+          "actual database isolation",
+          "SQL numeric sequence allocation",
+          "harness execution",
+          "external effects",
+          "anti-loop budget persistence",
+          "arbitrary sender population"
+        ]
+      },
+      "assumptions": [
+        "Correct profile atomically commits message, durable request identity and all delivery wake decisions.",
+        "Concurrent requests recheck the authoritative unique identity at commit; each transaction has isolated asynchronous ownership.",
+        "Completed database commit survives the modelled process crash.",
+        "Notification can be lost at crash; polling uses only persisted allowed and unacknowledged deliveries.",
+        "No fairness or eventual completion claim is made."
+      ]
+    },
+    "reach-recovery": {
+      "config": "reach-recovery.cfg",
+      "timeout_seconds": 45,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": [
+        "TypeOK",
+        "AtMostOneMessage",
+        "CompleteEnvelope",
+        "StableReply",
+        "DurableKeyMatches",
+        "OnlyAllowedWake",
+        "AtMostOneHint",
+        "HintAfterCommit",
+        "NoRecoveryWitness"
+      ],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "workers": 2,
+        "logical_sender_keys": 1,
+        "recipient_decisions": [
+          "allowed",
+          "suppressed",
+          "visible-only"
+        ],
+        "global_crashes": 1,
+        "maximum_attempts_per_worker": 2,
+        "faults": [
+          "before commit",
+          "after commit before notification",
+          "restart",
+          "concurrent stale reads"
+        ],
+        "liveness": "NOT_CHECKED",
+        "purpose": "reachability counterexample probe",
+        "exclusions": [
+          "actual database isolation",
+          "SQL numeric sequence allocation",
+          "harness execution",
+          "external effects",
+          "anti-loop budget persistence",
+          "arbitrary sender population"
+        ]
+      },
+      "assumptions": [
+        "Correct profile atomically commits message, durable request identity and all delivery wake decisions.",
+        "Concurrent requests recheck the authoritative unique identity at commit; each transaction has isolated asynchronous ownership.",
+        "Completed database commit survives the modelled process crash.",
+        "Notification can be lost at crash; polling uses only persisted allowed and unacknowledged deliveries.",
+        "No fairness or eventual completion claim is made."
+      ]
+    },
+    "bug-wake-filter": {
+      "config": "bug-wake-filter.cfg",
+      "timeout_seconds": 45,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": [
+        "TypeOK",
+        "AtMostOneMessage",
+        "CompleteEnvelope",
+        "StableReply",
+        "DurableKeyMatches",
+        "OnlyAllowedWake",
+        "AtMostOneHint",
+        "HintAfterCommit"
+      ],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "workers": 2,
+        "logical_sender_keys": 1,
+        "recipient_decisions": [
+          "allowed",
+          "suppressed",
+          "visible-only"
+        ],
+        "global_crashes": 1,
+        "maximum_attempts_per_worker": 2,
+        "faults": [
+          "before commit",
+          "after commit before notification",
+          "restart",
+          "concurrent stale reads"
+        ],
+        "liveness": "NOT_CHECKED",
+        "purpose": "negative sensitivity variant",
+        "exclusions": [
+          "actual database isolation",
+          "SQL numeric sequence allocation",
+          "harness execution",
+          "external effects",
+          "anti-loop budget persistence",
+          "arbitrary sender population"
+        ]
+      },
+      "assumptions": [
+        "Correct profile atomically commits message, durable request identity and all delivery wake decisions.",
+        "Concurrent requests recheck the authoritative unique identity at commit; each transaction has isolated asynchronous ownership.",
+        "Completed database commit survives the modelled process crash.",
+        "Notification can be lost at crash; polling uses only persisted allowed and unacknowledged deliveries.",
+        "No fairness or eventual completion claim is made."
+      ]
+    }
+  }
+}
