@@ -254,7 +254,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     if (value === null) return null;
     if (value.id !== row.targetId || value.projectId !== row.projectId || !snapshotText(value.name) ||
       !snapshotText(value.createdAt) || !snapshotText(value.updatedAt) || !snapshotReference(value.parentId) ||
-      (value.role !== "top_manager" && value.role !== "sub_manager" && value.role !== "member") || !Number.isInteger(value.sortOrder) ||
+      (value.role !== "top_manager" && value.role !== "sub_manager" && value.role !== "member") ||
+      typeof value.sortOrder !== "number" || !Number.isFinite(value.sortOrder) ||
       ((value.parentId === null) !== (value.role === "top_manager"))) snapshotError();
     return value as unknown as OrgNode;
   }
@@ -1252,7 +1253,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
             detail: { undoes: row.id, ...(originalForRedo ? { kind: "redo" } : { kind: "undo" }) },
             reversedByAuditId: row.id,
           }));
-          (await (repos.audit.markReversed(projectId, row.id, newRow.id, at)));
+          if (!await repos.audit.markReversed(projectId, row.id, newRow.id, at)) {
+            throw new RepositoryError("conflict", "该审计事件已被撤销，不能重复撤销。");
+          }
         })));
         writeJson(response, 200, { entry: auditView(newRow) });
         return true;
