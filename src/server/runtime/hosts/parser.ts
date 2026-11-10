@@ -55,8 +55,8 @@ export function createHostOutputParser(options: HostParserOptions) {
     if (Array.isArray(value.permission_denials) && value.permission_denials.length > 0) {
       emit({ type: "permission_denied", reason: "permission_required" });
     }
-    if (options.usageSchema?.format !== "claude-result-v1" || !isObject(value.usage)
-      || !Number.isSafeInteger(value.num_turns) || (value.num_turns as number) < 0) {
+    if (options.usageSchema?.format !== "claude-result-v1" || options.usageSchema.sequenceField !== "result_index"
+      || !isObject(value.usage) || !Number.isSafeInteger(value.result_index) || (value.result_index as number) < 0) {
       emit({ type: "usage_unavailable" }); return;
     }
     const metrics: Partial<Record<"inputTokens" | "cachedInputTokens" | "outputTokens" | "costUsd", number>> = {};
@@ -66,17 +66,21 @@ export function createHostOutputParser(options: HostParserOptions) {
     }
     if (typeof value.total_cost_usd === "number" && Number.isFinite(value.total_cost_usd) && value.total_cost_usd >= 0) metrics.costUsd = value.total_cost_usd;
     let emitted = false;
+    let missingScope = false;
     for (const metric of ["inputTokens", "cachedInputTokens", "outputTokens", "costUsd"] as const) {
       const semantics = options.usageSchema.metrics[metric];
       const n = metrics[metric];
       if (!semantics || n === undefined) continue;
-      emit({ type: "usage", source: options.backend, harnessVersion: options.version, scope: semantics.scope,
-        sequence: value.num_turns as number, metric, value: n, cumulative: semantics.cumulative,
+      if (semantics.scope === "session" && !validId(value.session_id)) { missingScope = true; continue; }
+      const identity = semantics.scope === "session"
+        ? { scope: "session" as const, sessionId: value.session_id as string } : { scope: "invocation" as const };
+      emit({ type: "usage", source: options.backend, harnessVersion: options.version, ...identity,
+        sequence: value.result_index as number, metric, value: n, cumulative: semantics.cumulative,
         zeroMeaningful: semantics.zeroMeaningful, successful: value.is_error === false && value.subtype === "success",
         coverage: "partial", schemaVerified: true });
       emitted = true;
     }
-    if (!emitted) emit({ type: "usage_unavailable" });
+    if (!emitted || missingScope) emit({ type: "usage_unavailable" });
   }
 
   function push(chunk: Buffer | string): void {

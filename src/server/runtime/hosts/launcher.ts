@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { bootstrapPrompt, buildHostArguments, expectedPermissionMode, parseHostVersion } from "./adapters.ts";
 import { createHostOutputParser } from "./parser.ts";
+import { selectVerifiedHostProfile } from "./profiles.ts";
 import { VERIFIED_HOST_PROFILES, type HostInstallation, type HostLaunchSnapshot, type HostLauncher, type HostPreflight, type HostReason, type ManagedBackend, type ResolvedHostInstallation, type VerifiedHostProfile } from "./types.ts";
 import { linuxIsolationAvailable, prepareLinuxIsolation, spawnIsolatedProcess, validateWorkdir, validateWorkdirFilesystemBoundary } from "../isolation/linux.ts";
 import { createPipeBridge } from "../isolation/pipe-bridge.ts";
@@ -67,8 +68,8 @@ export function createHostLauncher(options: HostLauncherOptions): HostLauncher {
       version = parseHostVersion(snapshot.backend, output);
     } catch { return denied("host_version_unknown"); }
     if (!version) return denied("host_version_unknown");
-    const profile = VERIFIED_HOST_PROFILES.find(p => p.backend === snapshot.backend && p.version === version
-      && p.platform === process.platform && p.architecture === process.arch && p.mode === expected);
+    const profile = selectVerifiedHostProfile(VERIFIED_HOST_PROFILES, { backend: snapshot.backend, version,
+      platform: process.platform, architecture: process.arch, mode: expected });
     // 没有真实证据时不启动 CLI、检查登录或尝试更宽松模式。
     if (!profile) return denied("host_version_unsupported", version);
     if (snapshot.sessionId && !profile.resumeVerified) return denied("profile_unsupported", version);

@@ -15,7 +15,7 @@ import { createRuntimeSupervisor } from "../src/server/runtime/supervisor.ts";
 import { createRuntimeGateway, type RuntimeGateway } from "../src/server/runtime/gateway.ts";
 import { createLogger } from "../src/server/logger.ts";
 import { createHostOutputParser } from "../src/server/runtime/hosts/parser.ts";
-import type { HostEvent, HostLauncher, HostLaunchSnapshot, HostPreflight, OwnedHostProcess, OwnedProcessIdentity, OwnedProcessInspection } from "../src/server/runtime/hosts/types.ts";
+import type { HostEvent, HostLauncher, HostLaunchSnapshot, HostPreflight, OwnedHostProcess, OwnedProcessIdentity, OwnedProcessInspection, VerifiedUsageSchema } from "../src/server/runtime/hosts/types.ts";
 
 type Observer = Parameters<HostLauncher["launch"]>[1];
 interface Payload { ok: boolean; status?: string; messages?: { id: string; text: string }[]; error?: { code: string }; [key: string]: unknown }
@@ -667,5 +667,164 @@ test("R6 退出恢复保留不可重试错误与失效会话，不能顺便解�
     f.advance(60_000); await f.supervisor.tick(); assert.equal(f.launches, 0);
     await f.runtime.intent(f.binding.id, "new-session", undefined, { runtimeRevision: 1, bindingRevision: 1 });
     await f.supervisor.tick(); assert.equal(f.launches, 1); assert.equal(f.hosts[0]!.snapshot.sessionId, undefined);
+  } finally { await f.close(); }
+});
+
+// 仅验证来源合同；不能将合成 schema 登记为真实宿主支持。
+const SESSION_USAGE_SCHEMA: VerifiedUsageSchema = {
+  format: "claude-result-v1", sequenceField: "result_index", evidence: "synthetic-session-scope-contract-only",
+  metrics: {
+    inputTokens: { scope: "invocation", cumulative: false, zeroMeaningful: false },
+    costUsd: { scope: "session", cumulative: true, zeroMeaningful: false },
+  },
+};
+function usageParser(host: ControlledHost) {
+  return createHostOutputParser({ backend: "claude-code", version: "2.1.322", expectedPermissionMode: "auto",
+    usageSchema: SESSION_USAGE_SCHEMA, onEvent: event => host.event(event) });
+}
+function usageFrame(sessionId: string, cost: number, tokens: number,
+  { index = 0, turns = 1, successful = true }: { index?: number; turns?: number; successful?: boolean } = {}) {
+  return JSON.stringify({ type: "result", subtype: "success", is_error: !successful,
+    session_id: sessionId, result_index: index, num_turns: turns, total_cost_usd: cost, usage: { input_tokens: tokens } }) + "\n";
+}
+
+test("R-64-NATIVE-003：同SID续接的累计金额只保留会话快照，token仍属于两次调用", async () => {
+  const f = await fixture();
+  const sid = "synthetic-private-session-003";
+  try {
+    const first = (await f.start())!;
+    usageParser(first).push(usageFrame(sid, 0.021495, 101));
+    await until(async () => (await f.observations.listUsage({ bindingId: f.binding.id })).length === 2, "首份结果应采得独立token及金额");
+    first.finish();
+    await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.exitConfirmed, "旧进程必须实际退出");
+    await f.runtime.intent(f.binding.id, "retry"); await f.supervisor.tick();
+    const second = f.hosts[1]!;
+    assert.equal(second.snapshot.sessionId, sid);
+    assert(second.snapshot.generation > first.snapshot.generation);
+    // 两次进程的 native result_index 和 num_turns 都可重新从头计数。
+    usageParser(second).push(usageFrame(sid, 0.024667, 202));
+    await until(async () => (await f.observations.listUsage({ bindingId: f.binding.id })).some(row => row.value === 0.024667), "续接结果应已处理");
+    const rows = await f.observations.listUsage({ bindingId: f.binding.id });
+    const costs = rows.filter(row => row.metric === "costUsd");
+    assert.equal(costs.length, 1, "不能把同一session累计金额拆成每次attempt各一份");
+    assert.equal(costs[0]!.value, 0.024667);
+    assert.equal(costs[0]!.scope, "session"); assert.equal(costs[0]!.cumulative, true);
+    assert.equal(costs[0]!.coverage, "partial"); assert.equal(costs[0]!.delta, null);
+    const tokens = rows.filter(row => row.metric === "inputTokens");
+    assert.deepEqual(tokens.map(row => row.value).sort(), [101, 202]);
+    assert(tokens.every(row => row.scope === "invocation"));
+    assert.notEqual(tokens[0]!.scopeId, tokens[1]!.scopeId);
+    assert.equal(JSON.stringify(rows).includes(sid), false, "公开观测不能带CLI SID");
+    assert.equal(JSON.stringify(await f.observations.list({ bindingId: f.binding.id })).includes(sid), false);
+  } finally { await f.close(); }
+});
+
+test("R-64-NATIVE-003：请求resume、错误SID与旧generation均不能冒认会话用量", async () => {
+  const f = await fixture();
+  const sid = "synthetic-private-original-sid";
+  const wrongSid = "synthetic-private-wrong-sid";
+  try {
+    const first = (await f.start())!;
+    const firstParser = usageParser(first);
+    firstParser.push(usageFrame(sid, 20, 100));
+    await until(async () => (await f.observations.listUsage({ bindingId: f.binding.id })).some(row => row.value === 20), "首次会话用量未写入");
+    first.finish();
+    await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.exitConfirmed, "首个进程退出未确认");
+    await f.runtime.intent(f.binding.id, "retry"); await f.supervisor.tick();
+    const second = f.hosts[1]!;
+    assert.equal(second.snapshot.sessionId, sid);
+    const missingCount = async () => (await f.observations.list({ bindingId: f.binding.id })).events
+      .filter(event => event.event === "usage_unavailable").length;
+    const beforeMissing = await missingCount();
+    // 请求中的 resume SID 不是本代进程已经报告该会话的证据。
+    second.event({ type: "usage", source: "claude-code", harnessVersion: "2.1.322", scope: "session", sessionId: sid,
+      sequence: 0, metric: "costUsd", value: 999, cumulative: true, zeroMeaningful: false,
+      successful: true, coverage: "partial", schemaVerified: true });
+    await until(async () => await missingCount() === beforeMissing + 1, "未观察到会话归属应保持不可得");
+    assert.equal((await f.observations.listUsage({ bindingId: f.binding.id })).find(row => row.metric === "costUsd")!.value, 20);
+
+    const parser = usageParser(second);
+    parser.push(usageFrame(sid, 23, 200));
+    await until(async () => (await f.observations.listUsage({ bindingId: f.binding.id })).some(row => row.value === 23), "合法续接未写入");
+    parser.push(usageFrame(sid, 24, 201, { index: 2, turns: 0 }));
+    await until(async () => (await f.observations.listUsage({ bindingId: f.binding.id })).some(row => row.value === 24), "轮次数回退不能推翻源结果顺序");
+    parser.push(usageFrame(wrongSid, 999, 202, { index: 3 }));
+    await until(async () => await missingCount() === beforeMissing + 2, "被拒绝的SID不能继续使用旧会话归属");
+    assert.equal((await f.runtime.getBinding(f.binding.id))!.runner.harnessSessionId, sid);
+    const cost = (await f.observations.listUsage({ bindingId: f.binding.id })).find(row => row.metric === "costUsd")!;
+    assert.equal(cost.value, 24); assert.equal(cost.sequence, 2);
+
+    // 已退出旧进程即使补发更大的序号，也不能进入现有 generation。
+    firstParser.push(usageFrame(sid, 999, 999, { index: 999 }));
+    first.event({ type: "usage_unavailable" });
+    await nextTurn(); await nextTurn();
+    assert.deepEqual((await f.observations.listUsage({ bindingId: f.binding.id })).find(row => row.metric === "costUsd"), cost);
+    assert.equal(await missingCount(), beforeMissing + 2);
+    const publicRecords = JSON.stringify({ usage: await f.observations.listUsage({ bindingId: f.binding.id }),
+      events: await f.observations.list({ bindingId: f.binding.id }) });
+    assert.equal(publicRecords.includes(sid), false); assert.equal(publicRecords.includes(wrongSid), false);
+  } finally { await f.close(); }
+});
+
+test("R-64-NATIVE-003：不同binding报告相同原生SID也有独立公开引用", async () => {
+  // 使用独立数据库允许同一个原生SID；真实共享数据库另有session唯一性约束。
+  const one = await fixture(); const two = await fixture();
+  try {
+    for (const f of [one, two]) {
+      usageParser((await f.start())!).push(usageFrame("same-private-native-sid", 20, 100));
+      await until(async () => (await f.observations.listUsage({ bindingId: f.binding.id })).some(row => row.metric === "costUsd"), "会话统计未写入");
+    }
+    const a = (await one.observations.listUsage({ bindingId: one.binding.id })).find(row => row.metric === "costUsd")!;
+    const b = (await two.observations.listUsage({ bindingId: two.binding.id })).find(row => row.metric === "costUsd")!;
+    assert.notEqual(a.scopeId, b.scopeId); assert.notEqual(a.epochId, b.epochId);
+  } finally { await two.close(); await one.close(); }
+});
+
+test("R-64-NATIVE-003：失败零与累计回退保留跨attempt高水位，明确新SID才分开", async () => {
+  const f = await fixture();
+  const sid = "synthetic-private-cumulative-sid";
+  try {
+    const first = (await f.start())!;
+    usageParser(first).push(usageFrame(sid, 20, 100));
+    await until(async () => (await f.observations.listUsage({ bindingId: f.binding.id })).some(row => row.value === 20), "初始累计未写入");
+    const original = (await f.observations.listUsage({ bindingId: f.binding.id })).find(row => row.metric === "costUsd")!;
+    async function resume(previous: ControlledHost) {
+      previous.finish();
+      await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.exitConfirmed, "进程退出未确认");
+      await f.runtime.intent(f.binding.id, "retry"); await f.supervisor.tick();
+      return f.hosts.at(-1)!;
+    }
+    const failed = await resume(first);
+    usageParser(failed).push(usageFrame(sid, 0, 0, { successful: false }));
+    await until(async () => (await f.observations.listUsage({ bindingId: f.binding.id }))
+      .some(row => row.metric === "costUsd" && row.runnerGeneration === failed.snapshot.generation), "失败零未处理");
+    const zero = (await f.observations.listUsage({ bindingId: f.binding.id })).find(row => row.metric === "costUsd")!;
+    assert.equal(zero.value, null); assert.equal(zero.delta, null); assert.equal(zero.cumulativeHighWatermark, 20);
+    assert.equal(zero.scopeId, original.scopeId); assert.equal(zero.epochId, original.epochId);
+    assert.equal(zero.epochReliable, true, "缺失零不能猜测会话reset");
+
+    const reset = await resume(failed);
+    usageParser(reset).push(usageFrame(sid, 3, 300));
+    await until(async () => (await f.observations.listUsage({ bindingId: f.binding.id }))
+      .some(row => row.metric === "costUsd" && row.runnerGeneration === reset.snapshot.generation), "回退累计未处理");
+    const dropped = (await f.observations.listUsage({ bindingId: f.binding.id })).find(row => row.metric === "costUsd")!;
+    assert.equal(dropped.value, 3); assert.equal(dropped.cumulativeHighWatermark, 20);
+    assert.equal(dropped.scopeId, original.scopeId); assert.equal(dropped.epochId, original.epochId);
+    assert.equal(dropped.delta, null); assert.equal(dropped.epochReliable, false); assert.equal(dropped.reasonCode, "cumulative_reset");
+
+    reset.finish();
+    await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.exitConfirmed, "回退进程退出未确认");
+    await f.runtime.intent(f.binding.id, "new-session", undefined, { runtimeRevision: 1, bindingRevision: 1 });
+    await f.supervisor.tick();
+    const fresh = f.hosts.at(-1)!;
+    assert.equal(fresh.snapshot.sessionId, undefined);
+    usageParser(fresh).push(usageFrame("synthetic-private-new-sid", 5, 400));
+    await until(async () => (await f.observations.listUsage({ bindingId: f.binding.id }))
+      .filter(row => row.metric === "costUsd").length === 2, "新SID应有独立会话引用");
+    const costs = (await f.observations.listUsage({ bindingId: f.binding.id })).filter(row => row.metric === "costUsd");
+    const newCost = costs.find(row => row.value === 5)!;
+    assert.notEqual(newCost.scopeId, original.scopeId); assert.notEqual(newCost.epochId, original.epochId);
+    assert.equal(newCost.cumulativeHighWatermark, 5); assert.equal(newCost.epochReliable, true);
+    assert.equal(newCost.delta, null); assert.equal(newCost.coverage, "partial");
   } finally { await f.close(); }
 });

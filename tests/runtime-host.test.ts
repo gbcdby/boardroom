@@ -23,7 +23,7 @@ test("R3 launcher argv 将名字/模型/提示中的 shell 字符保留为独立
   assert(args.includes("--restricted"));
   assert(!args.includes("--dangerously-skip-permissions"));
   assert.throws(() => buildHostArguments({ ...snapshot(), config: { ...snapshot().config, tools: ["arbitrary-plugin"] } }), /config_invalid/);
-  assert.throws(() => buildHostArguments({ ...snapshot(), config: { ...snapshot().config, bypass: true } }), /profile_unsupported/);
+  assert.throws(() => buildHostArguments({ ...snapshot(), config: { ...snapshot().config, permissionMode: "bypassPermissions" } }), /profile_unsupported/);
   assert.throws(() => buildHostArguments({ ...snapshot(), backend: "codex-cli" }), /profile_unsupported/);
 });
 
@@ -80,12 +80,12 @@ test("R3 真实认证失败帧只取顶层枚举，success + is_error 不能抹�
 test("R3 权限拒绝只记录操作拒绝；未知 usage 不填零，不把 session 金额当 invocation", () => {
   const events: HostEvent[] = [];
   const result = { type: "result", subtype: "success", is_error: false, num_turns: 2,
-    permission_denials: [{ tool_input: "PRIVATE_CANARY" }], total_cost_usd: 12, usage: { input_tokens: 8, output_tokens: 3 } };
+    result_index: 0, permission_denials: [{ tool_input: "PRIVATE_CANARY" }], total_cost_usd: 12, usage: { input_tokens: 8, output_tokens: 3 } };
   const parser = createHostOutputParser({ backend: "claude-code", version: "fixture", expectedPermissionMode: "auto", onEvent: e => events.push(e) });
   parser.push(`${JSON.stringify(result)}\n`);
   assert.deepEqual(events, [{ type: "permission_denied", reason: "permission_required" }, { type: "usage_unavailable" }]);
   const verified = createHostOutputParser({ backend: "claude-code", version: "fixture", expectedPermissionMode: "auto", onEvent: e => events.push(e),
-    usageSchema: { format: "claude-result-v1", evidence: "fixture-schema-only-not-host-acceptance", metrics: { inputTokens: { scope: "invocation", cumulative: true, zeroMeaningful: true } } } });
+    usageSchema: { format: "claude-result-v1", sequenceField: "result_index", evidence: "fixture-schema-only-not-host-acceptance", metrics: { inputTokens: { scope: "invocation", cumulative: true, zeroMeaningful: true } } } });
   verified.push(`${JSON.stringify(result)}\n`);
   const usage = events.filter(e => e.type === "usage");
   assert.equal(usage.length, 1);
@@ -93,6 +93,33 @@ test("R3 权限拒绝只记录操作拒绝；未知 usage 不填零，不把 ses
   assert.equal(usage[0]?.value, 8);
   assert(!events.some(e => e.type === "exit"));
   assert(!JSON.stringify(events).includes("PRIVATE_CANARY"));
+});
+
+test("R-64-NATIVE-003：用量只采用已声明result_index，缺序号或会话归属保持不可得", () => {
+  const schema = { format: "claude-result-v1", sequenceField: "result_index", evidence: "synthetic-scope-contract-only", metrics: {
+    inputTokens: { scope: "invocation", cumulative: false, zeroMeaningful: false },
+    costUsd: { scope: "session", cumulative: true, zeroMeaningful: false },
+  } } as const;
+  for (const index of [undefined, -1, 0.5, "0", Number.MAX_SAFE_INTEGER + 1]) {
+    const events: HostEvent[] = [];
+    const parser = createHostOutputParser({ backend: "claude-code", version: "2.1.322", expectedPermissionMode: "auto",
+      usageSchema: schema, onEvent: event => events.push(event) });
+    parser.push(JSON.stringify({ type: "result", result_index: index, session_id: "observed-session", num_turns: 999,
+      total_cost_usd: 12, usage: { input_tokens: 8 } }) + "\n");
+    assert.equal(events.some(event => event.type === "usage"), false);
+    assert.equal(events.some(event => event.type === "usage_unavailable"), true);
+  }
+  const events: HostEvent[] = [];
+  const parser = createHostOutputParser({ backend: "claude-code", version: "2.1.322", expectedPermissionMode: "auto",
+    usageSchema: schema, onEvent: event => events.push(event) });
+  parser.push('{"type":"system","subtype":"init","session_id":"init-only-session","permissionMode":"auto"}\n');
+  parser.push('{"type":"result","subtype":"success","is_error":false,"result_index":0,"num_turns":4,"total_cost_usd":12,"usage":{"input_tokens":8}}\n');
+  const usage = events.filter(event => event.type === "usage");
+  assert.equal(usage.length, 1, "不能从init或请求中的SID补造这份session统计的归属");
+  assert.equal(usage[0]!.metric, "inputTokens"); assert.equal(usage[0]!.scope, "invocation");
+  assert.equal(usage[0]!.sequence, 0, "不把num_turns当来源序号");
+  assert.equal(usage[0]!.coverage, "partial");
+  assert.equal(events.filter(event => event.type === "usage_unavailable").length, 1);
 });
 
 test("R3 help/版本与模拟输出不能打开生产支持；普通失败不降级 bypass", async () => {

@@ -73,6 +73,7 @@ export type UsageCoverage = "complete" | "partial" | "unavailable";
  * 由具体版本的 adapter 生成，每种指标独立携带作用域。
  * schemaVerified 只表示已有实际样本证据，不可由 HTTP/CLI 自述字段设置。
  * scopeId / epochId 使用平台内部引用，不能传 CLI 的不透明 sid。
+ * session 观测必须含实际 runnerGeneration，以区分 resume 后重新起算的源序号。
  */
 export interface NormalizedUsageObservation extends ObservationContext {
   readonly bindingId: string;
@@ -82,7 +83,7 @@ export interface NormalizedUsageObservation extends ObservationContext {
   readonly scope: UsageScope;
   readonly scopeId: string;
   readonly epochId: string;
-  /** 同一作用域内的来源顺序；重放沿用 sequence，不用接收时钟生成。 */
+  /** 同一来源进程内的顺序；session 按 (runnerGeneration, sequence) 排序，不用接收时钟。 */
   readonly sequence: number;
   readonly reportedAt: string;
   readonly coverage: UsageCoverage;

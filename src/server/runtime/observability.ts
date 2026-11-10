@@ -227,9 +227,21 @@ export function createRuntimeObservability(options: RuntimeObservabilityOptions)
             `SELECT payload FROM agent_runtime_usage_snapshots WHERE binding_id = ? AND source = ?
              AND harness_version = ? AND metric = ? AND scope = ? AND scope_id = ? AND epoch_id = ?`, params,
           );
-          const previous = row ? JSON.parse(row.payload) as UsageSnapshot : null;
-          if (previous && (input.sequence <= previous.sequence || input.reportedAt < previous.reportedAt)) {
-            return { stored: false, duplicate: true, incomplete: incomplete() };
+          let previous = row ? JSON.parse(row.payload) as UsageSnapshot : null;
+          if (previous) {
+            if (input.scope === "session") {
+              const priorGeneration = previous.runnerGeneration;
+              if (Number.isSafeInteger(priorGeneration) && priorGeneration! >= 1) {
+                if (input.runnerGeneration! < priorGeneration! || (input.runnerGeneration === priorGeneration && input.sequence <= previous.sequence)) {
+                  return { stored: false, duplicate: true, incomplete: incomplete() };
+                }
+              } else {
+                // 旧记录没有源代次，不能拿它推导差额；仍保留高水位检测累计回退。
+                previous = { ...previous, baselineReliable: false };
+              }
+            } else if (input.sequence <= previous.sequence || input.reportedAt < previous.reportedAt) {
+              return { stored: false, duplicate: true, incomplete: incomplete() };
+            }
           }
           const snapshot = normalizeUsage(input, previous, now);
           await tx.exec(
@@ -337,6 +349,7 @@ function validUsageInput(input: NormalizedUsageObservation): boolean {
   if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}(?:-[0-9A-Za-z.-]{1,64})?(?:\+[0-9A-Za-z.-]{1,64})?$/.test(input.harnessVersion)) return false;
   if (!["turn", "invocation", "session"].includes(input.scope) || !["complete", "partial", "unavailable"].includes(input.coverage)) return false;
   if (!Number.isSafeInteger(input.sequence) || input.sequence < 0) return false;
+  if (input.scope === "session" && (!Number.isSafeInteger(input.runnerGeneration) || input.runnerGeneration! < 1)) return false;
   if (typeof input.reportedAt !== "string" || input.reportedAt.length !== 24 || !Number.isFinite(Date.parse(input.reportedAt))) return false;
   if (new Date(input.reportedAt).toISOString() !== input.reportedAt) return false;
   return [input.cumulative, input.schemaVerified, input.zeroMeaningful, input.successful].every((v) => typeof v === "boolean");

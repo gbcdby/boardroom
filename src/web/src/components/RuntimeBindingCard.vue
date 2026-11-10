@@ -95,7 +95,7 @@ function usageValue(row: RuntimeUsageDto): string {
           <time>{{ timeLabel(event.observedAt) }}</time><div><strong>{{ eventLabels[event.event] ?? '运行事件' }}</strong><span v-if="event.reasonCode"> · {{ reasonLabel(event.reasonCode) }}</span><span v-if="event.runnerGeneration !== undefined" class="muted small"> · 代次 {{ event.runnerGeneration }}</span><span v-if="event.truncated" class="muted small"> · 元数据已截断</span></div>
         </li></ol>
         <h4>最近已知用量</h4>
-        <p class="muted small">仅显示 CLI 实际采得且格式已验证的数据。金额为 CLI 估算（非账单）；不同来源与作用域不合并总费用。</p>
+        <p class="muted small">仅显示 CLI 实际采得且格式已验证的数据。金额为 CLI 估算（非账单）；会话累计包含续接前用量，不代表本次调用。不同来源与作用域不合并总费用。</p>
         <p v-if="observations.usage.length === 0" class="muted small" data-testid="runtime-usage-unknown">暂无可信用量数据，token 与金额未知。</p>
         <div v-else class="table-scroll"><table>
           <thead><tr><th>来源 / 作用域</th><th>指标</th><th>数值</th><th>覆盖</th></tr></thead>

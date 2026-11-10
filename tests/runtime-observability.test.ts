@@ -60,7 +60,7 @@ test("OBS-74-02：白名单关联元数据保留，raw stdout/env/prompt 与错�
 function usage(overrides: Partial<NormalizedUsageObservation> = {}): NormalizedUsageObservation {
   return {
     bindingId: newId(), source: "codex-cli", harnessVersion: "0.167.0-alpha.4", metric: "inputTokens",
-    scope: "invocation", scopeId: newId(), epochId: newId(), sequence: 1,
+    scope: "invocation", scopeId: newId(), epochId: newId(), sequence: 1, runnerGeneration: 1,
     reportedAt: "2026-11-10T00:00:00.000Z", coverage: "complete", value: 12,
     cumulative: false, schemaVerified: true, zeroMeaningful: true, successful: true,
     ...overrides,
@@ -195,6 +195,51 @@ test("OBS-74-06：token与金额保持独立作用域，版本变化/未知统�
   } finally { await f.close(); }
 });
 
+test("R-64-NATIVE-003：会话按持久generation/result_index排序，resume归零和墙钟回拨不丢样本", async () => {
+  const f = await fixture();
+  try {
+    const observation = createRuntimeObservability(f);
+    const first = usage({ source: "claude-code", harnessVersion: "2.1.322", metric: "costUsd", scope: "session",
+      cumulative: true, runnerGeneration: 7, sequence: 4, value: 20, reportedAt: "2026-11-10T02:00:00.000Z" });
+    assert.equal((await observation.observeUsage(first)).stored, true);
+    const resumed = { ...first, runnerGeneration: 8, sequence: 0, value: 23, reportedAt: "2026-11-10T01:00:00.000Z" };
+    assert.equal((await observation.observeUsage(resumed)).stored, true);
+    const reloaded = createRuntimeObservability(f);
+    assert.equal((await reloaded.observeUsage({ ...resumed, value: 999 })).duplicate, true);
+    assert.equal((await reloaded.observeUsage({ ...first, sequence: 100, value: 999 })).duplicate, true);
+    assert.equal((await reloaded.observeUsage({ ...resumed, sequence: 1, value: 26, reportedAt: "2026-11-10T00:00:00.000Z" })).stored, true);
+    const rows = await reloaded.listUsage({ bindingId: first.bindingId });
+    assert.equal(rows.length, 1); assert.equal(rows[0]!.value, 26);
+    assert.equal(rows[0]!.runnerGeneration, 8); assert.equal(rows[0]!.sequence, 1);
+    assert.equal(rows[0]!.delta, 3, "仅这个独立complete夹具可计算差额；真实CLI parser仍partial");
+    assert.equal((await reloaded.list()).events.length, 3);
+  } finally { await f.close(); }
+});
+
+test("R-64-NATIVE-003：旧无代次快照不成为差额基线，已知高水位仍保留", async () => {
+  const f = await fixture();
+  try {
+    const observation = createRuntimeObservability(f);
+    const first = usage({ scope: "session", metric: "costUsd", cumulative: true, sequence: 4, value: 20 });
+    await observation.observeUsage(first);
+    const legacy = { ...(await observation.listUsage({ bindingId: first.bindingId }))[0]! };
+    delete (legacy as { runnerGeneration?: number }).runnerGeneration;
+    await f.db.exec("UPDATE agent_runtime_usage_snapshots SET payload = ? WHERE id = ?", [JSON.stringify(legacy), legacy.id]);
+    assert.equal((await observation.observeUsage({ ...first, runnerGeneration: 2, sequence: 0, value: 23 })).stored, true);
+    let snapshot = (await observation.listUsage({ bindingId: first.bindingId }))[0]!;
+    assert.equal(snapshot.delta, null); assert.equal(snapshot.reasonCode, "baseline_unknown");
+    assert.equal(snapshot.cumulativeHighWatermark, 23);
+    await observation.observeUsage({ ...first, runnerGeneration: 3, sequence: 0, value: 3 });
+    await createRuntimeObservability(f).observeUsage({ ...first, runnerGeneration: 4, sequence: 0, value: 5 });
+    snapshot = (await observation.listUsage({ bindingId: first.bindingId }))[0]!;
+    assert.equal(snapshot.value, 5); assert.equal(snapshot.cumulativeHighWatermark, 23);
+    assert.equal(snapshot.delta, null); assert.equal(snapshot.epochReliable, false);
+    assert.equal(snapshot.coverage, "partial"); assert.equal(snapshot.reasonCode, "cumulative_reset");
+    const missingGeneration = { ...first, runnerGeneration: undefined };
+    assert.equal((await observation.observeUsage(missingGeneration as unknown as NormalizedUsageObservation)).stored, false);
+  } finally { await f.close(); }
+});
+
 test("OBS-74-08：记录拒绝和数据库持续不可用仍返回可见故障，不抛出原始诊断", async () => {
   const f = await fixture();
   try {
@@ -241,6 +286,15 @@ test("OBS-74-06/07 PostgreSQL：跨连接容量锁、并发去重和乱序快照
     assert.equal(snapshots[0]?.value, 20);
     assert.equal(snapshots[0]?.sequence, 20);
     assert.equal((await one.observeUsage({ ...sample, sequence: 20, value: 20 })).duplicate, true);
+    const resumed = { ...sample, runnerGeneration: 2, sequence: 0, value: 23,
+      reportedAt: "2026-11-09T23:59:00.000Z" };
+    assert.equal((await two.observeUsage(resumed)).stored, true, "新的持久generation允许源序号和墙钟回退");
+    assert.equal((await one.observeUsage({ ...sample, sequence: 999, value: 999 })).duplicate, true);
+    assert.equal((await one.observeUsage({ ...resumed, value: 999 })).duplicate, true);
+    const resumedRows = await one.listUsage({ bindingId: sample.bindingId });
+    assert.equal(resumedRows.length, 1); assert.equal(resumedRows[0]?.value, 23);
+    assert.equal(resumedRows[0]?.runnerGeneration, 2); assert.equal(resumedRows[0]?.sequence, 0);
+    assert.equal(resumedRows[0]?.delta, 3);
     assert.equal((await two.health()).incomplete, false);
     assert.ok((await two.list()).events.length <= 3);
   } finally {

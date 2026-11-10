@@ -5,6 +5,7 @@ export const CLAUDE_TOOLS = Object.freeze(["Read", "Write", "Edit", "Glob", "Gre
 /** 纯 argv 构造；无 shell、无用户任意 flags/env。MCP 和权限策略由服务端固定。 */
 export function buildHostArguments(snapshot: HostLaunchSnapshot): readonly string[] {
   if (snapshot.backend !== "claude-code") throw new Error("profile_unsupported");
+  if (!["auto", "manual"].includes(snapshot.config.permissionMode)) throw new Error("profile_unsupported");
   const mode = snapshot.config.bypass ? "bypassPermissions" : snapshot.config.permissionMode;
   if (mode !== "auto" && mode !== "bypassPermissions") throw new Error("profile_unsupported");
   const tools = snapshot.config.tools ?? CLAUDE_TOOLS;
@@ -13,9 +14,9 @@ export function buildHostArguments(snapshot: HostLaunchSnapshot): readonly strin
     "--permission-mode", mode, "--permission-prompts", "none", "--strict-mcp-config",
     "--mcp-config", "/run/boardroom/mcp.json", "--setting-sources", "", "--disable-slash-commands",
     "--no-chrome", "--tools", tools.join(","), "--settings", "/run/boardroom/settings.json"];
-  // restricted 明确拒绝 bypassPermissions。高级策略不得偷偷去掉 restricted 再声称同等已验证。
+  // 两档在 launcher 中分别匹配已验证 profile；此处只构造该档参数，不能提升支持。
+  // restricted 拒绝 bypass，但会保留 --tools 明确列出的 Bash；文件/网络边界由 Linux 隔离负责。
   if (!snapshot.config.bypass) args.push("--restricted");
-  else throw new Error("profile_unsupported");
   // = 固定值边界，值以 -- 开头时也不能被 CLI parser 解释成另一个开关。
   if (snapshot.config.model) args.push(`--model=${snapshot.config.model}`);
   if (snapshot.config.systemPrompt) args.push(`--append-system-prompt=${snapshot.config.systemPrompt}`);

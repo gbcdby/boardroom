@@ -37,7 +37,7 @@ async function processStartTicks(pid: number): Promise<string> {
 export async function captureOwnedProcessIdentity(child: ChildProcess): Promise<OwnedProcessIdentity | undefined> {
   if (process.platform !== "linux" || !child.pid || child.exitCode !== null || child.signalCode !== null) return undefined;
   const prefix = ["/usr/bin/unshare", "--user", "--map-root-user", "--net", "--fork", "--kill-child=SIGKILL", "/usr/bin/python3",
-    fileURLToPath(new URL("../isolation/network-init.py", import.meta.url)), "/usr/bin/bwrap", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent", "--new-session", "--cap-drop", "ALL", "--clearenv"];
+    fileURLToPath(new URL("../isolation/network-init.py", import.meta.url)), "/usr/bin/bwrap", "--unshare-user", "--uid", "1000", "--gid", "1000", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent", "--new-session", "--cap-drop", "ALL", "--clearenv"];
   if (child.spawnfile !== prefix[0] || prefix.some((part, i) => child.spawnargs[i] !== part)) return undefined;
   try {
     const [kernelBootId, namespace, startTicks, childNamespace] = await Promise.all([

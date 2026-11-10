@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { newId } from "../db/ids.ts";
 import type { DbDriver } from "../db/driver.ts";
 import type { Logger } from "../logger.ts";
@@ -38,6 +38,7 @@ interface ActiveRunner {
   stopping: boolean;
   yielded: boolean;
   permission: string;
+  observedSessionId: string | null;
   failure: RuntimeReasonCode | null;
   eventChain: Promise<void>;
   completion: Promise<void> | null;
@@ -67,6 +68,17 @@ export function hostReason(reason: string): RuntimeReasonCode {
 
 function requiresExplicitRetry(reason: string | null): boolean {
   return reason !== null && ["auth_required", "permission_required", "configuration_invalid", "profile_unsupported", "protocol_invalid"].includes(reason);
+}
+
+/** 域分离的内部引用：跨 resume 稳定，不在观测中暴露 CLI SID，也不读取会话文件。 */
+function usageSessionReference(bindingId: string, sessionId: string): string {
+  const bytes = createHash("sha256").update(JSON.stringify(["boardroom-usage-session-v1", bindingId, sessionId])).digest().subarray(0, 16);
+  let bits = 0n;
+  for (const byte of bytes) bits = (bits << 8n) | BigInt(byte);
+  const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  let result = "";
+  for (let index = 0; index < 26; index += 1) { result = alphabet[Number(bits & 31n)]! + result; bits >>= 5n; }
+  return result;
 }
 
 export function launchSnapshot(view: RuntimeBindingView, owner: string, socketPath: string): HostLaunchSnapshot {
@@ -209,7 +221,10 @@ export function createRuntimeSupervisor(options: {
         await maybeReady(item);
         break;
       }
-      case "session": await repo.setSession(item.fence, event.sessionId); break;
+      case "session":
+        await repo.setSession(item.fence, event.sessionId);
+        item.observedSessionId = event.sessionId;
+        break;
       case "permission_denied":
         // 一次操作拒绝不是整轮结束，不 ACK、不杀进程、不清空队列。
         await record(view, "observation_warning", { reasonCode: "permission_required", attemptId: item.attemptId });
@@ -229,16 +244,27 @@ export function createRuntimeSupervisor(options: {
         break;
       case "usage_unavailable":
         await record(view, "usage_unavailable", { reasonCode: "usage_missing", attemptId: item.attemptId }); break;
-      case "usage":
+      case "usage": {
+        let scopeId = item.attemptId; let epochId = item.epochId;
+        if (event.scope === "session") {
+          if (!item.observedSessionId || event.sessionId !== item.observedSessionId || event.sessionId !== view.runner.harnessSessionId) {
+            await record(view, "usage_unavailable", { reasonCode: "usage_missing", attemptId: item.attemptId });
+            break;
+          }
+          scopeId = usageSessionReference(view.binding.id, item.observedSessionId);
+          // 没有可靠的原生 reset 信号时，不能以新 attempt 洗掉同会话的累计回退。
+          epochId = scopeId;
+        }
         await options.observations.observeUsage({ bindingId: view.binding.id, runtimeId: view.runtime.id,
           projectId: view.binding.projectId, memberId: view.binding.memberId,
           runnerGeneration: item.fence.generation, attemptId: item.attemptId,
           source: event.source, harnessVersion: event.harnessVersion, metric: event.metric,
-          scope: event.scope, scopeId: item.attemptId, epochId: item.epochId,
+          scope: event.scope, scopeId, epochId,
           sequence: event.sequence, reportedAt: new Date(now()).toISOString(), coverage: event.coverage,
           value: event.value, cumulative: event.cumulative, schemaVerified: event.schemaVerified,
           zeroMeaningful: event.zeroMeaningful, successful: event.successful });
         break;
+      }
       case "exit": break; // 只由 ownedChild.exited 确认进程退出，输出文本不能释放所有权。
     }
   }
@@ -313,7 +339,7 @@ export function createRuntimeSupervisor(options: {
     const item: ActiveRunner = { fence, attemptId: newId(), epochId: newId(), startedAt: now(),
       snapshot: launchSnapshot(claimed, owner, ""), preflight, gateway: null, child: null,
       joined: false, ready: false, readyAt: null, safe: false, delivered: false, stopping: false, yielded: false,
-      permission: "unknown", failure: null, eventChain: Promise.resolve(), completion: null };
+      permission: "unknown", observedSessionId: null, failure: null, eventChain: Promise.resolve(), completion: null };
     active.set(b.id, item);
     try {
       item.gateway = await (options.gatewayFactory ?? createRuntimeGateway)({ db: options.db, logger: options.logger,

@@ -8,6 +8,8 @@ import { createWritableFilesystemBoundary, verifyExpectedDirectoryLocation, type
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SYSTEM_ROOTS = ["/usr", "/bin", "/lib", "/lib64"];
+// 只把发起者映射为私有 namespace 内的非零身份；不新增宿主权限或规避 CLI 的 root 守卫。
+const SANDBOX_USER = ["--unshare-user", "--uid", "1000", "--gid", "1000"] as const;
 
 export interface LinuxIsolationInput {
   readonly executable: string;
@@ -86,7 +88,7 @@ export async function linuxIsolationAvailable(): Promise<boolean> {
     // 只验证原语可建立；这不是 CLI host/version 的支持声明。
     return await new Promise<boolean>(resolve => {
       const child = spawn("/usr/bin/unshare", ["--user", "--map-root-user", "--net", "--fork", "/usr/bin/python3", path.join(HERE, "network-init.py"),
-        "/usr/bin/bwrap", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent", "--new-session", "--cap-drop", "ALL",
+        "/usr/bin/bwrap", ...SANDBOX_USER, "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent", "--new-session", "--cap-drop", "ALL",
         "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib", "/lib", "--ro-bind-try", "/lib64", "/lib64", "--proc", "/proc", "--dev", "/dev", "/bin/true"],
       { shell: false, stdio: "ignore", env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" } });
       const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(false); }, 5000);
@@ -141,7 +143,7 @@ export async function prepareLinuxIsolation(input: LinuxIsolationInput): Promise
     const sessionHandle = await open(sessionPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY); handles.push(sessionHandle);
     await verifyExpectedDirectoryLocation(sessionHandle, stateHandle, `sessions/${sessionKey}`);
 
-    const bwrap = ["--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent", "--new-session", "--cap-drop", "ALL", "--clearenv"];
+    const bwrap = [...SANDBOX_USER, "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent", "--new-session", "--cap-drop", "ALL", "--clearenv"];
     for (const root of SYSTEM_ROOTS) {
       try { await access(root); bwrap.push("--ro-bind", root, root); } catch { /* libc 目录按主机存在性 */ }
     }

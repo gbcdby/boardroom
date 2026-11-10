@@ -41,11 +41,11 @@ export interface HostPreflight {
 
 export type ObservedPermissionMode = "auto" | "bypassPermissions" | "manual" | "dontAsk" | "plan" | "acceptEdits" | "unknown";
 
-export interface HostUsageEvent {
+interface HostUsageMetric {
   readonly type: "usage";
   readonly source: ManagedBackend;
   readonly harnessVersion: string;
-  readonly scope: "invocation";
+  /** 可信 schema 指定的原生结果顺序，不是 num_turns 或接收时间。 */
   readonly sequence: number;
   readonly metric: "inputTokens" | "cachedInputTokens" | "outputTokens" | "costUsd";
   readonly value: number;
@@ -55,6 +55,12 @@ export interface HostUsageEvent {
   readonly coverage: "partial";
   readonly schemaVerified: true;
 }
+
+export type HostUsageEvent = HostUsageMetric & (
+  | { readonly scope: "invocation" }
+  /** 仅供 supervisor 校验实际归属；原生 SID 不能进入公开观测。 */
+  | { readonly scope: "session"; readonly sessionId: string }
+);
 
 export type HostEvent =
   | { readonly type: "ready"; readonly permissionMode: ObservedPermissionMode }
@@ -139,9 +145,10 @@ export interface VerifiedHostProfile {
 
 export interface VerifiedUsageSchema {
   readonly format: "claude-result-v1";
+  readonly sequenceField: "result_index";
   /** 每项分别固定真实取样确认的作用域。未确认字段保持未知，尤其是 total_cost_usd。 */
   readonly metrics: Readonly<Partial<Record<"inputTokens" | "cachedInputTokens" | "outputTokens" | "costUsd", {
-    readonly scope: "invocation";
+    readonly scope: "invocation" | "session";
     readonly cumulative: boolean;
     readonly zeroMeaningful: boolean;
   }>>>;
