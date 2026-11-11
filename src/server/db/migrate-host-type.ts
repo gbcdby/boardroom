@@ -69,6 +69,10 @@ function countRows(db: Database.Database, table: string, hostType: string): numb
   return row.c;
 }
 
+function hasAliases(db: Database.Database): boolean {
+  return Boolean(db.prepare("SELECT version FROM schema_migrations WHERE version = 14").get());
+}
+
 /**
  * Pre-flight：统计将受影响 / 将跳过 / 会冲突的行。
  *
@@ -81,7 +85,7 @@ function preflight(db: Database.Database): Preflight {
   const otherSessions = countRows(db, "mcp_sessions", "other");
   const dshSessions = countRows(db, "mcp_sessions", "dsh");
 
-  const collisions = (
+  const collisions = new Set((
     db
       .prepare(
         `SELECT display_name FROM agents
@@ -90,9 +94,15 @@ function preflight(db: Database.Database): Preflight {
          HAVING COUNT(DISTINCT host_type) > 1`,
       )
       .all() as { display_name: string }[]
-  ).map((r) => r.display_name);
+  ).map((r) => r.display_name));
+  if (hasAliases(db)) {
+    const reserved = db.prepare(`SELECT a.display_name FROM agents a JOIN agent_legacy_aliases l
+      ON l.display_name = a.display_name AND l.host_type IN ('other', 'dsh')
+      WHERE a.host_type = 'other' AND (l.agent_id <> a.id OR l.retired_at IS NOT NULL)`).all() as { display_name: string }[];
+    for (const row of reserved) collisions.add(row.display_name);
+  }
 
-  return { otherAgents, dshAgents, otherSessions, dshSessions, collisions };
+  return { otherAgents, dshAgents, otherSessions, dshSessions, collisions: [...collisions].sort() };
 }
 
 /**
@@ -133,6 +143,17 @@ export function migrateOtherToDsh(db: Database.Database, opts: MigrateOptions = 
     }
 
     const now = new Date().toISOString();
+    if (hasAliases(db)) {
+      // 全部目标冲突已在同一事务预检。保留原 alias，仅追加相同稳定 ID 的新宿主 alias。
+      const rows = db.prepare("SELECT id, display_name, created_at FROM agents WHERE host_type = 'other'").all() as
+        { id: string; display_name: string; created_at: string }[];
+      const insert = db.prepare(`INSERT INTO agent_legacy_aliases (display_name, host_type, agent_id, created_at)
+        VALUES (?, ?, ?, ?) ON CONFLICT (display_name, host_type) DO NOTHING`);
+      for (const row of rows) {
+        insert.run(row.display_name, "other", row.id, row.created_at);
+        insert.run(row.display_name, "dsh", row.id, now);
+      }
+    }
     const agentRes = db
       .prepare(`UPDATE agents SET host_type = 'dsh', updated_at = ? WHERE host_type = 'other'`)
       .run(now);

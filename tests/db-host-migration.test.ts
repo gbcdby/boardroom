@@ -81,6 +81,28 @@ function countSessions(db: Database.Database, hostType: string): number {
   return (db.prepare("SELECT COUNT(*) AS c FROM mcp_sessions WHERE host_type = ?").get(hostType) as { c: number }).c;
 }
 
+test("S2 alias：other→dsh 保留旧 alias 与已改显示名；隐藏的历史别名冲突也整体拒绝", async () => {
+  await withCtx(async ctx => {
+    const old = await ctx.repos.agents.create({ displayName: "改名前", hostType: "other" });
+    await ctx.repos.agents.rename(old.id, "改名前", "改名后");
+    const reserved = await ctx.repos.agents.create({ displayName: "改名后", hostType: "dsh" });
+    await ctx.repos.agents.rename(reserved.id, "改名后", "另一个稳定身份");
+    const beforeAgents = ctx.db.prepare("SELECT * FROM agents ORDER BY id").all();
+    const beforeAliases = ctx.db.prepare("SELECT * FROM agent_legacy_aliases ORDER BY display_name, host_type").all();
+    assert.throws(() => migrateOtherToDsh(ctx.db), HostTypeMigrationCollisionError);
+    assert.deepEqual(ctx.db.prepare("SELECT * FROM agents ORDER BY id").all(), beforeAgents);
+    assert.deepEqual(ctx.db.prepare("SELECT * FROM agent_legacy_aliases ORDER BY display_name, host_type").all(), beforeAliases);
+    await ctx.repos.agents.rename(old.id, "改名后", "无冲突的新名字");
+    assert.equal(migrateOtherToDsh(ctx.db).changedAgents, 1);
+    for (const name of ["改名前", "改名后", "无冲突的新名字"]) {
+      const agent = await ctx.repos.agents.findByIdentity(name, "other");
+      assert.equal(agent?.id, old.id); assert.equal(agent?.displayName, "无冲突的新名字");
+    }
+    assert.equal((await ctx.repos.agents.findByIdentity("无冲突的新名字", "dsh"))?.id, old.id);
+    assert.equal((await ctx.repos.agents.findByIdentity("改名后", "dsh"))?.id, reserved.id);
+  });
+});
+
 test("T3-1：迁移把历史 other→dsh，已 dsh 行不变", async () => {
   await withCtx(async (ctx) => {
     await ctx.join("k1", "OldOther", "other");

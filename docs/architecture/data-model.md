@@ -1,10 +1,10 @@
 # 数据模型与持久化
 
 状态：已确认
-日期：2026-10-22 初版；2026-11-11 补 v11/v12/v13 任务、记忆、成员代际与共同事务边界
-来源：F2 #12、阶段 2 Spec #45、阶段 3 Spec #104、阶段 4 Spec #108、阶段 5 Spec #109。
+日期：2026-10-22 初版；2026-11-11 补 v11–v14 任务、记忆、成员代际、稳定身份与共同事务边界
+来源：F2 #12、阶段 2 Spec #45、阶段 3 Spec #104、阶段 4 Spec #108、阶段 5 Spec #109、协作平台 S2 #126 / T1 #134。
 
-本文描述服务端的持久化实体、关系、约束、迁移与事务边界。具体 DDL 以[迁移入口](../../src/server/db/migrations/index.ts)及其子模块为准。v13 属当前工程候选；实现存在不代表该候选已合并、上线或完成双引擎验收，实际状态见 [V1 索引](../v1-acceptance.md)。运行默认 SQLite，可选 PostgreSQL；产品 AC-CORE-01 的 PostgreSQL 验收要求不等于修改默认驱动。
+本文描述服务端的持久化实体、关系、约束、迁移与事务边界。具体 DDL 以[迁移入口](../../src/server/db/migrations/index.ts)及其子模块为准。v14 属当前工程候选；实现存在不代表该候选已合并、上线或完成双引擎验收，V1 状态见 [V1 索引](../v1-acceptance.md)，v14 见 [S2-T1 #134](https://github.com/gbcdby/boardroom/issues/134)。运行默认 SQLite，可选 PostgreSQL；产品 AC-CORE-01 的 PostgreSQL 验收要求不等于修改默认驱动。
 
 ## 1. 实体与关系
 
@@ -12,7 +12,9 @@ Agent 是跨项目身份，Member 是项目中的关系；组织节点、群组�
 
 | 实体 | 含义 | 关键字段 |
 | --- | --- | --- |
-| **Agent** | 跨项目的全局身份 | `display_name`、`host_type`、`last_seen_at` |
+| **Agent** | 跨项目的全局身份 | 稳定 `id`、可改 `display_name`、`host_type`、`last_seen_at` |
+| **AgentLegacyAlias** | 旧客户端永久接入键 | `(display_name, host_type)`、`agent_id`、`retired_at` |
+| **RoleTemplate / RoleTemplateVersion** | 职责元数据及不可变修订 | 稳定 ID、revision、推荐技能固定引用、复制来源版本、归档时间 |
 | **Project** | 协作容器；按项目作用域建模（阶段 2 起多项目并用） | `name`、`archived_at` |
 | **Member** | agent 或人在项目中的成员关系、岗位与加入代际 | `project_id`、`agent_id`、`kind`、`role`、`node_id`、`status`、`removed_at`、`membership_revision` |
 | **OrgNode** | 组织岗位节点（多层树，汇报线 = `parent_id`） | `project_id`、`parent_id`、`name`、`role`、`sort_order` |
@@ -36,6 +38,7 @@ Agent 是跨项目身份，Member 是项目中的关系；组织节点、群组�
 - **Agent** 是全局身份，跨项目存在。连接相关字段只持久化可恢复的 `last_seen_at`（最近观察到的连接活动时间）；**连接是否存活由运行时按心跳推导，连接对象不落库**。
 - **Member** 是 agent 或人在某个项目中的成员关系。`kind='agent'` 的成员必须绑定 `agent_id`；`kind='human'` 的成员不绑定（由 CHECK 强制）。
 - 同一 Agent 可在多个项目中各有一个 Member；`(project_id, agent_id)` 唯一。
+- v14 将旧 `(displayName, hostType)` 接入键保留为永久 alias，稳定身份仍为 agentId。改名以 expectedDisplayName CAS 执行，保留旧 alias；旧 MCP 重连读取当前显示名，不改回旧名。未引用 Agent 的低层删除保留退休 alias/ID，被引用删除失败整体回滚。详见[角色库与稳定身份](../identity-catalog.md)。
 
 ### 1.2 Status vs Agent 连接状态（D1）
 
@@ -147,6 +150,16 @@ SQLite 使用 AFTER INSERT/UPDATE/DELETE trigger；PG 使用等价 PL/pgSQL trig
 
 成员的 `ix_members_effective` 与参与/任务/轮次/请求/事件/会话/绑定/组织 seek 索引用于有界采集。完整补偿快照使用有版本的 graph/assignment/member-status/member-relations schema，记录根审计与 undo/redo 方向。旧不完整删除/关系快照安全返回 `legacy_incomplete_snapshot`，历史仍可读；兼容解析只用于具备足够事实的旧简单事件。
 
+### 1.11 职责模板、永久 alias 与 user 审计（v14）
+
+[identity-catalog.ts](../../src/server/db/migrations/identity-catalog.ts) 增加 `role_templates`、`role_template_versions` 与 `agent_legacy_aliases`。职责模板以 revision CAS 追加不可变版本，复制来源由复合外键固定到具体修订；被历史副本引用的模板不能删除，只能归档。职责名不授予权限，推荐技能引用仅为元数据。
+
+alias 从现存 Agent 精确回填，之后只追加不重分配。表内保留旧稳定 ID 与退休时间，特意不设 Agent 的级联外键，以兼容原有未引用 Agent 删除并阻止旧接入键复用。活 alias 指向缺失 Agent 属损坏引用，预检报告 `migration_identity_ambiguous`。
+
+原 `audit_log` 增加 scope，旧记录保留为 project；user scope 的 project_id 必须为 NULL，project scope 必须非空。旧列和项目索引保持，全局目录写入不建立伪项目。职责/alias 修改与 user 审计同事务提交。
+
+Profile/Binding 仅提供旧 runtime 的只读来源视图，无第二套配置表。预检保留 raw advanced 与实际有效性、requested/applied/effective 三份来源、原始 SID/意图/目录；纯选择器按 requested → applied → 本次完整 effective 返回固定引用，不启动、不激活失效高级策略、不消费意图。详细契约见[角色库与旧配置来源](../identity-catalog.md)。
+
 ## 2. 稳定 ID 方案
 
 - 采用 **UUIDv7 值编码为 26 位 Crockford Base32**（ULID 形状），实现见 `src/server/db/ids.ts`。
@@ -193,10 +206,13 @@ SQLite 使用 AFTER INSERT/UPDATE/DELETE trigger；PG 使用等价 PL/pgSQL trig
   - `11 tasks_reviews_and_work_events`：项目任务、默认 reviewer、固定轮次、两轴报告/评论、历史、消息关联与持久工作事件。
   - `12 memory_documents_summaries_and_scan_checkpoints`：三层文档/历史、自总结请求、首次投递收据/计数/游标；追加真实 MCP 投递标记和群上下文事件。
   - `13 member_tombstones_and_retained_fact_revisions`：保留身份墓碑、单调加入代际、六类事实版本/双引擎 trigger 与有界采集索引。
+  - `14 identity_catalog_roles_aliases_user_audit`：职责模板头/不可变版本、永久 legacy alias 和 user/project scope 一致性审计；旧 runtime 保持配置写权威。
 - 生产迁移保持 SQLite/PostgreSQL 可执行；跨驱动搬运使用 `migrate-data.ts` 的对应目标 DDL、列复制与逐表校验。托管表、已应用快照、进程归属和观测基线均在搬运范围内。
 - `schema.test.ts` 校验当前版本及老库升级，`runtime-repository.test.ts` 与 `migrate-data.test.ts` 检查非空配置、投递和所有权的保留。只读内核核验不依赖迁移重造 PID。
 
 跨驱动复制不修改旧迁移 checksum。源库使用同版本 schema 后只读打开；目标先迁移，再按外键顺序复制。成员插入和事实表复制会触发目标 revision 递增，因此 **member_fact_revisions 最后复制**：先移除目标自动生成的版本行，再原值写入源版本，并逐键/值核对。不能把目标触发出的临时 revision 当源库事实。
+
+v14 的 alias（含退休记录）、职责头/全部版本和 user 审计进入同一搬运清单。职责版本按复制来源依赖排序，清空时先删版本再删头；固定来源引用不能靠级联删除消除。
 
 清空目标时先删六类事实，让仍存在的 Member 基准接收删除 trigger；再删除 Member，随后清理剩余事实版本。不能简单把 copy-last 表放到反向顺序首位，否则删除事实时会失去基准而失败。项目 purge 同样在硬删 Member 前清完依赖事实，成员事实版本由外键级联；普通移除不硬删它们。rollback 只处理指定目标，保留源数据；具体命令见[接入与迁移说明](../getting-started-mcp.md#数据迁移与恢复)。
 
@@ -242,7 +258,7 @@ SQLite 使用 AFTER INSERT/UPDATE/DELETE trigger；PG 使用等价 PL/pgSQL trig
 
 | repository | 主要方法 |
 | --- | --- |
-| `agents` | `create / get / list / update / touchLastSeen / delete / insertRaw` |
+| `agents` | `create / get / list / findByIdentity / update / rename / aliases / addAlias / touchLastSeen / delete / insertRaw`；全局用户写入经 identity catalog service 同事务审计 |
 | `projects` | `create / get / list({includeArchived}) / rename / archive / restore / previewPurge / capturePurge / purge / delete` |
 | `members` | 有效成员读、历史作者 lookup、状态与生命周期 CAS；有权限的领域 service 负责移除/重新添加/完整审计，低层 delete 不是用户移除入口 |
 | `org`（T2 #49） | `createNode / getNode / listNodes / getRootNode / subtreeNodeIds / updateNode / deleteNode / assignNode / autoPlaceMember / nodeOfMember` |
