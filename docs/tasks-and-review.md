@@ -1,7 +1,7 @@
 # 任务与双轴评审
 
 状态：已确认（实现与使用说明；最终验收独立记录）
-日期：2026-11-10；2026-11-11 更新生命周期与验证边界
+日期：2026-11-10；2026-11-11 更新生命周期与外部复测边界
 需求来源：[主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)，AC-TASK-01～03、AC-REVIEW-01～05。
 
 任务归属于当前项目。任务板使用 `todo → in-progress → review → done`，阻塞单独显示为 `blocked`。编辑、状态、配置和评审操作使用对应的当前修订号；遇到 409 先读取最新数据，本地草稿保留，不能自动覆盖别人的改动。
@@ -73,6 +73,8 @@ node scripts/run-review-axes.mjs task-detail.json /path/to/codex
 
 平台接受的执行证据始终标记为 `reviewer-declared`；结构和 hash 校验不能证明外部模型已经运行。AC-REVIEW-04 需要真实完成的评审、两份原始执行记录、平台轮次与报告 ID、裁决后的状态读回。[2026-11-11 阶段 3 独立实测回传](https://github.com/gbcdby/boardroom/issues/107#issuecomment-6789489800)已在应用候选 `5c7f87f20c31f78eac9be5875e644d44033e3648` 完成：macOS 26.5.2 / SQLite，两个 Codex CLI 0.167.0 隔离上下文并行，指定 Claude Code 2.1.233 reviewer 提交两轴并裁决；[阶段 5 补验](https://github.com/gbcdby/boardroom/issues/107#issuecomment-6790049547)另绑定 `533e49da5d4e9d4a236d68e0bc23c03411caa5b1`。执行与原始材料核对归原独立执行者，交付方承接正式报告，未将其写成本机或修复后候选重跑。
 
-该回传发现 Codex reviewer 误读兄弟属性 `$ref`。任务工具现为每个公开字段导出内联类型和原有约束，仍拒绝字符串修订号及无效整数；没有改变 CAS、权限或裁决语义。实际 MCP schema/协议回归验证了这一表示修正，修复后真实 Codex reviewer 仍未重跑。已完成的 Claude reviewer 路径保留原候选身份，后续适用性与合并状态见 [Spec #104](https://github.com/gbcdby/boardroom/issues/104)及 [PR #99](https://github.com/gbcdby/boardroom/pull/99)。此前本机只读 Codex 运行目录的失败仍是该环境的历史事实，不代表外部实测未执行。
+该回传发现 Codex reviewer 误读兄弟属性 `$ref`。任务工具现为每个公开字段导出内联类型和原有约束，仍拒绝字符串修订号及无效整数；没有改变 CAS、权限或裁决语义。2026-11-11 用户提供的独立 `recheck-report.md` 追加修复后 main `89af568fe106a4d80c15189d8108a63298fac220` 的外部复验：macOS 26.5.2 / SQLite、Codex CLI 0.167.0 经原生 Streamable HTTP MCP，以 JSON 整数发送修订号；指定 reviewer 的 `begin_task_review` 成功进入 `running`，非指定成员得到 `FORBIDDEN / not_self`。这补齐的是 schema 修复后的接手成功与拒绝路径，完整新格式双轴评审与自总结全流程仍未重跑。报告还记录采集器拒绝 Markdown 占位正文、接受完整事实报告，以及两份目标测试共 27/27 通过；这些解析器与协议检查不计作真实模型全流程。
+
+上述新增报告的身份、摘要及证据范围见 [V1 验收索引 §2.4](v1-acceptance.md#24-合并后的外部局部复测)和 [Ticket #120](https://github.com/gbcdby/boardroom/issues/120)。原始 JSONL 仍由外部执行者保管，交付方承接报告，未把它写成本机重跑。已完成的 Claude reviewer 路径保留原候选身份，后续适用性与合并状态见 [Spec #104](https://github.com/gbcdby/boardroom/issues/104)及 [PR #99](https://github.com/gbcdby/boardroom/pull/99)。此前本机只读 Codex 运行目录的失败仍是该环境的历史事实，不代表外部实测未执行。
 
 完整 46 项验收映射、候选身份、历史证据与尚未执行范围见 [V1 验收证据索引](v1-acceptance.md)。`scripts/run-review-axes.mjs` 只产出真实执行材料，不自动替 reviewer 接受报告、覆盖裁决或合并代码。

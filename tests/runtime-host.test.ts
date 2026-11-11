@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { link, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { buildHostArguments, parseHostVersion } from "../src/server/runtime/hosts/adapters.ts";
@@ -126,7 +126,8 @@ test("R3 help/版本与模拟输出不能打开生产支持；普通失败不降
   const profilesBefore = structuredClone(VERIFIED_HOST_PROFILES);
   assert.equal(parseHostVersion("claude-code", "2.1.322 (Claude Code)\n"), "2.1.322");
   assert.equal(parseHostVersion("codex-cli", "codex-cli 0.167.0-alpha.4"), "0.167.0-alpha.4");
-  const root = await mkdtemp(path.join(tmpdir(), "br-host-"));
+  // macOS 的临时目录可经 /var 别名访问；夹具中的现有工作目录和未来保护路径统一使用真实根。
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "br-host-")));
   try {
     const workdir = path.join(root, "work"); await mkdir(workdir);
     const launcher = createHostLauncher({ stateRoot: path.join(root, "state"), protectedPaths: [path.join(root, "control")], installations: [{ backend: "claude-code", executable: "/does-not-exist" }] });

@@ -14,6 +14,7 @@ const profile: VerifiedHostProfile = { backend: "claude-code", version: "0.0.0-t
   executableSha256: "0".repeat(64), mode: "auto", evidence: "synthetic-layout-test-only", isolationProfile: "linux-private-net-v1",
   nativeCredentialLayout: "claude-linux-user-login-v1", egressPolicy: "anthropic-api-oauth-v1", resumeVerified: false };
 const SENTINEL = "SYNTHETIC_CREDENTIAL_MARKER_NOT_REAL_SECRET";
+const linuxLayoutOptions = { skip: process.platform !== "linux" ? "Linux 原生凭据布局仅在 Linux 验证；非 Linux 拒绝路径另测" : false };
 
 async function fixture() {
   const root = await mkdtemp(path.join(tmpdir(), "br-native-login-"));
@@ -26,7 +27,7 @@ async function fixture() {
   return { root, home, nativeDir, credentials, installation, close: () => rm(root, { recursive: true, force: true }) };
 }
 
-test("R3 默认二进制发现可接原生Linux布局，凭据只生成固定只读挂载与固定出口", async () => {
+test("R3 默认二进制发现可接原生Linux布局，凭据只生成固定只读挂载与固定出口", linuxLayoutOptions, async () => {
   const f = await fixture();
   try {
     // 故意不是JSON：resolver没有解析凭据，元信息通过也不声称token有效。
@@ -42,7 +43,7 @@ test("R3 默认二进制发现可接原生Linux布局，凭据只生成固定只
 });
 
 for (const kind of ["missing", "directory", "file-symlink", "directory-symlink"] as const) {
-  test(`R3 原生凭据${kind}不能成为受信认证挂载`, async () => {
+  test(`R3 原生凭据${kind}不能成为受信认证挂载`, linuxLayoutOptions, async () => {
     const f = await fixture();
     try {
       if (kind === "directory") await mkdir(f.credentials);
@@ -60,6 +61,14 @@ for (const kind of ["missing", "directory", "file-symlink", "directory-symlink"]
   });
 }
 
+test("R3 非Linux宿主拒绝Linux原生安装profile", { skip: process.platform === "linux" ? "仅在非 Linux 宿主验证平台保护" : false }, async () => {
+  const f = await fixture();
+  try {
+    await writeFile(f.credentials, SENTINEL, { mode: 0o600 });
+    await assert.rejects(resolveNativeInstallation(f.installation, profile, f.home), /^Error: profile_unsupported$/);
+  } finally { await f.close(); }
+});
+
 test("R3 profile必须声明已知认证与出口策略，Codex/dsh和任意URL均失败关闭", async () => {
   const f = await fixture();
   try {
@@ -74,7 +83,7 @@ test("R3 profile必须声明已知认证与出口策略，Codex/dsh和任意URL�
   } finally { await f.close(); }
 });
 
-test("R3 installation附加任意mount/env/endpoint不能覆盖profile固定策略", async () => {
+test("R3 installation附加任意mount/env/endpoint不能覆盖profile固定策略", linuxLayoutOptions, async () => {
   const profilesBefore = structuredClone(VERIFIED_HOST_PROFILES);
   const f = await fixture();
   try {
