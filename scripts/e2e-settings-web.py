@@ -122,7 +122,7 @@ def exercise(page, context, fixture, process, output, report):
     page.set_viewport_size({"width": 1440, "height": 1000})
     page.emulate_media(color_scheme="light")
     page.goto(origin + "/projects")
-    expect(page.get_by_test_id("current-project")).to_have_count(1)
+    expect(page.get_by_test_id("current-project")).to_have_count(0)
     page.get_by_role("link", name="设置", exact=True).focus()
     page.keyboard.press("Enter")
     expect(page).to_have_url(origin + "/settings")

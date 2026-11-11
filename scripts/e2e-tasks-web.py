@@ -69,6 +69,29 @@ def exercise(page, fixture, output, report):
     assert created["repoPath"] == fixture["repoPath"] and created["fixedPoint"] == fixture["fixedPoint"]
     report["checks"].append("AC-TASK-01: UI保存默认reviewer、完整创建，HTTP持久化字段一致")
 
+    for index in range(20):
+        request(page, origin, "POST", f"/api/projects/{pid}/tasks", {
+            "title": f"列表返回位置验收 {index + 1}", "body": "用于真实长列表滚动恢复检查。",
+            "assigneeMemberId": first["members"][0]["id"],
+        })
+    page.reload()
+    expect(page.get_by_test_id("task-board")).to_contain_text("列表返回位置验收 20")
+    page.get_by_test_id("task-state-filter").select_option("todo")
+    page.get_by_test_id("task-list-mode").click()
+    last_task = page.get_by_test_id("task-board").get_by_role("link").last
+    last_title = last_task.inner_text()
+    last_task.scroll_into_view_if_needed()
+    saved_scroll = page.evaluate("() => scrollY")
+    assert saved_scroll > 0, "长列表必须产生真实滚动，避免零位置假通过"
+    last_task.click()
+    expect(page.locator("h1")).to_have_text(last_title)
+    page.go_back()
+    expect(page.get_by_test_id("task-state-filter")).to_have_value("todo")
+    expect(page.get_by_test_id("task-list-mode")).to_have_attribute("aria-pressed", "true")
+    page.wait_for_function("saved => Math.abs(scrollY - saved) <= 2", arg=saved_scroll)
+    report["taskListReturn"] = {"beforeScrollY": saved_scroll, "afterScrollY": page.evaluate("() => scrollY"), "filter": "todo", "layout": "list"}
+    report["checks"].append("S6导航返回：长列表进入详情后浏览器返回，恢复当前项目筛选、列表布局和实际滚动位置")
+
     page.get_by_role("link", name="浏览器完整创建的任务", exact=True).click()
     expect(page.locator("h1")).to_have_text("浏览器完整创建的任务")
     page.get_by_test_id("task-edit-open").click()
@@ -124,8 +147,9 @@ def exercise(page, fixture, output, report):
     expect(page).to_have_url(origin + f"/projects/{other}/tasks")
     expect(page.get_by_test_id("task-title")).to_have_count(0)
     expect(page.get_by_test_id("task-board")).to_contain_text("乙项目独立任务")
-    page.get_by_role("navigation", name="主导航").get_by_role("link", name="组织与角色", exact=True).click()
-    expect(page).to_have_url(origin + f"/projects/{other}/org")
+    page.get_by_role("navigation", name="项目功能").get_by_role("link", name="成员", exact=True).click()
+    page.get_by_role("navigation", name="成员视图").get_by_role("link", name="组织与岗位", exact=True).click()
+    expect(page).to_have_url(origin + f"/projects/{other}/members?tab=organization")
     page.reload()
     expect(page.get_by_test_id("current-project")).to_have_value(other)
     page.goto(origin + f"/tasks?projectId={pid}")

@@ -70,7 +70,7 @@ def exercise(page, fixture, process, output, report):
     ids = fixture["requestIds"]
     shared_url = f"/api/projects/{pid}/memories/shared"
     member_url = f"/api/projects/{pid}/memories/agents/{primary}"
-    shared_page = f"/projects/{pid}/memory"
+    shared_page = f"/projects/{pid}/knowledge"
     member_page = shared_page + f"?scope=members&agentId={primary}"
     report.update({"checks": [], "screenshots": [], "layouts": [], "contrast": [], "pageErrors": [], "consoleErrors": []})
     page.on("pageerror", lambda error: report["pageErrors"].append(str(error)))

@@ -33,8 +33,8 @@ export function createCurrentProjectContext(options: ContextOptions = {}) {
   let pending: Promise<void> | null = null;
   let router: Router | null = null;
   let storage: ProjectStorage | null = options.storage ?? null;
-  if (options.storage === undefined && typeof localStorage !== "undefined") {
-    try { storage = localStorage; } catch { /* 禁用存储仍可使用 URL 导航。 */ }
+  if (options.storage === undefined) {
+    try { if (typeof localStorage !== "undefined") storage = localStorage; } catch { /* 属性 getter 也可能被浏览器禁用；URL 导航仍可用。 */ }
   }
   let remembered: string | null = null;
   try { remembered = storage?.getItem(STORAGE_KEY) ?? null; } catch { /* 存储不是可用性的前提。 */ }
@@ -113,10 +113,15 @@ export function createCurrentProjectContext(options: ContextOptions = {}) {
       if (error.value) return from.matched.length === 0 || to.fullPath === from.fullPath || mayLeave();
       const explicit = requestedProject(to);
       const choice = resolveSelection(explicit);
-      const section = typeof to.meta["projectSection"] === "string" ? to.meta["projectSection"] : (["/projects", "/"].includes(to.path) && explicit ? "overview" : null);
+      const legacySection = typeof to.meta["projectSection"] === "string" ? to.meta["projectSection"] : (["/projects", "/"].includes(to.path) && explicit ? "overview" : null);
+      const section = legacySection === "org" || legacySection === "status" ? "members"
+        : legacySection === "audit" ? "activity" : legacySection === "memory" ? "knowledge"
+        : legacySection === "groups" ? "chat" : legacySection;
       if (section) {
         const query = { ...to.query };
         delete query["projectId"];
+        if (legacySection === "org") query["tab"] = "organization";
+        if (legacySection === "status") query["tab"] = "status";
         const group = to.params["groupId"] ?? query["groupId"];
         const item = section === "chat" ? group : to.params["taskId"];
         if (section === "chat") delete query["groupId"];
@@ -156,7 +161,11 @@ export function createCurrentProjectContext(options: ContextOptions = {}) {
     }
     const current = router.currentRoute.value;
     const section = typeof current.meta["projectSection"] === "string" ? current.meta["projectSection"] : "overview";
-    const target: RouteLocationRaw = current.path === "/runtimes" ? { path: "/runtimes", query: { projectId: id } } : projectPath(id, section);
+    const query = { ...current.query };
+    for (const key of ["projectId", "groupId", "taskId", "agentId", "memberId", "conversationId", "scope"]) delete query[key];
+    const target: RouteLocationRaw = ["/runtimes", "/collaboration/connections"].includes(current.path)
+      ? { path: "/collaboration/connections", query: { ...query, projectId: id } }
+      : { path: projectPath(id, section), query };
     await router.push(target);
     return currentProjectId.value === id;
   }

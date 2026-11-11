@@ -4,7 +4,7 @@ import { nextTick } from "vue";
 import { byTestId, deferred, find, json, settle, textOf, withPage as renderPage, type UiElement } from "./helpers/web-ui.ts";
 
 function withPage(name: string, respond: (url: string, init: RequestInit | undefined) => Promise<Response> | Response, check: (container: UiElement) => Promise<void>): Promise<void> {
-  return renderPage(name, respond, check, { path: name === "ProjectsView" ? "/projects" : `/projects/project-1/${name === "OrgView" ? "org" : "audit"}` });
+  return renderPage(name, respond, check, { path: name === "ProjectsView" ? "/projects/project-1/overview" : `/projects/project-1/${name === "OrgView" ? "org" : "audit"}` });
 }
 
 const project = { id: "project-1", name: "界面验收", manager: null, archivedAt: null };
@@ -65,12 +65,12 @@ test("项目详情并行加载时，先完成的一项不会提前开放写入�
     return json({ projects: [project] });
   }, async (container) => {
     try {
-      assert.equal(byTestId(container, "create-project").props.disabled, true);
+      assert.equal(byTestId(container, "add-member").props.disabled, true);
     } finally {
       members.resolve(json({ members: [] }));
       await settle();
     }
-    assert.equal(byTestId(container, "create-project").props.disabled, false);
+    assert.equal(byTestId(container, "add-member").props.disabled, false);
   });
 });
 

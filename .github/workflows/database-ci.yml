@@ -351,6 +351,12 @@ jobs:
       - name: 只读设置、配置重启与键盘布局真实浏览器验证
         run: .agent-output/browser-venv/bin/python scripts/e2e-settings-web.py
 
+      - name: 聊天式导航、项目范围与草稿保护真实浏览器验证
+        run: .agent-output/browser-venv/bin/python scripts/e2e-navigation-web.py --artifacts .agent-output/navigation-web-e2e
+
+      - name: 三态主题、首帧与页面状态保持真实浏览器验证
+        run: .agent-output/browser-venv/bin/python scripts/e2e-theme-web.py
+
       - name: SQLite 固定负载与真实 DOM 消息时延
         run: .agent-output/browser-venv/bin/python scripts/e2e-v1-load-web.py --ci --db sqlite
 
@@ -371,6 +377,8 @@ jobs:
             .agent-output/tasks-web-e2e/
             .agent-output/memory-web-e2e/
             .agent-output/settings-web-e2e/
+            .agent-output/navigation-web-e2e/
+            .agent-output/theme-web-e2e/
             .agent-output/v1-load-web/
           include-hidden-files: true
           if-no-files-found: warn
