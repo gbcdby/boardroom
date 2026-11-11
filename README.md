@@ -22,7 +22,7 @@
 | 记忆 `/projects/:projectId/memory` | 项目共享与获授权成员文档、CAS 编辑、版本历史、自总结请求状态与重试；Agent global 无人类入口 | [三层记忆](docs/memory.md) |
 | 设置 `/settings` | 当前服务实际生效的只读配置、配置来源与重启生效说明、刷新与 MCP 地址复制 | [设置与配置生效](docs/settings.md) |
 
-项目页面共享顶部“当前项目”。URL 指定的项目优先；旧 `/chat`、`/org`、`/audit`、`/status`、`/tasks`、`/memory` 链接会规范化到该项目上下文。切换有草稿的页面需要确认，取消保留原 URL 和输入。`/settings` 是全局只读页面。真实模型双轴评审、自总结及 V1 总体验收仍为 **BLOCKED**，协议/页面实现不替代这些门槛。页面入口以[路由表](src/web/src/router.ts)为准。
+项目页面共享顶部“当前项目”。URL 指定的项目优先；旧 `/chat`、`/org`、`/audit`、`/status`、`/tasks`、`/memory` 链接会规范化到该项目上下文。切换有草稿的页面需要确认，取消保留原 URL 和输入。`/settings` 是全局只读页面。2026-11-11 已收到对应阶段和最终集成候选的真实双宿主、双轴评审、目标自总结及 macOS SQLite 验收回传；候选、修正后的证据适用性与整体交付状态见 [V1 验收索引](docs/v1-acceptance.md)和 [主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)。页面入口以[路由表](src/web/src/router.ts)为准。
 
 ## 快速开始
 
@@ -138,7 +138,7 @@ HTTP、MCP 与业务仓储已通过统一 `DbDriver` 接入两种数据库，选
 
 真实 PostgreSQL 测试需显式设置 `AGENT_STUDIO_PG_TEST_URL` 后运行 `npm test`；使用专用测试库。缺少 PG 配置时，相关用例会跳过或不注册，默认测试通过不证明 PG 运行路径已验收。三个 SDK e2e 命令默认用 SQLite，可通过 `AGENT_STUDIO_DB_DRIVER=postgres` 和 `AGENT_STUDIO_PG_CONNECTION_STRING` 切换。真实 Chromium 安装/运行及干净启动复验步骤见[接入指南](docs/getting-started-mcp.md#8-验收与可重复验证)。
 
-**SDK 检查不会启动真实模型或 harness**，也不覆盖浏览器中的完整人工操作。脚本输出中关于 Claude/Codex 的历史措辞，不应当作本次真实宿主验收。历史宿主结果见 [2026-11-03 验收报告](docs/t8-acceptance-report.md)与 [DSH 证据索引](evidence/real-host-retest/README.md)，适用范围如下：
+**SDK 检查不会启动真实模型或 harness**，也不覆盖浏览器中的完整人工操作。2026-11-11 的独立真实宿主回传见 [#112](https://github.com/gbcdby/boardroom/issues/112#issuecomment-6790053498)及 [V1 验收索引](docs/v1-acceptance.md)：Claude Code 2.1.233、Codex CLI 0.167.0，macOS 26.5.2 arm64 / SQLite / Streamable HTTP。它与 Linux 双数据库 CI 分开取证；没有将代理模型线路视为托管官方 OAuth profile，也没有宣称 macOS PostgreSQL 或修复后 Codex reviewer 已重新实测。更早的宿主结果见 [2026-11-03 验收报告](docs/t8-acceptance-report.md)与 [DSH 证据索引](evidence/real-host-retest/README.md)，适用范围如下：
 
 | 宿主 / 历史版本 | 已有历史记录 | 当前保守边界 |
 | --- | --- | --- |

@@ -1,36 +1,38 @@
 # V1 验收证据索引
 
-状态：工程候选验收已取证；V1 整体仍为 BLOCKED
+状态：工程证据与独立真实宿主回传已承接；修复后最终交付仍为 BLOCKED
 日期：2026-11-11
 范围：[主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)、[阶段 5 Spec #109](https://github.com/gbcdby/boardroom/issues/109)、[Ticket #112](https://github.com/gbcdby/boardroom/issues/112)。验收要求取自[产品基线 §8](architecture/agent-studio.md#8-产品验收基线)。
 
-**本索引包含全部 46 个 V1 验收项：37 项 PASS、6 项 NOT_RUN、3 项 BLOCKED。** 固定工程候选的真实 PostgreSQL、协议、安装重启、Chromium 和负载检查已经通过；尚缺的 6 项真实宿主 Core 验收，以及 REVIEW-04、MEM-04 和整体 HARD-05，均未以 SDK、合成报告或历史记录代替。macOS 首要平台验收 NFR-07 另记 `NOT_RUN`，因此本索引不宣告 V1 全项通过。
+**本索引承接全部 46 个 V1 验收项：45 项 PASS、0 项 NOT_RUN、1 项 BLOCKED。** 原 37 项工程/安装结果保留固定 CI 对象；六项 Core、REVIEW-04、MEM-04 已有独立真实宿主执行者的对应候选回传，见 §2.2。macOS 首要平台 NFR-07 为 **PASS（SQLite 范围）**，macOS PostgreSQL 未覆盖。报告新发现的任务 schema 与采集完整性修复已实现，正在独立复审；修复候选的必经 CI、证据适用性及最终交付尚待核对，HARD-05 因此仍为 BLOCKED。本版不宣告新候选已经在真实宿主重跑、PR 已合并或产品已部署。
 
 ## 1. 候选与记录口径
 
-本轮产品代码候选为 `4f1b5ebfd61eb2fc9f5d9da89a211e43b47ceaee`，tree 为 `5729fea69cb1a9e8c7c1f86dd65ff02023d1e8b3`；同树远端提交为 [`6c8f400bb63d2c6a4beb96a4d2afab0098ae4d1c`](https://github.com/gbcdby/boardroom/commit/6c8f400bb63d2c6a4beb96a4d2afab0098ae4d1c)。[CI 42959198409](https://github.com/gbcdby/boardroom/actions/runs/42959198409) 实际检出的 merge commit 为 `10797d3450a648d2868d9c7745db6c3dc9243477`，tree 与上述产品代码候选一致。不同 commit 身份保留在此，不能因 tree 相同而省略实际运行对象。
+已固定工程证据的产品代码候选为 `4f1b5ebfd61eb2fc9f5d9da89a211e43b47ceaee`，tree 为 `5729fea69cb1a9e8c7c1f86dd65ff02023d1e8b3`；同树远端提交为 [`6c8f400bb63d2c6a4beb96a4d2afab0098ae4d1c`](https://github.com/gbcdby/boardroom/commit/6c8f400bb63d2c6a4beb96a4d2afab0098ae4d1c)。[CI 42959198409](https://github.com/gbcdby/boardroom/actions/runs/42959198409) 实际检出的 merge commit 为 `10797d3450a648d2868d9c7745db6c3dc9243477`，tree 与上述产品代码候选一致。不同 commit 身份保留在此，不能因 tree 相同而省略实际运行对象。
 
-本文是工程候选之后的**纯文档增量**；它记录该工程候选的证据，不要求把本文自己的 commit 再填回本文形成递归绑定。产品代码变更需要重新判断证据有效范围；仅更新索引不能把未执行项变为通过。工程候选与后续文档的交付、独立审查及合并状态以 [PR #119 当前记录](https://github.com/gbcdby/boardroom/pull/119)为准；本文不据 CI 成功宣告已经合并、完成主线复验或部署。
+原最终文档候选为远端 `533e49da5d4e9d4a236d68e0bc23c03411caa5b1` / tree `f3ba63767d354febd37b2359414b70a6aab23af3`，对应本地 `043ff2e7c7471a4d0b73de55017c5a10502f988c`；外部最终集成实测绑定此对象。其与上段工程候选之间仅为 `docs/v1-acceptance.md` 文档增量；[最终文档 CI 42961222509](https://github.com/gbcdby/boardroom/actions/runs/42961222509) 两个 job 均通过，实际 checkout `4a26574f1e850ef7949554408c0b15e35c6bc2f6` 与该最终文档候选同树。
 
-每个 AC 记录由下表共同字段、命令目录、§2.1 证据组和该 AC 行合并得到。状态按该项完整范围判断；同组的自动化检查通过，也不代表未启动的真实宿主通过。
+本文这次只整理外部回传与剩余交付条件，不要求把本文自己的 commit 再填回本文形成递归绑定。§2.1 的工程运行、§2.2 的外部实测和后续修复候选是不同对象；旧证据保留原身份，跨版本适用性按 §2.3 核查，不能改标为修复后重跑。最终修复、独立审查、CI、合并和 main 结果以 [PR #119](https://github.com/gbcdby/boardroom/pull/119)及 [Spec #109](https://github.com/gbcdby/boardroom/issues/109)的固定候选记录为准。
+
+每个 AC 记录由下表共同字段、命令目录、§2.1/2.2 证据组和该 AC 行合并得到。状态按该项完整范围判断；同组的自动化检查通过，也不代表未启动的真实宿主通过。
 
 | 字段 | 本版值与填写规则 |
 | --- | --- |
 | `acceptanceId` | 每行唯一 AC ID，与产品基线的 46 项一一对应。 |
-| `candidateCommit` / `tree` | 工程候选、远端同树提交和 CI 实际 merge commit 如上；共同 tree 为 `5729fea69cb1a9e8c7c1f86dd65ff02023d1e8b3`。历史证据另列对象，不能拼接为本候选结果。 |
-| `dirtyManifest` | 工程 CI 为 `[]`：双数据库安装报告 `worktree: ""`，浏览器负载报告 `dirty: false`。本文工作树从工程候选干净检出，后续增量仅此文件。 |
+| `candidateCommit` / `tree` | §2.1 工程证据的共同 tree 为 `5729fea69cb1a9e8c7c1f86dd65ff02023d1e8b3`；§2.2 分列三个外部实测应用候选。被评审示例仓库的 base/candidate 不等于 Boardroom 应用版本；后续修复不得沿用旧身份。 |
+| `dirtyManifest` | 工程 CI 为 `[]`：双数据库安装报告 `worktree: ""`，浏览器负载报告 `dirty: false`。外部报告记载三个应用候选运行前后均为 `[]`；归原执行者核对。修复后集成树与工作区状态在对应 PR/CI 中另记，不与原实测对象混用。 |
 | `command` | 每行列出的命令组及指定测试/场景；正式结果保存真实 argv、工作目录、退出码。命令存在不代表已执行。 |
-| `environment` | CI：Ubuntu 24.04 runner，Linux `7.0.0-1017-azure x86_64`，Node `v24.22.2`，npm `11.19.1`，PostgreSQL `16.15`；SQLite 使用锁定依赖 `better-sqlite3 13.0.3`，报告未单列 SQLite 内核版本。Chromium `151.0.7922.34` / Playwright `1.62.0`。本地补充检查为 Linux、Node v24.22.1、npm 11.9.0；原生 CLI 环境独立见 `B-NATIVE`。 |
-| `observedAt` | 2026-11-11 UTC：CI 干净安装始于 04:26:27，全量测试于 04:31:46 完成，独立负载于 04:32:11 完成，协议/安装于 04:32:51 完成；页面/DOM 时间见证据组。日志包含更精确的各步骤时间。 |
+| `environment` | CI：Ubuntu 24.04 runner，Linux `7.0.0-1017-azure x86_64`，Node `v24.22.2`，npm `11.19.1`，PostgreSQL `16.15`；SQLite 使用锁定依赖 `better-sqlite3 13.0.3`，报告未单列 SQLite 内核版本。Chromium `151.0.7922.34` / Playwright `1.62.0`。本地补充检查为 Linux、Node v24.22.1、npm 11.9.0；外部真实 CLI 环境见 §2.2；此前本机环境限制另保留在 `B-NATIVE`。 |
+| `observedAt` | 2026-11-11 UTC：CI 干净安装始于 04:26:27，全量测试于 04:31:46 完成，独立负载于 04:32:11 完成，协议/安装于 04:32:51 完成；页面/DOM 时间见证据组。日志包含更精确的各步骤时间。外部实测为 2026-11-11（Asia/Shanghai，UTC+8），精确调用时间归原执行者日志。 |
 | `status` | 只用 `PASS`、`FAIL`、`BLOCKED`、`NOT_RUN`。测试工具的 SKIP 是该范围未验证，不是 PASS。静态检查另标 OBSERVED。 |
-| `evidence` | `E-*` 为本候选证据；`B-NATIVE` 为环境阻塞；`H-*` 仅历史背景。报告通过数量、跳过项及合成模型边界都保留。 |
-| `limitation` / `nextAction` | 每行末列明确尚缺范围与下一步。模型环境阻塞详见 §5；不能用协议夹具替代。 |
+| `evidence` | §2.1 的 `E-*` 为固定工程候选证据；§2.2 的 `E-NATIVE-*` 为外部执行者回传；`B-NATIVE` 为此前本机环境限制；`H-*` 仅历史背景。生产者、原候选、跳过项及合成模型边界均保留。 |
+| `limitation` / `nextAction` | 每行末列明确范围与下一步。修复后适用性见 §2.3，历史本机环境见 §5；不能用协议夹具替代外部真实执行。 |
 
 数据库、HTTP/MCP、真实浏览器、真实宿主模型分别记录。一次 SDK 调用只证明该协议路径；`reviewer-declared` / `agent-declared` 元数据只证明声明被校验和保存。消息入库、进入模型上下文、开始模型轮次和成功完成任务是不同事实。
 
 46 项分为：可由当前工程行为验收的 **36 项**、要求实际宿主或模型的 **8 项**（CORE-02/03/05/07/10/11、REVIEW-04、MEM-04）、安装与文档 **1 项**（HARD-04），以及整体完成条件 **1 项**（HARD-05）。CORE-03 的页面操作、CORE-07 的可靠投递回退、CORE-10 的支持表即使已有协议或文档证据，也不能单独通过其真实宿主范围。macOS 属于横切 NFR-07，单列状态，不增加第 47 个 AC。
 
-交付负责人已冻结同一产品候选的独立两轴结论，完整报告随 [PR #119](https://github.com/gbcdby/boardroom/pull/119) 保存：需求轴工程符合性 PASS、完整需求 INCONCLUSIVE / 工作 BLOCKED，REQ001–006 已验证，报告 SHA-256 `e37294fb6d1cb5b4232be53adeae478cb579be5b0433ab7fdc456d48412acf68`；标准轴代码 PASS，STD001–005 已验证，报告 SHA-256 `14177f291efaf305b3e97d962725e59e73772ba7b90c2603c49e8fdb7b80af9e`。这些是产品候选的独立结论；本文为作者整理的证据索引，后续纯文档增量仍随 PR 检查。
+交付负责人已冻结上述工程产品候选的独立两轴结论，完整报告随 [PR #119](https://github.com/gbcdby/boardroom/pull/119) 保存：需求轴工程符合性 PASS、完整需求 INCONCLUSIVE / 工作 BLOCKED，REQ001–006 已验证，报告 SHA-256 `e37294fb6d1cb5b4232be53adeae478cb579be5b0433ab7fdc456d48412acf68`；标准轴代码 PASS，STD001–005 已验证，报告 SHA-256 `14177f291efaf305b3e97d962725e59e73772ba7b90c2603c49e8fdb7b80af9e`。这些是当时产品候选与证据条件下的独立结论，不抹除历史 BLOCKED，也不自动变成修复候选的复审结论。本文承接新增外部执行证据；修复及本文增量仍需独立审查和最终检查。
 
 ## 2. 命令与证据目录
 
@@ -46,8 +48,8 @@
 | `C-UI` | `python scripts/e2e-webui.py`；`python scripts/e2e-tasks-web.py`；`python scripts/e2e-memory-web.py`；`python scripts/e2e-settings-web.py` | 安装 Playwright 及 Chromium 后执行真实页面操作、报告和截图；先 `npm run build`。默认产物在 `.agent-output/{webui,tasks-web,memory-web,settings-web}-e2e/`。SFC/DOM 定向测试不等同于 Chromium。 |
 | `C-MANAGED` | `python scripts/e2e-managed-web.py --ci`；`node --test 'tests/runtime-*.test.ts'` | 托管配置、状态和隔离协议。脚本使用 synthetic fixture，不能放行原生 CLI profile，也不替代外部真实宿主。 |
 | `C-HOST` | 按[三宿主指南](getting-started-mcp.md)配置真实 CLI，执行 `join → wait → send/ACK → 断开 → 新会话 join/wait` | 保存精确 CLI 版本、原始命令/输出、project/group/member/message ID、等待前后状态和重连结果。两 SDK 客户端不是两个真实宿主。 |
-| `C-REVIEW` | `node scripts/run-review-axes.mjs task-detail.json /path/to/codex`，再由指定 reviewer 显式提交两轴报告并裁决 | 输入必须是当前任务与固定轮次；两隔离上下文并行、真实模型事件、标准来源、fixed point、原始输出和最终平台状态都要保存。见[任务与评审](tasks-and-review.md)。当前 BLOCKED。 |
-| `C-SELF-SUMMARY` | 目标 Agent 在自己的有效 MCP 绑定中依次 `read_memory_summary → begin_memory_summary → submit_memory_summary` | 先由真实任务 done、N 条首次 MCP 投递或显式 session-end 触发；保留触发来源、request/attempt/version ID、真实模型原始输出及人工竞争测试。见[记忆文档](memory.md)。当前 BLOCKED。 |
+| `C-REVIEW` | `node scripts/run-review-axes.mjs task-detail.json /path/to/codex`，再由指定 reviewer 显式提交两轴报告并裁决 | 输入必须是当前任务与固定轮次；两隔离上下文并行、真实模型事件、标准来源、fixed point、原始输出和最终平台状态都要保存。见[任务与评审](tasks-and-review.md)。原候选真实回传见 `E-NATIVE-REVIEW`；新增采集合同的验证范围见 §2.3。 |
+| `C-SELF-SUMMARY` | 目标 Agent 在自己的有效 MCP 绑定中依次 `read_memory_summary → begin_memory_summary → submit_memory_summary` | 先由真实任务 done、N 条首次 MCP 投递或显式 session-end 触发；保留触发来源、request/attempt/version ID、真实模型原始输出及人工竞争测试。见[记忆文档](memory.md)。对应阶段与最终集成真实回传见 `E-NATIVE-MEM`。 |
 | `C-INSTALL` | 独立目录干净检出 → `npm ci` → 类型/必要测试 → `npm start` → health/页面深链 → MCP tools/list 与实际领域操作 → 正常停止 → 同数据重启 | 保存 Node/npm/OS/数据库/CLI 版本、启动日志、实际端口和重启后数据读回；HTTP 200、HTML 或 tools/list 单独不能证明完整使用流程。 |
 | `C-LOAD` | `node --test --test-concurrency=1 tests/lifecycle-load.acceptance.ts`；`python scripts/e2e-v1-load-web.py --ci --db sqlite`；在专用 PG 环境追加 `--db postgres` | 前者为真实数据库 + SDK InMemoryTransport，后者为生产 HTTP/MCP 与 Chromium DOM。逐次记录 1000/10,000 历史下的 remove/undo/redo、SQL/返回量、消息/ACK/心跳与 DOM 时延，不能互相替代。 |
 
@@ -55,15 +57,15 @@
 
 `C-INSTALL` 的生产 smoke 自动化入口为 `node scripts/e2e-install.mjs`，使用实际 `npm start/prestart`、独立临时配置/data、可选 PG 新 schema，检查 HTTP、32 个 MCP 工具、实际消息/ACK、正常关闭与同数据重启。数据库选择沿用 `AGENT_STUDIO_DB_DRIVER` + `AGENT_STUDIO_PG_CONNECTION_STRING`，原始报告为 `.agent-output/install-e2e/{sqlite,postgres}.json`，本轮结果为 `E-INSTALL`。干净检出的 `npm ci` 由安装环境/CI 单独记录，不由脚本伪造。
 
-### 2.1 本轮证据组
+### 2.1 已固定工程证据组
 
 共同 CI 为 [42959198409](https://github.com/gbcdby/boardroom/actions/runs/42959198409)，数据库 job [130321417993](https://github.com/gbcdby/boardroom/actions/runs/42959198409/job/130321417993) 与浏览器 job [130321418111](https://github.com/gbcdby/boardroom/actions/runs/42959198409/job/130321418111) 均为 SUCCESS。下表结果已回读完整日志和下载的 JSON 报告；artifact 的存在本身不是通过依据。命令与产物归属可对照 [CI 配置](../.github/workflows/database-ci.yml)。
 
-| evidence ID | 实际入口与产物 | 本轮结果及边界 |
+| evidence ID | 实际入口与产物 | 固定工程结果及边界 |
 | --- | --- | --- |
 | `E-LOCAL` | 工程候选的 `npm test` / `npm run typecheck`；交付记录 `phase5-full-final-delta.log`、`phase5-types-final-delta.log` | 已回读：1006 项，820 PASS、186 SKIP、0 FAIL，双类型检查退出 0。未配置真实 PG 的本地跳过项不作 PG 证据。 |
 | `E-BASE` | 数据库 job：`npm ci`、`C-BASE` 与启用 PG 的 `C-DB`；完整 job 日志 | PASS：干净安装、双类型、构建通过；1006 项中 975 PASS、31 SKIP、0 FAIL。真实 PG 故障/锁序/预算/迁移已执行；跳过范围下述单列。 |
-| `E-CORE` | 数据库 job：SQLite / PostgreSQL 分别 `C-CORE`，完整 SDK 端到端日志 | PASS：两数据库各 29/29，0 失败；日志明确为“协议范围”。不能通过真实宿主 CORE-02/03/05/07/10/11。 |
+| `E-CORE` | 数据库 job：SQLite / PostgreSQL 分别 `C-CORE`，完整 SDK 端到端日志 | PASS：两数据库各 29/29，0 失败；日志明确为“协议范围”。本组单独不能通过真实宿主 CORE-02/03/05/07/10/11；其真实回传另见 §2.2。 |
 | `E-TASK` | [`tasks-protocol-1`](https://github.com/gbcdby/boardroom/actions/runs/42959198409/artifacts/13828533293)：源目录 `tasks-e2e/`，artifact 内 `{sqlite,postgres}.json` | PASS：两数据库各 8/8；`applicationCommit/applicationTree` 与 §1 一致。`realModelReview: NOT_RUN`，synthetic 两轴输出不放行 REVIEW-04。 |
 | `E-MEM` | [`memory-protocol-1`](https://github.com/gbcdby/boardroom/actions/runs/42959198409/artifacts/13828038834)：源目录 `memory-e2e/`，artifact 内 `{sqlite,postgres}.json` | PASS：两数据库各 6/6；候选身份一致。`realModelSummary: NOT_RUN`，真实 MCP 投递与真实模型总结分别判断。 |
 | `E-UI` | [`managed-web-browser-1`](https://github.com/gbcdby/boardroom/actions/runs/42959198409/artifacts/13828741463)：`{managed-web,webui,tasks-web,memory-web,settings-web}-e2e/report.json` 及截图 | PASS：2026-11-11T04:27:14Z–04:28:39Z 完成 5 份页面报告。真实 Chromium + 临时 SQLite；任务/总结正文为 synthetic，`modelInvocation: NOT_RUN`。`webui-before` 仅基线截图。 |
@@ -99,25 +101,58 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 
 48 次数据库资源记录中，最大 mutation 204.084 ms、消息投递 339.158 ms、发送至 ACK 369.655 ms、heartbeat 205.771 ms；每次均单独验限。不同数据库、历史类型、数据量和 HTTP/DOM 场景仍分别保存原始记录，不能将这些最大值当作跨平台性能承诺。
 
+### 2.2 独立真实宿主回传
+
+2026-11-11，用户交回《Boardroom-V1-真实场景验收报告-20261111.pdf》（429403 字节，SHA-256 `d4c0993b1490b1a71eaec038a865aedd5ae33212b83469d95c3bdbfaa703635f`）。交付方已回读 PDF 与以下 GitHub 验收评论，核对候选和结果一致；**真实 CLI/模型执行、原始 hash/manifest 检查和平台读回归原独立执行者**。交付方没有在本机重跑 macOS 场景，也没有重新计算其本地 146 个原始文件的摘要或逐帧重读 transcript。原始目录由执行者保管，不把 Mac 绝对路径当成可下载证据；本索引主要引用可持续回读的正式验收评论。
+
+外部环境：macOS `26.5.2 (25F84)`，arm64 / Apple M1 Pro；Node `v24.14.0`、npm `11.19.0`；Chrome `157.0.8103.40`、Playwright `1.62.0`；SQLite / `better-sqlite3 13.0.3`，迁移分别 v11/v12/v13；Streamable HTTP。Claude Code `2.1.233` 使用 deepseek-flash 兼容端点，Codex CLI `0.167.0` 使用 group/free-model 代理。这些是普通外部 MCP 结果，不放行官方认证、固定出口和隔离要求独立的托管 profile。
+
+| 应用对象 | applicationCommit | applicationTree |
+| --- | --- | --- |
+| 阶段 3 / PR99 | `5c7f87f20c31f78eac9be5875e644d44033e3648` | `fd35618ee4e10efb1a5b204f1d08f34fc3fd3d7a` |
+| 阶段 4 / PR118 | `0182ecee29760430e81ca5511f449c45b7125b12` | `b592f19cee96016797ff815a5bebccd698deedc6` |
+| 最终集成 / PR119 | `533e49da5d4e9d4a236d68e0bc23c03411caa5b1` | `f3ba63767d354febd37b2359414b70a6aab23af3` |
+
+| evidence ID | 真实范围与结果 | 生产者回传 / 对象 |
+| --- | --- | --- |
+| `E-NATIVE-CORE` | 六项 Core PASS：双宿主原生 join；人经真实页面建项目/群并看到两 Agent 在线；@单人/多人/@all 和离线边界；忙碌下一 wait 投递；无 wait 不启动模型；双向 @、新会话及同数据重启补投 | [#112 实测回传](https://github.com/gbcdby/boardroom/issues/112#issuecomment-6789494239)，独立真实宿主验收 Agent，PR119 原候选 |
+| `E-NATIVE-REVIEW` | REVIEW-04 PASS：两独立 Codex 只读上下文实际并行且时间重叠；指定 Claude reviewer 提交两轴并裁决到 done。PR119 另执行真实 changes_requested → 修改被评审示例仓库 → 新轮次 pass；Boardroom 应用候选未因此改变 | [PR99 回传](https://github.com/gbcdby/boardroom/issues/107#issuecomment-6789489800)、[PR119 集成补验](https://github.com/gbcdby/boardroom/issues/107#issuecomment-6790049547)，分别绑定上表对象 |
+| `E-NATIVE-MEM` | MEM-04 PASS：目标 Codex 自身上下文完成 task_completed、N=1 首次真实投递、显式 session_end；history→ACK 不计数负例；人工先写后旧输出 conflicted，新请求基准重算到 v4 并在 join 注入 | [PR118 回传](https://github.com/gbcdby/boardroom/issues/117#issuecomment-6789491909)、[PR119 集成补验](https://github.com/gbcdby/boardroom/issues/117#issuecomment-6790050561)，分别绑定上表对象；人工写入经 HTTP |
+| `E-NATIVE-MAC` | NFR-07 PASS（macOS + SQLite）：干净 npm ci、typecheck、生产 npm start、真实页面/领域操作、双宿主、任务/记忆与同数据重启读回 | [#112 回传及补充](https://github.com/gbcdby/boardroom/issues/112#issuecomment-6790053498)，独立执行者，PR119 原候选；macOS PostgreSQL 未执行 |
+
+原报告整体 HARD-05 仍为 BLOCKED，并反馈两个新问题；本索引保留该历史结论，不将逐项实测通过直接当作已完成修复、独立复审或交付。早期评论的“PR119 REVIEW/MEM 未复验”已被上述补充评论取代。
+
+### 2.3 修复候选的适用性与尚待检查
+
+真实回传发现 `expectedRoundRevision` 的兄弟属性 `$ref` 使 Codex reviewer 发送字符串，以及 220 字节不完整轴报告被采集器标为 READY。初始阶段 3 修复候选 `74a3003f0b60036f0202ad18fc915fdf3881839b` 的标准审查另发现纯 Markdown 占位正文仍可通过，稳定 finding 为 `STD-NATIVE-001`。新增回归后，修正候选为本地 `58a405861ed6f9c4ed5a980df252c7d4c35104c9` / tree `1955f508da8a5d052b0be8d60b2a4b9e739317b8`；它尚不是本索引的最终阶段 5 交付候选。该增量和有序带入阶段 4/5 后的实际候选，仍须以各 PR 记录固定身份、必要 CI 和独立复审结果。
+
+| 受影响范围 | 复用前提与增量验证 | 当前边界 |
+| --- | --- | --- |
+| 任务工具 schema | 仅改变重复 Zod 字段实例/描述，使导出类型内联；核对原类型、范围、required、严格校验、CAS、权限与业务路径均未放宽。通过实际 tools/list、合法数字流程和非法/过时修订拒绝验证 | 原 Claude reviewer 路径保留原实测身份；修复后 Codex reviewer 尚未真实重跑，schema/协议回归不能改称原生复验 |
+| 采集完整性 | 新格式校验应拒绝半句、缺结论、缺章节和矛盾元数据，完整 PASS / CHANGES_REQUESTED 均可供 reviewer；保留 CLI argv、上下文隔离、真实事件、时间重叠、候选前后相同及原始输出一致性 | 新 prompt/格式尚无新原生运行；校验回归与原候选 CLI 执行分开取证，旧报告不得补写标记后充当新格式实测 |
+| 六项 Core、记忆与 macOS 安装 | 按最终实际 diff 确认未改变聊天/投递/重连、记忆触发/冲突或平台安装路径，再记录证据 transfer；仍执行项目规定的当前候选 CI | 不能只因提交 hash 变化撤销旧结果，也不能仅凭“改动小”覆盖受影响路径；新增影响应定向验证 |
+
+原 AC-REVIEW-04 要求 Claude **或** Codex 完成真实评审，未要求两种 reviewer 都完整重跑。现行主 Spec / NFR-07 与阶段 5 §5/6 也未规定每个 OS × 数据库 × 宿主的全组合矩阵；Linux SQLite/PG 工程证据与 macOS SQLite 实际使用证据按环境分列，macOS PostgreSQL 保持未覆盖。当前 31 个可选托管隔离 SKIP 仍不能计作 PASS，既有 [Spec #83](https://github.com/gbcdby/boardroom/issues/83) 例外只在原范围内有效，生产 profile 继续 unsupported；外部实测不扩大该例外。
+
 ## 3. 全部 46 项映射
 
-表中的文件均为当前工程候选存在的入口；`E-*` 指向本轮运行，`C-*` 给出复现命令。每行 `status` 针对该 AC 的完整要求；测试名称里出现 AC 编号或旧报告写“通过”不会改变该状态。
+表中的文件为工程基线已有入口；`E-*` 分别指向 §2.1 固定工程运行或 §2.2 外部真实回传，`C-*` 给出复现命令。每行 `status` 针对该 AC 的完整要求；测试名称里出现 AC 编号或旧报告写“通过”不会改变该状态。
 
 ### 3.1 通信核心：11 项
 
 | acceptanceId | 验收要求 | command / evidence 入口 | status | limitation / nextAction |
 | --- | --- | --- | --- | --- |
 | AC-CORE-01 | localhost 启动、真实 PG 初始化/连接、WebUI 可访问 | `E-BASE/E-INSTALL/E-UI`；`C-INSTALL`、`C-DB`、`C-UI`；`tests/http.test.ts`、`tests/postgres-smoke.test.ts`、`tests/settings-server.test.ts` | PASS | 真实 PG 初始化、服务生产入口与 Chromium 页面均已执行；原阶段 1 SQLite 记录不用于替代本次 PG 要求。 |
-| AC-CORE-02 | Claude Code、Codex CLI 各经 MCP 入群，无 wrapper、无需自动入群 | `B-NATIVE/H-HOST`；`C-HOST`；历史 `H-HOST` 仅背景 | NOT_RUN | 做宿主/绑定/权限变化影响分析，必要真实复验；SDK `hostType` 字符串不能充当宿主。 |
-| AC-CORE-03 | 人在 WebUI 建项目/群，两个 Agent 加入并在线 | `E-CORE/E-UI（部分）`；`C-CORE`、`C-UI`；`tests/projects-api.test.ts`、`tests/webui-e2e.test.ts` | NOT_RUN | 工程证据只覆盖页面建项目/群和 SDK 在线状态；本项仍需两真实宿主在该候选入同群并在线。 |
+| AC-CORE-02 | Claude Code、Codex CLI 各经 MCP 入群，无 wrapper、无需自动入群 | `E-NATIVE-CORE`；`C-HOST` | PASS | 双宿主均以原生 MCP 配置实际 join，未使用 wrapper；macOS SQLite / PR119 原候选，SDK hostType 字符串不作为宿主证据。 |
+| AC-CORE-03 | 人在 WebUI 建项目/群，两个 Agent 加入并在线 | `E-NATIVE-CORE`；`C-HOST`、`C-UI` | PASS | 人在真实 Chrome 建项目/群，两 Agent 入同群，页面和服务端在线状态正确；生产者与应用对象见 §2.2。 |
 | AC-CORE-04 | 普通成员只被 @；manager 被其他成员消息唤醒 | `E-BASE/E-CORE`；`C-CORE`；`tests/chat-routing.test.ts`、`tests/chat-routing-mcp.test.ts`、`tests/t8-human-wake.test.ts` | PASS | 实际参与关系、定向投递、manager 接收他人消息及发送者不自唤醒通过；进入模型轮次仍须宿主证据。 |
-| AC-CORE-05 | 真实双宿主中 @单人/多人/全体正确，@all 只展开当时在线参与者 | `E-CORE（部分）/H-HOST`；`C-HOST`、`C-CORE`；`tests/chat-routing.test.ts`、`tests/t5-restart-recovery.test.ts` | NOT_RUN | `H-HOST` 仅旧对象；离线普通成员不因 @all 新增补投资格。 |
+| AC-CORE-05 | 真实双宿主中 @单人/多人/全体正确，@all 只展开当时在线参与者 | `E-NATIVE-CORE`；`E-CORE` 作协议补充；`C-HOST` | PASS | 实际 @单人/多人/@all 定向正确；离线 Codex 不进入 @all 持久化 mentions，之后 wait 未收到该消息。 |
 | AC-CORE-06 | 等待显示 waiting，处理显示 working | `E-BASE/E-CORE/E-UI`；`C-CORE`、`C-UI`；`tests/status-domain.test.ts`、`tests/status-heartbeat-http.test.ts`、`tests/status-ws.test.ts` | PASS | HTTP/WS 与显式 MCP 状态链通过；waiting/working 是平台观察状态，终端画面或 ACK 不证明模型内部状态。 |
-| AC-CORE-07 | 忙碌期尽力打断；不支持时保留到安全点 | `E-BASE/E-CORE（部分）`；`C-CORE`；`tests/interrupt-core.test.ts`、`tests/interrupt-mcp.test.ts`、`tests/message-durability.test.ts` | NOT_RUN | 工程证据只覆盖保留与下一次 wait；三宿主在途打断均按 unsupported 声明，真实忙碌宿主的安全点回退仍未复验。 |
-| AC-CORE-08 | 服务重启后消息保留，重连只补允许积压 | `E-BASE/E-CORE/E-INSTALL`；`C-CORE`、`C-HOST`；`tests/t5-restart-http.test.ts`、`tests/t5-restart-recovery.test.ts` | PASS | 同数据服务重启与 SDK 重连读回消息、ACK/游标和身份；真实 CLI 重连复验仍在 CORE-11 中单列。 |
+| AC-CORE-07 | 忙碌期尽力打断；不支持时保留到安全点 | `E-NATIVE-CORE`；`E-BASE/E-CORE` 作协议补充；`C-HOST` | PASS | Codex 执行 sleep 45 的忙碌期不打断，持久消息到下一次真实 wait 才收到并 ACK；在途打断仍 unsupported。 |
+| AC-CORE-08 | 服务重启后消息保留，重连只补允许积压 | `E-BASE/E-CORE/E-INSTALL`；`C-CORE`、`C-HOST`；`tests/t5-restart-http.test.ts`、`tests/t5-restart-recovery.test.ts` | PASS | 同数据服务重启与 SDK 重连读回消息、ACK/游标和身份；真实 CLI 重连回传在 CORE-11 中单列。 |
 | AC-CORE-09 | 连续对话有界，manager 不唤醒自己 | `E-BASE/E-CORE`；`C-CORE`；`tests/antiloop.test.ts`、`tests/antiloop-mcp.test.ts` | PASS | 阈值、持久消息与抑制事实通过；防环计数重启重置是既有边界。 |
-| AC-CORE-10 | 记录真实双宿主等待/打断和空闲唤醒限制 | `B-NATIVE/H-HOST/H-DSH`；`C-HOST`；`H-HOST`、`H-DSH`；[接入支持表](getting-started-mcp.md#1-先决条件与宿主支持范围) | NOT_RUN | 支持表及旧版本来源已核对；当前候选与 CLI 的实际等待/打断/空闲限制尚未实测，文档完整不替代该项。 |
-| AC-CORE-11 | 人 + 两真实 Agent 双向 @、等待、断开和重连 | `E-CORE（部分）/H-HOST`；`C-HOST`；`C-CORE` 作协议回归；历史 `H-HOST` | NOT_RUN | 未把历史完整链推广成本候选 PASS；保留对应消息和新会话结果。 |
+| AC-CORE-10 | 记录真实双宿主等待/打断和空闲唤醒限制 | `E-NATIVE-CORE/H-DSH`；`C-HOST`；[支持边界](getting-started-mcp.md#1-先决条件与宿主支持范围) | PASS | 实际活跃 wait 可返回；忙碌回退到安全点；无 wait 时 45 秒无模型响应，后由新会话补投。DSH 仍仅沿用其已验证能力范围。 |
+| AC-CORE-11 | 人 + 两真实 Agent 双向 @、等待、断开和重连 | `E-NATIVE-CORE`；`E-CORE` 作协议补充；`C-HOST` | PASS | Claude↔Codex 双向 @ 送达；新会话和同数据重启后 drainedBacklog:true，memberId 保持；未宣称空闲宿主自动开始轮次。 |
 
 ### 3.2 项目、组织、身份、生命周期、状态与权限：15 项
 
@@ -149,7 +184,7 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 | AC-REVIEW-01 | 明确默认 reviewer、真实固定 diff；无效/空候选前置失败 | `E-BASE/E-TASK`；`C-TASK`；`tests/tasks-candidate.test.ts`、`tests/tasks-service.test.ts` | PASS | 真实 Git 固定候选、无效/空/脏候选、采集中权限/修订变化及可诊断失败 round 通过，未截断后接受。 |
 | AC-REVIEW-02 | Spec/Standards 两报告独立，进入评论，不跨轴排名 | `E-BASE/E-TASK/E-UI`；`C-DB`、`C-TASK`、`C-UI`；`tests/tasks-service.test.ts`、`tests/task-ui.test.ts` | PASS | 合同、持久化、评论和 UI 两轴分开呈现通过；报告正文是 synthetic，真实隔离并行模型执行仍归 REVIEW-04。 |
 | AC-REVIEW-03 | reviewer 通过到 done、打回进行中、manager 有原因覆盖 | `E-BASE/E-TASK/E-UI`；`C-TASK`、`C-UI`；`tests/tasks-service.test.ts`、`tests/tasks-mcp.test.ts` | PASS | 普通通过/打回、manager 原因覆盖及再次覆盖通过；原报告/裁决保留，报告不全不能普通通过。 |
-| AC-REVIEW-04 | Claude 或 Codex 完成真实任务双轴评审，命令/版本/fixed point 可追溯 | `B-NATIVE`；`C-REVIEW`；环境记录 `B-NATIVE` | BLOCKED | Codex 在模型前初始化失败；需正常原生环境、真实并行隔离上下文及平台裁决读回。 |
+| AC-REVIEW-04 | Claude 或 Codex 完成真实任务双轴评审，命令/版本/fixed point 可追溯 | `E-NATIVE-REVIEW`；`C-REVIEW`；§2.3 修复适用性 | PASS | PR99 与 PR119 各自完成真实两轴和指定 Claude reviewer 裁决；修复后 Codex reviewer/新 prompt 未重跑，不把采集回归当真实模型。 |
 | AC-REVIEW-05 | 报告保留标准来源、任务要求、结论与证据 | `E-BASE/E-TASK/E-UI`；`C-TASK`、`C-UI`；`tests/tasks-input.test.ts`、`tests/tasks-service.test.ts`；[报告流程](tasks-and-review.md) | PASS | 标准来源、任务要求、候选与声明字段校验/保存通过；此结果不认证 synthetic 输出来自真实外部模型。 |
 
 ### 3.4 记忆：7 项
@@ -159,7 +194,7 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 | AC-MEM-01 | global 仅本体 Agent 读写、跨项目本人注入 | `E-BASE/E-MEM`；`C-MEM`、`C-DB`；`tests/memory-service.test.ts`、`tests/memory-mcp.test.ts`、`tests/memory-injection.test.ts` | PASS | 其他 Agent、owner、manager 的存在性/历史窥探均拒绝；本人跨项目注入通过，HTTP 无 global 入口。 |
 | AC-MEM-02 | 共享文档成员读、manager/人写、显式拉取 | `E-BASE/E-MEM/E-UI`；`C-MEM`、`C-UI`；`tests/memory-http.test.ts`、`tests/memory-service.test.ts` | PASS | 实时 ACL、列表/历史同边界、显式拉取与归档只读通过；shared 不自动注入。 |
 | AC-MEM-03 | project-agent 本人/授权管理者可读写、本人项目内注入 | `E-BASE/E-MEM`；`C-MEM`、`C-DB`；`tests/memory-service.test.ts`、`tests/memory-reader.test.ts`、`tests/memory-mcp.test.ts` | PASS | 子树和失活/已移除目标文档维护边界通过；读取期间撤权也不返回正文。 |
-| AC-MEM-04 | 三种真实触发自总结、新版本、人工优先 | `E-MEM（协议部分）/B-NATIVE`；`C-MEM`、`C-SELF-SUMMARY`；`tests/memory-triggers.test.ts`、`tests/memory-summary.test.ts`；`B-NATIVE` | BLOCKED | 协议夹具可验证触发/CAS，真实目标模型尚缺；N 计数只能来自首次真实 MCP 投递。 |
+| AC-MEM-04 | 三种真实触发自总结、新版本、人工优先 | `E-NATIVE-MEM`；`E-MEM` 作协议补充；`C-SELF-SUMMARY` | PASS | PR118 与 PR119 各自完成三触发、N=1 计数负例、人工优先冲突、新请求重算与 v4 注入；保留原执行者和候选身份。 |
 | AC-MEM-05 | 执行中人工编辑、版本历史可查 | `E-BASE/E-MEM/E-UI`；`C-MEM`、`C-UI`；`tests/memory-http.test.ts`、`tests/memory-ui.test.ts`、`tests/memory-summary.test.ts` | PASS | 执行状态中的人工写入、409 草稿/新基准、历史、迟到响应与自动结果竞争通过；真实模型调用仍在 MEM-04 单列。 |
 | AC-MEM-06 | 普通 Agent 不能经记忆/聊天读取未参与群消息 | `E-BASE/E-MEM`；`C-MEM`、`C-DB`；`tests/memory-service.test.ts`、`tests/memory-triggers.test.ts`、`tests/memory-summary.test.ts` | PASS | packet 输入、任务关联、不可见前缀分页与退群后权限通过，不以页面无入口替代服务端拒绝。 |
 | AC-MEM-07 | 总结失败不阻断主流程，有可诊断状态 | `E-BASE/E-MEM`；`C-MEM`、`C-DB`；`tests/memory-mcp-postgres.test.ts`、`tests/memory-reader.test.ts`、`tests/memory-runtime.test.ts`、`tests/memory-stdio.test.ts` | PASS | 独立 reader/真实 PG 阻塞、超时、回滚、ACK 后补偿与 stdio EOF 清理通过；模型不可用仍保持真实失败状态。 |
@@ -169,10 +204,10 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 | acceptanceId | 验收要求 | command / evidence 入口 | status | limitation / nextAction |
 | --- | --- | --- | --- | --- |
 | AC-HARD-01 | 自动化覆盖 mention/权限/状态/记忆/隔离 | `E-BASE/E-CORE/E-TASK/E-MEM`；`C-BASE`、`C-DB`、`C-CORE`、`C-TASK`、`C-MEM`；各域测试见前表 | PASS | 同一 tree 的类型、构建与全量测试通过；1006 项中的 31 个环境 SKIP 明列，不以多个旧候选拼接。 |
-| AC-HARD-02 | 重启、断线、MCP 超时、无效 ref 等故障 | `E-BASE/E-CORE/E-TASK/E-MEM/E-LOAD-SQL/E-LOAD-WEB`；`C-CORE`、`C-TASK`、`C-MEM`、`C-DB`；§4 故障矩阵 | PASS | 故障/并发/预算/重启/无效 ref 均有本候选证据；模型环境失败仅记录阻塞，不记作模型成功路径。 |
+| AC-HARD-02 | 重启、断线、MCP 超时、无效 ref 等故障 | `E-BASE/E-CORE/E-TASK/E-MEM/E-LOAD-SQL/E-LOAD-WEB`；`C-CORE`、`C-TASK`、`C-MEM`、`C-DB`；§4 故障矩阵 | PASS | 故障/并发/预算/重启/无效 ref 均有固定工程候选证据；模型环境失败仅记录阻塞，不记作模型成功路径。 |
 | AC-HARD-03 | 跨项目/群隔离与未授权读拒绝 | `E-BASE/E-TASK/E-MEM/E-UI`；`C-DB`、`C-TASK`、`C-MEM`、`C-UI`；`tests/current-project-ui.test.ts`、`tests/domain-mutation-scope.test.ts`、`tests/mcp-lifecycle-scope.test.ts` | PASS | 数据、领域、HTTP/MCP 与 Chromium 分层通过，包含切项目草稿/旧请求、成员移除后的旧加入代际。 |
-| AC-HARD-04 | 可复现安装/启动/三宿主配置和限制说明 | `E-INSTALL/H-HOST/H-DSH`；`C-INSTALL`；[接入](getting-started-mcp.md)、[任务](tasks-and-review.md)、[记忆](memory.md)、[设置与审计](settings-and-audit.md) | PASS | 干净 Linux CI 真实安装/启动与双数据库重启通过；三宿主配置及已知限制有文档。原生宿主复验归六项 Core，macOS 归 NFR-07，均未被本项放行。 |
-| AC-HARD-05 | 全部 V1 AC 通过，或有明确有效例外 | `全部证据组及独立审查`；完整本索引 + 独立需求/标准审查 + 最终 PR/主线结果 | BLOCKED | 37 项工程/安装通过，6 项原生 Core 未执行，REVIEW-04/MEM-04 阻塞，macOS 尚缺；没有新豁免，#83 例外不能扩用。 |
+| AC-HARD-04 | 可复现安装/启动/三宿主配置和限制说明 | `E-INSTALL/H-HOST/H-DSH`；`C-INSTALL`；[接入](getting-started-mcp.md)、[任务](tasks-and-review.md)、[记忆](memory.md)、[设置与审计](settings-and-audit.md) | PASS | 干净 Linux CI 真实安装/启动与双数据库重启通过；三宿主配置及限制有文档。外部真实宿主与 macOS SQLite 回传分别归六项 Core 和 NFR-07，不由本项自动推广。 |
+| AC-HARD-05 | 全部 V1 AC 通过，或有明确有效例外 | `全部证据组及独立审查`；§2.3、当前 PR/主线记录 | BLOCKED | 45 项已承接；尚待两项修复及说明的独立复审、最终集成候选必经 CI 与交付核对。逐项 PASS 不等于已合并；不新增验收豁免。 |
 
 ## 4. 横切故障、负载与迁移门禁
 
@@ -180,31 +215,31 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 
 | 范围 | 当前入口 / 必须观察的结果 | 本版状态与缺口 |
 | --- | --- | --- |
-| 重启、断开、MCP 超时 | `E-BASE/E-CORE/E-INSTALL`；`tests/mcp-http.test.ts`、`tests/t5-restart-http.test.ts`、`tests/mcp-lifecycle-scope.test.ts`；消息/游标持久化，旧会话不能越过加入代际，新会话权限正确 | PASS：生产服务与 SDK 链通过；真实 CLI 重连仍按六项 Core 的未执行范围单列。 |
+| 重启、断开、MCP 超时 | `E-BASE/E-CORE/E-INSTALL`；`tests/mcp-http.test.ts`、`tests/t5-restart-http.test.ts`、`tests/mcp-lifecycle-scope.test.ts`；消息/游标持久化，旧会话不能越过加入代际，新会话权限正确 | PASS：生产服务与 SDK 链通过；真实 CLI 重连另由 E-NATIVE-CORE 的原候选实测回传支持。 |
 | S5-AUDIT-07 / 11 完整关系与逐步失败 | `E-BASE`；`tests/phase5-fault-matrix.test.ts` 加既有 `api-mutation-atomic`、`member-compensation`、`audit-compensation`；完整关系 remove 与 5 次补偿读回；13 个 remove/undo 故障场景均在成员、task/settings、round、request、通知、audit 或 reversed 的真实 DML 后抛错 | PASS：SQLite/PG 分别逐表比对历史字节、作者、事实版本、审计与 reversed；同连接失败后可继续正常提交。 |
 | S5-AUDIT-11 / 13 竞争与锁序 | `E-BASE`；`tests/phase5-concurrency-matrix.test.ts`、`tests/domain-mutation-scope.test.ts`、`tests/runtime-mutation-scope.test.ts`；18 个普通/managed MCP、HTTP remove/undo、task/memory、join、runtime/binding 入口；remove/undo/改派、claim/remove 及跨项目 delete/addBinding 闭包扩大 | PASS：真实 PG 独立连接和数据库屏障，项目锁先于 member/runtime；无 40P01，仅完整提交或稳定冲突。SQLite 结果只作串行兼容证据。 |
 | S5-AUDIT-14 预算与真实取消 | `E-BASE`；`tests/capture-budget-boundaries.test.ts`、`tests/capture-budget-pagination.test.ts`；2048 返回行、2 MiB UTF-8、512 SQL、2048 改变行、32 KiB 快照、128 参与边/512 关系及长字段的恰限与超限，整批返回计费 | PASS：真实 PG 57014 后 rollback 与同连接复用；SQLite 原生长查询返回后拒绝并回滚，不声称可中途取消；NUL/最坏转义未截断后接受。 |
 | 无效/空/脏 Git 候选与外部程序 | `E-BASE/E-TASK`；`tests/tasks-candidate.test.ts`、`tests/tasks-service.test.ts`；失败轮次可读，10 秒/2 MiB/200 commits 预算，不运行 hooks/filter/外部 diff 或懒拉取 | PASS：真实 Git、外部程序 canary 和退出结果通过；不代表模型完成评审。 |
 | 记忆 reader 真阻塞与关闭 | `E-BASE/E-MEM`；`tests/memory-reader.test.ts`、`tests/memory-mcp-postgres.test.ts`、`tests/memory-runtime.test.ts`、`tests/memory-stdio.test.ts`；独立只读进程、超时有界、消息/ACK/status 可用、真实事务回滚 | PASS：包含实际 PG 表锁、独立 reader 超时及 EOF 清理，未以 SQLite 或延时 Promise 替代。 |
-| 触发与请求恢复 | `E-BASE/E-MEM`；`tests/memory-mcp.test.ts`、`tests/memory-triggers.test.ts`、`tests/memory-summary.test.ts`；首次 MCP 投递、不可见前缀 raw cursor、持久 checkpoint、已 ACK 任务事件的补建、来源重开取消 | PASS：触发、人工优先与失败恢复协议通过；真实目标模型完成仍为 MEM-04 BLOCKED。 |
+| 触发与请求恢复 | `E-BASE/E-MEM`；`tests/memory-mcp.test.ts`、`tests/memory-triggers.test.ts`、`tests/memory-summary.test.ts`；首次 MCP 投递、不可见前缀 raw cursor、持久 checkpoint、已 ACK 任务事件的补建、来源重开取消 | PASS：触发、人工优先与失败恢复协议通过；真实目标模型的三触发及人工竞争回传见 E-NATIVE-MEM。 |
 | 非空 v12 → v13 / S5-AUDIT-15 | `E-BASE`；`tests/member-facts.test.ts`；历史作者保留、六类事实版本基准/trigger、旧 checksum 不变、移除代际单调；插入/删除/替换/回改、FK 级联与事务回滚 | PASS：SQLite 与真实 PG 均已执行。 |
 | v13 ↔ v13 数据复制与回滚 | `E-BASE`；`tests/migrate-data.test.ts`、[迁移 CLI](../scripts/migrate-data.ts)；tasks/memory/receipts/checkpoints/投递/审计/removed/事实版本逐键核对，事实版本最后复制，回滚只处理目标 | PASS：双向独立目标库验证，源数据未受回滚影响。 |
 | 只读设置与真实重启 | `E-BASE/E-UI/E-INSTALL`；`tests/settings-server.test.ts`、`tests/settings-http.test.ts`、`tests/settings-ui.test.ts` 与 `scripts/e2e-settings-web.py`；白名单实际配置/来源、环境覆盖、改文件不热加载、正常重启生效、随机实际端口一致 | PASS：生产 HTTP/真实 Chromium 均取证；刷新失败保旧值/时间，无保存或假重启按钮，受控剪贴板失败不报成功。 |
 | NFR-03 时序 | `E-LOAD-SQL/E-LOAD-WEB`，命令为 `C-LOAD`；真实待收消息 ≤2 秒、WebUI ≤1 秒；记录发送、wait 返回、ACK/heartbeat 和 DOM 可见单调时间及精确 message ID；补偿并发下逐次验证 | PASS（Linux）：48 次数据库资源记录与 24 轮 HTTP/DOM 记录分别验限；未用普通 5 秒 wait 或截图代替。 |
 | NFR-04 / S5-AUDIT-16 固定负载 | `E-LOAD-SQL/E-LOAD-WEB`；3 并发 Agent、5 项目、每项目 5 群、每群 3 参与者、1000 条消息的实际清单；另列 10000 条/大正文及未 mention 历史；每档 6 次 remove/undo/redo 翻转 | PASS（Linux）：每次 mutation ≤500ms、MCP ≤2s、DOM ≤1s；SQL/返回量与 DOM 分开，各数据库/数据档分别通过。 |
-| NFR-07 平台 | 记录真实 OS/架构；macOS 是产品首要环境 | NOT_RUN：本轮工程验证是 Linux；尚无该候选 macOS 实测，不作跨平台通过结论。 |
+| NFR-07 平台 | 记录真实 OS/架构；macOS 是产品首要环境；E-NATIVE-MAC | PASS（macOS + SQLite）：原 PR119 候选的真实安装、接入、领域使用与同数据重启回传已承接。macOS PostgreSQL 未执行；Linux 数据不改标为 macOS 结果。 |
 
-## 5. 真实模型阻塞与历史材料
+## 5. 历史本机环境限制与背景材料
 
-### B-NATIVE：本轮原生模型环境
+### B-NATIVE：此前本机原生模型环境
 
 2026-11-11 01:17:37–01:19:23 UTC 的只读恢复核查记录：`/opt/codex/bin/codex --version` 返回 `codex-cli 0.167.0-alpha.4`，登录状态可读；继承的 Codex 运行目录仍是只读挂载。此前最小原生调用在模型前退出 1，错误为 `failed to initialize in-process app-server client: Read-only file system (os error 30)`，没有模型 JSONL。环境未改变，恢复核查未重复同一模型探测。
 
 2026-11-11T04:12:14.506593Z 再次只读核对确认：`/home/agent` 所在挂载可写，但 `/home/agent/.codex` 是独立只读挂载，`writable: false`。本次只检查文件系统与访问权限，**未重复模型调用、未复制凭据、未改变运行目录**。不能把父目录可写或 CLI 登录成功理解为阻塞已解除。
 
-该事实的范围是环境阻塞：版本/登录读取成功不是任务评审或自总结成功。交付记录包括 `native-cli-resume-check.md`（SHA-256 `b3d9ce907cbcb696f261c9c478f13fd7edc8c3235ed7aef19df8be83343e47ed`）及 `native-cli-readonly-recheck-20261111.json`，关联 [Spec #109](https://github.com/gbcdby/boardroom/issues/109) / [Ticket #112](https://github.com/gbcdby/boardroom/issues/112)。初始失败的原始 stderr 为 133 字节，SHA-256 `ac45fa2da13b377015236d8241d591493c6df7085a78a3844b8d2d87b8946d9c`；模型 JSONL 为 0 字节，没有可计作模型执行的输出。原始材料需随最终验收归档为可读取产物，不能只保留机器上的临时绝对路径。
+该事实仅描述此前本机环境：版本/登录读取成功不是任务评审或自总结成功；它不否定 §2.2 已完成的外部独立实测。交付记录包括 `native-cli-resume-check.md`（SHA-256 `b3d9ce907cbcb696f261c9c478f13fd7edc8c3235ed7aef19df8be83343e47ed`）及 `native-cli-readonly-recheck-20261111.json`，关联 [Spec #109](https://github.com/gbcdby/boardroom/issues/109) / [Ticket #112](https://github.com/gbcdby/boardroom/issues/112)。初始失败的原始 stderr 为 133 字节，SHA-256 `ac45fa2da13b377015236d8241d591493c6df7085a78a3844b8d2d87b8946d9c`；模型 JSONL 为 0 字节，没有可计作模型执行的输出。原始材料需随最终验收归档为可读取产物，不能只保留机器上的临时绝对路径。
 
-解除条件是正常的原生模型运行环境，然后分别完成 `C-REVIEW` 和 `C-SELF-SUMMARY`。仅修复 CLI 启动、验证登录或换成预制报告都不足以通过。不得复制凭据、改运行目录以绕过只读挂载，或把 SDK/托管旧例外改名为真实模型证据。
+当时的解除条件是正常原生模型环境与真实 `C-REVIEW` / `C-SELF-SUMMARY`；现在已由独立执行者在其正常 macOS 环境完成并正式回传。本机环境没有被改写为已恢复，也不需要为承接外部结果复制凭据或绕过只读限制。SDK、登录状态及托管旧例外仍不能改名为真实模型证据。
 
 ### 历史背景清单
 
@@ -213,16 +248,16 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 | H-HOST | 2026-11-03，Claude Code 2.1.233、Codex CLI 0.166.0、Node v24.14.0，阶段 1 外部 Streamable HTTP | [T8 历史报告](t8-acceptance-report.md) | background：join、活跃等待、双向 @、重连能力的旧记录。原始输出部分只在当时本地留档；不是当前 commit、当前 CLI 或真实任务/记忆验收。 |
 | H-DSH | 2026-11-03，DSH 0.2.1-rc.5、Node v24.14.0，当时 `hostType=other` | [随库索引](../evidence/real-host-retest/README.md)、[join](../evidence/real-host-retest/dsh-join.out)、[wait](../evidence/real-host-retest/dsh-wait.out) | background：仅 join 与活跃 wait。当前已注册 `dsh`；reconnect、空闲唤醒、在途打断仍 unsupported，不扩大旧输出含义。 |
 | H-MANAGED | 可选托管运行时的既有独立交付 | [Spec #83](https://github.com/gbcdby/boardroom/issues/83)、[README 支持边界](../README.md#可选托管-agent-运行时) | background：只在原批准对象与范围内有效；支持表为空，不能代替 REVIEW-04/MEM-04。 |
-| H-P5-CI | 2026-11-11，旧工程候选 `ab5fc086347cf84b0cb8fd04658ec671a14e708f`，CI 实际 `8dac3fe349f7b456ec51c31f4ab27a1dd2451713`，同 tree `32aaf5318658efbd96c6936355bd52450377b415` | [CI 42957360213](https://github.com/gbcdby/boardroom/actions/runs/42957360213)；原数据库日志和浏览器报告 | background：数据库 990 项中 958 PASS、31 SKIP、1 FAIL；唯一失败为 PG 旧 generation 挂起 wait。浏览器页面与两数据库 24 轮负载单独 PASS，整次 CI 不是全绿。之后的 wait、未发布记忆指纹、NUL 修复属于本轮新候选，不能把旧通过项直接复标。 |
+| H-P5-CI | 2026-11-11，旧工程候选 `ab5fc086347cf84b0cb8fd04658ec671a14e708f`，CI 实际 `8dac3fe349f7b456ec51c31f4ab27a1dd2451713`，同 tree `32aaf5318658efbd96c6936355bd52450377b415` | [CI 42957360213](https://github.com/gbcdby/boardroom/actions/runs/42957360213)；原数据库日志和浏览器报告 | background：数据库 990 项中 958 PASS、31 SKIP、1 FAIL；唯一失败为 PG 旧 generation 挂起 wait。浏览器页面与两数据库 24 轮负载单独 PASS，整次 CI 不是全绿。之后的 wait、未发布记忆指纹、NUL 修复属于 §1 的工程候选，不能把旧通过项直接复标。 |
 
 历史证据若用于本轮结论，需记录新旧候选差异、受影响权限/协议/宿主路径、哪些结论仍适用、哪些要重跑。主架构 §8 的 DSH 历史注释与 §10.2 的保守声明存在旧文字差异；本索引采用随库证据与当前适配器的实际边界，不因此修改主 Spec 要求。T8 原报告的日期、对象和结论保持原样。
 
 ## 6. 尚需完成的验收与交付记录
 
-1. 六项 Core 真实宿主范围仍需在有效的 Claude Code / Codex CLI 环境执行并保存版本、命令、消息 ID 和新会话结果；DSH 仅按已证实支持范围记录。历史材料保持原日期和对象。
-2. 原生模型环境恢复后，分别完成 REVIEW-04 真实双轴评审与 MEM-04 三触发目标自总结；支持这两项的协议/数据库通过不解除真实模型门槛。无有效例外时 HARD-05 保持 BLOCKED。
-3. 在真实 macOS 首要环境补 NFR-07 安装、接入及相关行为检查；当前 Linux CI、安装和性能数据不能自动推广。
-4. 将 `E-*` 产物及 `B-NATIVE` 原始材料归档到可持续读取的交付记录，并在 [PR #119](https://github.com/gbcdby/boardroom/pull/119) 保留工程候选、纯文档增量和独立需求/标准审查的对象身份。作者整理证据不替代独立审查。
-5. 实际合并和合并后主线复验按 PR/主线的新记录核对。PR CI 已通过不等于 PR 已合并；即使合并，也不等于 V1 全项验收或部署。
+1. 将报告发现的 schema 表示与采集完整性修复有序带入阶段 3/4/5，固定各自实际候选；按 §2.3 完成增量验证、独立需求/标准复审与证据适用性记录。未执行的新 Codex reviewer / 新 prompt 原生运行保持未执行，不将回归夹具改标。
+2. 对最终集成候选执行项目规定的数据库/SDK 与 Chromium CI，保留真实 checkout/tree、日志、通过/失败/跳过范围。§2.1 的旧工程全绿不能直接替代新候选必经 CI。
+3. 按 #99 → #118 → #119 推进 ready、合并与各次 main 检查，回读平台实际结果并更新 HARD-05 及 [Spec #109](https://github.com/gbcdby/boardroom/issues/109)。PR 就绪不以“已经合并”为循环前置条件；整体交付结论另需实际合并和主线核对。
+4. 持续保留原 `E-*` 工程产物、外部正式回传与 `B-NATIVE` 历史记录的生产者、对象和边界。Mac 本地原始包并未挂载到交付环境，本次不声称已逐帧重审或重新计算整包摘要；出现具体冲突时再核对对应最小原始片段。
+5. macOS PostgreSQL、DSH 未证实能力和可选托管 profile 限制继续明列。未部署、未关闭父 Spec 或未删除分支不是新增功能验收门槛；这些动作只在相应任务与授权内处理。
 
 本版没有新增验收例外。若随后有明确授权的例外，逐项保存 `acceptanceIds / reason / exactScope / knownRisk / followUp / acceptanceAuthority / date`；不能只写“已知问题”或把旧例外扩大范围。

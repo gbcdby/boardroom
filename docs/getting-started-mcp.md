@@ -4,7 +4,7 @@
 日期：2026-10-22 初版；2026-11-11 更新任务、记忆、设置与生命周期
 适用：多项目、多群组；localhost、无认证、单用户。
 
-本文说明安装、存储、普通外部 MCP 接入及恢复方式。任务、记忆和设置已有独立入口，真实模型任务评审与自总结仍有门槛缺口，见 [V1 验收索引](v1-acceptance.md)。[T8 报告](t8-acceptance-report.md)是 2026-11-03 的历史对象，不代表当前候选全项通过。可选托管 CLI 使用另一套验收 profile，见 [README](../README.md#可选托管-agent-运行时)。
+本文说明安装、存储、普通外部 MCP 接入及恢复方式。任务、记忆和设置已有独立入口；2026-11-11 的真实宿主评审、自总结与 macOS SQLite 回传及后续候选适用性见 [V1 验收索引](v1-acceptance.md)。[T8 报告](t8-acceptance-report.md)是 2026-11-03 的历史对象，不能单独代表后续候选。可选托管 CLI 使用另一套验收 profile，见 [README](../README.md#可选托管-agent-运行时)。
 
 ## 1. 先决条件与宿主支持范围
 
@@ -12,15 +12,15 @@
 - macOS 为产品首要开发/验收环境（NFR-07）。Linux 上的通过结果只覆盖实际记录的 Linux 组合。
 - 安装你实际使用的外部 CLI 并完成其正常登录。连接 MCP、登录有效与模型可执行是不同检查。
 
-下表是已保存的历史能力与当前适配器声明，**不是对其他 CLI 版本或本轮模型任务的通过承诺**。
+下表区分已保存的真实回传、历史能力与当前适配器声明，**不推广到其他 CLI 版本、数据库、传输或托管 profile**。
 
-| 宿主 / 历史版本 | 已有接入记录 | 当前连接/恢复边界 |
+| 宿主 / 实测版本 | 已有接入记录 | 当前连接/恢复边界 |
 | --- | --- | --- |
-| Claude Code 2.1.233 | stdio 配置检查；Streamable HTTP 的 join、活跃 wait、双向 @、重连补积压 | 适配器声明 stdio / Streamable HTTP、reconnect supported；在途打断 unsupported、空闲唤醒 false。 |
-| Codex CLI 0.166.0 | stdio 配置检查；Streamable HTTP 的 join、活跃 wait、双向 @、重连补积压 | 同上；当前 0.167.0-alpha.4 的只读运行目录阻塞另见 V1 索引，不能沿用旧版本模型结果。 |
+| Claude Code 2.1.233 | 2026-11-11 macOS SQLite / Streamable HTTP：原生 join、活跃 wait、双向 @、重连及重启补投；指定 reviewer 提交真实两轴报告并裁决 | 适配器声明 stdio / Streamable HTTP、reconnect supported；本次真实回传只覆盖 HTTP。在途打断 unsupported、空闲唤醒 false。 |
+| Codex CLI 0.167.0 | 同轮同环境的外部消息链、两个独立并行评审上下文、目标本人三触发自总结；历史 0.166.0 记录另列 | 忙碌工具期间不打断，消息在下一 wait 投递；无 wait 不自动启动模型。原 reviewer 的 schema 已按内联类型修复，修复后真实 Codex reviewer 未重跑，不将 schema/协议回归写成原生复验。 |
 | DSH 0.2.1-rc.5 | 历史 `hostType=other` 的真实 join、活跃 wait；如今注册为 `dsh` | reconnect / interrupt unsupported、wakeIdle false。适配器没有独立验证的传输列表；下面 HTTP 配置来自已有实测，不推定 stdio 或重连可用。 |
 
-来源：[当前适配器](../src/server/mcp/adapters)、[双宿主历史报告](t8-acceptance-report.md)、[随库 DSH 输出](../evidence/real-host-retest/README.md)。DSH 是产品正式支持范围的一员，各具体能力仍受证据边界约束。
+来源：[当前适配器](../src/server/mcp/adapters)、[2026-11-11 独立真实回传](https://github.com/gbcdby/boardroom/issues/112#issuecomment-6790053498)、[双宿主历史报告](t8-acceptance-report.md)、[随库 DSH 输出](../evidence/real-host-retest/README.md)。独立执行者使用的兼容/代理模型线路仅证明普通外部 MCP 路径；不满足或放行托管官方认证/固定出口的独立要求。DSH 是产品正式支持范围的一员，各具体能力仍受证据边界约束。
 
 ## 2. 启动服务
 
@@ -145,7 +145,7 @@ codex mcp add agent-studio --url http://127.0.0.1:4317/mcp
 codex mcp list           # 期望：agent-studio ... Status=enabled
 ```
 
-> 2026-11-03 的 Codex CLI 0.166.0 记录覆盖 join / 活跃 wait / 双向 @ / 重连补积压。当前环境与版本需单独核验，`codex mcp list` 显示 enabled 不证明模型已经调用工具。
+> 2026-11-11 的 Codex CLI 0.167.0 外部真实回传与此前 0.166.0 历史记录分别保留候选、环境和范围，见 [V1 验收索引](v1-acceptance.md)。`codex mcp list` 显示 enabled 仍不证明模型已经调用工具。
 
 ### 4.3 Streamable HTTP（可选，两端都支持）
 

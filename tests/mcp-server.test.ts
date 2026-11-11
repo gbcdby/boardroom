@@ -150,12 +150,68 @@ test("工具列表符合公开契约：聊天、心跳、任务与工作事件",
         assert.equal(typeof tool.description, "string");
         assert.ok(tool.description && tool.description.length > 0, `${tool.name} 必须有描述`);
         assert.equal(tool.inputSchema.type, "object");
+        if (/(?:^|_)tasks?(?:_|$)|work_event/.test(tool.name)) {
+          // 原生宿主会把没有显式 type 的兄弟属性 $ref 当成字符串。
+          // 检查实际 tools/list 响应，不从内部 Zod 实例重建预期。
+          const checkInline = (value: unknown, location: string): void => {
+            if (value === null || typeof value !== "object") return;
+            assert.ok(!Object.hasOwn(value, "$ref"), `${location} 必须内联类型和约束`);
+            for (const [key, child] of Object.entries(value)) checkInline(child, `${location}.${key}`);
+          };
+          checkInline(tool.inputSchema, tool.name);
+        }
+        if (["begin_task_review", "submit_task_review_report", "decide_task_review"].includes(tool.name)) {
+          for (const field of ["expectedTaskRevision", "expectedRoundRevision"]) {
+            const schema = tool.inputSchema.properties?.[field] as Record<string, unknown>;
+            assert.equal(schema.type, "integer", `${tool.name}.${field}`);
+            assert.equal(schema.minimum, 1);
+            assert.equal(schema.maximum, Number.MAX_SAFE_INTEGER);
+          }
+        }
       }
     } finally {
       await client.close();
       await server.close();
       core.close();
     }
+  });
+});
+
+test("评审 MCP 参数保持严格整数边界，不把数字字符串转换成修订号", async () => {
+  await withDb(async (ctx) => {
+    const member = await spawnMember(ctx, "review-schema");
+    const timestamp = "2026-11-11T00:00:00Z";
+    const evidence = {
+      provenance: "reviewer-declared", host: "sdk-protocol-fixture", hostVersion: "test",
+      parentRunId: "parent", invocationId: "invocation", contextId: "context",
+      startedAt: timestamp, completedAt: timestamp,
+      command: { argv: ["fixture"], cwd: "/fixture", startedAt: timestamp, completedAt: timestamp, exitCode: 0 },
+      promptSha256: "a".repeat(64), transcriptSha256: "b".repeat(64), evidenceRef: "fixture://schema-only",
+      baseCommit: "c".repeat(40), candidateCommit: "d".repeat(40), diffSha256: "e".repeat(64),
+    };
+    const commands: Array<[string, Record<string, unknown>]> = [
+      ["begin_task_review", {}],
+      ["submit_task_review_report", { axis: "spec", verdict: "pass", body: "仅验证协议输入，不是模型报告", sources: ["fixture"], evidence }],
+      ["decide_task_review", { verdict: "pass", reason: "仅验证协议输入" }],
+    ];
+    try {
+      for (const [name, extra] of commands) {
+        const args = { taskId: "task", roundId: "round", expectedTaskRevision: 1, expectedRoundRevision: 1, ...extra };
+        for (const field of ["expectedTaskRevision", "expectedRoundRevision"]) {
+          for (const value of [1, Number.MAX_SAFE_INTEGER]) {
+            const result = await member.call(name, { ...args, [field]: value });
+            // 数字经过真实 SDK schema 后进入领域的会话边界；未 join 不会写数据库。
+            assert.equal(result.payload.error?.code, "NOT_IN_GROUP", `${name}.${field}=${value}`);
+          }
+          for (const value of ["1", 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+            const result = await member.call(name, { ...args, [field]: value });
+            assert.equal(result.isError, true);
+            assert.match(result.payload.error?.message ?? "", /Input validation error/);
+            assert.match(result.payload.error?.message ?? "", new RegExp(field));
+          }
+        }
+      }
+    } finally { await member.close(); }
   });
 });
 
