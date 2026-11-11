@@ -191,8 +191,39 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: 打包本候选已验证的浏览器服务依赖
+        run: |
+          mkdir -p .agent-output/browser-dependencies
+          node --input-type=module <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const manifest = {
+            candidate: process.env.GITHUB_SHA,
+            node: process.version,
+            abi: process.versions.modules,
+            platform: process.platform,
+            arch: process.arch,
+            libc: process.report.getReport().header.glibcVersionRuntime,
+            lockSha256: createHash('sha256').update(readFileSync('package-lock.json')).digest('hex'),
+          };
+          writeFileSync('.agent-output/browser-dependencies/environment.json', JSON.stringify(manifest, null, 2));
+          JS
+          # tar 保留原生模块、可执行位和 .bin 符号链接；来源为本 job 已完成的 npm ci。
+          tar -czf .agent-output/browser-dependencies/node_modules.tar.gz node_modules
+          (cd .agent-output/browser-dependencies && sha256sum node_modules.tar.gz > SHA256SUMS)
+
+      - name: 交接同候选原生依赖
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: browser-dependencies-${{ github.run_attempt }}
+          path: .agent-output/browser-dependencies/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
   managed-web-browser:
     name: Chromium · 工作台与托管 Agent 页面
+    needs: database-tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # 与下方 Python 包版本一致；镜像已安装浏览器及完整系统依赖，避免 apt 镜像 DNS 故障。
@@ -230,15 +261,42 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      - name: 安装 SQLite 原生模块编译工具
-        run: |
-          # 官方浏览器镜像不包含 node-gyp 所需的 make/g++；使用镜像的签名软件源。
-          apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
-          apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends build-essential
+      - name: 取得同次运行的原生依赖
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: browser-dependencies-${{ github.run_attempt }}
+          path: .agent-output/browser-dependencies
+          digest-mismatch: error
 
-      - name: 安装并构建真实 WebUI
+      - name: 核对依赖身份并构建真实 WebUI
         run: |
-          npm ci
+          (cd .agent-output/browser-dependencies && sha256sum --check SHA256SUMS)
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+          const manifest = JSON.parse(readFileSync('.agent-output/browser-dependencies/environment.json', 'utf8'));
+          assert.match(manifest.candidate, /^[0-9a-f]{40}$/);
+          const current = {
+            candidate: process.env.GITHUB_SHA,
+            node: process.version,
+            abi: process.versions.modules,
+            platform: process.platform,
+            arch: process.arch,
+            libc: process.report.getReport().header.glibcVersionRuntime,
+            lockSha256: createHash('sha256').update(readFileSync('package-lock.json')).digest('hex'),
+          };
+          assert.deepEqual(manifest, current, '依赖必须来自本候选、同一锁文件和相同 Node/Linux ABI');
+          console.log(JSON.stringify(current));
+          JS
+          tar --extract --gzip --no-same-owner --file .agent-output/browser-dependencies/node_modules.tar.gz
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import Database from 'better-sqlite3';
+          const db = new Database(':memory:');
+          assert.equal(db.prepare('SELECT 1 AS value').get().value, 1);
+          db.close();
+          JS
           npm run build
 
       - name: 安装固定版本 Playwright 并核对预置 Chromium
