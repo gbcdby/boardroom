@@ -1,6 +1,7 @@
 import type { DbDriver, DbRow } from "../db/driver.ts";
 import type { OwnedProcessIdentity } from "./hosts/types.ts";
-import { createRepositories } from "../db/repositories.ts";
+import { createRepositories, hasMemberLifecycleSchema, type RepoCtx, type RepositorySet } from "../db/repositories.ts";
+import type { MutationDiscover, MutationDiscovery, MutationLockPlan } from "../db/mutation-scope.ts";
 import { newId } from "../db/ids.ts";
 import {
   ArchivedError, ConflictError, InvalidArgumentError, InvalidReferenceError,
@@ -12,7 +13,7 @@ import {
 } from "./config.ts";
 import type {
   AgentRuntime, AgentRuntimeBinding, AgentRunnerState, FenceOptions, NewRuntimeBinding,
-  RunnerFence, RuntimeAppliedConfig, RuntimeBindingView, RuntimeRepository, RuntimeView,
+  RunnerFence, RuntimeAppliedConfig, RuntimeBackend, RuntimeBindingView, RuntimeOverrides, RuntimeRepository, RuntimeView,
 } from "./types.ts";
 
 type Row = DbRow;
@@ -103,24 +104,60 @@ function appliedSnapshot(view: RuntimeBindingView): RuntimeAppliedConfig {
 }
 
 /**
- * 独立仓储仍使用同一个 DbDriver；驱动的 AsyncLocalStorage 使外层 MCP 事务、
- * 基础仓储和这里的嵌套事务复用真正的事务连接。所有锁内回调仅允许短数据库操作。
+ * 生产装配传入同一个 RepositorySet；兼容调用仍复用 driver 唯一 coordinator。
+ * 项目→完整成员→群/运行时的锁序在所有入口一致，锁内只运行短数据库操作。
  */
-export function createRuntimeRepository(db: DbDriver, options: { now?: () => Date } = {}): RuntimeRepository {
-  const repos = createRepositories(db);
+export function createRuntimeRepository(db: DbDriver, options: { now?: () => Date; repos?: RepositorySet } = {}): RuntimeRepository {
+  const repos = options.repos ?? createRepositories(db);
   const now = options.now ?? (() => new Date());
   const at = (): string => now().toISOString();
   const one = async (sql: string, args: readonly unknown[] = []): Promise<Row | undefined> => (await db.query(sql, args))[0];
-  const transaction = async <T>(fn: () => Promise<T>): Promise<T> => {
-    try { return await db.transaction(fn); } catch (error) { return normalize(error); }
+  const scoped = async <T>(plan: MutationLockPlan, fn: () => Promise<T>): Promise<T> => {
+    try { return await repos.mutations.run(plan, fn); } catch (error) { return normalize(error); }
   };
-
-  async function lockRuntime(id: string): Promise<AgentRuntime> {
-    if (await db.exec("UPDATE agent_runtimes SET revision = revision WHERE id = ?", [id]) !== 1) {
-      throw new NotFoundError("runtime_not_found");
-    }
-    return (await getRuntime(id))!;
+  type BindingScope = { id: string; runtime_id: string; project_id: string; group_id: string; member_id: string };
+  function scopeChanged(): never { throw new RepositoryError("mutation_scope_changed", "运行时绑定范围已改变，请刷新后重试。"); }
+  async function bindingScope(id: string, tx: Pick<RepoCtx, "one"> = repos.context): Promise<BindingScope> {
+    const row = await tx.one<BindingScope>("SELECT id, runtime_id, project_id, group_id, member_id FROM agent_runtime_bindings WHERE id = ?", [id]);
+    if (!row) throw new NotFoundError("runtime_binding_not_found");
+    return row;
   }
+  function sameBinding(left: BindingScope, right: BindingScope): boolean {
+    return left.id === right.id && left.runtime_id === right.runtime_id && left.project_id === right.project_id
+      && left.group_id === right.group_id && left.member_id === right.member_id;
+  }
+  function combine(base: MutationDiscovery, extra?: MutationDiscovery): MutationDiscovery {
+    return { memberIds: [...base.memberIds, ...(extra?.memberIds ?? [])],
+      newMemberIds: [...(base.newMemberIds ?? []), ...(extra?.newMemberIds ?? [])],
+      groupIds: [...base.groupIds, ...(extra?.groupIds ?? [])], runtimeIds: [...base.runtimeIds, ...(extra?.runtimeIds ?? [])] };
+  }
+  async function withBindingScope<T>(id: string, fn: () => Promise<T>, discover?: MutationDiscover): Promise<T> {
+    const initial = await bindingScope(id);
+    return scoped({ projectIds: [initial.project_id], discover: async tx => {
+      if (!sameBinding(initial, await bindingScope(id, tx))) scopeChanged();
+      return combine({ memberIds: [initial.member_id], groupIds: [initial.group_id], runtimeIds: [initial.runtime_id] }, await discover?.(tx));
+    } }, async () => {
+      if (!sameBinding(initial, await bindingScope(id))) scopeChanged();
+      return fn();
+    });
+  }
+  async function runtimeClosure(id: string, tx: Pick<RepoCtx, "query"> = repos.context): Promise<BindingScope[]> {
+    const rows = await tx.query<BindingScope>("SELECT id, runtime_id, project_id, group_id, member_id FROM agent_runtime_bindings WHERE runtime_id = ? ORDER BY id LIMIT 2049", [id]);
+    if (rows.length > 2048) scopeChanged();
+    return rows;
+  }
+  async function prepareBinding(backend: RuntimeBackend, input: NewRuntimeBinding): Promise<NewRuntimeBinding & { overrides: RuntimeOverrides }> {
+    if (typeof input?.projectId !== "string" || !input.projectId.trim() || typeof input?.groupId !== "string" || !input.groupId.trim()) {
+      throw new InvalidArgumentError("runtime_binding_reference_invalid");
+    }
+    // 配置校验含文件系统读取，必须在任何数据库写锁之前完成。
+    return { projectId: input.projectId, groupId: input.groupId, overrides: await validateRuntimeOverrides(backend, input.overrides ?? {}) };
+  }
+  async function validGroup(tx: Pick<RepoCtx, "one">, input: NewRuntimeBinding): Promise<void> {
+    const group = await tx.one<{ project_id: string }>("SELECT project_id FROM groups WHERE id = ?", [input.groupId]);
+    if (!group || group.project_id !== input.projectId) throw new InvalidReferenceError("runtime_group_project_mismatch");
+  }
+
   async function getRuntime(id: string): Promise<AgentRuntime | null> {
     const row = await one("SELECT r.*, a.display_name, a.host_type FROM agent_runtimes r JOIN agents a ON a.id = r.agent_id WHERE r.id = ?", [id]);
     return row ? runtime(row) : null;
@@ -141,50 +178,44 @@ export function createRuntimeRepository(db: DbDriver, options: { now?: () => Dat
     }
   }
   async function assertActive(view: RuntimeBindingView): Promise<void> {
-    const row = await one(`SELECT p.archived_at AS project_archived, g.archived_at AS group_archived, m.status
+    const lifecycle = await hasMemberLifecycleSchema(repos.context);
+    const row = await one(`SELECT p.archived_at AS project_archived, g.archived_at AS group_archived, m.status,
+      ${lifecycle ? "m.removed_at" : "NULL"} AS member_removed
       FROM projects p JOIN groups g ON g.project_id = p.id JOIN members m ON m.project_id = p.id
       WHERE p.id = ? AND g.id = ? AND m.id = ?`, [view.binding.projectId, view.binding.groupId, view.binding.memberId]);
     if (!row) throw new InvalidReferenceError("runtime_binding_reference_invalid");
     if (row.project_archived != null || row.group_archived != null) throw new ArchivedError("runtime_scope_archived");
+    if (row.member_removed != null) throw new ConflictError("member_removed");
     if (row.status !== "active") throw new ConflictError("runtime_member_inactive");
   }
   function assertStopped(view: RuntimeBindingView): void {
     if (view.binding.desiredState !== "stopped" || view.runner.owner !== null || !view.runner.exitConfirmed
       || !["stopped", "failed"].includes(view.runner.state)) throw new ConflictError("runtime_must_stop_first");
   }
-  async function insertBinding(r: AgentRuntime, input: NewRuntimeBinding): Promise<string> {
-    if (typeof input?.projectId !== "string" || typeof input?.groupId !== "string") {
-      throw new InvalidArgumentError("runtime_binding_reference_invalid");
-    }
-    const overrides = await validateRuntimeOverrides(r.backend, input.overrides ?? {});
-    // 与永久删除使用相同父级锁，避免确认停机后又插入新的可启动绑定。
-    if (await db.exec("UPDATE projects SET updated_at = updated_at WHERE id = ?", [input.projectId]) !== 1) {
-      throw new InvalidReferenceError("runtime_project_not_found");
-    }
-    if (await db.exec("UPDATE groups SET updated_at = updated_at WHERE id = ? AND project_id = ?", [input.groupId, input.projectId]) !== 1) {
-      throw new InvalidReferenceError("runtime_group_project_mismatch");
-    }
+  async function insertBinding(r: AgentRuntime, input: NewRuntimeBinding & { overrides: RuntimeOverrides }, memberId: string): Promise<string> {
+    const scope = repos.mutations.current(); if (!scope) scopeChanged();
+    scope.assertCovers([input.projectId], [memberId]);
+    await validGroup(repos.context, input);
     const project = await repos.projects.get(input.projectId);
     const group = await repos.groups.get(input.groupId);
     if (project?.archivedAt != null || group?.archivedAt != null) throw new ArchivedError("runtime_scope_archived");
-    let member = await repos.members.findByAgent(input.projectId, r.agentId);
-    if (!member) member = await repos.members.create({ projectId: input.projectId, agentId: r.agentId, kind: "agent", displayName: r.name });
-    const memberId = member.id;
-    return api.withMemberLock(memberId, async () => {
-      const reservation = await one("SELECT * FROM agent_runtime_members WHERE member_id = ?", [memberId]);
-      if (reservation && reservation.runtime_id !== r.id) throw new ConflictError("runtime_member_reserved");
-      if (!reservation) await assertNoExternalConnection(memberId);
-      const id = newId();
-      const createdAt = at();
-      await db.exec(`INSERT INTO agent_runtime_bindings
-        (id, runtime_id, project_id, group_id, member_id, overrides_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [id, r.id, input.projectId, input.groupId, memberId, JSON.stringify(overrides), createdAt, createdAt]);
-      await db.exec("INSERT INTO agent_runner_states (binding_id, updated_at) VALUES (?, ?)", [id, createdAt]);
-      if (!reservation) await db.exec(`INSERT INTO agent_runtime_members
-        (member_id, runtime_id, project_id, updated_at) VALUES (?, ?, ?, ?)`, [memberId, r.id, input.projectId, createdAt]);
-      await repos.groups.addParticipant(input.groupId, memberId);
-      return id;
-    });
+    let member = await repos.members.getIncludingRemoved(memberId);
+    if (!member) member = await repos.members.create({ id: memberId, projectId: input.projectId, agentId: r.agentId, kind: "agent", displayName: r.name });
+    if (member.removedAt !== null) throw new ConflictError("member_removed");
+    if (member.projectId !== input.projectId || member.agentId !== r.agentId) scopeChanged();
+    const reservation = await one("SELECT * FROM agent_runtime_members WHERE member_id = ?", [memberId]);
+    if (reservation && reservation.runtime_id !== r.id) throw new ConflictError("runtime_member_reserved");
+    if (!reservation) await assertNoExternalConnection(memberId);
+    const id = newId();
+    const createdAt = at();
+    await db.exec(`INSERT INTO agent_runtime_bindings
+      (id, runtime_id, project_id, group_id, member_id, overrides_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [id, r.id, input.projectId, input.groupId, memberId, JSON.stringify(input.overrides), createdAt, createdAt]);
+    await db.exec("INSERT INTO agent_runner_states (binding_id, updated_at) VALUES (?, ?)", [id, createdAt]);
+    if (!reservation) await db.exec(`INSERT INTO agent_runtime_members
+      (member_id, runtime_id, project_id, updated_at) VALUES (?, ?, ?, ?)`, [memberId, r.id, input.projectId, createdAt]);
+    await repos.groups.addParticipant(input.groupId, memberId);
+    return id;
   }
   async function releaseBinding(id: string): Promise<void> {
     const view = await requiredBinding(id);
@@ -201,7 +232,7 @@ export function createRuntimeRepository(db: DbDriver, options: { now?: () => Dat
       if (!view) return false;
       try { await assertActive(view); return true; }
       catch (error) {
-        if (error instanceof ArchivedError || error instanceof ConflictError && error.message === "runtime_member_inactive") return false;
+        if (error instanceof ArchivedError || error instanceof ConflictError && ["runtime_member_inactive", "member_removed"].includes(error.message)) return false;
         throw error;
       }
     },
@@ -212,7 +243,13 @@ export function createRuntimeRepository(db: DbDriver, options: { now?: () => Dat
       if (!Array.isArray(input?.bindings) || input.bindings.length < 1 || input.bindings.length > 100) {
         throw new InvalidArgumentError("runtime_initial_binding_required");
       }
-      return transaction(async () => {
+      const entries: (NewRuntimeBinding & { overrides: RuntimeOverrides })[] = [];
+      for (const entry of input.bindings) entries.push(await prepareBinding(backend, entry));
+      const memberByProject = new Map(entries.map(entry => [entry.projectId, newId()]));
+      return scoped({ projectIds: [...memberByProject.keys()], discover: async tx => {
+        for (const entry of entries) await validGroup(tx, entry);
+        return { memberIds: [], newMemberIds: [...memberByProject.values()], groupIds: entries.map(entry => entry.groupId), runtimeIds: [] };
+      } }, async () => {
         if (await repos.agents.findByIdentity(name, backend)) throw new ConflictError("runtime_identity_exists");
         const agent = await repos.agents.create({ displayName: name, hostType: backend });
         const id = newId();
@@ -221,7 +258,7 @@ export function createRuntimeRepository(db: DbDriver, options: { now?: () => Dat
           (id, agent_id, config_version, defaults_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
         [id, agent.id, RUNTIME_CONFIG_VERSION, JSON.stringify(defaults), createdAt, createdAt]);
         const r = (await getRuntime(id))!;
-        for (const entry of input.bindings) await insertBinding(r, entry);
+        for (const entry of entries) await insertBinding(r, entry, memberByProject.get(entry.projectId)!);
         return (await api.get(id))!;
       });
     },
@@ -270,8 +307,7 @@ export function createRuntimeRepository(db: DbDriver, options: { now?: () => Dat
       const r = await getRuntime(id);
       if (!r) throw new NotFoundError("runtime_not_found");
       const defaults = await validateRuntimeConfig(r.backend, input);
-      return transaction(async () => {
-        await lockRuntime(id);
+      return scoped({ projectIds: [], discover: async () => ({ memberIds: [], groupIds: [], runtimeIds: [id] }) }, async () => {
         const changed = await db.exec(`UPDATE agent_runtimes SET defaults_json = ?, revision = revision + 1, updated_at = ?
           WHERE id = ? AND revision = ?`, [JSON.stringify(defaults), at(), id, expectedRevision]);
         if (changed !== 1) throw new ConflictError("runtime_revision_conflict");
@@ -279,10 +315,18 @@ export function createRuntimeRepository(db: DbDriver, options: { now?: () => Dat
       });
     },
     async addBinding(runtimeId, input, expectedRuntimeRevision) {
-      return transaction(async () => {
-        const r = await lockRuntime(runtimeId);
+      const initial = await getRuntime(runtimeId); if (!initial) throw new NotFoundError("runtime_not_found");
+      const prepared = await prepareBinding(initial.backend, input);
+      const newMemberId = newId(); let memberId = newMemberId;
+      return scoped({ projectIds: [prepared.projectId], discover: async tx => {
+        await validGroup(tx, prepared);
+        const member = await tx.one<{ id: string }>("SELECT id FROM members WHERE project_id = ? AND agent_id = ?", [prepared.projectId, initial.agentId]);
+        memberId = member?.id ?? newMemberId;
+        return { memberIds: member ? [memberId] : [], newMemberIds: member ? [] : [memberId], groupIds: [prepared.groupId], runtimeIds: [runtimeId] };
+      } }, async () => {
+        const r = await getRuntime(runtimeId); if (!r) throw new NotFoundError("runtime_not_found");
         if (expectedRuntimeRevision !== undefined && r.revision !== expectedRuntimeRevision) throw new ConflictError("runtime_revision_conflict");
-        return (await api.getBinding(await insertBinding(r, input)))!;
+        return (await api.getBinding(await insertBinding(r, prepared, memberId)))!;
       });
     },
     async updateBinding(id, input) {
@@ -290,63 +334,56 @@ export function createRuntimeRepository(db: DbDriver, options: { now?: () => Dat
       const initial = await requiredBinding(id);
       const overrides = await validateRuntimeOverrides(initial.runtime.backend, input.overrides);
       const strategy = validateAdvancedStrategy(initial.runtime.backend, input.advancedStrategy);
-      return transaction(async () => {
-        const r = await lockRuntime(initial.runtime.id);
-        return api.withMemberLock(initial.binding.memberId, async () => {
-          const current = await requiredBinding(id);
-          if (r.revision !== input.runtimeRevision || current.binding.revision !== input.bindingRevision) {
-            throw new ConflictError("runtime_revision_conflict");
-          }
-          const advanced = strategy === null ? null : { strategy, runtimeRevision: r.revision, bindingRevision: input.bindingRevision + 1 };
-          await db.exec(`UPDATE agent_runtime_bindings SET overrides_json = ?, advanced_json = ?, revision = revision + 1, updated_at = ?
-            WHERE id = ? AND revision = ?`, [JSON.stringify(overrides), advanced === null ? null : JSON.stringify(advanced), at(), id, input.bindingRevision]);
-          return (await api.getBinding(id))!;
-        });
+      return withBindingScope(id, async () => {
+        const r = (await getRuntime(initial.runtime.id))!;
+        const current = await requiredBinding(id);
+        if (r.revision !== input.runtimeRevision || current.binding.revision !== input.bindingRevision) {
+          throw new ConflictError("runtime_revision_conflict");
+        }
+        const advanced = strategy === null ? null : { strategy, runtimeRevision: r.revision, bindingRevision: input.bindingRevision + 1 };
+        await db.exec(`UPDATE agent_runtime_bindings SET overrides_json = ?, advanced_json = ?, revision = revision + 1, updated_at = ?
+          WHERE id = ? AND revision = ?`, [JSON.stringify(overrides), advanced === null ? null : JSON.stringify(advanced), at(), id, input.bindingRevision]);
+        return (await api.getBinding(id))!;
       });
     },
     async intent(id, action, expectedIntentRevision, expectedConfig) {
       if (!["start", "retry", "stop", "apply", "new-session"].includes(action)) throw new InvalidArgumentError("runtime_intent_invalid");
-      const initial = await requiredBinding(id);
-      return transaction(async () => {
-        await lockRuntime(initial.runtime.id);
-        return api.withMemberLock(initial.binding.memberId, async () => {
-          const view = await requiredBinding(id);
-          if (expectedConfig !== undefined && (expectedConfig.runtimeRevision !== view.runtime.revision
-            || expectedConfig.bindingRevision !== view.binding.revision)) throw new ConflictError("runtime_revision_conflict");
-          if (expectedIntentRevision !== undefined && expectedIntentRevision !== view.binding.intentRevision) {
-            throw new ConflictError("runtime_intent_conflict");
+      return withBindingScope(id, async () => {
+        const view = await requiredBinding(id);
+        if (expectedConfig !== undefined && (expectedConfig.runtimeRevision !== view.runtime.revision
+          || expectedConfig.bindingRevision !== view.binding.revision)) throw new ConflictError("runtime_revision_conflict");
+        if (expectedIntentRevision !== undefined && expectedIntentRevision !== view.binding.intentRevision) {
+          throw new ConflictError("runtime_intent_conflict");
+        }
+        if (action !== "stop") await assertActive(view);
+        if (action === "stop" && view.binding.desiredState === "stopped") return view;
+        if (action === "start" && view.binding.desiredState === "running") return view;
+        let requested = view.binding.requestedSnapshot;
+        let reset = view.binding.resetSessionRequested;
+        if (action === "apply") { requested = appliedSnapshot(view); reset = true; }
+        if (action === "new-session") { requested = view.runner.applied ?? appliedSnapshot(view); reset = true; }
+        if ((action === "start" || action === "retry") && view.runner.applied === null && requested === null) requested = appliedSnapshot(view);
+        const desired = action === "stop" ? "stopped" : "running";
+        const stamp = at();
+        await db.exec(`UPDATE agent_runtime_bindings SET desired_state = ?, intent_revision = intent_revision + 1,
+          requested_snapshot_json = ?, reset_session_requested = ?, updated_at = ? WHERE id = ?`,
+        [desired, requested === null ? null : JSON.stringify(requested), reset ? 1 : 0, stamp, id]);
+        if (view.runner.owner !== null && action !== "start" && action !== "retry") {
+          await db.exec("UPDATE agent_runner_states SET state = 'stopping', updated_at = ? WHERE binding_id = ?", [stamp, id]);
+        } else if (view.runner.owner === null && action !== "stop") {
+          await db.exec("UPDATE agent_runner_states SET next_retry_at = NULL, last_error_code = NULL, updated_at = ? WHERE binding_id = ?", [stamp, id]);
+          // resume 失败禁止自动重试；人的明确 retry 仍可重新尝试原 sid，不生成新会话。
+          if (action === "retry" && view.runner.sessionState === "invalid" && view.runner.harnessSessionId !== null) {
+            await db.exec("UPDATE agent_runner_states SET session_state = 'resumable' WHERE binding_id = ?", [id]);
           }
-          if (action !== "stop") await assertActive(view);
-          if (action === "stop" && view.binding.desiredState === "stopped") return view;
-          if (action === "start" && view.binding.desiredState === "running") return view;
-          let requested = view.binding.requestedSnapshot;
-          let reset = view.binding.resetSessionRequested;
-          if (action === "apply") { requested = appliedSnapshot(view); reset = true; }
-          if (action === "new-session") { requested = view.runner.applied ?? appliedSnapshot(view); reset = true; }
-          if ((action === "start" || action === "retry") && view.runner.applied === null && requested === null) requested = appliedSnapshot(view);
-          const desired = action === "stop" ? "stopped" : "running";
-          const stamp = at();
-          await db.exec(`UPDATE agent_runtime_bindings SET desired_state = ?, intent_revision = intent_revision + 1,
-            requested_snapshot_json = ?, reset_session_requested = ?, updated_at = ? WHERE id = ?`,
-          [desired, requested === null ? null : JSON.stringify(requested), reset ? 1 : 0, stamp, id]);
-          if (view.runner.owner !== null && action !== "start" && action !== "retry") {
-            await db.exec("UPDATE agent_runner_states SET state = 'stopping', updated_at = ? WHERE binding_id = ?", [stamp, id]);
-          } else if (view.runner.owner === null && action !== "stop") {
-            await db.exec("UPDATE agent_runner_states SET next_retry_at = NULL, last_error_code = NULL, updated_at = ? WHERE binding_id = ?", [stamp, id]);
-            // resume 失败禁止自动重试；人的明确 retry 仍可重新尝试原 sid，不生成新会话。
-            if (action === "retry" && view.runner.sessionState === "invalid" && view.runner.harnessSessionId !== null) {
-              await db.exec("UPDATE agent_runner_states SET session_state = 'resumable' WHERE binding_id = ?", [id]);
-            }
-          }
-          return (await api.getBinding(id))!;
-        });
+        }
+        return (await api.getBinding(id))!;
       });
     },
     async claim(id, owner, claimOptions = {}) {
       if (typeof owner !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(owner)) throw new InvalidArgumentError("runtime_owner_invalid");
       const leaseMs = claimOptions.leaseMs ?? DEFAULT_LEASE_MS; leaseDuration(leaseMs);
-      const initial = await requiredBinding(id);
-      return api.withMemberLock(initial.binding.memberId, async () => {
+      return withBindingScope(id, async () => {
         const view = await requiredBinding(id);
         await assertActive(view);
         if (claimOptions.expectedIntentRevision !== undefined && claimOptions.expectedIntentRevision !== view.binding.intentRevision) {
@@ -399,8 +436,8 @@ export function createRuntimeRepository(db: DbDriver, options: { now?: () => Dat
       if (fenceOptions.requireActiveScope !== false) await assertActive(view);
       return view;
     },
-    async withFence<T>(fence: RunnerFence, fn: () => Promise<T>, fenceOptions: FenceOptions = {}): Promise<T> {
-      return api.withMemberLock(fence.memberId, async () => { await api.checkFence(fence, fenceOptions); return fn(); });
+    async withFence<T>(fence: RunnerFence, fn: () => Promise<T>, fenceOptions: FenceOptions = {}, discover?: MutationDiscover): Promise<T> {
+      return withBindingScope(fence.bindingId, async () => { await api.checkFence(fence, fenceOptions); return fn(); }, discover);
     },
     async renew(fence, leaseMs = DEFAULT_LEASE_MS) {
       leaseDuration(leaseMs);
@@ -494,8 +531,7 @@ export function createRuntimeRepository(db: DbDriver, options: { now?: () => Dat
     },
     async queued(id, reason, retryAt = null) {
       code(reason); timestamp(retryAt);
-      const initial = await requiredBinding(id);
-      return api.withMemberLock(initial.binding.memberId, async () => {
+      return withBindingScope(id, async () => {
         const view = await requiredBinding(id);
         if (view.runner.owner !== null || !view.runner.exitConfirmed) throw new ConflictError("runtime_member_owned");
         await db.exec("UPDATE agent_runner_states SET last_error_code = ?, next_retry_at = ?, observed_at = ?, updated_at = ? WHERE binding_id = ?",
@@ -509,7 +545,7 @@ export function createRuntimeRepository(db: DbDriver, options: { now?: () => Dat
         JOIN messages m ON m.id = d.message_id AND m.group_id = b.group_id
         JOIN projects p ON p.id = b.project_id JOIN groups g ON g.id = b.group_id JOIN members mb ON mb.id = b.member_id
         WHERE b.desired_state = 'running' AND d.wake_decision = 'allowed' AND d.status <> 'acked'
-          AND p.archived_at IS NULL AND g.archived_at IS NULL AND mb.status = 'active'
+          AND p.archived_at IS NULL AND g.archived_at IS NULL AND mb.status = 'active'${await hasMemberLifecycleSchema(repos.context) ? " AND mb.removed_at IS NULL" : ""}
         ORDER BY m.created_at, m.id, b.id`);
       const results = new Map<string, { bindingId: string; memberId: string; projectId: string; groupId: string; firstMessageAt: string; messageIds: string[] }>();
       for (const row of rows) {
@@ -523,31 +559,34 @@ export function createRuntimeRepository(db: DbDriver, options: { now?: () => Dat
       }
       return [...results.values()];
     },
-    async withMemberLock<T>(memberId: string, fn: () => Promise<T>): Promise<T> {
-      return transaction(async () => {
-        // 无值变化的 UPDATE 在两种数据库上都取得成员写锁；PG 独立连接同样互斥。
-        if (await db.exec("UPDATE members SET updated_at = updated_at WHERE id = ?", [memberId]) !== 1) throw new NotFoundError("runtime_member_not_found");
+    async withMemberLock<T>(memberId: string, fn: () => Promise<T>, discover?: MutationDiscover): Promise<T> {
+      const initial = await memberRow(memberId); const projectId = String(initial.project_id);
+      return scoped({ projectIds: [projectId], discover: async tx => combine({ memberIds: [memberId], groupIds: [], runtimeIds: [] }, await discover?.(tx)) }, async () => {
+        if (String((await memberRow(memberId)).project_id) !== projectId) scopeChanged();
         return fn();
       });
     },
     async assertExternalJoinAllowed(memberId) {
-      await memberRow(memberId);
+      if ((await memberRow(memberId)).removed_at != null) throw new ConflictError("member_removed");
       if (await one("SELECT member_id FROM agent_runtime_members WHERE member_id = ?", [memberId])) throw new ConflictError("runtime_member_reserved");
     },
     async removeBinding(id) {
-      const initial = await requiredBinding(id);
-      await transaction(async () => {
-        await lockRuntime(initial.runtime.id);
-        await api.withMemberLock(initial.binding.memberId, () => releaseBinding(id));
-      });
+      await withBindingScope(id, () => releaseBinding(id));
     },
     async delete(id) {
-      await transaction(async () => {
-        await lockRuntime(id);
-        const bindings = await db.query("SELECT id, member_id FROM agent_runtime_bindings WHERE runtime_id = ? ORDER BY member_id, id", [id]);
-        for (const row of bindings) await db.exec("UPDATE members SET updated_at = updated_at WHERE id = ?", [row.member_id]);
-        for (const row of bindings) assertStopped(await requiredBinding(String(row.id)));
-        for (const row of bindings) await releaseBinding(String(row.id));
+      if (!await getRuntime(id)) throw new NotFoundError("runtime_not_found");
+      const initial = await runtimeClosure(id); const projectIds = [...new Set(initial.map(row => row.project_id))];
+      let planned: BindingScope[] = [];
+      await scoped({ projectIds, discover: async tx => {
+        planned = await runtimeClosure(id, tx);
+        if (planned.some(row => !projectIds.includes(row.project_id))) scopeChanged();
+        return { memberIds: planned.map(row => row.member_id), groupIds: planned.map(row => row.group_id), runtimeIds: [id] };
+      } }, async () => {
+        // 获得运行时锁后再次枚举；跨项目新增不能靠迟到追加锁解决。
+        const current = await runtimeClosure(id);
+        if (current.length !== planned.length || current.some((row, index) => !sameBinding(row, planned[index]!))) scopeChanged();
+        for (const row of current) assertStopped(await requiredBinding(row.id));
+        for (const row of current) await releaseBinding(row.id);
         await db.exec("DELETE FROM agent_runtimes WHERE id = ?", [id]);
       });
     },

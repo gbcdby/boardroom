@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { newId } from "../db/ids.ts";
 import type { DbDriver } from "../db/driver.ts";
+import type { RepositorySet } from "../db/repositories.ts";
+import type { MutationDiscover } from "../db/mutation-scope.ts";
 import type { Logger } from "../logger.ts";
 import { McpToolError } from "../mcp/errors.ts";
 import type { ManagedCoreAuthority, SessionBinding } from "../mcp/core.ts";
@@ -101,6 +103,7 @@ export function launchSnapshot(view: RuntimeBindingView, owner: string, socketPa
 
 export function createRuntimeSupervisor(options: {
   db: DbDriver;
+  repos?: RepositorySet;
   logger: Logger;
   launcher: HostLauncher;
   observations: RuntimeObservability;
@@ -115,7 +118,7 @@ export function createRuntimeSupervisor(options: {
   /** 测试用显式 tick，不自动开启时钟；不能改变生产宿主支持判定。 */
   manual?: boolean;
 }): RuntimeSupervisor {
-  const repo = options.repository ?? createRuntimeRepository(options.db);
+  const repo = options.repository ?? createRuntimeRepository(options.db, options.repos ? { repos: options.repos } : {});
   const now = options.now ?? Date.now;
   const owner = randomUUID();
   const log = options.logger.child({ component: "runtime-supervisor" });
@@ -184,7 +187,7 @@ export function createRuntimeSupervisor(options: {
     return {
       identity: { displayName: view.runtime.name, hostType: view.runtime.backend,
         projectId: view.binding.projectId, groupId: view.binding.groupId, memberId: view.binding.memberId },
-      async run(operation, fn) {
+      async run(operation, fn, discover?: MutationDiscover) {
         if (item.stopping && operation !== "observe" && operation !== "disconnect") throw new McpToolError("CONFLICT", "托管运行正在停止");
         if ((operation === "consume" || operation === "write") && !item.joined) {
           throw new McpToolError("CONFLICT", "托管 MCP 通道尚未就绪或已断开");
@@ -194,7 +197,7 @@ export function createRuntimeSupervisor(options: {
           throw new McpToolError("FORBIDDEN", "实际权限模式尚未确认，不能处理新业务");
         }
         return await repo.withFence(item.fence, fn, { requireRunningIntent: operation === "consume",
-          requireActiveScope: operation !== "disconnect" });
+          requireActiveScope: operation !== "disconnect" }, discover);
       },
       beforeWait: () => beforeWait(item),
       async onDelivery() {
@@ -342,7 +345,7 @@ export function createRuntimeSupervisor(options: {
       permission: "unknown", observedSessionId: null, failure: null, eventChain: Promise.resolve(), completion: null };
     active.set(b.id, item);
     try {
-      item.gateway = await (options.gatewayFactory ?? createRuntimeGateway)({ db: options.db, logger: options.logger,
+      item.gateway = await (options.gatewayFactory ?? createRuntimeGateway)({ db: options.db, ...(options.repos ? { repos: options.repos } : {}), logger: options.logger,
         authority: authorityFor(item, claimed),
         ...(options.actorFor ? { actorFor: options.actorFor } : {}),
         onJoined: async () => { item.joined = true; await maybeReady(item); },

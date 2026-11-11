@@ -80,6 +80,15 @@ export type MemberRole = "manager" | "normal";
  */
 export type MemberLifecycleStatus = "active" | "disabled" | "pending";
 
+/** v13 持久身份代际；接口先发布，旧 schema 的默认值为 null / 1。 */
+export interface MemberLifecycleFields {
+  readonly removedAt: string | null;
+  readonly membershipRevision: number;
+}
+export const MEMBER_FACT_KINDS = ["authored-messages", "deliveries", "memory-requests", "memory-receipts", "memory-counters", "memory-checkpoints"] as const;
+export type MemberFactKind = typeof MEMBER_FACT_KINDS[number];
+export interface MemberFactRevision { kind: MemberFactKind; revision: number }
+
 /**
  * 岗位角色的静态枚举（T2 #49；spec #45 §3、决策票 #25/#26 定稿口径）。
  * 与 F2 `AUTHZ_ROLES` 同值：角色静态、岗位动态（角色与岗位分离）；
@@ -107,6 +116,8 @@ export interface OrgNode {
 }
 
 export interface NewOrgNode {
+  /** 仅 server-only mutation 入口预分配；公开输入不能自报 ID。 */
+  readonly id?: string;
   readonly projectId: string;
   readonly parentId?: string | null;
   readonly name: string;
@@ -115,7 +126,7 @@ export interface NewOrgNode {
 }
 
 /** Member：agent 或人在某项目中的成员关系与岗位。 */
-export interface Member {
+export interface Member extends MemberLifecycleFields {
   readonly id: string;
   readonly projectId: string;
   readonly agentId: string | null;
@@ -134,6 +145,8 @@ export interface Member {
 }
 
 export interface NewMember {
+  /** server-only 预分配 ID，供共同锁计划声明新成员。HTTP/MCP 不接受用户自报。 */
+  readonly id?: string;
   readonly projectId: string;
   /** kind=agent 时必填；kind=human 时必须省略/为 null。 */
   readonly agentId?: string | null;

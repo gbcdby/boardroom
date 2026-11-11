@@ -40,14 +40,16 @@ async function init(database: MemoryDatabaseDescriptor, values: MemoryConfig): P
 
 async function read(binding: MemoryReadBinding): Promise<MemoryInjection> {
   if (!config) throw new Error("not initialized");
+  if (!Number.isSafeInteger(binding.membershipRevision) || binding.membershipRevision < 1) return unavailableMemory(config, "memory_binding_unavailable");
   const size = sqlite ? "length(CAST(d.markdown AS BLOB))" : "octet_length(d.markdown)";
-  const p = sqlite ? ["?", "?", "?"] : ["$1", "$2", "$3"];
+  const p = sqlite ? ["?", "?", "?", "?"] : ["$1", "$2", "$3", "$4"];
   const sql = `SELECT m.id AS member_id, m.agent_id AS binding_agent_id, d.id, d.scope, d.project_id, d.version,
       CASE WHEN ${size} <= ${p[0]} THEN d.markdown ELSE NULL END AS markdown, ${size} AS byte_length
     FROM members m LEFT JOIN memory_documents d ON d.agent_id=m.agent_id
       AND ((d.scope='global' AND d.project_id IS NULL) OR (d.scope='project-agent' AND d.project_id=m.project_id))
-    WHERE m.id=${p[1]} AND m.project_id=${p[2]} AND m.kind='agent' AND m.status='active' LIMIT 2`;
-  const params = [config.maxDocumentBytes, binding.memberId, binding.projectId];
+    WHERE m.id=${p[1]} AND m.project_id=${p[2]} AND m.kind='agent' AND m.status='active'
+      AND m.removed_at IS NULL AND m.membership_revision=${p[3]} LIMIT 2`;
+  const params = [config.maxDocumentBytes, binding.memberId, binding.projectId, binding.membershipRevision];
   const rows = sqlite ? sqlite.prepare(sql).all(...params) as Row[] : (await pg!.query<Row>(sql, params)).rows;
   if (!rows.length) return unavailableMemory(config, "memory_binding_unavailable");
   if (rows.some(row => row.id !== null && row.markdown === null)) return unavailableMemory(config, "memory_too_large");
@@ -66,7 +68,8 @@ process.on("message", async (raw: unknown) => {
     if (message["type"] === "init") { await init(message["database"] as MemoryDatabaseDescriptor, message["config"] as MemoryConfig); process.send?.({ type: "ready" }); return; }
     if (message["type"] !== "read" || busy) return;
     busy = true;
-    const binding = { memberId: String(message["memberId"]), projectId: String(message["projectId"]), bindingGeneration: String(message["bindingGeneration"]) };
+    const binding = { memberId: String(message["memberId"]), projectId: String(message["projectId"]), bindingGeneration: String(message["bindingGeneration"]),
+      membershipRevision: message["membershipRevision"] as number };
     const result = await read(binding);
     process.send?.({ type: "result", nonce: message["nonce"], ...binding, result });
   } catch { process.send?.({ type: "error", code: "memory_reader_query_failed" }); }

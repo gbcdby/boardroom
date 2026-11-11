@@ -1,10 +1,15 @@
 # 三层记忆与 Agent 自总结
 
+状态：已确认（实现与使用说明；真实模型验收仍阻塞）
+日期：2026-11-11
+
 范围与验收以 [Spec #108](https://github.com/gbcdby/boardroom/issues/108) 和 Tickets #113～#117 为准。本文描述实现合同；PR、测试与真实模型是否通过，以对应候选的验收记录为准。
 
 ## 使用方式与可见范围
 
 项目导航的「记忆」页面可以维护项目共享文档和获授权的成员文档。编辑器显示 UTF-8 字节数、当前版本与保存结果；空文档以版本 0 开始。历史正文以文本显示，选择「带入草稿」后仍需显式保存，形成新版本。发生 409 冲突时保留草稿，先查看最新正文并明确接受新基准，再保存。
+
+规范入口为 `/projects/:projectId/memory`。切项目、切成员前会保护未保存草稿；取消后上下文不变。保存期间可以继续输入，旧保存结果不会清除新输入；迟到的旧项目/成员响应不能混入当前文档。正文和历史均按普通文本显示，Markdown/HTML 不会作为可执行页面插入。
 
 | 作用域 | 可读写主体 | 自动注入 |
 | --- | --- | --- |
@@ -34,6 +39,8 @@
 
 请求状态为 pending / running / completed / failed / conflicted / cancelled。只有成功完成才保存 `SelfSummaryEvidence`；其 `provenance` 固定为 `agent-declared`，含 host/version、invocation/context、起止时间、prompt/output SHA-256 和 evidenceRef。平台检查格式与提交正文 hash；这不证明宿主真的运行过模型。真实模型验收必须另有实际调用、输出与上下文证据。
 
+页面只为 failed / conflicted / cancelled 提供重试。重试创建新请求、新基准和新的模型 attempt；pending / running / completed 不可重试，失活或已离开的目标也不能开始新总结。页面刷新只读取实际状态，不触发模型；管理者可维护历史文档不等于可以冒充目标 Agent 总结。
+
 消息历史读取、直接 ACK、旧库 delivered 状态都不能回填真实 MCP 投递标记。任务通知即使已 ACK，仍可由持久任务来源补偿。断线、transport EOF、超时或进程退出都不是逻辑 session-end。
 
 ## HTTP 与 MCP
@@ -59,15 +66,29 @@ HTTP 仅限当前本地同源管理边界；不接受请求自行声明 actor �
 
 配置仍按默认值 → 配置文件 → 环境变量加载，修改后正常重启生效。
 
-| `memory` 字段 | 默认 | 环境变量 |
-| --- | ---: | --- |
-| messageThreshold | 50 | AGENT_STUDIO_MEMORY_MESSAGE_THRESHOLD |
-| maxDocumentBytes | 32768 | AGENT_STUDIO_MEMORY_MAX_DOCUMENT_BYTES |
-| maxInjectedBytes | 8192 | AGENT_STUDIO_MEMORY_MAX_INJECTED_BYTES |
-| summaryInputBytes | 65536 | AGENT_STUDIO_MEMORY_SUMMARY_INPUT_BYTES |
-| summaryAttemptTimeoutMs | 900000 | AGENT_STUDIO_MEMORY_SUMMARY_ATTEMPT_TIMEOUT_MS |
+| `memory` 字段 | 默认 | 允许范围（整数，含端点） | 环境变量 |
+| --- | ---: | --- | --- |
+| messageThreshold | 50 | 1–10000 条 | AGENT_STUDIO_MEMORY_MESSAGE_THRESHOLD |
+| maxDocumentBytes | 32768 | 1024–1048576 B | AGENT_STUDIO_MEMORY_MAX_DOCUMENT_BYTES |
+| maxInjectedBytes | 8192 | 512–65536 B | AGENT_STUDIO_MEMORY_MAX_INJECTED_BYTES |
+| summaryInputBytes | 65536 | 1024–262144 B | AGENT_STUDIO_MEMORY_SUMMARY_INPUT_BYTES |
+| summaryAttemptTimeoutMs | 900000 | 30000–3600000 ms | AGENT_STUDIO_MEMORY_SUMMARY_ATTEMPT_TIMEOUT_MS |
 
 正文与注入预算按 UTF-8 计算；注入按 grapheme 边界截断，避免切坏 emoji/组合字符。文档保存超限时拒绝，不截断用户草稿。
+
+例如可在配置文件加入以下字段；未填写的字段保持默认值，当前已解析的值见 `/settings` 和 `GET /api/memory-settings`，修改后正常重启：
+
+```json
+{
+  "memory": {
+    "messageThreshold": 50,
+    "maxDocumentBytes": 32768,
+    "maxInjectedBytes": 8192,
+    "summaryInputBytes": 65536,
+    "summaryAttemptTimeoutMs": 900000
+  }
+}
+```
 
 `npm run e2e:memory` 使用真实 HTTP/MCP SDK 和数据库，检查权限、版本冲突、新请求、证据原子提交、消息阈值与注入；摘要正文是明确标注的协议夹具，报告保留 `realModelSummary: NOT_RUN`。真实 PG 表锁下的主消息/ACK/status 与实际回滚见 `tests/memory-mcp-postgres.test.ts`。没有配置真实 PG 时该项 SKIP，由 CI 的 PG 服务执行，不能以 SQLite 通过代替。
 

@@ -20,6 +20,8 @@ function member(overrides: Partial<Member> & Pick<Member, "id" | "kind" | "role"
     nodeId: null,
     // T3 #50：生命周期状态；阶段 1 兼容映射用例均为在岗（active）。
     status: "active",
+    removedAt: null,
+    membershipRevision: 1,
     createdAt: "",
     updatedAt: "",
     ...overrides,

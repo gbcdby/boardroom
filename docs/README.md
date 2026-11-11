@@ -4,26 +4,30 @@
 
 ## 目录结构
 
-```
-docs/
-├── README.md
-├── agent-workflow.md       # 可调整的 Agent 工作流程
-├── architecture/
-│   ├── agent-studio.md       # 产品宏观架构、范围与验收基线
-│   ├── data-model.md         # 持久化数据模型、ID 方案、迁移与事务
-│   └── （阶段 2 起按需新增架构/契约文档）
-├── f2-authorize-guard.md     # F2 统一权限守卫：能力点矩阵、拒绝语义、接入点位
-├── mcp-tool-contract.md      # 阶段 1 MCP 工具契约（F3）
-├── t1-project-group-api.md   # T1 项目/群组/成员 HTTP API 与 WebUI 页面
-├── t3-member-lifecycle.md    # T3 成员生命周期状态机与守卫（复用 T1 归档/删除流程）
-├── getting-started-mcp.md    # T8 接入指南：Claude Code / Codex CLI MCP 配置与已知限制
-├── t8-acceptance-report.md   # T8 阶段 1 收口验收报告（AC-CORE-01..11 逐项结论）
-└── archive/                  # 已取代或废弃的架构文档（按需创建）
-```
+| 文档 | 内容 |
+| --- | --- |
+| [agent-workflow.md](agent-workflow.md) | 可调整的 Agent 工作流程 |
+| [architecture/agent-studio.md](architecture/agent-studio.md) | 产品宏观架构、范围与验收基线 |
+| [architecture/data-model.md](architecture/data-model.md) | 持久化数据模型、迁移、v13 事实版本与共同事务边界 |
+| [f2-authorize-guard.md](f2-authorize-guard.md) | 统一权限矩阵、拒绝语义、接入点位 |
+| [mcp-tool-contract.md](mcp-tool-contract.md) | 当前工具目录、绑定/CAS 与聊天契约 |
+| [t1-project-group-api.md](t1-project-group-api.md) | 项目/群组/成员 HTTP 与早期 WebUI 契约 |
+| [t3-member-lifecycle.md](t3-member-lifecycle.md) | 当前成员生命周期、移除、审计补偿与删除范围 |
+| [getting-started-mcp.md](getting-started-mcp.md) | 安装、双数据库、三宿主 MCP 配置与限制 |
+| [tasks-and-review.md](tasks-and-review.md) | 任务、固定 Git 候选与独立双轴评审 |
+| [memory.md](memory.md) | 三层记忆、版本/冲突与目标 Agent 自总结 |
+| [settings.md](settings.md) | 只读有效配置、来源、刷新与重启生效 |
+| [settings-and-audit.md](settings-and-audit.md) | 设置、审计撤销/重做、移除与恢复的用户操作 |
+| [v1-acceptance.md](v1-acceptance.md) | 全部 46 项 AC 的证据索引与实际缺口 |
+| [t8-acceptance-report.md](t8-acceptance-report.md) | 保留原日期和对象的阶段 1 历史验收报告 |
+
+被取代的架构文档按需要归档到 `docs/archive/`，不删去旧证据的日期与对象。
 
 ## 内容归属
 
-任务与评审的状态、权限、MCP 入口及验证方式见 [tasks-and-review.md](tasks-and-review.md)。
+开始使用见[安装与 MCP 接入](getting-started-mcp.md)。任务与评审见 [tasks-and-review.md](tasks-and-review.md)，记忆权限与冲突见 [memory.md](memory.md)，有效配置见 [settings.md](settings.md)，审计和恢复流程见 [settings-and-audit.md](settings-and-audit.md)。
+
+[V1 验收索引](v1-acceptance.md)区分最终候选的 PASS / FAIL / BLOCKED / NOT_RUN、静态 OBSERVED 与历史背景。[T8 报告](t8-acceptance-report.md)保留原阶段、原宿主版本与日期，不作为后续任务评审/记忆真实模型结果。
 
 | 内容 | 位置 |
 | --- | --- |

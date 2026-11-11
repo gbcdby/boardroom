@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { setImmediate, setTimeout as delay } from "node:timers/promises";
 import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
-import type { DbRow } from "../src/server/db/driver.ts";
+import type { DbRow, DbTransaction } from "../src/server/db/driver.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories } from "../src/server/db/repositories.ts";
 import { createMcpCore } from "../src/server/mcp/core.ts";
@@ -113,46 +113,56 @@ test("任务事件兑现同一次等待时保留 afterCursor，不重复投递�
   } finally { await f.close(); }
 });
 
-test("初始聊天查询已取空快照时到达的唤醒，仍在当前 wait 内重扫并投递", async () => {
+test("初始空 consume 真实提交后到达的唤醒，仍在当前 wait 内重扫并投递", { timeout: 10000 }, async () => {
   const f = await fixture();
   const originalQuery = f.db.query.bind(f.db);
+  const originalTransaction = f.db.transaction.bind(f.db);
+  async function within<T>(promise: Promise<T>, label: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([promise, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`等待 ${label} 超过 2500ms；检查事务是否释放及唤醒是否入队`)), 2500);
+      })]);
+    } finally { if (timer) clearTimeout(timer); }
+  }
   let captured!: () => void;
   let release!: () => void;
   const snapshot = new Promise<void>(resolve => { captured = resolve; });
   const gate = new Promise<void>(resolve => { release = resolve; });
   let armed = true;
-  f.db.query = async <T extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []): Promise<T[]> => {
-    const rows = await originalQuery<T>(sql, params);
-    // 暂停真实 SQL 的响应；驱动队列已释放，新消息可实际提交。
-    if (armed && sql.startsWith("SELECT * FROM messages WHERE group_id = ? AND seq > ? ORDER BY seq")) {
+  f.db.transaction = async <T>(body: (tx: DbTransaction) => Promise<T>): Promise<T> => {
+    const result = await originalTransaction(body);
+    const delivered = result as { batch?: unknown; workEvents?: unknown[] } | null;
+    // 查询属于 consume 事务，必须等物理 COMMIT 后再暂停响应；否则新消息无法取项目锁。
+    if (armed && delivered?.batch === null && Array.isArray(delivered.workEvents) && delivered.workEvents.length === 0) {
       armed = false;
-      assert.equal(rows.length, 0);
+      assert.equal(f.db.currentTransactionContext(), undefined, '交错点必须已释放完整 consume 事务');
       captured();
-      await gate;
+      await within(gate, '释放初始空 consume 响应');
     }
-    return rows;
+    return result;
   };
   try {
-    const waiting = f.core.waitForMessages("worker", { timeoutMs: 1000 });
-    await snapshot;
+    const waiting = f.core.waitForMessages("worker", { timeoutMs: 2000 });
+    await within(snapshot, '捕获初始空 consume 提交');
     const sending = f.core.sendMessage("manager", { text: "查询快照之后到达", mentions: [f.worker.memberId] });
     let inserted = false;
     for (let i = 0; i < 100; i++) {
-      const rows = await originalQuery("SELECT COUNT(*) AS count FROM messages");
+      const rows = await within(originalQuery("SELECT COUNT(*) AS count FROM messages"), '确认新消息真实提交');
       if (Number(rows[0]?.count) > 0) { inserted = true; break; }
       await setImmediate();
     }
     assert.equal(inserted, true);
-    await setImmediate();
-    await setImmediate();
+    // 公共通知入口同步把重扫排入尚未处理空响应的等待；等同 HTTP 提交后的 resolveGroup。
+    const waking = f.core.resolveGroup(f.group.id, new Set([f.worker.memberId]));
     release();
-    const sent = await sending;
-    const result = await waiting;
+    const [sent, result] = await within(Promise.all([sending, waiting, waking]), '当前 wait 重扫并兑现新消息');
+    assert.equal(armed, false);
     assert.equal(result.status, "message");
     assert.deepEqual(result.messages.map(message => message.id), [sent.messageId]);
     assert.equal(result.drainedBacklog, false);
     assert.equal(f.core.pendingWaitCount, 0);
-  } finally { release(); f.db.query = originalQuery; await f.close(); }
+  } finally { release(); f.db.transaction = originalTransaction; await f.close(); }
 });
 
 test("慢于轮询间隔的空查询不会使已到期的 wait 无限重新排队", async () => {
@@ -163,7 +173,7 @@ test("慢于轮询间隔的空查询不会使已到期的 wait 无限重新排�
     const rows = await originalQuery<T>(sql, params);
     if (sql.includes("FROM work_events") && sql.includes("delivery_state") && sql.includes("ORDER BY")) {
       reads++;
-      // 查询本身完成且释放真实 DB 队列，仅让响应晚于 1 秒轮询周期。
+      // 查询本身已完成；故意延迟当前 consume 事务内的响应，覆盖慢于 1 秒轮询的收束。
       await delay(1100);
     }
     return rows;

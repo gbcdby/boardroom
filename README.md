@@ -6,21 +6,23 @@
 
 ## 当前实现范围
 
-当前代码包含聊天与 MCP 主链路，以及多项目、组织、成员生命周期和审计功能。下表依据当前路由与实现整理；产品后续规划见[架构与范围基线](docs/architecture/agent-studio.md)，详细 spec 和进度以项目 Issues 为准。
+当前代码包含聊天与 MCP、多项目、组织、成员生命周期、审计、任务评审、记忆和只读设置。下表依据当前路由与实现整理；产品要求见[架构与范围基线](docs/architecture/agent-studio.md)，完整验收状态见 [V1 的 46 项证据索引](docs/v1-acceptance.md)，详细 spec 和进度以项目 Issues 为准。
 
 | 能力 / 入口 | 当前范围 | 详细说明 |
 | --- | --- | --- |
 | 项目与群组 `/projects` | 多项目、多群组、成员与参与者管理、顶层 manager 指定；项目/群组归档与恢复、二次确认后永久删除 | [项目与群组 API](docs/t1-project-group-api.md) |
 | 托管 Agent `/runtimes` | 配置、继承/覆盖、显式应用、启停意图、分层状态与有界观测；真实 CLI 执行按证据门控，当前均未开放 | [运行时说明](#可选托管-agent-运行时)、[子 spec #83](https://github.com/gbcdby/boardroom/issues/83) |
-| 成员生命周期 `/projects` | 暂停与恢复成员，保留历史、数据与岗位；与在线/离线状态分开 | [成员生命周期](docs/t3-member-lifecycle.md) |
-| 群聊 `/chat` | 人与 agent 发消息、`@` / `@all`、历史持久化、按成员范围投递与确认 | [聊天与路由](docs/t3-chat-and-routing.md) |
+| 成员生命周期 `/projects/:projectId/members` | 暂停/恢复保留岗位，移除保留历史作者；显式重新添加使用新的加入代际，旧会话不复活 | [成员生命周期](docs/t3-member-lifecycle.md) |
+| 群聊 `/projects/:projectId/chat/:groupId?` | 人与 agent 发消息、`@` / `@all`、历史持久化、按成员范围投递与确认 | [聊天与路由](docs/t3-chat-and-routing.md) |
 | 状态看板 `/projects/:projectId/status` | 当前项目成员在线/离线、等待/工作、断线与陈旧状态，WebSocket 更新 | [状态与心跳](docs/t4-status-and-heartbeat.md) |
-| 组织与角色 `/org` | 组织树、岗位、汇报线、成员占岗，以及静态角色与能力范围 | [权限守卫](docs/f2-authorize-guard.md)、[页面实现](src/web/src/views/OrgView.vue) |
-| 审计与撤销 `/audit` | 变更记录、由人撤销可逆的成员/组织变更；永久删除不可撤销，归档/恢复使用对应正向操作 | [审计页面](src/web/src/views/AuditView.vue) |
+| 组织与角色 `/projects/:projectId/org` | 组织树、岗位、汇报线、成员占岗，以及静态角色与能力范围 | [权限守卫](docs/f2-authorize-guard.md)、[页面实现](src/web/src/views/OrgView.vue) |
+| 审计与撤销 `/projects/:projectId/audit` | 有版本的完整变更记录、由人撤销/重做可逆成员与组织变更；冲突安全拒绝，永久删除不可撤销 | [设置与审计操作](docs/settings-and-audit.md)、[审计页面](src/web/src/views/AuditView.vue) |
 | 跨项目概览 `/` | 展示各项目状态、成员/群组/消息/在线人数、最近活动与归档筛选；数据来自 `GET /api/projects` | [首页实现](src/web/src/views/HomeView.vue)、[HTTP 实现](src/server/api.ts) |
 | 任务 `/projects/:projectId/tasks` | 看板与列表、负责人和 reviewer、状态流转、固定 Git 候选、独立双轴报告和最终裁决、工作通知与历史 | [任务与评审](docs/tasks-and-review.md) |
+| 记忆 `/projects/:projectId/memory` | 项目共享与获授权成员文档、CAS 编辑、版本历史、自总结请求状态与重试；Agent global 无人类入口 | [三层记忆](docs/memory.md) |
+| 设置 `/settings` | 当前服务实际生效的只读配置、配置来源与重启生效说明、刷新与 MCP 地址复制 | [设置与配置生效](docs/settings.md) |
 
-项目页面共享顶部“当前项目”，旧 `/chat`、`/org`、`/audit`、`/status`、`/tasks` 链接继续兼容该上下文。`/settings` 仍是占位页，三层记忆尚未提供。任务协议和页面已实现，真实模型双轴执行验收仍待完成。页面入口以[路由表](src/web/src/router.ts)为准。
+项目页面共享顶部“当前项目”。URL 指定的项目优先；旧 `/chat`、`/org`、`/audit`、`/status`、`/tasks`、`/memory` 链接会规范化到该项目上下文。切换有草稿的页面需要确认，取消保留原 URL 和输入。`/settings` 是全局只读页面。2026-11-11 已收到对应阶段和最终集成候选的真实双宿主、双轴评审、目标自总结及 macOS SQLite 验收回传；候选、修正后的证据适用性与整体交付状态见 [V1 验收索引](docs/v1-acceptance.md)和 [主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)。页面入口以[路由表](src/web/src/router.ts)为准。
 
 ## 快速开始
 
@@ -61,7 +63,7 @@ npm start
 }
 ```
 
-服务注册了 `join`、`wait_for_messages`、`send_message`、`acknowledge_message`、`report_status`、`heartbeat`、`read_history` 七个聊天工具，以及十五个任务、评审与工作通知工具，共二十二个。参数、游标、可见范围和错误格式见 [MCP 工具契约](docs/mcp-tool-contract.md)与[任务扩展契约](docs/tasks-and-review.md)；当前注册以[工具实现](src/server/mcp/server.ts)为准。每个 MCP 会话绑定一个项目/群组，连接成功不等于已经入群。
+服务注册了 `join`、`wait_for_messages`、`send_message`、`acknowledge_message`、`report_status`、`heartbeat`、`read_history` 七个聊天工具，十五个任务、评审与工作通知工具，以及十个记忆工具，共 **32 个**。完整分组、参数来源和错误格式见 [MCP 工具契约](docs/mcp-tool-contract.md)，当前注册以[工具实现](src/server/mcp/server.ts)为准。每个 MCP 会话绑定一个项目/群组；连接成功不等于已经入群，ACK 不代表任务或自总结已完成。
 
 另有 [stdio 入口](src/server/mcp/stdio.ts)：由宿主运行 `node /绝对路径/src/server/mcp/stdio.ts`。它独立打开数据库，必须与 Web 服务使用同一存储配置（SQLite 使用相同的绝对数据目录）。**共享数据库不会共享进程内唤醒通知**；跨进程新消息需在再次调用 `wait_for_messages` 时读取积压。需要 WebUI 发消息及时结束挂起等待时，使用同一服务上的 Streamable HTTP。
 
@@ -87,6 +89,8 @@ npm start
 
 优先级为 **默认值 → 配置文件 → 环境变量**。`AGENT_STUDIO_CONFIG` 可指定配置文件；未设置时读取 `<cwd>/config.json`，默认文件不存在则使用默认值。参考 [config.example.json](config.example.json)，实际解析规则见 [config.ts](src/server/config.ts)。
 
+在 `/settings` 查看当前进程已经生效的配置与实际 MCP 地址。修改配置文件或启动环境后，正常停止并重新启动服务，再刷新页面核对；页面不保存配置或执行重启。详见[设置与配置生效](docs/settings.md)。
+
 | 配置字段 | 环境变量 | 默认值 / 说明 |
 | --- | --- | --- |
 | `port` | `AGENT_STUDIO_PORT` | `4317`，只绑定 `127.0.0.1` |
@@ -97,6 +101,7 @@ npm start
 | `heartbeat.timeoutMs` | `AGENT_STUDIO_HEARTBEAT_TIMEOUT_MS` | `30000` ms，必须大于间隔 |
 | `antiLoop.maxConsecutiveAutoReplies` | `AGENT_STUDIO_MAX_CONSECUTIVE_AUTO_REPLIES` | `6`，每群组连续自动回复阈值 |
 | `antiLoop.maxWakesPerMinutePerMember` | `AGENT_STUDIO_MAX_WAKES_PER_MINUTE_PER_MEMBER` | `20`，每成员每分钟唤醒上限 |
+| `memory.*` | `AGENT_STUDIO_MEMORY_*` | 消息阈值 `50`、文档 `32768` B、注入 `8192` B、总结输入 `65536` B、attempt `900000` ms；完整变量与范围见[记忆配置](docs/memory.md#配置与验证) |
 | — | `AGENT_STUDIO_LOG_LEVEL` | `info`；可选 `debug` / `info` / `warn` / `error` |
 
 临时换端口：`AGENT_STUDIO_PORT=5000 npm start`。PostgreSQL 需先备好可连接的数据库，例如：
@@ -126,12 +131,14 @@ HTTP、MCP 与业务仓储已通过统一 `DbDriver` 接入两种数据库，选
 | `npm run typecheck` | 后端 `tsc` 与前端 `vue-tsc` |
 | `npm test` | Node 自动化测试，包括 API、MCP SDK、存储及页面构建/深链检查 |
 | `npm run e2e` | 本地 HTTP 服务 + 两个 MCP SDK 客户端的链路检查；先运行 `npm run build` |
+| `npm run e2e:tasks` | 真实 HTTP/MCP/Git/数据库任务链；两轴正文为协议夹具，非模型评审 |
+| `npm run e2e:memory` | 真实 HTTP/MCP/数据库记忆链；明确区分人工版本、请求完成与真实模型自总结 |
 
 开发代理把 `/api`、`/ws` 固定转到后端 4317；修改后端端口时也要调整 [Vite 代理](src/web/vite.config.ts)。MCP 客户端直接连接后端 `/mcp`。
 
-真实 PostgreSQL 测试需显式设置 `AGENT_STUDIO_PG_TEST_URL` 后运行 `npm test`；使用专用测试库。缺少 PG 配置时，相关用例会跳过或不注册，默认测试通过不证明 PG 运行路径已验收。`npm run e2e` 默认用 SQLite，可通过 `AGENT_STUDIO_DB_DRIVER=postgres` 和 `AGENT_STUDIO_PG_CONNECTION_STRING` 切换。
+真实 PostgreSQL 测试需显式设置 `AGENT_STUDIO_PG_TEST_URL` 后运行 `npm test`；使用专用测试库。缺少 PG 配置时，相关用例会跳过或不注册，默认测试通过不证明 PG 运行路径已验收。三个 SDK e2e 命令默认用 SQLite，可通过 `AGENT_STUDIO_DB_DRIVER=postgres` 和 `AGENT_STUDIO_PG_CONNECTION_STRING` 切换。真实 Chromium 安装/运行及干净启动复验步骤见[接入指南](docs/getting-started-mcp.md#8-验收与可重复验证)。
 
-**SDK 检查不会启动真实模型或 harness**，也不覆盖浏览器中的完整人工操作。脚本输出中关于 Claude/Codex 的历史措辞，不应当作本次真实宿主验收。历史宿主结果见 [2026-11-03 验收报告](docs/t8-acceptance-report.md)与 [DSH 证据索引](evidence/real-host-retest/README.md)，适用范围如下：
+**SDK 检查不会启动真实模型或 harness**，也不覆盖浏览器中的完整人工操作。2026-11-11 的独立真实宿主回传见 [#112](https://github.com/gbcdby/boardroom/issues/112#issuecomment-6790053498)及 [V1 验收索引](docs/v1-acceptance.md)：Claude Code 2.1.233、Codex CLI 0.167.0，macOS 26.5.2 arm64 / SQLite / Streamable HTTP。它与 Linux 双数据库 CI 分开取证；没有将代理模型线路视为托管官方 OAuth profile，也没有宣称 macOS PostgreSQL 或修复后 Codex reviewer 已重新实测。更早的宿主结果见 [2026-11-03 验收报告](docs/t8-acceptance-report.md)与 [DSH 证据索引](evidence/real-host-retest/README.md)，适用范围如下：
 
 | 宿主 / 历史版本 | 已有历史记录 | 当前保守边界 |
 | --- | --- | --- |
@@ -151,6 +158,7 @@ HTTP、MCP 与业务仓储已通过统一 `DbDriver` 接入两种数据库，选
 
 - [工作技能使用指南](.agents/skills/guide/references/guide.md)：从一个目标开始，按需接入项目、理解方案和主动介入；不要求逐项运行所有技能。
 - [文档目录与内容归属](docs/README.md)：区分架构、接口、历史验收与详细工单。
+- [V1 验收证据索引](docs/v1-acceptance.md)：46 项 AC 的具体检查、候选与历史边界、真实模型阻塞和剩余验收。
 - [AGENTS.md](AGENTS.md)、[CONTEXT.md](CONTEXT.md)：贡献约定、跨会话事实与宿主差异；历史阶段描述需结合当前实现阅读。
 - 源码入口：[后端启动](src/server/server.ts)、[业务 API](src/server/api.ts)、[MCP](src/server/mcp)、[WebUI](src/web/src)、[自动化测试](tests)。
 

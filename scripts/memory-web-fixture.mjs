@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { createLogger } from "../src/server/logger.ts";
 import { startServer } from "../src/server/server.ts";
 import { createRepositories } from "../src/server/db/repositories.ts";
+import { createOrgMutationService } from "../src/server/org/mutations.ts";
 import { actorForMember, ownerActor } from "../src/server/authz/actors.ts";
 import { createMemoryService } from "../src/server/memory/service.ts";
 import { getMemoryRuntime } from "../src/server/memory/runtime.ts";
@@ -42,7 +43,7 @@ export async function seedMemoryBrowser(repos, service) {
     records.push({ project, members, group });
   }
   const first = records[0];
-  const own = (member) => ({ actor: actorForMember(member), connection: { projectId: member.projectId, memberId: member.id, groupId: first.group.id }, injectionBindingGeneration: `synthetic-ui-session-${member.id}` });
+  const own = (member) => ({ actor: actorForMember(member), connection: { projectId: member.projectId, memberId: member.id, groupId: first.group.id, membershipRevision: member.membershipRevision }, injectionBindingGeneration: `synthetic-ui-session-${member.id}` });
   const actor = own(first.members.primary);
   await service.write(actor, { scope: "global", projectId: null, agentId: first.members.primary.agentId }, { expectedVersion: 0, clientMutationId: randomUUID(), markdown: privateSentinel });
   async function schedule(access = actor) {
@@ -78,7 +79,7 @@ export async function seedMemoryBrowser(repos, service) {
   await service.failSummary(disabledAccess, disabledRequest.id, { expectedRevision: disabledRequest.revision, attemptId: disabledRequest.attemptId, code: "synthetic_model_failed" });
   for (const record of records) {
     await repos.members.setStatus(record.members.disabled.id, "disabled");
-    await repos.members.delete(record.members.removed.id);
+    await createOrgMutationService({ repos }).removeMember({ actor: ownerActor(record.project.id) }, record.project.id, record.members.removed.id);
   }
   return {
     records, privateSentinel, oldMarkdown,

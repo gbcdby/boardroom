@@ -9,7 +9,7 @@ import { MemoryError } from "./errors.ts";
 export type MemoryDatabaseDescriptor =
   | { kind: "sqlite"; sqlitePath: string }
   | { kind: "postgres"; connectionString: string; schema?: string };
-export interface MemoryReadBinding { memberId: string; projectId: string; bindingGeneration: string }
+export interface MemoryReadBinding { memberId: string; projectId: string; bindingGeneration: string; membershipRevision: number }
 export interface MemoryInjectionReader { readOwn(input: MemoryReadBinding): Promise<MemoryInjection>; close(): Promise<void> }
 export interface MemoryInjectionReaderOptions {
   database: MemoryDatabaseDescriptor;
@@ -68,7 +68,8 @@ export function createMemoryInjectionReader(options: MemoryInjectionReaderOption
         if (message["type"] !== "result" || !active) return;
         const job = active;
         if (message["nonce"] !== job.nonce || message["bindingGeneration"] !== job.input.bindingGeneration ||
-          message["memberId"] !== job.input.memberId || message["projectId"] !== job.input.projectId) {
+          message["memberId"] !== job.input.memberId || message["projectId"] !== job.input.projectId ||
+          message["membershipRevision"] !== job.input.membershipRevision) {
           openCircuit("memory_reader_protocol_failed", true); return;
         }
         clearWatchdog(); active = null;
@@ -95,12 +96,13 @@ export function createMemoryInjectionReader(options: MemoryInjectionReaderOption
     readOwn(input) {
       if (closed) return Promise.resolve(unavailableMemory(config, "memory_reader_closed"));
       if (retiring || Date.now() < circuitUntil) return Promise.resolve(unavailableMemory(config, "memory_reader_circuit_open"));
-      if (![input.memberId, input.projectId, input.bindingGeneration].every(value => typeof value === "string" && value.length > 0 && value.length <= 512 && !value.includes("\0"))) {
+      if (![input.memberId, input.projectId, input.bindingGeneration].every(value => typeof value === "string" && value.length > 0 && value.length <= 512 && !value.includes("\0")) ||
+        !Number.isSafeInteger(input.membershipRevision) || input.membershipRevision < 1) {
         return Promise.resolve(unavailableMemory(config, "memory_binding_unavailable"));
       }
       const key = `${input.projectId}\0${input.memberId}`;
       const previous = jobs.get(key);
-      if (previous?.input.bindingGeneration === input.bindingGeneration) return previous.promise;
+      if (previous?.input.bindingGeneration === input.bindingGeneration && previous.input.membershipRevision === input.membershipRevision) return previous.promise;
       if (previous) finish(previous, unavailableMemory(config, "memory_binding_changed"));
       if (queue.length >= 8) return Promise.resolve(unavailableMemory(config, "memory_reader_busy"));
       let resolve!: (value: MemoryInjection) => void;

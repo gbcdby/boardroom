@@ -2,6 +2,7 @@ import type { RepoCtx } from "./db/repositories.ts";
 import { newId } from "./db/ids.ts";
 import type { Actor } from "./authz/authorize.ts";
 import type { OrgChange, OrgChangeAction } from "./org-change-hook.ts";
+import { RepositoryError } from "./db/errors.ts";
 
 /**
  * T5（#52）最小审计：单表 append-only 审计日志 + 统一写入/查看/撤销所需的核心形状。
@@ -236,10 +237,21 @@ const MAX_FIELD_BYTES = 32 * 1024;
 function serialize(value: unknown): string | null {
   if (value === undefined) return null;
   const json = JSON.stringify(value);
-  if (json.length > MAX_FIELD_BYTES) {
-    return JSON.stringify({ truncated: true, bytes: json.length });
+  if (Buffer.byteLength(json, "utf8") > MAX_FIELD_BYTES) {
+    return JSON.stringify({ truncated: true, bytes: Buffer.byteLength(json, "utf8") });
   }
   return json;
+}
+
+/** v2 可逆事件绝不截断；正向服务在首次业务写入前也调用同一检查。 */
+export function assertCompleteAuditFields(...values: unknown[]): void {
+  for (const value of values) {
+    if (value === undefined) continue;
+    const json = JSON.stringify(value);
+    if (json === undefined || Buffer.byteLength(json, "utf8") > MAX_FIELD_BYTES) {
+      throw new RepositoryError("audit_snapshot_too_large", "完整审计快照超过单字段 32 KiB，操作未提交；请缩小本次变更范围。");
+    }
+  }
 }
 
 /** 字段级 diff：{"field":{"from":…,"to":…}}，忽略时间戳噪声列。 */
@@ -309,7 +321,7 @@ export function createAuditRepository(ctx: RepoCtx): AuditRepository {
         row.targetKind, row.targetId, row.targetName, row.changed, row.before, row.after,
         row.detail, row.reversedByAuditId, row.createdAt,
       ]);
-      return toAuditRow((await ctx.one<AuditRowDb>(getOneSql, [row.projectId, row.id]))!);
+      return { ...row, reversedAt: null };
     },
     async get(projectId, id) {
       const row = await ctx.one<AuditRowDb>(getOneSql, [projectId, id]);
@@ -339,6 +351,10 @@ export async function appendAuditEntry(
   entry: AuditEntry,
   opts: { readonly id?: string; readonly createdAt?: string } = {},
 ): Promise<AuditRow> {
+  if (typeof entry.detail === "object" && entry.detail !== null &&
+      (entry.detail as { reversal?: { version?: unknown } }).reversal?.version === 2) {
+    assertCompleteAuditFields(entry.before, entry.after, entry.detail);
+  }
   const beforeJson = serialize(entry.before);
   const afterJson = serialize(entry.after);
   const changed = entry.changed !== undefined ? entry.changed : diffChanged(entry.before, entry.after);

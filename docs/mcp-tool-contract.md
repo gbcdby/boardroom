@@ -1,17 +1,22 @@
-# MCP 工具契约（阶段 1）
+# MCP 工具契约
 
-阶段 3 在原七个工具上增加任务与工作事件工具；新增字段、权限和 `wait_for_messages.status="work"` 见 [任务与双轴评审](tasks-and-review.md)。以下阶段 1 名称和既有字段保持兼容。
+状态：已确认（当前工具目录与兼容聊天契约）
+日期：2026-10-22 初版；2026-11-11 更新任务、记忆与成员代际
+来源：[主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)、阶段 3/4/5 共享合同及当前注册代码。
 
-阶段 4 增加十个记忆工具及 join/wait 记忆注入；作用域、版本、总结状态和执行证据边界见 [三层记忆与 Agent 自总结](memory.md)。
+当前注册 **32 个工具：7 个聊天/连接、15 个任务/评审/工作事件、10 个记忆工具**。工具名字、实际 schema 与调用装配以 [MCP 注册层](../src/server/mcp/server.ts)、[任务入口](../src/server/tasks/mcp.ts)、[记忆入口](../src/server/memory/mcp.ts)为准。以下目录列全现有工具；§7 起保留早期阶段增量的来源背景，不能单独据旧段落判断当前支持范围。
 
-状态：草案（随 F3 #13 建立，供 T2–T8 引用）
-日期：2026-10-22
-来源：子 spec #2 §6.1、§8.1、§8.2；决策票 D1 #4、D4 #7、D6 #10；F1 #11 服务骨架
+| 分组 | 工具名 | 参数与行为说明 |
+| --- | --- | --- |
+| 入群/消息/状态（7） | `join`、`wait_for_messages`、`send_message`、`acknowledge_message`、`report_status`、`heartbeat`、`read_history` | 本文 §2–4；[宿主接入与限制](getting-started-mcp.md) |
+| 任务配置/查询（4） | `get_task_settings`、`set_task_settings`、`list_tasks`、`read_task` | [任务与评审](tasks-and-review.md)、`src/server/tasks/schemas.ts` |
+| 任务修改（5） | `create_task`、`update_task`、`transition_task`、`comment_task`、`link_task_message` | 创建/分配受管理范围限制，评论受项目成员权限，状态受负责人/管理权限 |
+| 评审（4） | `start_task_review`、`begin_task_review`、`submit_task_review_report`、`decide_task_review` | 固定 Git 候选，独立轴报告，指定 reviewer / 有理由管理覆盖 |
+| 工作事件（2） | `list_work_events`、`acknowledge_work_event` | 当前绑定成员自己的持久通知；ACK 不改变任务或总结状态 |
+| 文档/历史（3） | `read_memory`、`write_memory`、`list_memory_versions` | [记忆范围与版本](memory.md)、`src/server/memory/schemas.ts` |
+| 总结（7） | `list_memory_summary_requests`、`read_memory_summary`、`begin_memory_summary`、`submit_memory_summary`、`fail_memory_summary`、`retry_memory_summary`、`report_memory_session_end` | 材料/begin/submit/fail/session-end 由目标 Agent 本体有效绑定执行；重试另按管理权限与状态核验 |
 
-> 本文档固定阶段 1 的 MCP 工具**名字、入参、出参和错误码**，是 T2–T8 的共同基线。
-> 阶段 1 只验收单个项目 / 单个群组；数据按 project/group 作用域建模，但多项目隔离的验收属于阶段 2。
-> 本票只实现**服务端骨架与工具契约**；真实宿主接入（T2/T8）、消息路由/可见性/mention（T3）、
-> 持久化实现（F2/T5）、宿主等待/打断行为（T6/T8）由后续票负责。阶段 1 只记载 D6 已实测的机制。
+任务、记忆输入严格拒绝未知字段。身份、绑定代际和项目权限由服务端取当前连接/数据库事实；客户端不能通过传 actor、projectId 或 targetAgentId 获得额外权限。真实模型证据门槛见 [V1 验收索引](v1-acceptance.md)，工具返回成功与模型真实运行分开记录。
 
 ## 1. 传输选择
 
@@ -30,8 +35,7 @@ Streamable HTTP 贴合「本地单服务端、多成员」形态，便于在 F1 
 - **会话**：Streamable HTTP 有状态模式，每个 `initialize` 生成独立 `Mcp-Session-Id`；会话无心跳时按
   `MCP_SESSION_IDLE_TIMEOUT_MS`（默认 5 分钟）清理（D6：Codex 发 `DELETE`、Claude 不发，需容忍悬挂会话）。
   连接会话状态与成员运行状态 **分开建模**（D1）：MCP 会话连接 ≠ waiting/working。
-- **共享存储**：每个会话一个 `McpCore` 实例（各自独立 `memberKey`）。（F3 草案为共享内存 `McpStore`；
-  T2 已换成共享同一 SQLite 的 F2 repository，见 §7。）同一群组内互相可见（A 发送的消息能唤醒等待中的 B）。
+- **共享存储**：HTTP 会话使用同一服务的 `DbDriver` 与持久仓储，SQLite/PG 二选一；各会话绑定独立。同一进程内的通知可结束获授权的挂起等待。stdio 独立打开相同存储，不能共享进程内通知；跨进程变化由下次 wait 读积压。
 - **观测字段**（供 T4 状态看板与测试）：`mcpSessionCount`（活跃 HTTP 会话数）、
   `mcpPendingWaitCount`（挂起中的等待调用数）。
 
@@ -74,27 +78,32 @@ HTTP/传输层错误（Streamable HTTP 自身）由 SDK 返回 JSON-RPC 错误�
 
 **F2（#47）之后**：工具内的权限判定统一交给 `src/server/authz/authorize.ts`（见 `docs/f2-authorize-guard.md`），错误码表不变；`FORBIDDEN` 的 `details` 会携带 `{ deny, capability }`，其中 `deny` 是守卫的稳定拒绝码（`forbidden` / `cross_project` / `out_of_subtree` / `not_a_member` / `not_visible` / `not_self` / `out_of_connection`）。宿主仍只需按 `code` 分支，`deny` 用于排障与后续票的细粒度判断。工具名、入参、出参与其余语义均未改变。
 
+任务、记忆及成员代际路径还会以 `details.reason` 给出领域原因；例如 `member_removed`、`membership_changed`、版本或请求状态冲突。外层按 `code` 判断，显示可读错误并按实际 schema 读取 details，不假定每个工具都返回同一组细节字段。HTTP 409 与 MCP `CONFLICT` 需要刷新基准，不能自动覆盖旧草稿。
+
 ### 2.3 身份 / 会话
 
 - MCP 会话与成员身份分离：一个会话可能在未 `join` 前调用工具（此时返回 `NOT_IN_GROUP`）。
 - `join` 之后该会话绑定一个 `memberId` + `projectId` + `groupId`；后续工具读取该绑定。
 - 连接层心跳（D4：interval 10s / timeout 30s，可配置）记录在**会话**上，不与成员 `waiting/working` 混同。
+- 绑定保存成员加入代际，操作时重查当前成员、项目/群和运行所有权。移除返回 `FORBIDDEN` / `reason:member_removed`；明确恢复或重新添加后，旧代际返回 `membership_changed`，需要新连接重新 join。普通 join 不隐式恢复已移除成员。
+- 任务编辑/流转、配置和评审分别使用各自 expected revision。记忆保存使用 `expectedVersion` 与 `clientMutationId`；同作者/文档/mutation 的成功重放返回原版本，换正文复用 mutation 拒绝。报告/attempt 的重放按各自合同处理，不对所有写工具笼统承诺幂等。
+- `join.context.memory` 与 wait 的可选 `memory` 只注入本人 global + 当前 project-agent 文档，shared 通过 `read_memory` 按需读。HTTP owner 也无 global 内容、元数据或历史入口。
 
 ## 3. 工具清单
 
-阶段 1 固定注册以下 6 个工具（T2 追加 `heartbeat`，共 7 个）。名字一经固定，后续票不得随意改名。
+下面展开 7 个聊天/连接工具的兼容字段；任务和记忆的完整参数见开头对应 schema 与专题文档。
 
 ### 3.1 `join` —— 入群 / 身份声明
 
-声明全局身份、宿主类型并加入（阶段 1 唯一的）群组。
+声明全局身份、宿主类型，并绑定指定项目内的指定群组。
 
 入参：
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `displayName` | string | 是 | 显示名（非空，≤ 64 字符）。 |
-| `hostType` | `"claude-code"` \| `"codex-cli"` \| `"other"` | 是 | 宿主类型。 |
-| `projectId` | string | 是 | 项目 ID；阶段 1 由 WebUI 预先创建（T1）。 |
+| `hostType` | string | 是 | 必须是已注册 adapter ID；当前内置 `claude-code` / `codex-cli` / `dsh` / `other`。注册不等于真实能力验收。 |
+| `projectId` | string | 是 | 已存在的项目 ID。 |
 | `groupId` | string | 是 | 群组 ID。 |
 | `role` | `"manager"` \| `"normal"` | 否（默认 `normal`） | 提示性角色；真正指定 manager 由 WebUI 完成（D2）。 |
 
@@ -139,7 +148,7 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 ```jsonc
 {
   "ok": true,
-  "status": "message" | "timeout" | "cancelled",
+  "status": "message" | "work" | "timeout" | "cancelled",
   "messages": [ { "id": "msg_...", "groupId": "...", "senderId": "...", "text": "...", "mentions": ["..."], "createdAt": "..." } ],
   "cursor": "c_...",        // 下次等待的 afterCursor
   "drainedBacklog": false   // 本次是否来自积压补投
@@ -147,6 +156,7 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 ```
 
 - `status:"timeout"` 是**正常返回**，不是错误；`status:"cancelled"` 表示宿主取消（`signal` abort）。
+- 可选 `workEvents` 包含本人任务/记忆通知；只有通知时为 `work`，有聊天消息时仍是 `message` 并可同时带通知。ACK 只表示收到。可选 `memory` 给出本人记忆版本变化或 unavailable 状态。
 - 未入群：`NOT_IN_GROUP`。超限：`INVALID_ARGUMENT`。
 
 ### 3.3 `send_message` —— 发送消息
@@ -249,33 +259,35 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 ```
 
 错误：`INVALID_ARGUMENT`、`NOT_IN_GROUP`、`FORBIDDEN`（跨群组/越权）、`INTERNAL`。
-**T3 起可见性**：普通 agent 只返回「自己发送 + 被 @」；顶层 manager 返回群组全部消息；人（若以 MCP 接入）
-返回全部；未参与群组者读不到（`FORBIDDEN`）。规则见 `docs/t3-chat-and-routing.md`。
+**当前可见性**：普通 Agent 的聊天基线为自己发送 + 被 @，阶段 3 的合法任务关联可扩展当前授权群内的相关消息读取。所有路径仍检查当前项目/群与成员权限；顶层 manager、人以及下级 manager 的纯子树只读群边界见[权限守卫](f2-authorize-guard.md)与[任务关联说明](tasks-and-review.md)。只读可见不意味着可发言或唤醒。
+
+### 3.7 `heartbeat` —— 连接心跳
+
+入参为 `{}`，刷新当前连接心跳与 Agent `last_seen_at`。不改变任务状态，不领取任务，不确认消息；waiting/working 由等待循环和 `report_status` 表达。未入群或旧成员代际被拒绝，不能用 heartbeat 复活已移除身份。
 
 ## 4. 超时、并发与生命周期
 
 - **等待超时**：`wait_for_messages.timeoutMs` 由工具自身 `setTimeout` 控制，超时以 `status:"timeout"` 正常返回。
 - **宿主取消**：监听 `extra.signal`，abort 时以 `status:"cancelled"` resolve，不抛错。
-- **并发限制**（阶段 1 最小实现）：
+- **并发限制**：
   - 单会话同时最多 **1 个**未完成的 `wait_for_messages`；第二个并发等待返回 `CONFLICT`。
-  - 全局并发等待数 = 成员数（阶段 1 单群组，量级很小）；不做额外压测。
+  - 全局负载与时序按固定候选单独验收，不能由一次成功等待推出吞吐保证；见 [V1 门禁](v1-acceptance.md#4-横切故障负载与迁移门禁)。
 - **优雅关闭**：`close()` 时停止接受新请求 → 以 `status:"cancelled"` 结束挂起等待 → 关闭所有
   Streamable HTTP 会话 → 关闭 HTTP server 并释放端口。重复 `close()` 幂等。测试验证重启不泄漏端口。
 
-## 5. 与 F1 的集成
+## 5. 服务与存储集成
 
 - 复用 `AppConfig`（`port` / `dataDir` / `heartbeat`）与 `createLogger`；MCP 相关日志统一 `component: "mcp"`。
 - Streamable HTTP 挂到 F1 `startServer` 的同一个 HTTP server（`/mcp` 路径，方法 `POST`/`GET`/`DELETE`）。
-- stdio 入口（`src/server/mcp/stdio.ts`）只建立 stdio 传输，不监听端口，不启动数据库迁移。
-- 阶段 1 的存储为**内存实现**（`src/server/mcp/store.ts`），用于本票的契约与 fake client 测试；
-  持久化由 F2/T5 替换，repository 集成留给 T2。
+- stdio 入口（`src/server/mcp/stdio.ts`）不监听端口，但独立打开驱动、执行幂等迁移、装配记忆 reader，并在 EOF/关闭时等待所属资源退出。stdout 只用于 MCP 协议，日志写 stderr。
+- 业务状态来自 SQLite/PG 仓储；内存仅保存实际运行资源和等待，不是持久化替身。普通服务和 stdio 要使用相同解析配置；配置不匹配时可能看到不同数据，按启动日志排查。
 
-## 6. 未做 / 留给后续票
+## 6. 支持边界
 
-- 真实宿主接入与接入文档（T2/T8）；宿主等待/打断实测记录（T6/T8）。
-- 消息路由、可见性、mention 规则（T3）；限流阈值落地（T7）。
-- 持久化实现（F2/T5）；重连积压持久化。
-- **不承诺**可即时唤醒空闲宿主；**不承诺**打断在途工具调用（D6）。本票只实现工具自身挂起并在有消息时 resolve。
+- 普通外部宿主需要主动 join 并持续 wait；适配器未验证的能力保守视为 unsupported，见[三宿主支持表](getting-started-mcp.md#1-先决条件与宿主支持范围)。
+- 不能即时唤醒结束当前轮的空闲外部宿主，也不能打断在途工具。消息持久化、安全点投递和工作 ACK 不是模型执行完成。
+- 协议 fixture 验证状态机、权限和事务，不能充当真实模型评审或自总结；两项真实门槛仍在 [V1 索引](v1-acceptance.md)保留 BLOCKED。
+- 下列 §7–10 是阶段 1 的来源记录；其中“T2/T3 起”等语句描述当时增量，现行任务/记忆/代际边界以上文和当前 schema 为准。
 
 ## 7. T2（#15）落地补充
 

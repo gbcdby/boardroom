@@ -15,7 +15,7 @@ import {
   type MigrationRunResult,
 } from "../migrate.ts";
 import { sqliteDialect } from "../dialect.ts";
-import type { DbDriver, DbRow, DbTransaction } from "../driver.ts";
+import type { DbDriver, DbRow, DbTransaction, DbTransactionContext } from "../driver.ts";
 
 export interface SqliteDriverOptions {
   readonly dataDir: string;
@@ -30,6 +30,7 @@ export class SqliteDriver implements DbDriver {
   /** SAVEPOINT 计数器：用于嵌套事务（事务内再开事务，#61）。 */
   private spCounter = 0;
   private readonly transactionScope = new AsyncLocalStorage<OperationQueue>();
+  private readonly transactionIdentity = new AsyncLocalStorage<DbTransactionContext & { active: boolean }>();
   private readonly operations = new OperationQueue();
 
   /** 单连接顶层操作排队；只有同一异步调用链中的操作才属于嵌套事务。 */
@@ -39,6 +40,11 @@ export class SqliteDriver implements DbDriver {
 
   constructor(options: SqliteDriverOptions) {
     this.dataDir = options.dataDir;
+  }
+
+  currentTransactionContext(): DbTransactionContext | undefined {
+    const context = this.transactionIdentity.getStore();
+    return context?.active ? context : undefined;
   }
 
   /** better-sqlite3 连接句柄（阶段 1 调用点继续使用）；须先 connect()。 */
@@ -77,13 +83,9 @@ export class SqliteDriver implements DbDriver {
   }
 
   async exec(sql: string, params: readonly unknown[] = []): Promise<number> {
-    return this.serialize(async () => {
-      if (params.length === 0) {
-        this.handle.exec(sql);
-        return 0;
-      }
-      return this.handle.prepare(sql).run(...params).changes;
-    });
+    // DbDriver.exec 是单语句接口：无参数的 DML 也必须返回真实顶层 changes。
+    // prepare 同时在执行前拒绝多语句；迁移仍由 runMigrations 使用原生 exec。
+    return this.serialize(async () => this.handle.prepare(sql).run(...params).changes);
   }
 
   async transaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T> {
@@ -94,6 +96,8 @@ export class SqliteDriver implements DbDriver {
   private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, parent?: OperationQueue): Promise<T> {
     const db = this.handle;
     const nested = parent !== undefined;
+    const identity = this.transactionIdentity.getStore() ?? { values: new Map<symbol, unknown>(), active: true };
+    const savedValues = nested ? new Map(identity.values) : undefined;
     const scope = new OperationQueue(parent);
     const enqueue = <R>(operation: () => Promise<R>): Promise<R> => {
       const current = this.transactionScope.getStore();
@@ -103,13 +107,8 @@ export class SqliteDriver implements DbDriver {
       query: async <R extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []) =>
         enqueue(async () => db.prepare(sql).all(...params) as R[]),
       // 事务内 exec：返回影响行数，与 SQLite `changes` 对齐（#61）。
-      exec: async (sql, params: readonly unknown[] = []) => enqueue(async () => {
-        if (params.length === 0) {
-          db.exec(sql);
-          return 0;
-        }
-        return db.prepare(sql).run(...params).changes;
-      }),
+      exec: async (sql, params: readonly unknown[] = []) =>
+        enqueue(async () => db.prepare(sql).run(...params).changes),
     };
     // 嵌套事务（事务内再开事务，#61）用 SAVEPOINT 实现，回滚时只回到保存点，
     // 不影响外层；非嵌套走阶段 1 的 BEGIN IMMEDIATE 语义。
@@ -117,7 +116,7 @@ export class SqliteDriver implements DbDriver {
     if (nested) db.exec(`SAVEPOINT ${sp}`);
     else db.exec(this.dialect.beginTransaction());
     try {
-      const result = await this.transactionScope.run(scope, () => fn(tx));
+      const result = await this.transactionIdentity.run(identity, () => this.transactionScope.run(scope, () => fn(tx)));
       await scope.drain();
       if (nested) db.exec(`RELEASE SAVEPOINT ${sp}`);
       else db.exec(this.dialect.commit());
@@ -127,6 +126,10 @@ export class SqliteDriver implements DbDriver {
       try {
         if (nested) {
           db.exec(`ROLLBACK TO SAVEPOINT ${sp}`);
+          // 数据和在保存点内取得的锁一同回滚；不能继续复用其锁范围元数据。
+          // 仅恢复保存点前的条目，保留父事务原本已持有的 scope。
+          identity.values.clear();
+          for (const [key, value] of savedValues!) identity.values.set(key, value);
           db.exec(`RELEASE SAVEPOINT ${sp}`);
         } else {
           db.exec(this.dialect.rollback());
@@ -137,6 +140,7 @@ export class SqliteDriver implements DbDriver {
       throw error;
     } finally {
       scope.close();
+      if (!nested) identity.active = false;
     }
   }
 

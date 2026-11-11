@@ -3,6 +3,7 @@ import test from "node:test";
 import type { MemoryKey } from "../src/shared/memory.ts";
 import { DEFAULT_MEMORY_CONFIG } from "../src/server/config.ts";
 import { createMemoryService } from "../src/server/memory/service.ts";
+import { createOrgMutationService } from "../src/server/org/mutations.ts";
 import { actorForMember } from "../src/server/authz/actors.ts";
 import { WriteFailedError } from "../src/server/db/errors.ts";
 import { memoryFixture, memoryPeople, pgUnavailable } from "./helpers/memory-fixture.ts";
@@ -49,7 +50,7 @@ for (const engine of ["sqlite", "postgres"] as const) {
     const second = await repos.projects.create({ name: "第二项目" });
     const secondMember = await repos.members.create({ projectId: second.id, agentId: p.agent.id, kind: "agent", displayName: p.agent.displayName });
     const secondGroup = await repos.groups.create({ projectId: second.id, name: "第二群", participantMemberIds: [secondMember.id] });
-    const secondAccess = { actor: actorForMember(secondMember), connection: { projectId: second.id, memberId: secondMember.id, groupId: secondGroup.id } };
+    const secondAccess = { actor: actorForMember(secondMember), connection: { projectId: second.id, memberId: secondMember.id, groupId: secondGroup.id, membershipRevision: secondMember.membershipRevision } };
     assert.equal((await service.read(secondAccess, global)).document?.markdown, "仅本体的全局事实");
     const own: MemoryKey = { scope: "project-agent", projectId: p.project.id, agentId: p.agent.id };
     await service.write(p.own, own, { expectedVersion: 0, clientMutationId: "own", markdown: "项目私有" });
@@ -107,9 +108,13 @@ for (const engine of ["sqlite", "postgres"] as const) {
     const unknown: MemoryKey = { scope: "project-agent", projectId: p.project.id, agentId: unjoined.id };
     await assert.rejects(service.write(p.owner, unknown, { expectedVersion: 0, clientMutationId: "outside", markdown: "不创建无项目归属的记忆" }), { code: "not_found" });
     const key: MemoryKey = { scope: "project-agent", projectId: p.project.id, agentId: p.agent.id };
-    await service.write(p.owner, key, { expectedVersion: 0, clientMutationId: "before-leaving", markdown: "项目历史" });
-    await repos.members.delete(p.member.id);
-    assert.equal((await service.read(p.owner, key)).document?.markdown, "项目历史");
+    const original = await service.write(p.owner, key, { expectedVersion: 0, clientMutationId: "before-leaving", markdown: "项目历史" });
+    await createOrgMutationService({ repos }).removeMember({ actor: p.owner.actor }, p.project.id, p.member.id);
+    assert.equal(await repos.members.get(p.member.id), null);
+    assert.ok((await repos.members.getIncludingRemoved(p.member.id))?.removedAt);
+    assert.deepEqual((await service.read(p.owner, key)).document, original.document);
+    assert.equal((await service.readVersion(p.owner, key, 1))?.markdown, "项目历史");
+    await assert.rejects(service.read(p.own, key), { name: "ForbiddenError" });
     assert.equal((await service.write(p.owner, key, { expectedVersion: 1, clientMutationId: "after-leaving", markdown: "离岗后人工维护" })).document.version, 2);
   }, engine));
 }

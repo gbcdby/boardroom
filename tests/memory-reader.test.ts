@@ -18,10 +18,10 @@ async function fixture(body: (file: string, dir: string) => Promise<void>) {
   const dir = await mkdtemp(path.join(tmpdir(), "boardroom-memory-reader-")); const file = path.join(dir, "reader.sqlite");
   const db = new Database(file);
   db.pragma("journal_mode=WAL");
-  db.exec(`CREATE TABLE members(id TEXT PRIMARY KEY,project_id TEXT,agent_id TEXT,kind TEXT,status TEXT);
+  db.exec(`CREATE TABLE members(id TEXT PRIMARY KEY,project_id TEXT,agent_id TEXT,kind TEXT,status TEXT,removed_at TEXT,membership_revision INTEGER NOT NULL DEFAULT 1);
     CREATE TABLE memory_documents(id TEXT PRIMARY KEY,scope TEXT,project_id TEXT,agent_id TEXT,version INTEGER,markdown TEXT,byte_length INTEGER,updated_at TEXT,updated_by TEXT,source TEXT);
     CREATE TABLE messages(id TEXT PRIMARY KEY,body TEXT);
-    INSERT INTO members VALUES('member','project','agent','agent','active'),('other','project','other-agent','agent','active');`);
+    INSERT INTO members(id,project_id,agent_id,kind,status) VALUES('member','project','agent','agent','active'),('other','project','other-agent','agent','active');`);
   const insert = db.prepare("INSERT INTO memory_documents VALUES(?,?,?,?,1,?,?,?,?,'agent')");
   const author = JSON.stringify({ kind: "agent", actorId: "member", agentId: "agent", displayName: "A" });
   for (const [id, scope, project, agent, text] of [["g", "global", null, "agent", "global private"], ["p", "project-agent", "project", "agent", "own project"],
@@ -35,13 +35,30 @@ async function fixture(body: (file: string, dir: string) => Promise<void>) {
 test("AC-MEM-01/03：专属读取只选真实绑定Agent两层，成员撤销后不返回旧正文", async () => fixture(async file => {
   const reader = createMemoryInjectionReader({ database: { kind: "sqlite", sqlitePath: file }, config: DEFAULT_MEMORY_CONFIG });
   try {
-    const input = { memberId: "member", projectId: "project", bindingGeneration: "1" };
+    const input = { memberId: "member", projectId: "project", membershipRevision: 1, bindingGeneration: "1" };
     const result = await reader.readOwn(input);
     assert.equal(result.state, "available"); assert.deepEqual(result.entries.map(entry => entry.markdown), ["global private", "own project"]);
     assert.equal((await reader.readOwn({ ...input, projectId: "elsewhere" })).state, "unavailable");
     const db = new Database(file); db.prepare("UPDATE members SET status='disabled' WHERE id='member'").run(); db.close();
     assert.equal((await reader.readOwn(input)).state, "unavailable");
     assert.equal((await reader.readOwn(input)).entries.length, 0);
+  } finally { await reader.close(); }
+}));
+
+test("AC-HARD：记忆 helper 单查询拒绝 removed 与恢复后旧成员 epoch", async () => fixture(async file => {
+  const reader = createMemoryInjectionReader({ database: { kind: "sqlite", sqlitePath: file }, config: DEFAULT_MEMORY_CONFIG });
+  const input = { memberId: "member", projectId: "project", membershipRevision: 1, bindingGeneration: "same-generation" };
+  try {
+    assert.equal((await reader.readOwn(input)).state, "available");
+    const db = new Database(file);
+    // status is deliberately still active: removed is an independent revocation fact.
+    db.prepare("UPDATE members SET removed_at='2026-11-11T00:00:00Z',membership_revision=2 WHERE id='member'").run();
+    assert.equal((await reader.readOwn({ ...input, membershipRevision: 2 })).state, "unavailable");
+    db.prepare("UPDATE members SET removed_at=NULL,membership_revision=3 WHERE id='member'").run();
+    assert.equal((await reader.readOwn(input)).state, "unavailable");
+    assert.equal((await reader.readOwn({ ...input, membershipRevision: 3 })).state, "available");
+    db.close();
+    assert.equal((await reader.readOwn({ ...input, membershipRevision: undefined! })).errors[0]?.code, "memory_binding_unavailable");
   } finally { await reader.close(); }
 }));
 
@@ -61,7 +78,7 @@ test("R-P4-S-003：同步SQLite阻塞隔离、1个进程/8排队、超时熔断�
     spawnChild: () => { const child = fork(probe, [], { execArgv: [], stdio: ["ignore", "ignore", "ignore", "ipc"] });
       children.push(child); child.on("message", (message: { type?: string }) => { if (message.type === "probe-started") started(); }); return child; } });
   try {
-    const batch = Array.from({ length: 20 }, (_, i) => reader.readOwn({ memberId: `m${i}`, projectId: "project", bindingGeneration: "1" }));
+    const batch = Array.from({ length: 20 }, (_, i) => reader.readOwn({ memberId: `m${i}`, projectId: "project", membershipRevision: 1, bindingGeneration: "1" }));
     await blocked;
     let ticks = 0; const timer = setInterval(() => { ticks++; }, 10);
     const db = new Database(file); db.prepare("INSERT INTO messages VALUES('message','main flow continues')").run();
@@ -71,7 +88,7 @@ test("R-P4-S-003：同步SQLite阻塞隔离、1个进程/8排队、超时熔断�
     assert.equal(results.filter(result => result.errors[0]?.code === "memory_reader_busy").length, 11);
     assert.equal(children.length, 1); assert.ok(results.every(result => result.state === "unavailable"));
     if (children[0]!.exitCode === null && children[0]!.signalCode === null) await once(children[0]!, "exit");
-    const again = await reader.readOwn({ memberId: "new", projectId: "project", bindingGeneration: "2" });
+    const again = await reader.readOwn({ memberId: "new", projectId: "project", membershipRevision: 1, bindingGeneration: "2" });
     assert.equal(again.errors[0]?.code, "memory_reader_circuit_open"); assert.equal(children.length, 1);
   } finally { await reader.close(); }
 }));
@@ -79,8 +96,8 @@ test("R-P4-S-003：同步SQLite阻塞隔离、1个进程/8排队、超时熔断�
 test("R-P4-S-003：同一绑定新代际取代排队/在途请求，旧回复不污染新会话", async () => fixture(async file => {
   const reader = createMemoryInjectionReader({ database: { kind: "sqlite", sqlitePath: file }, config: DEFAULT_MEMORY_CONFIG });
   try {
-    const input = { memberId: "member", projectId: "project", bindingGeneration: "old" };
-    const old = reader.readOwn(input); const fresh = reader.readOwn({ ...input, bindingGeneration: "new" });
+    const input = { memberId: "member", projectId: "project", membershipRevision: 1, bindingGeneration: "old" };
+    const old = reader.readOwn(input); const fresh = reader.readOwn({ ...input, membershipRevision: 1, bindingGeneration: "new" });
     assert.equal((await old).errors[0]?.code, "memory_binding_changed");
     assert.equal((await fresh).state, "available");
   } finally { await reader.close(); }
@@ -92,7 +109,7 @@ test("R-P4-S-003：子进程实际退出后立即清理在途读取，不等满�
   const reader = createMemoryInjectionReader({ database: { kind: "sqlite", sqlitePath: file }, config: DEFAULT_MEMORY_CONFIG,
     spawnChild: () => fork(probe, [], { execArgv: [], stdio: ["ignore", "ignore", "ignore", "ipc"] }) });
   try {
-    const result = await reader.readOwn({ memberId: "member", projectId: "project", bindingGeneration: "1" });
+    const result = await reader.readOwn({ memberId: "member", projectId: "project", membershipRevision: 1, bindingGeneration: "1" });
     assert.equal(result.errors[0]?.code, "memory_reader_exited");
   } finally { await reader.close(); }
 }));
@@ -134,10 +151,10 @@ test("R-P4-S-003：原生阻塞未退出时不创建替代，关闭等待实际 
     onDiagnostic: code => { if (code === "memory_reader_hard_timeout") hard(); },
     spawnChild: () => { const child = fork(probe, [], { execArgv: [], stdio: ["ignore", "ignore", "ignore", "ipc"] }); children.push(child); return child; } });
   try {
-    const result = await reader.readOwn({ memberId: "member", projectId: "project", bindingGeneration: "1" });
+    const result = await reader.readOwn({ memberId: "member", projectId: "project", membershipRevision: 1, bindingGeneration: "1" });
     assert.equal(result.errors[0]?.code, "memory_reader_timeout"); await hardTimeout;
     assert.equal(children[0]!.exitCode, null); assert.equal(children[0]!.signalCode, null);
-    assert.equal((await reader.readOwn({ memberId: "member", projectId: "project", bindingGeneration: "new" })).errors[0]?.code, "memory_reader_circuit_open");
+    assert.equal((await reader.readOwn({ memberId: "member", projectId: "project", membershipRevision: 1, bindingGeneration: "new" })).errors[0]?.code, "memory_reader_circuit_open");
     assert.equal(children.length, 1); await reader.close();
     assert.equal(children[0]!.signalCode, "SIGKILL"); assert.throws(() => process.kill(children[0]!.pid!, 0), { code: "ESRCH" });
   } finally { await reader.close(); }
@@ -149,9 +166,9 @@ async function postgresReaderFixture(body: (admin: Client, schema: string, conne
   const url = new URL(memoryPgUrl!); url.searchParams.set("application_name", schema);
   try {
     await admin.query(`CREATE SCHEMA "${schema}"`); await admin.query(`SET search_path TO "${schema}"`);
-    await admin.query(`CREATE TABLE members(id TEXT PRIMARY KEY,project_id TEXT,agent_id TEXT,kind TEXT,status TEXT);
+    await admin.query(`CREATE TABLE members(id TEXT PRIMARY KEY,project_id TEXT,agent_id TEXT,kind TEXT,status TEXT,removed_at TEXT,membership_revision INTEGER NOT NULL DEFAULT 1);
       CREATE TABLE memory_documents(id TEXT PRIMARY KEY,scope TEXT,project_id TEXT,agent_id TEXT,version INTEGER,markdown TEXT);
-      INSERT INTO members VALUES('member','project','agent','agent','active');
+      INSERT INTO members(id,project_id,agent_id,kind,status) VALUES('member','project','agent','agent','active');
       INSERT INTO memory_documents VALUES('global','global',NULL,'agent',1,'private-global'),('project','project-agent','project','agent',1,'private-project');`);
     await body(admin, schema, url.toString(), schema);
   } finally {
@@ -174,7 +191,7 @@ test(`postgres R-P4-S-003/C-S-001 URI override=${overrideUri}：真实 lock_time
   const reader = createMemoryInjectionReader({ database: readerDatabase(connectionString, schema), config: DEFAULT_MEMORY_CONFIG,
     spawnChild: () => { const child = fork(fileURLToPath(new URL("../src/server/memory/injection-reader-child.ts", import.meta.url)), [],
       { execArgv: [], stdio: ["ignore", "ignore", "ignore", "ipc"] }); children.push(child); return child; } });
-  const input = { memberId: "member", projectId: "project", bindingGeneration: "1" };
+  const input = { memberId: "member", projectId: "project", membershipRevision: 1, bindingGeneration: "1" };
   try {
     assert.equal((await reader.readOwn(input)).state, "available");
     assert.equal(Number((await admin.query("SELECT COUNT(*) AS n FROM pg_stat_activity WHERE application_name=$1", [name])).rows[0].n), 1);
@@ -190,7 +207,7 @@ test(`postgres R-P4-S-003/C-S-001 URI override=${overrideUri}：真实 lock_time
 }));
 
 test(`postgres R-P4-S-003/C-S-001 URI override=${overrideUri}：实际 statement_timeout 与 readonly session 拒写`, { skip: pgUnavailable }, async () => postgresReaderFixture(async (admin, schema, connectionString) => {
-  const input = { memberId: "member", projectId: "project", bindingGeneration: "1" };
+  const input = { memberId: "member", projectId: "project", membershipRevision: 1, bindingGeneration: "1" };
   let reader = createMemoryInjectionReader({ database: readerDatabase(connectionString, schema), config: DEFAULT_MEMORY_CONFIG });
   try {
     assert.equal((await reader.readOwn(input)).state, "available");

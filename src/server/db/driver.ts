@@ -18,6 +18,11 @@ import { createPostgresDriver } from "./drivers/postgres.ts";
 /** 一次查询的行结果。 */
 export type DbRow = Record<string, unknown>;
 
+/** 同一物理事务共享的内部状态；SAVEPOINT 回滚恢复此前条目，事务结束后不可继续使用。
+ * value 视为不可变值：修改时替换条目，不能原地修改对象绕过保存点恢复。
+ */
+export interface DbTransactionContext { readonly values: Map<symbol, unknown> }
+
 /** 事务会话：事务内的语句只在事务可见范围内生效。 */
 export interface DbTransaction {
   /** 读取查询；参数使用统一 `?` 占位符。 */
@@ -34,6 +39,8 @@ export interface DbDriver {
   readonly kind: DbDriverKind;
   /** 本方言的 SQL 差异面（占位符、事务语句、类型映射、基线 DDL）。 */
   readonly dialect: SqlDialect;
+  /** 仅当前异步事务链可见；嵌套仓储/工厂不能各自生成另一份锁集合。 */
+  currentTransactionContext(): DbTransactionContext | undefined;
   /** 建立并验证连接（SQLite 打开文件；PG 建立连接池并握手）。幂等。 */
   connect(): Promise<void>;
   /** 按版本升序执行未应用的迁移；定义校验与 checksum 跨方言一致。 */

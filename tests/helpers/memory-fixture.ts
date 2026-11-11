@@ -34,7 +34,7 @@ export async function memoryPeople(repos: RepositorySet) {
   const outsider = await repos.members.create({ projectId: project.id, agentId: other.id, kind: "agent", displayName: other.displayName });
   const group = await repos.groups.create({ projectId: project.id, name: "记忆取材群", participantMemberIds: [member.id, outsider.id] });
   const owner: MemoryAccess = { actor: ownerActor() };
-  const own: MemoryAccess = { actor: actorForMember(member), connection: { projectId: project.id, memberId: member.id, groupId: group.id } };
-  const foreign: MemoryAccess = { actor: actorForMember(outsider), connection: { projectId: project.id, memberId: outsider.id, groupId: group.id } };
+  const own: MemoryAccess = { actor: actorForMember(member), connection: { projectId: project.id, memberId: member.id, groupId: group.id, membershipRevision: member.membershipRevision } };
+  const foreign: MemoryAccess = { actor: actorForMember(outsider), connection: { projectId: project.id, memberId: outsider.id, groupId: group.id, membershipRevision: outsider.membershipRevision } };
   return { project, agent, other, member, outsider, group, owner, own, foreign };
 }

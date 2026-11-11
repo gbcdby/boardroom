@@ -48,7 +48,7 @@ test("DbDriver 共用真实只读 reader，拒绝重复装配，关闭后不再�
     const first = getMemoryRuntime(db), second = getMemoryRuntime(db);
     assert.equal(first.reader, second.reader);
     assert.throws(() => registerMemoryRuntime(db, { database: { kind: "sqlite", sqlitePath: "/different-untrusted-path" } }), /already_configured/);
-    const input = { memberId: member.id, projectId: project.id, bindingGeneration: "trusted-binding" };
+    const input = { memberId: member.id, projectId: project.id, membershipRevision: member.membershipRevision, bindingGeneration: "trusted-binding" };
     const result = await second.reader.readOwn(input);
     assert.equal(result.state, "available", JSON.stringify(result.errors));
     assert.equal(result.entries[0]?.markdown, "仅属于这个 Agent");

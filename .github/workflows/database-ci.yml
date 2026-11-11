@@ -62,6 +62,21 @@ jobs:
           AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
         run: npm test
 
+      - name: 固定 V1 与万条历史负载逐次计时（SQLite / PostgreSQL）
+        env:
+          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: node --test --test-concurrency=1 tests/lifecycle-load.acceptance.ts
+
+      - name: 保存逐次负载与 SQL 范围报告
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lifecycle-load-${{ github.run_attempt }}
+          path: .agent-output/lifecycle-load/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: SQLite SDK 端到端验证
         env:
           AGENT_STUDIO_DB_DRIVER: sqlite
@@ -115,10 +130,45 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: SQLite 真实 npm 启动与同数据重启
+        env:
+          AGENT_STUDIO_DB_DRIVER: sqlite
+        run: node scripts/e2e-install.mjs
+
+      - name: PostgreSQL 真实 npm 启动与同数据重启
+        env:
+          AGENT_STUDIO_DB_DRIVER: postgres
+          AGENT_STUDIO_PG_CONNECTION_STRING: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: node scripts/e2e-install.mjs
+
+      - name: 保存安装与重启报告
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: install-${{ github.run_attempt }}
+          path: .agent-output/install-e2e/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
   managed-web-browser:
     name: Chromium · 工作台与托管 Agent 页面
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: boardroom
+          POSTGRES_PASSWORD: boardroom-ci-only
+          POSTGRES_DB: boardroom_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U boardroom -d boardroom_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: 检出本次验证候选
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -168,6 +218,17 @@ jobs:
       - name: 记忆编辑、冲突与历史真实浏览器验证
         run: .agent-output/browser-venv/bin/python scripts/e2e-memory-web.py
 
+      - name: 只读设置、配置重启与键盘布局真实浏览器验证
+        run: .agent-output/browser-venv/bin/python scripts/e2e-settings-web.py
+
+      - name: SQLite 固定负载与真实 DOM 消息时延
+        run: .agent-output/browser-venv/bin/python scripts/e2e-v1-load-web.py --ci --db sqlite
+
+      - name: PostgreSQL 固定负载与真实 DOM 消息时延
+        env:
+          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: .agent-output/browser-venv/bin/python scripts/e2e-v1-load-web.py --ci --db postgres
+
       - name: 保存浏览器截图与逐项报告
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -179,6 +240,8 @@ jobs:
             .agent-output/webui-before/
             .agent-output/tasks-web-e2e/
             .agent-output/memory-web-e2e/
+            .agent-output/settings-web-e2e/
+            .agent-output/v1-load-web/
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7

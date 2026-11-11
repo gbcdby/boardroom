@@ -11,23 +11,24 @@ import type { Logger } from "./logger.ts";
 import { createStaticHandler, isWebUiBuilt } from "./static.ts";
 import { createWebSocketHub, type ServerEvent, type WebSocketHub } from "./ws.ts";
 import { MCP_HTTP_PATH, createMcpSessionsHandler, type McpSessionsHandler } from "./mcp/transport.ts";
-import { createT1ApiRouter, type ActorResolution } from "./api.ts";
+import { createT1ApiRouter, messageView, type ActorResolution } from "./api.ts";
 import type { WsActorContext } from "./ws.ts";
 import type { Actor } from "./authz/authorize.ts";
 import type { SessionBinding } from "./mcp/core.ts";
 import { createOrgActorResolver } from "./authz/org-actors.ts";
 import type { OrgChangeRecorder } from "./org-change-hook.ts";
-import { createAuditRecorder } from "./audit.ts";
 import { buildStatusBoard } from "./status.ts";
 import { createRuntimeApi } from "./runtime/api.ts";
 import { createRuntimeObservability } from "./runtime/observability.ts";
 import { createRuntimeSupervisor, type RuntimeSupervisor } from "./runtime/supervisor.ts";
 import { createHostLauncher } from "./runtime/hosts/launcher.ts";
 import type { HostLauncher } from "./runtime/hosts/types.ts";
-import { notifyMessageCommit } from "./runtime/dispatch-events.ts";
+import { notifyMessageCommit, onMessageCommit } from "./runtime/dispatch-events.ts";
 import { createTaskApi } from "./tasks/api.ts";
 import { createMemoryApi } from "./memory/api.ts";
 import { registerMemoryRuntime, closeMemoryRuntime } from "./memory/runtime.ts";
+import { createSettingsApi } from "./settings/api.ts";
+import { buildEffectiveSettings } from "./settings.ts";
 
 /** WebSocket 端点路径。 */
 export const WS_PATH = "/ws";
@@ -59,7 +60,7 @@ export interface StartServerOptions {
   readonly webRoot?: string;
   /** F2 权限守卫主体注入（默认阶段 1 人=owner，行为不变）。 */
   readonly authorization?: ServerAuthorization;
-  /** T5（#52）审计/撤销接口钩子；省略时默认注入写 audit_log 的真实 recorder。 */
+  /** 组织变更提交后观察钩子；权威审计始终由领域事务写入。 */
   readonly orgChangeRecorder?: OrgChangeRecorder;
   /** 受信装配/测试 seam；不从 HTTP、聊天或运行时配置接受 launcher。 */
   readonly runtimeLauncher?: HostLauncher;
@@ -161,11 +162,13 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     throw new ServerStartupError((error as Error).message);
   }
 
+  const repos = createRepositories(driver);
+
   // T2 / D6：进程重启后，上一进程遗留的「connected」MCP 会话已失效。
   // 启动时统一标记为断开，并把这些成员的运行状态置为 offline——恢复完全依赖
   // 服务端持久化 + agent 重连后主动 join/心跳，不臆造在线（STATUS-02）。
   try {
-    const recovered = createRepositories(driver);
+    const recovered = repos;
     const staleAt = new Date().toISOString();
     const staleCount = await (recovered.mcpSessions.markAllStale(staleAt));
     if (staleCount > 0) {
@@ -189,7 +192,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   // T2（#49）：把 F2 的纯权限结构接到真实 DB 数据。未显式注入 authorization 时，
   // 三个入口统一用 org_nodes / members.node_id 装配 Actor；无组织数据的升级库
   // 逐入口回退到阶段 1 兼容映射（人=owner），AC-CORE-* 行为不变。
-  const orgResolver = createOrgActorResolver(createRepositories(driver));
+  const orgResolver = createOrgActorResolver(repos);
   const authorization: ServerAuthorization = options.authorization ?? {
     resolveHttpActor: (resolution) => orgResolver.resolveHttpActor(resolution),
     resolveWsActor: (context) => orgResolver.resolveWsActor(context),
@@ -211,30 +214,27 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     antiLoop: { ...(config.antiLoop ? { config: config.antiLoop } : {}) },
     ...(authorization.resolveMcpActor ? { actorFor: authorization.resolveMcpActor } : {}),
   });
-  // T3：人的消息广播目标。hub 在 httpServer 之后创建，这里用晚绑定回调占位。
-  let broadcastMessage: (message: import("./api.ts").MessageView) => void | Promise<void> = () => {};
-  // T5（#52）：把 T2/T3 的 noop 钩子换成默认真实 recorder（写 audit_log）。
-  // 显式注入（测试替身 / 未来装配）优先，保证既有 org-authz 等用例不变。
-  const auditRecorder: OrgChangeRecorder =
-    options.orgChangeRecorder ?? createAuditRecorder(createRepositories(driver).audit);
+  // hub 在 httpServer 之后创建；HTTP 提交后的通知使用晚绑定回调。
+  let notifyHttpMessage: (message: import("./api.ts").MessageView) => void | Promise<void> = () => {};
+  // 权威组织审计由 API 领域服务原子提交；可选 hook 只作提交后观察。
   const t1Api = createT1ApiRouter({
-    db: driver,
+    db: driver, repos,
     logger,
     heartbeat: config.heartbeat,
-    onMessage: (message) => broadcastMessage(message),
+    onMessage: (message) => notifyHttpMessage(message),
     ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}),
-    orgChangeRecorder: auditRecorder,
+    ...(options.orgChangeRecorder ? { orgChangeRecorder: options.orgChangeRecorder } : {}),
   });
   const runtimeObservations = createRuntimeObservability({ db: driver, logger });
   const runtimeStateRoot = path.join(config.dataDir, "managed");
-  const runtimeSupervisor = createRuntimeSupervisor({ db: driver, logger, observations: runtimeObservations,
+  const runtimeSupervisor = createRuntimeSupervisor({ db: driver, repos, logger, observations: runtimeObservations,
     stateRoot: runtimeStateRoot,
     ...(authorization.resolveMcpActor ? { actorFor: authorization.resolveMcpActor } : {}),
     launcher: options.runtimeLauncher ?? createHostLauncher({ stateRoot: runtimeStateRoot,
       protectedPaths: [path.resolve(import.meta.dirname, "../.."), config.dataDir,
         ...(config.configFile ? [config.configFile] : [])] }),
   });
-  const runtimeApi = createRuntimeApi({ db: driver, logger, heartbeat: config.heartbeat,
+  const runtimeApi = createRuntimeApi({ db: driver, repos, logger, heartbeat: config.heartbeat,
     supervisor: runtimeSupervisor, observations: runtimeObservations,
     ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}),
   });
@@ -242,6 +242,14 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}) });
   const memoryApi = createMemoryApi({ db: driver, logger,
     ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}) });
+  const settingsApi = createSettingsApi({ logger,
+    getSettings: () => {
+      const address = httpServer.address();
+      if (!address || typeof address === "string") throw new Error("server_not_listening");
+      return buildEffectiveSettings({ config, address: { host: HOST, port: address.port }, startedAt: new Date(startedAt).toISOString() });
+    },
+    ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}),
+  });
 
   const httpServer = createServer((request, response) => {
     void handleRequest(request, response).catch((error: unknown) => {
@@ -274,6 +282,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     }
 
     if (pathname.startsWith("/api/")) {
+      if (await settingsApi.handle(request, response, pathname)) return;
       if (await memoryApi.handle(request, response, pathname)) return;
       if (await taskApi.handle(request, response, pathname)) return;
       if (await runtimeApi.handle(request, response, pathname)) return;
@@ -301,11 +310,18 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     ...(authorization.resolveWsActor ? { resolveActor: authorization.resolveWsActor } : {}),
   });
 
-  // T3：把人的消息通过 WebSocket 广播给 WebUI（阶段 1 WebUI = 人，可见全部群组消息）。
-  // 注意：广播范围受本票约束「只推送允许范围内的消息」；目前 WebUI 连接即人的视角，
-  // 单群组内全部消息都在人的可见范围内。MCP agent 的投递不经过 WS（走 wait_for_messages）。
-  broadcastMessage = async (message) => {
-    hub.broadcast({ type: "message", message });
+  // WebUI 是人的视角，实时读取所有来源的已提交消息。MCP core 与 HTTP 都发送
+  // 同一提交通知，因此 Agent 的消息也可见，HTTP 消息不会重复广播。
+  const unsubscribeMessages = onMessageCommit(driver, async (messageId) => {
+    if (!messageId) return;
+    try {
+      const message = await repos.messages.get(messageId);
+      if (message) hub.broadcast({ type: "message", message: await messageView(repos, message) });
+    } catch (error) {
+      log.warn("广播已提交消息失败", { error, messageId });
+    }
+  });
+  notifyHttpMessage = async (message) => {
     await notifyMessageCommit(driver, message.id);
     // T8（#21）修复：人的消息经 HTTP 写入后，唤醒 HTTP 会话中在该群组等待、且被该消息
     // 路由 wake 的 agent。否则 agent 只能等 wait 超时或下次 wait 才拿到积压（定向消息不及时）。
@@ -368,6 +384,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     await runtimeSupervisor.close();
     await mcpHandler.close();
     clearInterval(statusTimer);
+    unsubscribeMessages();
     await hub.close();
     await closeMemoryRuntime(driver);
     await driver.close();
@@ -429,6 +446,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
       clearInterval(statusTimer);
       await runtimeSupervisor.close();
       await mcpHandler.close();
+      unsubscribeMessages();
       await hub.close();
       // 先在途的连接一并断开：Streamable HTTP 的 SSE 响应会持续保持连接，
       // 仅 close() 不会中断它们；closeAllConnections 让进行中的等待随连接结束。

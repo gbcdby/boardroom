@@ -240,7 +240,7 @@ for (const engine of ["sqlite", "postgres"] as const) {
       await repos.audit.markReversed(f.project.id, audit.id, "compensation", at);
       const oldAudit = await repos.audit.get(f.project.id, audit.id);
       const oldMigrations = (await db.migrationState()).applied;
-      assert.equal((await db.migrate(migrations)).version, 12);
+      assert.equal((await db.migrate(migrations.filter(m => m.version <= 12))).version, 12);
       assert.deepEqual((await db.migrationState()).applied.slice(0, 11), oldMigrations);
       assert.deepEqual(await repos.audit.get(f.project.id, audit.id), oldAudit);
       assert.equal((await repos.deliveries.get(message.id, f.member.id))!.firstMcpDeliveredAt, null);
@@ -251,7 +251,7 @@ for (const engine of ["sqlite", "postgres"] as const) {
       const memoryAudit = await appendAuditEntry(repos.audit, { projectId: f.project.id, actor: { kind: "human", name: "人" }, action: "memory.updated",
         targetKind: "memory", targetId: "document", targetName: "项目记忆" });
       assert.equal((await repos.audit.get(f.project.id, memoryAudit.id))!.targetKind, "memory");
-      assert.deepEqual((await db.migrate(migrations)).applied, []);
+      assert.deepEqual((await db.migrate(migrations.filter(m => m.version <= 12))).applied, []);
     }, 11);
   });
   test(`${engine} 错群和缺失群上下文均不能 ACK；同群幂等也不能绕过群边界`, { skip }, async () => {

@@ -8,6 +8,7 @@ import {
   RepositoryError,
 } from "../db/errors.ts";
 import { createRepositories, type RepositorySet } from "../db/repositories.ts";
+import type { MutationDiscover } from "../db/mutation-scope.ts";
 import { newId } from "../db/ids.ts";
 import type { McpSession, Member, MemberKind, Message as DbMessage } from "../db/types.ts";
 import { invalidArgument, McpToolError, notInGroup } from "./errors.ts";
@@ -102,6 +103,7 @@ export interface SessionBinding {
   readonly sessionId: string;
   readonly agentId: string;
   readonly memberId: string;
+  readonly membershipRevision: number;
   readonly projectId: string;
   readonly groupId: string;
   readonly role: MemberRole;
@@ -309,12 +311,14 @@ interface WaitDrainRequest {
 
 interface PendingWait {
   readonly ownerKey: string;
+  readonly binding: SessionBinding;
   readonly memberId: string;
   readonly groupId: string;
   readonly afterSeq: number | undefined;
   readonly resolve: (result: WaitResult) => void;
   readonly settled: () => void;
   done: boolean;
+  settling: boolean;
   deadlineReached: boolean;
   timer: NodeJS.Timeout | null;
   pollTimer: NodeJS.Timeout | null;
@@ -391,7 +395,7 @@ export interface AntiLoopRuntimeOptions {
 /** 只能由父 supervisor 的专用传输注入；工具参数不能提供此授权。 */
 export interface ManagedCoreAuthority {
   readonly identity: JoinParams & { readonly memberId: string };
-  run<T>(operation: "join" | "observe" | "write" | "consume" | "disconnect", fn: () => Promise<T>): Promise<T>;
+  run<T>(operation: "join" | "observe" | "write" | "consume" | "disconnect", fn: () => Promise<T>, discover?: MutationDiscover): Promise<T>;
   /** wait 边界决定是否允许下一轮；false 返回取消且不投递新消息。 */
   beforeWait(): Promise<boolean>;
   /** 与投递同一短事务执行，记录离开安全点。 */
@@ -401,6 +405,7 @@ export interface ManagedCoreAuthority {
 export interface McpCoreOptions {
   readonly logger: Logger;
   readonly db: DbDriver;
+  readonly repos?: RepositorySet;
   readonly heartbeat?: Heartbeat;
   readonly now?: () => Date;
   /**
@@ -468,7 +473,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   const now = options.now ?? (() => new Date());
   const memberKey = options.memberKey ?? "default";
 
-  const repos: RepositorySet = createRepositories(options.db);
+  const repos: RepositorySet = options.repos ?? createRepositories(options.db);
   const tasks = createTaskService({ repos, now,
     onWorkEvents: events => notifyWorkEventCommit(options.db, events) });
   const memoryRuntime = getMemoryRuntime(options.db);
@@ -488,7 +493,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       return messages;
     },
   });
-  const runtimes = createRuntimeRepository(options.db);
+  const runtimes = createRuntimeRepository(options.db, { repos });
   /** T7：进程级共享的防环/限流器。 */
   const antiLoop = getSharedAntiLoop(options.antiLoop);
   /** 会话键 → 绑定（运行时对象，进程内维护；持久化部分在 mcp_sessions/members/agents）。 */
@@ -504,19 +509,42 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
   const selfKey = (sessionId: string): string => `${memberKey}:${sessionId}`;
 
+  async function currentBindingMember(binding: SessionBinding, allowInactive = false): Promise<Member> {
+    const member = await repos.members.getIncludingRemoved(binding.memberId);
+    if (!member || member.projectId !== binding.projectId || member.removedAt !== null) {
+      throw new McpToolError("FORBIDDEN", "成员已移除，不能沿用旧连接。", { reason: "member_removed" });
+    }
+    if (!Number.isSafeInteger(binding.membershipRevision) || member.membershipRevision !== binding.membershipRevision) {
+      throw new McpToolError("FORBIDDEN", "成员授权代际已变化，请重新加入会话。", { reason: "membership_changed" });
+    }
+    if (!allowInactive && member.status !== "active") throw new McpToolError("FORBIDDEN", "当前成员已停用，不能继续访问。", { reason: "inactive_member" });
+    return member;
+  }
+
   async function withAccess<T>(binding: SessionBinding | null,
-    operation: "join" | "observe" | "write" | "consume" | "disconnect", fn: () => Promise<T>): Promise<T> {
+    operation: "join" | "observe" | "write" | "consume" | "disconnect", fn: () => Promise<T>, discover?: MutationDiscover): Promise<T> {
     try {
-      if (options.managed) return await options.managed.run(operation, fn);
-      if (binding) return await runtimes.withMemberLock(binding.memberId, async () => {
-        await runtimes.assertExternalJoinAllowed(binding.memberId);
-        return await fn();
-      });
-      return await fn();
+      if (!binding) return options.managed ? await options.managed.run(operation, fn, discover) : await fn();
+      const complete: MutationDiscover = async tx => {
+        const found = discover ? await discover(tx) : { memberIds: [], groupIds: [], runtimeIds: [] };
+        return { ...found, memberIds: [...new Set([...found.memberIds, binding.memberId])],
+          groupIds: [...new Set([...found.groupIds, binding.groupId])] };
+      };
+      const run = async () => {
+        // 停用仍允许同代连接记录退出事实；移除或代际变化不能清理恢复后的新状态。
+        await currentBindingMember(binding, operation === "disconnect");
+        if (!options.managed) await runtimes.assertExternalJoinAllowed(binding.memberId);
+        return fn();
+      };
+      if (options.managed) return await options.managed.run(operation, run, complete);
+      return await repos.mutations.run({ projectIds: [binding.projectId], discover: complete }, run);
     } catch (error) {
       if (error instanceof McpToolError) throw error;
       if (error instanceof RepositoryError && error.code === "conflict") {
         throw new McpToolError("CONFLICT", "运行所有权已变化或成员已由托管运行时预留");
+      }
+      if (error instanceof RepositoryError && error.code === "mutation_scope_changed") {
+        throw new McpToolError("CONFLICT", error.message, { reason: error.code });
       }
       throw error;
     }
@@ -526,23 +554,23 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     return {
       // 任务主体只取真实连接身份，领域服务随后按 DB 当前岗位/状态重新解析权限。
       actor: actorForSession(binding),
-      connection: { projectId: binding.projectId, memberId: binding.memberId, groupId: binding.groupId },
-      runMutation: (operation, body) => withAccess(binding, operation, async () => {
+      connection: { projectId: binding.projectId, memberId: binding.memberId, groupId: binding.groupId, membershipRevision: binding.membershipRevision },
+      runMutation: (operation, body, discover) => withAccess(binding, operation, async () => {
         // 领域冲突先转换，避免被外层运行时 fence 错认成所有权冲突。
         try { return await body(); }
         catch (error) {
           if (error instanceof RepositoryError && error.code === "conflict") throw mapTaskToolError(error);
           throw error;
         }
-      }),
+      }, discover),
     };
   }
 
   async function memoryAccess(binding: SessionBinding, background = false): Promise<MemoryAccess> {
     return { actor: actorForSession(binding),
-      connection: { projectId: binding.projectId, memberId: binding.memberId, groupId: binding.groupId },
+      connection: { projectId: binding.projectId, memberId: binding.memberId, groupId: binding.groupId, membershipRevision: binding.membershipRevision },
       injectionBindingGeneration: memoryCoreKey + binding.sessionId,
-      runMutation: async (operation, body) => {
+      runMutation: async (operation, body, discover) => {
         const invoke = () => withAccess(binding, operation, async () => {
           if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError("CONFLICT", "记忆会话绑定已失效。");
           try { return await body(); }
@@ -552,7 +580,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
             if (error instanceof RepositoryError && error.code === "conflict") throw mapMemoryToolError(error);
             throw error;
           }
-        });
+        }, discover);
         if (!background || options.db.kind !== "postgres") return await invoke();
         // 自动补偿先设置真实数据库超时，再取得成员/fence 锁；不留下后台占池或锁等待。
         return await options.db.transaction(async () => {
@@ -564,7 +592,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     };
   }
 
-  async function memoryAtSafePoint(binding: SessionBinding, force = false): Promise<MemoryInjection | undefined> {
+  async function prepareMemoryAtSafePoint(binding: SessionBinding): Promise<{ injection: MemoryInjection; fingerprint: string }> {
     let injection: MemoryInjection;
     try {
       await withAccess(binding, "observe", () => guard(binding, "group:view", { projectId: binding.projectId, groupId: binding.groupId }));
@@ -576,9 +604,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     }
     const fingerprint = JSON.stringify({ state: injection.state, errors: injection.errors,
       entries: injection.entries.map(entry => [entry.scope, entry.documentId, entry.version, entry.injectedBytes, entry.truncated]) });
-    if (!force && injectedVersions.get(binding.sessionId) === fingerprint) return undefined;
-    injectedVersions.set(binding.sessionId, fingerprint);
-    return injection;
+    // 取材与发布分开。后续ACL/fence仍可能拒绝整个wait，不能提前消费这个版本。
+    return { injection, fingerprint };
   }
 
   function reconcileMemorySoon(binding: SessionBinding): void {
@@ -617,53 +644,47 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       throw new McpToolError("INVALID_ARGUMENT", `群组 ${groupId} 不属于项目 ${projectId}`, { projectId, groupId });
     }
 
+    const newMemberId = newId();
+    const discover: MutationDiscover = async tx => {
+      const member = await tx.one<{ id: string }>(`SELECT m.id FROM members m JOIN agents a ON a.id = m.agent_id
+        WHERE m.project_id = ? AND a.display_name = ? AND a.host_type = ?`, [projectId, displayName, hostType]);
+      return { memberIds: member ? [member.id] : [], newMemberIds: member ? [] : [newMemberId], groupIds: [groupId], runtimeIds: [] };
+    };
     try {
-      return await (repos.transaction(async () => {
-        // 1) 全局身份：按 (displayName, hostType) 查找或创建（唯一索引兜底）。
-        let agent = await (repos.agents.findByIdentity(displayName, hostType));
-        if (!agent) agent = await (repos.agents.create({ displayName, hostType }));
-        const agentId = agent.id;
-
-        // 2) 项目成员：同 agent 在同项目唯一（(project_id, agent_id) 唯一索引）。
-        let member = await (repos.members.findByAgent(projectId, agentId));
-        if (!member) {
-          // 阶段 1 一个项目只有一个岗位（D2）；入群保留已有 manager，不覆盖。
-          member = await (repos.members.create({
-            projectId,
-            kind: "agent",
-            agentId,
-            displayName,
-            role: role === "manager" ? "manager" : "normal",
-          }));
-        } else if (member.displayName !== displayName) {
-          member = await (repos.members.update(member.id, { displayName }));
+      return await repos.mutations.run({ projectIds: [projectId], discover }, async scope => {
+        // 所有授权与身份事实在项目及成员范围锁取得后重读，不能让普通 join 复活 tombstone。
+        const currentProject = await repos.projects.get(projectId), currentGroup = await repos.groups.get(groupId);
+        if (!currentProject || !currentGroup || currentGroup.projectId !== projectId) {
+          throw new McpToolError("CONFLICT", "项目或群组已变化，请刷新后重新加入。");
         }
-
-        // external join 与托管预留必须锁定同一 Member，防止 PG 检查后竞争。
-        return await runtimes.withMemberLock(member.id, async () => {
+        if (currentProject.archivedAt !== null || currentGroup.archivedAt !== null) {
+          throw new McpToolError("CONFLICT", "已归档项目或群组不能建立新连接。");
+        }
+        let agent = await repos.agents.findByIdentity(displayName, hostType);
+        if (!agent) agent = await repos.agents.create({ displayName, hostType });
+        const agentId = agent.id;
+        let member = await repos.members.findByAgentIncludingRemoved(projectId, agentId);
+        if (member && member.removedAt !== null) {
+          throw new McpToolError("FORBIDDEN", "成员已移除，请由有权限的用户恢复成员后重新加入。", { reason: "member_removed" });
+        }
+        if (member && member.status !== "active") {
+          throw new McpToolError("FORBIDDEN", "成员未激活或已停用，不能建立新连接。", { reason: "inactive_member" });
+        }
+        if (!member) {
+          member = await repos.members.create({ id: newMemberId, projectId, kind: "agent", agentId, displayName,
+            role: role === "manager" ? "manager" : "normal" });
+        }
+        scope.assertCovers([projectId], [member.id]);
         if (!options.managed) await runtimes.assertExternalJoinAllowed(member.id);
         else if (options.managed.identity.memberId !== member.id) {
           throw new McpToolError("FORBIDDEN", "托管通道不能切换成员身份");
         }
-        // 3) 群组参与者（幂等）。
-        await (repos.groups.addParticipant(groupId, member.id));
-
-        // 4) MCP 会话（连接状态，D1）：建立或复用活跃会话。
-        const session = await (repos.mcpSessions.connect({
-          agentId,
-          projectId,
-          groupId,
-          memberId: member.id,
-          displayName,
-          hostType,
-        }));
-
-        // 5) 成员运行状态：连接建立 → online（与连接心跳分开记录）。
-        await (repos.statuses.set(projectId, member.id, "online"));
-
+        if (member.displayName !== displayName) member = await repos.members.update(member.id, { displayName });
+        await repos.groups.addParticipant(groupId, member.id);
+        const session = await repos.mcpSessions.connect({ agentId, projectId, groupId, memberId: member.id, displayName, hostType });
+        await repos.statuses.set(projectId, member.id, "online");
         return { agentId, member, session };
-        });
-      }));
+      });
     } catch (error) {
       throw mapRepoError(error, { projectId, groupId, displayName, hostType });
     }
@@ -695,10 +716,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 拒绝时按 MCP 契约抛 `FORBIDDEN`，并在 details 里给出稳定拒绝码。
    */
   async function guard(binding: SessionBinding, capability: Capability, scope: GuardScope, denyMessage?: string): Promise<void> {
-    const member = await repos.members.get(binding.memberId);
-    if (!member || member.projectId !== binding.projectId || member.status !== "active") {
-      throw new McpToolError("FORBIDDEN", "当前成员已退出或停用，不能继续访问。", { reason: "inactive_member" });
-    }
+    const member = await currentBindingMember(binding);
     const decision = authorize(
       (await options.authz?.actorFor?.(binding)) ?? (await orgActorForMember(repos, binding.memberId)) ?? actorForMember(member),
       capability,
@@ -755,38 +773,15 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   /** 某成员对该消息的可见性（T3 路由规则：普通=自己发送+被@；manager=全部；人=全部）。 */
   async function isVisibleTo(binding: SessionBinding, message: DbMessage): Promise<boolean> {
     if (message.groupId !== binding.groupId) return false;
-    const roster = await (buildRosterFor(message.groupId));
-    const plan = resolveWakeAndVisibility(
-      {
-        senderMemberId: message.senderMemberId,
-        mentionIds: message.mentions,
-        mentionsAll: false,
-      },
-      roster,
-    );
-    return plan.visible.includes(binding.memberId) || await tasks.canReadLinkedMessage(await taskAccess(binding), binding.projectId, message.id);
+    return (await repos.messages.listVisibleForMember(binding, { messageId: message.id, limit: 1 })).length > 0;
   }
 
   /** 从 afterSeq 之后取该成员可见、且未 acked 的消息（积压/唤醒）。 */
   async function deliverableSince(binding: SessionBinding, afterSeq: number | undefined): Promise<DbMessage[]> {
     await guard(binding, "group:view", { projectId: binding.projectId, groupId: binding.groupId });
-    const list = await (repos.messages.listByGroup(binding.groupId, {
+    return await repos.messages.listVisibleForMember(binding, { unackedOnly: true,
       ...(afterSeq === undefined ? {} : { afterSeq }),
-    }));
-    // roster 在一次调用内不变，构建一次即可。
-    const roster = await (buildRosterFor(binding.groupId));
-    const pending: DbMessage[] = [];
-    for (const message of list) {
-      const plan = resolveWakeAndVisibility(
-        { senderMemberId: message.senderMemberId, mentionIds: message.mentions, mentionsAll: false },
-        roster,
-      );
-      if (!plan.visible.includes(binding.memberId) && !await tasks.canReadLinkedMessage(await taskAccess(binding), binding.projectId, message.id)) continue;
-      const delivery = await (repos.deliveries.get(message.id, binding.memberId));
-      if (delivery?.status === "acked") continue;
-      pending.push(message);
-    }
-    return pending;
+    });
   }
 
   /** 把一批消息记为「已投递」（至少一次；acked 前可重复读取，靠 acked 过滤去重）。 */
@@ -809,36 +804,72 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
   /** 某成员最后一条非 pending 消息的游标（timeout/cancelled 时回显 afterCursor）。 */
   async function lastDeliveredCursor(binding: SessionBinding): Promise<string | null> {
-    const list = await (repos.messages.listByGroup(binding.groupId));
-    let lastSeq: number | null = null;
-    for (const message of list) {
-      const delivery = await (repos.deliveries.get(message.id, binding.memberId));
-      if (delivery && delivery.status !== "pending") lastSeq = message.seq;
-    }
+    const lastSeq = await repos.messages.lastDeliveredSeq(binding);
     return lastSeq === null ? null : seqCursor(lastSeq);
   }
 
   async function settle(entry: PendingWait, result: WaitResult): Promise<void> {
     if (entry.done) return;
-    entry.done = true;
-    entry.drainRequests.length = 0;
+    const finish = (value: WaitResult): boolean => {
+      if (entry.done) return false;
+      entry.done = true; entry.drainRequests.length = 0;
+      if (entry.timer) clearTimeout(entry.timer);
+      if (entry.pollTimer) clearInterval(entry.pollTimer);
+      const idx = pendingWaits.indexOf(entry);
+      if (idx >= 0) pendingWaits.splice(idx, 1);
+      waitingMembers.delete(entry.memberId);
+      entry.settled(); entry.resolve(value);
+      return true;
+    };
+    const cancelled = (): WaitResult => ({ ok: true, status: 'cancelled', messages: [], cursor: null, drainedBacklog: false,
+      memory: unavailableMemory(memoryRuntime.config, 'memory_binding_unavailable') });
+    // 关闭/取消可在外部reader等待期间抢先结束，但绝不携带正在准备的旧payload。
+    if (closed || result.status === 'cancelled') { finish(closed ? cancelled() : result); return; }
+    if (entry.settling) return;
+    entry.settling = true;
     if (entry.timer) clearTimeout(entry.timer);
     if (entry.pollTimer) clearInterval(entry.pollTimer);
-    const idx = pendingWaits.indexOf(entry);
-    if (idx >= 0) pendingWaits.splice(idx, 1);
-    waitingMembers.delete(entry.memberId);
-    // 结束等待 = 离开等待循环、进入下一轮处理 → working（T4/AGENT-04）。
-    // 但服务端关闭/会话断开时取消等待属于「终止」，不得回写 working：成员已离线，
-    // 由 disconnect()/启动恢复置为 offline（STATUS-02，不臆造 working）。
-    if (!closed) {
-      const binding = bindingByMember(entry.memberId);
-      if (binding) await (markWorking(binding));
-    }
-    const binding = !closed && result.status !== "cancelled" ? bindingByMember(entry.memberId) : undefined;
-    const injection = binding ? await memoryAtSafePoint(binding) : undefined;
-    entry.settled();
-    entry.resolve(injection ? { ...result, memory: injection } : result);
-    if (binding) reconcileMemorySoon(binding);
+    const binding = entry.binding;
+    let published = false;
+    try {
+      // 状态写入真实提交后才能继续；这里不能使用吞错的best-effort markWorking。
+      await withAccess(binding, 'observe', async () => {
+        await guard(binding, 'group:view', { projectId: binding.projectId, groupId: binding.groupId });
+        await repos.statuses.set(binding.projectId, binding.memberId, 'working');
+      });
+      const preparedMemory = await prepareMemoryAtSafePoint(binding);
+      // 投递事实已在drain的consume事务提交。最终发布段只做可信fresh校验：
+      // 检查和resolve处在同一持锁边界，没有锁释放后的异步payload返回窗口。
+      await withAccess(binding, 'consume', async () => {
+        if (entry.done) return;
+        if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError('FORBIDDEN', '等待所绑定的会话已失效。');
+        await guard(binding, 'group:view', { projectId: binding.projectId, groupId: binding.groupId });
+        for (const message of result.messages) {
+          if (!(await repos.messages.listVisibleForMember(binding, { messageId: message.id, limit: 1 })).length) {
+            throw new McpToolError('FORBIDDEN', '消息在最终兑现前已失去可见权限。');
+          }
+        }
+        if (result.workEvents?.length) {
+          const current = new Set((await tasks.listWorkEvents(await taskAccess(binding), binding.projectId)).map(event => event.id));
+          if (result.workEvents.some(event => !current.has(event.id))) throw new McpToolError('FORBIDDEN', '工作事件在最终兑现前已失效。');
+        }
+        // 可能经过多条ACL查询；在同步resolve前再经过managed fence/代际校验。
+        await withAccess(binding, 'consume', async () => {
+          if (entry.done) return;
+          if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError('FORBIDDEN', '等待所绑定的会话已失效。');
+          const injection = injectedVersions.get(binding.sessionId) === preparedMemory.fingerprint ? undefined : preparedMemory.injection;
+          if (finish(injection ? { ...result, memory: injection } : result)) {
+            // 与成功resolve同步确认，取消的旧wait不会覆盖期间由join发布的新版本。
+            if (injection) injectedVersions.set(binding.sessionId, preparedMemory.fingerprint);
+            published = true;
+          }
+        });
+      });
+    } catch (error) {
+      log.warn('wait_settlement_rejected', { error, memberId: binding.memberId });
+      finish(cancelled());
+    } finally { entry.settling = false; }
+    if (published) reconcileMemorySoon(binding);
   }
 
   /** 串行结算同一次等待，工作事件不会扩大聊天的 mention 唤醒范围。 */
@@ -855,15 +886,15 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       const access = await taskAccess(binding);
       const available = await withAccess(binding, "observe", () => tasks.listWorkEvents(access, binding.projectId));
       if (input.workOnly && available.length === 0) return false;
-      let messages = await deliverableSince(binding, entry.afterSeq);
-      if (input.wakeOnly && available.length === 0) {
-        const roster = await buildRosterFor(binding.groupId);
-        messages = messages.filter(message => resolveWakeAndVisibility({ senderMemberId: message.senderMemberId,
-          mentionIds: message.mentions, mentionsAll: false }, roster).wake.includes(binding.memberId));
-      }
-      if (entry.done || (messages.length === 0 && available.length === 0)) return false;
       const delivered = await withAccess(binding, "consume", async () => {
         if (entry.done) return null;
+        // 取得共同项目/成员范围后按最新岗位、参与边和任务关系读取；不投递锁外旧 ACL 快照。
+        let messages = await deliverableSince(binding, entry.afterSeq);
+        if (input.wakeOnly && available.length === 0) {
+          const roster = await buildRosterFor(binding.groupId);
+          messages = messages.filter(message => resolveWakeAndVisibility({ senderMemberId: message.senderMemberId,
+            mentionIds: message.mentions, mentionsAll: false }, roster).wake.includes(binding.memberId));
+        }
         const workEvents = available.length ? await tasks.deliverWorkEvents(access, binding.projectId) : [];
         const batch = messages.length ? await markDelivered(binding, messages) : null;
         if (workEvents.length && !batch && options.managed) await options.managed.onDelivery();
@@ -995,6 +1026,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         sessionId: selfKey(sessionId),
         agentId: joined.agentId,
         memberId: joined.member.id,
+        membershipRevision: joined.member.membershipRevision,
         projectId: params.projectId,
         groupId: params.groupId,
         role: joined.member.role,
@@ -1071,6 +1103,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       const waitPromise = new Promise<WaitResult>((resolve) => {
         entry = {
           ownerKey: memberKey,
+          binding,
           memberId: binding.memberId,
           groupId: binding.groupId,
           afterSeq,
@@ -1081,6 +1114,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
             }
           },
           done: false,
+          settling: false,
           deadlineReached: false,
           timer: null,
           pollTimer: null,
@@ -1125,6 +1159,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         await drainWait(entry, binding, { drainedBacklog: true });
       } catch (error) {
         await settle(entry, { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false });
+        // 托管wait已登记后，初次consume也可能遇到真实generation/owner变化。
+        // 与后续wake的fence失效一致，兑现已取消的等待；未登记请求及实际写入错误仍报错。
+        if (options.managed && error instanceof McpToolError && error.code === "CONFLICT") return await waitPromise;
         throw error;
       }
       if (!entry.done) {
@@ -1149,56 +1186,52 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       // F2（#47）：跨群组写入由统一守卫判定（conn 作用域 + group:post 参与范围）。
       await (guard(binding, "group:post", { projectId: binding.projectId, groupId }, "只能向当前入群的群组发送消息"));
 
-      if (params.clientMessageId) {
-        const existing = await repos.messages.findByClientKey(binding.memberId, params.clientMessageId);
-        if (existing) {
-          return {
-            ok: true,
-            messageId: existing.id,
-            createdAt: existing.createdAt,
-            duplicate: true,
-          };
-        }
-      }
-
-      // T3：mention 解析。显式 mentions 入参（稳定 ID）+ 正文里的 @ 名称/@all 合并。
-      const roster = await (buildRosterFor(groupId));
-      const parsed = parseMentions(text, roster);
-      if (parsed.unknownNames.length > 0) {
-        // 无效 mention 明确报错（失败路径之一），不静默丢弃。
-        throw new McpToolError("INVALID_ARGUMENT", `无法解析 @ 名称：${parsed.unknownNames.join("、")}`, {
-          unknownNames: parsed.unknownNames,
-        });
-      }
-      const explicitMentions = (params.mentions ?? []).filter((id) => {
-        // 显式 mention 必须是本群参与者（防止跨群/外部 ID 泄漏）。
-        if (!roster.some((m) => m.id === id)) {
-          throw new McpToolError("INVALID_ARGUMENT", `被 @ 的成员 ${id} 不是当前群组参与者`, { memberId: id });
-        }
-        return true;
-      });
-      const mentionIds = [...new Set([...explicitMentions, ...parsed.mentionIds])];
-
-      // @all：展开为发送时在线参与者快照，并把快照成员写入持久化 mentions，
-      // 使历史/投递与「发送时在线」一致（CHAT-02）。
-      const plan = resolveWakeAndVisibility(
-        { senderMemberId: binding.memberId, mentionIds, mentionsAll: parsed.all },
-        roster,
-      );
-      const persistedMentions = [...new Set([...mentionIds, ...plan.allRecipients])];
-
       // T5：消息落库与「可见成员的 pending 投递」在同一事务内完成，避免中途崩溃留下
       // 消息可见却无任何投递记录的半成品（NFR-01/NFR-09）。即便极端情况下缺失投递记录，
       // wait_for_messages 的 deliverableSince 仍按「未 acked」补投，不丢消息（见测试）。
+      const discover: MutationDiscover = async tx => {
+        const rows = await tx.query<{ id: string }>(`SELECT m.id FROM group_participants gp JOIN members m ON m.id = gp.member_id
+          JOIN groups g ON g.id = gp.group_id WHERE gp.group_id = ? AND g.project_id = ? AND m.project_id = ? ORDER BY m.id LIMIT 2049`,
+          [groupId, binding.projectId, binding.projectId]);
+        if (rows.length > 2048) throw new RepositoryError("mutation_scope_changed", "当前群组接收成员超过有界变更范围。");
+        return { memberIds: rows.map(row => row.id), groupIds: [groupId], runtimeIds: [] };
+      };
       let persisted: { message: DbMessage; duplicate: true } |
-        { message: DbMessage; duplicate: false; decision: WakeDecision };
+        { message: DbMessage; duplicate: false; decision: WakeDecision; plan: ReturnType<typeof resolveWakeAndVisibility> };
       try {
-        persisted = await withAccess(binding, "write", () => repos.transaction(async () => {
+        persisted = await withAccess(binding, "write", async () => {
+          await guard(binding, "group:post", { projectId: binding.projectId, groupId }, "只能向当前入群的群组发送消息");
           // 事务外查重只是优化；并发请求必须在实际提交范围内再查，并由唯一索引兜底。
           if (params.clientMessageId) {
             const existing = await repos.messages.findByClientKey(binding.memberId, params.clientMessageId);
             if (existing) return { message: existing, duplicate: true as const };
           }
+          // T3：mention 解析。显式 mentions 入参（稳定 ID）+ 正文里的 @ 名称/@all 合并。
+          const roster = await (buildRosterFor(groupId));
+          const parsed = parseMentions(text, roster);
+          if (parsed.unknownNames.length > 0) {
+            // 无效 mention 明确报错（失败路径之一），不静默丢弃。
+            throw new McpToolError("INVALID_ARGUMENT", `无法解析 @ 名称：${parsed.unknownNames.join("、")}`, {
+              unknownNames: parsed.unknownNames,
+            });
+          }
+          const explicitMentions = (params.mentions ?? []).filter((id) => {
+            // 显式 mention 必须是本群参与者（防止跨群/外部 ID 泄漏）。
+            if (!roster.some((m) => m.id === id)) {
+              throw new McpToolError("INVALID_ARGUMENT", `被 @ 的成员 ${id} 不是当前群组参与者`, { memberId: id });
+            }
+            return true;
+          });
+          const mentionIds = [...new Set([...explicitMentions, ...parsed.mentionIds])];
+
+          // @all：展开为发送时在线参与者快照，并把快照成员写入持久化 mentions，
+          // 使历史/投递与「发送时在线」一致（CHAT-02）。
+          const plan = resolveWakeAndVisibility(
+            { senderMemberId: binding.memberId, mentionIds, mentionsAll: parsed.all },
+            roster,
+          );
+          const persistedMentions = [...new Set([...mentionIds, ...plan.allRecipients])];
+
           const message = await (repos.messages.create({
             groupId,
             senderMemberId: binding.memberId,
@@ -1223,8 +1256,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
               reason ? { decision: "suppressed", reason } :
                 allowed.has(memberId) ? { decision: "allowed" } : undefined);
           }
-          return { message, duplicate: false as const, decision };
-        }));
+          return { message, duplicate: false as const, decision, plan };
+        }, discover);
       } catch (error) {
         // 跨连接/进程竞争唯一键：失败事务已经回滚，再读取已提交胜者。
         if (params.clientMessageId && error instanceof RepositoryError && error.code === "conflict") {
@@ -1235,7 +1268,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       }
       const created = persisted.message;
       if (persisted.duplicate) return { ok: true, messageId: created.id, createdAt: created.createdAt, duplicate: true };
-      const decision = persisted.decision;
+      const { decision, plan } = persisted;
       await notifyMessageCommit(options.db, created.id);
       log.info("message_sent", {
         memberId: binding.memberId,
@@ -1396,21 +1429,16 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       const groupId = params.groupId ?? binding.groupId;
       // F2（#47）：历史读取受 conn 作用域 + 可见性判定（替代手写的群组比较）。
       await (guard(binding, "group:view", { projectId: binding.projectId, groupId }, "只能读取当前入群群组的历史"));
-      const messages = await (repos.messages.listByGroup(groupId));
-      const visible: typeof messages = [];
-      for (const m of messages) {
-        if (await isVisibleTo(binding, m)) visible.push(m);
-      }
-
-      let endIndex = visible.length;
+      let beforeSeq: number | undefined;
       if (params.beforeCursor) {
-        const beforeSeq = cursorToSeq(params.beforeCursor);
-        const idx = visible.findIndex((m) => m.seq === beforeSeq);
-        if (idx >= 0) endIndex = idx;
+        const candidate = cursorToSeq(params.beforeCursor);
+        // 沿用既有约定：未知/不可见的 beforeCursor 不改变当前可见页。
+        if (candidate !== undefined && (await repos.messages.listVisibleForMember(binding, { atSeq: candidate, limit: 1 })).length) beforeSeq = candidate;
       }
-      const startIndex = Math.max(0, endIndex - limit);
-      const page = visible.slice(startIndex, endIndex);
-      const hasMore = startIndex > 0;
+      const visible = await repos.messages.listVisibleForMember(binding, { newestFirst: true, limit: limit + 1,
+        ...(beforeSeq === undefined ? {} : { beforeSeq }) });
+      const hasMore = visible.length > limit;
+      const page = visible.slice(0, limit).reverse();
       return {
         ok: true,
         messages: page.map(toMessage),
@@ -1478,7 +1506,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     ...core,
     join: async (sid, params) => {
       // gateway 的 join 完成回调先确认通道就绪，再以 consume fence 领取持久工作事件。
-      const result = await withAccess(null, "join", () => core.join(sid, params));
+      const result = await withAccess(bindings.get(selfKey(sid)) ?? null, "join", () => core.join(sid, params));
       const binding = bindingFor(sid);
       const access = await taskAccess(binding);
       const pending = await withAccess(binding, "observe", () => tasks.listWorkEvents(access, binding.projectId));
@@ -1487,9 +1515,11 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         if (events.length && options.managed) await options.managed.onDelivery();
         return events;
       }) : [];
-      const injection = await memoryAtSafePoint(binding, true);
+      const preparedMemory = await prepareMemoryAtSafePoint(binding);
       reconcileMemorySoon(binding);
-      return { ...result, context: { ...result.context, ...(injection ? { memory: injection } : {}) },
+      // join总是携带一次当前记忆；此处之后无异步操作，再确认已发布版本。
+      injectedVersions.set(binding.sessionId, preparedMemory.fingerprint);
+      return { ...result, context: { ...result.context, memory: preparedMemory.injection },
         ...(workEvents.length ? { workEvents } : {}) };
     },
     acknowledgeMessage: (sid, id) => withAccess(bindingFor(sid), "write", () => core.acknowledgeMessage(sid, id)),

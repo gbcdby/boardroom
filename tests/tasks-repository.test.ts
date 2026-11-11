@@ -10,6 +10,8 @@ import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
 import { RepositoryError } from "../src/server/db/errors.ts";
 import { appendAuditEntry } from "../src/server/audit.ts";
+import { createOrgMutationService } from "../src/server/org/mutations.ts";
+import { ownerActor } from "../src/server/authz/actors.ts";
 import type { Task, ReviewRound, ReviewReport, WorkEvent } from "../src/shared/tasks.ts";
 
 const pgUrl = process.env["AGENT_STUDIO_PG_TEST_URL"] ?? process.env["AGENT_STUDIO_PG_CONNECTION_STRING"];
@@ -96,11 +98,11 @@ for (const engine of ["sqlite", "postgres"] as const) {
       await repos.members.setStatus(task.reviewerMemberId!, "disabled");
       assert.equal((await repos.tasks.getSettings(task.projectId)).reviewerValid, false);
       assert.equal((await repos.tasks.getSettings(task.projectId)).defaultReviewerMemberId, task.reviewerMemberId);
-      await repos.members.delete(task.reviewerMemberId!);
+      await createOrgMutationService({ repos }).removeMember({ actor: ownerActor() }, task.projectId, task.reviewerMemberId!);
       assert.equal((await repos.tasks.getSettings(task.projectId)).defaultReviewerMemberId, null);
       await repos.projects.archive(task.projectId);
-      await assert.rejects(() => repos.tasks.setSettings(task.projectId, 1, null), code("archived"));
-      assert.equal((await repos.tasks.getSettings(task.projectId)).revision, 1);
+      await assert.rejects(() => repos.tasks.setSettings(task.projectId, 2, null), code("archived"));
+      assert.equal((await repos.tasks.getSettings(task.projectId)).revision, 2, 'v13 移除显式 CAS，不能依靠 FK 静默清引用');
     });
   });
 
@@ -125,7 +127,7 @@ for (const engine of ["sqlite", "postgres"] as const) {
       await repos.tasks.create(other);
       await assert.rejects(() => repos.tasks.updateCas(task.projectId, other.id, 1, { currentReviewRoundId: round.id }, at), code("invalid_reference"));
       await assert.rejects(() => repos.tasks.updateCas(task.projectId, other.id, 1, { currentReviewRoundId: "missing" }, at), code("invalid_reference"));
-      await repos.members.delete(task.reviewerMemberId!);
+      await createOrgMutationService({ repos }).removeMember({ actor: ownerActor() }, task.projectId, task.reviewerMemberId!);
       assert.equal((await repos.tasks.get(task.projectId, task.id))?.reviewerMemberId, null);
       assert.equal((await repos.tasks.getRound(task.projectId, task.id, round.id))?.reviewerMemberId, task.reviewerMemberId);
       assert.deepEqual((await repos.tasks.listReports(task.projectId, task.id))[0]?.author, author);
@@ -273,9 +275,12 @@ for (const engine of ["sqlite", "postgres"] as const) {
       assert.equal(await repos.tasks.getRound(task.projectId, task.id, round.id), null);
       await repos.tasks.appendHistory({ id: randomUUID(), taskId: task.id, projectId: task.projectId, action: "task.created", actor: author, taskRevision: 1, detail: {}, createdAt: at });
       await repos.tasks.enqueueWorkEvent(eventFor(task));
-      await repos.members.delete(task.assigneeMemberId!);
+      await createOrgMutationService({ repos }).removeMember({ actor: ownerActor() }, task.projectId, task.assigneeMemberId!);
       assert.equal((await repos.tasks.get(task.projectId, task.id))?.assigneeMemberId, null);
-      assert.equal((await repos.tasks.listHistory(task.projectId, task.id)).length, 1);
+      const history = await repos.tasks.listHistory(task.projectId, task.id);
+      assert.equal(history.length, 2);
+      assert.ok(history.some(h => h.action === 'task.created'));
+      assert.ok(history.some(h => h.action === 'member_removed' && h.taskRevision === 2));
       assert.deepEqual(await repos.tasks.listUnackedWorkEvents(task.projectId, task.assigneeMemberId!), []);
     });
   });

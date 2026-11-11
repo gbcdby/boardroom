@@ -6,12 +6,23 @@ import { isDeepStrictEqual } from "node:util";
 export interface TasksRepository {
   getSettings(projectId: string): Promise<TaskSettings>;
   setSettings(projectId: string, expectedRevision: number, reviewerMemberId: string | null): Promise<TaskSettings>;
+  /** server-only 生命周期补偿；可还原 disabled Agent 引用，仍不可还原 removed/跨项目身份。 */
+  setSettingsLifecycleCas(projectId: string, expectedRevision: number, reviewerMemberId: string | null): Promise<TaskSettings>;
   create(task: Task): Promise<Task>;
   get(projectId: string, taskId: string): Promise<Task | null>;
   list(projectId: string, filter?: { state?: TaskState; assigneeMemberId?: string }): Promise<Task[]>;
   updateCas(projectId: string, taskId: string, expectedRevision: number,
     patch: Partial<Pick<Task, 'title'|'body'|'labels'|'state'|'assigneeMemberId'|'reviewerMemberId'|'repoPath'|'fixedPoint'|'currentReviewRoundId'|'blockedReason'>>,
     at: string): Promise<Task>; // UPDATE ... WHERE revision=?；成功恰好 +1，零行 conflict
+  /** server-only 历史投影补偿；非 active 引用只允许 blocked/done，revision 从当前值递增。 */
+  updateLifecycleCas(projectId: string, taskId: string, expectedRevision: number,
+    patch: Partial<Pick<Task, 'title'|'body'|'labels'|'state'|'assigneeMemberId'|'reviewerMemberId'|'repoPath'|'fixedPoint'|'currentReviewRoundId'|'blockedReason'>>,
+    at: string): Promise<Task>;
+  /** 有界补偿专用：不读任务正文，只更新已捕获的生命周期投影；调用方定向读回。 */
+  updateLifecycleProjectionCas(projectId: string, taskId: string, expectedRevision: number,
+    projection: Pick<Task, 'state'|'assigneeMemberId'|'reviewerMemberId'|'currentReviewRoundId'|'blockedReason'>, at: string): Promise<void>;
+  /** 只失效当前尚可执行的轮次，绝不读取 candidate/spec/report 正文或恢复终态。 */
+  supersedeRoundLifecycleCas(projectId: string, roundId: string, expectedRevision: number, at: string): Promise<void>;
   addComment(comment: TaskComment): Promise<TaskComment>;
   listComments(projectId: string, taskId: string): Promise<TaskComment[]>;
   appendHistory(history: TaskHistory): Promise<void>;
@@ -117,25 +128,61 @@ export function createTasksRepository(ctx: RepoCtx): TasksRepository {
     throw new ArchivedError("项目已归档，不能修改任务；请先恢复项目。");
   }
 
-  async function requireMember(projectId: string, memberId: string | null, reviewer = false, active = true): Promise<void> {
-    if (memberId === null) return;
-    const member = await ctx.one<{ project_id: string; kind: string; status: string }>("SELECT project_id, kind, status FROM members WHERE id = ?", [memberId]);
-    if (!member || member.project_id !== projectId) throw new InvalidReferenceError("成员不存在或不属于任务项目。");
+  async function requireMember(projectId: string, memberId: string | null, reviewer = false, active = true): Promise<{ status: string } | null> {
+    if (memberId === null) return null;
+    const lifecycle = Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 13"));
+    const member = await ctx.one<{ project_id: string; kind: string; status: string; removed_at?: string | null }>(`SELECT project_id, kind, status${lifecycle ? ", removed_at" : ""} FROM members WHERE id = ?`, [memberId]);
+    if (!member || member.project_id !== projectId || member.removed_at != null) throw new InvalidReferenceError("成员不存在、已移除或不属于任务项目。");
     if ((active && member.status !== "active") || (reviewer && member.kind !== "agent")) throw new InvalidReferenceError("任务成员必须有效，评审人必须为在岗 Agent。");
+    return member;
   }
 
-  async function requireTask(projectId: string, taskId: string): Promise<Task> {
-    const task = await repo.get(projectId, taskId);
+  async function requireTask(projectId: string, taskId: string): Promise<void> {
+    const task = await ctx.one("SELECT id FROM tasks WHERE project_id = ? AND id = ?", [projectId, taskId]);
     if (!task) throw new NotFoundError("任务不存在或不属于当前项目。");
-    return task;
   }
 
-  async function checkTaskReferences(task: Task, activeAssignee = true, activeReviewer = true): Promise<void> {
-    await requireMember(task.projectId, task.assigneeMemberId, false, activeAssignee);
-    await requireMember(task.projectId, task.reviewerMemberId, true, activeReviewer);
+  async function checkTaskReferences(task: Pick<Task, 'projectId'|'id'|'assigneeMemberId'|'reviewerMemberId'|'currentReviewRoundId'>, activeAssignee = true, activeReviewer = true): Promise<boolean> {
+    const assignee = await requireMember(task.projectId, task.assigneeMemberId, false, activeAssignee);
+    const reviewer = await requireMember(task.projectId, task.reviewerMemberId, true, activeReviewer);
     if (task.currentReviewRoundId !== null && !await ctx.one("SELECT id FROM task_review_rounds WHERE project_id = ? AND task_id = ? AND id = ?", [task.projectId, task.id, task.currentReviewRoundId])) {
       throw new InvalidReferenceError("当前评审轮次必须存在且属于同一任务与项目。");
     }
+    return [assignee, reviewer].some(member => member !== null && member.status !== "active");
+  }
+
+  async function setSettingsCas(projectId: string, expectedRevision: number, reviewerMemberId: string | null, lifecycle = false): Promise<TaskSettings> {
+    revision(expectedRevision, 0);
+    return ctx.withTransaction(async () => {
+      await requireActive(projectId); await requireMember(projectId, reviewerMemberId, true, !lifecycle);
+      if ((await repo.getSettings(projectId)).revision !== expectedRevision) throw new ConflictError("任务设置已更新，请重新读取后再试。");
+      const changed = expectedRevision === 0
+        ? await ctx.exec("INSERT INTO project_task_settings (project_id, default_reviewer_member_id, revision) VALUES (?, ?, 1) ON CONFLICT (project_id) DO NOTHING", [projectId, reviewerMemberId])
+        : await ctx.exec("UPDATE project_task_settings SET default_reviewer_member_id = ?, revision = revision + 1 WHERE project_id = ? AND revision = ?", [reviewerMemberId, projectId, expectedRevision]);
+      if (!changed) throw new ConflictError("任务设置已更新，请重新读取后再试。");
+      return repo.getSettings(projectId);
+    });
+  }
+  async function updateTaskCas(projectId: string, taskId: string, expectedRevision: number, patch: Parameters<TasksRepository["updateCas"]>[3], at: string, lifecycle = false): Promise<Task> {
+    revision(expectedRevision);
+    return ctx.withTransaction(async () => {
+      await requireActive(projectId);
+      const task = await repo.get(projectId, taskId);
+      if (!task || task.revision !== expectedRevision) throw new ConflictError("任务已更新或不存在，请重新读取后再试。");
+      const next = { ...task, ...patch };
+      const inactive = await checkTaskReferences(next, !lifecycle && patch.assigneeMemberId !== undefined, !lifecycle && patch.reviewerMemberId !== undefined);
+      if (lifecycle && inactive && !["blocked", "done"].includes(next.state)) throw new InvalidReferenceError("失活成员的历史任务只能保持 blocked；已完成任务不重新执行。");
+      const columns = { title: "title", body: "body", labels: "labels", state: "state", assigneeMemberId: "assignee_member_id",
+        reviewerMemberId: "reviewer_member_id", repoPath: "repo_path", fixedPoint: "fixed_point", currentReviewRoundId: "current_review_round_id", blockedReason: "blocked_reason" } as const;
+      const changes: string[] = []; const values: unknown[] = [];
+      for (const key of Object.keys(columns) as Array<keyof typeof columns>) {
+        if (patch[key] === undefined) continue;
+        changes.push(`${columns[key]} = ?`); values.push(key === "labels" ? json(patch.labels) : patch[key]);
+      }
+      changes.push("revision = revision + 1", "updated_at = ?"); values.push(at, projectId, taskId, expectedRevision);
+      if (!await ctx.exec(`UPDATE tasks SET ${changes.join(", ")} WHERE project_id = ? AND id = ? AND revision = ?`, values)) throw new ConflictError("任务已更新，请重新读取后再试。");
+      return (await repo.get(projectId, taskId))!;
+    });
   }
 
   /** v11 的事件均无群绑定；v12 缺省上下文只允许项目级事件。读取和幂等返回共用此边界。 */
@@ -151,24 +198,13 @@ export function createTasksRepository(ctx: RepoCtx): TasksRepository {
       if (!await ctx.one("SELECT id FROM projects WHERE id = ?", [projectId])) throw new NotFoundError("项目不存在。");
       const row = await ctx.one<{ default_reviewer_member_id: string | null; revision: number }>("SELECT default_reviewer_member_id, revision FROM project_task_settings WHERE project_id = ?", [projectId]);
       const reviewerId = row?.default_reviewer_member_id ?? null;
-      const member = reviewerId === null ? undefined : await ctx.one<{ project_id: string; kind: string; status: string }>("SELECT project_id, kind, status FROM members WHERE id = ?", [reviewerId]);
-      const valid = member?.project_id === projectId && member.kind === "agent" && member.status === "active";
+      const member = reviewerId === null ? undefined : await ctx.one<{ project_id: string; kind: string; status: string; removed_at?: string | null }>("SELECT * FROM members WHERE id = ?", [reviewerId]);
+      const valid = member?.project_id === projectId && member.kind === "agent" && member.status === "active" && member.removed_at == null;
       return { projectId, defaultReviewerMemberId: reviewerId, revision: row?.revision ?? 0, reviewerValid: valid,
         invalidReason: valid ? null : reviewerId === null ? "未配置默认评审人。" : "默认评审人已失效，请重新配置在岗 Agent。" };
     },
-    async setSettings(projectId, expectedRevision, reviewerMemberId) {
-      revision(expectedRevision, 0);
-      return ctx.withTransaction(async () => {
-        await requireActive(projectId);
-        await requireMember(projectId, reviewerMemberId, true);
-        if ((await repo.getSettings(projectId)).revision !== expectedRevision) throw new ConflictError("任务设置已更新，请重新读取后再试。");
-        const changed = expectedRevision === 0
-          ? await ctx.exec("INSERT INTO project_task_settings (project_id, default_reviewer_member_id, revision) VALUES (?, ?, 1) ON CONFLICT (project_id) DO NOTHING", [projectId, reviewerMemberId])
-          : await ctx.exec("UPDATE project_task_settings SET default_reviewer_member_id = ?, revision = revision + 1 WHERE project_id = ? AND revision = ?", [reviewerMemberId, projectId, expectedRevision]);
-        if (!changed) throw new ConflictError("任务设置已更新，请重新读取后再试。");
-        return repo.getSettings(projectId);
-      });
-    },
+    setSettings: (projectId, expectedRevision, reviewerMemberId) => setSettingsCas(projectId, expectedRevision, reviewerMemberId),
+    setSettingsLifecycleCas: (projectId, expectedRevision, reviewerMemberId) => setSettingsCas(projectId, expectedRevision, reviewerMemberId, true),
     async create(task) {
       return ctx.withTransaction(async () => {
         await requireActive(task.projectId);
@@ -193,29 +229,27 @@ export function createTasksRepository(ctx: RepoCtx): TasksRepository {
       if (filter.assigneeMemberId !== undefined) { where.push("assignee_member_id = ?"); params.push(filter.assigneeMemberId); }
       return (await ctx.query<TaskRow>(`SELECT * FROM tasks WHERE ${where.join(" AND ")} ORDER BY created_at, id`, params)).map(toTask);
     },
-    async updateCas(projectId, taskId, expectedRevision, patch, at) {
+    updateCas: (projectId, taskId, expectedRevision, patch, at) => updateTaskCas(projectId, taskId, expectedRevision, patch, at),
+    updateLifecycleCas: (projectId, taskId, expectedRevision, patch, at) => updateTaskCas(projectId, taskId, expectedRevision, patch, at, true),
+    async updateLifecycleProjectionCas(projectId, taskId, expectedRevision, projection, at) {
       revision(expectedRevision);
       return ctx.withTransaction(async () => {
         await requireActive(projectId);
-        const task = await repo.get(projectId, taskId);
-        if (!task || task.revision !== expectedRevision) throw new ConflictError("任务已更新或不存在，请重新读取后再试。");
-        const next = { ...task, ...patch };
-        await checkTaskReferences(next, patch.assigneeMemberId !== undefined, patch.reviewerMemberId !== undefined);
-        const columns = { title: "title", body: "body", labels: "labels", state: "state", assigneeMemberId: "assignee_member_id",
-          reviewerMemberId: "reviewer_member_id", repoPath: "repo_path", fixedPoint: "fixed_point", currentReviewRoundId: "current_review_round_id", blockedReason: "blocked_reason" } as const;
-        const changes: string[] = [];
-        const values: unknown[] = [];
-        for (const key of Object.keys(columns) as Array<keyof typeof columns>) {
-          if (patch[key] === undefined) continue;
-          changes.push(`${columns[key]} = ?`);
-          values.push(key === "labels" ? json(patch.labels) : patch[key]);
-        }
-        changes.push("revision = revision + 1", "updated_at = ?");
-        values.push(at, projectId, taskId, expectedRevision);
-        if (!await ctx.exec(`UPDATE tasks SET ${changes.join(", ")} WHERE project_id = ? AND id = ? AND revision = ?`, values)) {
-          throw new ConflictError("任务已更新，请重新读取后再试。");
-        }
-        return (await repo.get(projectId, taskId))!;
+        const inactive = await checkTaskReferences({ projectId, id: taskId, ...projection }, false, false);
+        if (inactive && !['blocked', 'done'].includes(projection.state)) throw new InvalidReferenceError("失活成员的历史任务必须保持 blocked，已完成任务不重启。");
+        if (projection.currentReviewRoundId !== null) throw new InvalidArgumentError("生命周期补偿不得恢复旧评审轮次。");
+        if (!await ctx.exec(`UPDATE tasks SET state = ?, assignee_member_id = ?, reviewer_member_id = ?, current_review_round_id = NULL,
+          blocked_reason = ?, revision = revision + 1, updated_at = ? WHERE project_id = ? AND id = ? AND revision = ?`,
+          [projection.state, projection.assigneeMemberId, projection.reviewerMemberId, projection.blockedReason, at, projectId, taskId, expectedRevision])) throw new ConflictError("任务已更新，生命周期补偿拒绝覆盖。");
+      });
+    },
+    async supersedeRoundLifecycleCas(projectId, roundId, expectedRevision, at) {
+      revision(expectedRevision);
+      return ctx.withTransaction(async () => {
+        await requireActive(projectId);
+        if (!await ctx.exec(`UPDATE task_review_rounds SET state = 'superseded', revision = revision + 1, updated_at = ?
+          WHERE project_id = ? AND id = ? AND revision = ? AND state IN ('ready', 'running', 'reported')`,
+          [at, projectId, roundId, expectedRevision])) throw new ConflictError("评审轮次已变化，不能重写历史终态。");
       });
     },
     async addComment(comment) {

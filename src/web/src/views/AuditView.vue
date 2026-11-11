@@ -16,6 +16,7 @@ const context = useCurrentProject();
 const { projects, currentProjectId: activeProjectId, currentProject: activeProject, readonly: projectReadonly } = context;
 let disposed = false;
 let request = 0;
+let revokeRequest = 0;
 const entries = ref<AuditEntryDto[]>([]);
 
 const loading = ref(true);
@@ -84,7 +85,31 @@ function actionLabel(action: string): string {
 }
 
 function canRevoke(entry: AuditEntryDto): boolean {
-  return !projectReadonly.value && !entry.reversedAt && REVERSIBLE.has(entry.action);
+  return revokeReason(entry) === null;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function incompleteRelations(entry: AuditEntryDto): boolean {
+  const rootAction = record(record(entry.detail)?.reversal)?.rootAction ?? entry.action;
+  const schema = rootAction === "member.add" || rootAction === "member.remove" ? "member-relations/v2"
+    : rootAction === "org.node_delete" ? "org-graph/v2" : null;
+  return schema !== null && (record(entry.before)?.schema !== schema || record(entry.after)?.schema !== schema);
+}
+
+function restartNotice(detail: unknown): string {
+  const required = record(detail)?.restartRequired;
+  if (!Array.isArray(required)) return "";
+  const labels: Record<string, string> = {
+    "mcp-session": "让成员重新连接",
+    review: "重新发起评审",
+    "runtime-binding": "重新配置托管绑定并显式启动",
+    "memory-summary": "重新发起记忆总结",
+  };
+  const steps = [...new Set(required)].flatMap(key => typeof key === "string" && labels[key] ? [labels[key]] : []);
+  return steps.length ? ` 请${steps.join("、")}。` : "";
 }
 
 function revokeReason(entry: AuditEntryDto): string | null {
@@ -93,6 +118,7 @@ function revokeReason(entry: AuditEntryDto): string | null {
   if (PERMANENT.has(entry.action)) return "永久删除，不可撤销";
   if (STATE_REVERSIBLE.has(entry.action)) return "归档/恢复属状态可逆，请用正向操作复原";
   if (!REVERSIBLE.has(entry.action)) return "该操作不可撤销";
+  if (entry.reversible === false || incompleteRelations(entry)) return "历史快照不足，无法安全撤销";
   return null;
 }
 
@@ -108,21 +134,23 @@ async function loadProjects(): Promise<void> {
 
 async function loadAudit(preserveFeedback = false): Promise<void> {
   const projectId = activeProjectId.value;
+  const version = ++request;
+  const generation = context.generation.value;
+  const current = () => !disposed && version === request && generation === context.generation.value && activeProjectId.value === projectId;
   if (projectId === null) {
     entries.value = [];
     loading.value = false;
     return;
   }
-  const version = ++request;
   loading.value = true;
   if (!preserveFeedback) clearMessages();
   try {
     const res = await api.listAudit(projectId);
-    if (!disposed && version === request && activeProjectId.value === projectId) entries.value = res.entries;
+    if (current()) entries.value = res.entries;
   } catch (e) {
-    error.value = e instanceof ApiError ? e.message : String(e);
+    if (current()) error.value = e instanceof ApiError ? e.message : String(e);
   } finally {
-    loading.value = false;
+    if (current()) loading.value = false;
   }
 }
 
@@ -130,22 +158,35 @@ async function revoke(entry: AuditEntryDto): Promise<void> {
   const projectId = activeProjectId.value;
   if (busy.value || projectId === null || !canRevoke(entry)) return;
   const generation = context.generation.value;
+  const version = ++revokeRequest;
+  const current = () => !disposed && version === revokeRequest && generation === context.generation.value && activeProjectId.value === projectId;
   revokingId.value = entry.id;
   clearMessages();
   try {
-    await api.revokeAudit(projectId, entry.id);
-    if (disposed || activeProjectId.value !== projectId || generation !== context.generation.value) return;
-    notice.value = `已撤销「${actionLabel(entry.action)}」事件。`;
+    const result = await api.revokeAudit(projectId, entry.id);
+    if (!current()) return;
+    notice.value = `已撤销「${actionLabel(entry.action)}」事件。${restartNotice(result.entry.detail)}`;
     await loadAudit(true);
   } catch (e) {
-    error.value =
-      e instanceof ApiError ? `${e.message}${e.code ? `（${e.code}）` : ""}` : String(e);
+    if (!current()) return;
+    const messages: Record<string, string> = {
+      compensation_conflict: "当前状态已经变化，无法撤销这次操作。请刷新记录并核对相关成员或岗位。",
+      legacy_incomplete_snapshot: "这条历史记录缺少完整快照，无法安全撤销。记录仍可查看。",
+      audit_snapshot_too_large: "这条记录的快照不完整，无法安全撤销。",
+      chain_broken: "撤销记录之间的关联不完整，无法继续恢复。请核对历史记录。",
+      audit_capture_budget_exceeded: "本次恢复涉及的内容超出处理范围，未提交任何变更。请缩小操作范围后重试。",
+    };
+    error.value = e instanceof ApiError ? messages[e.code] ?? e.message : String(e);
   } finally {
-    revokingId.value = null;
+    if (current()) revokingId.value = null;
   }
 }
 
 function selectProject(): void {
+  request++;
+  revokeRequest++;
+  revokingId.value = null;
+  clearMessages();
   entries.value = [];
   void loadAudit();
 }
@@ -155,8 +196,8 @@ function formatTime(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
 }
 
-watch(activeProjectId, () => { request++; selectProject(); }, { immediate: true });
-onBeforeUnmount(() => { disposed = true; request++; });
+watch(activeProjectId, selectProject, { immediate: true });
+onBeforeUnmount(() => { disposed = true; request++; revokeRequest++; });
 </script>
 
 <template>

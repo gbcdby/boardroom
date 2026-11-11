@@ -74,9 +74,9 @@ async function fixture(driver?: DbDriver) {
     let joined = false;
     const gateway = await createRuntimeGateway({ db, logger, onJoined: async () => { joined = true; }, authority: {
       identity: { displayName: v.runtime.name, hostType: v.runtime.backend, projectId: v.binding.projectId, groupId: v.binding.groupId, memberId: v.binding.memberId },
-      run: (operation, fn) => {
+      run: (operation, fn, discover) => {
         if ((operation === "write" || operation === "consume") && !joined) throw new McpToolError("CONFLICT", "托管 MCP 通道尚未就绪");
-        return runtime.withFence(fence, fn, { requireRunningIntent: operation === "consume" });
+        return runtime.withFence(fence, fn, { requireRunningIntent: operation === "consume" }, discover);
       },
       beforeWait: async () => (await runtime.checkFence(fence)).binding.desiredState === "running",
       onDelivery: async () => { await runtime.patchRunner(fence, { phase: "working" }); },
@@ -125,7 +125,8 @@ databaseTest("任务通知在托管 join 就绪后投递，旧 generation 无法
     const events = joined["workEvents"] as { id: string; taskId: string }[];
     assert.equal(events[0]?.taskId, task.id);
     assert.equal((await f.runtime.checkFence(managed.fence)).runner.phase, "working");
-    assert.equal((await managed.call("transition_task", { taskId: task.id, expectedRevision: 1, state: "in-progress" })).ok, true);
+    const progressed = await managed.call("transition_task", { taskId: task.id, expectedRevision: 1, state: "in-progress" });
+    assert.equal(progressed.ok, true, JSON.stringify(progressed));
     await f.runtime.markExit(managed.fence, { exitCode: 0 });
     for (const session of await f.repos.mcpSessions.listByProject(f.project.id)) await f.repos.mcpSessions.disconnect(session.id, new Date().toISOString());
     const next = await f.runtime.claim(f.view.binding.id, "replacement-tasks");
@@ -226,24 +227,43 @@ databaseTest("R2 托管MCP在组织岗位降级及退群后动态撤销历史与
 
 databaseTest("R2 旧generation挂起wait不会出队、ACK或覆盖新generation状态", async (driver) => {
   const f = await fixture(driver);
+  const withFence = f.runtime.withFence.bind(f.runtime);
+  let release!: () => void;
+  const resume = new Promise<void>(resolve => { release = resolve; });
   try {
     const old = await f.managed(); await old.join();
+    let captured!: () => void;
+    const atInitialConsume = new Promise<void>(resolve => { captured = resolve; });
+    let armed = true;
+    f.runtime.withFence = async (fence, fn, options = {}, discover) => {
+      if (armed && options.requireRunningIntent && old.gateway.pendingWaitCount === 1) {
+        armed = false;
+        assert.equal(f.db.currentTransactionContext(), undefined, "在初次consume取得锁前交错，不在锁内等待替换者");
+        captured(); await resume;
+      }
+      return await withFence(fence, fn, options, discover);
+    };
     const wait = old.call("wait_for_messages", { timeoutMs: 5000 });
-    await until(() => old.gateway.pendingWaitCount === 1, "旧wait应已挂起");
+    await Promise.race([atInitialConsume, wait.then(result => {
+      throw new Error(`未到达初次consume即结束等待：${JSON.stringify(result)}`);
+    })]);
+    assert.equal(old.gateway.pendingWaitCount, 1, "真实MCP wait已登记，但初次consume尚未开始");
     // 模拟已确认退出后仍有迟到的旧传输请求；只替换所有权，不伪造新消息处理。
     await f.runtime.markExit(old.fence, { exitCode: 0 });
     for (const session of await f.repos.mcpSessions.listByProject(f.project.id)) await f.repos.mcpSessions.disconnect(session.id, new Date().toISOString());
     const next = await f.runtime.claim(f.view.binding.id, "replacement");
     await f.repos.statuses.set(f.project.id, f.view.binding.memberId, "online");
-    const message = await f.humanMessage("只给新代次"); await old.gateway.wake();
+    const message = await f.humanMessage("只给新代次");
+    release(); await old.gateway.wake();
     const result = await wait;
+    assert.equal(result.ok, true, JSON.stringify(result));
     assert.equal(result.status, "cancelled"); assert.deepEqual(result.messages, []);
     assert.equal((await f.repos.deliveries.get(message.id, f.view.binding.memberId))?.status, "pending");
     assert.equal((await f.repos.statuses.get(f.project.id, f.view.binding.memberId))?.state, "online");
     assert.equal((await old.call("acknowledge_message", { messageId: message.id })).error?.code, "CONFLICT");
     assert.equal((await old.call("send_message", { text: "迟到旧回复" })).error?.code, "CONFLICT");
     assert.equal((await f.runtime.checkFence(next)).runner.generation, next.generation);
-  } finally { await f.close(); }
+  } finally { release(); f.runtime.withFence = withFence; await f.close(); }
 });
 
 databaseTest("R2 stop允许已投递轮次回复/ACK，但下一批消息保留pending", async (driver) => {

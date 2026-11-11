@@ -9,6 +9,7 @@ import { createLogger } from "../src/server/logger.ts";
 import { startServer, type RunningServer } from "../src/server/server.ts";
 import type { Actor } from "../src/server/authz/authorize.ts";
 import { ownerActor } from "../src/server/authz/actors.ts";
+import { createRepositories } from "../src/server/db/repositories.ts";
 
 /**
  * T1（#48）项目与群组生命周期 + 跨项目数据隔离。
@@ -433,8 +434,9 @@ test("群组永久删除需二次确认，且只清群聊与参与者关系：�
 // ---------------------------------------------------------------------------
 
 test("顶层 manager 可归档项目与群组，但不能发起永久删除（403），人才能发起（409 待确认）", async () => {
+  let managerId = "";
   const managerActor = (projectId: string): Actor => ({
-    actorId: "member-manager",
+    actorId: managerId,
     kind: "agent",
     role: "top_manager",
     projectId,
@@ -454,6 +456,9 @@ test("顶层 manager 可归档项目与群组，但不能发起永久删除（40
     async (server) => {
       const asManager = { "x-as": "manager" };
       const project = await createProject(server, "谁能删");
+      const repos = createRepositories(server.database);
+      const managerAgent = await repos.agents.create({ displayName: "实际主管", hostType: "codex" });
+      managerId = (await repos.members.create({ projectId: project.id, kind: "agent", agentId: managerAgent.id, displayName: "实际主管", role: "manager" })).id;
       const alice = await addHuman(server, project.id, "Alice");
       const group = await createGroup(server, project.id, "群组", [alice.id]);
 

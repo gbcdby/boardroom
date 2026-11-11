@@ -10,5 +10,12 @@
   "antiLoop": {
     "maxConsecutiveAutoReplies": 6,
     "maxWakesPerMinutePerMember": 20
+  },
+  "memory": {
+    "messageThreshold": 50,
+    "maxDocumentBytes": 32768,
+    "maxInjectedBytes": 8192,
+    "summaryInputBytes": 65536,
+    "summaryAttemptTimeoutMs": 900000
   }
 }

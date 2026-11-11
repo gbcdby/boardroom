@@ -19,6 +19,8 @@ export interface MemoryRepository {
   getRequest(requestId: string): Promise<MemorySummaryRequest | null>;
   listRequests(projectId: string, agentId: string, state?: SummaryState, query?: { startedBefore?: string; limit?: number; contextGroupId?: string }): Promise<MemorySummaryRequest[]>;
   updateRequestCas(requestId: string, expectedRevision: number, patch: Partial<MemorySummaryRequest>): Promise<MemorySummaryRequest>;
+  /** server-only 移除补偿原语；仅读固定身份/版本，允许目标刚removed，不读取packet/evidence JSON。 */
+  cancelForMemberLifecycleCas(projectId: string, memberId: string, requestId: string, expectedRevision: number, at: string): Promise<void>;
   // A/B 固定以下投递/扫描方法的参数：只接受可信的已落库投递/事件，不接受公网请求自报。
   observeDeliveredMessage(input: { projectId: string; agentId: string; groupId: string; messageId: string; threshold: number; at: string }): Promise<{ added: boolean; thresholdSequence: number | null; messageIds: string[] }>;
   getScanCheckpoint(scope: ScanScope): Promise<ScanCheckpoint>; // 无行虚拟revision0；after/through均null
@@ -120,8 +122,8 @@ export function createMemoryRepository(ctx: RepoCtx): MemoryRepository {
     if (row.archived_at !== null) throw new ArchivedError("群组已归档，不能继续观察输入。");
   }
   async function agentMember(projectId: string, agentId: string): Promise<{ id: string }> {
-    const member = await ctx.one<{ id: string }>("SELECT id FROM members WHERE project_id = ? AND agent_id = ? AND kind = 'agent' AND status = 'active'", [projectId, agentId]);
-    if (!member) throw new InvalidReferenceError("总结目标必须是本项目 active Agent 成员。");
+    const member = await ctx.one<{ id: string; removed_at?: string | null }>("SELECT * FROM members WHERE project_id = ? AND agent_id = ? AND kind = 'agent' AND status = 'active'", [projectId, agentId]);
+    if (!member || member.removed_at != null) throw new InvalidReferenceError("总结目标必须是本项目未移除的 active Agent 成员。");
     return member;
   }
   async function keyWrite(key: MemoryKey): Promise<void> {
@@ -254,6 +256,19 @@ export function createMemoryRepository(ctx: RepoCtx): MemoryRepository {
           [next.revision, next.state, next.attemptId, next.beginMutationId, next.resultVersion, next.resultSha256,
             next.error === null ? null : json(next.error), next.evidence === null ? null : json(next.evidence), next.startedAt, next.finishedAt, requestId, expectedRevision])) throw new ConflictError("memory_request_conflict");
         return (await repo.getRequest(requestId))!;
+      });
+    },
+    async cancelForMemberLifecycleCas(projectId, memberId, requestId, expectedRevision, at) {
+      integer(expectedRevision, 1); nonempty(memberId); nonempty(requestId);
+      await ctx.withTransaction(async () => {
+        await active(projectId);
+        const current = await ctx.one<{ project_id: string; recipient_member_id: string; state: SummaryState; revision: number }>(
+          "SELECT project_id, recipient_member_id, state, revision FROM memory_summary_requests WHERE id = ?", [requestId]);
+        if (!current || current.project_id !== projectId || current.recipient_member_id !== memberId
+          || current.revision !== expectedRevision || !["pending", "running"].includes(current.state)) throw new ConflictError("memory_request_conflict");
+        if (!await ctx.exec(`UPDATE memory_summary_requests SET state = 'cancelled', revision = revision + 1, error = ?, finished_at = ?
+          WHERE id = ? AND project_id = ? AND recipient_member_id = ? AND revision = ? AND state IN ('pending', 'running')`,
+          [json({ code: "member_removed", message: "目标成员已移除，旧总结请求已取消。" }), at, requestId, projectId, memberId, expectedRevision])) throw new ConflictError("memory_request_conflict");
       });
     },
     async observeDeliveredMessage(input) {

@@ -1,28 +1,39 @@
-# 接入指南：把 Claude Code / Codex CLI / DSH 接入 Agent Studio（阶段 1）
+# 安装与 MCP 接入：Claude Code / Codex CLI / DSH
 
-状态：已实现（T8 #21，覆盖 CONFIG-03）；2026-11-03 真实双宿主补验通过；DSH 列为第三个正式支持宿主
-日期：2026-10-22（初版）；2026-11-03（补验 + DSH 入范围）
-适用：阶段 1（单项目、单群组、localhost、无认证、单用户）。
+状态：已确认（当前使用说明，运行验收按候选另记）
+日期：2026-10-22 初版；2026-11-11 更新任务、记忆、设置与生命周期
+适用：多项目、多群组；localhost、无认证、单用户。
 
-> 本文是面向使用者的**接入指南**：如何启动服务、如何用 MCP 配置把 Claude Code / Codex CLI / DSH 接入、
-> 已知限制（含**不承诺即时唤醒空闲宿主**、**不能打断在途工具**）、以及提示注入风险。
-> 工具契约细节见 `docs/mcp-tool-contract.md`；验收结论见 `docs/t8-acceptance-report.md`；宿主适配器扩展见决策票 #43。
+本文说明安装、存储、普通外部 MCP 接入及恢复方式。任务、记忆和设置已有独立入口；2026-11-11 的真实宿主评审、自总结与 macOS SQLite 回传及后续候选适用性见 [V1 验收索引](v1-acceptance.md)。[T8 报告](t8-acceptance-report.md)是 2026-11-03 的历史对象，不能单独代表后续候选。可选托管 CLI 使用另一套验收 profile，见 [README](../README.md#可选托管-agent-运行时)。
 
-## 1. 先决条件
+## 1. 先决条件与宿主支持范围
 
-- Node.js **>= 24**（`package.json` engines）。
-- macOS 为首要开发/验收环境（NFR-07）。
-- 已安装并在 PATH 中：Claude Code（实测 2.1.233）、Codex CLI（实测 0.166.0）、DSH（实测 0.2.1-rc.5）。
+- Node.js **>= 24** 和 npm，版本要求见 [package.json](../package.json)。干净检出使用锁文件安装。
+- macOS 为产品首要开发/验收环境（NFR-07）。Linux 上的通过结果只覆盖实际记录的 Linux 组合。
+- 安装你实际使用的外部 CLI 并完成其正常登录。连接 MCP、登录有效与模型可执行是不同检查。
+
+下表区分已保存的真实回传、历史能力与当前适配器声明，**不推广到其他 CLI 版本、数据库、传输或托管 profile**。
+
+| 宿主 / 实测版本 | 已有接入记录 | 当前连接/恢复边界 |
+| --- | --- | --- |
+| Claude Code 2.1.233 | 2026-11-11 macOS SQLite / Streamable HTTP：原生 join、活跃 wait、双向 @、重连及重启补投；指定 reviewer 提交真实两轴报告并裁决 | 适配器声明 stdio / Streamable HTTP、reconnect supported；本次真实回传只覆盖 HTTP。在途打断 unsupported、空闲唤醒 false。 |
+| Codex CLI 0.167.0 | 同轮同环境的外部消息链、两个独立并行评审上下文、目标本人三触发自总结；历史 0.166.0 记录另列 | 忙碌工具期间不打断，消息在下一 wait 投递；无 wait 不自动启动模型。原 reviewer 的 schema 已按内联类型修复，修复后真实 Codex reviewer 未重跑，不将 schema/协议回归写成原生复验。 |
+| DSH 0.2.1-rc.5 | 历史 `hostType=other` 的真实 join、活跃 wait；如今注册为 `dsh` | reconnect / interrupt unsupported、wakeIdle false。适配器没有独立验证的传输列表；下面 HTTP 配置来自已有实测，不推定 stdio 或重连可用。 |
+
+来源：[当前适配器](../src/server/mcp/adapters)、[2026-11-11 独立真实回传](https://github.com/gbcdby/boardroom/issues/112#issuecomment-6790053498)、[双宿主历史报告](t8-acceptance-report.md)、[随库 DSH 输出](../evidence/real-host-retest/README.md)。独立执行者使用的兼容/代理模型线路仅证明普通外部 MCP 路径；不满足或放行托管官方认证/固定出口的独立要求。DSH 是产品正式支持范围的一员，各具体能力仍受证据边界约束。
 
 ## 2. 启动服务
 
+从仓库检出到独立目录后，在仓库根运行：
+
 ```bash
-npm install
-npm start                 # 会先构建 WebUI，再启动服务（默认 127.0.0.1:4317）
-# 或开发模式：
-npm run dev:server        # 只起后端
-npm run dev:web           # 起前端（5173，代理到 4317）
+git clone https://github.com/gbcdby/boardroom.git
+cd boardroom
+npm ci
+npm start
 ```
+
+`npm start` 先构建 WebUI，再启动服务，默认绑定 `127.0.0.1:4317`。开发时在两个终端分别运行 `npm run dev:server` 与 `npm run dev:web`；Vite 使用 5173，并默认代理 `/api`、`/ws` 到后端 4317。后端换端口时应同步修改开发代理。
 
 启动后：
 
@@ -37,27 +48,56 @@ npm run dev:web           # 起前端（5173，代理到 4317）
 | --- | --- | --- |
 | 端口 | `AGENT_STUDIO_PORT` | 4317（仅绑 127.0.0.1） |
 | 数据目录 | `AGENT_STUDIO_DATA_DIR` | `data` |
+| 数据库驱动 | `AGENT_STUDIO_DB_DRIVER` | `sqlite`；可选 `postgres` |
+| PG 连接串 | `AGENT_STUDIO_PG_CONNECTION_STRING` | postgres 时必填；不在设置页输出 |
 | 心跳 interval / timeout | `AGENT_STUDIO_HEARTBEAT_INTERVAL_MS` / `..._TIMEOUT_MS` | 10000 / 30000（D4） |
 | 防环阈值 | `AGENT_STUDIO_MAX_CONSECUTIVE_AUTO_REPLIES` / `..._MAX_WAKES_PER_MINUTE_PER_MEMBER` | 6 / 20（D5） |
+| 记忆预算与阈值 | `AGENT_STUDIO_MEMORY_*` | [完整默认值与范围](memory.md#配置与验证) |
+
+`AGENT_STUDIO_CONFIG` 可指定配置文件；未指定则尝试 `<cwd>/config.json`，默认文件不存在时用默认值。`dataDir` 相对启动工作目录解析；stdio 与 HTTP 应使用明确的绝对路径。SQLite 首次启动创建 `agent-studio.db` 并迁移，重启继续使用相同数据目录。`/settings` 显示已解析配置与来源；文件修改不会热加载，正常停止并重启后才生效。
+
+PostgreSQL 需先准备可连接的专用数据库；以下为替换成自己配置的示例，不含真实凭据：
+
+```bash
+AGENT_STUDIO_DB_DRIVER=postgres \
+AGENT_STUDIO_PG_CONNECTION_STRING='postgresql://USER:PASSWORD@127.0.0.1:5432/boardroom' \
+npm start
+```
+
+### 数据迁移与恢复
+
+换 `dbDriver` 不会自动搬迁数据。复制前正常停止使用该数据的服务/stdio，备份源库，确保源库已由相同版本完成迁移，再使用**新的独立目标库/schema**。迁移默认清空目标业务表；不要把用户正在使用的库当目标。示例中的 `AGENT_STUDIO_PG_CONNECTION_STRING` 应由自己的启动环境提供，以下命令不会回显它：
+
+```bash
+npm run db:migrate -- --command migrate \
+  --src-driver sqlite --src-data-dir /absolute/path/to/source-data \
+  --dst-driver postgres --dst-pg-schema boardroom_copy --snapshot
+
+npm run db:migrate -- --command validate \
+  --src-driver sqlite --src-data-dir /absolute/path/to/source-data \
+  --dst-driver postgres --dst-pg-schema boardroom_copy
+```
+
+`validate` 校对源/目标，不代替产品启动与读写验证。`rollback` 的语义是丢弃指定目标业务数据，源库保持不变；决定回退时先停目标服务，确认源备份，再按 [CLI 参数](../scripts/migrate-data.ts)操作并恢复原存储配置。`--snapshot` 会为 SQLite 源主库及存在的 WAL/SHM 做文件副本；仍应先停止写入，并保留独立可恢复备份。最终 v12→v13 升级和两驱动复制证据在 [V1 索引](v1-acceptance.md)单列。
 
 ## 3. 人在 WebUI 里先建项目与群组
 
 MCP 入群需要**预先存在**项目与群组：
 
-1. 打开 `/projects`（「项目与群组」）；
-2. 创建项目；添加「人」成员；
-3. 创建群组（从项目成员里选择参与者，至少含你自己）；
+1. 打开 `/projects` 创建项目；顶部“当前项目”供聊天、组织、任务和记忆共用；
+2. 添加自己的「人」成员；
+3. 创建群组，从本项目成员选择参与者，至少含你的发言人成员；
 4. 指定一个 agent 成员为顶层 manager（可在 agent 入群后设置）。
 
-记下 **projectId** 与 **groupId**（后续 `join` 工具需要）。
+在项目管理区复制 **projectId**，在群聊「消息与提及说明」复制 **groupId**，供 `join` 使用。聊天规范链接为 `/projects/:projectId/chat/:groupId`；旧 `/chat?projectId=...&groupId=...` 仍可规范化。一个项目可以有多个群组，同一成员可以加入多群。每条 MCP 连接只绑定一个项目/群。
 
 ## 4. MCP 配置示例
 
-阶段 1 提供两种传输：**stdio（默认）** 与 **Streamable HTTP（可选）**。**不使用 SSE**（Codex 不支持）。
+提供 **stdio** 与 **Streamable HTTP**；与 WebUI 实时协作时使用同一个 HTTP 服务上的 `/mcp`。不提供旧式 HTTP + SSE 传输；Streamable HTTP 自身的响应流机制另当别论。
 
-> 关键：**stdio 的 `AGENT_STUDIO_DATA_DIR` 必须与 HTTP 服务使用同一数据目录**，否则 stdio 子进程与服务端看不到同一份项目/群组/成员。
+> stdio 独立打开数据库并执行迁移。SQLite 必须使用相同的绝对 `AGENT_STUDIO_DATA_DIR`；PG 必须使用相同驱动、连接串和 schema。共享数据库不共享进程内通知：跨进程新增消息会在下一次 wait 读积压，不能据此承诺即时结束另一进程已挂起的等待。
 
-### 4.1 Claude Code（stdio，实测 `✔ Connected`）
+### 4.1 Claude Code（stdio，历史连接检查）
 
 ```bash
 claude mcp add agent-studio -s local \
@@ -105,7 +145,7 @@ codex mcp add agent-studio --url http://127.0.0.1:4317/mcp
 codex mcp list           # 期望：agent-studio ... Status=enabled
 ```
 
-> 2026-11-03 复核：Codex CLI 0.166.0 配额已恢复，已用真实 Codex 走通 join / 等待中活唤醒 / agent↔agent 双向 @ / 重启后重连补积压（`drainedBacklog` 正常）。
+> 2026-11-11 的 Codex CLI 0.167.0 外部真实回传与此前 0.166.0 历史记录分别保留候选、环境和范围，见 [V1 验收索引](v1-acceptance.md)。`codex mcp list` 显示 enabled 仍不证明模型已经调用工具。
 
 ### 4.3 Streamable HTTP（可选，两端都支持）
 
@@ -119,8 +159,7 @@ claude mcp add --transport http agent-studio http://127.0.0.1:4317/mcp
 codex mcp add agent-studio --url http://127.0.0.1:4317/mcp
 ```
 
-HTTP 模式每次会话独立 `Mcp-Session-Id`；Codex 结束会 `DELETE`、Claude 不发（服务端按
-`MCP_SESSION_IDLE_TIMEOUT_MS` 默认 5 分钟回收悬挂会话）。**不要依赖 SSE**。
+HTTP 模式每次会话独立 `Mcp-Session-Id`。旧实测中 Codex 正常结束会发 `DELETE`、Claude 不发；服务端按 `MCP_SESSION_IDLE_TIMEOUT_MS` 默认 5 分钟回收悬挂会话。不能把进程退出立即等同于所有远端状态已清理；正常断开后重新建立会话并 join。旧式 SSE 不提供。
 
 ### 4.4 DeepSeek Harness（dsh，第三个正式支持宿主）
 
@@ -137,7 +176,7 @@ DSH 是第三个正式支持宿主（产品基线 §1/§5.1 已列入；宿主�
         failOnStartupError: true
 ```
 
-然后让 agent 调 `mcp__boardroom__join`，`hostType:"dsh"`（DSH 已是一等公民宿主，枚举与校验已随决策票 #43 / 票 #56 落地）。2026-11-03 实测 dsh 0.2.1-rc.5 可真实 join + 等待中活唤醒；真实实测证据见 `evidence/real-host-retest/`（`dsh-join.out`、`dsh-wait.out`），及其索引 §4.5。
+然后让 agent 调 `mcp__boardroom__join`，`hostType:"dsh"`（当前注册值）。`failOnStartupError: true` 使 MCP 启动连接/握手失败直接失败，不能悄悄以“已接入”继续。2026-11-03 的 dsh 0.2.1-rc.5 输出当时使用 `hostType=other`，实际覆盖 join + 活跃 wait；证据见 `evidence/real-host-retest/`（`dsh-join.out`、`dsh-wait.out`）及 §4.5，不含 DSH 重连证明。
 
 > 新增宿主接入不是「写完适配器就完成」，必须提供真实实测证据。完整 DoD 与证据索引见 §4.5。
 
@@ -190,8 +229,11 @@ MCP **没有服务端→客户端主动推送**。agent 能收到消息的唯一
 - `wait_for_messages` 返回后请对每条消息 `acknowledge_message`（至少一次投递 + 去重）；
   未 ack 的消息会被重复投递，客户端按稳定 `messageId` 去重。
 - 重连后**先拉积压再进入等待**（首次 `wait_for_messages` 会立即返回 `drainedBacklog` 的积压）。
+- 返回 `status:"work"` 时读取 `workEvents`；聊天与工作通知也可能一起返回。`acknowledge_work_event` 只确认收到通知，之后仍需显式领取/推进任务或由目标 Agent 执行总结。
+- 任务更新使用 `expectedRevision`，记忆保存使用 `expectedVersion` 与 `clientMutationId`。冲突先读当前值，不自动覆盖；读取材料、ACK、heartbeat 都不表示模型已经完成。
+- 被移除成员不能靠普通 join 自动恢复；有权管理者需先显式重新添加，再建立新会话。旧加入代际的请求/ACK/总结结果不能复活，见[生命周期与审计恢复](t3-member-lifecycle.md#当前-v13-行为与审计恢复)。
 
-## 6. 已知限制（必读，阶段 1 不作为能力承诺）
+## 6. 已知限制与故障恢复
 
 1. **不承诺即时唤醒空闲宿主**：只有 agent 正处在一个 `wait_for_messages` 工具调用里时，服务端才能结束等待并让它拿到消息。
    已结束当前轮、未等待的宿主无法被服务端唤醒。
@@ -199,10 +241,23 @@ MCP **没有服务端→客户端主动推送**。agent 能收到消息的唯一
    `attemptInterrupt` 结果可观察（`accepted/rejected/unsupported`，两个宿主实测 `unsupported`）。
 3. **无 wrapper、不要求自动入群**：agent 必须显式调用 `join` 入群；没有包装进程、没有自动拉群。
 4. **不承诺 exactly-once**：至少一次投递，重复消息由稳定 `messageId` 去重。
-5. **Codex 配额阻塞（历史，已解除）**：曾因 Codex CLI 0.163.0 配额耗尽（至 2026-10-27）无法发起工具轮次；2026-11-03 复核 0.166.0 已恢复，真实 join/等待/重连均实测通过。
-6. **单项目 / 单群组 / 多项目隔离**：数据按 project/group 作用域建模，但多项目隔离验收属阶段 2。
+5. **宿主登录、配额与运行目录必须可用**：历史版本的配额恢复不保证当前版本可运行。原生模型前初始化失败应保留错误并修复环境；不以登录成功或手工填入证据宣称模型成功。
+6. **项目/群组隔离按当前授权重查**：服务已有多项目/多群权限，读取、消息关联、记忆材料和旧会话都受边界限制。HTTP 本地人类管理入口不构成远程认证。
 7. **防环计数为进程内内存**：进程重启后连续/限流计数重置（T7 取舍）。
 8. **仅 localhost、无认证**：见 §7 安全边界。
+
+| 现象 | 如何核对与恢复 |
+| --- | --- |
+| 启动失败 / 端口占用 | 查看启动错误；确认 Node 版本、数据目录权限、PG 可达性或换 `AGENT_STUDIO_PORT`。`/api/health` 只是探针。 |
+| 页面空白或 `webui.built:false` | 使用会构建页面的 `npm start`，或先 `npm run build`；后端 watch 不负责构建。 |
+| MCP enabled 但没有成员 | 让该 CLI 实际调用 join，核对项目/群 ID 和当前成员状态；连接检查不是入群。 |
+| WebUI 发消息后 stdio 未立即收到 | 核对相同存储；跨进程在下一次 wait 读取积压。需结束当前等待的实时协作改用同服务 HTTP。 |
+| 断线 / wait 超时 | 超时是正常返回，继续等待；重连建立新会话并 join，按稳定 ID 去重。已移除成员先由管理者明确重新添加。 |
+| 任务/记忆保存 409 | 保留草稿，读取最新修订/版本并比较，再显式提交；不盲目重发旧内容覆盖。 |
+| 评审固定候选失败 | 查看保留的失败 round；修复 repo/fixed point、空 diff、未提交修改或限额后重新提交评审。 |
+| 记忆注入 unavailable / 总结 failed | 读取诊断状态，主消息流程仍可继续；重试须目标 active 且状态为 failed/conflicted/cancelled，新请求重新执行。 |
+| 撤销被拒 / capture 超预算 | 审计可能是旧不完整快照，或业务已再次修改；检查当前关系和失败原因。未完整捕获或发生 CAS 冲突时不会部分复原。 |
+| 配置文件改了页面仍是旧值 | 设置显示当前进程快照；正常停止并重启，再刷新核对实际端口/来源。 |
 
 ## 7. 安全边界与提示注入风险（NFR-05）
 
@@ -213,13 +268,40 @@ MCP **没有服务端→客户端主动推送**。agent 能收到消息的唯一
   这是协作必需的。
 - **提示注入风险（重要）**：agent 会读取**其他成员（含人和其他 agent）的消息正文**作为模型输入。
   - 这意味着：任何成员都可以在消息里写入「指令」，可能诱导其它 agent 执行非预期动作（典型 prompt injection）。
-  - 阶段 1 **不做**正文可信度校验、不做指令/数据隔离、不做权限矩阵。
+  - 组织、聊天、任务、记忆已有服务端权限守卫；这些守卫不能判断外部消息中的指令是否可信，也不能替宿主批准工具执行。
   - 建议：仅在你信任的本地环境使用；不要接入不可信的第三方 agent 或转发外部不可信内容；
     对 agent 的工具权限保持最小化。
 
 ## 8. 验收与可重复验证
 
-- 端到端验收脚本：`node scripts/e2e-phase1.mjs`（真实 HTTP/MCP 服务端 + MCP SDK 客户端，覆盖 AC-CORE-01..09、11）。
-- 自动化测试：`npm test`；类型检查：`npm run typecheck`。
-- 逐项验收结论：`docs/t8-acceptance-report.md`。
-- 真实双宿主补验（Claude Code + Codex CLI 真机，2026-11-03）：`evidence/real-host-retest/README.md`。
+基础检查与 SDK 协议链：
+
+```bash
+npm ci
+npm run typecheck
+npm run build
+npm test
+npm run e2e
+npm run e2e:tasks
+npm run e2e:memory
+```
+
+真实 PG 测试在专用数据库环境设置 `AGENT_STUDIO_PG_TEST_URL` 后运行 `npm test`；三个 SDK e2e 使用 `AGENT_STUDIO_DB_DRIVER=postgres` 与 `AGENT_STUDIO_PG_CONNECTION_STRING`。没有 PG 配置而跳过的用例不计作 PG 通过。协议脚本不会运行真实模型，任务/记忆报告中的 synthetic 标记必须保留。
+
+真实浏览器复验在支持启动 Chromium 的环境运行。与 CI 一致的 Playwright 版本为 1.62.0，先构建 WebUI，然后：
+
+```bash
+python3 -m venv .agent-output/web-check-venv
+.agent-output/web-check-venv/bin/python -m pip install playwright==1.62.0
+.agent-output/web-check-venv/bin/python -m playwright install chromium
+.agent-output/web-check-venv/bin/python scripts/e2e-webui.py
+.agent-output/web-check-venv/bin/python scripts/e2e-tasks-web.py
+.agent-output/web-check-venv/bin/python scripts/e2e-memory-web.py
+.agent-output/web-check-venv/bin/python scripts/e2e-settings-web.py
+```
+
+脚本保存实际报告与截图。它们检查页面交互和布局，不能替代真实模型；若浏览器在启动前受系统限制，记录 BLOCKED，不能把 SFC/DOM 测试或 HTTP HTML 结果改称浏览器通过。
+
+干净安装 smoke 需用独立数据目录，例如 `AGENT_STUDIO_DATA_DIR=/absolute/path/to/smoke-data AGENT_STUDIO_PORT=4318 npm start`。记录实际版本/端口，检查 health 与规范页面深链，经 MCP tools/list 后执行一次实际领域读写，正常停止，再以完全相同存储配置启动并读回。对 PG 独立执行；复制/回滚使用单独目标库，不触碰已有用户数据。
+
+所有 46 个 AC、时序/负载、v13 迁移和真实模型的证据归属见 [V1 验收索引](v1-acceptance.md)。本文给出可运行步骤，不把尚未运行的最终候选写成通过。
