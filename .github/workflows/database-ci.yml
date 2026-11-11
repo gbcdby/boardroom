@@ -257,6 +257,12 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: 核对浏览器容器的已检出候选
+        run: |
+          # 只信任本次 runner 检出的确切工作区，不放宽其他 Git 目录。
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
