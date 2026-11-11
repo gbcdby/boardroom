@@ -2,11 +2,14 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import { ApiError, api, type MemberDto, type OrgNodeDto } from "../api/client.ts";
-import { draftInput, emptyTaskDraft, taskStates, taskStateLabel, tasksApi, type Task, type TaskSettings } from "../api/tasks.ts";
+import { draftInput, emptyTaskDraft, NO_REVIEWER, taskFieldErrors, taskStates, taskStateLabel, tasksApi, type Task, type TaskSettings, type TaskFieldErrors } from "../api/tasks.ts";
 import TaskFields from "../components/TaskFields.vue";
+import CreationDialog from "../components/CreationDialog.vue";
 import { projectPath, useCurrentProject, useProjectDraft } from "../composables/useCurrentProject.ts";
+import { useToast } from "../composables/useToast.ts";
 
 const context = useCurrentProject();
+const toast = useToast();
 const { currentProjectId, readonly: projectReadonly } = context;
 const tasks = ref<Task[]>([]);
 const members = ref<MemberDto[]>([]);
@@ -15,6 +18,9 @@ const settings = ref<TaskSettings | null>(null);
 const defaultReviewer = ref("");
 const draft = ref(emptyTaskDraft());
 const createOpen = ref(false);
+const createError = ref<string | null>(null);
+const createUnknown = ref(false);
+const createFields = ref<TaskFieldErrors>({});
 const layout = ref<"board" | "list">("board");
 const filter = ref("");
 const loading = ref(false);
@@ -26,13 +32,17 @@ let request = 0;
 let disposed = false;
 const activeAgents = computed(() => members.value.filter((member) => member.kind === "agent" && member.status === "active"));
 const defaultReviewerName = computed(() => settings.value?.reviewerValid ? members.value.find((member) => member.id === settings.value?.defaultReviewerMemberId)?.displayName ?? null : null);
-const resolvedReviewer = computed(() => draft.value.reviewerMemberId || (settings.value?.reviewerValid ? settings.value.defaultReviewerMemberId : null));
-const canCreate = computed(() => !projectReadonly.value && !loading.value && !busy.value && draft.value.title.trim() !== "" && members.value.some((member) => member.id === draft.value.assigneeMemberId && member.status === "active") && activeAgents.value.some((member) => member.id === resolvedReviewer.value) && resolvedReviewer.value !== draft.value.assigneeMemberId);
+const resolvedReviewer = computed(() => draft.value.reviewerMemberId === NO_REVIEWER ? null : draft.value.reviewerMemberId || (settings.value?.reviewerValid && settings.value.defaultReviewerMemberId !== draft.value.assigneeMemberId ? settings.value.defaultReviewerMemberId : null));
+const canCreate = computed(() => !createUnknown.value && !projectReadonly.value && !loading.value && !busy.value && draft.value.title.trim() !== ""
+  && (!draft.value.assigneeMemberId || members.value.some((member) => member.id === draft.value.assigneeMemberId && member.status === "active"))
+  && (!resolvedReviewer.value || activeAgents.value.some((member) => member.id === resolvedReviewer.value))
+  && (!resolvedReviewer.value || resolvedReviewer.value !== draft.value.assigneeMemberId));
 const visibleTasks = computed(() => tasks.value.filter((task) => !filter.value || task.state === filter.value));
+const matchingCreatedTasks = computed(() => tasks.value.filter(task => task.title === draft.value.title.trim()).sort((left, right) => right.createdAt.localeCompare(left.createdAt)));
 const groups = computed(() => taskStates.filter((state) => !filter.value || state.value === filter.value).map((state) => ({ ...state, tasks: visibleTasks.value.filter((task) => task.state === state.value) })));
 const hasDraft = () => Object.values(draft.value).some(Boolean) || (settings.value !== null && defaultReviewer.value !== (settings.value.defaultReviewerMemberId ?? ""));
-useProjectDraft(hasDraft, () => { draft.value = emptyTaskDraft(); defaultReviewer.value = settings.value?.defaultReviewerMemberId ?? ""; createOpen.value = false; });
-function nameOf(id: string | null): string { return members.value.find((member) => member.id === id)?.displayName ?? (id ? "成员已不可用" : "待重新指派"); }
+useProjectDraft(hasDraft, () => { draft.value = emptyTaskDraft(); defaultReviewer.value = settings.value?.defaultReviewerMemberId ?? ""; createOpen.value = false; createError.value = null; createUnknown.value = false; createFields.value = {}; });
+function nameOf(id: string | null): string { return members.value.find((member) => member.id === id)?.displayName ?? (id ? "成员已不可用" : "待分派"); }
 function positionOf(id: string): string { return nodes.value.find((node) => node.memberId === id)?.name ?? "未分配岗位"; }
 function current(projectId: string, generation: number): boolean { return !disposed && currentProjectId.value === projectId && context.generation.value === generation; }
 
@@ -57,14 +67,19 @@ async function createTask(): Promise<void> {
   const projectId = currentProjectId.value;
   if (!projectId || !canCreate.value) return;
   const generation = context.generation.value;
-  busy.value = true; error.value = null; notice.value = null;
+  busy.value = true; createError.value = null; createFields.value = {};
   try {
     const result = await tasksApi.create(projectId, draftInput(draft.value));
     if (!current(projectId, generation)) return;
     tasks.value = [result.task, ...tasks.value];
     draft.value = emptyTaskDraft(); createOpen.value = false;
-    notice.value = `已创建「${result.task.title}」。负责人会收到任务分配事件。`;
-  } catch (err) { if (current(projectId, generation)) error.value = err instanceof Error ? err.message : "创建失败，填写内容已保留。"; }
+    toast.success(`已保存「${result.task.title}」${result.task.assigneeMemberId ? "，已记录分派通知。" : "，可稍后补齐资料与分派。"}`, `task-created:${result.task.id}`);
+  } catch (err) {
+    if (!current(projectId, generation)) return;
+    createUnknown.value = !(err instanceof ApiError) || err.status >= 500 || err.status === 408;
+    createFields.value = taskFieldErrors(err);
+    createError.value = createUnknown.value ? "保存结果尚未确认。请求可能已经生效，请先读取当前任务核对，不要重复保存。" : err instanceof Error ? err.message : "创建失败，填写内容已保留。";
+  }
   finally { if (current(projectId, generation)) busy.value = false; }
 }
 
@@ -85,40 +100,39 @@ async function saveSettings(): Promise<void> {
 }
 
 function cancelCreate(): void {
-  if (Object.values(draft.value).some(Boolean) && typeof window !== "undefined" && !window.confirm("丢弃尚未创建的任务内容？")) return;
-  draft.value = emptyTaskDraft(); createOpen.value = false;
+  if (!createUnknown.value) { draft.value = emptyTaskDraft(); createError.value = null; createFields.value = {}; }
+  createOpen.value = false;
 }
-watch(currentProjectId, () => { request++; tasks.value = []; settings.value = null; members.value = []; nodes.value = []; void load(); }, { immediate: true });
+watch(currentProjectId, () => { request++; busy.value = false; tasks.value = []; settings.value = null; members.value = []; nodes.value = []; void load(); }, { immediate: true });
 onMounted(() => { if (typeof matchMedia !== "undefined" && matchMedia("(max-width: 760px)").matches) layout.value = "list"; });
 onBeforeUnmount(() => { disposed = true; request++; });
 </script>
 
 <template>
   <section class="page tasks-page">
-    <header class="page-header"><div><h1>任务</h1><p class="page-description">让目标、负责人和评审结论保持清楚。</p></div><button type="button" class="primary" :disabled="!currentProjectId || projectReadonly || loading || busy" data-testid="task-create-open" @click="createOpen = true">创建任务</button></header>
+    <header class="page-header"><div><h1>任务</h1><p class="page-description">先记下要做的事，再补齐目标、验收和分派。</p></div><button type="button" class="primary" :disabled="!currentProjectId || projectReadonly || loading || busy" data-testid="task-create-open" @click="createOpen = true">{{ createUnknown ? '核对上次保存' : '创建任务' }}</button></header>
     <div v-if="error" class="error" role="alert" data-testid="task-error">{{ error }} <button v-if="!busy" type="button" class="text-button" @click="load">{{ conflict ? '载入最新设置（保留选择）' : '重新加载' }}</button></div>
     <p v-if="notice" class="notice" role="status" data-testid="task-notice">{{ notice }}</p>
     <p v-if="projectReadonly" class="notice" role="status">项目已归档，可查看任务、评论与评审记录，无法修改。</p>
-    <section v-if="createOpen" class="panel task-create-panel" aria-label="创建任务">
-      <h2>创建任务</h2>
-      <form @submit.prevent="createTask"><TaskFields v-model="draft" :members="members" :nodes="nodes" :disabled="busy || projectReadonly" :default-reviewer="defaultReviewerName" />
+    <CreationDialog :open="createOpen" title="创建任务" :pending="busy" :dirty="!createUnknown && Object.values(draft).some(Boolean)" :error="createError" :confirm-disabled="!canCreate" confirm-label="保存任务" confirm-test-id="task-create" @confirm="createTask" @close="cancelCreate">
+      <p class="muted small">只需标题即可保存为待办，其他资料可以稍后完善。</p>
+      <TaskFields v-model="draft" :members="members" :nodes="nodes" :disabled="busy || projectReadonly || createUnknown" :default-reviewer="defaultReviewerName" :errors="createFields" />
         <p v-if="resolvedReviewer && resolvedReviewer === draft.assigneeMemberId" class="warning-text small">负责人不能评审自己的任务，请另选 reviewer。</p>
-        <p v-else-if="!resolvedReviewer" class="muted small">请选择一位 reviewer，或先在项目任务设置中配置默认 reviewer。</p>
-        <div class="actions task-form-actions"><button type="submit" class="primary" :disabled="!canCreate" data-testid="task-create">{{ busy ? '正在创建…' : '创建任务' }}</button><button type="button" :disabled="busy" @click="cancelCreate">取消</button></div>
-      </form>
-    </section>
+        <p v-if="!draft.reviewerMemberId && draft.assigneeMemberId && settings?.defaultReviewerMemberId === draft.assigneeMemberId" class="muted small">项目默认评审人与负责人相同，本次会保存为暂未选择评审人。</p>
+      <section v-if="createUnknown" class="task-unknown" data-testid="task-create-unknown"><p>关闭窗口不会撤销已发出的请求。本页会保留这次输入，重新打开可继续核对。</p><button type="button" :disabled="loading" @click="load">读取当前任务（不再次保存）</button><p v-if="error" class="error" role="alert">{{ error }}</p><p class="small">当前同标题任务（请逐项核对内容与时间）：</p><ul><li v-for="item in matchingCreatedTasks" :key="item.id"><RouterLink v-if="currentProjectId" :to="projectPath(currentProjectId, 'tasks', item.id)">{{ item.title }}</RouterLink> <span class="muted small">{{ item.id }} · {{ new Date(item.createdAt).toLocaleString('zh-CN') }}</span></li></ul><p class="muted small">列表中没有看到目标也不能证明请求没有生效。核实前请勿重新录入同一任务。</p></section>
+    </CreationDialog>
     <div class="task-toolbar">
       <label class="field">筛选状态<select v-model="filter" data-testid="task-state-filter"><option value="">全部状态</option><option v-for="state in taskStates" :key="state.value" :value="state.value">{{ state.label }}</option></select></label>
       <div class="actions" aria-label="任务显示方式"><button type="button" :aria-pressed="layout === 'board'" @click="layout = 'board'">看板</button><button type="button" :aria-pressed="layout === 'list'" @click="layout = 'list'" data-testid="task-list-mode">列表</button></div>
     </div>
     <p v-if="loading" role="status" class="muted">正在加载任务…</p>
     <div v-if="!currentProjectId" class="panel empty-state"><h2>选择一个项目</h2><p>选择项目后查看任务，或先创建项目。</p><RouterLink to="/projects">前往项目</RouterLink></div>
-    <div v-else-if="!loading && !error && tasks.length === 0" class="panel empty-state"><h2>从一项明确的任务开始</h2><p>写下目标与验收条件，选择负责人和 reviewer。</p></div>
+    <div v-else-if="!loading && !error && tasks.length === 0" class="panel empty-state"><h2>先记下一项任务</h2><p>标题即可保存，目标、验收条件和负责人可稍后完善。</p></div>
     <div v-if="currentProjectId" data-testid="task-board">
       <div v-if="layout === 'board'" class="task-board">
-        <section v-for="group in groups" :key="group.value" class="task-column" :aria-label="group.label" :data-state="group.value"><h2>{{ group.label }} <span class="badge">{{ group.tasks.length }}</span></h2><ul><li v-for="task in group.tasks" :key="task.id" class="task-card"><RouterLink :to="projectPath(currentProjectId, 'tasks', task.id)" class="task-card-title">{{ task.title }}</RouterLink><p class="small muted">{{ nameOf(task.assigneeMemberId) }}</p><p v-if="task.blockedReason" class="small warning-text">{{ task.blockedReason }}</p><div class="actions"><span v-for="label in task.labels" :key="label" class="badge">{{ label }}</span></div></li><li v-if="group.tasks.length === 0" class="small muted task-column-empty">暂无任务</li></ul></section>
+        <section v-for="group in groups" :key="group.value" class="task-column" :aria-label="group.label" :data-state="group.value"><h2>{{ group.label }} <span class="badge">{{ group.tasks.length }}</span></h2><ul><li v-for="task in group.tasks" :key="task.id" class="task-card"><RouterLink :to="projectPath(currentProjectId, 'tasks', task.id)" class="task-card-title">{{ task.title }}</RouterLink><p class="small muted">{{ nameOf(task.assigneeMemberId) }}</p><p v-if="task.state === 'todo' && task.materialStatus?.startExecution.issues.length" class="small muted">{{ task.materialStatus.startExecution.issues.map(issue => issue.message).join(' ') }}</p><p v-if="task.blockedReason" class="small warning-text">{{ task.blockedReason }}</p><div class="actions"><span v-for="label in task.labels" :key="label" class="badge">{{ label }}</span></div></li><li v-if="group.tasks.length === 0" class="small muted task-column-empty">暂无任务</li></ul></section>
       </div>
-      <ul v-else class="task-list"><li v-for="task in visibleTasks" :key="task.id" class="panel task-list-item"><div><RouterLink :to="projectPath(currentProjectId, 'tasks', task.id)" class="task-card-title">{{ task.title }}</RouterLink><p class="small muted">负责人：{{ nameOf(task.assigneeMemberId) }} · Reviewer：{{ nameOf(task.reviewerMemberId) }}</p><p v-if="task.blockedReason" class="small warning-text">{{ task.blockedReason }}</p></div><span class="badge" :class="`task-state-${task.state}`">{{ taskStateLabel(task.state) }}</span></li><li v-if="visibleTasks.length === 0 && tasks.length > 0" class="panel empty-state">该状态下暂无任务。</li></ul>
+      <ul v-else class="task-list"><li v-for="task in visibleTasks" :key="task.id" class="panel task-list-item"><div><RouterLink :to="projectPath(currentProjectId, 'tasks', task.id)" class="task-card-title">{{ task.title }}</RouterLink><p class="small muted">负责人：{{ nameOf(task.assigneeMemberId) }} · 评审人：{{ nameOf(task.reviewerMemberId) }}</p><p v-if="task.state === 'todo' && task.materialStatus?.startExecution.issues.length" class="small muted">{{ task.materialStatus.startExecution.issues.map(issue => issue.message).join(' ') }}</p><p v-if="task.blockedReason" class="small warning-text">{{ task.blockedReason }}</p></div><span class="badge" :class="`task-state-${task.state}`">{{ taskStateLabel(task.state) }}</span></li><li v-if="visibleTasks.length === 0 && tasks.length > 0" class="panel empty-state">该状态下暂无任务。</li></ul>
     </div>
     <details v-if="currentProjectId" class="panel task-settings"><summary>项目任务设置 <span class="muted small">默认 reviewer</span></summary><form @submit.prevent="saveSettings"><label class="field">默认 reviewer<select v-model="defaultReviewer" :disabled="projectReadonly || busy || !settings" data-testid="task-default-reviewer"><option value="">不设默认，新建任务时逐项选择</option><option v-if="settings?.defaultReviewerMemberId && !activeAgents.some((member) => member.id === settings?.defaultReviewerMemberId)" :value="settings.defaultReviewerMemberId" disabled>原 reviewer 已不可用，请重新选择</option><option v-for="member in activeAgents" :key="member.id" :value="member.id">{{ member.displayName }} · {{ positionOf(member.id) }}</option></select></label><p v-if="settings && !settings.reviewerValid" class="warning-text small">{{ settings.invalidReason || '尚未配置有效的默认 reviewer。' }}</p><p class="muted small">仅用于新建任务。已有任务的 reviewer 由任务详情单独管理。</p><button type="submit" :disabled="projectReadonly || busy || !settings || defaultReviewer === (settings.defaultReviewerMemberId ?? '')" data-testid="task-save-settings">保存默认 reviewer</button></form></details>
   </section>

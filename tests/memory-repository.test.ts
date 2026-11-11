@@ -110,7 +110,7 @@ async function summaryEvent(repos: RepositorySet, f: Awaited<ReturnType<typeof f
     payload: { requestId: summary.id, requestRevision: summary.revision, trigger: summary.trigger } }));
 }
 async function taskFixture(repos: RepositorySet, f: Awaited<ReturnType<typeof fixture>>) {
-  const task: Task = { id: randomUUID(), projectId: f.project.id, title: "完成来源任务", body: "固定验收", labels: [], state: "todo",
+  const task: Task = { id: randomUUID(), projectId: f.project.id, title: "完成来源任务", body: "固定验收", deliveryKind: "code", acceptanceText: "固定验收", acceptanceSource: "explicit", labels: [], state: "todo",
     assigneeMemberId: f.member.id, reviewerMemberId: f.member.id, repoPath: null, fixedPoint: null, revision: 1,
     currentReviewRoundId: null, blockedReason: null, author, createdAt: at, updatedAt: at };
   return repos.tasks.create(task);

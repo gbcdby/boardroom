@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DbDriver } from "../db/driver.ts";
 import { createRepositories } from "../db/repositories.ts";
 import { InvalidArgumentError, RepositoryError } from "../db/errors.ts";
+import { TaskError } from "./errors.ts";
 import type { Logger } from "../logger.ts";
 import type { ActorResolution } from "../api.ts";
 import type { Actor } from "../authz/authorize.ts";
@@ -106,7 +107,8 @@ export function createTaskApi(options: { db: DbDriver; logger: Logger;
       if (error instanceof ForbiddenError) json(response, 403, { error: { code: error.code, message: error.message } });
       else if (error instanceof RepositoryError) {
         const reason = "reason" in error && typeof error.reason === "string" ? error.reason : undefined;
-        json(response, errorStatus[error.code] ?? 500, { error: { code: error.code, message: error.message, ...(reason ? { reason } : {}) } });
+        json(response, errorStatus[error.code] ?? 500, { error: { code: error.code, message: error.message, ...(reason ? { reason } : {}),
+          ...(error instanceof TaskError ? { details: error.details } : {}) } });
       } else {
         log.error("task_request_failed", { error });
         json(response, 500, { error: { code: "internal_error", message: "任务操作失败，请重试。" } });

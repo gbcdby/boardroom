@@ -4,11 +4,23 @@ import { createTaskSchema, updateTaskSchema, submitReviewReportSchema, parseTask
 
 test("任务入口拒绝伪造主体、直接状态与修订覆盖", () => {
   const valid = { title: "整理接口", body: "完成字段与验收说明", assigneeMemberId: "worker" };
-  for (const field of ["author", "actor", "memberId", "state", "revision", "projectId"]) {
+  for (const field of ["author", "actor", "memberId", "state", "revision", "projectId", "acceptanceSource"]) {
     assert.throws(() => parseTaskInput(createTaskSchema, { ...valid, [field]: "forged" }), /task_input_invalid/);
   }
   assert.throws(() => parseTaskInput(updateTaskSchema, { expectedRevision: 1, state: "done" }), /task_input_invalid/);
   assert.throws(() => parseTaskInput(updateTaskSchema, { expectedRevision: 0, title: "不应写入" }), /task_input_invalid/);
+});
+
+test("任务资料输入保持 nullable/omitted 区别与严格修订，并返回对应字段错误", () => {
+  assert.deepEqual(parseTaskInput(createTaskSchema, { title: "随手记录" }), { title: "随手记录", body: "" });
+  assert.deepEqual(parseTaskInput(createTaskSchema, { title: "明确空分派", assigneeMemberId: null, reviewerMemberId: null, deliveryKind: null }),
+    { title: "明确空分派", body: "", assigneeMemberId: null, reviewerMemberId: null, deliveryKind: null });
+  for (const expectedRevision of ["1", 1.5, Number.MAX_SAFE_INTEGER + 1]) assert.throws(() => parseTaskInput(updateTaskSchema, { expectedRevision, reviewerMemberId: null }));
+  assert.throws(() => parseTaskInput(createTaskSchema, { title: "字段错误", labels: ["字".repeat(41)] }), error => {
+    assert.ok(error && typeof error === "object" && "details" in error);
+    assert.deepEqual(error.details, { fields: [{ code: "task_input_invalid", field: "labels", message: "标签超过允许的长度或数量。" }] });
+    return true;
+  });
 });
 
 test("任务正文按 UTF-8 字节限制，标签标准化不改变正文", () => {

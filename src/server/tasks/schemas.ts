@@ -1,13 +1,14 @@
 import { z } from "zod";
-import { InvalidArgumentError } from "../db/errors.ts";
+import { TaskError } from "./errors.ts";
 
 // HTTP、MCP 和领域入口共用输入边界；主体与项目绑定始终由受信入口提供。
 export const taskIdSchema = z.string().trim().min(1).max(100);
 export const taskRevisionSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 export const taskStateSchema = z.enum(["todo", "in-progress", "review", "blocked", "done"]);
 const title = z.string().trim().min(1).max(200);
-const text = z.string().refine(value => Buffer.byteLength(value, "utf8") <= 65_536, "正文不能超过 64 KiB");
-const nonemptyText = text.refine(value => value.trim().length > 0, "正文不能为空");
+// 每个文本字段新建内部 string 实例，避免 MCP 导出兄弟属性 $ref。
+const text = () => z.string().refine(value => Buffer.byteLength(value, "utf8") <= 65_536, "正文不能超过 64 KiB");
+const nonemptyText = text().refine(value => value.trim().length > 0, "正文不能为空");
 const labels = z.array(z.string().trim().min(1).max(40)).max(20).transform(values => [...new Set(values)]);
 const repoPath = z.string().trim().min(1).max(4096).nullable();
 const fixedPoint = z.string().trim().min(1).max(512).nullable();
@@ -16,12 +17,14 @@ const hash = z.string().regex(/^[0-9a-f]{64}$/);
 const commit = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
 const timestamp = z.string().max(40).datetime({ offset: true });
 
-export const createTaskSchema = z.object({ title, body: text, labels: labels.optional(),
-  assigneeMemberId: taskIdSchema.describe("任务负责人成员 ID"), reviewerMemberId: taskIdSchema.describe("指定评审成员 ID").optional(),
+export const createTaskSchema = z.object({ title, body: text().default(""), labels: labels.optional(),
+  assigneeMemberId: taskIdSchema.describe("任务负责人成员 ID，null 表示待分派").nullable().optional(), reviewerMemberId: taskIdSchema.describe("指定评审成员 ID，null 表示不使用默认评审人").nullable().optional(),
+  deliveryKind: z.enum(["code", "artifact", "finding"]).nullable().optional(), acceptanceText: text().describe("明确的任务验收条件").optional(),
   repoPath: repoPath.optional(), fixedPoint: fixedPoint.optional() }).strict();
 export const updateTaskSchema = z.object({ expectedRevision: taskRevisionSchema,
-  title: title.optional(), body: text.optional(), labels: labels.optional(),
-  assigneeMemberId: taskIdSchema.describe("任务负责人成员 ID").optional(), reviewerMemberId: taskIdSchema.describe("指定评审成员 ID").optional(),
+  title: title.optional(), body: text().optional(), labels: labels.optional(),
+  assigneeMemberId: taskIdSchema.describe("任务负责人成员 ID，null 表示清除分派").nullable().optional(), reviewerMemberId: taskIdSchema.describe("指定评审成员 ID，null 表示清除分派").nullable().optional(),
+  deliveryKind: z.enum(["code", "artifact", "finding"]).nullable().optional(), acceptanceText: text().describe("明确的任务验收条件").optional(),
   repoPath: repoPath.optional(), fixedPoint: fixedPoint.optional() }).strict();
 export const transitionTaskSchema = z.object({ expectedRevision: taskRevisionSchema,
   state: z.enum(["todo", "in-progress", "blocked"]), reason: reason.optional() }).strict();
@@ -60,8 +63,13 @@ export const decideTaskReviewSchema = beginTaskReviewSchema.extend({
 export function parseTaskInput<T extends object>(schema: z.ZodType<T>, input: unknown): { [K in keyof T]: Exclude<T[K], undefined> } {
   const parsed = schema.safeParse(input);
   if (!parsed.success) {
-    const fields = [...new Set(parsed.error.issues.map(issue => issue.path.join(".") || "请求"))].slice(0, 5).join("、");
-    throw new InvalidArgumentError(`task_input_invalid：任务参数无效，请检查${fields}。`);
+    const names: Record<string, string> = { title: "标题", body: "目标与范围", acceptanceText: "验收条件", deliveryKind: "交付类型", assigneeMemberId: "负责人", reviewerMemberId: "评审人", labels: "标签", repoPath: "仓库路径", fixedPoint: "对比基准", expectedRevision: "任务版本" };
+    const fields = parsed.error.issues.map(issue => {
+      const field = String(issue.path[0] ?? "request"), label = names[field] ?? field;
+      const message = issue.code === "too_big" ? `${label}超过允许的长度或数量。` : issue.code === "too_small" ? `${label}不能为空或小于允许的范围。` : issue.code === "custom" ? `${label}：${issue.message}` : `请检查${label}的格式或取值。`;
+      return { code: "task_input_invalid", field, message };
+    });
+    throw new TaskError("task_input_invalid", `task_input_invalid：任务参数无效，请检查${[...new Set(fields.map(issue => names[issue.field] ?? issue.field))].slice(0, 5).join("、")}。`, "invalid_argument", { fields });
   }
   return Object.fromEntries(Object.entries(parsed.data).filter(([, value]) => value !== undefined)) as { [K in keyof T]: Exclude<T[K], undefined> };
 }

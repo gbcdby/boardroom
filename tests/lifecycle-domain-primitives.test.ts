@@ -9,7 +9,7 @@ const at = "2026-11-11T03:00:00.000Z";
 for (const engine of ["sqlite", "postgres"] as const) {
   test(`${engine} S5-AUDIT-07：任务/设置补偿可恢复disabled引用但不恢复执行，revision始终向前`, { skip: engine === "postgres" ? pgUnavailable : false }, async () => memoryFixture(async repos => {
     const p = await memoryPeople(repos);
-    const task: Task = { id: randomUUID(), projectId: p.project.id, title: "补偿任务", body: "历史任务投影", labels: [], state: "blocked",
+    const task: Task = { id: randomUUID(), projectId: p.project.id, title: "补偿任务", body: "历史任务投影", deliveryKind: "code", acceptanceText: "历史任务投影", acceptanceSource: "explicit", labels: [], state: "blocked",
       assigneeMemberId: null, reviewerMemberId: null, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null,
       blockedReason: "member_removed", author: { kind: "human", actorId: "owner", displayName: "人" }, createdAt: at, updatedAt: at };
     await repos.tasks.create(task); await repos.members.setStatus(p.member.id, "disabled");

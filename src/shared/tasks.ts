@@ -3,27 +3,41 @@ export type TaskState = 'todo' | 'in-progress' | 'review' | 'blocked' | 'done';
 export type ReviewAxis = 'spec' | 'standards';
 export type ReviewRoundState = 'ready' | 'running' | 'reported' | 'decided' | 'failed' | 'superseded';
 export type ReviewVerdict = 'pass' | 'changes_requested';
+export type TaskDeliveryKind = 'code' | 'artifact' | 'finding';
+export type TaskAcceptanceSource = 'explicit' | 'legacy_task_body';
+export type TaskMaterialStage = 'startExecution' | 'submitReview' | 'complete';
+export interface TaskMaterialIssue { code: string; field: string; message: string }
+export interface TaskMaterialPhase { reasonCodes: string[]; issues: TaskMaterialIssue[] }
+/** 仅任务资料观察；不代表 Run、策略、工作区或执行权已经放行。 */
+export interface TaskMaterialStatus {
+  scope: 'task-materials'; executionAdmission: 'not-issued';
+  startExecution: TaskMaterialPhase; submitReview: TaskMaterialPhase; complete: TaskMaterialPhase;
+}
 export interface TaskAuthor { kind: 'human' | 'agent'; actorId: string; displayName: string }
 export interface Task {
   id: string; projectId: string; title: string; body: string; labels: string[];
   state: TaskState; assigneeMemberId: string | null; reviewerMemberId: string | null;
+  deliveryKind: TaskDeliveryKind | null; acceptanceText: string; acceptanceSource: TaskAcceptanceSource;
   repoPath: string | null; fixedPoint: string | null; revision: number;
   currentReviewRoundId: string | null; blockedReason: string | null;
   author: TaskAuthor; createdAt: string; updatedAt: string;
 }
+export interface TaskView extends Task { materialStatus: TaskMaterialStatus }
 export interface TaskSettings {
   projectId: string; defaultReviewerMemberId: string | null; revision: number;
   // 有配置但成员停用/已删除时不自动猜替代人。
   reviewerValid: boolean; invalidReason: string | null;
 }
 export interface CreateTaskInput {
-  title: string; body: string; labels?: string[]; assigneeMemberId: string;
-  reviewerMemberId?: string; repoPath?: string | null; fixedPoint?: string | null;
+  title: string; body?: string; labels?: string[]; assigneeMemberId?: string | null;
+  reviewerMemberId?: string | null; repoPath?: string | null; fixedPoint?: string | null;
+  deliveryKind?: TaskDeliveryKind | null; acceptanceText?: string;
 }
 export interface UpdateTaskInput {
   expectedRevision: number; title?: string; body?: string; labels?: string[];
-  assigneeMemberId?: string; reviewerMemberId?: string;
+  assigneeMemberId?: string | null; reviewerMemberId?: string | null;
   repoPath?: string | null; fixedPoint?: string | null;
+  deliveryKind?: TaskDeliveryKind | null; acceptanceText?: string;
 }
 export interface TransitionTaskInput {
   expectedRevision: number; state: 'todo' | 'in-progress' | 'blocked'; reason?: string;
@@ -46,7 +60,8 @@ export interface ReviewCandidate {
 }
 export interface ReviewRound {
   id: string; taskId: string; projectId: string; revision: number; taskRevision: number;
-  state: ReviewRoundState; reviewerMemberId: string; specSnapshot: { title: string; body: string; labels: string[] };
+  state: ReviewRoundState; reviewerMemberId: string; specSnapshot: { title: string; body: string; labels: string[];
+    deliveryKind?: TaskDeliveryKind | null; acceptanceText?: string; acceptanceSource?: TaskAcceptanceSource };
   candidate: ReviewCandidate | null; failure: { code: string; message: string } | null;
   decision: { verdict: ReviewVerdict; actor: TaskAuthor; reason: string; override: boolean; taskRevision: number } | null;
   createdAt: string; updatedAt: string;
@@ -80,5 +95,5 @@ export interface WorkEvent {
   deliveryState: 'pending' | 'delivered' | 'acked'; attempts: number;
   createdAt: string; firstDeliveredAt: string | null; lastDeliveredAt: string | null; ackedAt: string | null;
 }
-export interface TaskDetail { task: Task; comments: TaskComment[]; history: TaskHistory[]; rounds: ReviewRound[]; reports: ReviewReport[]; messageLinks: TaskMessageLink[] }
-export type StartReviewResult = { ready: true; task: Task; round: ReviewRound } | { ready: false; task: Task; round: ReviewRound; error: { code: string; message: string } };
+export interface TaskDetail { task: TaskView; comments: TaskComment[]; history: TaskHistory[]; rounds: ReviewRound[]; reports: ReviewReport[]; messageLinks: TaskMessageLink[] }
+export type StartReviewResult = { ready: true; task: TaskView; round: ReviewRound } | { ready: false; task: TaskView; round: ReviewRound; error: { code: string; message: string } };

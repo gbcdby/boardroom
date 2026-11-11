@@ -13,7 +13,7 @@ import { identityFixture, identityEngines, identitySkip } from "./helpers/identi
 
 const access = { actor: ownerActor() };
 async function fixture(engine: typeof identityEngines[number]) {
-  const f = await identityFixture(engine, 15);
+  const f = await identityFixture(engine);
   const sourcePath = await mkdtemp(path.join(tmpdir(), "boardroom-workspace-source-")); const root = await realpath(sourcePath);
   const environment = await resolveBoardroomEnvironment({ cwd: f.dir,
     env: { BOARDROOM_HOME: path.join(f.dir, "home"), AGENT_STUDIO_DATA_DIR: f.dir } });
