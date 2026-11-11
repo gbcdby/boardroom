@@ -23,6 +23,7 @@ export type RepositoryErrorCode =
   | "invalid_argument"
   | "write_failed"
   | "mutation_scope_changed"
+  | "confirmation_changed"
   | "member_removed"
   | "compensation_conflict"
   | "legacy_incomplete_snapshot"

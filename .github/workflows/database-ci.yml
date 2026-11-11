@@ -232,6 +232,24 @@ jobs:
         run: |
           python3 -m venv .agent-output/browser-venv
           .agent-output/browser-venv/bin/python -m pip install playwright==1.62.0
+          # Azure 镜像 DNS 失败会耗尽作业时间；沿用 runner 已配置的 Ubuntu 官方备用源。
+          # 不替换签名密钥，不跳过任何系统依赖或浏览器检查。
+          sudo python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          for mirror_file in Path('/etc/apt').glob('apt-mirrors*.txt'):
+              lines = mirror_file.read_text().splitlines()
+              def host(line):
+                  text = line.strip()
+                  return urlsplit(text.split()[0]).hostname if text and not text.startswith('#') else None
+              if not any(host(line) == 'azure.archive.ubuntu.com' for line in lines):
+                  continue
+              remaining = [line for line in lines if host(line) != 'azure.archive.ubuntu.com']
+              if not any(host(line) in {'archive.ubuntu.com', 'security.ubuntu.com'} for line in remaining):
+                  raise SystemExit(f'{mirror_file}: 缺少已配置的 Ubuntu 官方备用源')
+              mirror_file.write_text('\n'.join(remaining) + '\n')
+              print(f'{mirror_file}: 已移除故障 Azure 镜像，保留已有备用源')
+          PY
           .agent-output/browser-venv/bin/python -m playwright install --with-deps chromium
 
       - name: 真实浏览器操作临时 SQLite 服务

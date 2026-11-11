@@ -265,6 +265,64 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     report["confirmationRequests"] = {"member": len(writes(member_path, "DELETE")), "groupArchive": len(writes(group_path + "/archive", "POST")), "groupPurgeWithToken": len(committed_purges(group_path)), "projectArchive": len(writes(project_path + "/archive", "POST")), "projectPurgeWithToken": len(committed_purges(project_path)), "orgDelete": len(writes(node_path, "DELETE"))}
     page.remove_listener("request", collect)
 
+def purge_snapshot_flows(page, origin, output, report):
+    """#130：实际HTTP写入改变快照；不拦截或伪造确认响应。"""
+    page.set_viewport_size({"width": 1440, "height": 1000})
+    project = request(page, origin, "POST", "/api/projects", {"name": "删除快照真实集成"})["project"]
+    project_id = project["id"]
+    member = request(page, origin, "POST", f"/api/projects/{project_id}/members", {"kind": "human", "displayName": "另一入口的发信人"})["member"]
+    groups = [request(page, origin, "POST", f"/api/projects/{project_id}/groups", {"name": name, "participantMemberIds": [member["id"]]})["group"] for name in ["快照目标群", "项目确认时的群"]]
+    page.goto(origin + f"/projects/{project_id}/overview")
+    expect(page.get_by_test_id("group-list")).to_contain_text(groups[0]["name"])
+    report["purgeSnapshotFlows"] = []
+    for kind, group in zip(["group", "project"], groups):
+        target = f"/api/groups/{group['id']}" if kind == "group" else f"/api/projects/{project_id}"
+        if kind == "group":
+            row = page.get_by_test_id("group-list").locator("li").filter(has_text=group["name"])
+            row.get_by_test_id("group-management").locator("summary").click()
+            trigger = row.get_by_test_id("purge-group")
+        else:
+            details = page.get_by_test_id("project-actions")
+            if not details.evaluate("el => el.open"): details.locator("summary").click()
+            trigger = page.get_by_test_id("purge-project")
+        with page.expect_response(lambda r: r.url.endswith(target) and r.request.method == "DELETE") as initial_response:
+            trigger.click()
+        assert initial_response.value.status == 409
+        initial = initial_response.value.json()["confirmation"]
+        message = request(page, origin, "POST", f"/api/groups/{group['id']}/messages", {"senderMemberId": member["id"], "text": f"{kind}预览之后由另一HTTP入口写入"})["message"]
+        confirm = page.get_by_test_id(f"confirm-purge-{kind}")
+        with page.expect_response(lambda r: r.url.endswith(target) and r.request.method == "DELETE") as refused_response:
+            confirm.click()
+        refused = refused_response.value.json()
+        assert refused_response.value.status == 409 and refused["error"]["code"] == "confirmation_changed"
+        expect(page.get_by_test_id("confirmation-error")).to_contain_text("影响范围已变化")
+        expect(confirm).to_be_disabled()
+        assert page.request.get(origin + target).status == 200
+        assert any(item["id"] == message["id"] for item in request(page, origin, "GET", f"/api/groups/{group['id']}/messages")["messages"]), "被拒确认清掉了新事实"
+        consumed = page.request.delete(origin + target, data={"confirm": initial["token"]})
+        assert consumed.status == 400 and consumed.json()["error"]["code"] == "invalid_confirmation"
+        filename = f"purge-snapshot-{kind}-changed-1440-light.png"
+        page.screenshot(path=str(output / filename), animations="disabled")
+        report["screenshots"].append(filename)
+        with page.expect_response(lambda r: r.url.endswith(target) and r.request.method == "DELETE") as latest_response:
+            page.get_by_test_id("confirmation-preview").click()
+        latest = latest_response.value.json()["confirmation"]
+        assert latest["token"] != initial["token"]
+        assert latest["cascade"]["messages"] == initial["cascade"]["messages"] + 1
+        assert page.request.get(origin + target).status == 200, "重新预览不能自动删除"
+        expect(confirm).to_be_enabled()
+        with page.expect_response(lambda r: r.url.endswith(target) and r.request.method == "DELETE") as deleted_response:
+            confirm.click()
+        assert deleted_response.value.status == 204
+        assert json.loads(deleted_response.value.request.post_data)["confirm"] == latest["token"]
+        expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
+        assert page.request.get(origin + target).status == 404
+        if kind == "group":
+            assert any(item["id"] == member["id"] for item in request(page, origin, "GET", f"/api/projects/{project_id}/members")["members"])
+            assert page.request.get(origin + f"/api/groups/{groups[1]['id']}").status == 200
+        report["purgeSnapshotFlows"].append({"kind": kind, "target": target, "newMessageId": message["id"], "before": initial["cascade"], "after": latest["cascade"], "rejection": refused, "consumedTokenStatus": consumed.status, "confirmedStatus": deleted_response.value.status, "preservedBeforeReconfirmation": True})
+    report["checks"].append("S6-AC03 / #130: 项目与群均走真实预览→另一HTTP入口新增消息→409 confirmation_changed且完整保留→旧token作废→重预览不自动删除→再次点击才204；群成员与其他群保留")
+
 def exercise(page, origin, records, output, report, capture_only):
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
@@ -449,6 +507,7 @@ def exercise(page, origin, records, output, report, capture_only):
     assert any(node["name"] == "项目统筹" and node["parentId"] is None for node in nodes), "岗位改名没有被真正撤销"
     report["checks"].append("UI-05: 组织按需编辑、实际改名与审计撤销")
     confirmation_flows(page, origin, created_project_id, project_id, output, report)
+    purge_snapshot_flows(page, origin, output, report)
     assert not errors, f"页面JavaScript错误: {errors}"
     report["status"] = "PASS"
 

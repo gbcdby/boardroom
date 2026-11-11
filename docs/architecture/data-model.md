@@ -243,10 +243,10 @@ SQLite 使用 AFTER INSERT/UPDATE/DELETE trigger；PG 使用等价 PL/pgSQL trig
 | repository | 主要方法 |
 | --- | --- |
 | `agents` | `create / get / list / update / touchLastSeen / delete / insertRaw` |
-| `projects` | `create / get / list({includeArchived}) / rename / archive / restore / previewPurge / purge / delete` |
+| `projects` | `create / get / list({includeArchived}) / rename / archive / restore / previewPurge / capturePurge / purge / delete` |
 | `members` | 有效成员读、历史作者 lookup、状态与生命周期 CAS；有权限的领域 service 负责移除/重新添加/完整审计，低层 delete 不是用户移除入口 |
 | `org`（T2 #49） | `createNode / getNode / listNodes / getRootNode / subtreeNodeIds / updateNode / deleteNode / assignNode / autoPlaceMember / nodeOfMember` |
-| `groups` | `create / get / listByProject({includeArchived}) / archive / restore / previewPurge / purge / participants / addParticipant / removeParticipant / delete` |
+| `groups` | `create / get / listByProject({includeArchived}) / archive / restore / previewPurge / capturePurge / purge / participants / addParticipant / removeParticipant / delete` |
 | `messages` | `create / get / listByGroup({afterSeq, limit})` |
 | `deliveries` | `ensure / get / recordAttempt / listPending / delete` |
 | `statuses` | `set / get / listByProject / delete` |
@@ -262,6 +262,15 @@ SQLite 使用 AFTER INSERT/UPDATE/DELETE trigger；PG 使用等价 PL/pgSQL trig
 - `projects.purge(id)` 先确认关联托管运行停止，再清记忆请求/收据/计数/checkpoint、项目版本/文档；随后清工作事件、评论/历史/关联、报告/轮次/任务/设置；再清消息投递/消息、参与/会话/状态、runtime reservation/runner/绑定、群组、成员（包括墓碑身份）、组织和项目。六类事实在 Member 仍存在时删除，Member 硬删最终级联其事实版本。保留全局 Agent、global 记忆与既有审计。
 - `groups.purge(id)` 清当前群上下文的记忆请求/工作事件/收据/计数/checkpoint、任务消息链接，再清投递/消息、参与/会话和群绑定后删群。保留项目 Member、任务/评论、项目文档及版本和 global 记忆；不会按项目扩大删除。
 - `PurgeCounts` / `GroupPurgeCounts` 的新表计数与前端二次确认文案一起演进，实际清除结果需要双引擎逐键核对。详见[仓储实现](../../src/server/db/repositories.ts)及[生命周期说明](../t3-member-lifecycle.md#4-归档永久删除与资料保留)。
+
+**删除确认快照（#130）**：`capturePurge(id)` 返回同一事务中的 `{ target, cascade, digest }`，旧 `previewPurge` 继续返回计数。
+HTTP 进程把快照绑定一次性 token，确认将服务端保存的 digest 传给 `purge(id, expectedDigest)`；客户端不自行计算或覆盖摘要。
+在正常 v13 运行路径中，两种预览和 purge 都通过既有 coordinator 持有项目、相关成员、群和 runtime 锁；API 再用同一外层事务包住权限复核、删除和审计。
+摘要按表名、列名、行内容稳定排序，以 SHA-256 绑定真实删除闭包。业务对象和关系变化由其身份、字段或修订识别，不能仅比较数量。
+群范围不读取整个成员的事实版本值，因为同成员在其他群的消息会推进该值；而是读取当前群实际消息、投递、链接、请求等事实。
+成员运行状态、MCP 心跳、投递/ACK 和空扫描位置等观测字段不进入摘要，其对象身份和作用域仍进入。
+运行状态的安全性由原 `runtime_must_stop_first` 门禁在锁内重新判断。删群的孤立 reservation 选择与实际清理条件一致，
+因此其他绑定变化若改变该预留的保留/删除结果，也会要求重新确认。实现见 [purge-impact.ts](../../src/server/db/purge-impact.ts)。
 
 ## 8. 验证与能力边界
 
