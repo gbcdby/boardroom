@@ -168,6 +168,8 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 
 记忆 reader 在业务事务外运行。它返回后，消息 ID 集合使用与正文查询相同的当前权限谓词再次完整复核，并检查项目/群组仍为活跃态。成员代际、岗位/任务关系、参与边、托管运行 fence 或会话在此期间失效时，旧等待返回不带正文的 `cancelled`；归档历史仍可按读取权限查询。最终绑定/fence 检查与同步 resolve 保持在同一个锁边界内。此前已提交且未 ACK 的投递事实保留，权限恢复后可重投。
 
+取消信号同步标记当前 wait，在任何数据库等待前收口，最终锁内兑现再次核对该标记。取消不返回准备中的消息、记忆或工作通知，且 `cursor` 为 `null`，不提供可推进游标；下一次等待仍可读取已提交但未 ACK 的积压。正常成功和超时结果沿用既有游标规则。取消不会放弃正在执行的 drain/数据库事务，其真实写入失败仍向调用方报错；已兑现后的旧取消信号不影响新的 wait。
+
 ### 3.3 `send_message` —— 发送消息
 
 入参：
@@ -277,7 +279,7 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 ## 4. 超时、并发与生命周期
 
 - **等待超时**：`wait_for_messages.timeoutMs` 由工具自身 `setTimeout` 控制，超时以 `status:"timeout"` 正常返回。
-- **宿主取消**：监听 `extra.signal`，abort 时以 `status:"cancelled"` resolve，不抛错。
+- **宿主取消**：监听 `extra.signal`，abort 同步取消当前 wait，以 `status:"cancelled"`、空 payload、`cursor:null` resolve。取消本身不抛错，也不吞掉在途事务的实际失败。
 - **并发限制**：
   - 单会话同时最多 **1 个**未完成的 `wait_for_messages`；第二个并发等待返回 `CONFLICT`。
   - 全局负载与时序按固定候选单独验收，不能由一次成功等待推出吞吐保证；见 [V1 门禁](v1-acceptance.md#4-横切故障负载与迁移门禁)。

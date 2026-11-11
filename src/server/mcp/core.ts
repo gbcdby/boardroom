@@ -319,6 +319,8 @@ interface PendingWait {
   readonly resolve: (result: WaitResult) => void;
   readonly settled: () => void;
   done: boolean;
+  /** 只属于本次 wait；取消事件同步置位，不等待游标或数据库。 */
+  cancelRequested: boolean;
   settling: boolean;
   deadlineReached: boolean;
   timer: NodeJS.Timeout | null;
@@ -823,7 +825,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     const cancelled = (): WaitResult => ({ ok: true, status: 'cancelled', messages: [], cursor: null, drainedBacklog: false,
       memory: unavailableMemory(memoryRuntime.config, 'memory_binding_unavailable') });
     // 关闭/取消可在外部reader等待期间抢先结束，但绝不携带正在准备的旧payload。
-    if (closed || result.status === 'cancelled') { finish(closed ? cancelled() : result); return; }
+    if (closed || entry.cancelRequested || result.status === 'cancelled') {
+      finish(closed || entry.cancelRequested ? cancelled() : result); return;
+    }
     if (entry.settling) return;
     entry.settling = true;
     if (entry.timer) clearTimeout(entry.timer);
@@ -854,6 +858,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         }
         // 可能经过多条ACL查询；在同步resolve前再经过managed fence/代际校验。
         await withAccess(binding, 'consume', async () => {
+          if (entry.cancelRequested) { finish(cancelled()); return; }
           if (entry.done) return;
           if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError('FORBIDDEN', '等待所绑定的会话已失效。');
           const injection = injectedVersions.get(binding.sessionId) === preparedMemory.fingerprint ? undefined : preparedMemory.injection;
@@ -1116,6 +1121,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
             }
           },
           done: false,
+          cancelRequested: false,
           settling: false,
           deadlineReached: false,
           timer: null,
@@ -1142,15 +1148,17 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         entry.pollTimer = setInterval(() => { void resolveWorkEvents(); }, 1000);
         entry.pollTimer.unref();
         if (params.signal) {
-          entry.abortListener = async () => {
+          entry.abortListener = () => {
+            // 取消必须先成为不可逆的当前 wait 事实，再收口；不能排在最终持锁事务的游标查询后。
+            entry.cancelRequested = true;
             log.debug("wait_cancelled", { memberId: binding.memberId });
-            await (settle(entry, {
+            void settle(entry, {
               ok: true,
               status: "cancelled",
               messages: [],
-              cursor: await (lastDeliveredCursor(binding)),
+              cursor: null,
               drainedBacklog: false,
-            }));
+            });
           };
           params.signal.addEventListener("abort", entry.abortListener, { once: true });
         }
