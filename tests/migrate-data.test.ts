@@ -63,7 +63,7 @@ async function seedSqliteDir(dir: string): Promise<void> {
     const repos = createRepositories(driver);
     const at = "2026-11-10T12:00:00.000Z";
     const author = { kind: "human" as const, actorId: "owner", displayName: "人" };
-    const task: Task = { id: "task-copy", projectId: "pr1", title: "迁移任务", body: "验收正文", deliveryKind: "code", acceptanceText: "验收正文", acceptanceSource: "explicit", labels: ["迁移"], state: "in-progress",
+    const task: Task = { id: "task-copy", projectId: "pr1", title: "迁移任务", body: "验收正文", deliveryKind: "code", acceptanceText: "明确验收与 Unicode 🧪\n独立于目标", acceptanceSource: "explicit", labels: ["迁移"], state: "in-progress",
       assigneeMemberId: "mb1", reviewerMemberId: "mb2", repoPath: "/repo", fixedPoint: "HEAD~1", revision: 1,
       currentReviewRoundId: null, blockedReason: null, author, createdAt: at, updatedAt: at };
     await repos.tasks.setSettings("pr1", 0, "mb2");
@@ -127,6 +127,8 @@ async function assertDispatchValues(options: DbDriverOptions): Promise<void> {
   const driver = createDbDriver(options);
   await driver.connect();
   try {
+    assert.deepEqual(await driver.query("SELECT delivery_kind, acceptance_text, acceptance_source FROM tasks WHERE id = 'task-copy'"),
+      [{ delivery_kind: "code", acceptance_text: "明确验收与 Unicode 🧪\n独立于目标", acceptance_source: "explicit" }]);
     assert.deepEqual(await driver.query("SELECT id, client_message_id FROM messages ORDER BY id"), [
       { id: "msg1", client_message_id: "migration-request" },
       { id: "msg2", client_message_id: null },
@@ -152,6 +154,7 @@ async function assertDispatchValues(options: DbDriverOptions): Promise<void> {
 
 // 跨表外键依赖（自引用 org_nodes 由递归读取处理，此处不计入顺序约束）。
 const FK_DEPS: Record<string, string[]> = {
+  project_workspace_versions: ["projects"],
   role_template_versions: ["role_templates"],
   org_nodes: ["projects"],
   members: ["projects", "agents", "org_nodes"],
@@ -179,15 +182,16 @@ const FK_DEPS: Record<string, string[]> = {
   memory_trigger_counters: ["projects", "agents", "groups"], memory_scan_checkpoints: ["projects", "agents", "groups"],
 };
 
-test("业务表清单：36 张表、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
+test("业务表清单：37 张表、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
   const names = BUSINESS_TABLES.map((t) => t.name);
-  assert.equal(names.length, 36);
+  assert.equal(names.length, 37);
   assert.equal(names.at(-1), "member_fact_revisions");
   assert.ok(!names.includes("schema_migrations"));
   for (const expected of [
     "agents",
     "agent_legacy_aliases", "role_templates", "role_template_versions",
     "projects",
+    "project_workspace_versions",
     "members",
     "groups",
     "org_nodes",
@@ -318,6 +322,20 @@ test("SQLite → SQLite：目标键集完整（含复合主键表与 id 保留�
   });
 });
 
+test("任务资料值参与复制校验，相同主键但验收漂移不能通过", async () => {
+  await withTempDir(async srcDir => {
+    await seedSqliteDir(srcDir);
+    await withTempDir(async dstDir => {
+      const source: DbDriverOptions = { dbDriver: "sqlite", dataDir: srcDir }, target: DbDriverOptions = { dbDriver: "sqlite", dataDir: dstDir };
+      assert.equal((await migrateData(source, target)).validation.ok, true);
+      const driver = createDbDriver(target); await driver.connect();
+      try { await driver.exec("UPDATE tasks SET acceptance_text = ? WHERE id = 'task-copy'", ["被错误替换的验收"]); }
+      finally { await driver.close(); }
+      assert.equal((await validateData(source, target)).ok, false);
+    });
+  });
+});
+
 test("回滚：清空目标业务表，源库不受影响；可重新迁移恢复", async () => {
   await withTempDir(async (srcDir) => {
     await seedSqliteDir(srcDir);
@@ -327,7 +345,7 @@ test("回滚：清空目标业务表，源库不受影响；可重新迁移恢�
       await migrateData(srcOpts, dstOpts);
 
       const rb = await rollbackTarget(dstOpts);
-      assert.equal(rb.clearedTables.length, 36);
+      assert.equal(rb.clearedTables.length, 37);
 
       // 目标业务表已清空，校验失败。
       const afterRollback = await validateData(srcOpts, dstOpts);

@@ -1,26 +1,36 @@
 # 任务与双轴评审
 
 状态：已确认（实现与使用说明；最终验收独立记录）
-日期：2026-11-10；2026-11-11 更新生命周期与外部复测边界
-需求来源：[主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)，AC-TASK-01～03、AC-REVIEW-01～05。
+日期：2026-11-10；2026-11-11 更新录入、阶段资料门禁与验收来源
+需求来源：[主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)，AC-TASK-01～03、AC-REVIEW-01～05；[S5 #129](https://github.com/gbcdby/boardroom/issues/129)、[S5-T1 #137](https://github.com/gbcdby/boardroom/issues/137) 的录入与最低资料检查局部范围。
 
 任务归属于当前项目。任务板使用 `todo → in-progress → review → done`，阻塞单独显示为 `blocked`。编辑、状态、配置和评审操作使用对应的当前修订号；遇到 409 先读取最新数据，本地草稿保留，不能自动覆盖别人的改动。
 
-入口为 `/projects/:projectId/tasks`，详情为 `/projects/:projectId/tasks/:taskId`。顶部项目选择与聊天、组织、记忆共用；URL 项目优先。有未保存输入时切项目先确认，取消不改变 URL 或草稿。页面加载/写入失败可重试；409 应先比较新旧数据，再用明确的新修订提交。
+入口为 `/projects/:projectId/tasks`，详情为 `/projects/:projectId/tasks/:taskId`。顶部项目选择与聊天、组织、记忆共用；URL 项目优先。有未保存输入时切项目先确认，取消不改变 URL 或草稿。已知字段拒绝可修正后重试；网络中断或服务端错误造成结果未知时，保留输入并先核对持久记录，不能盲目重复创建。409 后读取最新数据仍保留原草稿版本；明确采用当前版本后，合并远端未被本地修改的字段，再只提交本地更改。
 
 ## 使用流程
 
-1. 在项目任务页明确选择默认评审 Agent。评审成员必须在岗，并与负责人不同；失效配置会说明原因，不猜测替代人。
-2. 人或有管理范围的 manager 创建任务，填写标题、正文、标签、负责人、仓库路径及 fixed point。普通项目成员可评论，负责人可推进自己的任务。
+1. 可为项目选择默认评审 Agent。创建时省略 reviewer 仅采用当前有效且不与负责人相同的默认人；显式 `null` 保持未选择。失效默认不会阻止录入，也不会替用户另选一个人。
+2. 人或有管理范围的 manager 打开快速录入弹窗，仅填写标题即可保存真实 `todo`。目标与范围、验收条件、交付类型、负责人、评审人和候选资料可随后补齐。普通项目成员可评论，负责人可推进自己的任务；未分派录入不改变原有管理权限。
 3. 指派通知持久保存。Agent 在 `join` 或 `wait_for_messages` 安全点领取；确认事件只表示收到，不代表任务开始或完成。离线宿主保持待处理，平台不据此承诺启动外部 CLI。
-4. 负责人进入进行中。阻塞时必须写原因，系统沿岗位汇报线跳过空岗寻找有效 manager；没有接收者时仍保留未解决记录。
-5. 提交评审时固定任务快照、base commit、candidate commit、完整 diff 和命令记录。真实 Git 采集发生在短事务之外，提交前重新验证权限、运行所有权和任务修订。
+4. 开始、恢复或重开前，服务端要求有效负责人、非空目标、明确验收和交付类型。缺评审人不阻断这一步。阻塞时必须写原因，系统沿岗位汇报线跳过空岗寻找有效 manager；没有接收者时仍保留未解决记录。
+5. 当前 `code` 兼容路径在送审前还要求另一位在岗 Agent、真实仓库和 fixed point。送审固定目标、验收与来源快照、base commit、candidate commit、完整 diff 和命令记录。真实 Git 采集发生在短事务之外，提交前重新验证权限、运行所有权和任务修订。
 6. 指定 reviewer 接手评审，运行两个并行且上下文独立的评审：Spec 检查任务要求；Standards 优先检查仓库规范，再用代码坏味道作为判断提示。两份报告分别写入评论，不能合并为排名。
 7. 两轴均通过才能作普通通过裁决。打回返回进行中；人或有管辖权的 manager 可在两份报告齐备后写理由覆盖，原报告、原结论及覆盖原因保留。
 
+### 录入字段与阶段边界
+
+`deliveryKind` 为 `code`、`artifact`、`finding` 或 `null`。文件产物与调查结论可以录入、分派和完善资料；分类候选尚未接入，当前拒绝把它们送入旧 Git 评审或完成路径。填写占位仓库或 SHA 不能解除此限制。
+
+HTTP/MCP 的任务返回带有 `materialStatus`，其 `scope` 固定为 `task-materials`、`executionAdmission` 为 `not-issued`。`startExecution`、`submitReview`、`complete` 分别列出稳定 `reasonCodes` 和 `{ code, field, message }` 待补项。字段检查只反映任务资料；权限、有效连接、旧候选与双轴守卫仍由服务端检查，不返回代表完整 Run 或政策准入的 `allowed: true`。
+
+开始/恢复缺项统一返回 `task_materials_incomplete`。常见原因包括 `assignee_required`、`assignee_invalid`、`task_goal_required`、`task_acceptance_required`、`task_delivery_kind_required`；送审还包括 `reviewer_required`、`reviewer_invalid`、`reviewer_is_assignee`、`review_source_required`、`candidate_type_requires_v2`。页面直接使用同一服务结果展示待补项。
+
+更新时 omitted 保留已有字段，显式 `null` 清除相应分派；不会重新套用创建默认。进行中或评审中要清除负责人，须先明确标记受阻。实际改派才通知新负责人；未分派、无变化更新与过期 CAS 不产生重复分配事件。
+
 ## Git 候选与失败处理
 
-首版接收已提交、工作区与索引都干净的候选。fixed point 必须可解析为提交；空 diff、未提交修改、缺少任务正文、不可用仓库、超限或不支持的工作区会记录失败轮次并说明原因。失败不推进任务修订/状态。改正文、指派或候选会使旧轮次失效，旧报告保留，但不能用于新候选通过。
+当前代码兼容路径接收已提交、工作区与索引都干净的候选。资料缺失在采集前拒绝，不创建空轮次。fixed point 必须可解析为提交；空 diff、未提交修改、不可用仓库、超限或不支持的工作区会记录采集失败轮次并说明原因。失败不推进任务修订/状态。修改目标、验收、交付类型、指派或候选会使旧轮次失效，旧报告保留，但不能用于新候选通过。
 
 候选检查不运行仓库的 clean/process filter、fsmonitor、external diff、textconv、hooks 或签名验证程序。禁用全部 Git 传输与缺失对象懒拉取；对象不完整时失败。直接比较固定树、索引及文件原始字节，支持 SHA-1/SHA-256 Git 对象；子模块、稀疏/转换工作区或无法完整表示的 diff 明确拒绝。命令超时 10 秒、diff 上限 2 MiB、提交列表上限 200；不会截断后冒充完整候选。
 
@@ -46,6 +56,8 @@ HTTP 为 `/api/projects/:projectId/tasks` 及任务详情、`transitions`、`com
 ## 数据与页面
 
 v11 新增任务配置、任务、评论、历史、消息关联、评审轮次、报告和工作事件八张表。业务修改、历史、审计和事件在同一 RepoCtx 事务提交；通知失败不会把已经提交的业务误报为失败。SQLite 与 PostgreSQL 使用相同约束，数据复制覆盖新表。
+
+v16 为任务追加 `delivery_kind`、`acceptance_text` 和 `acceptance_source`。既有任务保持原 ID、状态、修订和评审记录，交付类型回填为 `code`，迁移时的旧正文复制为验收快照并标 `legacy_task_body`。这保留原有内容的来源，不生成新的验收承诺。之后修改目标不改动该快照；明确修改验收时标 `explicit`，历史与审计保留修改前后的验收及来源。新任务的验收来源为 `explicit`，空验收仍会阻断推进。
 
 归档项目可读但禁止写入。删除群组清除关联消息链接和该群上下文工作事件，保留项目任务与评论；删除项目清理全部任务实体及事件，保留既有审计。移除成员保留任务、评论、报告及作者身份。审计补偿或重新添加不会倒退任务/配置修订，也不会复活旧评审执行；需要重新接入、重新提交评审的情况见[生命周期说明](t3-member-lifecycle.md#当前-v13-行为与审计恢复)。
 

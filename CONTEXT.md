@@ -13,6 +13,7 @@
 | 术语 | 在本项目中的含义 | 来源 |
 | --- | --- | --- |
 | Agent vs Member | Agent 是跨项目的全局身份；Member 是 agent 或人在某个项目中的成员关系与岗位。 | `docs/architecture/agent-studio.md` §4.1 |
+| 项目配置版本 vs 工作区版本 | v15 的 `expectedProjectRevision` 比较项目名称/归档/工作区配置的真实版本，`workspaceRevision` 只标识追加的工作区快照；锁、消息与心跳不推进前者。重放旧 mutation 返回旧固定结果，不重新应用旧目录，须 GET 才取得当前状态。 | 2026-11-11 #135；`docs/project-workspaces.md`、`tests/workspace-service.test.ts` |
 | Project vs Group | Project 是协作容器（成员、组织树、任务板、记忆）；Group 是项目内的聊天空间，参与者是项目成员子集。 | 同上 |
 | Status vs 任务状态 | Status 是成员的在线/离线、等待/工作中的运行状态；任务状态属于 Task，两者分开建模。 | 同上 |
 | Agent 连接状态 vs Status | Agent 连接状态是全局 MCP 会话状态（connected/disconnected、最后心跳）；Status 是项目成员的 online/offline/waiting/working，按 `(project_id, member_id)` 记录。 | 决策票 #4（D1，2026-10-18） |

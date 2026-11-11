@@ -88,6 +88,39 @@ try {
   checked("nullable 录入保持 MCP 权限，未分派不投递工作事件", () => {
     assert.equal(forbiddenQuick.error.code, "FORBIDDEN"); assert.equal(noQuickEvent.status, "timeout");
   });
+  let assignedQuick = (await http("PATCH", `${prefix}/tasks/${quick.task.id}`, { expectedRevision: quick.task.revision, assigneeMemberId: worker.joined.memberId })).task;
+  const firstAssignment = await worker.call("wait_for_messages", { timeoutMs: 100 });
+  assert.equal(firstAssignment.workEvents?.[0]?.taskId, quick.task.id);
+  await worker.call("acknowledge_work_event", { eventId: firstAssignment.workEvents[0].id });
+  const noChange = await manager.call("update_task", { taskId: quick.task.id, expectedRevision: assignedQuick.revision, assigneeMemberId: worker.joined.memberId });
+  const staleAssignment = await http("PATCH", `${prefix}/tasks/${quick.task.id}`, { expectedRevision: quick.task.revision, assigneeMemberId: worker.joined.memberId }, 409);
+  const noRepeatedAssignment = await worker.call("wait_for_messages", { timeoutMs: 100 });
+  checked("实际分派从null产生一次事件，无变化MCP更新与旧CAS不重复通知", () => {
+    assert.equal(noChange.ok, true); assert.equal(noChange.task.revision, assignedQuick.revision);
+    assert.equal(staleAssignment.error.code, "conflict"); assert.equal(noRepeatedAssignment.status, "timeout");
+  });
+  assignedQuick = (await manager.call("update_task", { taskId: quick.task.id, expectedRevision: assignedQuick.revision, assigneeMemberId: reviewer.joined.memberId })).task;
+  const reassigned = await reviewer.call("wait_for_messages", { timeoutMs: 100 });
+  const oldRecipient = await worker.call("wait_for_messages", { timeoutMs: 100 });
+  checked("实际改派只通知新负责人，不通知旧负责人", () => {
+    assert.equal(reassigned.workEvents?.length, 1); assert.equal(reassigned.workEvents[0].taskId, quick.task.id);
+    assert.equal(oldRecipient.status, "timeout");
+  });
+  await reviewer.call("acknowledge_work_event", { eventId: reassigned.workEvents[0].id });
+  assignedQuick = (await http("PATCH", `${prefix}/tasks/${quick.task.id}`, { expectedRevision: assignedQuick.revision, assigneeMemberId: null })).task;
+  assert.equal(assignedQuick.assigneeMemberId, null);
+  const finding = (await http("PATCH", `${prefix}/tasks/${quick.task.id}`, { expectedRevision: assignedQuick.revision, assigneeMemberId: worker.joined.memberId,
+    reviewerMemberId: reviewer.joined.memberId, deliveryKind: "finding", body: "整理事实与来源", acceptanceText: "结论可以复核", repoPath: repository, fixedPoint: baseCommit })).task;
+  const findingAssignment = await worker.call("wait_for_messages", { timeoutMs: 100 });
+  await worker.call("acknowledge_work_event", { eventId: findingAssignment.workEvents[0].id });
+  const findingStarted = await worker.call("transition_task", { taskId: finding.id, expectedRevision: finding.revision, state: "in-progress" });
+  const findingReview = await http("POST", `${prefix}/tasks/${finding.id}/reviews`, { expectedRevision: findingStarted.task.revision }, 400);
+  const findingDetail = await http("GET", `${prefix}/tasks/${finding.id}`);
+  const noFindingReviewEvent = await reviewer.call("wait_for_messages", { timeoutMs: 100 });
+  checked("非代码任务即使附真实Git也不能使用旧评审，不创建轮次或评审就绪事件", () => {
+    assert.equal(findingStarted.ok, true); assert.ok(findingReview.error.details.reasonCodes.includes("candidate_type_requires_v2"));
+    assert.equal(findingDetail.task.state, "in-progress"); assert.deepEqual(findingDetail.rounds, []); assert.equal(noFindingReviewEvent.status, "timeout");
+  });
   await http("PUT", `${prefix}/task-settings`, { expectedRevision: 0, defaultReviewerMemberId: reviewer.joined.memberId });
   let task = (await http("POST", `${prefix}/tasks`, { title: "验证任务协议链", body: "README 应记录候选结果。", labels: ["protocol"],
     deliveryKind: "code", acceptanceText: "README 应记录候选结果，并通过指定候选两轴检查。",

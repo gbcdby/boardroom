@@ -85,13 +85,16 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
     if (!task) throw new NotFoundError("任务不存在或不属于当前项目。");
     return task;
   }
+  function withMaterials(task: Task, assignee: Member | null | undefined, reviewer: Member | null | undefined): TaskView {
+    const active = (member: Member | null | undefined) => !!member && member.projectId === task.projectId && member.status === "active" && member.removedAt === null;
+    return { ...task, materialStatus: assessTaskMaterials(task, { assigneeValid: active(assignee), reviewerValid: active(reviewer) && reviewer?.kind === "agent" }) };
+  }
   async function present(task: Task): Promise<TaskView> {
     const [assignee, reviewer] = await Promise.all([
       task.assigneeMemberId ? repos.members.get(task.assigneeMemberId) : null,
       task.reviewerMemberId ? repos.members.get(task.reviewerMemberId) : null,
     ]);
-    const active = (member: Member | null) => !!member && member.projectId === task.projectId && member.status === "active" && member.removedAt === null;
-    return { ...task, materialStatus: assessTaskMaterials(task, { assigneeValid: active(assignee), reviewerValid: active(reviewer) && reviewer?.kind === "agent" }) };
+    return withMaterials(task, assignee, reviewer);
   }
   async function requireMaterials(task: Task, stage: TaskMaterialStage): Promise<void> {
     const status = (await present(task)).materialStatus, phase = status[stage];
@@ -258,7 +261,12 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         return settings;
       }, "write", { memberIds: [value.defaultReviewerMemberId], taskDefaults: true });
     },
-    async list(access, projectId, filter = {}) { const parsed = parseTaskInput(listTasksSchema, filter); await actorFor(access, projectId); return Promise.all((await repos.tasks.list(projectId, parsed)).map(present)); },
+    async list(access, projectId, filter = {}) {
+      const parsed = parseTaskInput(listTasksSchema, filter); await actorFor(access, projectId);
+      const [tasks, members] = await Promise.all([repos.tasks.list(projectId, parsed), repos.members.listByProject(projectId)]);
+      const byId = new Map(members.map(member => [member.id, member]));
+      return tasks.map(task => withMaterials(task, byId.get(task.assigneeMemberId ?? ""), byId.get(task.reviewerMemberId ?? "")));
+    },
     async get(access, projectId, taskId) {
       const actor = await actorFor(access, projectId); const task = await required(projectId, taskId);
       const [comments, records, rounds, reports, links] = await Promise.all([repos.tasks.listComments(projectId, taskId), repos.tasks.listHistory(projectId, taskId), repos.tasks.listRounds(projectId, taskId), repos.tasks.listReports(projectId, taskId), repos.tasks.listMessageLinks(projectId, taskId)]);

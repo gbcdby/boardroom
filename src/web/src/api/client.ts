@@ -137,12 +137,14 @@ export class ApiError extends Error {
   readonly code: string;
   readonly status: number;
   readonly reason: string | undefined;
+  readonly details: unknown;
 
-  constructor(status: number, code: string, message: string, reason?: string) {
+  constructor(status: number, code: string, message: string, reason?: string, details?: unknown) {
     super(message);
     this.status = status;
     this.reason = reason;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -163,12 +165,13 @@ export async function request<T>(method: string, path: string, body?: unknown): 
   }
 
   if (!response.ok) {
-    const error = (payload as { error?: { code?: string; message?: string; reason?: string } } | null)?.error;
+    const error = (payload as { error?: { code?: string; message?: string; reason?: string; details?: unknown } } | null)?.error;
     throw new ApiError(
       response.status,
       error?.code ?? "unknown_error",
       error?.message ?? `请求失败（HTTP ${response.status}）`,
       error?.reason,
+      error?.details,
     );
   }
   return payload as T;

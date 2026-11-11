@@ -79,9 +79,24 @@ both("显式清空与默认评审人不同，实际改派只通知新执行人�
   assert.equal((await repos.tasks.listUnackedWorkEvents(p.project.id, p.worker.id)).filter(event => event.taskId === task.id && event.kind === "task.assigned").length, 1);
   task = await service.update(p.owner, p.project.id, task.id, { expectedRevision: task.revision, assigneeMemberId: p.worker.id });
   assert.equal((await repos.tasks.listUnackedWorkEvents(p.project.id, p.worker.id)).filter(event => event.taskId === task.id && event.kind === "task.assigned").length, 2);
+  task = await service.update(p.owner, p.project.id, task.id, { expectedRevision: task.revision, assigneeMemberId: p.reviewer.id });
+  assert.equal((await repos.tasks.listUnackedWorkEvents(p.project.id, p.worker.id)).filter(event => event.taskId === task.id).length, 2, "改派不再通知旧负责人");
+  assert.equal((await repos.tasks.listUnackedWorkEvents(p.project.id, p.reviewer.id)).filter(event => event.taskId === task.id && event.kind === "task.assigned").length, 1);
   await repos.members.setStatus(p.reviewer.id, "disabled");
+  const changed = (await service.get(p.owner, p.project.id, task.id)).task;
+  assert.ok(changed.materialStatus.startExecution.reasonCodes.includes("assignee_invalid"));
+  assert.deepEqual((await service.list(p.owner, p.project.id)).find(item => item.id === task.id)?.materialStatus, changed.materialStatus, "列表与详情使用相同的当前成员资料观察");
   assert.equal((await service.create(p.owner, p.project.id, { title: "失效默认不阻断录入" })).reviewerMemberId, null);
   await assert.rejects(service.create(p.owner, p.project.id, { title: "显式失效仍拒绝", reviewerMemberId: p.reviewer.id }), { reason: "reviewer_invalid" });
+});
+
+both("资料字段受数据库约束，非法类别或来源不会写入", async (repos, db) => {
+  const p = await people(repos), service = createTaskService({ repos });
+  const task = await service.create(p.owner, p.project.id, { title: "类型约束", deliveryKind: null });
+  for (const [column, value] of [["delivery_kind", "unknown"], ["acceptance_source", "fabricated"], ["acceptance_text", null]] as const) {
+    await assert.rejects(db.exec(`UPDATE tasks SET ${column} = ? WHERE id = ?`, [value, task.id]));
+  }
+  assert.deepEqual((await service.get(p.owner, p.project.id, task.id)).task, task);
 });
 
 both("交付类型与明确验收持久保存，修改保留原验收快照", async repos => {

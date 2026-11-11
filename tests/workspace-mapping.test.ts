@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, rm, realpath } from "node:fs/promises";
+import { mkdir, rm, realpath, mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { mapLegacyWorkspaces } from "../src/server/workspace/legacy-mapping.ts";
 import { createLegacyConfigInspector, selectLegacyConfigSnapshot } from "../src/server/identity/legacy-config-inspection.ts";
@@ -9,13 +10,20 @@ import { snapshotRuntimeConfig } from "../src/server/runtime/config.ts";
 import { resolveBoardroomEnvironment } from "../src/server/environment.ts";
 import { identityFixture, identityEngines, identitySkip } from "./helpers/identity-fixture.ts";
 
+async function fixture(engine: typeof identityEngines[number]) {
+  const f = await identityFixture(engine);
+  const sourceBase = await mkdtemp(path.join(tmpdir(), "boardroom-workspace-mapping-"));
+  const environment = await resolveBoardroomEnvironment({ cwd: f.dir, env: { BOARDROOM_HOME: path.join(f.dir, "home"), AGENT_STUDIO_DATA_DIR: f.dir } });
+  return { ...f, sourceBase, environment, async close() { await f.close(); await rm(sourceBase, { recursive: true, force: true }); } };
+}
+
 for (const engine of identityEngines) {
   test(`${engine} S3 映射保留三原路径/版本引用：requested 选择不被最新 effective 覆盖，目录不一留 unresolved`, { skip: identitySkip(engine) }, async () => {
-    const f = await identityFixture(engine);
+    const f = await fixture(engine);
     try {
-      const dirs = ["applied", "requested", "effective"].map(name => path.join(f.dir, name));
+      const dirs = ["applied", "requested", "effective"].map(name => path.join(f.sourceBase, name));
       for (const dir of dirs) await mkdir(dir);
-      const environment = await resolveBoardroomEnvironment({ cwd: f.dir, env: { BOARDROOM_HOME: path.join(f.dir, "home") } });
+      const environment = f.environment;
       const p = await f.repos.projects.create({ name: "三份来源" });
       const g = await f.repos.groups.create({ projectId: p.id, name: "原绑定" });
       const runtimes = createRuntimeRepository(f.db, { repos: f.repos });
@@ -42,10 +50,10 @@ for (const engine of identityEngines) {
   });
 
   test(`${engine} S3 映射同根仅给建议；限定参与绑定，外项目/损坏来源不被降级或自动选公共父目录`, { skip: identitySkip(engine) }, async () => {
-    const f = await identityFixture(engine);
+    const f = await fixture(engine);
     try {
-      const a = path.join(f.dir, "source-a"), b = path.join(f.dir, "source-b"); await mkdir(a); await mkdir(b);
-      const environment = await resolveBoardroomEnvironment({ cwd: f.dir, env: { BOARDROOM_HOME: path.join(f.dir, "home") } });
+      const a = path.join(f.sourceBase, "source-a"), b = path.join(f.sourceBase, "source-b"); await mkdir(a); await mkdir(b);
+      const environment = f.environment;
       const p = await f.repos.projects.create({ name: "本项目" }), other = await f.repos.projects.create({ name: "外项目" });
       const groups = await Promise.all(["甲", "乙"].map(name => f.repos.groups.create({ projectId: p.id, name })));
       const outside = await f.repos.groups.create({ projectId: other.id, name: "外群" });
