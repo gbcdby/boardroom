@@ -48,6 +48,207 @@ def layout(page, label, strict=True):
         assert max(dimensions["document"], dimensions["body"]) <= dimensions["viewport"] + 1, f"{label}: 整页溢出 {dimensions}"
     return {"view": label, **dimensions}
 
+def confirmation_flows(page, origin, project_id, org_project_id, output, report):
+    """真实操作与数据结果；仅对拒绝/响应丢失场景注入传输故障。"""
+    observed = []
+    def collect(req):
+        if req.method in ("POST", "DELETE"):
+            observed.append({"path": urlsplit(req.url).path, "method": req.method, "body": json.loads(req.post_data) if req.post_data else None})
+    page.on("request", collect)
+    def writes(path, method):
+        return [item for item in observed if item["path"] == path and item["method"] == method]
+    def committed_purges(path):
+        return [item for item in writes(path, "DELETE") if item["body"] and item["body"].get("confirm")]
+    def toast(message):
+        item = page.get_by_test_id("toast").filter(has_text=message)
+        expect(item).to_have_count(1)
+        item.get_by_role("button").click()
+    def cancel_with_keyboard(trigger, cancel_id="confirm-cancel"):
+        dialog = page.get_by_test_id("confirmation-dialog")
+        expect(dialog).to_be_visible()
+        assert dialog.evaluate("el => el.tagName === 'DIALOG' && el.open"), "必须使用原生模态 dialog"
+        expect(page.get_by_test_id(cancel_id)).to_be_focused()
+        for _ in range(3):
+            page.keyboard.press("Tab")
+            assert dialog.evaluate("el => el.contains(document.activeElement)"), "焦点离开模态窗口"
+        page.keyboard.press("Escape")
+        expect(dialog).not_to_be_visible()
+        expect(trigger).to_be_focused()
+
+    page.goto(origin + f"/projects/{project_id}/overview?archived=1")
+    expect(page.get_by_test_id("member-list")).to_contain_text("可访问性验证成员")
+    member = request(page, origin, "GET", f"/api/projects/{project_id}/members")["members"][0]
+    member_path = f"/api/projects/{project_id}/members/{member['id']}"
+    member_row = page.get_by_test_id("member-list").locator("li").filter(has_text=member["displayName"])
+    member_row.locator("summary").click()
+    remove = member_row.get_by_role("button", name="移除", exact=True)
+    page.get_by_test_id("new-member-name").fill("删除成员期间保留的草稿")
+    remove.click()
+    expect(page.get_by_test_id("confirmation-dialog")).to_contain_text(member["displayName"])
+    cancel_with_keyboard(remove)
+    assert not writes(member_path, "DELETE"), "取消成员移除产生了写请求"
+    assert any(item["id"] == member["id"] for item in request(page, origin, "GET", f"/api/projects/{project_id}/members")["members"])
+
+    held = []
+    def hold_remove(route):
+        if route.request.method == "DELETE": held.append(route)
+        else: route.continue_()
+    route_pattern = "**" + member_path
+    page.route(route_pattern, hold_remove)
+    remove.click()
+    confirm = page.get_by_test_id("confirm-submit")
+    confirm.click()
+    expect(confirm).to_be_disabled()
+    expect(page.get_by_test_id("confirm-cancel")).to_be_disabled()
+    confirm.dispatch_event("click")
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("confirmation-dialog")).to_be_visible()
+    assert len(held) == 1, "pending 中重复提交成员移除"
+    held.pop().fulfill(status=409, content_type="application/json", body=json.dumps({"error": {"code": "ui_test_conflict", "message": "测试：成员关系已变化，请核对后重试"}}))
+    expect(page.get_by_test_id("confirmation-error")).to_contain_text("成员关系已变化")
+    expect(confirm).to_be_enabled()
+    confirm.click()
+    expect(confirm).to_be_disabled()
+    assert len(held) == 1
+    failed_response = held.pop()
+    actual = failed_response.fetch()
+    assert actual.status == 204, f"真实移除未完成：{actual.status}"
+    failed_response.abort("failed")  # 服务端已提交，但浏览器没有可信完成回执。
+    expect(page.get_by_test_id("confirmation-error")).to_contain_text("操作结果未知")
+    expect(confirm).to_be_disabled()
+    page.unroute(route_pattern, hold_remove)
+    page.get_by_test_id("confirmation-reconcile").click()
+    expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
+    expect(page.locator("h1")).to_be_focused()
+    expect(page.get_by_test_id("new-member-name")).to_have_value("删除成员期间保留的草稿")
+    page.get_by_test_id("new-member-name").fill("")
+    assert len(writes(member_path, "DELETE")) == 2, "一次被拒绝、一次明确重试后，不应再次发送移除"
+    assert not request(page, origin, "GET", f"/api/projects/{project_id}/members")["members"]
+    toast(f"成员「{member['displayName']}」已移除。")
+    report["checks"].append("S6-AC01/02/05: 成员取消/Escape与还焦；pending单飞；注入409拒绝与提交后响应丢失，权威核对完成且保留草稿")
+
+    group = request(page, origin, "GET", f"/api/projects/{project_id}/groups")["groups"][0]
+    group_path = f"/api/groups/{group['id']}"
+    page.get_by_test_id("group-management").locator("summary").click()
+    archive_group = page.get_by_test_id("archive-group")
+    archive_group.click()
+    cancel_with_keyboard(archive_group)
+    assert not writes(group_path + "/archive", "POST")
+    archive_group.click()
+    page.get_by_test_id("confirm-submit").click()
+    expect(page.get_by_test_id("group-archived-badge")).to_be_visible()
+    assert len(writes(group_path + "/archive", "POST")) == 1
+    toast(f"群组「{group['name']}」已归档")
+    page.get_by_test_id("restore-group").click()
+    expect(page.get_by_test_id("group-archived-badge")).to_have_count(0)
+    toast(f"群组「{group['name']}」已恢复")
+
+    purge_group = page.get_by_test_id("purge-group")
+    purge_group.click()
+    expect(page.get_by_test_id("group-purge-confirm")).to_contain_text("记忆正文与版本历史全部保留")
+    expect(page.get_by_test_id("confirm-purge-group")).to_be_enabled()
+    cancel_with_keyboard(purge_group, "cancel-purge-group")
+    assert not committed_purges(group_path), "预览取消不能发送确认 token"
+    assert len(request(page, origin, "GET", f"/api/projects/{project_id}/groups")["groups"]) == 1
+    with page.expect_response(lambda r: r.url.endswith(group_path) and r.request.method == "DELETE") as preview_response:
+        purge_group.click()
+    previous_token = preview_response.value.json()["confirmation"]["token"]
+    def changed_confirmation(route):
+        if route.request.method == "DELETE" and route.request.post_data:
+            route.fulfill(status=409, content_type="application/json", body=json.dumps({"error": {"code": "confirmation_changed", "message": "测试：删除影响已变化，请重新预览"}}))
+        else: route.continue_()
+    group_pattern = "**" + group_path
+    page.route(group_pattern, changed_confirmation)
+    page.get_by_test_id("confirm-purge-group").click()
+    expect(page.get_by_test_id("confirmation-error")).to_contain_text("删除影响已变化")
+    expect(page.get_by_test_id("confirm-purge-group")).to_be_disabled()
+    page.unroute(group_pattern, changed_confirmation)
+    with page.expect_response(lambda r: r.url.endswith(group_path) and r.request.method == "DELETE") as latest_response:
+        page.get_by_test_id("confirmation-preview").click()
+    latest_token = latest_response.value.json()["confirmation"]["token"]
+    assert previous_token != latest_token
+    assert len(committed_purges(group_path)) == 1, "重新预览不能自动删除"
+    page.get_by_test_id("confirm-purge-group").click()
+    expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
+    assert len(committed_purges(group_path)) == 2
+    assert committed_purges(group_path)[-1]["body"]["confirm"] == latest_token
+    assert not request(page, origin, "GET", f"/api/projects/{project_id}/groups?includeArchived=true")["groups"]
+    toast(f"群组「{group['name']}」已永久删除")
+    report["checks"].append("S6-AC01/03: 群归档取消/确认/恢复；群purge取消；注入confirmation_changed后重新预览及再次确认，实际删除仅使用新token（不作为后端CAS证据）")
+
+    page.get_by_test_id("project-actions").locator("summary").click()
+    archive_project = page.get_by_test_id("archive-project")
+    archive_project.click()
+    cancel_with_keyboard(archive_project)
+    assert not writes(f"/api/projects/{project_id}/archive", "POST")
+    archive_project.click()
+    page.get_by_test_id("confirm-submit").click()
+    expect(page.get_by_test_id("project-archived-badge")).to_be_visible()
+    expect(page.get_by_test_id("new-member-name")).to_be_disabled()
+    assert len(writes(f"/api/projects/{project_id}/archive", "POST")) == 1
+    toast("项目「浏览器操作创建的项目」已归档")
+    page.get_by_test_id("restore-project").click()
+    expect(page.get_by_test_id("project-archived-badge")).to_have_count(0)
+    toast("项目「浏览器操作创建的项目」已恢复")
+    project_path = f"/api/projects/{project_id}"
+    purge_project = page.get_by_test_id("purge-project")
+    purge_project.click()
+    expect(page.get_by_test_id("project-purge-confirm")).to_contain_text("组织岗位")
+    expect(page.get_by_test_id("confirm-purge-project")).to_be_enabled()
+    for width, height in [(1440, 1000), (390, 844)]:
+        page.set_viewport_size({"width": width, "height": height})
+        dialog = page.get_by_test_id("confirmation-dialog")
+        body = dialog.locator(".confirm-dialog-body")
+        if width == 390:
+            assert body.evaluate("el => el.scrollHeight > el.clientHeight"), "窄窗长清单应在正文内滚动"
+            body.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+        rect = dialog.bounding_box()
+        assert rect and rect["x"] >= 0 and rect["y"] >= 0 and rect["x"] + rect["width"] <= width + 1 and rect["y"] + rect["height"] <= height + 1
+        expect(page.get_by_test_id("confirm-purge-project")).to_be_in_viewport()
+        expect(page.get_by_test_id("cancel-purge-project")).to_be_in_viewport()
+        filename = f"confirmation-project-purge-{width}-light.png"
+        page.screenshot(path=str(output / filename), animations="disabled")
+        report["screenshots"].append(filename)
+        report["layouts"].append(layout(page, f"confirmation-{width}"))
+    cancel_with_keyboard(purge_project, "cancel-purge-project")
+    assert not committed_purges(project_path)
+    assert any(item["id"] == project_id for item in request(page, origin, "GET", "/api/projects?includeArchived=true")["projects"])
+    page.set_viewport_size({"width": 1440, "height": 1000})
+    purge_project.click()
+    page.get_by_test_id("confirm-purge-project").click()
+    expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
+    expect(page.locator("h1")).to_be_focused()
+    assert len(committed_purges(project_path)) == 1
+    assert not any(item["id"] == project_id for item in request(page, origin, "GET", "/api/projects?includeArchived=true")["projects"])
+    toast("项目「浏览器操作创建的项目」已永久删除。")
+    report["checks"].append("S6-AC01/03/04/05: 项目归档/恢复与只读保护，purge长清单390/1440截图、取消与单次确认，目标消失后标题还焦及全局Toast")
+
+    org = request(page, origin, "GET", f"/api/projects/{org_project_id}/org")
+    target = next(node for node in org["nodes"] if node["name"] == "产品设计")
+    child = request(page, origin, "POST", f"/api/projects/{org_project_id}/org/nodes", {"name": "验证下级提升", "role": "member", "parentId": target["id"]})["node"]
+    page.goto(origin + f"/projects/{org_project_id}/org")
+    page.locator(f"button[aria-controls='node-editor-{target['id']}']").click()
+    editor = page.get_by_role("region", name="编辑岗位：产品设计", exact=True)
+    delete_node = editor.get_by_role("button", name="删除岗位", exact=True)
+    delete_node.click()
+    expect(page.get_by_test_id("confirmation-dialog")).to_contain_text("下级岗位会移交给上级")
+    cancel_with_keyboard(delete_node)
+    node_path = f"/api/org/nodes/{target['id']}"
+    assert not writes(node_path, "DELETE")
+    delete_node.click()
+    page.get_by_test_id("confirm-submit").click()
+    expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
+    expect(page.locator("h1")).to_be_focused()
+    assert len(writes(node_path, "DELETE")) == 1
+    latest_org = request(page, origin, "GET", f"/api/projects/{org_project_id}/org")
+    assert not any(node["id"] == target["id"] for node in latest_org["nodes"])
+    assert next(node for node in latest_org["nodes"] if node["id"] == child["id"])["parentId"] == target["parentId"]
+    assert len(latest_org["members"]) == len(org["members"]), "删除岗位不能删除成员"
+    toast("岗位「产品设计」已删除，成员与历史保留。")
+    report["checks"].append("S6-AC01/05: 岗位删除取消/确认、下级提升与成员保留，目标消失后可用焦点")
+    report["confirmationRequests"] = {"member": len(writes(member_path, "DELETE")), "groupArchive": len(writes(group_path + "/archive", "POST")), "groupPurgeWithToken": len(committed_purges(group_path)), "projectArchive": len(writes(project_path + "/archive", "POST")), "projectPurgeWithToken": len(committed_purges(project_path)), "orgDelete": len(writes(node_path, "DELETE"))}
+    page.remove_listener("request", collect)
+
 def exercise(page, origin, records, output, report, capture_only):
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
@@ -201,12 +402,13 @@ def exercise(page, origin, records, output, report, capture_only):
     name.fill("浏览器操作创建的项目")
     page.get_by_test_id("create-project").click()
     expect(page.get_by_test_id("project-detail")).to_contain_text("浏览器操作创建的项目")
-    expect(page.get_by_test_id("context-notice")).to_be_visible()
+    expect(page.get_by_test_id("toast-message").filter(has_text="项目「浏览器操作创建的项目」已创建。")).to_have_count(1)
+    created_project_id = page.get_by_test_id("current-project").input_value()
     member = page.get_by_test_id("new-member-name")
     member.fill("可访问性验证成员")
     page.get_by_test_id("add-member").click()
     expect(page.get_by_test_id("member-list")).to_contain_text("可访问性验证成员")
-    expect(page.get_by_test_id("notice")).to_be_visible()
+    expect(page.get_by_test_id("toast-message").filter(has_text="成员「可访问性验证成员」已添加。")).to_have_count(1)
     page.get_by_test_id("new-group-name").fill("浏览器创建群组")
     page.get_by_test_id("participant-picker").get_by_role("checkbox").first.check()
     page.get_by_test_id("create-group").click()
@@ -222,7 +424,7 @@ def exercise(page, origin, records, output, report, capture_only):
     editor = page.get_by_role("region", name="编辑岗位：项目统筹", exact=True)
     editor.get_by_label("岗位名称", exact=True).fill("协作统筹")
     editor.get_by_role("button", name="改名", exact=True).click()
-    expect(page.get_by_test_id("notice")).to_contain_text("岗位已改名")
+    expect(page.get_by_test_id("toast-message").filter(has_text="岗位已改名")).to_have_count(1)
     expect(page.get_by_test_id("org-node-list")).to_contain_text("协作统筹")
     page.goto(origin + f"/projects/{project_id}/audit")
     page.get_by_test_id("audit-revoke").first.click()
@@ -230,6 +432,7 @@ def exercise(page, origin, records, output, report, capture_only):
     nodes = request(page, origin, "GET", f"/api/projects/{project_id}/org")["nodes"]
     assert any(node["name"] == "项目统筹" and node["parentId"] is None for node in nodes), "岗位改名没有被真正撤销"
     report["checks"].append("UI-05: 组织按需编辑、实际改名与审计撤销")
+    confirmation_flows(page, origin, created_project_id, project_id, output, report)
     assert not errors, f"页面JavaScript错误: {errors}"
     report["status"] = "PASS"
 
