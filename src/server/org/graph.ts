@@ -38,7 +38,7 @@ export async function captureOrgGraph(repos: RepositorySet, projectId: string, n
   for (const id of memberIds) {
     const member = await repos.members.get(id);
     if (!member || member.projectId !== projectId) conflict("原占岗成员已移除或换代。");
-    assignments.push({ memberId: id, nodeId: member.nodeId, legacyRole: member.role });
+    assignments.push({ memberId: id, nodeId: member.nodeId, legacyRole: member.role, membershipRevision: member.membershipRevision });
   }
   const result: OrgGraphSnapshotV2 = { schema: "org-graph/v2", projectId, targetId: nodeId, node, childEdges, assignments, directChildIds: children.map(c => c.node_id) };
   assertCompleteAuditFields(result); return result;
@@ -60,7 +60,7 @@ export async function applyOrgGraph(repos: RepositorySet, expected: OrgGraphSnap
   const watch = { childIds: [...new Set([...expected.childEdges, ...target.childEdges].map(c => c.nodeId))],
     memberIds: [...new Set([...expected.assignments, ...target.assignments].map(m => m.memberId))] };
   const actualBefore = await captureOrgGraph(repos, expected.projectId, expected.targetId, watch, includeRelations);
-  if (!equalGraph(actualBefore, expected)) conflict("岗位内容、直接下级集合或占岗已变化，不能覆盖后续修改。");
+  if (!equalGraph(actualBefore, expected)) conflict("岗位内容、直接下级集合、占岗或成员代际已变化，不能覆盖后续修改。");
   if (expected.node && target.node && expected.node.id !== target.node.id) conflict();
   if (target.node) {
     await validateParent(repos, target.projectId, target.targetId, target.node.parentId);

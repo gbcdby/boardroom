@@ -18,7 +18,9 @@ import { createPostgresDriver } from "./drivers/postgres.ts";
 /** 一次查询的行结果。 */
 export type DbRow = Record<string, unknown>;
 
-/** 同一物理事务（含 SAVEPOINT）共享的内部状态；事务结束后不可继续使用。 */
+/** 同一物理事务共享的内部状态；SAVEPOINT 回滚恢复此前条目，事务结束后不可继续使用。
+ * value 视为不可变值：修改时替换条目，不能原地修改对象绕过保存点恢复。
+ */
 export interface DbTransactionContext { readonly values: Map<symbol, unknown> }
 
 /** 事务会话：事务内的语句只在事务可见范围内生效。 */

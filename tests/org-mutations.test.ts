@@ -28,6 +28,50 @@ async function withDb(engine: "sqlite" | "postgres", body: (repos: RepositorySet
 }
 for (const engine of ["sqlite", "postgres"] as const) {
   const skip = engine === "postgres" && !pgUrl ? "未配置真实 PostgreSQL；交 CI 执行" : false;
+  test(`${engine} R-P5-C-REQ-001：岗位图绑定占岗成员代际，移除后重新加入或恢复不能继承旧岗位`, { skip }, async () => withDb(engine, async repos => {
+    const service = createOrgMutationService({ repos }), compensation = createAuditCompensationService({ repos });
+    for (const mode of ['readd', 'undo-remove'] as const) {
+      const p = await repos.projects.create({ name: `岗位代际 ${mode}` });
+      const agent = await repos.agents.create({ displayName: `代际 Agent ${mode}`, hostType: 'other' });
+      const added = await service.addMember(access, { projectId: p.id, kind: 'agent', agentId: agent.id, displayName: '原周期' });
+      const root = await service.createNode(access, { projectId: p.id, name: '根', role: 'top_manager' });
+      const node = await service.createNode(access, { projectId: p.id, parentId: root.node.id, name: '旧岗位', role: 'member' });
+      await service.assignNode(access, p.id, added.member.id, node.node.id);
+      const deleted = await service.deleteNode(access, p.id, node.node.id);
+      const removed = await service.removeMember(access, p.id, added.member.id);
+      if (mode === 'readd') await service.addMember(access, { projectId: p.id, kind: 'agent', agentId: agent.id, displayName: '新周期' });
+      else await compensation.revoke(access, p.id, removed.auditId);
+      const current = (await repos.members.get(added.member.id))!;
+      assert.equal(current.membershipRevision, 3); assert.equal(current.nodeId, null);
+      const auditCount = (await repos.audit.list(p.id)).length;
+      await assert.rejects(compensation.revoke(access, p.id, deleted.auditId), { code: 'compensation_conflict' });
+      assert.deepEqual(await repos.members.get(added.member.id), current);
+      assert.equal(await repos.org.getNode(node.node.id), null);
+      assert.equal((await repos.audit.list(p.id)).length, auditCount);
+      const original = (await repos.audit.get(p.id, deleted.auditId))!;
+      assert.equal(original.reversedAt, null);
+      assert.equal(JSON.parse(original.before!).assignments[0].membershipRevision, 1);
+      assert.equal(JSON.parse(original.after!).assignments[0].membershipRevision, 1);
+    }
+  }));
+  test(`${engine} 旧岗位图占岗缺代际时明确拒绝，不猜当前代际或默认1`, { skip }, async () => withDb(engine, async (repos, db) => {
+    const p = await repos.projects.create({ name: '缺代际旧v2' });
+    const m = await repos.members.create({ projectId: p.id, kind: 'human', displayName: '旧占岗者' });
+    const node = await repos.org.createNode({ projectId: p.id, name: '根岗位', role: 'top_manager' });
+    await repos.org.assignNode(m.id, node.id);
+    const service = createOrgMutationService({ repos }), compensation = createAuditCompensationService({ repos });
+    const deleted = await service.deleteNode(access, p.id, node.id);
+    const row = (await repos.audit.get(p.id, deleted.auditId))!;
+    const before = JSON.parse(row.before!), after = JSON.parse(row.after!);
+    for (const snapshot of [before, after]) for (const assignment of snapshot.assignments) delete assignment.membershipRevision;
+    await db.exec('UPDATE audit_log SET before = ?, after = ? WHERE id = ?', [JSON.stringify(before), JSON.stringify(after), row.id]);
+    await assert.rejects(compensation.revoke(access, p.id, row.id), { code: 'legacy_incomplete_snapshot' });
+    assert.equal(await repos.org.getNode(node.id), null);
+    assert.equal((await repos.members.get(m.id))!.nodeId, null);
+    assert.equal((await repos.members.get(m.id))!.role, 'normal');
+    assert.equal((await repos.audit.get(p.id, row.id))!.reversedAt, null);
+    assert.equal((await repos.audit.list(p.id)).length, 1);
+  }));
   test(`${engine} 合法大快照按列有界读取，三次撤销不重复读取整行历史`, { skip }, async () => withDb(engine, async (repos, db) => {
     const p = await repos.projects.create({ name: "大快照边界" });
     const originalName = "\\".repeat(14000), updatedName = "\"".repeat(14000);

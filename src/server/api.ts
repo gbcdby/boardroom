@@ -43,7 +43,6 @@ import {
   appendAuditEntry,
   auditActorFrom,
   auditView,
-  isTruncated,
   revokeUnavailableReason,
   type AuditAction,
   type AuditEntry,
@@ -1080,9 +1079,20 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         const auditId = decodeSegment(segments[4]!);
         // F2：org:revoke 仅人（owner）。agent 主体在此被 authorize 直接拒绝（#30 §5）。
         const { actor } = (await (guard(r, request, "org:revoke", { projectId })));
-        const row = (await (r.audit.get(projectId, auditId)));
+        // 锁外只读取有界状态；历史损坏的大正文不能绕过补偿服务的采集预算。
+        // 真正快照、链关系与当前权限仍在共同项目锁内重新读取和校验。
+        const byteLength = (column: string) => options.db.kind === "postgres" ? `octet_length(${column})` : `length(CAST(${column} AS BLOB))`;
+        const truncated = (column: string) => `CASE WHEN ${byteLength(column)} <= 32768 THEN CASE WHEN ${options.db.kind === "postgres" ? "strpos" : "instr"}(${column}, '"truncated":true') > 0 THEN 1 ELSE 0 END ELSE 0 END`;
+        const row = await r.context.one<{
+          action: string; reversed_at: string | null; before_truncated: number; after_truncated: number;
+          before_bytes: number | null; after_bytes: number | null; detail_bytes: number | null; target_name_bytes: number | null;
+        }>(`SELECT substr(action, 1, 129) AS action, substr(reversed_at, 1, 129) AS reversed_at,
+          ${byteLength("before")} AS before_bytes, ${byteLength("after")} AS after_bytes,
+          ${byteLength("detail")} AS detail_bytes, ${byteLength("target_name")} AS target_name_bytes,
+          ${truncated("before")} AS before_truncated, ${truncated("after")} AS after_truncated
+          FROM audit_log WHERE project_id = ? AND id = ?`, [projectId, auditId]);
         if (!row) throw new RepositoryError("not_found", `审计事件 ${auditId} 不存在。`);
-        if (row.reversedAt) {
+        if (row.reversed_at) {
           throw new RepositoryError("conflict", `审计事件 ${auditId} 已被撤销，不能重复撤销。`);
         }
         const reason = revokeUnavailableReason(row.action);
@@ -1090,8 +1100,11 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           throw new HttpError(403, reason, REVOKE_REASON_MESSAGE[reason] ?? "该操作不可撤销。");
         }
         // 截断事件失去完整快照，撤销补偿无法还原（#30 §1）。
-        if (isTruncated(row)) {
+        if (Number(row.before_truncated) === 1 || Number(row.after_truncated) === 1) {
           throw new HttpError(403, "truncated", REVOKE_REASON_MESSAGE.truncated ?? "该审计事件被截断，不可撤销。");
+        }
+        if ([row.before_bytes, row.after_bytes, row.detail_bytes, row.target_name_bytes].some(size => Number(size ?? 0) > 32768)) {
+          throw new RepositoryError("audit_snapshot_too_large", "历史审计字段超出完整快照上限。");
         }
         const newRow = await compensations.revoke(mutationAccess(actor, request, response), projectId, auditId);
         writeJson(response, 200, { entry: auditView(newRow) });

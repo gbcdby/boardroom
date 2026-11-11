@@ -85,6 +85,8 @@ function validateV2(value: unknown, row: ChainAudit, rootAction: string): Snapsh
     }
     for (const a of value.assignments) {
       if (!object(a) || !text(a.memberId) || !ref(a.nodeId) || !["manager", "normal"].includes(String(a.legacyRole))) invalid();
+      if (a.membershipRevision === undefined) throw new RepositoryError("legacy_incomplete_snapshot", "旧岗位图未记录占岗成员代际，不能将历史岗位授予重新加入的实例。");
+      if (!revision(a.membershipRevision)) invalid();
       memberIds.push(a.memberId);
     }
     if (!sortedUnique(childIds) || !sortedUnique(memberIds) || !isDeepStrictEqual(value.directChildIds, value.childEdges.filter(c => c.parentId === row.targetId).map(c => c.nodeId))) invalid();
@@ -116,7 +118,7 @@ function snapshotPair(row: SnapshotAudit, rootAction: string): { before: Snapsho
     if (pair.before.schema !== pair.after.schema) invalid();
     if (pair.before.schema === "org-graph/v2" && pair.after.schema === "org-graph/v2") {
       if (!isDeepStrictEqual(pair.before.childEdges.map(c => c.nodeId), pair.after.childEdges.map(c => c.nodeId)) ||
-        !isDeepStrictEqual(pair.before.assignments.map(m => m.memberId), pair.after.assignments.map(m => m.memberId))) invalid();
+        !isDeepStrictEqual(pair.before.assignments.map(m => [m.memberId, m.membershipRevision]), pair.after.assignments.map(m => [m.memberId, m.membershipRevision]))) invalid();
     }
     return pair;
   }

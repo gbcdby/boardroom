@@ -286,11 +286,31 @@ export interface GroupsRepository {
   delete(id: string): Promise<void>;
 }
 
+/** server-only 当前连接范围；代际来自可信 binding，不从工具参数接受。 */
+export interface MessageReadScope {
+  readonly projectId: string;
+  readonly groupId: string;
+  readonly memberId: string;
+  readonly membershipRevision: number;
+}
+export interface VisibleMessageOptions {
+  readonly afterSeq?: number;
+  readonly beforeSeq?: number;
+  readonly atSeq?: number;
+  readonly messageId?: string;
+  readonly unackedOnly?: boolean;
+  readonly newestFirst?: boolean;
+  readonly limit?: number;
+}
 export interface MessagesRepository {
   create(input: NewMessage): Promise<Message>;
   get(id: string): Promise<Message | null>;
   findByClientKey(senderMemberId: string, clientMessageId: string): Promise<Message | null>;
   listByGroup(groupId: string, options?: MessageListOptions): Promise<Message[]>;
+  /** 当前群的可见行先在 SQL 过滤；不提供 limit 时保留全部合法积压。调用方仍须检查能力/fence。 */
+  listVisibleForMember(scope: MessageReadScope, options?: VisibleMessageOptions): Promise<Message[]>;
+  /** 只计算原始 seq；不加载历史正文，也不将不可见行推进为已投递。 */
+  lastDeliveredSeq(scope: MessageReadScope): Promise<number | null>;
   /** T4（#51）：项目内消息总数（跨其全部群组），用于跨项目概览的「消息数」。 */
   countByProject(projectId: string): Promise<number>;
   /** T4（#51）：项目内最近一条消息的时间（ISO），无消息则返回 null（用于「最近活跃」）。 */
@@ -1382,6 +1402,15 @@ function toMessage(row: MessageRow): Message {
 }
 
 function createMessages(ctx: RepoCtx, driverKind: DbDriver["kind"]): MessagesRepository {
+  const mentionContains = driverKind === 'postgres'
+    ? 'm.mentions::jsonb @> jsonb_build_array(viewer.id)'
+    : "EXISTS (SELECT 1 FROM json_each(m.mentions) mention WHERE mention.type = 'text' AND mention.value = viewer.id)";
+  const participant = 'EXISTS (SELECT 1 FROM group_participants gp WHERE gp.group_id = m.group_id AND gp.member_id = viewer.id)';
+  function readScope(scope: MessageReadScope): unknown[] {
+    requireNonEmpty(scope.projectId, 'projectId'); requireNonEmpty(scope.groupId, 'groupId'); requireNonEmpty(scope.memberId, 'memberId');
+    if (!Number.isSafeInteger(scope.membershipRevision) || scope.membershipRevision < 1) throw new InvalidArgumentError('消息读取需要当前有效成员代际。');
+    return [scope.memberId, scope.projectId, scope.groupId, scope.membershipRevision];
+  }
   return {
     async create(input) {
       // 前置校验：错误必须明确，不留给数据库外键泛化报错。
@@ -1467,6 +1496,47 @@ function createMessages(ctx: RepoCtx, driverKind: DbDriver["kind"]): MessagesRep
         params.push(limit);
       }
       return (await ctx.query<MessageRow>(sql, params)).map(toMessage);
+    },
+    async listVisibleForMember(scope, options = {}) {
+      const params = readScope(scope);
+      // 等价于路由可见性 + task.messageVisible：能力/连接先由 core guard 判定，
+      // SQL 再复核同项目、当前代际、参与边、当前岗位与任务关系，不依赖发送时投递快照。
+      let sql = `SELECT m.* FROM messages m
+        JOIN groups g ON g.id = m.group_id
+        JOIN members viewer ON viewer.id = ? AND viewer.project_id = g.project_id
+        LEFT JOIN org_nodes n ON n.id = viewer.node_id AND n.project_id = viewer.project_id
+        WHERE g.project_id = ? AND m.group_id = ? AND viewer.membership_revision = ?
+          AND viewer.removed_at IS NULL AND viewer.status = 'active'
+          AND (viewer.kind = 'human' OR n.role = 'top_manager' OR (n.id IS NULL AND viewer.role = 'manager') OR ${participant})
+          AND (viewer.kind = 'human' OR viewer.role = 'manager' OR n.role IN ('top_manager', 'sub_manager')
+            OR m.sender_member_id = viewer.id OR ${mentionContains}
+            OR EXISTS (SELECT 1 FROM task_message_links link
+              JOIN tasks task ON task.project_id = link.project_id AND task.id = link.task_id
+              WHERE link.project_id = g.project_id AND link.group_id = m.group_id AND link.message_id = m.id
+                AND (task.assignee_member_id = viewer.id OR task.reviewer_member_id = viewer.id
+                  OR EXISTS (SELECT 1 FROM task_comments comment WHERE comment.project_id = task.project_id
+                    AND comment.task_id = task.id AND comment.author_actor_id = viewer.id))))`;
+      if (options.unackedOnly) sql += " AND NOT EXISTS (SELECT 1 FROM message_deliveries d WHERE d.message_id = m.id AND d.member_id = viewer.id AND d.project_id = g.project_id AND d.status = 'acked')";
+      if (options.afterSeq !== undefined) { sql += ' AND m.seq > ?'; params.push(options.afterSeq); }
+      if (options.beforeSeq !== undefined) { sql += ' AND m.seq < ?'; params.push(options.beforeSeq); }
+      if (options.atSeq !== undefined) { sql += ' AND m.seq = ?'; params.push(options.atSeq); }
+      if (options.messageId !== undefined) { sql += ' AND m.id = ?'; params.push(options.messageId); }
+      sql += ` ORDER BY m.seq ${options.newestFirst ? 'DESC' : 'ASC'}`;
+      if (options.limit !== undefined) {
+        if (!Number.isSafeInteger(options.limit) || options.limit < 1) throw new InvalidArgumentError('可见消息查询数量必须是正整数。');
+        sql += ' LIMIT ?'; params.push(options.limit);
+      }
+      return (await ctx.query<MessageRow>(sql, params)).map(toMessage);
+    },
+    async lastDeliveredSeq(scope) {
+      const params = readScope(scope);
+      const row = await ctx.one<{ seq: number | string | null }>(`SELECT MAX(m.seq) AS seq FROM messages m
+        JOIN groups g ON g.id = m.group_id
+        JOIN members viewer ON viewer.id = ? AND viewer.project_id = g.project_id
+        JOIN message_deliveries d ON d.message_id = m.id AND d.member_id = viewer.id AND d.project_id = g.project_id
+        WHERE g.project_id = ? AND m.group_id = ? AND viewer.membership_revision = ?
+          AND viewer.removed_at IS NULL AND viewer.status = 'active' AND d.status <> 'pending'`, params);
+      return row?.seq === null || row?.seq === undefined ? null : Number(row.seq);
     },
     async countByProject(projectId) {
       const row = await ctx.one<CountRow>(

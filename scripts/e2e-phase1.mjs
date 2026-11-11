@@ -4,16 +4,15 @@
  *
  * 目的：用**真实 HTTP/MCP 服务端** + **真实 MCP SDK 客户端**（Streamable HTTP，与 Claude Code
  * 使用的同一 wire 协议），把 AC-CORE-01 ~ 09 与 AC-CORE-11 的核心链路跑成一个可重复的脚本，
- * 输出逐项结论。Codex 的「真实双宿主」部分受配额阻塞，不在本脚本内伪造，见验收报告。
+ * 输出该协议范围的逐项结论。脚本不调用真实 Claude/Codex；宿主与模型验收另行记录。
  *
  * 本脚本**不修改业务代码**，只消费既有 HTTP API（T1）、MCP 工具契约（F3/T2–T7）。
  * 用 `node scripts/e2e-phase1.mjs` 运行；退出码 0 = 全部断言通过，非 0 = 有断言失败。
  *
  * 场景（人 + 两个 agent）：
- *   A = manager（hostType claude-code，顶点 manager）
- *   B = 普通 agent（hostType codex-cli 仅作真实模型之外的「第二个 agent」身份占位，
- *       用 MCP SDK 客户端模拟其工具调用——因为 Codex 模型后端配额阻塞，无法发起真实轮次；
- *       这一点在验收报告中如实标注为「模拟第二 agent」，不冒充真实 Codex 宿主）
+ *   A = manager（MCP SDK 客户端，hostType claude-code 只作协议参数）
+ *   B = 普通 agent（MCP SDK 客户端，hostType codex-cli 只作协议参数）
+ *   两名 agent 均为协议夹具，hostType 字符串不证明对应宿主或模型实际运行。
  *
  *   步骤：
  *   1. 人创建项目 → 创建群组 → 指定 A 为 manager（HTTP，AC-CORE-03 前置）
@@ -400,7 +399,7 @@ try {
   await ackAll(agents.B.client, await callTool(agents.B.client, "wait_for_messages", { timeoutMs: 300 }));
 
   // =========================================================================
-  // AC-CORE-11：人 + 2 agent 双向 @、等待、断线重连完整走通（Claude Code 真实宿主 + 模拟第二 agent）
+  // AC-CORE-11 协议部分：人 + 两个 SDK 客户端双向 @、等待、断线重连
   // =========================================================================
   // 先清空 A、B 各自的旧积压（manager A 可见全部；B 有第 7 条等），避免旧消息先于目标消息返回
   await ackAll(agents.A.client, await callTool(agents.A.client, "wait_for_messages", { timeoutMs: 300 }));
@@ -422,8 +421,8 @@ try {
   check("AC-CORE-11", "B → @all（含 A）链路", r11c.hit, `status=${r11c.last?.status ?? "-"}`);
 
   // 这一整套已经覆盖：入群在线、双向 @、waiting/working、断线重连（上文 AC-CORE-08）
-  check("AC-CORE-11", "「人 + 2 agent」入群在线 / 双向 @ / 等待 / 断线重连链路已完整跑通",
-    true, "Claude Code 真实宿主可用；第二 agent 由 MCP SDK 客户端模拟（Codex 模型配额阻塞，见报告）");
+  check("AC-CORE-11", "「人 + 2 SDK 客户端」入群在线 / 双向 @ / 等待 / 断线重连协议链路",
+    true, "两名 Agent 均为 MCP SDK 协议夹具；真实 Claude/Codex 宿主与模型未在本脚本执行");
 } catch (error) {
   if (!error?.assertion) {
     console.error("\n未捕获异常：", error);
@@ -480,15 +479,15 @@ for (const r of results) {
   else byAc[r.ac].fail += 1;
 }
 
-console.log("\n=== 结论汇总 ===");
+console.log("\n=== HTTP/MCP SDK 协议检查汇总 ===");
 for (const ac of Object.keys(byAc).sort()) {
   const v = byAc[ac];
-  console.log(`${ac}: ${v.fail === 0 ? "PASS" : "FAIL"} (${v.pass} 通过 / ${v.fail} 失败)`);
+  console.log(`${ac}（协议范围）: ${v.fail === 0 ? "PASS" : "FAIL"} (${v.pass} 通过 / ${v.fail} 失败)`);
 }
 console.log(`\n合计：${passed} 通过 / ${failed} 失败`);
 console.log(
-  "注意：AC-CORE-02/10/11 的「真实 Codex 双宿主」部分因 Codex 配额阻塞未验证，" +
-    "本脚本用 MCP SDK 客户端模拟第二个 agent 走通链路，不冒充真实 Codex 宿主。\n",
+  "真实宿主/模型验收：NOT_RUN。两名 Agent 均由 MCP SDK 客户端驱动；" +
+    "本次断言不证明 Claude/Codex 的模型轮次、宿主唤醒或真实双宿主验收。\n",
 );
 
 process.exit(failed === 0 ? 0 : 1);

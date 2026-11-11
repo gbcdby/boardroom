@@ -22,7 +22,7 @@ export interface OrgGraphSnapshotV2 {
   targetId: string;
   node: OrgNode | null;
   childEdges: Array<{ nodeId: string; parentId: string | null }>;
-  assignments: Array<{ memberId: string; nodeId: string | null; legacyRole: "manager" | "normal" }>;
+  assignments: Array<{ memberId: string; nodeId: string | null; legacyRole: "manager" | "normal"; membershipRevision: number }>;
   directChildIds: string[];
 }
 export interface MemberRelationsSnapshotV2 {

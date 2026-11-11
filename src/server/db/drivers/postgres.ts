@@ -159,6 +159,7 @@ export class PostgresDriver implements DbDriver {
   private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, client: PoolClient, parent?: OperationQueue): Promise<T> {
     const nested = parent !== undefined;
     const identity = this.transactionIdentity.getStore() ?? { values: new Map<symbol, unknown>(), active: true };
+    const savedValues = nested ? new Map(identity.values) : undefined;
     const queue = new OperationQueue(parent);
     const enqueue = <R>(operation: () => Promise<R>): Promise<R> => {
       const current = this.transactionScope.getStore()?.queue;
@@ -190,6 +191,9 @@ export class PostgresDriver implements DbDriver {
         try {
           if (nested) {
             await client.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+            // PostgreSQL 会释放保存点后取得的行锁，元数据必须回到相同边界。
+            identity.values.clear();
+            for (const [key, value] of savedValues!) identity.values.set(key, value);
             await client.query(`RELEASE SAVEPOINT ${sp}`);
           }
           else await client.query(this.dialect.rollback());

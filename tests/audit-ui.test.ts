@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { byTestId, find, json, settle, textOf, withPage } from "./helpers/web-ui.ts";
+import { byTestId, deferred, find, json, settle, textOf, withPage } from "./helpers/web-ui.ts";
 
 const project = { id: "project-1", name: "审计项目", archivedAt: null };
 const entry = { id: "audit-1", projectId: project.id, actorKind: "human", actorMemberId: null, actorName: "人（owner）",
@@ -52,5 +52,48 @@ test("S5-AUDIT-06：状态冲突给出核对指引且不报告撤销成功", asy
     assert.match(textOf(byTestId(container, "audit-error")), /当前状态.*变化.*刷新.*核对/);
     assert.equal(find(container, node => node.props["data-testid"] === "audit-notice"), undefined);
     assert.ok(byTestId(container, "audit-revoke"));
+  }, { path: "/projects/project-1/audit" });
+});
+
+test("切换项目后旧撤销的失败与结束不能覆盖新项目的反馈或忙碌状态", async () => {
+  const other = { ...project, id: "project-2", name: "另一个项目" };
+  const otherEntry = { ...entry, id: "audit-2", projectId: other.id, targetName: "另一个成员" };
+  const oldPost = deferred<Response>(), newPost = deferred<Response>();
+  await withPage("AuditView", (url, init) => {
+    if (url.startsWith("/api/projects?")) return json({ projects: [project, other] });
+    if (init?.method === "POST") return url.includes(project.id) ? oldPost.promise : newPost.promise;
+    return json({ entries: [url.includes(project.id) ? entry : otherEntry] });
+  }, async (container, { store }) => {
+    const oldOperation = byTestId(container, "audit-revoke").props.onClick(); await settle();
+    assert.equal(await store.selectProject(other.id), true); await settle();
+    assert.equal(byTestId(container, "audit-revoke").props.disabled, false, "切换项目释放旧操作的界面状态");
+    const newOperation = byTestId(container, "audit-revoke").props.onClick(); await settle();
+    oldPost.resolve(json({ error: { code: "compensation_conflict", message: "旧项目冲突" } }, 409));
+    await oldOperation; await settle();
+    assert.equal(find(container, node => node.props["data-testid"] === "audit-error"), undefined);
+    assert.equal(byTestId(container, "audit-revoke").props.disabled, true, "旧操作finally不能结束新操作");
+    newPost.resolve(json({ entry: { ...otherEntry, action: "member.revoke" } }));
+    await newOperation; await settle();
+    assert.match(textOf(byTestId(container, "audit-notice")), /已撤销/);
+    assert.equal(byTestId(container, "audit-revoke").props.disabled, false);
+  }, { path: "/projects/project-1/audit" });
+});
+
+test("旧项目列表延迟失败不能污染新项目，也不能提前清除新请求的加载状态", async () => {
+  const other = { ...project, id: "project-2", name: "另一个项目" };
+  const oldLoad = deferred<Response>(), newLoad = deferred<Response>();
+  await withPage("AuditView", url => {
+    if (url.startsWith("/api/projects?")) return json({ projects: [project, other] });
+    return url.includes(project.id) ? oldLoad.promise : newLoad.promise;
+  }, async (container, { store }) => {
+    assert.match(textOf(container), /正在加载变更记录/);
+    await store.selectProject(other.id); await settle();
+    oldLoad.resolve(json({ error: { code: "read_failed", message: "旧项目读取失败" } }, 500)); await settle();
+    assert.equal(find(container, node => node.props["data-testid"] === "audit-error"), undefined);
+    assert.match(textOf(container), /正在加载变更记录/);
+    assert.equal(byTestId(container, "audit-refresh").props.disabled, true);
+    newLoad.resolve(json({ entries: [{ ...entry, id: "audit-2", projectId: other.id, targetName: "新项目成员" }] })); await settle();
+    assert.match(textOf(byTestId(container, "audit-list")), /新项目成员/);
+    assert.equal(byTestId(container, "audit-refresh").props.disabled, false);
   }, { path: "/projects/project-1/audit" });
 });

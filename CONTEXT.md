@@ -19,10 +19,11 @@
 | role（阶段 1） | Member 的项目级角色字段；阶段 1 只有 `manager` / `normal`，每项目最多一个顶层 manager；完整角色模型在阶段 2。 | 决策票 #5（D2，2026-10-18） |
 | legacy `members.role='manager'`（T2 #49 起） | **不再是真实角色**，只是组织树根节点（顶层 manager 岗位）的阶段 1 兼容投影：旧 `ux_members_project_manager` 索引在迁移 v4 移除，唯一性下沉到 `members` repository 应用层；占据/让出根节点时同步升降。真实角色看 `org_nodes.role`（静态枚举）与 F2 `ROLE_CAPABILITIES`。升级库默认无组织数据，未落位成员走 `actorForMember` 兼容映射（人=owner），因此阶段 1 行为不变。 | 决策票 #24/#25/#26、T2 #49 |
 | 角色 vs 岗位（T2 #49 起） | 角色是静态枚举 `owner/top_manager/sub_manager/member` 的能力集合定义（不落库）；岗位是 `org_nodes` 节点上的实例，`members.node_id` 指向它。二者正交：`node_id` 管「谁占哪个岗」，节点 `role` 管「该岗位是什么角色」。 | 决策票 #25、T2 #49 |
-| 自己参与的消息（阶段 1） | 阶段 1 只覆盖自己发送 + 被 @；任务关联消息留阶段 3，最终定义在阶段 3 重新确认。 | 决策票 #6（D3，2026-10-18） |
+| 自己参与的消息 | 2026-11-11 核对：普通 Agent 的聊天基线为自己发送 + 被 @；阶段 3 的合法任务关系可扩展当前授权群内的关联消息读取，但不扩大跨项目/跨群或 mention 唤醒范围。 | 决策票 #6；`docs/tasks-and-review.md`、`tests/tasks-service.test.ts` |
 | fixed point | 双轴评审的 diff 基准点（commit SHA、分支、tag 等）；评审记录必须可追溯，未提交候选另记录完整工作树身份。 | `docs/architecture/agent-studio.md` §6.7；`.agents/skills/worker-review/SKILL.md`（2026-11-10 技能迁移） |
 | 三层记忆 | Agent 全局记忆、项目共享记忆、项目+agent 记忆；作用域、读写权限和注入方式不同。 | `docs/architecture/agent-studio.md` §6.8 |
-| 状态看板 vs 跨项目总览 | 状态看板 = **项目作用域的成员级明细**（阶段 1 现路由 `/status`，`StatusBoardView.vue`）；跨项目总览 = 阶段 2 的 `/` 页，**只到每项目计数**，无成员明细。自 #31 起两者共用同一条**不绑项目的全局 human presence**（memberId 级连接引用计数），所以「人在所有项目都算在线」是设计而非 bug。 | 决策票 #31（2026-11-04）、#40（子地图 #35） |
+| 状态看板 vs 跨项目总览 | 状态看板是项目成员明细（规范路由 `/projects/:projectId/status`，旧 `/status` 继续规范化）；`/` 是项目级概览。自 #31 起共用不绑项目的全局 human presence（memberId 级引用计数），不是切项目后只保留当前人的在线。 | 决策票 #31/#40；2026-11-11 核对 `src/web/src/router.ts` |
+| 成员移除 vs 暂停 | 2026-11-11 的 v13 工程候选：暂停保留岗位；移除保留 Member 历史身份并推进 membershipRevision。显式重新添加复用 ID、用新代际且不默认复活旧群关系；撤销不复活旧 MCP/评审/托管/总结执行。 | `docs/t3-member-lifecycle.md`、`src/server/db/migrations/member-lifecycle.ts`、`tests/member-compensation.test.ts`；最终运行状态见 V1 索引 |
 
 ## 宿主差异（Claude Code / Codex CLI）
 
@@ -37,7 +38,7 @@
 | Claude Code | 2.1.233 | 重连：宿主不保留跨会话 MCP 状态；积压需服务端持久化，重连后首次等待立即补投。 | 进程退出→服务端留存→新会话 `initialize`→`drained_backlog: true`。 | 2026-10-21 |
 | Codex CLI | 0.163.0 | 传输：仅 stdio 与 Streamable HTTP（`codex mcp add -- <cmd>` / `--url`）；**不支持 SSE**。 | 两种传输均完成 `initialize` + `tools/list`；HTTP 会话结束发 `DELETE` 优雅关闭。 | 2026-10-21 |
 | Codex CLI | 0.166.0 | 等待：`wait_for_messages` 挂起后可被服务端投递结束、同一轮继续；重连靠服务端持久化、重连首等待补投；**不能打断在途工具**（`unsupported`）；不支持 SSE。 | Streamable HTTP 真实接入：join 成功；等待中 `state=waiting` 后收到人消息（`drainedBacklog:false`）；agent↔agent 双向 @；服务端重启后重连 `drainedBacklog:true`。 | 2026-11-03 |
-| DeepSeek Harness (dsh) | 0.2.1-rc.5 | 第三个正式支持宿主（已入产品基线/主 spec）；`@deepseek-ai/dsh-mcp-client` 支持 `stdio`/`streamable-http`。当前代码以 `hostType=other` 接入，正式 `hostType="dsh"` 与宿主适配器由决策票 #43 定稿。 | Streamable HTTP 真实接入 boardroom：join 成功；等待中 `state=waiting` 后收到人消息（`drainedBacklog:false`）。 | 2026-11-03 |
+| DeepSeek Harness (dsh) | 0.2.1-rc.5 | 第三个正式宿主，当前注册 `hostType="dsh"`；历史实测使用 other，已迁移。修正旧“正式标识待定/双传输可承诺”表述：适配器未声明独立验证传输，reconnect/interrupt unsupported、wakeIdle false。 | 随库 `evidence/real-host-retest/` 只证实当时 Streamable HTTP join 与活跃 wait 收消息；无重连原始证据。 | 实测 2026-11-03；2026-11-11 对照 `src/server/mcp/adapters/dsh.ts` 修订 |
 
 ## 踩坑记录
 
@@ -57,6 +58,7 @@
 | 测试里 `await client.close(); await transport.terminateSession()` 之后，服务端 `mcp_sessions` 仍是 `connected`（成员一直 online） | MCP SDK `StreamableHTTPClientTransport.close()` 会 `abortController.abort()`；随后 `terminateSession()` 里的 DELETE fetch 用的正是这个**已 abort 的 signal**，DELETE 根本没到服务端，`onclose→core.disconnect()` 不触发 | 必须**先** `await transport.terminateSession()` 发 DELETE（触发服务端 onclose / 会话断开 / 运行状态回落 offline），**再** `await client.close()`。仅 `client.close()` 的既有清理顺序不适用于「要验证断开态」的用例 | 所有用 `StreamableHTTPClientTransport` 验证「断开/离线」的测试；仅做收尾清理时顺序无所谓 | 2026-11-05 #50 LIFE-MEM-03 用例调试；SDK `dist/esm/client/streamableHttp.js` `close()` / `terminateSession()` |
 | `dbDriver=postgres` 上 `wait_for_messages` 漏投消息（AC-CORE-05/04 失败、`status=undefined`），服务端报 `error: LIMIT must not be negative`（SQLSTATE `2201W`）；同一代码在 SQLite 下全通过 | SQLite 把 `LIMIT -1` 解释为「不限」，PostgreSQL 拒绝负数 LIMIT；`repositories.listByGroup` 原以 `limit ?? -1` 拼 `LIMIT ?`，PG 上直接抛错 | 双方言共用的分页查询在 `limit<=0` 时**省略 LIMIT 子句**，不要传负数；PG 运行态异常先看 SQLSTATE / 错误码，别只怀疑唤醒竞态 | 所有经 `DbDriver` 双方言执行的 `LIMIT` / `OFFSET` 查询 | 2026-11-06 #61 真实 PG 复现与修复；`src/server/db/repositories.ts` `listByGroup`；PR #75 的 `fix(#61)` 提交 |
 | feature 分支 HEAD 上 `npm test` / `tsc` 全绿，合并到 `main` 后同一套命令立刻变成 2 个测试失败 + 5 个 tsc 错误 | `main` 在分支分叉后由 `c345f3a` 新增了 `tests/host-adapter-converge.test.ts` 的 AC-HOST-01/04 用例，按旧同步 API 编写；#61 把 `core.join` / `attemptInterrupt` / `close` / `ctx.spawn` 改为 async，Git 文本合并无冲突但语义不兼容（未 `await`） | 验收不能只在 feature 分支做；**合并后必须在合并后的 `main` 树复跑** `tsc` / `npm test` / e2e 才能宣布通过；凡改动公共 API 签名（尤其 sync→async），把分叉点之后 `main` 的改动视为集成风险 | 所有改动公共 API 签名的票；长期分支与 `main` 并行演进时 | 2026-11-06 PR #75 合并（`a7081d8`）后复验、PR #76（`9d75ea8`）修复；#61 更正评论 |
+| v13 复制/清库不能简单使用完全相反表序 | 成员和六类事实的真实 trigger 会生成/推进 member_fact_revisions；过早清它会使后续事实删除缺基准 | 复制最后用源值替换事实版本；清空先删事实、再删 Member/事实版本。不要停用 trigger 或伪造 revision | SQLite/PG 非空复制与项目 purge；当前工程实现，最终双引擎结果单列 | 2026-11-11 静态核对 `src/server/db/migrate-data.ts`、`tests/member-facts.test.ts`、`tests/migrate-data.test.ts` |
 
 ## 待验证
 

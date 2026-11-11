@@ -16,6 +16,7 @@ const context = useCurrentProject();
 const { projects, currentProjectId: activeProjectId, currentProject: activeProject, readonly: projectReadonly } = context;
 let disposed = false;
 let request = 0;
+let revokeRequest = 0;
 const entries = ref<AuditEntryDto[]>([]);
 
 const loading = ref(true);
@@ -133,21 +134,23 @@ async function loadProjects(): Promise<void> {
 
 async function loadAudit(preserveFeedback = false): Promise<void> {
   const projectId = activeProjectId.value;
+  const version = ++request;
+  const generation = context.generation.value;
+  const current = () => !disposed && version === request && generation === context.generation.value && activeProjectId.value === projectId;
   if (projectId === null) {
     entries.value = [];
     loading.value = false;
     return;
   }
-  const version = ++request;
   loading.value = true;
   if (!preserveFeedback) clearMessages();
   try {
     const res = await api.listAudit(projectId);
-    if (!disposed && version === request && activeProjectId.value === projectId) entries.value = res.entries;
+    if (current()) entries.value = res.entries;
   } catch (e) {
-    error.value = e instanceof ApiError ? e.message : String(e);
+    if (current()) error.value = e instanceof ApiError ? e.message : String(e);
   } finally {
-    loading.value = false;
+    if (current()) loading.value = false;
   }
 }
 
@@ -155,14 +158,17 @@ async function revoke(entry: AuditEntryDto): Promise<void> {
   const projectId = activeProjectId.value;
   if (busy.value || projectId === null || !canRevoke(entry)) return;
   const generation = context.generation.value;
+  const version = ++revokeRequest;
+  const current = () => !disposed && version === revokeRequest && generation === context.generation.value && activeProjectId.value === projectId;
   revokingId.value = entry.id;
   clearMessages();
   try {
     const result = await api.revokeAudit(projectId, entry.id);
-    if (disposed || activeProjectId.value !== projectId || generation !== context.generation.value) return;
+    if (!current()) return;
     notice.value = `已撤销「${actionLabel(entry.action)}」事件。${restartNotice(result.entry.detail)}`;
     await loadAudit(true);
   } catch (e) {
+    if (!current()) return;
     const messages: Record<string, string> = {
       compensation_conflict: "当前状态已经变化，无法撤销这次操作。请刷新记录并核对相关成员或岗位。",
       legacy_incomplete_snapshot: "这条历史记录缺少完整快照，无法安全撤销。记录仍可查看。",
@@ -172,11 +178,15 @@ async function revoke(entry: AuditEntryDto): Promise<void> {
     };
     error.value = e instanceof ApiError ? messages[e.code] ?? e.message : String(e);
   } finally {
-    revokingId.value = null;
+    if (current()) revokingId.value = null;
   }
 }
 
 function selectProject(): void {
+  request++;
+  revokeRequest++;
+  revokingId.value = null;
+  clearMessages();
   entries.value = [];
   void loadAudit();
 }
@@ -186,8 +196,8 @@ function formatTime(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
 }
 
-watch(activeProjectId, () => { request++; selectProject(); }, { immediate: true });
-onBeforeUnmount(() => { disposed = true; request++; });
+watch(activeProjectId, selectProject, { immediate: true });
+onBeforeUnmount(() => { disposed = true; request++; revokeRequest++; });
 </script>
 
 <template>

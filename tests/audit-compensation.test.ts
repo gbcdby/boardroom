@@ -169,10 +169,49 @@ test("并发重复撤销只产生一条补偿且仅恢复一次", async () => {
   });
 });
 
+test("HTTP 撤销的初检不加载损坏的超长审计正文，保留既有拒绝分类", async () => {
+  await withRouter(async (repos, call, driver) => {
+    const project = await repos.projects.create({ name: "有界初检" });
+    const node = await repos.org.createNode({ projectId: project.id, name: "之前", role: "top_manager" });
+    assert.equal((await call("PUT", `/api/org/nodes/${node.id}`, { name: "之后" })).status, 200);
+    const original = (await repos.audit.list(project.id, { action: "org.node_update" }))[0]!;
+    const oversized = JSON.stringify({ damaged: "长".repeat(1_000_000) });
+    await driver.exec("UPDATE audit_log SET before = ? WHERE id = ?", [oversized, original.id]);
+    const query = driver.query.bind(driver);
+    const returned: { sql: string; bytes: number }[] = [];
+    driver.query = async <T extends DbRow = DbRow>(sql: string, params?: readonly unknown[]): Promise<T[]> => {
+      const rows = await query<T>(sql, params);
+      if (/FROM audit_log/.test(sql)) returned.push({ sql, bytes: Buffer.byteLength(JSON.stringify(rows)) });
+      return rows;
+    };
+    const url = `/api/projects/${project.id}/audit/${original.id}/revoke`;
+    const rejected = await call("POST", url);
+    assert.equal(rejected.status, 409);
+    assert.equal(rejected.body.error.code, "audit_snapshot_too_large");
+    assert.ok(returned.length > 0);
+    assert.ok(returned.every(row => row.bytes < 1024), JSON.stringify(returned));
+    assert.ok(returned.every(row => !/SELECT \*/i.test(row.sql)));
+    assert.equal((await repos.org.getNode(node.id))!.name, "之后");
+    assert.equal((await repos.audit.get(project.id, original.id))!.reversedAt, null);
+    assert.equal((await repos.audit.list(project.id)).length, 1);
+    for (const [action, before, reversedAt, status, code] of [
+      ["project.delete", oversized, null, 403, "permanent_delete"],
+      ["org.node_update", '{"truncated":true}', null, 403, "truncated"],
+      ["org.node_update", oversized, "2026-11-11T00:00:00Z", 409, "conflict"],
+    ] as const) {
+      await driver.exec("UPDATE audit_log SET action = ?, before = ?, reversed_at = ? WHERE id = ?", [action, before, reversedAt, original.id]);
+      const denied = await call("POST", url);
+      assert.equal(denied.status, status); assert.equal(denied.body.error.code, code);
+    }
+  });
+});
+
 const PG_URL = process.env["AGENT_STUDIO_PG_TEST_URL"];
-test("真实 PostgreSQL 两个事务同时读到未撤销时，仅一个补偿提交", { skip: !PG_URL, timeout: 15_000 }, async () => {
+test("真实 PostgreSQL 两个独立连接均预读未撤销，项目锁内重验仅一个补偿提交", { skip: !PG_URL, timeout: 15_000 }, async () => {
   const schema = `audit_compensation_${randomBytes(8).toString("hex")}`;
   const driver = new PostgresDriver({ connectionString: PG_URL!, schema });
+  let competitor: PostgresDriver | undefined;
+  let barrierTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     await driver.connect();
     await driver.migrate(migrations);
@@ -183,27 +222,33 @@ test("真实 PostgreSQL 两个事务同时读到未撤销时，仅一个补偿�
     assert.equal((await call("PUT", `/api/org/nodes/${node.id}`, { name: "之后" })).status, 200);
     const original = (await repos.audit.list(project.id, { action: "org.node_update" }))[0]!;
 
-    // 仅协调真实 SELECT 的返回时间，使两个独立 PG 事务确定读到未撤销。
-    // SQL、锁、业务补偿、审计插入及提交/回滚均由真实驱动执行。
+    competitor = new PostgresDriver({ connectionString: PG_URL!, schema });
+    await competitor.connect();
+    const competingCall = routerCall(competitor);
+    // 两个独立驱动/连接在 HTTP 初检均读到未撤销，再竞争真实项目锁。
+    // 锁内快照读取必须串行且复核最新状态，不能等待另一个持项目锁的事务来制造屏障。
     let reads = 0;
     let release!: () => void;
-    const bothRead = new Promise<void>((resolve) => { release = resolve; });
-    const transaction = driver.transaction.bind(driver);
-    driver.transaction = (body) => transaction((tx) => body({
-      exec: tx.exec,
-      query: async <T extends DbRow = DbRow>(sql: string, params?: readonly unknown[]): Promise<T[]> => {
-        const rows = await tx.query<T>(sql, params);
-        if (sql === "SELECT * FROM audit_log WHERE project_id = ? AND id = ?" && params?.[1] === original.id && reads < 2) {
+    let rejectBarrier!: (error: Error) => void;
+    const bothRead = new Promise<void>((resolve, reject) => { release = resolve; rejectBarrier = reject; });
+    const observePreRead = (connection: PostgresDriver) => {
+      const query = connection.query.bind(connection);
+      connection.query = async <T extends DbRow = DbRow>(sql: string, params?: readonly unknown[]): Promise<T[]> => {
+        const rows = await query<T>(sql, params);
+        if (sql.includes("AS before_bytes") && sql.includes("FROM audit_log WHERE project_id = ? AND id = ?") && params?.[1] === original.id && reads < 2) {
+          assert.equal(connection.currentTransactionContext(), undefined, "屏障必须在共同项目锁外");
           assert.equal(rows[0]?.["reversed_at"], null);
           reads += 1;
-          if (reads === 2) release();
+          if (reads === 1) barrierTimer = setTimeout(() => rejectBarrier(new Error("两个独立连接没有同时到达真实预读屏障")), 2000);
+          if (reads === 2) { clearTimeout(barrierTimer); release(); }
           await bothRead;
         }
         return rows;
-      },
-    }));
+      };
+    };
+    observePreRead(driver); observePreRead(competitor);
     const url = `/api/projects/${project.id}/audit/${original.id}/revoke`;
-    const results = await Promise.all([call("POST", url), call("POST", url)]);
+    const results = await Promise.all([call("POST", url), competingCall("POST", url)]);
     assert.equal(reads, 2);
     assert.deepEqual(results.map((result) => result.status).sort(), [200, 409]);
     assert.equal((await repos.org.getNode(node.id))?.name, "之前");
@@ -212,6 +257,8 @@ test("真实 PostgreSQL 两个事务同时读到未撤销时，仅一个补偿�
     const successful = results.find((result) => result.status === 200)!;
     assert.equal((await repos.audit.get(project.id, original.id))?.reversedByAuditId, successful.body.entry.id);
   } finally {
+    clearTimeout(barrierTimer);
+    await competitor?.close();
     await driver.exec(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
     await driver.close();
   }

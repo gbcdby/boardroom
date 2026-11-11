@@ -101,6 +101,7 @@ export class SqliteDriver implements DbDriver {
     const db = this.handle;
     const nested = parent !== undefined;
     const identity = this.transactionIdentity.getStore() ?? { values: new Map<symbol, unknown>(), active: true };
+    const savedValues = nested ? new Map(identity.values) : undefined;
     const scope = new OperationQueue(parent);
     const enqueue = <R>(operation: () => Promise<R>): Promise<R> => {
       const current = this.transactionScope.getStore();
@@ -134,6 +135,10 @@ export class SqliteDriver implements DbDriver {
       try {
         if (nested) {
           db.exec(`ROLLBACK TO SAVEPOINT ${sp}`);
+          // 数据和在保存点内取得的锁一同回滚；不能继续复用其锁范围元数据。
+          // 仅恢复保存点前的条目，保留父事务原本已持有的 scope。
+          identity.values.clear();
+          for (const [key, value] of savedValues!) identity.values.set(key, value);
           db.exec(`RELEASE SAVEPOINT ${sp}`);
         } else {
           db.exec(this.dialect.rollback());
