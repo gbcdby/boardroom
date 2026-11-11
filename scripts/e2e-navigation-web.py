@@ -101,7 +101,11 @@ def exercise(page, origin, output, report):
             suffix = f"&groupId={gid}" if entry in ("chat", "groups") else ""
             page.goto(origin + legacy + suffix + "&filter=active#saved-anchor")
             path = f"/projects/{pid}/{target}" + (f"/{gid}" if entry in ("chat", "groups") else "")
-            page.wait_for_url(lambda url: urlsplit(str(url)).path == path)
+            # 显式项目路径在首次文档加载时已匹配；项目读取完成后守卫才会清理 query。
+            page.wait_for_url(lambda url: (
+                urlsplit(str(url)).path == path
+                and "projectId" not in parse_qs(urlsplit(str(url)).query, keep_blank_values=True)
+            ))
             actual = urlsplit(page.url)
             query = parse_qs(actual.query)
             assert query.get("filter") == ["active"] and actual.fragment == "saved-anchor", page.url

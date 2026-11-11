@@ -37,6 +37,10 @@ button.primary:active:not(:disabled), a.primary:active { color: var(--on-accent)
 a.primary, a.secondary { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; min-height: 38px; border: 1px solid var(--border); border-radius: 8px; padding: .45rem .9rem; font-weight: 500; font-size: .9rem; }
 a.primary { border-color: var(--accent-fill); } a.secondary { background: var(--card-bg); color: var(--fg); border-color: var(--control-border); }
 .text-button { border-color: transparent; background: transparent; color: var(--accent); box-shadow: none; } button.danger, .text-button.danger { color: var(--bad); }
+/* 仅供任务视图、记忆范围和历史版本选择使用；勾选占位避免切换时文字移动。 */
+.selection-mark { display: inline-block; inline-size: 1em; flex: none; text-align: center; font-weight: 700; visibility: hidden; }
+button.selection-button[aria-pressed="true"] .selection-mark { visibility: visible; }
+button.selection-button[aria-pressed="true"]:not(:disabled) { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
 :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; } main:focus, h1:focus { outline: none; }
 input:not([type="checkbox"]):not([type="radio"]), select, textarea { min-height: 38px; min-width: 0; max-width: 100%; border: 1px solid var(--control-border); border-radius: 8px; padding: .5rem .7rem; color: var(--fg); background: var(--card-bg); line-height: 1.5; }
 input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }

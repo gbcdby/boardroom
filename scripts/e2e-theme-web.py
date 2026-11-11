@@ -10,6 +10,7 @@ import select
 import subprocess
 import traceback
 from urllib.parse import urlsplit
+from uuid import uuid4
 from playwright.sync_api import sync_playwright, expect
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -30,6 +31,69 @@ def capture(page, output, report, name):
     page.screenshot(path=str(output / f"{name}.png"), full_page=True, animations="disabled")
     report["screenshots"].append(f"{name}.png")
     report["layouts"].append(dimensions)
+
+
+def selected_choice(page, selected_id, other_id, name, report, accessible_name=None):
+    selected = page.get_by_test_id(selected_id)
+    other = page.get_by_test_id(other_id)
+    expect(selected).to_have_attribute("aria-pressed", "true")
+    expect(other).to_have_attribute("aria-pressed", "false")
+    mark = selected.locator(".selection-mark")
+    expect(mark).to_be_visible()
+    expect(mark).to_have_text("✓")
+    expect(mark).to_have_attribute("aria-hidden", "true")
+    expect(other.locator(".selection-mark")).to_be_hidden()
+    if accessible_name:
+        expect(selected).to_have_accessible_name(accessible_name)
+    # 检查实际渲染的勾选和轮廓，不能只凭 aria-pressed 或底色不同判定可辨。
+    expect(selected).to_have_css("border-top-color", selected.evaluate("el => getComputedStyle(el).color"))
+    measure = "el => { const s=getComputedStyle(el); return {border:s.borderTopColor,borderWidth:parseFloat(s.borderTopWidth),borderStyle:s.borderTopStyle,shadow:s.boxShadow}; }"
+    current, inactive = selected.evaluate(measure), other.evaluate(measure)
+    assert current["borderWidth"] >= 1 and current["borderStyle"] == "solid", (name, current)
+    assert current["shadow"] != "none" and current["shadow"] != inactive["shadow"], (name, current, inactive)
+    control_box, mark_box = selected.bounding_box(), mark.bounding_box()
+    assert control_box and mark_box and mark_box["width"] > 0 and mark_box["height"] > 0, name
+    assert (mark_box["x"] >= control_box["x"] and mark_box["y"] >= control_box["y"]
+            and mark_box["x"] + mark_box["width"] <= control_box["x"] + control_box["width"] + 1
+            and mark_box["y"] + mark_box["height"] <= control_box["y"] + control_box["height"] + 1), (name, control_box, mark_box)
+    report.setdefault("selectionStates", []).append({"view": name, "selected": selected_id, "other": other_id,
+                                                    "current": current, "inactive": inactive, "mark": mark_box})
+
+
+def selection_states(page, controls, origin, project_id, output, report):
+    page.goto(origin + f"/projects/{project_id}/tasks"); page.wait_for_load_state("networkidle")
+    for width, height in [(1440, 1000), (390, 844)]:
+        page.set_viewport_size({"width": width, "height": height})
+        for theme in ("light", "dark"):
+            controls.get_by_test_id(f"theme-{theme}").click(); appearance(page, theme)
+            for mode, other, title in [("board", "list", "看板"), ("list", "board", "列表")]:
+                page.get_by_test_id(f"task-{mode}-mode").click()
+                name = f"task-selected-{mode}-{width}-{theme}"
+                selected_choice(page, f"task-{mode}-mode", f"task-{other}-mode", name, report, title)
+                capture(page, output, report, name); contrast(page, name, report)
+
+    page.goto(origin + f"/projects/{project_id}/knowledge")
+    expect(page.get_by_test_id("memory-editor")).to_be_enabled()
+    expect(page.get_by_test_id("memory-version")).to_have_text("版本 2")
+    for width, height in [(1440, 1000), (390, 844)]:
+        page.set_viewport_size({"width": width, "height": height})
+        for theme in ("light", "dark"):
+            controls.get_by_test_id(f"theme-{theme}").click(); appearance(page, theme)
+            for scope, other, title in [("members", "shared", "成员记忆"), ("shared", "members", "项目共享")]:
+                page.get_by_test_id(f"memory-scope-{scope}").click()
+                name = f"memory-selected-{scope}-{width}-{theme}"
+                selected_choice(page, f"memory-scope-{scope}", f"memory-scope-{other}", name, report, title)
+                expect(page.get_by_test_id("memory-editor")).to_be_enabled()
+                capture(page, output, report, name); contrast(page, name, report)
+            expect(page.get_by_test_id("memory-editor")).to_be_enabled()
+            page.get_by_test_id("memory-history-open").click()
+            for version, other in [(2, 1), (1, 2)]:
+                page.get_by_test_id(f"memory-history-version-{version}").click()
+                expect(page.get_by_test_id("memory-history-text")).to_have_text(f"主题状态验收共识：版本 {version}")
+                name = f"memory-selected-version-{version}-{width}-{theme}"
+                selected_choice(page, f"memory-history-version-{version}", f"memory-history-version-{other}", name, report)
+                capture(page, output, report, name); contrast(page, name, report)
+    report["checks"].append("任务看板/列表、记忆共享/成员、历史两个版本均有真实可见勾选与描边；1440/390浅深主题可辨且保留无障碍名称")
 
 
 def contrast(page, name, report):
@@ -123,6 +187,9 @@ def exercise(browser, origin, workdir, output, report):
         records = webui.seed(page, origin)
         project, group = records[0]["project"], records[0]["groups"][0]
         pid, gid = project["id"], group["id"]
+        for version in (1, 2):
+            webui.request(page, origin, "PUT", f"/api/projects/{pid}/memories/shared", {
+                "expectedVersion": version - 1, "clientMutationId": str(uuid4()), "markdown": f"主题状态验收共识：版本 {version}"})
         for index in range(24):
             webui.request(page, origin, "POST", f"/api/groups/{gid}/messages", {"senderMemberId": records[0]["members"][0]["id"], "text": f"主题验收历史消息 {index + 1}：保持阅读位置与上下文。"})
         page.goto(origin + f"/runtimes?projectId={pid}&groupId={gid}")
@@ -193,6 +260,8 @@ def exercise(browser, origin, workdir, output, report):
         task_filter.select_option(options[0]); controls.get_by_test_id("theme-dark").click(); appearance(page, "dark")
         expect(task_filter).to_have_value(options[0])
         report["checks"].append("任务筛选在主题切换后保留")
+
+        selection_states(page, controls, origin, pid, output, report)
 
         page.goto(origin + f"/projects/{pid}/overview"); page.wait_for_load_state("networkidle")
         page.get_by_test_id("project-actions").locator("summary").click()

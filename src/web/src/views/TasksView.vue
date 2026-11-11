@@ -123,7 +123,7 @@ onBeforeUnmount(() => { disposed = true; request++; pendingRender?.cancel(); });
     </section>
     <div class="task-toolbar">
       <label class="field">筛选状态<select v-model="filter" data-testid="task-state-filter"><option value="">全部状态</option><option v-for="state in taskStates" :key="state.value" :value="state.value">{{ state.label }}</option></select></label>
-      <div class="actions" aria-label="任务显示方式"><button type="button" :aria-pressed="layout === 'board'" @click="layout = 'board'">看板</button><button type="button" :aria-pressed="layout === 'list'" @click="layout = 'list'" data-testid="task-list-mode">列表</button></div>
+      <div class="actions" aria-label="任务显示方式"><button type="button" class="selection-button" :aria-pressed="layout === 'board'" data-testid="task-board-mode" @click="layout = 'board'"><span class="selection-mark" aria-hidden="true">✓</span>看板</button><button type="button" class="selection-button" :aria-pressed="layout === 'list'" @click="layout = 'list'" data-testid="task-list-mode"><span class="selection-mark" aria-hidden="true">✓</span>列表</button></div>
     </div>
     <p v-if="loading" role="status" class="muted">正在加载任务…</p>
     <div v-if="!currentProjectId" class="panel empty-state"><h2>选择一个项目</h2><p>选择项目后查看任务，或先创建项目。</p><RouterLink to="/projects">前往项目</RouterLink></div>
