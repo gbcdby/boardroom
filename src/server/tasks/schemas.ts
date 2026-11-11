@@ -17,32 +17,37 @@ const commit = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
 const timestamp = z.string().max(40).datetime({ offset: true });
 
 export const createTaskSchema = z.object({ title, body: text, labels: labels.optional(),
-  assigneeMemberId: taskIdSchema, reviewerMemberId: taskIdSchema.optional(),
+  assigneeMemberId: taskIdSchema.describe("任务负责人成员 ID"), reviewerMemberId: taskIdSchema.describe("指定评审成员 ID").optional(),
   repoPath: repoPath.optional(), fixedPoint: fixedPoint.optional() }).strict();
 export const updateTaskSchema = z.object({ expectedRevision: taskRevisionSchema,
   title: title.optional(), body: text.optional(), labels: labels.optional(),
-  assigneeMemberId: taskIdSchema.optional(), reviewerMemberId: taskIdSchema.optional(),
+  assigneeMemberId: taskIdSchema.describe("任务负责人成员 ID").optional(), reviewerMemberId: taskIdSchema.describe("指定评审成员 ID").optional(),
   repoPath: repoPath.optional(), fixedPoint: fixedPoint.optional() }).strict();
 export const transitionTaskSchema = z.object({ expectedRevision: taskRevisionSchema,
   state: z.enum(["todo", "in-progress", "blocked"]), reason: reason.optional() }).strict();
 export const commentTaskSchema = z.object({ body: nonemptyText }).strict();
 export const linkTaskMessageSchema = z.object({ messageId: taskIdSchema }).strict();
 export const startTaskReviewSchema = z.object({ expectedRevision: taskRevisionSchema }).strict();
-export const beginTaskReviewSchema = z.object({ expectedTaskRevision: taskRevisionSchema, expectedRoundRevision: taskRevisionSchema }).strict();
+// 每个公开字段使用独立实例，使 MCP JSON Schema 内联类型；部分原生宿主不解析兄弟属性 $ref。
+// describe 只补充说明和实例身份，不改变 HTTP/MCP 共用的严格整数范围。
+export const beginTaskReviewSchema = z.object({
+  expectedTaskRevision: taskRevisionSchema.describe("当前任务修订号，必须为整数"),
+  expectedRoundRevision: taskRevisionSchema.describe("当前评审轮次修订号，必须为整数"),
+}).strict();
 export const taskSettingsSchema = z.object({ expectedRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   defaultReviewerMemberId: taskIdSchema.nullable() }).strict();
 export const listTasksSchema = z.object({ state: taskStateSchema.optional(), assigneeMemberId: taskIdSchema.optional() }).strict();
 
 export const reviewCommandSchema = z.object({
   argv: z.array(z.string().max(8192)).min(1).max(100), cwd: z.string().min(1).max(4096),
-  startedAt: timestamp, completedAt: timestamp, exitCode: z.number().int().min(0).max(255),
+  startedAt: timestamp.describe("命令启动时间"), completedAt: timestamp.describe("命令结束时间"), exitCode: z.number().int().min(0).max(255),
 }).strict();
 export const reviewEvidenceSchema = z.object({
   provenance: z.literal("reviewer-declared"), host: z.string().trim().min(1).max(100), hostVersion: z.string().trim().min(1).max(200),
-  parentRunId: taskIdSchema, invocationId: taskIdSchema, contextId: taskIdSchema,
-  startedAt: timestamp, completedAt: timestamp, command: reviewCommandSchema,
-  promptSha256: hash, transcriptSha256: hash, evidenceRef: z.string().trim().min(1).max(4096),
-  baseCommit: commit, candidateCommit: commit, diffSha256: hash,
+  parentRunId: taskIdSchema.describe("两轴共享的执行批次 ID"), invocationId: taskIdSchema.describe("本轴调用 ID"), contextId: taskIdSchema.describe("本轴独立上下文 ID"),
+  startedAt: timestamp.describe("本轴执行开始时间"), completedAt: timestamp.describe("本轴执行完成时间"), command: reviewCommandSchema,
+  promptSha256: hash.describe("提示词 SHA-256"), transcriptSha256: hash.describe("执行记录 SHA-256"), evidenceRef: z.string().trim().min(1).max(4096),
+  baseCommit: commit.describe("固定基线提交"), candidateCommit: commit.describe("固定候选提交"), diffSha256: hash.describe("候选差异 SHA-256"),
 }).strict();
 export const submitReviewReportSchema = beginTaskReviewSchema.extend({
   axis: z.enum(["spec", "standards"]), verdict: z.enum(["pass", "changes_requested"]), body: nonemptyText,

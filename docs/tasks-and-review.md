@@ -61,4 +61,14 @@ node scripts/run-review-axes.mjs task-detail.json /path/to/codex
 
 脚本固定输入，并行启动两个只读、独立临时上下文，保留精确 CLI 版本、argv、时间、上下文 ID、prompt/JSONL hash 和独立输出；不会修改登录目录，也不会自动提交报告或裁决。CLI 失败、缺少真实模型事件、两轴未重叠或候选变化都会返回失败。指定 reviewer 必须核对真实输出、标准来源与需求覆盖，再用平台工具分别提交报告和裁决；两轴竞争同一 revision 时，失败一轴刷新轮次后重试。
 
-平台接受的执行证据始终标记为 `reviewer-declared`；结构和 hash 校验不能证明外部模型已经运行。AC-REVIEW-04 还需保存一次真实完成的评审、两份原始执行记录、平台轮次与报告 ID、裁决后的状态读回。当前开发环境的 Codex 0.167.0-alpha.4 在模型执行前因只读运行目录初始化失败，此门槛保持 **BLOCKED**；已登录、SDK 测试或人工填入元数据不能替代该证据。
+### 采集报告的完整性合同
+
+每轴 prompt 使用 `boardroom-review-report/v1`：第一行 `Review-Axis: spec` 或 `Review-Axis: standards`，第二个非空行为唯一的 `Verdict: PASS` 或 `Verdict: CHANGES_REQUESTED`；然后依次为 `## Evidence`、`## Risks and gaps`、`## Checks`，每节填写实际正文。最后一行必须是本轴的 `<!-- review-report-complete:spec -->` 或 `<!-- review-report-complete:standards -->`。禁止只返回标记、空章节、未替换的模板或把整份报告包在代码围栏中；完整正文仍受平台 64 KiB 上限约束。
+
+`evidence.json` 分轴保存 `modelOutputCollected`、`reportComplete`、`reportVerdict`、`reportValidationErrors` 和精确正文 `outputSha256`；汇总保存 `failureReasons`。正文、JSONL、stderr 和 prompt 在失败时仍保留。任何一轴缺结论、存在重复/矛盾结论、缺少章节/结束标记、轴不符或 CLI 失败，整体返回 `BLOCKED_OR_FAILED` 和非零退出码；不会自动重跑直到得到通过。一次完整的 `CHANGES_REQUESTED` 报告也可以得到 `READY_FOR_REVIEWER`，表示材料可供 reviewer 检查，并不代表任务通过。
+
+结构校验不能证明结论合理、需求覆盖充分或原始执行真实。reviewer 仍须检查实际宿主、标准来源、文件证据和未执行范围，再自行提交与裁决。新增完整性规则由采集脚本回归验证；修订后的 prompt 尚未在真实 CLI 上重新执行，不能把合成事件回归称为原生复验。历史报告保留原始版本与格式，不能补写标记后宣称为新合同下的原生执行结果。
+
+平台接受的执行证据始终标记为 `reviewer-declared`；结构和 hash 校验不能证明外部模型已经运行。AC-REVIEW-04 需要真实完成的评审、两份原始执行记录、平台轮次与报告 ID、裁决后的状态读回。[2026-11-11 阶段 3 独立实测回传](https://github.com/gbcdby/boardroom/issues/107#issuecomment-6789489800)已在应用候选 `5c7f87f20c31f78eac9be5875e644d44033e3648` 完成：macOS 26.5.2 / SQLite，两个 Codex CLI 0.167.0 隔离上下文并行，指定 Claude Code 2.1.233 reviewer 提交两轴并裁决；[阶段 5 补验](https://github.com/gbcdby/boardroom/issues/107#issuecomment-6790049547)另绑定 `533e49da5d4e9d4a236d68e0bc23c03411caa5b1`。执行与原始材料核对归原独立执行者，交付方承接正式报告，未将其写成本机或修复后候选重跑。
+
+该回传发现 Codex reviewer 误读兄弟属性 `$ref`。任务工具现为每个公开字段导出内联类型和原有约束，仍拒绝字符串修订号及无效整数；没有改变 CAS、权限或裁决语义。实际 MCP schema/协议回归验证了这一表示修正，修复后真实 Codex reviewer 仍未重跑。已完成的 Claude reviewer 路径保留原候选身份，后续适用性与合并状态见 [Spec #104](https://github.com/gbcdby/boardroom/issues/104)及 [PR #99](https://github.com/gbcdby/boardroom/pull/99)。此前本机只读 Codex 运行目录的失败仍是该环境的历史事实，不代表外部实测未执行。

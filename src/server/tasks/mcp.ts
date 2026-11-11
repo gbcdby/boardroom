@@ -9,9 +9,9 @@ import {
   submitReviewReportSchema, decideTaskReviewSchema, taskSettingsSchema, listTasksSchema,
 } from "./schemas.ts";
 
-const project = { projectId: taskIdSchema.optional() };
-const task = { ...project, taskId: taskIdSchema };
-const round = { ...task, roundId: taskIdSchema };
+const project = { projectId: taskIdSchema.describe("项目 ID，省略时使用当前 MCP 绑定").optional() };
+const task = { ...project, taskId: taskIdSchema.describe("任务 ID") };
+const round = { ...task, roundId: taskIdSchema.describe("评审轮次 ID") };
 export const TASK_COMMANDS = {
   get_settings: { name: "get_task_settings", title: "查看默认评审成员", schema: z.object(project).strict() },
   set_settings: { name: "set_task_settings", title: "设置默认评审成员", schema: taskSettingsSchema.extend(project).strict() },
