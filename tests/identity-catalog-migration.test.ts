@@ -17,6 +17,21 @@ import { clearTargetTables, compareData, copyAllTables } from "../src/server/db/
 
 const pgUrl = process.env["AGENT_STUDIO_PG_TEST_URL"] ?? process.env["AGENT_STUDIO_PG_CONNECTION_STRING"];
 for (const engine of ["sqlite", "postgres"] as const) {
+  test(`${engine} R-134-STD-001：复制来源的 ID/修订必须同时为空或同时非空`, {
+    skip: engine === "postgres" && !pgUrl ? "未配置真实 PostgreSQL；由数据库 CI 门控执行" : false,
+  }, async () => {
+    const f = await identityFixture(engine);
+    try {
+      const catalog = createIdentityCatalog({ repos: f.repos });
+      const role = await catalog.roles.create({ actor: ownerActor() }, { name: "约束基准", purpose: "", instructions: "", recommendedSkillRefs: [] });
+      for (const [sourceId, sourceRevision] of [[role.roleTemplateId, null], [null, 1]] as const) {
+        await assert.rejects(f.db.exec(`INSERT INTO role_template_versions (role_template_id, revision, name, purpose, instructions,
+          recommended_skill_refs_json, copied_from_role_template_id, copied_from_revision, created_at)
+          VALUES (?, 2, '不允许的半空引用', '', '', '[]', ?, ?, ?)`, [role.roleTemplateId, sourceId, sourceRevision, new Date().toISOString()]));
+      }
+      assert.equal((await f.db.query("SELECT * FROM role_template_versions")).length, 1);
+    } finally { await f.close(); }
+  });
   test(`${engine} S2 v13→v14 非空升级保留全部旧身份/引用/快照/审计，并建立不可重分配 alias`, {
     skip: engine === "postgres" && !pgUrl ? "未配置真实 PostgreSQL；由数据库 CI 门控执行" : false,
   }, async () => {

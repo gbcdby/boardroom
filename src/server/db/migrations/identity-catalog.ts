@@ -25,7 +25,7 @@ export const identityCatalogMigration: Migration = {
       created_at TEXT NOT NULL,
       PRIMARY KEY (role_template_id, revision),
       CHECK ((copied_from_role_template_id IS NULL AND copied_from_revision IS NULL)
-        OR (copied_from_role_template_id IS NOT NULL AND copied_from_revision >= 1)),
+        OR (copied_from_role_template_id IS NOT NULL AND copied_from_revision IS NOT NULL AND copied_from_revision >= 1)),
       FOREIGN KEY (copied_from_role_template_id, copied_from_revision)
         REFERENCES role_template_versions(role_template_id, revision)
     );
