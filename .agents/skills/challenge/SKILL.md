@@ -48,5 +48,3 @@ disable-model-invocation: true
 方向清楚后交回原负责人；需要完整设计时由 `worker-design` 形成或更新 Spec，再由 `worker-plan-tickets` 拆出实现任务，复用已有有效记录。决策问题不冒充实现 Ticket，本技能不接管架构设计、拆票与实现。用户限定只讨论或设定停点时遵守；已有授权覆盖的后续工作可继续，未决项只阻塞受影响部分。大任务不要求先调用本入口。
 
 只有接收方需要结构化结果时读取 [机器交接](references/result-contract.md)。本次讨论完成不表示意见一致、设计正确或工作已获批准。
-
-方法来源见 [方法来源](references/methods.md)。

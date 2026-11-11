@@ -23,10 +23,10 @@ disable-model-invocation: true
 
 主动按项目流程启动或恢复自动推进用 `auto`，只调整默认流程也可单独调用；持续调度由 `deliver` 承担。直接持续交付用 `deliver`；已有 Spec 要拆任务用 `worker-plan-tickets`；执行指定 Ticket 用 `worker-implement`；想了解进度或设计变化用只读 `brief`。只有用户选择时才启动 `auto`、`challenge`、`steer`、`setup` 等人工入口。
 
-setup 可选，任务不必经过所有 worker；没有 GitHub、Boardroom 或某项可选能力也可继续不受影响的工作。具体共享记录、工具和授权以项目为准。
+setup 可选，任务不必经过所有 worker；没有代码托管平台、协作房间或某项可选能力也可继续不受影响的工作。具体共享记录、工具和授权以项目为准。
 
 ## 结束与交接
 
 纯咨询给出结论、提示和必要限制后结束。明确工作请求交接后说明实际采用的能力与到达的终点，不把推荐当执行结果。引用用户可访问的技能页面或仓库资料，不假定本机路径能被他人打开。
 
-仅在接收方需要时提供 [机器交接](references/result-contract.md)；导航完成不表示建议中的工作已执行。方法来源见 [来源](references/sources.md)。
+仅在接收方需要时提供 [机器交接](references/result-contract.md)；导航完成不表示建议中的工作已执行。
