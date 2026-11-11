@@ -37,7 +37,7 @@ async function fixture(repos: RepositorySet) {
 }
 
 function task(projectId: string): Task {
-  return { id: randomUUID(), projectId, title: "将被删除的任务", body: "完整业务事实", labels: [], state: "todo",
+  return { id: randomUUID(), projectId, title: "将被删除的任务", body: "完整业务事实", deliveryKind: "code", acceptanceText: "完整业务事实", acceptanceSource: "explicit", labels: [], state: "todo",
     assigneeMemberId: null, reviewerMemberId: null, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null,
     blockedReason: null, author, createdAt: at, updatedAt: at };
 }

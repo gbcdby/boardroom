@@ -55,7 +55,7 @@ try {
     records.push({ project, members });
   }
   const first = records[0], owner = { actor: ownerActor(first.project.id) };
-  const create = (title) => service.create(owner, first.project.id, { title, body: "完成目标，保留清楚的验收与评审记录。", labels: ["浏览器验收"], assigneeMemberId: first.members[0].id, repoPath, fixedPoint });
+  const create = (title) => service.create(owner, first.project.id, { title, body: "完成目标，保留清楚的验收与评审记录。", deliveryKind: "code", acceptanceText: "目标实现、评审和交付记录完整可核对。", labels: ["浏览器验收"], assigneeMemberId: first.members[0].id, repoPath, fixedPoint });
   await create("整理交付目标");
   let active = await create("进行中的协作任务");
   active = await service.transition(owner, first.project.id, active.id, { expectedRevision: active.revision, state: "in-progress" });

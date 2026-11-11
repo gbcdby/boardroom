@@ -58,7 +58,7 @@ async function person(repos: RepositorySet) {
 
 async function related(repos: RepositorySet) {
   const people = await person(repos), { project, member, agent } = people;
-  const task: Task = { id: randomUUID(), projectId: project.id, title: "保留真实业务关系", body: "不应采集的正文", labels: [],
+  const task: Task = { id: randomUUID(), projectId: project.id, title: "保留真实业务关系", body: "不应采集的正文", deliveryKind: "code", acceptanceText: "不应采集的正文", acceptanceSource: "explicit", labels: [],
     state: "blocked", assigneeMemberId: member.id, reviewerMemberId: member.id, repoPath: null, fixedPoint: null,
     revision: 1, currentReviewRoundId: null, blockedReason: "先前原因", author: { kind: "human", actorId: "human:local", displayName: "预算测试" }, createdAt: at, updatedAt: at };
   await repos.tasks.create(task);

@@ -36,7 +36,7 @@ async function http(method, url, body, expected = 200) {
   assert.equal(response.status, expected, JSON.stringify(result));
   return result;
 }
-async function connect(name, groupId) {
+async function connect(name, groupId, role) {
   const client = new Client({ name, version: "tasks-protocol-fixture" });
   const transport = new StreamableHTTPClientTransport(new URL(server.mcpUrl));
   await client.connect(transport);
@@ -45,7 +45,7 @@ async function connect(name, groupId) {
     const response = await client.callTool({ name, arguments: args });
     return JSON.parse(response.content.find(item => item.type === "text").text);
   }
-  const joined = await call("join", { displayName: name, hostType: "other", projectId, groupId });
+  const joined = await call("join", { displayName: name, hostType: "other", projectId, groupId, ...(role ? { role } : {}) });
   assert.equal(joined.ok, true, JSON.stringify(joined));
   return { call, joined };
 }
@@ -64,9 +64,33 @@ try {
   const groupId = (await http("POST", `/api/projects/${projectId}/groups`, { name: "任务协作" }, 201)).group.id;
   const worker = await connect(`执行者-${projectId}`, groupId);
   const reviewer = await connect(`评审者-${projectId}`, groupId);
+  const manager = await connect(`统筹-${projectId}`, groupId, "manager");
   const prefix = `/api/projects/${projectId}`;
+  const quick = await manager.call("create_task", { title: "先记下待整理的需求", reviewerMemberId: null });
+  checked("MCP 标题录入持久 todo，缺分派不误发执行或评审通知", () => {
+    assert.equal(quick.ok, true, JSON.stringify(quick)); assert.equal(quick.task.state, "todo");
+    assert.equal(quick.task.body, ""); assert.equal(quick.task.assigneeMemberId, null); assert.equal(quick.task.reviewerMemberId, null);
+    assert.equal(quick.task.deliveryKind, null); assert.equal(quick.task.acceptanceSource, "explicit");
+  });
+  const quickRead = await http("GET", `${prefix}/tasks/${quick.task.id}`);
+  const httpGate = await http("POST", `${prefix}/tasks/${quick.task.id}/transitions`, { expectedRevision: quick.task.revision, state: "in-progress" }, 400);
+  const mcpGate = await manager.call("transition_task", { taskId: quick.task.id, expectedRevision: quick.task.revision, state: "in-progress" });
+  checked("HTTP 与 MCP 使用相同资料门禁，缺条件不能经旧 transition 推进", () => {
+    assert.deepEqual(quickRead.task, quick.task);
+    assert.equal(mcpGate.ok, false); assert.equal(mcpGate.error.details.reason, "task_materials_incomplete");
+    assert.deepEqual(httpGate.error.details.reasonCodes, mcpGate.error.details.reasonCodes);
+    assert.deepEqual(httpGate.error.details.reasonCodes, quick.task.materialStatus.startExecution.reasonCodes);
+    assert.equal(quick.task.materialStatus.executionAdmission, "not-issued");
+    assert.equal("allowed" in quick.task.materialStatus.startExecution, false);
+  });
+  const forbiddenQuick = await worker.call("create_task", { title: "普通执行人不能借未分派取得创建权" });
+  const noQuickEvent = await worker.call("wait_for_messages", { timeoutMs: 100 });
+  checked("nullable 录入保持 MCP 权限，未分派不投递工作事件", () => {
+    assert.equal(forbiddenQuick.error.code, "FORBIDDEN"); assert.equal(noQuickEvent.status, "timeout");
+  });
   await http("PUT", `${prefix}/task-settings`, { expectedRevision: 0, defaultReviewerMemberId: reviewer.joined.memberId });
   let task = (await http("POST", `${prefix}/tasks`, { title: "验证任务协议链", body: "README 应记录候选结果。", labels: ["protocol"],
+    deliveryKind: "code", acceptanceText: "README 应记录候选结果，并通过指定候选两轴检查。",
     assigneeMemberId: worker.joined.memberId, repoPath: repository, fixedPoint: baseCommit }, 201)).task;
   checked("人通过 HTTP 创建完整任务并使用明确默认 reviewer", () => assert.equal(task.reviewerMemberId, reviewer.joined.memberId));
   const notification = await worker.call("wait_for_messages", { timeoutMs: 100 });

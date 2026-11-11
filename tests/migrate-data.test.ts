@@ -63,7 +63,7 @@ async function seedSqliteDir(dir: string): Promise<void> {
     const repos = createRepositories(driver);
     const at = "2026-11-10T12:00:00.000Z";
     const author = { kind: "human" as const, actorId: "owner", displayName: "人" };
-    const task: Task = { id: "task-copy", projectId: "pr1", title: "迁移任务", body: "验收正文", labels: ["迁移"], state: "in-progress",
+    const task: Task = { id: "task-copy", projectId: "pr1", title: "迁移任务", body: "验收正文", deliveryKind: "code", acceptanceText: "验收正文", acceptanceSource: "explicit", labels: ["迁移"], state: "in-progress",
       assigneeMemberId: "mb1", reviewerMemberId: "mb2", repoPath: "/repo", fixedPoint: "HEAD~1", revision: 1,
       currentReviewRoundId: null, blockedReason: null, author, createdAt: at, updatedAt: at };
     await repos.tasks.setSettings("pr1", 0, "mb2");
