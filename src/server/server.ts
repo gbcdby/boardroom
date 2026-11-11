@@ -26,6 +26,8 @@ import { createHostLauncher } from "./runtime/hosts/launcher.ts";
 import type { HostLauncher } from "./runtime/hosts/types.ts";
 import { notifyMessageCommit } from "./runtime/dispatch-events.ts";
 import { createTaskApi } from "./tasks/api.ts";
+import { createMemoryApi } from "./memory/api.ts";
+import { registerMemoryRuntime, closeMemoryRuntime } from "./memory/runtime.ts";
 
 /** WebSocket 端点路径。 */
 export const WS_PATH = "/ws";
@@ -147,6 +149,18 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     );
   }
 
+  try {
+    registerMemoryRuntime(driver, {
+      database: driver.kind === "sqlite" ? { kind: "sqlite", sqlitePath: path.join(config.dataDir, "agent-studio.db") }
+        : { kind: "postgres", connectionString: config.pgConnectionString! },
+      ...(config.memory ? { config: config.memory } : {}),
+      onDiagnostic: code => log.warn("memory_reader_unavailable", { code }),
+    });
+  } catch (error) {
+    await driver.close();
+    throw new ServerStartupError((error as Error).message);
+  }
+
   // T2 / D6：进程重启后，上一进程遗留的「connected」MCP 会话已失效。
   // 启动时统一标记为断开，并把这些成员的运行状态置为 offline——恢复完全依赖
   // 服务端持久化 + agent 重连后主动 join/心跳，不臆造在线（STATUS-02）。
@@ -226,6 +240,8 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   });
   const taskApi = createTaskApi({ db: driver, logger,
     ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}) });
+  const memoryApi = createMemoryApi({ db: driver, logger,
+    ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}) });
 
   const httpServer = createServer((request, response) => {
     void handleRequest(request, response).catch((error: unknown) => {
@@ -258,6 +274,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     }
 
     if (pathname.startsWith("/api/")) {
+      if (await memoryApi.handle(request, response, pathname)) return;
       if (await taskApi.handle(request, response, pathname)) return;
       if (await runtimeApi.handle(request, response, pathname)) return;
       // T1（#14）项目/群组/成员 API；未匹配时落到统一的 404。
@@ -352,6 +369,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     await mcpHandler.close();
     clearInterval(statusTimer);
     await hub.close();
+    await closeMemoryRuntime(driver);
     await driver.close();
     const err = error as NodeJS.ErrnoException;
     const message =
@@ -419,6 +437,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
         httpServer.close(() => resolve());
         httpServer.closeAllConnections();
       });
+      await closeMemoryRuntime(driver);
       await driver.close();
       log.info("服务已停止");
     },

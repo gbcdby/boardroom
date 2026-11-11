@@ -72,9 +72,10 @@ export interface DecideReviewInput {
   expectedTaskRevision: number; expectedRoundRevision: number;
   verdict: ReviewVerdict; reason: string; override?: boolean;
 }
-export type WorkEventKind = 'task.assigned' | 'task.review_ready' | 'task.blocked' | 'task.review_decided';
+export type WorkEventKind = 'task.assigned' | 'task.review_ready' | 'task.blocked' | 'task.review_decided' | 'memory.summary_requested';
 export interface WorkEvent {
   id: string; projectId: string; recipientMemberId: string; taskId: string | null;
+  contextGroupId?: string | null;
   kind: WorkEventKind; eventKey: string; payload: Record<string, unknown>;
   deliveryState: 'pending' | 'delivered' | 'acked'; attempts: number;
   createdAt: string; firstDeliveredAt: string | null; lastDeliveredAt: string | null; ackedAt: string | null;

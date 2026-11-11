@@ -30,6 +30,7 @@ import { managedRuntime } from "./migrations/runtime.ts";
 import { runtimeObservabilityMigration } from "./migrations/runtime-observability.ts";
 import { runtimeProcessIdentityMigration } from "./migrations/runtime-process-identity.ts";
 import { tasksMigration } from "./migrations/tasks.ts";
+import { memoryMigration } from "./migrations/memory.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -55,6 +56,8 @@ export interface TableSpec {
 export const BUSINESS_TABLES: readonly TableSpec[] = [
   { name: "agents", keyColumns: ["id"] },
   { name: "projects", keyColumns: ["id"] },
+  { name: "memory_documents", keyColumns: ["id"] },
+  { name: "memory_versions", keyColumns: ["id"] },
   {
     name: "org_nodes",
     keyColumns: ["id"],
@@ -75,10 +78,14 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
   { name: "task_review_reports", keyColumns: ["id"] },
   { name: "task_comments", keyColumns: ["id"] },
   { name: "task_history", keyColumns: ["id"] },
-  { name: "work_events", keyColumns: ["id"] },
   { name: "groups", keyColumns: ["id"] },
+  { name: "work_events", keyColumns: ["id"] },
+  { name: "memory_summary_requests", keyColumns: ["id"] },
+  { name: "memory_trigger_counters", keyColumns: ["project_id", "agent_id", "group_id"] },
+  { name: "memory_scan_checkpoints", keyColumns: ["id"] },
   { name: "group_participants", keyColumns: ["group_id", "member_id"] },
   { name: "messages", keyColumns: ["id"] },
+  { name: "memory_message_receipts", keyColumns: ["agent_id", "message_id"] },
   { name: "task_message_links", keyColumns: ["task_id", "message_id"] },
   { name: "message_deliveries", keyColumns: ["id"] },
   { name: "member_statuses", keyColumns: ["project_id", "member_id"] },
@@ -307,6 +314,7 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   runtimeObservabilityMigration,
   runtimeProcessIdentityMigration,
   tasksMigration,
+  memoryMigration,
 ];
 
 // ---------------------------------------------------------------------------

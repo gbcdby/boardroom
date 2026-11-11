@@ -16,6 +16,7 @@ const navigation = computed(() => [
     { to: "/projects", label: "项目与群组", icon: "folder" },
     { to: projectTo("tasks"), label: "任务", icon: "grid" },
     { to: projectTo("chat"), label: "群聊", icon: "message" },
+    { to: projectTo("memory"), label: "记忆", icon: "layers" },
   ] },
   { label: "管理", items: [
     { to: "/runtimes", label: "托管 Agent", icon: "layers" },

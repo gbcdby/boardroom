@@ -19,6 +19,7 @@ import { migrations } from "../db/migrations/index.ts";
 import { createLogger } from "../logger.ts";
 import { createMcpCore } from "./core.ts";
 import { createMcpServer } from "./server.ts";
+import { registerMemoryRuntime, closeMemoryRuntime } from "../memory/runtime.ts";
 
 async function main(): Promise<void> {
   // 日志写 stderr：stdout 属于 MCP 线协议，不能混入日志。
@@ -51,7 +52,15 @@ async function main(): Promise<void> {
     ...(config?.pgConnectionString === undefined ? {} : { pgConnectionString: config.pgConnectionString }),
   });
   await driver.connect();
-  await driver.migrate(migrations);
+  try {
+    await driver.migrate(migrations);
+    registerMemoryRuntime(driver, {
+      database: driver.kind === "sqlite" ? { kind: "sqlite", sqlitePath: path.join(dataDir, "agent-studio.db") }
+        : { kind: "postgres", connectionString: config!.pgConnectionString! },
+      ...(config?.memory ? { config: config.memory } : {}),
+      onDiagnostic: code => logger.warn("memory_reader_unavailable", { code }),
+    });
+  } catch (error) { await driver.close(); throw error; }
 
   const core = createMcpCore({
     logger,
@@ -62,31 +71,32 @@ async function main(): Promise<void> {
   });
   const server = createMcpServer({ core, logger });
   const transport = new StdioServerTransport();
-  await server.connect(transport);
-  logger.info("mcp_stdio_connected", { pid: process.pid, database: driver.kind });
-
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info("收到退出信号，正在关闭 stdio", { signal });
     // 连接断开：把本会话标记为 disconnected、成员状态 offline（状态可恢复）。
-    core.disconnect();
-    core.close();
-    try {
-      await server.close();
-    } catch (error) {
-      logger.error("关闭 stdio 时出错", { error });
+    for (const close of [() => core.disconnect(), () => core.close(), () => server.close(),
+      () => closeMemoryRuntime(driver), () => driver.close()]) {
+      try { await close(); }
+      catch { logger.error("关闭 stdio 资源失败"); }
     }
-    await driver.close();
   };
-
+  // 宿主正常关闭 stdin 也是资源关闭，不是一次 Agent 声明的逻辑 session-end。
+  process.stdin.once("end", () => void shutdown("stdin_end"));
+  process.stdin.once("close", () => void shutdown("stdin_close"));
+  server.server.onclose = () => { void shutdown("transport_close"); };
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.once(signal, () => void shutdown(signal));
   }
+  try {
+    await server.connect(transport);
+    logger.info("mcp_stdio_connected", { pid: process.pid, database: driver.kind });
+  } catch (error) { await shutdown("startup_failed"); throw error; }
 }
 
-await await (main()).catch((error) => {
+await main().catch((error) => {
   if (error instanceof ConfigError) {
     process.stderr.write(`配置无效：${error.message}\n`);
   } else {

@@ -28,6 +28,11 @@ import { createTaskService, type TaskAccess } from "../tasks/service.ts";
 import { invokeTaskOperation, mapTaskToolError, TASK_OBSERVATIONS, type TaskOperation } from "../tasks/mcp.ts";
 import { notifyWorkEventCommit, onWorkEventCommit } from "../tasks/events.ts";
 import type { WorkEvent } from "../../shared/tasks.ts";
+import type { MemoryInjection } from "../../shared/memory.ts";
+import { createMemoryService, type MemoryAccess } from "../memory/service.ts";
+import { invokeMemoryOperation, mapMemoryToolError, MEMORY_OBSERVATIONS, type MemoryOperation } from "../memory/mcp.ts";
+import { getMemoryRuntime, scheduleMemoryReconciliation, cancelMemoryReconciliations } from "../memory/runtime.ts";
+import { unavailableMemory } from "../memory/injection.ts";
 import { getAdapter, isRegistered, listAdapterIds } from "./adapters/index.ts";
 import { createRuntimeRepository } from "../runtime/repository.ts";
 import { notifyMessageCommit } from "../runtime/dispatch-events.ts";
@@ -128,6 +133,7 @@ export interface JoinParams {
  * 绝不出现任何跨项目数据（MCPCTX-02 / AC-PROJ-GUARD-01）。
  */
 export interface McpSessionContext {
+  readonly memory?: MemoryInjection;
   readonly project: { readonly id: string; readonly name: string };
   readonly group: { readonly id: string; readonly name: string };
   readonly identity: {
@@ -231,6 +237,7 @@ export interface WaitResult {
   readonly cursor: string | null;
   readonly drainedBacklog: boolean;
   readonly workEvents?: WorkEvent[];
+  readonly memory?: MemoryInjection;
 }
 
 export interface WaitParams {
@@ -433,6 +440,7 @@ export interface McpCore {
   heartbeat(sessionId: string): Promise<HeartbeatResult>;
   readHistory(sessionId: string, params: ReadHistoryParams): Promise<ReadHistoryResult>;
   taskOperation(sessionId: string, operation: TaskOperation, input: unknown): Promise<Record<string, unknown>>;
+  memoryOperation(sessionId: string, operation: MemoryOperation, input: unknown): Promise<Record<string, unknown>>;
   /**
    * T8（#21）：唤醒本 core 中在该群组等待、且属于 `wakeGate` 放行集合的成员。
    * 供人的 HTTP 消息路径显式触发（该路径不经过任何 core 的 send_message，因此需外部调用）。
@@ -463,11 +471,30 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   const repos: RepositorySet = createRepositories(options.db);
   const tasks = createTaskService({ repos, now,
     onWorkEvents: events => notifyWorkEventCommit(options.db, events) });
+  const memoryRuntime = getMemoryRuntime(options.db);
+  const memory = createMemoryService({ repos, now, config: memoryRuntime.config, injectionReader: memoryRuntime.reader,
+    onWorkEvents: events => notifyWorkEventCommit(options.db, events),
+    readVisibleMessages: async (access, ids) => {
+      const connection = access.connection;
+      const binding = connection && [...bindings.values()].find(item => item.memberId === connection.memberId
+        && item.projectId === connection.projectId && item.groupId === connection.groupId);
+      if (!binding || closed) return [];
+      await guard(binding, "group:view", { projectId: binding.projectId, groupId: binding.groupId });
+      const messages = [];
+      for (const id of new Set(ids)) {
+        const message = await repos.messages.get(id);
+        if (message && await isVisibleTo(binding, message)) messages.push({ id: message.id, groupId: message.groupId, text: message.body, createdAt: message.createdAt });
+      }
+      return messages;
+    },
+  });
   const runtimes = createRuntimeRepository(options.db);
   /** T7：进程级共享的防环/限流器。 */
   const antiLoop = getSharedAntiLoop(options.antiLoop);
   /** 会话键 → 绑定（运行时对象，进程内维护；持久化部分在 mcp_sessions/members/agents）。 */
   const bindings = new Map<string, SessionBinding>();
+  const memoryCoreKey = newId() + ":";
+  const injectedVersions = new Map<string, string>();
   /** 本 core 挂起的等待。 */
   const pendingWaits: PendingWait[] = [];
   /** 每位成员最多一个并发等待。 */
@@ -509,6 +536,57 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         }
       }),
     };
+  }
+
+  async function memoryAccess(binding: SessionBinding, background = false): Promise<MemoryAccess> {
+    return { actor: actorForSession(binding),
+      connection: { projectId: binding.projectId, memberId: binding.memberId, groupId: binding.groupId },
+      injectionBindingGeneration: memoryCoreKey + binding.sessionId,
+      runMutation: async (operation, body) => {
+        const invoke = () => withAccess(binding, operation, async () => {
+          if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError("CONFLICT", "记忆会话绑定已失效。");
+          try { return await body(); }
+          catch (error) {
+            // 只有领域 conflict 需先转换以避免运行时 fence 改写原因；
+            // 其他错误（包括权限回滚包装）交回 service 恢复原始语义。
+            if (error instanceof RepositoryError && error.code === "conflict") throw mapMemoryToolError(error);
+            throw error;
+          }
+        });
+        if (!background || options.db.kind !== "postgres") return await invoke();
+        // 自动补偿先设置真实数据库超时，再取得成员/fence 锁；不留下后台占池或锁等待。
+        return await options.db.transaction(async () => {
+          await options.db.exec("SET LOCAL lock_timeout = '100ms'");
+          await options.db.exec("SET LOCAL statement_timeout = '250ms'");
+          return await invoke();
+        });
+      },
+    };
+  }
+
+  async function memoryAtSafePoint(binding: SessionBinding, force = false): Promise<MemoryInjection | undefined> {
+    let injection: MemoryInjection;
+    try {
+      await withAccess(binding, "observe", () => guard(binding, "group:view", { projectId: binding.projectId, groupId: binding.groupId }));
+      injection = await memory.inject(await memoryAccess(binding));
+      if (closed || bindings.get(binding.sessionId) !== binding) throw new Error("stale_memory_binding");
+      await withAccess(binding, "observe", () => guard(binding, "group:view", { projectId: binding.projectId, groupId: binding.groupId }));
+    } catch {
+      injection = unavailableMemory(memoryRuntime.config, "memory_binding_unavailable");
+    }
+    const fingerprint = JSON.stringify({ state: injection.state, errors: injection.errors,
+      entries: injection.entries.map(entry => [entry.scope, entry.documentId, entry.version, entry.injectedBytes, entry.truncated]) });
+    if (!force && injectedVersions.get(binding.sessionId) === fingerprint) return undefined;
+    injectedVersions.set(binding.sessionId, fingerprint);
+    return injection;
+  }
+
+  function reconcileMemorySoon(binding: SessionBinding): void {
+    if (closed) return;
+    scheduleMemoryReconciliation(options.db, memoryCoreKey + binding.sessionId, async () => {
+      if (closed || bindings.get(binding.sessionId) !== binding) return;
+      await memory.reconcileTriggers(await memoryAccess(binding, true));
+    }, () => log.warn("memory_reconciliation_failed", { projectId: binding.projectId, memberId: binding.memberId }));
   }
 
   // -------------------------------------------------------------------------
@@ -719,12 +797,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     return await withAccess(binding, "consume", async () => {
     const result: Message[] = [];
     for (const message of messages) {
-      try {
-        await (repos.deliveries.recordAttempt(message.id, binding.memberId, "delivered"));
-      } catch (error) {
-        if (options.managed) throw error;
-        log.warn("delivery_record_failed", { error, messageId: message.id });
-      }
+      // 投递事实是可恢复性的组成部分；持久化失败时整批回滚、保留积压，
+      // 不成功返回消息后再让 ACK 永久抹掉缺失的首次投递来源。
+      await (repos.deliveries.markMcpDelivered(message.id, binding.memberId));
       result.push(toMessage(message));
     }
     if (options.managed) await options.managed.onDelivery();
@@ -759,8 +834,11 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       const binding = bindingByMember(entry.memberId);
       if (binding) await (markWorking(binding));
     }
+    const binding = !closed && result.status !== "cancelled" ? bindingByMember(entry.memberId) : undefined;
+    const injection = binding ? await memoryAtSafePoint(binding) : undefined;
     entry.settled();
-    entry.resolve(result);
+    entry.resolve(injection ? { ...result, memory: injection } : result);
+    if (binding) reconcileMemorySoon(binding);
   }
 
   /** 串行结算同一次等待，工作事件不会扩大聊天的 mention 唤醒范围。 */
@@ -950,6 +1028,20 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         await withAccess(binding, "observe", async () => {});
         return await invoke();
       } catch (error) { throw mapTaskToolError(error); }
+    },
+
+    async memoryOperation(sessionId, operation, input) {
+      const binding = bindingFor(sessionId);
+      try {
+        const access = await memoryAccess(binding);
+        const invoke = async () => {
+          try { return await invokeMemoryOperation(memory, access, binding, operation, input); }
+          catch (error) { throw mapMemoryToolError(error); }
+        };
+        if (MEMORY_OBSERVATIONS.has(operation)) return await withAccess(binding, "observe", invoke);
+        await withAccess(binding, "observe", async () => {});
+        return await invoke();
+      } catch (error) { throw mapMemoryToolError(error); }
     },
 
     async waitForMessages(sessionId, params) {
@@ -1343,6 +1435,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     async close() {
       if (closed) return;
       closed = true;
+      cancelMemoryReconciliations(options.db, memoryCoreKey);
+      injectedVersions.clear();
       unsubscribeWorkEvents();
       activeRegistrations.delete(registration);
       let drained = 0;
@@ -1388,13 +1482,15 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       const binding = bindingFor(sid);
       const access = await taskAccess(binding);
       const pending = await withAccess(binding, "observe", () => tasks.listWorkEvents(access, binding.projectId));
-      if (pending.length === 0) return result;
-      const workEvents = await withAccess(binding, "consume", async () => {
+      const workEvents = pending.length ? await withAccess(binding, "consume", async () => {
         const events = await tasks.deliverWorkEvents(access, binding.projectId);
         if (events.length && options.managed) await options.managed.onDelivery();
         return events;
-      });
-      return workEvents.length ? { ...result, workEvents } : result;
+      }) : [];
+      const injection = await memoryAtSafePoint(binding, true);
+      reconcileMemorySoon(binding);
+      return { ...result, context: { ...result.context, ...(injection ? { memory: injection } : {}) },
+        ...(workEvents.length ? { workEvents } : {}) };
     },
     acknowledgeMessage: (sid, id) => withAccess(bindingFor(sid), "write", () => core.acknowledgeMessage(sid, id)),
     reportStatus: (sid, params) => withAccess(bindingFor(sid), "observe", () => core.reportStatus(sid, params)),

@@ -461,11 +461,15 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
               <li>任务：{{ pendingProjectPurge.cascade.tasks }} 项（评论 {{ pendingProjectPurge.cascade.taskComments }} 条，历史 {{ pendingProjectPurge.cascade.taskHistory }} 条）</li>
               <li>评审：{{ pendingProjectPurge.cascade.reviewRounds }} 轮，报告 {{ pendingProjectPurge.cascade.reviewReports }} 份</li>
               <li>任务关联消息：{{ pendingProjectPurge.cascade.taskMessageLinks }} 条，工作事件 {{ pendingProjectPurge.cascade.workEvents }} 条，任务设置 {{ pendingProjectPurge.cascade.taskSettings }} 条</li>
+              <li>记忆文档：{{ pendingProjectPurge.cascade.memoryDocuments }} 份（历史版本 {{ pendingProjectPurge.cascade.memoryVersions }} 个）</li>
+              <li>自总结请求：{{ pendingProjectPurge.cascade.memorySummaryRequests }} 条</li>
+              <li>记忆投递收据：{{ pendingProjectPurge.cascade.memoryMessageReceipts }} 条，触发计数 {{ pendingProjectPurge.cascade.memoryTriggerCounters }} 条，扫描检查点 {{ pendingProjectPurge.cascade.memoryScanCheckpoints }} 条</li>
               <li>成员：{{ pendingProjectPurge.cascade.members }} 个</li>
               <li>群聊消息：{{ pendingProjectPurge.cascade.messages }} 条（投递记录 {{ pendingProjectPurge.cascade.deliveries }} 条）</li>
               <li>成员状态：{{ pendingProjectPurge.cascade.memberStatuses }} 条</li>
               <li>MCP 会话记录：{{ pendingProjectPurge.cascade.mcpSessions }} 条</li>
             </ul>
+            <p class="muted small">项目共享与成员记忆会随项目删除。Agent 的全局私有记忆保留。</p>
             <p class="muted small">确认凭据在 {{ pendingProjectPurge.expiresAt }} 后失效。</p>
             <div class="actions">
               <button type="button" class="secondary" :disabled="busy" data-testid="cancel-purge-project" @click="cancelProjectPurge">取消</button>
@@ -500,6 +504,7 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
               </div>
               <details class="member-manage" data-testid="member-management">
                 <summary>管理成员</summary>
+                <p v-if="member.kind === 'agent'" class="muted small">移除后，Agent 的项目记忆保留，自总结请求随成员关系清理。保留的文档可在记忆页维护。</p>
                 <div class="actions member-actions">
                   <button type="button" class="secondary" :disabled="busy || member.role === 'manager' || !!activeProject.archivedAt" @click="assignManager(member)">设为 manager</button>
                   <button type="button" class="secondary" :disabled="busy || !!activeProject.archivedAt" data-testid="toggle-member-status" @click="toggleMemberStatus(member)">{{ member.status === "active" ? "暂停成员" : "恢复成员" }}</button>
@@ -557,9 +562,13 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
             <ul class="small">
               <li>群聊消息：{{ pendingGroupPurge.cascade.messages }} 条（投递记录 {{ pendingGroupPurge.cascade.deliveries }} 条）</li>
               <li>参与者关系：{{ pendingGroupPurge.cascade.participants }} 条</li>
-              <li>任务关联消息：{{ pendingGroupPurge.cascade.taskMessageLinks }} 条（任务、评审与工作事件保留）</li>
+              <li>任务关联消息：{{ pendingGroupPurge.cascade.taskMessageLinks }} 条（任务与评审保留）</li>
+              <li>该群工作事件：{{ pendingGroupPurge.cascade.workEvents }} 条（其它工作事件保留）</li>
+              <li>自总结请求：{{ pendingGroupPurge.cascade.memorySummaryRequests }} 条</li>
+              <li>记忆投递收据：{{ pendingGroupPurge.cascade.memoryMessageReceipts }} 条，触发计数 {{ pendingGroupPurge.cascade.memoryTriggerCounters }} 条，扫描检查点 {{ pendingGroupPurge.cascade.memoryScanCheckpoints }} 条</li>
               <li>MCP 会话记录：{{ pendingGroupPurge.cascade.mcpSessions }} 条</li>
             </ul>
+            <p class="muted small">记忆正文与版本历史全部保留；该群的总结请求与触发记录会一并清除。</p>
             <div class="actions"><button type="button" class="secondary" :disabled="busy" data-testid="cancel-purge-group" @click="cancelGroupPurge">取消</button><button type="button" :disabled="busy" class="danger" data-testid="confirm-purge-group" @click="confirmGroupPurge">确认永久删除</button></div>
           </div>
         </section>

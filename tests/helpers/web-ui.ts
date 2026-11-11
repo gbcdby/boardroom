@@ -108,7 +108,8 @@ export async function withPage(
       { path: "/", component: placeholder }, { path: "/projects", component: placeholder }, { path: "/runtimes", component: placeholder },
       { path: "/projects/:projectId/tasks/:taskId", component: placeholder, meta: { projectSection: "tasks" } },
       { path: "/projects/:projectId/chat/:groupId?", component: placeholder, meta: { projectSection: "chat" } },
-      ...["overview", "tasks", "org", "audit", "status", "members"].map((section) => ({ path: `/projects/:projectId/${section}`, component: placeholder, meta: { projectSection: section } })),
+      { path: "/memory", component: placeholder, meta: { projectSection: "memory" } },
+      ...["overview", "tasks", "org", "audit", "status", "members", "memory"].map((section) => ({ path: `/projects/:projectId/${section}`, component: placeholder, meta: { projectSection: section } })),
     ] });
     store.installRouter(router);
     await router.push(options.path ?? "/projects/project-1/tasks");
