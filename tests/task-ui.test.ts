@@ -23,6 +23,39 @@ function read(url: string, tasks = [task]) {
   return json({ projects: [project] });
 }
 
+for (const assignee of [null, "disabled"]) {
+  test(`任务详情：完成任务负责人${assignee === null ? "移除" : "停用"}后可写理由重开待办，未满足开始条件仍不能执行`, async () => {
+    useToast().clear();
+    const response = deferred<Response>(); const writes: Record<string, unknown>[] = [];
+    const issue = { code: assignee === null ? "assignee_required" : "assignee_invalid", field: "assigneeMemberId", message: "开始前请选择有效负责人。" };
+    let current = { ...task, state: "done", assigneeMemberId: assignee, revision: 8,
+      materialStatus: { ...materialStatus, startExecution: { reasonCodes: [issue.code], issues: [issue] } } };
+    await withPage("TaskDetailView", (url, init) => {
+      if (init?.method === "POST") { writes.push(JSON.parse(String(init.body))); return response.promise; }
+      if (url.endsWith(`/tasks/${task.id}`)) return json({ task: current, comments: [], history: [], rounds: [], reports: [], messageLinks: [] });
+      return read(url);
+    }, async container => {
+      assert.equal(byTestId(container, "task-edit-open").props.disabled, true, "done 编辑限制保留");
+      assert.equal(byTestId(container, "task-block").props.disabled, true);
+      await submit(byTestId(container, "task-block")); assert.equal(writes.length, 0, "空理由连 handler 也不能提交");
+      await input(byTestId(container, "task-transition-reason"), "  原负责人不可用，先恢复待办重新安排  ");
+      assert.equal(byTestId(container, "task-block").props.disabled, false, "重开待办不受开始执行资料门禁阻挡");
+      assert.match(textOf(byTestId(container, "task-block")), /重新打开待办/);
+      assert.match(textOf(container), /补齐资料.*开始/);
+      const pending = submit(byTestId(container, "task-block")); await settle();
+      assert.equal(byTestId(container, "task-block").props.disabled, true);
+      await submit(byTestId(container, "task-block")); assert.equal(writes.length, 1);
+      assert.deepEqual(writes[0], { expectedRevision: 8, state: "todo", reason: "原负责人不可用，先恢复待办重新安排" });
+      current = { ...current, state: "todo", revision: 9 };
+      response.resolve(json({ task: current })); await pending; await settle();
+      assert.match(useToast().items.value.at(-1)?.message ?? "", /重新打开为待办/);
+      assert.equal(byTestId(container, "task-edit-open").props.disabled, false);
+      assert.equal(byTestId(container, "task-start").props.disabled, true, "需要先改派补齐资料再开始");
+      assert.equal(byTestId(container, "task-transition-reason").value, "");
+    }, { path: "/projects/project-1/tasks/task-1" });
+  });
+}
+
 test("任务板：提交完整创建字段，默认 reviewer 由服务解析，进行中防止重复", async () => {
   useToast().clear();
   const response = deferred<Response>(); let payload: any; let requests = 0;

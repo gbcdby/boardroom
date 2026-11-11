@@ -32,7 +32,7 @@ async function http(method, url, body, expected = 200) {
     headers: body === undefined ? {} : { "content-type": "application/json" },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
-  const result = await response.json();
+  const result = response.status === 204 ? null : await response.json();
   assert.equal(response.status, expected, JSON.stringify(result));
   return result;
 }
@@ -181,6 +181,97 @@ try {
   checked("管理者覆盖保留原裁决和两份报告", () => {
     assert.equal(task.state, "in-progress"); assert.equal(detail.reports.length, 2);
     assert.ok(detail.history.some(item => item.detail.previousDecision?.verdict === "pass"));
+  });
+  async function completedTask(title, assigneeMemberId) {
+    let current = (await http("POST", `${prefix}/tasks`, { title, body: "可继续完善的目标", deliveryKind: "code",
+      acceptanceText: "既有候选与评审历史完整保留", assigneeMemberId, repoPath: repository, fixedPoint: baseCommit }, 201)).task;
+    current = (await manager.call("transition_task", { taskId: current.id, expectedRevision: current.revision, state: "in-progress" })).task;
+    const prepared = await manager.call("start_task_review", { taskId: current.id, expectedRevision: current.revision });
+    assert.equal(prepared.ready, true, JSON.stringify(prepared)); current = prepared.task;
+    assert.equal(prepared.round.candidate.diffSha256, start.round.candidate.diffSha256);
+    let currentRound = (await reviewer.call("begin_task_review", { taskId: current.id, roundId: prepared.round.id,
+      expectedTaskRevision: current.revision, expectedRoundRevision: prepared.round.revision })).round;
+    for (const axis of ["spec", "standards"]) {
+      const input = report(axis);
+      const submitted = await reviewer.call("submit_task_review_report", { ...input, taskId: current.id, roundId: currentRound.id,
+        expectedTaskRevision: current.revision, expectedRoundRevision: currentRound.revision,
+        evidence: { ...input.evidence, parentRunId: `recovery-${current.id}`, invocationId: `${current.id}-${axis}`, contextId: `${current.id}-${axis}` } });
+      assert.equal(submitted.ok, true, JSON.stringify(submitted));
+      currentRound = (await http("GET", `${prefix}/tasks/${current.id}`)).rounds.find(item => item.id === currentRound.id);
+    }
+    const decided = await reviewer.call("decide_task_review", { taskId: current.id, roundId: currentRound.id,
+      expectedTaskRevision: current.revision, expectedRoundRevision: currentRound.revision, verdict: "pass", reason: "恢复路径的两轴协议 fixture 已完成" });
+    assert.equal(decided.ok, true, JSON.stringify(decided)); assert.equal(decided.task.state, "done");
+    return decided.task;
+  }
+  const taskEvents = id => server.database.query("SELECT * FROM work_events WHERE task_id = ? ORDER BY id", [id]);
+  for (const lifecycle of ["disabled", "removed"]) {
+    const departing = await connect(`将${lifecycle}的执行者-${projectId}`, groupId);
+    let recovery = await completedTask(`${lifecycle} 后重新打开`, departing.joined.memberId);
+    const beforeDenied = await http("GET", `${prefix}/tasks/${recovery.id}`);
+    const forbidden = await departing.call("transition_task", { taskId: recovery.id, expectedRevision: recovery.revision, state: "todo", reason: "普通负责人没有覆盖权" });
+    const noReason = await manager.call("transition_task", { taskId: recovery.id, expectedRevision: recovery.revision, state: "todo" });
+    checked(`${lifecycle} 场景：MCP 重开不能借自身负责权或省略理由绕过管理权限`, () => {
+      assert.equal(forbidden.error.code, "FORBIDDEN"); assert.equal(noReason.error.details.reason, "task_reason_required");
+    });
+    assert.deepEqual(await http("GET", `${prefix}/tasks/${recovery.id}`), beforeDenied);
+    if (lifecycle === "disabled") await http("POST", `${prefix}/members/${departing.joined.memberId}/disable`, {});
+    else await http("DELETE", `${prefix}/members/${departing.joined.memberId}`, undefined, 204);
+    const before = await http("GET", `${prefix}/tasks/${recovery.id}`);
+    recovery = before.task;
+    assert.equal(recovery.state, "done");
+    const expectedReason = lifecycle === "disabled" ? "assignee_invalid" : "assignee_required";
+    assert.deepEqual(recovery.materialStatus.startExecution.reasonCodes, [expectedReason]);
+    const beforeEvents = await taskEvents(recovery.id);
+    const rejectedHttp = await http("POST", `${prefix}/tasks/${recovery.id}/transitions`,
+      { expectedRevision: recovery.revision, state: "in-progress", reason: "直接恢复执行仍须满足资料" }, 400);
+    const rejectedMcp = await manager.call("transition_task", { taskId: recovery.id, expectedRevision: recovery.revision, state: "in-progress", reason: "直接恢复执行仍须满足资料" });
+    const rejectedEdit = await http("PATCH", `${prefix}/tasks/${recovery.id}`, { expectedRevision: recovery.revision, assigneeMemberId: manager.joined.memberId }, 409);
+    checked(`${lifecycle} 场景：HTTP/MCP 保留直接执行资料门禁与 done 编辑限制`, () => {
+      assert.deepEqual(rejectedHttp.error.details.reasonCodes, [expectedReason]);
+      assert.equal(rejectedMcp.error.details.reason, "task_materials_incomplete");
+      assert.deepEqual(rejectedMcp.error.details.reasonCodes, [expectedReason]);
+      assert.equal(rejectedEdit.error.reason, "task_reopen_required");
+    });
+    const reopen = { expectedRevision: recovery.revision, state: "todo", reason: "原负责人离岗，重新安排后续工作" };
+    const opened = lifecycle === "disabled"
+      ? await http("POST", `${prefix}/tasks/${recovery.id}/transitions`, reopen)
+      : await manager.call("transition_task", { taskId: recovery.id, ...reopen });
+    assert.ok(opened.task, JSON.stringify(opened)); recovery = opened.task;
+    const after = await http("GET", `${prefix}/tasks/${recovery.id}`);
+    checked(`${lifecycle} 场景：${lifecycle === "disabled" ? "HTTP" : "MCP"} 重开仅进入 todo，旧候选报告裁决逐字保留`, () => {
+      assert.equal(recovery.state, "todo"); assert.equal(recovery.revision, before.task.revision + 1);
+      assert.equal(recovery.currentReviewRoundId, null); assert.equal(recovery.assigneeMemberId, before.task.assigneeMemberId);
+      assert.equal(recovery.materialStatus.executionAdmission, "not-issued");
+      assert.deepEqual(after.rounds, before.rounds); assert.deepEqual(after.reports, before.reports); assert.deepEqual(after.comments, before.comments);
+      assert.deepEqual(after.history.slice(0, -1), before.history);
+      assert.deepEqual(after.history.at(-1).detail, { from: "done", to: "todo", reason: reopen.reason });
+    });
+    assert.deepEqual(await taskEvents(recovery.id), beforeEvents, "重开不产生分派或受阻升级通知");
+    const stale = await http("POST", `${prefix}/tasks/${recovery.id}/transitions`, reopen, 409);
+    assert.equal(stale.error.reason, "task_revision_conflict");
+    assert.deepEqual(await http("GET", `${prefix}/tasks/${recovery.id}`), after);
+    recovery = (await manager.call("update_task", { taskId: recovery.id, expectedRevision: recovery.revision, assigneeMemberId: manager.joined.memberId })).task;
+    const events = await taskEvents(recovery.id);
+    const newEvents = events.filter(event => !beforeEvents.some(old => old.id === event.id));
+    const received = await manager.call("wait_for_messages", { timeoutMs: 100 });
+    checked(`${lifecycle} 场景：todo 真正改派仅通知新负责人，MCP ACK 不开始执行`, () => {
+      assert.equal(newEvents.length, 1); assert.equal(newEvents[0].kind, "task.assigned");
+      assert.equal(newEvents[0].recipient_member_id, manager.joined.memberId);
+      assert.equal(received.workEvents?.length, 1); assert.equal(received.workEvents[0].taskId, recovery.id);
+      assert.equal(received.workEvents[0].id, newEvents[0].id);
+    });
+    assert.equal((await manager.call("acknowledge_work_event", { eventId: received.workEvents[0].id })).ok, true);
+    assert.equal((await http("GET", `${prefix}/tasks/${recovery.id}`)).task.state, "todo");
+    const resumed = await manager.call("transition_task", { taskId: recovery.id, expectedRevision: recovery.revision, state: "in-progress" });
+    assert.equal(resumed.ok, true, JSON.stringify(resumed)); assert.equal(resumed.task.state, "in-progress");
+    assert.deepEqual((await http("GET", `${prefix}/tasks/${recovery.id}`)).rounds, before.rounds);
+  }
+  const compatible = await completedTask("旧客户端资料完整的直接重开", worker.joined.memberId);
+  const direct = await manager.call("transition_task", { taskId: compatible.id, expectedRevision: compatible.revision,
+    state: "in-progress", reason: "旧客户端有管理权限、完整资料及理由" });
+  checked("MCP 旧 done→in-progress 完整资料正控制仍可用", () => {
+    assert.equal(direct.ok, true, JSON.stringify(direct)); assert.equal(direct.task.state, "in-progress");
   });
   const applicationCommit = (await exec("git", ["rev-parse", "HEAD"], { cwd: process.cwd() })).stdout.trim();
   const applicationTree = (await exec("git", ["rev-parse", "HEAD^{tree}"], { cwd: process.cwd() })).stdout.trim();

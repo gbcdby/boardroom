@@ -329,11 +329,12 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         const task = await required(projectId, taskId); await progress(ctx.actor, task); expect(task, value.expectedRevision);
         if (value.state === "in-progress") await requireMaterials(task, "startExecution");
         if (task.state === value.state) return present(task);
-        const valid: Record<TaskState, readonly TaskState[]> = { todo: ["in-progress", "blocked"], "in-progress": ["blocked"], blocked: ["in-progress"], review: ["in-progress", "blocked"], done: ["in-progress"] };
+        const valid: Record<TaskState, readonly TaskState[]> = { todo: ["in-progress", "blocked"], "in-progress": ["blocked"], blocked: ["in-progress"], review: ["in-progress", "blocked"], done: ["todo", "in-progress"] };
         if (!valid[task.state].includes(value.state)) throw new TaskError("task_transition_invalid", "此任务状态不能直接切换到目标状态。", "conflict");
         if (task.state === "done") { await manage(ctx.actor, task, "task:override"); if (!value.reason) throw new TaskError("task_reason_required", "重开任务需要说明原因。"); }
         if (value.state === "blocked" && !value.reason) throw new TaskError("task_reason_required", "标记阻塞需要说明原因。");
-        await supersede(ctx, task);
+        // 重开待办只解除当前轮关联；已完成的候选、轮次与裁决必须原样保留。
+        if (!(task.state === "done" && value.state === "todo")) await supersede(ctx, task);
         const updated = await repos.tasks.updateCas(projectId, taskId, value.expectedRevision, { state: value.state, blockedReason: value.state === "blocked" ? value.reason! : null, currentReviewRoundId: null }, ctx.at);
         const detail: Record<string, unknown> = { from: task.state, to: updated.state, reason: value.reason ?? null };
         if (updated.state === "blocked") {

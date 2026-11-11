@@ -167,6 +167,66 @@ def exercise_quick_intake(page, fixture, output, report):
     expect(page.locator("h1")).to_have_text("真实提交后响应丢失")
     report["checks"].append("S5-T1: POST已落库但丢响应、读403、关闭重开与成功核对均不会盲目重试；实际只创建一次")
 
+def exercise_reopen(page, fixture, output, report):
+    origin = fixture["url"]
+    first = fixture["records"][0]
+    pid = first["project"]["id"]
+    for case in fixture["recoveryTasks"]:
+        task_id, member_id, lifecycle = case["taskId"], case["assigneeMemberId"], case["lifecycle"]
+        task_path = f"/api/projects/{pid}/tasks/{task_id}"
+        if lifecycle == "disabled":
+            request(page, origin, "POST", f"/api/projects/{pid}/members/{member_id}/disable")
+        else:
+            request(page, origin, "DELETE", f"/api/projects/{pid}/members/{member_id}")
+        before = request(page, origin, "GET", task_path)
+        assert before["task"]["state"] == "done" and len(before["reports"]) == 2
+        missing = "assignee_invalid" if lifecycle == "disabled" else "assignee_required"
+        assert before["task"]["materialStatus"]["startExecution"]["reasonCodes"] == [missing]
+        width = 1440 if lifecycle == "disabled" else 390
+        page.set_viewport_size({"width": width, "height": 1000 if width == 1440 else 844})
+        page.emulate_media(color_scheme="light", reduced_motion="reduce")
+        page.goto(origin + f"/projects/{pid}/tasks/{task_id}")
+        expect(page.get_by_test_id("task-state")).to_have_text("已完成")
+        expect(page.get_by_test_id("task-edit-open")).to_be_disabled()
+        expect(page.get_by_test_id("task-block")).to_have_text("重新打开待办")
+        expect(page.get_by_test_id("task-block")).to_be_disabled()
+        reason = f"原负责人{lifecycle}，先退回待办重新安排"
+        page.get_by_test_id("task-transition-reason").fill(reason)
+        expect(page.get_by_test_id("task-block")).to_be_enabled()
+        dimensions = page.evaluate("() => ({viewport:innerWidth, document:document.documentElement.scrollWidth})")
+        assert dimensions["document"] <= width + 1, dimensions
+        key = f"task-reopen-{lifecycle}-{width}"
+        page.screenshot(path=str(output / f"{key}.png"), full_page=True, animations="disabled")
+        report["screenshots"].append(f"{key}.png")
+        page.get_by_test_id("task-block").click()
+        expect(page.get_by_test_id("task-state")).to_have_text("待办")
+        expect(page.get_by_test_id("toast-host")).to_contain_text("任务已重新打开为待办。")
+        expect(page.get_by_test_id("task-edit-open")).to_be_enabled()
+        expect(page.get_by_test_id("task-start")).to_be_disabled()
+        expect(page.get_by_test_id("task-transition-reason")).to_have_value("")
+        after = request(page, origin, "GET", task_path)
+        assert after["task"]["revision"] == before["task"]["revision"] + 1
+        assert after["task"]["currentReviewRoundId"] is None
+        assert after["task"]["assigneeMemberId"] == before["task"]["assigneeMemberId"]
+        assert after["rounds"] == before["rounds"] and after["reports"] == before["reports"]
+        assert after["history"][:-1] == before["history"]
+        assert after["history"][-1]["detail"] == {"from": "done", "to": "todo", "reason": reason}
+        transitions = [r for r in report["taskRequests"] if r["path"] == task_path + "/transitions"]
+        assert len(transitions) == 1
+        assert transitions[0]["body"] == {"expectedRevision": before["task"]["revision"], "state": "todo", "reason": reason}
+        page.get_by_test_id("task-edit-open").click()
+        page.get_by_test_id("task-assignee").select_option(first["members"][2]["id"])
+        page.get_by_test_id("task-acceptance").fill("后续处理补充验收，原候选与裁决仍然保留。")
+        page.get_by_test_id("task-save").click()
+        expect(page.get_by_test_id("task-save")).to_have_count(0)
+        expect(page.get_by_test_id("task-start")).to_be_enabled()
+        page.get_by_test_id("task-start").click()
+        expect(page.get_by_test_id("task-state")).to_have_text("进行中")
+        resumed = request(page, origin, "GET", task_path)
+        assert resumed["task"]["assigneeMemberId"] == first["members"][2]["id"]
+        assert resumed["rounds"] == before["rounds"] and resumed["reports"] == before["reports"]
+        report["checks"].append(f"R-BR-COLLAB-137-REQ-001/STD-001 {lifecycle}: 真实成员生命周期后界面理由必填、重开待办请求与Toast一致，保留旧历史、改派补资料后才开始")
+
 def exercise(page, fixture, output, report):
     origin = fixture["url"]
     first, second = fixture["records"]
@@ -325,6 +385,7 @@ def exercise(page, fixture, output, report):
     expect(page.get_by_text("项目已归档，可查看任务、评论与评审记录，无法修改。", exact=True)).to_be_visible()
     expect(page.get_by_test_id("task-board")).to_contain_text("乙项目独立任务")
     report["checks"].append("#39: 旧请求迟到不串项目、无效URL明确回退、归档深链只读")
+    exercise_reopen(page, fixture, output, report)
     assert not errors, errors
     report["status"] = "PASS"
 
