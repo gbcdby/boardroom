@@ -28,7 +28,7 @@ export interface SkillPackagePreview {
   readonly files: readonly SkillFileEntry[];
   readonly canonicalRoot: string;
   readonly sourceAliases: readonly string[];
-  readonly manifests: readonly { readonly path: string; readonly suiteVersion: string; readonly verified: true }[];
+  readonly manifests: readonly { readonly path: string; readonly suiteVersion: string; readonly manifestDigest: string; readonly verified: true }[];
 }
 export interface SkillInspectionIssue {
   readonly code: "invalid_path" | "path_escape" | "symlink_cycle" | "special_file" | "hardlink_unsupported" | "budget_exceeded"

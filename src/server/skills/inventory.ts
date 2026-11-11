@@ -5,7 +5,7 @@ import { z } from "zod";
 import { canonicalizePath } from "../environment.ts";
 import type { SkillFileEntry, SkillInspectionIssue, SkillInventoryPreview, SkillPackagePreview } from "../../shared/skills.ts";
 import { compare, digest, relativePath, sha256, uniqueSorted } from "./common.ts";
-import { readSkillMetadata } from "./metadata.ts";
+import { parseMetadataYaml, readSkillMetadata } from "./metadata.ts";
 
 type Code = SkillInspectionIssue["code"];
 class InspectionError extends Error {
@@ -32,7 +32,7 @@ const manifestSchema = z.object({ schema_version: z.literal("work-suite/v1"), su
   skills: z.array(z.object({ name: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/), path: z.string().refine(relativePath),
     invocation: z.enum(["explicit-user", "implicit-or-explicit"]), files: z.array(fileDeclaration).min(1) }).strict()).max(256) }).passthrough();
 type Declaration = z.infer<typeof manifestSchema>["skills"][number];
-interface ManifestSource { path: string; suiteVersion: string; declaration: Declaration }
+interface ManifestSource { path: string; suiteVersion: string; manifestDigest: string; declaration: Declaration }
 interface Candidate { root: string; aliases: Set<string>; manifests: ManifestSource[] }
 function inside(root: string, file: string) { const rel = path.relative(root, file); return rel === "" || (!rel.startsWith(`..${path.sep}`) && rel !== ".." && !path.isAbsolute(rel)); }
 function requireAbsolute(value: string) {
@@ -120,7 +120,8 @@ async function inspectPackage(candidate: Candidate, limits: SkillInspectionLimit
       if (entry.source_sha256 || entry.transform) {
         const marker = "\ndisable-model-invocation: true\n---";
         const text = actual.toString("utf8"), index = text.indexOf(marker);
-        if (entry.path !== "SKILL.md" || entry.transform !== "add-disable-model-invocation" || !entry.source_sha256 || index < 0
+        if (entry.path !== "SKILL.md" || declaration.invocation !== "explicit-user" || entry.transform !== "add-disable-model-invocation"
+          || !entry.source_sha256 || index < 0 || index + marker.length - 4 !== text.indexOf("\n---", 4)
           || sha256(text.slice(0, index) + "\n---" + text.slice(index + marker.length)) !== entry.source_sha256) fail("manifest_mismatch", "work-suite 导出变换的来源摘要不匹配");
       }
     }
@@ -129,13 +130,8 @@ async function inspectPackage(candidate: Candidate, limits: SkillInspectionLimit
   try {
     const openai = bytes.get("agents/openai.yaml");
     if ((openai?.length ?? 0) > 64 * 1024) fail("budget_exceeded", "策略元数据过大");
-    metadata = readSkillMetadata(skill, openai);
-    for (const manifest of candidate.manifests) {
-      if (metadata.skillName !== manifest.declaration.name) fail("manifest_mismatch", "work-suite 名称与 SKILL.md 不一致");
-      const withManifest = readSkillMetadata(skill, openai, manifest.declaration.invocation);
-      if (metadata.invocationMode !== "unknown" && withManifest.invocationMode !== metadata.invocationMode) fail("manifest_mismatch", "work-suite 与包调用限制不一致");
-      metadata = withManifest;
-    }
+    metadata = readSkillMetadata(skill, openai, candidate.manifests.map(manifest => manifest.declaration.invocation));
+    for (const manifest of candidate.manifests) if (metadata.skillName !== manifest.declaration.name) fail("manifest_mismatch", "work-suite 名称与 SKILL.md 不一致");
     for (const resource of metadata.resources) if (!bytes.has(resource.path)) fail("metadata_invalid", `声明资源不存在或不是文件：${resource.path}`);
   } catch (error) {
     if (error instanceof InspectionError) throw error;
@@ -145,12 +141,13 @@ async function inspectPackage(candidate: Candidate, limits: SkillInspectionLimit
   const contentDigest = digest({ schemaVersion: "skill-content/v1", files });
   return { kind: "local-preview", previewRef: `skill-preview:sha256:${contentDigest}`, versionId: null, ...metadata!,
     contentDigest, files, canonicalRoot: root, sourceAliases: [...candidate.aliases].sort(compare),
-    manifests: uniqueSorted(candidate.manifests.map(m => ({ path: m.path, suiteVersion: m.suiteVersion, verified: true as const }))) };
+    manifests: uniqueSorted(candidate.manifests.map(m => ({ path: m.path, suiteVersion: m.suiteVersion, manifestDigest: m.manifestDigest, verified: true as const }))) };
 }
 
 /** 可信本地只读入口。明确来源；不执行代码、不写源、包库或数据库。 */
 export async function inspectLocalSkillPackages(options: InspectLocalSkillOptions): Promise<SkillInventoryPreview> {
   const limits = { ...defaults, ...options.limits }, issues: SkillInspectionIssue[] = [], candidates = new Map<string, Candidate>();
+  const budget = { bytes: 0 };
   for (const value of Object.values(limits)) if (!Number.isSafeInteger(value) || value <= 0) throw new Error("技能检查预算须为正整数");
   const add = async (source: string, manifest?: ManifestSource, boundary?: string) => {
     const root = await directory(source);
@@ -180,18 +177,23 @@ export async function inspectLocalSkillPackages(options: InspectLocalSkillOption
   });
   for (const source of uniqueSorted(options.workSuites ?? [])) await attempt(source.manifestPath, async () => {
     const root = await directory(source.rootPath); requireAbsolute(source.manifestPath);
-    const buffer = await readRegular(source.manifestPath, root, Math.min(1024 * 1024, limits.maxTotalBytes));
+    const buffer = await readRegular(source.manifestPath, root, Math.min(1024 * 1024, limits.maxTotalBytes - budget.bytes));
+    budget.bytes += buffer.length;
     let manifest: z.infer<typeof manifestSchema>;
-    try { manifest = manifestSchema.parse(JSON.parse(new TextDecoder("utf8", { fatal: true }).decode(buffer))); }
+    try {
+      const text = new TextDecoder("utf8", { fatal: true }).decode(buffer);
+      JSON.parse(text); // 限定 JSON 语法；再用拒绝重复键的数据解析器检查结构。
+      manifest = manifestSchema.parse(parseMetadataYaml(text));
+    }
     catch { fail("manifest_invalid", "work-suite/v1 清单结构无效"); }
     if (new Set(manifest!.skills.map(skill => skill.name)).size !== manifest!.skills.length) fail("manifest_invalid", "work-suite 技能名称重复");
     for (const entry of [...manifest!.skills].sort((a, b) => compare(a.name, b.name))) {
       if (entry.path !== `.agents/skills/${entry.name}`) fail("manifest_invalid", "work-suite 的标准包目录与名称不一致");
       const packageRoot = path.join(source.rootPath, entry.path);
-      await attempt(packageRoot, () => add(packageRoot, { path: canonicalizePath(source.manifestPath), suiteVersion: manifest!.suite_version, declaration: entry }, root));
+      await attempt(packageRoot, () => add(packageRoot, { path: canonicalizePath(source.manifestPath), suiteVersion: manifest!.suite_version, manifestDigest: sha256(buffer), declaration: entry }, root));
     }
   });
-  const packages: SkillPackagePreview[] = [], budget = { bytes: 0 };
+  const packages: SkillPackagePreview[] = [];
   for (const candidate of [...candidates.values()].sort((a, b) => compare(a.root, b.root))) await attempt(candidate.root, async () => {
     packages.push(await inspectPackage(candidate, limits, budget));
   });

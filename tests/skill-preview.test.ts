@@ -31,7 +31,7 @@ for (const engine of identityEngines) test(`${engine} Skills 服务真实消费 
     const sources: SkillSelectionSources = { project: null, profile: { ownerId: runtime.runtime.agentId, revision: 1,
       selections: [{ skillName: "sample", enabled: true }] }, group: null };
     const currentRevisions = { project: null, profile: { ownerId: runtime.runtime.agentId, revision: 2 }, group: null, workspaceRevision: null };
-    const tables = ["agents", "members", "groups", "group_participants", "agent_runtimes", "agent_runtime_bindings", "agent_runner_states", "agent_runtime_events", "agent_runtime_usage_snapshots", "audit_log"];
+    const tables = ["agents", "members", "groups", "group_participants", "agent_runtimes", "agent_runtime_bindings", "agent_runner_states", "agent_runtime_members", "agent_legacy_aliases", "agent_runtime_events", "agent_runtime_usage_snapshots", "audit_log"];
     const captureDb = () => Promise.all(tables.map(table => f.db.query(`SELECT * FROM ${table} ORDER BY 1, 2`)));
     const before = await captureDb(), directories = await readdir(f.dir);
     for (const [id, kind] of [[requestedId, "requestedSnapshot"], [appliedId, "applied"]] as const) {
@@ -57,5 +57,25 @@ for (const engine of identityEngines) test(`${engine} Skills 服务真实消费 
     assert.deepEqual(empty.inventory.packages, []); assert.equal(empty.environment.skills.status, "planned");
     assert.deepEqual(await captureDb(), before); assert.deepEqual(await readdir(f.dir), directories);
     assert.ok(!directories.includes("future-home"));
+    const currentSources = { ...sources, profile: { ...sources.profile!, revision: 2 } };
+    const fresh = await previewLegacySkills({ environment, binding, selectionSnapshot: { configSnapshotRef: selected.configSnapshotRef!, sources: currentSources, workspaceRevision: null },
+      inventory: { packageRoots: [packageRoot] }, currentRevisions });
+    assert.equal(fresh.resolution.state, "resolved-preview"); assert.equal(fresh.resolution.lock!.fixed, false);
+    const incomplete = await previewLegacySkills({ environment, binding, selectionSnapshot: { configSnapshotRef: selected.configSnapshotRef!, sources: currentSources, workspaceRevision: null },
+      inventory: { packageRoots: [packageRoot, path.join(f.dir, "missing")] }, currentRevisions });
+    assert.equal(incomplete.resolution.conflicts[0]?.code, "inventory_invalid"); assert.equal(incomplete.resolution.lock, null);
+    const oldBinding = captured.bindings.find(item => item.bindingId === requestedId)!;
+    const original = selectLegacyConfigSnapshot(oldBinding);
+    await runtimes.intent(requestedId, "apply");
+    const newBinding = (await inspector.preflight()).bindings.find(item => item.bindingId === requestedId)!;
+    const beforeNewPreview = await captureDb();
+    const changedIntent = await previewLegacySkills({ environment, binding: newBinding,
+      selectionSnapshot: { configSnapshotRef: original.configSnapshotRef!, sources, workspaceRevision: null }, inventory: { packageRoots: [packageRoot] }, currentRevisions });
+    assert.equal(changedIntent.resolution.conflicts[0]?.code, "source_changed");
+    const invalidIdentity = await previewLegacySkills({ environment, binding: { ...newBinding, identityValid: false },
+      selectionSnapshot: { configSnapshotRef: original.configSnapshotRef!, sources, workspaceRevision: null }, inventory: {}, currentRevisions });
+    assert.equal(invalidIdentity.resolution.conflicts[0]?.code, "config_snapshot_invalid");
+    assert.deepEqual(await captureDb(), beforeNewPreview);
+
   } finally { await f.close(); }
 });

@@ -24,7 +24,7 @@ export function parseMetadataYaml(raw: string): unknown {
   });
   return doc.toJS({ maxAliasCount: 0 });
 }
-export function readSkillMetadata(skill: Buffer, openai: Buffer | undefined, manifestInvocation?: string): {
+export function readSkillMetadata(skill: Buffer, openai: Buffer | undefined, manifestInvocations: readonly string[] = []): {
   skillName: string; description: string; declaredVersion: string | null; invocationMode: SkillInvocationMode;
   invocationEvidence: string[]; dependencies: SkillDependency[]; resources: SkillResource[];
 } {
@@ -44,10 +44,10 @@ export function readSkillMetadata(skill: Buffer, openai: Buffer | undefined, man
       .parse(parseMetadataYaml(decoder.decode(openai)));
     if (value.policy?.allow_implicit_invocation !== undefined) modes.push({ mode: value.policy.allow_implicit_invocation ? "implicit-or-explicit" : "user-only", evidence: "agents/openai.yaml:policy.allow_implicit_invocation" });
   }
-  if (manifestInvocation) modes.push({ mode: manifestInvocation === "explicit-user" ? "user-only" : "implicit-or-explicit", evidence: "work-suite/v1:invocation" });
+  for (const manifestInvocation of manifestInvocations) modes.push({ mode: manifestInvocation === "explicit-user" ? "user-only" : "implicit-or-explicit", evidence: "work-suite/v1:invocation" });
   return { skillName: meta.name, description: meta.description, declaredVersion: meta.version ?? null,
     invocationMode: modes.some(item => item.mode === "user-only") ? "user-only" : modes.length ? "implicit-or-explicit" : "unknown",
-    invocationEvidence: modes.map(item => item.evidence).sort(),
+    invocationEvidence: uniqueSorted(modes.map(item => item.evidence)),
     dependencies: uniqueSorted([...(meta.dependencies ?? []), ...(meta.boardroom?.dependencies ?? [])]),
     resources: uniqueSorted([...(meta.resources ?? []), ...(meta.boardroom?.resources ?? [])]) };
 }

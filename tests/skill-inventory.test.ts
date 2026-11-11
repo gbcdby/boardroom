@@ -139,3 +139,88 @@ test("明确声明的顶层资源/依赖必须解析，无法理解的依赖版�
     assert.equal(report.issues[0]?.code, "metadata_invalid");
   } finally { await f.close(); }
 });
+
+test("work-suite 重复 JSON 键不能覆盖声明，清单自身摘要可追溯", async () => {
+  const f = await fixture();
+  try {
+    const p = path.join(f.dir, ".agents/skills/sample"); await mkdir(p, { recursive: true });
+    const data = "---\nname: sample\ndescription: 示例\n---\n正文"; await writeFile(path.join(p, "SKILL.md"), data);
+    const file = path.join(f.dir, "manifest.json");
+    const record = { name: "sample", path: ".agents/skills/sample", invocation: "explicit-user", files: [{ path: "SKILL.md", sha256: hash(data) }] };
+    const body = JSON.stringify({ schema_version: "work-suite/v1", suite_version: "test", skills: [record] });
+    await writeFile(file, body);
+    const report = await inspectLocalSkillPackages({ workSuites: [{ rootPath: f.dir, manifestPath: file }] });
+    assert.equal(report.packages[0]?.manifests[0]?.manifestDigest, hash(body));
+    await writeFile(file, body.replace('"suite_version":"test"', '"suite_version":"test","suite_version":"overwritten"'));
+    const invalid = await inspectLocalSkillPackages({ workSuites: [{ rootPath: f.dir, manifestPath: file }] });
+    assert.equal(invalid.issues[0]?.code, "manifest_invalid");
+  } finally { await f.close(); }
+});
+
+test("内部目录链接保留相对树；深度、包数、硬链接和逐字节预算有明确边界", async () => {
+  const f = await fixture();
+  try {
+    const p = await f.package(); await mkdir(path.join(p, "resources")); await mkdir(path.join(p, "assets"));
+    await writeFile(path.join(p, "assets/data"), "abc"); await symlink("../assets", path.join(p, "resources/linked"));
+    const report = await inspectLocalSkillPackages({ packageRoots: [p] });
+    assert.deepEqual(report.issues, []); assert.equal(report.packages[0]?.files.find(x => x.path === "resources/linked/data")?.sha256, hash("abc"));
+    assert.equal((await inspectLocalSkillPackages({ packageRoots: [p], limits: { maxDepth: 1 } })).issues[0]?.code, "budget_exceeded");
+    const second = await f.package("second");
+    assert.equal((await inspectLocalSkillPackages({ packageRoots: [p, second], limits: { maxPackages: 1 } })).issues[0]?.code, "budget_exceeded");
+    const size = (await readFile(path.join(second, "SKILL.md"))).length;
+    assert.deepEqual((await inspectLocalSkillPackages({ packageRoots: [second], limits: { maxFileBytes: size, maxPackageBytes: size, maxTotalBytes: size, maxEntries: 1 } })).issues, []);
+    assert.equal((await inspectLocalSkillPackages({ packageRoots: [second], limits: { maxFileBytes: size - 1 } })).issues[0]?.code, "budget_exceeded");
+    const { link } = await import("node:fs/promises"); await link(path.join(p, "assets/data"), path.join(f.dir, "outside-hardlink"));
+    assert.equal((await inspectLocalSkillPackages({ packageRoots: [p] })).issues[0]?.code, "hardlink_unsupported");
+  } finally { await f.close(); }
+});
+
+test("可信 CLI 只输出元数据；无来源不自动扫描，源文件/宿主配置与规划目录保持不变", async () => {
+  const f = await fixture();
+  try {
+    const p = await f.package("sample", "disable-model-invocation: true\n");
+    await writeFile(path.join(p, "hook.sh"), "#!/bin/sh\necho ran > MUST_NOT_EXIST\n");
+    await writeFile(path.join(f.dir, "AGENTS.md"), "源项目指令保持不变"); await mkdir(path.join(f.dir, ".claude"));
+    await writeFile(path.join(f.dir, ".claude/settings.json"), '{"hooks":{"Start":"touch MUST_NOT_EXIST"}}');
+    const secret = "skill-inspector-secret-canary", config = path.join(f.dir, "config.json");
+    await writeFile(config, JSON.stringify({ dbDriver: "postgres", pgConnectionString: `postgres://user:${secret}@127.0.0.1:1/db` }));
+    const before = await capture(f.dir), { spawnSync } = await import("node:child_process");
+    const run = (args: string[]) => spawnSync(process.execPath, [path.join(root, "scripts/inspect-skills.ts"), ...args], { cwd: f.dir,
+      env: { PATH: process.env["PATH"], BOARDROOM_HOME: path.join(f.dir, "planned-home"), AGENT_STUDIO_CONFIG: config }, encoding: "utf8", timeout: 15000 });
+    const result = run(["--package", p]); assert.equal(result.status, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout); assert.equal(parsed.inventory.packages[0].invocationMode, "user-only");
+    assert.equal(parsed.environment.skills.status, "planned"); assert.equal(parsed.activationAllowed, false);
+    assert.equal((result.stdout + result.stderr).includes(secret), false);
+    assert.equal((result.stdout + result.stderr).includes("echo ran"), false, "正文与脚本内容不放入目录响应");
+    const empty = run([]); assert.equal(empty.status, 0); assert.deepEqual(JSON.parse(empty.stdout).inventory.packages, []);
+    const remote = run(["--package", "https://example.invalid/skills"]); assert.equal(remote.status, 1);
+    assert.deepEqual(await capture(f.dir), before);
+  } finally { await f.close(); }
+});
+
+test("清单增加用户发起限制时采用更严格条件，不能把允许自动的包元数据当作覆盖权", async () => {
+  const f = await fixture();
+  try {
+    const p = path.join(f.dir, ".agents/skills/sample"); await mkdir(p, { recursive: true });
+    const body = "---\nname: sample\ndescription: 样例\ndisable-model-invocation: false\n---\n正文";
+    await writeFile(path.join(p, "SKILL.md"), body); const manifestPath = path.join(f.dir, "work-suite.json");
+    await writeFile(manifestPath, JSON.stringify({ schema_version: "work-suite/v1", suite_version: "test", skills: [
+      { name: "sample", path: ".agents/skills/sample", invocation: "explicit-user", files: [{ path: "SKILL.md", sha256: hash(body) }] }] }));
+    const result = await inspectLocalSkillPackages({ workSuites: [{ rootPath: f.dir, manifestPath }] });
+    assert.deepEqual(result.issues, []); assert.equal(result.packages[0]?.invocationMode, "user-only");
+  } finally { await f.close(); }
+});
+
+test("work-suite 的导出变换必须发生在 frontmatter，正文同名片段不能伪装来源证明", async () => {
+  const f = await fixture();
+  try {
+    const p = path.join(f.dir, ".agents/skills/sample"); await mkdir(p, { recursive: true });
+    const original = "---\nname: sample\ndescription: 示例\n---\n正文\n---\n";
+    const transformed = original.replace("正文\n---", "正文\ndisable-model-invocation: true\n---");
+    await writeFile(path.join(p, "SKILL.md"), transformed); const manifestPath = path.join(f.dir, "work-suite.json");
+    await writeFile(manifestPath, JSON.stringify({ schema_version: "work-suite/v1", suite_version: "test", skills: [
+      { name: "sample", path: ".agents/skills/sample", invocation: "explicit-user", files: [{ path: "SKILL.md", sha256: hash(transformed), source_sha256: hash(original), transform: "add-disable-model-invocation" }] }] }));
+    const result = await inspectLocalSkillPackages({ workSuites: [{ rootPath: f.dir, manifestPath }] });
+    assert.equal(result.packages.length, 0); assert.equal(result.issues[0]?.code, "manifest_mismatch");
+  } finally { await f.close(); }
+});

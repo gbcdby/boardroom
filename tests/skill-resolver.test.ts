@@ -96,3 +96,12 @@ test("同内容来源携带不同已知调用限制时取严格者并保留两�
   assert.equal(result.lock!.entries[0]?.invocationMode, "user-only");
   assert.deepEqual(result.lock!.entries[0]?.packageSources, ["/known", "/unknown"]);
 });
+
+test("跨层选择合并也受依赖图节点预算约束", () => {
+  const names = Array.from({ length: 257 }, (_, n) => `node-${n}`);
+  const candidates = names.map(name => pkg(name, a));
+  const result = resolveSkills({ ...input, packages: candidates, sources: { project: null,
+    profile: { ownerId: "profile", revision: 1, selections: names.slice(0, 256).map(skillName => ({ skillName, enabled: true })) },
+    group: { ownerId: "group", revision: 1, selections: [{ skillName: names[256]!, enabled: true }] } } });
+  assert.equal(result.lock, null); assert.equal(result.conflicts[0]?.code, "invalid_selection");
+});

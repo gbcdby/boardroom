@@ -111,6 +111,7 @@ export function resolveSkills(input: ResolveSkillsInput): SkillResolutionPreview
       }
     }
   }
+  if (constraints.size > 256) return skillPreviewConflict("invalid_selection", "依赖图超过 256 个节点预算");
   if (conflicts.length) return conflictResult(conflicts);
   const resolved = new Map<string, { packages: SkillPackagePreview[]; required: boolean }>(), expanded = new Set<string>();
   let progress = true, edgeCount = 0;
@@ -142,7 +143,7 @@ export function resolveSkills(input: ResolveSkillsInput): SkillResolutionPreview
       expanded.add(key);
       for (const dependency of declarations[0]!.dependencies) {
         edgeCount++;
-        if (edgeCount > 4096 || constraints.size > 256) { addConflict("invalid_selection", name, "依赖图超过预览预算", evidence); break; }
+        if (edgeCount > 4096 || (constraints.size >= 256 && !constraints.has(dependency.skillName))) { addConflict("invalid_selection", name, "依赖图超过预览预算", evidence); break; }
         const provenance: SkillProvenance = { kind: "dependency", ownerId: packages[0]!.previewRef, revision: null, via: [name, dependency.skillName] };
         constraints.set(dependency.skillName, uniqueSorted([...(constraints.get(dependency.skillName) ?? []), { pin: dependency.pin, required, provenance }]));
         progress = true;
