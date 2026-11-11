@@ -152,6 +152,7 @@ async function assertDispatchValues(options: DbDriverOptions): Promise<void> {
 
 // 跨表外键依赖（自引用 org_nodes 由递归读取处理，此处不计入顺序约束）。
 const FK_DEPS: Record<string, string[]> = {
+  role_template_versions: ["role_templates"],
   org_nodes: ["projects"],
   members: ["projects", "agents", "org_nodes"],
   groups: ["projects"],
@@ -178,13 +179,14 @@ const FK_DEPS: Record<string, string[]> = {
   memory_trigger_counters: ["projects", "agents", "groups"], memory_scan_checkpoints: ["projects", "agents", "groups"],
 };
 
-test("业务表清单：33 张表、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
+test("业务表清单：36 张表、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
   const names = BUSINESS_TABLES.map((t) => t.name);
-  assert.equal(names.length, 33);
+  assert.equal(names.length, 36);
   assert.equal(names.at(-1), "member_fact_revisions");
   assert.ok(!names.includes("schema_migrations"));
   for (const expected of [
     "agents",
+    "agent_legacy_aliases", "role_templates", "role_template_versions",
     "projects",
     "members",
     "groups",
@@ -325,7 +327,7 @@ test("回滚：清空目标业务表，源库不受影响；可重新迁移恢�
       await migrateData(srcOpts, dstOpts);
 
       const rb = await rollbackTarget(dstOpts);
-      assert.equal(rb.clearedTables.length, 33);
+      assert.equal(rb.clearedTables.length, 36);
 
       // 目标业务表已清空，校验失败。
       const afterRollback = await validateData(srcOpts, dstOpts);

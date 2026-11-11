@@ -10,6 +10,10 @@ import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories } from "../src/server/db/repositories.ts";
 import { createRuntimeRepository } from "../src/server/runtime/repository.ts";
 import { appendAuditEntry } from "../src/server/audit.ts";
+import { identityFixture } from "./helpers/identity-fixture.ts";
+import { createIdentityCatalog } from "../src/server/identity/catalog.ts";
+import { ownerActor } from "../src/server/authz/actors.ts";
+import { clearTargetTables, compareData, copyAllTables } from "../src/server/db/migrate-data.ts";
 
 const pgUrl = process.env["AGENT_STUDIO_PG_TEST_URL"] ?? process.env["AGENT_STUDIO_PG_CONNECTION_STRING"];
 for (const engine of ["sqlite", "postgres"] as const) {
@@ -80,5 +84,33 @@ for (const engine of ["sqlite", "postgres"] as const) {
       }
       await rm(dir, { recursive: true, force: true });
     }
+  });
+  test(`sqlite→${engine} 非空 catalog 复制/清库保留 alias 墓碑、历史版本、跨版本复制引用和 user 审计`, {
+    skip: engine === "postgres" && !pgUrl ? "未配置真实 PostgreSQL；由数据库 CI 门控执行" : false,
+  }, async () => {
+    const source = await identityFixture("sqlite"), target = await identityFixture(engine);
+    try {
+      const catalog = createIdentityCatalog({ repos: source.repos }), access = { actor: ownerActor() };
+      const a = await source.repos.agents.create({ displayName: "可迁移身份", hostType: "other" });
+      await catalog.agents.rename(access, a.id, "可迁移身份", "改名后身份");
+      const retired = await source.repos.agents.create({ displayName: "保留墓碑", hostType: "other" });
+      await source.repos.agents.delete(retired.id);
+      const fields = { name: "原角色", purpose: "职责", instructions: "不可变原内容", recommendedSkillRefs: [] };
+      const original = await catalog.roles.create(access, fields);
+      const copied = await catalog.roles.copy(access, original.roleTemplateId, 1, "一层副本");
+      await catalog.roles.update(access, original.roleTemplateId, 1, { ...fields, instructions: "后来的原内容" });
+      await catalog.roles.copy(access, copied.roleTemplateId, 1, "二层副本");
+      await catalog.roles.archive(access, original.roleTemplateId, 2);
+      const tables = ["agents", "agent_legacy_aliases", "role_templates", "role_template_versions", "audit_log"];
+      const before = await Promise.all(tables.map(table => source.db.query(`SELECT * FROM ${table} ORDER BY 1, 2`)));
+      const counts = await copyAllTables(source.db, target.db);
+      for (const table of tables) assert.ok(counts[table]! > 0, table);
+      assert.deepEqual(await Promise.all(tables.map(table => target.db.query(`SELECT * FROM ${table} ORDER BY 1, 2`))), before);
+      assert.equal((await compareData(source.db, target.db)).ok, true);
+      await clearTargetTables(target.db);
+      for (const table of tables) assert.deepEqual(await target.db.query(`SELECT * FROM ${table}`), [], table);
+      assert.deepEqual(await Promise.all(tables.map(table => source.db.query(`SELECT * FROM ${table} ORDER BY 1, 2`))), before);
+      assert.equal((await target.db.migrationState()).version, 14);
+    } finally { await source.close(); await target.close(); }
   });
 }
