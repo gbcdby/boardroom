@@ -17,6 +17,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { JoinResult } from "../src/server/mcp/core.ts";
+import { Client as PgClient } from "pg";
 
 const root = path.resolve(import.meta.dirname, "..");
 const stdioEntry = path.join(root, "src/server/mcp/stdio.ts");
@@ -199,4 +200,75 @@ test("S4 HTTP: 既有源解析后被移动时启动拒绝，不能创建新的�
     }, { code: "storage_source_changed" });
     assert.deepEqual(await readdir(dir), ["moved.sqlite"]);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+const pgUrl = process.env["AGENT_STUDIO_PG_TEST_URL"] ?? process.env["AGENT_STUDIO_PG_CONNECTION_STRING"];
+test("S4-AC01 PostgreSQL: HTTP/stdio 跨 cwd 共用显式 PG 源与记忆，绝不创建 SQLite", {
+  skip: pgUrl ? false : "未配置真实 PostgreSQL；保留真实连接的 CI 门控，不以配置清单或 SQLite 代替 PASS", timeout: 30_000,
+}, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "boardroom-pg-entry-"));
+  const schema = `env_${randomUUID().replaceAll("-", "")}`;
+  const admin = new PgClient({ connectionString: pgUrl! }); await admin.connect();
+  const url = new URL(pgUrl!); url.searchParams.set("options", `-c search_path=${schema}`);
+  const db = createDbDriver({ dbDriver: "postgres", pgConnectionString: url.href });
+  let stopHttp: (() => Promise<void>) | undefined;
+  try {
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await db.connect(); await db.migrate(migrations);
+    const repos = createRepositories(db);
+    const fixtures: { projectId: string; groupId: string }[] = [];
+    for (let i = 0; i < 2; i++) {
+      const project = await repos.projects.create({ name: `PG-${i}` });
+      const group = await repos.groups.create({ projectId: project.id, name: "PG group" });
+      fixtures.push({ projectId: project.id, groupId: group.id });
+    }
+    const httpCwd = path.join(dir, "http"); const stdioCwd = path.join(dir, "stdio"); await mkdir(httpCwd); await mkdir(stdioCwd);
+    const config = path.join(dir, "pg.json");
+    await writeFile(config, JSON.stringify({ dataDir: path.join(dir, "management"), dbDriver: "postgres", pgConnectionString: url.href }));
+    const env = cleanEnv({ BOARDROOM_HOME: path.join(dir, "home"), AGENT_STUDIO_CONFIG: config, AGENT_STUDIO_LOG_LEVEL: "error" });
+    const script = path.join(dir, "http.mjs"); const moduleUrl = (relative: string) => JSON.stringify(pathToFileURL(path.join(root, relative)).href);
+    await writeFile(script, `import { loadConfig } from ${moduleUrl("src/server/config.ts")};
+import { startServer } from ${moduleUrl("src/server/server.ts")};
+import { createLogger } from ${moduleUrl("src/server/logger.ts")};
+const server = await startServer({config:{...await loadConfig(),port:0},logger:createLogger({write:()=>{}})});
+process.send({url:server.url,mcpUrl:server.mcpUrl,kind:server.database.kind});
+process.on('message',async()=>{await server.close();process.disconnect();});`);
+    const http = fork(script, [], { cwd: httpCwd, env, execArgv: [], stdio: ["ignore", "ignore", "pipe", "ipc"] });
+    const exited = once(http, "exit");
+    stopHttp = async () => {
+      if (http.exitCode === null && http.signalCode === null) http.send({ close: true });
+      const force = setTimeout(() => http.kill("SIGKILL"), 3000); await exited; clearTimeout(force);
+    };
+    const [ready] = await Promise.race([once(http, "message"), exited.then(() => { throw new Error("PG HTTP fixture exited before ready"); })]) as [{ url: string; mcpUrl: string; kind: string }];
+    assert.equal(ready.kind, "postgres");
+    const projects = await (await fetch(`${ready.url}/api/projects`)).json() as { projects: { id: string }[] };
+    assert.deepEqual(projects.projects.map(p => p.id).sort(), fixtures.map(p => p.projectId).sort());
+    for (const [i, fixture] of fixtures.entries()) {
+      const transport = new StreamableHTTPClientTransport(new URL(ready.mcpUrl));
+      const client = new Client({ name: "PG HTTP", version: "1" });
+      const stdio = new StdioClientTransport({ command: process.execPath, args: [stdioEntry], cwd: stdioCwd, stderr: "ignore",
+        env: Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string")) });
+      const other = new Client({ name: "PG stdio", version: "1" });
+      try {
+        await client.connect(transport as unknown as Parameters<Client["connect"]>[0]);
+        const join = { ...fixture, displayName: `pg-reader-${i}`, hostType: "other" };
+        const joined = (await client.callTool({ name: "join", arguments: join })).structuredContent as unknown as JoinResult;
+        assert.equal(joined.ok, true);
+        const text = `PG committed memory ${i}`;
+        await repos.memory.insertHead({ id: randomUUID(), key: { scope: "project-agent", projectId: fixture.projectId, agentId: joined.agentId },
+          version: 1, markdown: text, byteLength: Buffer.byteLength(text), updatedAt: new Date().toISOString(),
+          updatedBy: { kind: "agent", actorId: joined.memberId, agentId: joined.agentId, displayName: join.displayName }, source: "agent" });
+        await other.connect(stdio as unknown as Parameters<Client["connect"]>[0]);
+        const observed = (await other.callTool({ name: "join", arguments: join })).structuredContent as unknown as JoinResult;
+        assert.equal(observed.ok, true); assert.equal(observed.agentId, joined.agentId); assert.equal(observed.projectId, fixture.projectId);
+        assert.deepEqual(observed.context.memory?.entries.map(entry => entry.markdown), [text]);
+      } finally { await transport.terminateSession().catch(() => {}); await client.close(); await other.close(); await stdio.close(); }
+    }
+    assert.deepEqual(await readdir(httpCwd), []); assert.deepEqual(await readdir(stdioCwd), []);
+    assert.equal((await readdir(dir)).includes("management"), false);
+  } finally {
+    await stopHttp?.(); await db.close();
+    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); await admin.end();
+    await rm(dir, { recursive: true, force: true });
+  }
 });

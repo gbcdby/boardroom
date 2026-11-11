@@ -83,7 +83,7 @@ test("S4-AC02: 清单只读发现唯一旧库、多个不同旧库拒绝默开 f
     const old = path.join(dir, "known-old");
     const file = await seed(path.join(old, "data"), "old-project");
     const before = await readFile(file); const names = await readdir(path.dirname(file));
-    const options = { cwd, env: { BOARDROOM_HOME: path.join(dir, "home") }, knownLegacyCwds: [old] };
+    const options = { cwd, env: { BOARDROOM_HOME: path.join(dir, "home") }, knownLegacyCwds: [path.relative(cwd, old)] };
     const one = await inspectLegacyStorage(options);
     assert.equal(one.startupState, "legacy_found");
     assert.equal(one.sources.length, 1);
@@ -225,6 +225,9 @@ test("S4 恢复: 不完整 storageId 配置、损坏 metadata、只有完成 jou
     await writeFile(path.join(home, "state/migrations/done.json"), JSON.stringify({ phase: "completed" }));
     assert.equal((await inspectLegacyStorage(options)).startupState, "recovery_required");
     await assert.rejects(loadConfig(options), { code: "migration_incomplete" });
+    await rm(path.join(home, "state/migrations/done.json"));
+    await mkdir(path.join(home, "state/migrations/unknown-format"));
+    assert.equal((await inspectLegacyStorage(options)).startupState, "recovery_required");
   });
 });
 

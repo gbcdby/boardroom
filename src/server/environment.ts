@@ -286,7 +286,7 @@ async function collectInventory(environment: Omit<ResolvedBoardroomEnvironment, 
     return { kind: "sqlite", dataDir: canonicalizePath(dataDir), sourcePath, sqlitePath: canonicalizePath(sourcePath), identity: identityOf(sourcePath) };
   }
   const selectedSourceId = await add(environment.databaseDescriptor, environment.layoutVersion, "selected", environment.configFile);
-  const dirs = options.config ? [] : [...new Set([cwd, ...options.knownLegacyCwds ?? []].map(value => path.resolve(value)))];
+  const dirs = options.config ? [] : [...new Set([cwd, ...options.knownLegacyCwds ?? []].map(value => path.resolve(cwd, value)))];
   for (const directory of dirs) {
     await add(sqliteAt(path.join(directory, "data")), 1, directory === cwd ? "cwd-data" : "known-legacy-data", null);
     const file = path.join(directory, "config.json");
@@ -335,6 +335,11 @@ async function collectInventory(environment: Omit<ResolvedBoardroomEnvironment, 
   try { journals = await readdir(journalRoot); }
   catch (error) { if (codeOf(error) !== "ENOENT") throw pathError("迁移记录目录", error); }
   if (journals.length > 4096) throw new ConfigError("迁移记录数量超出只读预检上限，请检查存储恢复记录。");
+  if (journals.some(name => !name.endsWith(".json"))) {
+    hardRecovery = true;
+    diagnostics.push({ code: "migration_incomplete", message: "迁移记录目录存在未知格式条目。",
+      recoveryAction: "核对该版本的迁移格式和恢复记录；预检不会递归猜测或忽略未知提交状态。" });
+  }
   for (const name of journals.filter(name => name.endsWith(".json"))) {
     const journal = await readMetadata(path.join(journalRoot, name), true);
     if (journal?.["phase"] !== "completed") {
