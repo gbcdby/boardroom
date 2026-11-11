@@ -1,10 +1,10 @@
 # V1 验收证据索引
 
-状态：固定候选的 V1 验收 PASS；实际合并和主线交付结果以 PR / Spec 记录为准
+状态：固定候选的 V1 验收 PASS；合并后局部复测及 macOS 测试补修另见 §2.4 / Ticket #120
 日期：2026-11-11
 范围：[主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)、[阶段 5 Spec #109](https://github.com/gbcdby/boardroom/issues/109)、[Ticket #112](https://github.com/gbcdby/boardroom/issues/112)。验收要求取自[产品基线 §8](architecture/agent-studio.md#8-产品验收基线)。
 
-**固定候选的全部 46 个 V1 验收项为 PASS，0 项 NOT_RUN、0 项 BLOCKED。** 原 37 项工程/安装证据与六项 Core、REVIEW-04、MEM-04 的外部真实回传保留各自对象；报告发现的修复已通过独立需求/标准复审、证据适用性核对和当前集成 CI，见 §2.3。macOS 首要平台 NFR-07 为 **PASS（SQLite 范围）**，macOS PostgreSQL 未覆盖，31 个可选托管隔离 SKIP 未算通过。HARD-05 的候选验收条件已经满足；PR ready、实际合并、各次 main 检查与任务收尾是另外核对的交付事实，见 [PR #119](https://github.com/gbcdby/boardroom/pull/119)及 [Spec #109](https://github.com/gbcdby/boardroom/issues/109)。本版不宣称修复后原生模型已重跑或产品已部署。
+**固定候选的全部 46 个 V1 验收项为 PASS，0 项 NOT_RUN、0 项 BLOCKED。** 原 37 项工程/安装证据与六项 Core、REVIEW-04、MEM-04 的外部真实回传保留各自对象；报告发现的修复已通过独立需求/标准复审、证据适用性核对和对应集成 CI，见 §2.3。macOS 首要平台 NFR-07 为 **PASS（SQLite 范围）**，macOS PostgreSQL 未覆盖，31 个可选托管隔离 SKIP 未算通过。HARD-05 的候选验收条件已经满足；PR ready、实际合并、各次 main 检查与任务收尾是另外核对的交付事实，见 [PR #119](https://github.com/gbcdby/boardroom/pull/119)及 [Spec #109](https://github.com/gbcdby/boardroom/issues/109)。本版追加修复后 Codex `begin_task_review` 成功/拒绝的外部原生复验，见 §2.4；完整新格式双轴与自总结全流程仍未重跑。新报告中的 macOS 全量测试失败由 [Ticket #120](https://github.com/gbcdby/boardroom/issues/120)单列处理，不将其改写为通过，也不从验收推导产品已经部署。
 
 ## 1. 候选与记录口径
 
@@ -12,7 +12,7 @@
 
 原最终文档候选为远端 `533e49da5d4e9d4a236d68e0bc23c03411caa5b1` / tree `f3ba63767d354febd37b2359414b70a6aab23af3`，对应本地 `043ff2e7c7471a4d0b73de55017c5a10502f988c`；外部最终集成实测绑定此对象。其与上段工程候选之间仅为 `docs/v1-acceptance.md` 文档增量；[最终文档 CI 42961222509](https://github.com/gbcdby/boardroom/actions/runs/42961222509) 两个 job 均通过，实际 checkout `4a26574f1e850ef7949554408c0b15e35c6bc2f6` 与该最终文档候选同树。
 
-本文这次只整理外部回传与剩余交付条件，不要求把本文自己的 commit 再填回本文形成递归绑定。§2.1 的工程运行、§2.2 的外部实测和后续修复候选是不同对象；旧证据保留原身份，跨版本适用性按 §2.3 核查，不能改标为修复后重跑。最终修复、独立审查、CI、合并和 main 结果以 [PR #119](https://github.com/gbcdby/boardroom/pull/119)及 [Spec #109](https://github.com/gbcdby/boardroom/issues/109)的固定候选记录为准。
+本索引整理外部回传与各轮交付事实，不要求把本文自己的 commit 再填回本文形成递归绑定。§2.1 的工程运行、§2.2 的外部实测、§2.3 的修复候选和 §2.4 的合并后局部复测是不同对象；旧证据保留原身份，不能改标为修复后重跑。阶段 3/4/5 的最终修复、独立审查、CI、合并和 main 结果以 [PR #119](https://github.com/gbcdby/boardroom/pull/119)及 [Spec #109](https://github.com/gbcdby/boardroom/issues/109)的固定候选记录为准；本轮测试补修另以 [Ticket #120](https://github.com/gbcdby/boardroom/issues/120)记录实际候选和结果。
 
 每个 AC 记录由下表共同字段、命令目录、§2.1/2.2 证据组和该 AC 行合并得到。状态按该项完整范围判断；同组的自动化检查通过，也不代表未启动的真实宿主通过。
 
@@ -25,7 +25,7 @@
 | `environment` | CI：Ubuntu 24.04 runner，Linux `7.0.0-1017-azure x86_64`，Node `v24.22.2`，npm `11.19.1`，PostgreSQL `16.15`；SQLite 使用锁定依赖 `better-sqlite3 13.0.3`，报告未单列 SQLite 内核版本。Chromium `151.0.7922.34` / Playwright `1.62.0`。本地补充检查为 Linux、Node v24.22.1、npm 11.9.0；外部真实 CLI 环境见 §2.2；此前本机环境限制另保留在 `B-NATIVE`。 |
 | `observedAt` | 2026-11-11 UTC：CI 干净安装始于 04:26:27，全量测试于 04:31:46 完成，独立负载于 04:32:11 完成，协议/安装于 04:32:51 完成；页面/DOM 时间见证据组。日志包含更精确的各步骤时间。外部实测为 2026-11-11（Asia/Shanghai，UTC+8），精确调用时间归原执行者日志。 |
 | `status` | 只用 `PASS`、`FAIL`、`BLOCKED`、`NOT_RUN`。测试工具的 SKIP 是该范围未验证，不是 PASS。静态检查另标 OBSERVED。 |
-| `evidence` | §2.1 的 `E-*` 为固定工程候选证据；§2.2 的 `E-NATIVE-*` 为外部执行者回传；`B-NATIVE` 为此前本机环境限制；`H-*` 仅历史背景。生产者、原候选、跳过项及合成模型边界均保留。 |
+| `evidence` | §2.1 的 `E-*` 为固定工程候选证据；§2.2 的 `E-NATIVE-*` 为外部执行者回传；§2.4 的 `E-RECHECK-*` 为合并后的外部局部复测，`E-MAC-BASELINE` 为新增 macOS CI 的修复前基线；`B-NATIVE` 为此前本机环境限制；`H-*` 仅历史背景。生产者、原候选、跳过项及合成模型边界均保留。 |
 | `limitation` / `nextAction` | 每行末列明确范围与下一步。修复后适用性见 §2.3，历史本机环境见 §5；不能用协议夹具替代外部真实执行。 |
 
 数据库、HTTP/MCP、真实浏览器、真实宿主模型分别记录。一次 SDK 调用只证明该协议路径；`reviewer-declared` / `agent-declared` 元数据只证明声明被校验和保存。消息入库、进入模型上下文、开始模型轮次和成功完成任务是不同事实。
@@ -126,7 +126,7 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 
 真实回传发现 `expectedRoundRevision` 的兄弟属性 `$ref` 使 Codex reviewer 发送字符串，以及 220 字节不完整轴报告被采集器标为 READY。初始修复的标准审查另发现纯 Markdown 占位正文仍可通过，稳定 finding 为 `STD-NATIVE-001`；新增回归后，原审查者独立重跑同一反例，确认拒绝并保留原始输出，finding 已由 OPEN 转为 VERIFIED。首轮失败与最终复审原文均保存在 [PR #99](https://github.com/gbcdby/boardroom/pull/99)。
 
-`E-RESUME` 为本次修复后的工程检查。三个候选的六个共同实现/测试文件完全一致；原任务状态机、权限、CAS、聊天、记忆、数据库、runtime、UI、依赖及 CI 配置未变。两轴分别核对实际差异、消费者、说明和原生证据适用性，对下列三个对象均 PASS：需求轴 r2 SHA-256 `94bb86b621af43c0619fd6a1b42ccdb276893f1ba97245c5767a214ea50adacf`，标准轴 r2 `10c9287d5abc920e49e850b9aee8711ba695c3ceece96940918054ce8ed71bdc`。完整报告在上述 PR 中按原文归档。
+`E-RESUME` 为上述两项缺陷修复后的工程检查。三个候选的六个共同实现/测试文件完全一致；原任务状态机、权限、CAS、聊天、记忆、数据库、runtime、UI、依赖及 CI 配置未变。两轴分别核对实际差异、消费者、说明和原生证据适用性，对下列三个对象均 PASS：需求轴 r2 SHA-256 `94bb86b621af43c0619fd6a1b42ccdb276893f1ba97245c5767a214ea50adacf`，标准轴 r2 `10c9287d5abc920e49e850b9aee8711ba695c3ceece96940918054ce8ed71bdc`。完整报告在上述 PR 中按原文归档。
 
 | 阶段 | 实际 PR head / tree | 当前工程证据 |
 | --- | --- | --- |
@@ -134,15 +134,34 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 | P4 | `6ea13d9cc60d525a52ace900ffb1aa6de709e40e` / `754a15161bd73fd31e2867df69739a0880f1b32c` | [CI 42990232081](https://github.com/gbcdby/boardroom/actions/runs/42990232081)，实际 checkout `ae83d743f69b4f0af4f4ee956b4f4a42902deafd` 同树；两 jobs SUCCESS，741 项 = 710 PASS / 31 SKIP / 0 FAIL。 |
 | P5 | `8887b4d5b8e85a3cf96bb719cb24a0d96caeabef` / `e56e0766052487572abd024e857e66dbbe4aee7f` | [CI 42990435658](https://github.com/gbcdby/boardroom/actions/runs/42990435658)，实际 checkout `b8978a20bc5fc29bee4f0da6d929c2825d853cd4` 同树；两 jobs SUCCESS，1013 项 = 982 PASS / 31 SKIP / 0 FAIL；另有固定生命周期负载 4/4、双 DB 协议/安装重启、Chromium 与双 DB DOM 负载通过。 |
 
-交付方已回读上述原始 job 日志与实际 Git 对象。阶段 5 源码对应本地 `1467a15333db6f4cc41960d8edfe709d3a9b4af6`，当前结论更新相对它只改本索引；这项文档增量的独立检查、最新 CI 与之后的 main 结果继续保留在 PR，不能改写上表的实际运行身份。两轴和 CI 通过不是新 Codex reviewer 或新 prompt 的原生重跑证明。
+交付方已回读上述原始 job 日志与实际 Git 对象。阶段 5 源码对应本地 `1467a15333db6f4cc41960d8edfe709d3a9b4af6`，当时的结论更新相对它只改本索引；该轮文档增量的独立检查、CI 与之后的 main 结果保留在 PR，不能改写上表的实际运行身份。本节两轴和 CI 通过不单独证明原生重跑；后续 Codex begin 局部复验另见 §2.4。
 
 | 受影响范围 | 复用前提与增量验证 | 当前边界 |
 | --- | --- | --- |
-| 任务工具 schema | 已核对仅改变重复 Zod 字段实例/描述，使导出类型内联；原类型、范围、required、严格校验、CAS、权限与业务路径未放宽。实际 tools/list、合法数字流程和非法/过时修订拒绝已回归 | 原 Claude reviewer 路径保留原实测身份并在未变业务范围内复用；修复后 Codex reviewer 尚未真实重跑，schema/协议回归不能改称原生复验 |
+| 任务工具 schema | 已核对仅改变重复 Zod 字段实例/描述，使导出类型内联；原类型、范围、required、严格校验、CAS、权限与业务路径未放宽。实际 tools/list、合法数字流程和非法/过时修订拒绝已回归 | 原 Claude reviewer 路径保留原实测身份；§2.4 另承接修复后 Codex begin 成功/拒绝的原生复验，完整新格式双轴流程仍未重跑，协议回归不冒充原生执行 |
 | 采集完整性 | 新回归确认拒绝半句、缺结论、缺章节、矛盾元数据及 Markdown 纯占位；完整 PASS / CHANGES_REQUESTED 仍可供 reviewer。CLI argv、上下文隔离、真实事件、时间重叠、候选前后相同及原始输出一致性检查未删减 | 新 prompt/格式尚无新原生运行；校验回归与原候选 CLI 执行分开取证，旧报告不得补写标记后充当新格式实测 |
 | 六项 Core、记忆与 macOS 安装 | 两轴已按三个实际 diff 确认未改变聊天/投递/重连、记忆触发/冲突或平台安装路径，按该范围承接原生证据；新候选 CI 另行执行并通过 | 没有把旧 applicationCommit 改成新候选，亦没有将 macOS SQLite 扩为 macOS PG；未来新增影响仍应定向验证 |
 
 原 AC-REVIEW-04 要求 Claude **或** Codex 完成真实评审，未要求两种 reviewer 都完整重跑。现行主 Spec / NFR-07 与阶段 5 §5/6 也未规定每个 OS × 数据库 × 宿主的全组合矩阵；Linux SQLite/PG 工程证据与 macOS SQLite 实际使用证据按环境分列，macOS PostgreSQL 保持未覆盖。当前 31 个可选托管隔离 SKIP 仍不能计作 PASS，既有 [Spec #83](https://github.com/gbcdby/boardroom/issues/83) 例外只在原范围内有效，生产 profile 继续 unsupported；外部实测不扩大该例外。
+
+### 2.4 合并后的外部局部复测
+
+2026-11-11（Asia/Shanghai），用户提供独立接手验收方的 `recheck-report.md`，SHA-256 `0f7fde0250e42d49832802b6a79714be0f08d9625a649d6064c450c8c09b5bcc`。交付方已回读报告并核对此摘要；原生 CLI 调用、测试执行及原始 JSONL 检查归外部执行者，未写成本机重跑。报告列出的 `boardroom-verify/evidence/raw/recheck-20261111/` 是执行者本地目录，本次只收到报告，未重新核验其中 `live-tools-list.txt`、`codex-begin-fixed.jsonl`、`codex-begin-forbidden.jsonl` 或 `SHA256SUMS.txt`。
+
+该报告的修复后主线对象为 `89af568fe106a4d80c15189d8108a63298fac220`，Git tree 为 `762a73126c571d1dba189922076828229e301a0f`；阶段 3/4 的目标测试另绑定 §2.3 中的 `135a69b5…` / `6ea13d9c…`，阶段 5 分支为 `6b2dd2cd6a8905b4fe7c143160e66b8005b4a10f`。外部环境为 macOS `26.5.2 (25F84)`、arm64 / Apple M1 Pro、Node `v24.14.0`、npm `11.19.0`、Codex CLI `0.167.0`、SQLite / `better-sqlite3 13.0.3`；未覆盖 macOS PostgreSQL。
+
+| evidence ID | 证据覆盖与结论 | 可用范围 |
+| --- | --- | --- |
+| `E-RECHECK-BEGIN` | 真实运行服务的 `tools/list` 中两修订号为内联 integer，`begin_task_review` 无 `$ref`；Codex 原生 Streamable HTTP MCP 以 JSON 整数发送修订号，指定 reviewer 接手成功且 round 为 `running`，非指定成员返回 `FORBIDDEN / not_self` | PASS：补齐 schema 修复后的原生 begin 成功与拒绝路径；不等于完成两轴报告提交、裁决或新格式全流程 |
+| `E-RECHECK-COLLECTOR` | 直接调用 `validateReviewReport`，Markdown 包装的占位正文被拒绝、完整事实报告被接受；`tests/review-collector.test.ts` 与 `tests/mcp-server.test.ts` 在 main、阶段 3、阶段 4 分别共 27/27 通过 | PASS：采集完整性解析器与 MCP schema 目标回归；不计作真实模型评审或自总结 |
+| `E-RECHECK-MAC-SUITE` | 报告记载 main / 阶段 5 的全量结果为 1008 项：777 PASS、7 FAIL、224 SKIP | FAIL：保留原报告数字与来源；未附完整失败清单，不将全部 7 项的归因视为已核实，后续见 Ticket #120 |
+| `E-MAC-BASELINE` | [CI 43022625652 / macOS job 130529324402](https://github.com/gbcdby/boardroom/actions/runs/43022625652/job/130529324402) 的完整日志：1008 项，777 PASS、7 FAIL、224 SKIP | FAIL：本次运行的七项失败已定位，六项在 `runtime-native-installation.test.ts`，另一项在 `runtime-host.test.ts`；它是独立的新运行，不代替原报告未提供的日志 |
+
+初次静态核查只能解释 `tests/runtime-native-installation.test.ts` 的六个 macOS 失败：默认安装成功、四种凭据布局校验、附加字段不能覆盖策略。它们期待进入 Linux 专属解析路径，而生产 `resolveNativeInstallation` 在非 Linux 先返回 `profile_unsupported`。该文件另有本就预期 `profile_unsupported` 的用例，以及按真实隔离原语可用性跳过的 canary；不能仅凭缺少明细的原报告核实其“七项全部同文件同因”的说法。解析器与测试在原阶段 5 候选和复测 main 中内容相同，该缺口不是前述 schema/采集修复引入的行为变化。
+
+随后 `E-MAC-BASELINE` 在 macOS `26.7.2 (25G332)`、arm64、Node `v24.22.2` 实跑并复现相同数量的失败。该运行 head 为 `7987215add29a10b84b9353b202ad3f997387d1b`，相对 main `89af568…` 只增加 CI 作业，测试和产品代码未改；实际 checkout 为 `d9cf9d1f6b80f8d3f2e0d448095c30d68b1aed58`，已核对与 head 同 tree `d0b532f9df8751de00306d55c7fa095cc4acb143`。日志明确新增定位的一项为 `tests/runtime-host.test.ts:125` 的“R3 help/版本与模拟输出不能打开生产支持；普通失败不降级 bypass”：第 139 行断言实际得到 `host_version_unknown`，预期为 `protected_path_overlap`。新运行的七项失败位置已经明确。额外一项的夹具混用了 macOS 临时目录别名与尚未创建的保护路径，导致首个失败原因不符；本轮只把夹具根规范为真实路径，保留原目录重叠、拒绝启动和支持表断言，具体修复候选与结果见 Ticket #120。该修正不声称早期路径诊断已覆盖所有缺失叶子别名，也不扩大 macOS 托管运行支持；原报告缺少原始全量日志的限制继续保留。
+
+[Ticket #120](https://github.com/gbcdby/boardroom/issues/120)承接测试平台条件、非 Linux 拒绝覆盖和 macOS 自动化回归。新增运行的对象、完整日志与结果单独记录，不反向改写这份历史报告，也不放宽生产平台守卫。修复后新格式完整双轴评审与自总结全流程、macOS PostgreSQL 仍为未执行范围；`VERIFIED_HOST_PROFILES` 的支持边界不因本次普通外部 MCP 复验而扩大。
 
 ## 3. 全部 46 项映射
 
@@ -194,7 +213,7 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 | AC-REVIEW-01 | 明确默认 reviewer、真实固定 diff；无效/空候选前置失败 | `E-BASE/E-TASK`；`C-TASK`；`tests/tasks-candidate.test.ts`、`tests/tasks-service.test.ts` | PASS | 真实 Git 固定候选、无效/空/脏候选、采集中权限/修订变化及可诊断失败 round 通过，未截断后接受。 |
 | AC-REVIEW-02 | Spec/Standards 两报告独立，进入评论，不跨轴排名 | `E-BASE/E-TASK/E-UI`；`C-DB`、`C-TASK`、`C-UI`；`tests/tasks-service.test.ts`、`tests/task-ui.test.ts` | PASS | 合同、持久化、评论和 UI 两轴分开呈现通过；报告正文是 synthetic，真实隔离并行模型执行仍归 REVIEW-04。 |
 | AC-REVIEW-03 | reviewer 通过到 done、打回进行中、manager 有原因覆盖 | `E-BASE/E-TASK/E-UI`；`C-TASK`、`C-UI`；`tests/tasks-service.test.ts`、`tests/tasks-mcp.test.ts` | PASS | 普通通过/打回、manager 原因覆盖及再次覆盖通过；原报告/裁决保留，报告不全不能普通通过。 |
-| AC-REVIEW-04 | Claude 或 Codex 完成真实任务双轴评审，命令/版本/fixed point 可追溯 | `E-NATIVE-REVIEW`；`C-REVIEW`；§2.3 修复适用性 | PASS | PR99 与 PR119 各自完成真实两轴和指定 Claude reviewer 裁决；修复后 Codex reviewer/新 prompt 未重跑，不把采集回归当真实模型。 |
+| AC-REVIEW-04 | Claude 或 Codex 完成真实任务双轴评审，命令/版本/fixed point 可追溯 | `E-NATIVE-REVIEW`；`C-REVIEW`；§2.3 修复适用性；§2.4 `E-RECHECK-BEGIN` | PASS | PR99 与 PR119 各自完成真实两轴和指定 Claude reviewer 裁决；修复后新增 Codex begin 成功/拒绝的原生复验，完整新格式双轴流程仍未重跑，采集回归不计作真实模型。 |
 | AC-REVIEW-05 | 报告保留标准来源、任务要求、结论与证据 | `E-BASE/E-TASK/E-UI`；`C-TASK`、`C-UI`；`tests/tasks-input.test.ts`、`tests/tasks-service.test.ts`；[报告流程](tasks-and-review.md) | PASS | 标准来源、任务要求、候选与声明字段校验/保存通过；此结果不认证 synthetic 输出来自真实外部模型。 |
 
 ### 3.4 记忆：7 项
@@ -264,8 +283,8 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 
 ## 6. 交付核对与保留边界
 
-1. schema 表示与采集完整性修复已有序带入三个固定候选，增量验证、独立双轴及证据适用性见 §2.3。新 Codex reviewer / 新 prompt 原生运行仍未执行，不将回归夹具改标。
-2. 修复候选的数据库/SDK 与 Chromium CI 已执行并通过；本文最后的纯文档增量仍按项目要求检查，当前实际 head 与最新结果以 PR 为准。§2.1 旧工程全绿、§2.3 修复运行和后续 CI 不混用身份。
+1. schema 表示与采集完整性修复已有序带入三个固定候选，增量验证、独立双轴及证据适用性见 §2.3。§2.4 追加 Codex begin 成功/拒绝的外部原生复验；完整新格式双轴评审与自总结全流程仍未重跑，不将回归夹具改标。
+2. §2.3 修复候选的数据库/SDK 与 Chromium CI 已执行并通过；新增文档和 macOS 测试补修按 [Ticket #120](https://github.com/gbcdby/boardroom/issues/120)记录实际候选、独立检查及 CI。§2.1 旧工程全绿、§2.3 修复运行、§2.4 外部复测与新增 macOS CI 不混用身份；新 CI 的七项失败已定位，根因和修复结果另记，原报告缺少原始全量日志的限制继续保留。
 3. 交付按 #99 → #118 → #119 实际合并并完成各次 main 检查，结果回写 [Spec #109](https://github.com/gbcdby/boardroom/issues/109)和主 Spec。候选验收 PASS 与 PR 就绪不以“已经合并”为循环前置条件；整体交付完成仍需平台合并、main 核对和任务状态回读，不由本索引的 PASS 自动推导。
 4. 持续保留原 `E-*` 工程产物、外部正式回传与 `B-NATIVE` 历史记录的生产者、对象和边界。Mac 本地原始包并未挂载到交付环境，本次不声称已逐帧重审或重新计算整包摘要；出现具体冲突时再核对对应最小原始片段。
 5. macOS PostgreSQL、DSH 未证实能力和可选托管 profile 限制继续明列。未部署、未关闭父 Spec 或未删除分支不是新增功能验收门槛；这些动作只在相应任务与授权内处理。
