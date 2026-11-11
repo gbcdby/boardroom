@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { byTestId, find, input, json, settle, withPage, type UiElement } from "./helpers/web-ui.ts";
+import { byTestId, deferred, find, input, json, settle, withPage, type UiElement } from "./helpers/web-ui.ts";
 
 type FrameCallback = (timestamp: number) => void;
 // 真 SFC + 受控几何：验证预算、阅读位置和资源清理；真实像素仍由既有 Chromium 负载门控验收。
@@ -11,7 +11,7 @@ async function withViewport(run: (viewport: any) => Promise<void>, observers = t
   const observed: Array<{ callback: () => void; disconnected: boolean }> = [];
   let nextFrame = 0;
   const viewport: any = {
-    innerHeight: 1000, innerWidth: 1440, scrollY: 0, observed, frames, listeners,
+    innerHeight: 1000, innerWidth: 1440, scrollY: 0, observed, frames, listeners, sockets: [],
     addEventListener(name: string, listener: () => void) { const set = listeners.get(name) ?? new Set(); set.add(listener); listeners.set(name, set); },
     removeEventListener(name: string, listener: () => void) { listeners.get(name)?.delete(listener); },
     requestAnimationFrame(callback: FrameCallback) { const id = ++nextFrame; frames.set(id, callback); return id; },
@@ -33,7 +33,13 @@ async function withViewport(run: (viewport: any) => Promise<void>, observers = t
   };
   globals.window = viewport;
   globals.location = { protocol: "http:", host: "localhost" };
-  globals.WebSocket = class { addEventListener() {} close() {} };
+  globals.WebSocket = class {
+    events = new Map<string, Array<(event: any) => void>>();
+    constructor() { viewport.sockets.push(this); }
+    addEventListener(name: string, listener: (event: any) => void) { const callbacks = this.events.get(name) ?? []; callbacks.push(listener); this.events.set(name, callbacks); }
+    message(payload: unknown) { for (const callback of this.events.get("message") ?? []) callback({ data: JSON.stringify(payload) }); }
+    close() {}
+  };
   if (observers) globals.ResizeObserver = class {
     entry: { callback: () => void; disconnected: boolean };
     constructor(callback: () => void) { this.entry = { callback, disconnected: false }; observed.push(this.entry); }
@@ -59,7 +65,7 @@ function respond(url: string) {
   return json({ projects: [project] });
 }
 
-function geometry(container: UiElement, viewport: any, initial = { top: 549, after: 324 }) {
+function geometry(container: UiElement, viewport: any, initial = { top: 549, after: 324 }, contentHeight = () => 22000) {
   const list: any = byTestId(container, "chat-messages");
   const conversation: any = find(container, node => node.props.class === "panel conversation");
   assert.ok(conversation);
@@ -70,10 +76,50 @@ function geometry(container: UiElement, viewport: any, initial = { top: 549, aft
   conversation.getBoundingClientRect = () => rect(size.top - viewport.scrollY - 86, size.top - viewport.scrollY + height() + size.after);
   let scroll = 0;
   Object.defineProperties(list, {
-    scrollHeight: { configurable: true, get: () => 22000 }, clientHeight: { configurable: true, get: height },
+    scrollHeight: { configurable: true, get: contentHeight }, clientHeight: { configurable: true, get: height },
     scrollTop: { configurable: true, get: () => scroll, set: value => { scroll = Math.max(0, Math.min(Number(value), list.scrollHeight - list.clientHeight)); } },
   });
   return { list, conversation, size, height };
+}
+
+for (const order of ["history-first", "layout-first"] as const) {
+  test(`首次聊天 ${order}：尺寸缩短产生scroll事件仍贴底，随后消息跟随而主动读历史保持`, async () => {
+    await withViewport(async viewport => {
+      const history = deferred<Response>();
+      const initial = messages.slice(0, 25);
+      let contentHeight = 248;
+      await withPage("ChatView", url => url.endsWith("/messages") ? history.promise : respond(url), async container => {
+        const measured = geometry(container, viewport, { top: 549, after: 262 }, () => contentHeight);
+        // 模拟浏览器在高度样式提交后、nextTick贴底之前通知scroll；scrollTop本身没有用户位移。
+        let applied = measured.list.props.style;
+        let duringUpdate: (() => void) | undefined;
+        Object.defineProperty(measured.list.props, "style", { configurable: true,
+          get: () => applied,
+          set: value => {
+            const before = measured.height(); applied = value;
+            if (measured.height() !== before) measured.list.props.onScroll();
+            const action = duringUpdate; duringUpdate = undefined; action?.();
+          },
+        });
+        if (order === "layout-first") await viewport.resize();
+        contentHeight = 2458;
+        history.resolve(json({ messages: initial })); await settle();
+        await viewport.resize();
+        assert.ok(Math.abs(measured.list.scrollHeight - measured.list.clientHeight - measured.list.scrollTop) <= 1,
+          `首次到达后应贴底：top=${measured.list.scrollTop}, height=${measured.list.clientHeight}, content=${measured.list.scrollHeight}`);
+        contentHeight += 100;
+        viewport.sockets[0].message({ type: "message", message: { ...initial.at(-1), id: "live-one", seq: 26, text: "首次布局后到达" } });
+        await settle(); await viewport.flush();
+        assert.equal(measured.list.scrollTop, measured.list.scrollHeight - measured.list.clientHeight, "跟随状态保留至后续实时消息");
+        // 消息watch已经捕获跟随状态，但用户在DOM提交期间主动向上；旧nextTick不能抢回。
+        duringUpdate = () => { measured.list.scrollTop = 100; measured.list.props.onScroll(); };
+        contentHeight += 100;
+        viewport.sockets[0].message({ type: "message", message: { ...initial.at(-1), id: "live-two", seq: 27, text: "阅读历史期间到达" } });
+        await settle(); await viewport.flush();
+        assert.equal(measured.list.scrollTop, 100, "真实向上位移后不能被新消息抢回底部");
+      }, { path: "/projects/project-1/chat/one" });
+    });
+  });
 }
 
 test("聊天剩余视口：原1440×1000失败几何收窄消息区，composer增高后仍跟随最新", async () => {

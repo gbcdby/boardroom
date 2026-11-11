@@ -24,6 +24,7 @@
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
+html { background: var(--bg); }
 body { min-width: 0; min-height: 100vh; background: var(--bg); color: var(--fg); }
 button, input, textarea, select { font: inherit; }
 button, a, summary, input, textarea, select { -webkit-tap-highlight-color: transparent; }

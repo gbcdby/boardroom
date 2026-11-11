@@ -2,6 +2,7 @@
 """#144：真实 Chromium / 临时 SQLite 的主题、首帧和状态保持验收。"""
 from __future__ import annotations
 import argparse
+import base64
 from datetime import datetime, timezone
 import importlib.util
 import json
@@ -31,6 +32,48 @@ def capture(page, output, report, name):
     page.screenshot(path=str(output / f"{name}.png"), full_page=True, animations="disabled")
     report["screenshots"].append(f"{name}.png")
     report["layouts"].append(dimensions)
+
+
+def chat_entry_latest(page, name, report):
+    # 只观察真实布局，不预置scrollTop；首次历史加载须自行把最后一条带到视口内。
+    measure = """() => {
+      const list=document.querySelector('[data-testid="chat-messages"]');
+      const last=list?.querySelector('.message:last-child .message-text');
+      if(!list||!last)return null;
+      const box=list.getBoundingClientRect(), r=last.getBoundingClientRect(), style=getComputedStyle(last);
+      return {text:last.textContent,scrollTop:list.scrollTop,scrollHeight:list.scrollHeight,clientHeight:list.clientHeight,
+        maxHeight:getComputedStyle(list).maxHeight,bottomGap:list.scrollHeight-list.scrollTop-list.clientHeight,
+        list:{top:box.top,bottom:box.bottom},last:{top:r.top,bottom:r.bottom},viewport:{width:innerWidth,height:innerHeight},
+        visible:r.width>0&&r.height>0&&style.visibility==='visible'&&style.display!=='none'
+          &&r.top>=Math.max(0,box.top)-1&&r.bottom<=Math.min(innerHeight,box.bottom)+1
+          &&r.left>=Math.max(0,box.left)-1&&r.right<=Math.min(innerWidth,box.right)+1};
+    }"""
+    try:
+        page.wait_for_function("expected => { const value=(" + measure + ")(); return value&&value.text===expected&&value.visible&&Math.abs(value.bottomGap)<=2; }",
+                               arg="主题验收历史消息 24：保持阅读位置与上下文。")
+    finally:
+        report.setdefault("chatEntries", []).append({"view": name, "geometry": page.evaluate(measure)})
+
+
+def chat_entry_held_history(page, origin, path, group_id, name, output, report):
+    held = []
+    pattern = f"**/api/groups/{group_id}/messages"
+    def hold(route):
+        held.append(route)
+    page.route(pattern, hold)
+    try:
+        page.goto(origin + path, wait_until="domcontentloaded")
+        page.get_by_test_id("chat-messages").wait_for(state="visible")
+        expect(page.get_by_role("log", name="群聊消息")).to_have_attribute("aria-busy", "true")
+        page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        assert held, "必须确实持有首次历史GET，不能以已完成的读取冒充延迟到达"
+    finally:
+        page.unroute(pattern, hold)
+        for route in held:
+            route.continue_()
+    page.wait_for_load_state("networkidle")
+    chat_entry_latest(page, name, report)
+    capture(page, output, report, name)
 
 
 def selected_choice(page, selected_id, other_id, name, report, accessible_name=None):
@@ -140,6 +183,83 @@ def first_frame(browser, origin, report):
     context.close()
 
 
+def media_readability(page, output, report, name, theme, *, forced=False, more=False):
+    # 只读当前页面；先取原生 viewport，避免仅凭祖先 computedStyle 漏掉 canvas 绘制错误。
+    page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+    geometry = page.evaluate("""() => {
+      const main=document.querySelector('main'), root=getComputedStyle(document.documentElement), body=getComputedStyle(document.body);
+      const rect=main.getBoundingClientRect(), style=getComputedStyle(main), forced=matchMedia('(forced-colors: active)').matches;
+      const canvas=document.createElement('canvas'); canvas.width=canvas.height=1;
+      const ctx=canvas.getContext('2d',{willReadFrequently:true});
+      const rgba=value=>{ctx.clearRect(0,0,1,1);ctx.fillStyle=value;ctx.fillRect(0,0,1,1);return [...ctx.getImageData(0,0,1,1).data];};
+      const texts=['h1','.page-description'].map(selector=>{
+        const el=main.querySelector(selector), range=document.createRange(); range.selectNodeContents(el);
+        const box=range.getBoundingClientRect();
+        return {selector,text:el.textContent.trim(),foreground:rgba(getComputedStyle(el).color),
+                box:{x:box.x,y:box.y,width:box.width,height:box.height}};
+      });
+      const points=texts.flatMap(({selector,box})=>[
+        {x:rect.left+parseFloat(style.paddingLeft)/2,y:box.y+box.height/2,target:selector+' left'},
+        {x:rect.right-parseFloat(style.paddingRight)/2,y:box.y+box.height/2,target:selector+' right'}
+      ]).map(point=>{
+        const hit=document.elementFromPoint(point.x,point.y);
+        return {...point,unobstructed:hit===main,hit:hit?{tag:hit.tagName,id:hit.id,className:hit.className}:null};
+      });
+      return {theme:document.documentElement.dataset.theme,forced,more:matchMedia('(prefers-contrast: more)').matches,
+              width:innerWidth,height:innerHeight,scrollY,rootBackground:root.backgroundColor,bodyBackground:body.backgroundColor,
+              expectedBackground:rgba(forced?body.backgroundColor:root.getPropertyValue('--bg').trim()),texts,points};
+    }""")
+    filename = f"{name}-viewport.png"
+    png = page.screenshot(path=str(output / filename))
+    report["screenshots"].append(filename)
+    pixels = page.evaluate("""async ({png,geometry}) => {
+      const image=new Image(); image.src='data:image/png;base64,'+png; await image.decode();
+      const canvas=document.createElement('canvas'); canvas.width=image.naturalWidth; canvas.height=image.naturalHeight;
+      const ctx=canvas.getContext('2d',{willReadFrequently:true}); ctx.drawImage(image,0,0);
+      const data=ctx.getImageData(0,0,canvas.width,canvas.height).data;
+      const sx=canvas.width/geometry.width, sy=canvas.height/geometry.height;
+      const pixel=(x,y)=>[...data.slice((y*canvas.width+x)*4,(y*canvas.width+x)*4+4)];
+      const delta=(a,b)=>Math.max(...a.slice(0,3).map((v,i)=>Math.abs(v-b[i])));
+      const lum=c=>c.slice(0,3).map(v=>v/255).map(v=>v<=.04045?v/12.92:((v+.055)/1.055)**2.4).reduce((s,v,i)=>s+v*[.2126,.7152,.0722][i],0);
+      const ratio=(a,b)=>{const l=[lum(a),lum(b)].sort((a,b)=>a-b);return (l[1]+.05)/(l[0]+.05);};
+      const backgrounds=geometry.points.map(point=>{
+        const x=Math.round(point.x*sx), y=Math.round(point.y*sy), patch=[];
+        for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++)patch.push(pixel(x+dx,y+dy));
+        return {...point,pixelX:x,pixelY:y,rgba:pixel(x,y),patch,
+                maximumDelta:Math.max(...patch.map(p=>delta(p,geometry.expectedBackground)))};
+      });
+      const texts=geometry.texts.map((text,index)=>{
+        const box=text.box, background=backgrounds[index*2].rgba;
+        const left=Math.ceil(box.x*sx),right=Math.floor((box.x+box.width)*sx);
+        const top=Math.ceil(box.y*sy),bottom=Math.floor((box.y+box.height)*sy);
+        let foreground=null, matchedPixels=0;
+        for(let y=top;y<bottom;y++)for(let x=left;x<right;x++){
+          const rgba=pixel(x,y), distance=delta(rgba,text.foreground);
+          // 只认足够接近真实文字前景、又与背景不同的笔画像素；找不到必须失败。
+          if(rgba[3]===255&&distance<=8&&delta(rgba,background)>8){
+            matchedPixels++;
+            if(!foreground||distance<foreground.distance)foreground={x,y,rgba,distance};
+          }
+        }
+        return {...text,background,foreground,matchedPixels,ratio:foreground?ratio(foreground.rgba,background):null,
+                computedForegroundRatio:ratio(text.foreground,background),minimum:4.5};
+      });
+      return {width:canvas.width,height:canvas.height,backgrounds,texts};
+    }""", {"png": base64.b64encode(png).decode("ascii"), "geometry": geometry})
+    report.setdefault("mediaReadability", []).append({"view": name, "viewport": filename, "geometry": geometry, **pixels})
+    assert geometry["theme"] == theme and geometry["forced"] == forced and geometry["more"] == more, (name, geometry)
+    assert geometry["scrollY"] == 0 and geometry["expectedBackground"][3] == 255, (name, geometry)
+    for sample in pixels["backgrounds"]:
+        assert sample["unobstructed"], (name, "background obscured", sample)
+        assert all(p[3] == 255 for p in sample["patch"]) and sample["maximumDelta"] <= 2, (name, "painted background mismatch", sample, geometry["expectedBackground"])
+    for sample in pixels["texts"]:
+        box = sample["box"]
+        assert sample["text"] and 0 <= box["x"] < box["x"] + box["width"] <= geometry["width"] and 0 <= box["y"] < box["y"] + box["height"] <= geometry["height"], (name, sample)
+        assert sample["matchedPixels"] > 0 and sample["foreground"], (name, "rendered text pixels missing", sample)
+        assert sample["ratio"] >= 4.5 and sample["computedForegroundRatio"] >= 4.5, (name, "rendered text contrast", sample)
+    contrast(page, name, report)
+
+
 def failure_modes(browser, origin, report):
     for failure, setup in [
         ("storage-get", "Object.defineProperty(window,'localStorage',{get(){throw new Error('blocked')}})"),
@@ -219,8 +339,13 @@ def exercise(browser, origin, workdir, output, report):
                     page.goto(origin + path); page.wait_for_load_state("networkidle")
                     expect(page.locator("main h1")).to_be_visible(); appearance(page, theme)
                     label = f"{name}-{width}-{theme}"
+                    if name == "chat":
+                        chat_entry_latest(page, label, report)
                     capture(page, output, report, label); contrast(page, label, report)
+                    if name == "chat":
+                        chat_entry_held_history(page, origin, path, gid, f"{label}-held-history", output, report)
         report["checks"].append("现有概览/项目/聊天/任务/知识/状态/组织/托管/设置，1440与390双主题真实截图及渲染对比度")
+        report["checks"].append("1440/390双主题首次进入聊天及持有GET后历史到达，末条真实可见且列表贴底；未由脚本预置滚动位置")
 
         page.goto(origin + f"/runtimes?projectId={pid}")
         page.get_by_role("button", name="删除配置", exact=True).click()
@@ -300,11 +425,25 @@ def exercise(browser, origin, workdir, output, report):
         expect(page.get_by_test_id("theme-dark")).to_have_attribute("aria-pressed", "true")
         page.get_by_test_id("theme-light").focus()
         assert page.get_by_test_id("theme-light").evaluate("el=>getComputedStyle(el).outlineStyle") != "none"
+        media_readability(page, output, report, "settings-forced-colors", "dark", forced=True)
         capture(page, output, report, "settings-forced-colors")
         page.emulate_media(forced_colors="none", contrast="more", reduced_motion="reduce")
         assert page.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--border').trim()===getComputedStyle(document.documentElement).getPropertyValue('--control-border').trim()")
+        media_readability(page, output, report, "settings-more-contrast", "dark", more=True)
         capture(page, output, report, "settings-more-contrast")
+        page.emulate_media(forced_colors="none", contrast="no-preference", reduced_motion="reduce")
+        media_readability(page, output, report, "settings-restored-dark", "dark")
+        capture(page, output, report, "settings-restored-dark")
+        controls.get_by_test_id("theme-light").click(); appearance(page, "light")
+        page.emulate_media(forced_colors="none", contrast="more", reduced_motion="reduce")
+        assert page.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--border').trim()===getComputedStyle(document.documentElement).getPropertyValue('--control-border').trim()")
+        media_readability(page, output, report, "settings-more-contrast-light", "light", more=True)
+        capture(page, output, report, "settings-more-contrast-light")
+        page.emulate_media(forced_colors="none", contrast="no-preference", reduced_motion="reduce")
+        media_readability(page, output, report, "settings-restored-light", "light")
+        capture(page, output, report, "settings-restored-light")
         report["checks"].append("forced-colors 保留选择/焦点指示，prefers-contrast 加强边界，减少动态仍可操作")
+        report["checks"].append("不刷新切换 forced-colors→more→常规并恢复浅色；原始 viewport 背景像素符合主题，标题和说明的真实笔画像素与背景对比度至少 4.5:1")
         assert not report["pageErrors"], report["pageErrors"]
     except Exception:
         if not page.is_closed(): page.screenshot(path=str(output / "failure.png"), full_page=True)

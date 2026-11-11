@@ -39,6 +39,7 @@ let projectRequest = 0;
 let historyRequest = 0;
 let contextRevision = 0;
 let draftRevision = 0;
+let lastScrollTop = 0;
 
 const activeGroup = computed(() => groups.value.find((g) => g.id === activeGroupId.value) ?? null);
 const humanMembers = computed(() => participants.value.filter((m) => m.kind === "human" && m.status === "active"));
@@ -211,7 +212,11 @@ function fullTimeLabel(iso: string): string {
 function updateScrollPosition(): void {
   const list = messageList.value;
   if (!list) return;
-  atBottom.value = list.scrollHeight - list.scrollTop - list.clientHeight < 64;
+  // 高度缩短也会产生scroll；没有位置位移时保留跟随意图，不能把布局变化当成主动翻历史。
+  if (list.scrollTop !== lastScrollTop || !atBottom.value) {
+    atBottom.value = list.scrollHeight - list.scrollTop - list.clientHeight < 64;
+  }
+  lastScrollTop = list.scrollTop;
   if (atBottom.value) newMessages.value = false;
 }
 
@@ -219,6 +224,7 @@ function scrollToLatest(): void {
   const list = messageList.value;
   if (!list) return;
   list.scrollTop = list.scrollHeight;
+  lastScrollTop = list.scrollTop;
   atBottom.value = true;
   newMessages.value = false;
 }
@@ -245,15 +251,18 @@ watch(activeGroupId, (id) => {
   error.value = null;
   loadError.value = null;
   atBottom.value = true;
+  lastScrollTop = 0;
   newMessages.value = false;
   if (id !== null) void loadHistory(id);
   else historyLoading.value = false;
 }, { flush: "sync" });
 watch(() => messages.value.length, async (length, previous) => {
   const follow = atBottom.value;
+  const revision = contextRevision;
   await nextTick();
-  if (follow) scrollToLatest();
-  else if (length > previous) newMessages.value = true;
+  if (disposed || revision !== contextRevision) return;
+  if (follow && atBottom.value) scrollToLatest();
+  else if (length > previous && !atBottom.value) newMessages.value = true;
 });
 watch(() => route.params["groupId"], (value) => {
   const groupId = queryValue(value);
