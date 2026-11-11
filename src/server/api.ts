@@ -3,7 +3,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DbDriver } from "./db/driver.ts";
 import type { HeartbeatConfig } from "./config.ts";
 import { RepositoryError } from "./db/errors.ts";
-import { createRepositories, type RepositorySet } from "./db/repositories.ts";
+import { createRepositories, type PurgeSnapshot, type RepositorySet } from "./db/repositories.ts";
+import { purgeDiscovery } from "./db/coordinated-repositories.ts";
 import type {
   Group,
   Member,
@@ -164,6 +165,7 @@ const ERROR_STATUS: Record<string, number> = {
   mutation_scope_changed: 409, member_removed: 409, compensation_conflict: 409,
   legacy_incomplete_snapshot: 409, chain_broken: 409,
   audit_snapshot_too_large: 409, audit_capture_budget_exceeded: 409,
+  confirmation_changed: 409,
 };
 
 const MAX_BODY_BYTES = 1_000_000;
@@ -192,7 +194,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
    * 必须在 `return { handle }` 之前初始化：路由器工厂靠提前 return 暴露句柄，
    * 之后的 `const` 不会被执行到（详见本文件底部的函数声明区）。
    */
-  const pendingPurges = new Map<string, { token: string; expiresAt: number }>();
+  type PendingPurge = { token: string; expiresAt: number; snapshot: PurgeSnapshot<Project | Group, unknown> };
+  const pendingPurges = new Map<string, PendingPurge>();
 
   // T2 #49 / T5 #52：审计钩子缺省空实现。同样必须在提前 return 之前初始化（TDZ 坑）。
   const orgChangeRecorder: OrgChangeRecorder = options.orgChangeRecorder ?? noopOrgChangeRecorder;
@@ -1145,23 +1148,21 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   // 注：待确认凭据表 `pendingPurges` 在路由器工厂顶部初始化（必须早于 `return { handle }`，
   // 否则该 `const` 永远不会执行到，这里只是复用同一个闭包变量）。
 
-  function issuePurgeConfirmation(key: string): { token: string; expiresAt: number } {
-    const entry = { token: randomUUID(), expiresAt: Date.now() + PURGE_CONFIRM_TTL_MS };
+  function issuePurgeConfirmation(key: string, snapshot: PurgeSnapshot<Project | Group, unknown>): PendingPurge {
+    const entry = { token: randomUUID(), expiresAt: now().getTime() + PURGE_CONFIRM_TTL_MS, snapshot };
     pendingPurges.set(key, entry);
     return entry;
   }
 
   /**
-   * 校验并消费确认凭据（一次性：成功执行后立刻失效）。
-   * 凭据**不对或已过期时不消费**——失败重试仍用同一凭据即可，不必重新发起；
-   * 过期后（{@link PURGE_CONFIRM_TTL_MS}）必须重新拿一份最新的级联清单。
+   * 正确凭据在尝试执行前消费，影响变化/运行限制/事务失败都需要重新预览；不会自动重试删除。
+   * 错误 token 不消费当前有效凭据；到期凭据移除，重新预览会替换旧凭据。
    */
-  function consumePurgeConfirmation(key: string, token: string): boolean {
+  function consumePurgeConfirmation(key: string, token: string): PendingPurge | null {
     const entry = pendingPurges.get(key);
-    if (entry === undefined) return false;
-    if (entry.token !== token || entry.expiresAt < Date.now()) return false;
+    if (entry === undefined || entry.token !== token) return null;
     pendingPurges.delete(key);
-    return true;
+    return entry.expiresAt <= now().getTime() ? null : entry;
   }
 
   /**
@@ -1170,49 +1171,52 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
    * 第一刀不删，只返回级联清单与一次性确认凭据；第二刀带同一凭据才执行 {@link PurgeFlow.execute}。
    * 守卫（能力点）在取凭据之前判定：manager 主体连清单都拿不到（403），人必须确认两次。
    */
-  interface PurgeFlow {
+  interface PurgeFlow<T extends Project | Group> {
     /** 待确认表键：`project:<id>` / `group:<id>`。 */
     readonly key: string;
     readonly capability: Capability;
     readonly scope: GuardScope;
     /** 确认载荷里的资源字段（kind/id/名称/归档位……），随级联清单一起返回。 */
-    readonly resource: () => Record<string, unknown>;
+    readonly resource: (target: T) => Record<string, unknown>;
     /** 第一刀给「人」看的可读说明：会清掉什么、能不能反悔。 */
-    readonly ask: () => string;
+    readonly ask: (target: T) => string;
     /** 日志事件名。 */
     readonly event: string;
     /** 第一刀的级联清单（只读）。 */
-    readonly preview: () => unknown;
+    readonly preview: () => Promise<PurgeSnapshot<T, unknown>>;
     /** 第二刀的实际清除，返回清除行数。 */
-    readonly execute: () => unknown;
+    readonly execute: (expectedDigest: string) => Promise<unknown>;
     /** T5 #52：永久删除留痕（不可撤销，但必须可查）。提供被删前快照与级联清单。 */
     readonly audit?: {
       readonly action: AuditAction;
       readonly targetKind: AuditTargetKind;
       readonly targetId: string;
-      readonly targetName: string;
-      readonly before: () => unknown;
     };
   }
 
-  async function purgeWithConfirmation(
+  async function purgeWithConfirmation<T extends Project | Group>(
     r: RepositorySet,
-    flow: PurgeFlow,
+    flow: PurgeFlow<T>,
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    const { actor } = (await (guard(r, request, flow.capability, flow.scope)));
+    await guard(r, request, flow.capability, flow.scope);
     const body = await readOptionalObjectBody(request);
     const confirm = typeof body["confirm"] === "string" ? (body["confirm"] as string) : null;
+    const plan = { projectIds: [flow.scope.projectId!], discover: purgeDiscovery(flow.scope.projectId!, flow.scope.groupId) };
 
     if (confirm === null) {
-      const cascade = await flow.preview();
-      const entry = issuePurgeConfirmation(flow.key);
+      const snapshot = await r.transaction(() => r.mutations.run(plan, async () => {
+        await guard(r, request, flow.capability, flow.scope);
+        return flow.preview();
+      }));
+      const { cascade, target } = snapshot;
+      const entry = issuePurgeConfirmation(flow.key, snapshot);
       log.info(`${flow.event}：等待二次确认`, { cascade });
       writeJson(response, 409, {
-        error: { code: "confirmation_required", message: flow.ask() },
+        error: { code: "confirmation_required", message: flow.ask(target) },
         confirmation: {
-          ...flow.resource(),
+          ...flow.resource(target),
           cascade,
           token: entry.token,
           expiresAt: new Date(entry.expiresAt).toISOString(),
@@ -1221,7 +1225,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       return;
     }
 
-    if (!consumePurgeConfirmation(flow.key, confirm)) {
+    const entry = consumePurgeConfirmation(flow.key, confirm);
+    if (!entry) {
       throw new HttpError(
         400,
         "invalid_confirmation",
@@ -1229,21 +1234,26 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       );
     }
 
-    const cleared = await flow.execute();
+    // 权限、快照复核、stopped gate、删除和权威审计共享物理事务及项目/成员/群/runtime锁。
+    // 所有合法写入口都先取得同一项目锁；不能在比较通过与实际清理之间插入新事实。
+    const cleared = await r.transaction(() => r.mutations.run(plan, async () => {
+      const { actor } = await guard(r, request, flow.capability, flow.scope);
+      const counts = await flow.execute(entry.snapshot.digest);
+      if (flow.audit) {
+        await recordAudit(actor, {
+          projectId: flow.scope.projectId!,
+          action: flow.audit.action,
+          targetKind: flow.audit.targetKind,
+          targetId: flow.audit.targetId,
+          targetName: entry.snapshot.target.name,
+          before: entry.snapshot.target,
+          after: null,
+          detail: { cascade: counts },
+        });
+      }
+      return counts;
+    }));
     log.info(`${flow.event}：已清除`, { cleared });
-    // T5 #52：永久删除虽不可撤销，但必须留痕（项目/群组被删后审计行仍按无外键存活）。
-    if (flow.audit) {
-      await (recordAudit(actor, {
-        projectId: flow.scope.projectId!,
-        action: flow.audit.action,
-        targetKind: flow.audit.targetKind,
-        targetId: flow.audit.targetId,
-        targetName: flow.audit.targetName,
-        before: flow.audit.before(),
-        after: null,
-        detail: { cascade: cleared },
-      }));
-    }
     response.writeHead(204, { "cache-control": "no-store" });
     response.end();
   }
@@ -1263,25 +1273,23 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         // 只有「人（owner）」持有 project:purge；顶层 manager 没有 → 403（LIFE-ARC-01）。
         capability: "project:purge",
         scope: { projectId: project.id },
-        resource: () => ({
+        resource: (project: Project) => ({
           kind: "project",
           projectId: project.id,
           projectName: project.name,
           archivedAt: project.archivedAt,
         }),
-        ask: () =>
+        ask: (project: Project) =>
           `永久删除项目「${project.name}」会级联清除它的群组、群聊消息、投递、成员与状态，且不可恢复。` +
           "确认无误后请带 confirmation.token 重新发起 DELETE。",
         event: "永久删除项目",
-        preview: async () => (await (r.projects.previewPurge(project.id))),
-        execute: async () => (await (r.projects.purge(project.id))),
+        preview: () => r.projects.capturePurge(project.id),
+        execute: digest => r.projects.purge(project.id, digest),
         // T5 #52：永久删除留痕（不可撤销）。
         audit: {
           action: AUDIT_ACTIONS.project_delete,
           targetKind: "project",
           targetId: project.id,
-          targetName: project.name,
-          before: () => project,
         },
       },
       request,
@@ -1307,26 +1315,24 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         // `group:purge` 同样只有人持有（LIFE-ARC-01）。
         capability: "group:purge",
         scope: { projectId: group.projectId, groupId: group.id },
-        resource: () => ({
+        resource: (group: Group) => ({
           kind: "group",
           projectId: group.projectId,
           groupId: group.id,
           groupName: group.name,
           archivedAt: group.archivedAt,
         }),
-        ask: () =>
+        ask: (group: Group) =>
           `永久删除群组「${group.name}」会清除它的群聊消息与参与者关系，且不可恢复；项目成员本身不受影响。` +
           "确认后请带 confirmation.token 重新发起 DELETE。",
         event: "永久删除群组",
-        preview: async () => (await (r.groups.previewPurge(group.id))),
-        execute: async () => (await (r.groups.purge(group.id))),
+        preview: () => r.groups.capturePurge(group.id),
+        execute: digest => r.groups.purge(group.id, digest),
         // T5 #52：永久删除留痕（不可撤销）。
         audit: {
           action: AUDIT_ACTIONS.group_delete,
           targetKind: "group",
           targetId: group.id,
-          targetName: group.name,
-          before: () => group,
         },
       },
       request,

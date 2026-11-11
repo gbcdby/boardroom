@@ -64,6 +64,8 @@ SQLite 权限检查针对数据库的真实父目录，那里需要保存 WAL �
 
 主要稳定错误为 `config_invalid`、`legacy_migration_required`、`storage_source_ambiguous`、`storage_root_mismatch`、`storage_maintenance`、`migration_incomplete` 和 `storage_source_changed`。`ConfigError` 提供 `code` 与 `recoveryAction`；错误不转发 JSON 原文、PG 连接串或底层可能包含凭据的异常。
 
+stdio 对非配置类启动失败统一输出 `stdio_startup_failed` 和固定恢复指引，不转发驱动、迁移、传输或其他底层异常正文。该边界也覆盖非 Error 抛出值，不依赖连接串中特定凭据字段的名称或编码形式。
+
 ## 管理命令
 
 只读来源预检输出可安全序列化的 inventory：

@@ -50,6 +50,64 @@ for (const method of ['connect', 'migrate']) {
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("REQ-001: 真实 PG 连接失败不泄漏 query 凭据，HTTP 对照与 stdio 协议保持安全", { timeout: 20_000 }, async t => {
+  const dir = await mkdtemp(path.join(tmpdir(), "boardroom-pg-diagnostic-"));
+  try {
+    const canary = "REVIEW_SYNTHETIC_QUERY_PASSWORD_132";
+    const config = path.join(dir, "config.json");
+    await writeFile(config, JSON.stringify({ dbDriver: "postgres", pgConnectionString: `postgres://tester@127.0.0.1:1/no_database?password=${canary}` }));
+    const trace = path.join(dir, "trace.mjs");
+    await writeFile(trace, `import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { SqliteDriver } from ${JSON.stringify(pathToFileURL(path.join(root, "src/server/db/drivers/sqlite.ts")).href)};
+import { PostgresDriver } from ${JSON.stringify(pathToFileURL(path.join(root, "src/server/db/drivers/postgres.ts")).href)};
+for (const [kind, Driver] of [['sqlite', SqliteDriver], ['postgres', PostgresDriver]]) for (const method of ['connect', 'migrate']) {
+  const original = Driver.prototype[method];
+  Driver.prototype[method] = function(...args) { fs.writeSync(3, kind + '.' + method + '\\n'); return original.apply(this, args); };
+}
+const mkdir = fs.mkdirSync; fs.mkdirSync = (...args) => { fs.writeSync(3, 'mkdir\\n'); return mkdir(...args); }; syncBuiltinESMExports();`);
+    const before = await readdir(dir);
+    for (const entry of [path.join(root, "src/server/index.ts"), stdioEntry]) {
+      const result = spawnSync(process.execPath, ["--import", trace, entry], { cwd: dir,
+        env: cleanEnv({ BOARDROOM_HOME: path.join(dir, "home"), AGENT_STUDIO_CONFIG: config, AGENT_STUDIO_LOG_LEVEL: "error" }),
+        input: "", encoding: "utf8", timeout: 8000, stdio: ["pipe", "pipe", "pipe", "pipe"] });
+      const diagnostic = result.stdout + result.stderr;
+      t.diagnostic(JSON.stringify({ entry: entry === stdioEntry ? "stdio" : "http", exitCode: result.status,
+        calls: result.output[3], canaryPresent: diagnostic.includes(canary), filesUnchanged: JSON.stringify(await readdir(dir)) === JSON.stringify(before) }));
+      assert.equal(result.error, undefined); assert.equal(result.status, 1);
+      assert.equal(result.output[3], "postgres.connect\n");
+      assert.deepEqual(await readdir(dir), before);
+      assert.equal(diagnostic.includes(canary), false);
+      assert.equal(diagnostic.includes("postgres://"), false);
+      if (entry === stdioEntry) {
+        assert.equal(result.stdout, "");
+        assert.match(result.stderr, /stdio_startup_failed/);
+        assert.match(result.stderr, /恢复方式/);
+      }
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("REQ-001: stdio 不转发任意底层 Error 或非 Error 原文", { timeout: 15_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "boardroom-opaque-diagnostic-"));
+  try {
+    const canary = "SYNTHETIC_UNSTRUCTURED_DRIVER_DETAIL_132";
+    const preload = path.join(dir, "failure.mjs");
+    for (const expression of [`new Error(${JSON.stringify(canary)})`, JSON.stringify(canary)]) {
+      await writeFile(preload, `import { PostgresDriver } from ${JSON.stringify(pathToFileURL(path.join(root, "src/server/db/drivers/postgres.ts")).href)};
+PostgresDriver.prototype.connect = async function() { throw ${expression}; };`);
+      const before = await readdir(dir);
+      const result = spawnSync(process.execPath, ["--import", preload, stdioEntry], { cwd: dir,
+        env: cleanEnv({ BOARDROOM_HOME: path.join(dir, "home"), AGENT_STUDIO_DB_DRIVER: "postgres",
+          AGENT_STUDIO_PG_CONNECTION_STRING: "postgres://tester@127.0.0.1:1/no_database" }),
+        input: "", encoding: "utf8", timeout: 8000 });
+      assert.equal(result.error, undefined); assert.equal(result.status, 1); assert.equal(result.stdout, "");
+      assert.equal(result.stderr.includes(canary), false); assert.match(result.stderr, /stdio_startup_failed/);
+      assert.deepEqual(await readdir(dir), before);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("S4-AC01: HTTP/stdio 配置错误矩阵在连接和 mkdir 前失败，诊断不泄露配置原文", { timeout: 20_000 }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "boardroom-strict-errors-"));
   try {

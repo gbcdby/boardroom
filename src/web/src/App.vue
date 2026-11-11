@@ -2,6 +2,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
 import AppIcon from "./components/AppIcon.vue";
+import ToastHost from "./components/ToastHost.vue";
 import { projectPath, useCurrentProject } from "./composables/useCurrentProject.ts";
 const route = useRoute();
 const router = useRouter();
@@ -68,4 +69,5 @@ watch(() => route.path, async () => {
       <footer class="footer">Agent Studio<span aria-hidden="true"> · </span>让协作井然有序</footer>
     </div>
   </div>
+  <ToastHost />
 </template>

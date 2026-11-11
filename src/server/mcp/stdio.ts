@@ -82,7 +82,9 @@ await main().catch((error) => {
   if (error instanceof ConfigError) {
     process.stderr.write(`配置无效 [${error.code}]：${error.message}\n恢复方式：${error.recoveryAction}\n`);
   } else {
-    process.stderr.write(`stdio 启动失败：${(error as Error)?.message ?? String(error)}\n`);
+    // 驱动/迁移/传输异常可含 DSN、任意配置值或服务端原文；不能依赖凭据关键字猜测。
+    // 仅输出固定诊断，不读取或转发 message、stack、cause 或非 Error 的 String 值。
+    process.stderr.write("stdio 启动失败 [stdio_startup_failed]。\n恢复方式：请检查数据库服务、连接配置、路径权限和应用版本后重试；不会自动切换数据源。\n");
   }
   process.exitCode = 1;
 });

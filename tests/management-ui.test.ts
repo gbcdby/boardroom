@@ -136,15 +136,18 @@ test("岗位逐项保存不会丢掉同一编辑区其他尚未保存的修改",
   });
 });
 
-test("删除预览展示记忆级联数量，并区分项目删除与群组删除的保留政策", async () => {
+test("删除预览展示记忆与托管级联数量，并区分项目删除与群组删除的保留政策", async () => {
   const group = { id: "group-1", projectId: project.id, name: "协作群", archivedAt: null };
-  const cascade = { groups: 1, members: 0, orgNodes: 0, messages: 2, deliveries: 3, memberStatuses: 0, mcpSessions: 0, participants: 0, taskSettings: 0, tasks: 0, taskComments: 0, taskHistory: 0, taskMessageLinks: 0, reviewRounds: 0, reviewReports: 0, workEvents: 8, memoryDocuments: 2, memoryVersions: 7, memorySummaryRequests: 3, memoryMessageReceipts: 4, memoryTriggerCounters: 5, memoryScanCheckpoints: 6 };
+  const cascade = { groups: 3, members: 4, orgNodes: 0, messages: 2, deliveries: 3, memberStatuses: 0, memberFactRevisions: 4, mcpSessions: 0, participants: 2, taskSettings: 0, tasks: 0, taskComments: 0, taskHistory: 0, taskMessageLinks: 0, reviewRounds: 0, reviewReports: 0, workEvents: 8, memoryDocuments: 2, memoryVersions: 7, memorySummaryRequests: 3, memoryMessageReceipts: 4, memoryTriggerCounters: 5, memoryScanCheckpoints: 6 };
   let confirmedDeletes = 0;
   await withPage("ProjectsView", (url, init) => {
     if (init?.method === "DELETE") {
       if (init.body) confirmedDeletes++;
       const kind = url.includes("/groups/") ? "group" : "project";
-      return json({ error: { code: "confirmation_required" }, confirmation: { kind, projectId: project.id, projectName: project.name, groupId: group.id, groupName: group.name, cascade, token: "preview-only", expiresAt: "2026-11-12T01:00:00Z" } }, 409);
+      const runtimeCascade = kind === "project"
+        ? { agentRuntimeBindings: 7, agentRunnerStates: 7, agentRuntimeMembers: 3 }
+        : { agentRuntimeBindings: 2, agentRunnerStates: 2, agentRuntimeMembers: 1 };
+      return json({ error: { code: "confirmation_required" }, confirmation: { kind, projectId: project.id, projectName: project.name, groupId: group.id, groupName: group.name, cascade: { ...cascade, ...runtimeCascade }, token: "preview-only", expiresAt: "2026-11-12T01:00:00Z" } }, 409);
     }
     if (url.endsWith("/groups")) return json({ groups: [group] });
     if (url.endsWith("/members")) return json({ members: [] });
@@ -156,12 +159,23 @@ test("删除预览展示记忆级联数量，并区分项目删除与群组删�
     assert.match(projectPreview, /记忆文档：2.*历史版本 7/);
     assert.match(projectPreview, /自总结请求：3/);
     assert.match(projectPreview, /全局私有记忆.*保留/);
+    assert.match(projectPreview, /托管群绑定：7 条/);
+    assert.match(projectPreview, /托管运行状态：7 条/);
+    assert.match(projectPreview, /托管成员预留关系：3 条/);
+    assert.match(projectPreview, /全局托管配置和 Agent 身份保留/);
+    assert.match(projectPreview, /其他项目的成员、托管群绑定与运行状态保留/);
     await byTestId(container, "cancel-purge-project").props.onClick(); await settle();
     await byTestId(container, "purge-group").props.onClick(); await settle();
     const groupPreview = textOf(byTestId(container, "group-purge-confirm"));
     assert.match(groupPreview, /记忆正文与版本历史.*保留/);
     assert.match(groupPreview, /该群工作事件：8/);
     assert.match(groupPreview, /自总结请求：3/);
+    assert.match(groupPreview, /托管群绑定：2 条/);
+    assert.match(groupPreview, /托管运行状态：2 条/);
+    assert.match(groupPreview, /托管成员预留关系：1 条/);
+    assert.match(groupPreview, /全局托管配置和项目成员保留/);
+    assert.match(groupPreview, /其他群的托管绑定与运行状态保留/);
+    assert.match(groupPreview, /仅清除删除后不再有其他群绑定的未占用预留关系/);
     assert.equal(confirmedDeletes, 0, "展示删除预览不能提交确认删除");
   });
 });

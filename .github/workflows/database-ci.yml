@@ -58,6 +58,8 @@ jobs:
     name: Node 24 · SQLite / PostgreSQL
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      browser_dependencies_id: ${{ steps.browser_dependencies.outputs.artifact-id }}
 
     services:
       postgres:
@@ -191,10 +193,49 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: 打包本候选已验证的浏览器服务依赖
+        run: |
+          mkdir -p .agent-output/browser-dependencies
+          node --input-type=module <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const manifest = {
+            candidate: process.env.GITHUB_SHA,
+            node: process.version,
+            abi: process.versions.modules,
+            platform: process.platform,
+            arch: process.arch,
+            libc: process.report.getReport().header.glibcVersionRuntime,
+            lockSha256: createHash('sha256').update(readFileSync('package-lock.json')).digest('hex'),
+          };
+          writeFileSync('.agent-output/browser-dependencies/environment.json', JSON.stringify(manifest, null, 2));
+          JS
+          # tar 保留原生模块、可执行位和 .bin 符号链接；来源为本 job 已完成的 npm ci。
+          tar -czf .agent-output/browser-dependencies/node_modules.tar.gz node_modules
+          (cd .agent-output/browser-dependencies && sha256sum node_modules.tar.gz > SHA256SUMS)
+
+      - name: 交接同候选原生依赖
+        id: browser_dependencies
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: browser-dependencies-${{ github.run_attempt }}
+          path: .agent-output/browser-dependencies/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
   managed-web-browser:
     name: Chromium · 工作台与托管 Agent 页面
+    needs: database-tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # 与下方 Python 包版本一致；镜像已安装浏览器及完整系统依赖，避免 apt 镜像 DNS 故障。
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.62.0-noble@sha256:aa81288e738725378becba5b3e06cb0f3a7f012a610e87e8d767a090ea3f740d
+      options: --init --shm-size=1g
+    defaults:
+      run:
+        shell: bash
     services:
       postgres:
         image: postgres:16-alpine
@@ -216,6 +257,12 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: 核对浏览器容器的已检出候选
+        run: |
+          # 只信任本次 runner 检出的确切工作区，不放宽其他 Git 目录。
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -223,16 +270,59 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      - name: 安装并构建真实 WebUI
+      - name: 取得同次运行的原生依赖
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          # 只重跑失败的 browser 时仍引用成功 producer 的实际产物。
+          artifact-ids: ${{ needs.database-tests.outputs.browser_dependencies_id }}
+          path: .agent-output/browser-dependencies
+          digest-mismatch: error
+
+      - name: 核对依赖身份并构建真实 WebUI
         run: |
-          npm ci
+          (cd .agent-output/browser-dependencies && sha256sum --check SHA256SUMS)
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+          const manifest = JSON.parse(readFileSync('.agent-output/browser-dependencies/environment.json', 'utf8'));
+          assert.match(manifest.candidate, /^[0-9a-f]{40}$/);
+          const current = {
+            candidate: process.env.GITHUB_SHA,
+            node: process.version,
+            abi: process.versions.modules,
+            platform: process.platform,
+            arch: process.arch,
+            libc: process.report.getReport().header.glibcVersionRuntime,
+            lockSha256: createHash('sha256').update(readFileSync('package-lock.json')).digest('hex'),
+          };
+          assert.deepEqual(manifest, current, '依赖必须来自本候选、同一锁文件和相同 Node/Linux ABI');
+          console.log(JSON.stringify(current));
+          JS
+          tar --extract --gzip --no-same-owner --file .agent-output/browser-dependencies/node_modules.tar.gz
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import Database from 'better-sqlite3';
+          const db = new Database(':memory:');
+          assert.equal(db.prepare('SELECT 1 AS value').get().value, 1);
+          db.close();
+          JS
           npm run build
 
-      - name: 安装固定版本 Playwright 与 Chromium
+      - name: 安装固定版本 Playwright 并核对预置 Chromium
         run: |
-          python3 -m venv .agent-output/browser-venv
+          python3 -m virtualenv .agent-output/browser-venv
           .agent-output/browser-venv/bin/python -m pip install playwright==1.62.0
-          .agent-output/browser-venv/bin/python -m playwright install --with-deps chromium
+          .agent-output/browser-venv/bin/python - <<'PY'
+          from importlib.metadata import version
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+          assert version('playwright') == '1.62.0'
+          with sync_playwright() as playwright:
+              executable = Path(playwright.chromium.executable_path)
+              assert executable.is_file(), f'固定版本 Chromium 缺失: {executable}'
+              print(f'Playwright {version("playwright")} / {executable}')
+          PY
 
       - name: 真实浏览器操作临时 SQLite 服务
         run: .agent-output/browser-venv/bin/python scripts/e2e-managed-web.py --ci
@@ -266,7 +356,7 @@ jobs:
 
       - name: PostgreSQL 固定负载与真实 DOM 消息时延
         env:
-          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@postgres:5432/boardroom_ci
         run: .agent-output/browser-venv/bin/python scripts/e2e-v1-load-web.py --ci --db postgres
 
       - name: 保存浏览器截图与逐项报告
