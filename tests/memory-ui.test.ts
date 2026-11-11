@@ -299,3 +299,52 @@ test("记忆：归档与失活的执行限制由控件和处理函数共同遵�
     }, { path: "/projects/project-1/memory?scope=members&agentId=agent-a" });
   }
 });
+
+test("记忆：目录和正文读取失败有独立重试，失败读取不会开放保存", async () => {
+  let directoryAvailable = false, bodyAvailable = false;
+  await withPage("MemoryView", (url) => {
+    if (url.endsWith("/org") && !directoryAvailable) return json({ error: { code: "read_failed", message: "目录暂不可用" } }, 503);
+    if (url.endsWith("/memories/shared")) return bodyAvailable ? json({ document: document("读取恢复的共识"), version: 1 }) : json({ error: { code: "read_failed", message: "正文暂不可用" } }, 503);
+    return read(url);
+  }, async (container) => {
+    assert.match(textOf(container), /目录暂不可用/);
+    assert.equal(find(container, (node) => node.props["data-testid"] === "memory-editor"), undefined);
+    directoryAvailable = true;
+    await byTestId(container, "memory-retry-directory").props.onClick(); await settle();
+    assert.match(textOf(byTestId(container, "memory-error")), /正文暂不可用/);
+    assert.equal(byTestId(container, "memory-save").props.disabled, true);
+    bodyAvailable = true;
+    const retry = find(container, (node) => node.type === "button" && textOf(node) === "重新读取（保留草稿）");
+    assert.ok(retry); await retry.props.onClick(); await settle();
+    assert.equal(byTestId(container, "memory-editor").value, "读取恢复的共识");
+    assert.equal(byTestId(container, "memory-editor").props.disabled, false);
+  }, { path: "/projects/project-1/memory" });
+});
+
+test("记忆：旧目标的历史与总结列表迟到，不出现在新目标面板", async () => {
+  const oldHistory = deferred<Response>(), oldSummary = deferred<Response>();
+  const members = ["a", "b"].map((id) => ({ id: `member-${id}`, projectId: project.id, agentId: `agent-${id}`, kind: "agent", displayName: `成员 ${id}`, status: "active", role: "normal", nodeId: null }));
+  await withPage("MemoryView", (url) => {
+    if (url.endsWith("/org")) return json({ members, nodes: [], roles: [] });
+    if (url.endsWith("/agents/agent-a/versions")) return oldHistory.promise;
+    if (url.endsWith("/agents/agent-a/summary-requests")) return oldSummary.promise;
+    if (url.endsWith("/agents/agent-b/summary-requests")) return json({ requests: [{ ...summaryRequest("pending", "current-target"), agentId: "agent-b" }] });
+    const match = /\/agents\/(agent-a|agent-b)$/.exec(url);
+    if (match) return json({ document: document(`${match[1]} 的正文`, 1, match[1]), version: 1 });
+    return read(url);
+  }, async (container) => {
+    const readingHistory = byTestId(container, "memory-history-open").props.onClick();
+    await select(byTestId(container, "memory-agent"), "agent-b"); await settle();
+    expectCurrent();
+    oldHistory.resolve(json({ versions: [{ ...written("旧目标的历史正文").writtenVersion, author: { ...author, displayName: "旧目标的历史作者" } }] }));
+    oldSummary.resolve(json({ requests: [{ ...summaryRequest("failed", "old-target"), error: { code: "old", message: "旧目标迟到的失败" } }] }));
+    await readingHistory; await settle();
+    expectCurrent();
+    assert.doesNotMatch(textOf(container), /旧目标的历史作者|旧目标迟到的失败/);
+    function expectCurrent() {
+      assert.equal(byTestId(container, "memory-editor").value, "agent-b 的正文");
+      assert.match(textOf(byTestId(container, "memory-summary-request-current-target")), /待处理/);
+      assert.equal(byTestId(container, "memory-history-open").props["aria-expanded"], false);
+    }
+  }, { path: "/projects/project-1/memory?scope=members&agentId=agent-a" });
+});

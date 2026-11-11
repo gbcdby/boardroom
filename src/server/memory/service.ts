@@ -42,7 +42,7 @@ export interface MemoryServiceOptions {
   readVisibleMessages: (access: MemoryAccess, ids: readonly string[]) => Promise<MemorySummaryPacket["messages"]>;
   onWorkEvents?: (events: readonly WorkEvent[]) => void | Promise<void>;
 }
-type Context = { actor: Actor; member: Member | null; author: MemoryAuthor; at: string; events: WorkEvent[] };
+type Context = { projectId: string; actor: Actor; member: Member | null; author: MemoryAuthor; at: string; events: WorkEvent[] };
 type Outcome<T> = { value: T; error?: never } | { error: MemoryError; value?: never };
 type SummarySource = { trigger: SummaryTrigger; triggerKey: string; contextGroupId: string | null;
   taskId?: string | null; completedTaskRevision?: number | null; messageIds?: string[];
@@ -112,7 +112,7 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
     const project = await repos.projects.get(projectId);
     if (!project) throw new NotFoundError("项目不存在。");
     if (write && project.archivedAt !== null) throw new ArchivedError("项目已归档，记忆保持只读。");
-    return { actor, member, author: { kind: actor.kind, actorId: actor.actorId, agentId: member?.agentId ?? null,
+    return { projectId, actor, member, author: { kind: actor.kind, actorId: actor.actorId, agentId: member?.agentId ?? null,
       displayName: member?.displayName ?? "人（owner）" }, at: now(), events: [] };
   }
   async function requireKey(ctx: Context, key: MemoryKey, write = false): Promise<void> {
@@ -131,7 +131,7 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
     }
     const target = await repos.members.findByAgent(key.projectId, key.agentId);
     authorizeOrThrow(ctx.actor, "memory:manage_agent", { projectId: key.projectId, nodeId: target?.nodeId ?? null });
-    if (!target && !await repos.agents.get(key.agentId)) throw new NotFoundError("目标 Agent 不存在。");
+    if (!target && !await repos.memory.get(key)) throw new NotFoundError("目标 Agent 不在本项目，且没有留存的项目记忆。");
   }
   async function mutate<T>(access: MemoryAccess, projectId: string, body: (ctx: Context) => Promise<T>, operation: "write" | "consume" = "write"): Promise<T> {
     let events: WorkEvent[] = [];
@@ -181,7 +181,7 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
   }
   async function requireGroup(ctx: Context, access: MemoryAccess, groupId: string, write = false): Promise<void> {
     const group = await repos.groups.get(groupId);
-    if (!group || group.projectId !== ctx.member?.projectId && ctx.actor.projectId !== null && group.projectId !== ctx.actor.projectId) {
+    if (!group || group.projectId !== ctx.projectId) {
       deny("group:view", "总结上下文群组不存在或不属于当前项目。", "cross_project");
     }
     const memberIds = await repos.groups.participants(groupId);

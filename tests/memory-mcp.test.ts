@@ -8,16 +8,18 @@ import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories } from "../src/server/db/repositories.ts";
 import { createMcpCore } from "../src/server/mcp/core.ts";
 import { createLogger } from "../src/server/logger.ts";
-import { registerMemoryRuntime, getMemoryRuntime, closeMemoryRuntime } from "../src/server/memory/runtime.ts";
+import { DEFAULT_MEMORY_CONFIG } from "../src/server/config.ts";
+import type { MemoryConfig } from "../src/shared/memory.ts";
+import { registerMemoryRuntime, getMemoryRuntime, closeMemoryRuntime, scheduleMemoryReconciliation } from "../src/server/memory/runtime.ts";
 
-async function fixture() {
+async function fixture(config?: MemoryConfig) {
   const dir = await mkdtemp(path.join(tmpdir(), "boardroom-memory-mcp-"));
   const db = createDbDriver({ dataDir: dir });
   await db.connect(); await db.migrate(migrations);
   const repos = createRepositories(db), logger = createLogger({ write: () => {} });
   const project = await repos.projects.create({ name: "记忆入口" });
   const group = await repos.groups.create({ projectId: project.id, name: "当前群" });
-  registerMemoryRuntime(db, { database: { kind: "sqlite", sqlitePath: path.join(dir, "agent-studio.db") } });
+  registerMemoryRuntime(db, { database: { kind: "sqlite", sqlitePath: path.join(dir, "agent-studio.db") }, ...(config ? { config } : {}) });
   const core = createMcpCore({ db, logger });
   return { dir, db, repos, project, group, core, logger,
     async close() { await core.close(); await closeMemoryRuntime(db); await db.close(); await rm(dir, { recursive: true, force: true }); } };
@@ -72,5 +74,30 @@ test("历史读取与直接 ACK 不伪造 MCP 投递，实际 wait 首次投递�
     assert.equal((await f.repos.deliveries.get(delivered.id, joined.memberId))?.firstMcpDeliveredAt, first);
     await f.core.acknowledgeMessage("reader", delivered.id);
     assert.equal((await f.repos.deliveries.get(delivered.id, joined.memberId))?.firstMcpDeliveredAt, first);
+  } finally { await f.close(); }
+});
+
+test("R-P4-C-REQ-001：投递事实写失败不成功出队；修复后重投仍能触发 N=1 总结", async () => {
+  const f = await fixture({ ...DEFAULT_MEMORY_CONFIG, messageThreshold: 1 });
+  try {
+    const joined = await f.core.join("reader", { displayName: "投递接收者", hostType: "other", projectId: f.project.id, groupId: f.group.id });
+    const human = await f.repos.members.create({ projectId: f.project.id, kind: "human", displayName: "用户" });
+    await f.repos.groups.addParticipant(f.group.id, human.id);
+    const message = await f.repos.messages.create({ groupId: f.group.id, senderMemberId: human.id, body: "故障后不可丢来源", mentions: [joined.memberId] });
+    await f.repos.deliveries.ensure(message.id, joined.memberId);
+    await f.db.exec("CREATE TRIGGER reject_mcp_fact BEFORE UPDATE OF first_mcp_delivered_at ON message_deliveries BEGIN SELECT RAISE(ABORT, 'fixture_delivery_fact_failed'); END");
+    await assert.rejects(f.core.waitForMessages("reader", { timeoutMs: 50 }));
+    const failed = await f.repos.deliveries.get(message.id, joined.memberId);
+    assert.equal(failed?.status, "pending"); assert.equal(failed?.firstMcpDeliveredAt, null);
+    assert.equal(f.core.pendingWaitCount, 0);
+    await f.db.exec("DROP TRIGGER reject_mcp_fact");
+    const delivered = await f.core.waitForMessages("reader", { timeoutMs: 50 });
+    assert.deepEqual(delivered.messages.map(row => row.id), [message.id]);
+    await f.core.acknowledgeMessage("reader", message.id);
+    await new Promise<void>(resolve => scheduleMemoryReconciliation(f.db, "test:confirmed-delivery", async () => { resolve(); }));
+    assert.ok((await f.repos.deliveries.get(message.id, joined.memberId))?.firstMcpDeliveredAt);
+    const requests = await f.repos.memory.listRequests(f.project.id, joined.agentId);
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0]?.messageIds, [message.id]);
   } finally { await f.close(); }
 });

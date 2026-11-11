@@ -797,12 +797,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     return await withAccess(binding, "consume", async () => {
     const result: Message[] = [];
     for (const message of messages) {
-      try {
-        await (repos.deliveries.markMcpDelivered(message.id, binding.memberId));
-      } catch (error) {
-        if (options.managed) throw error;
-        log.warn("delivery_record_failed", { error, messageId: message.id });
-      }
+      // 投递事实是可恢复性的组成部分；持久化失败时整批回滚、保留积压，
+      // 不成功返回消息后再让 ACK 永久抹掉缺失的首次投递来源。
+      await (repos.deliveries.markMcpDelivered(message.id, binding.memberId));
       result.push(toMessage(message));
     }
     if (options.managed) await options.managed.onDelivery();

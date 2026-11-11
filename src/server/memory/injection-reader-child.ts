@@ -8,12 +8,18 @@ type Row = { member_id: string; binding_agent_id: string; id: string | null; sco
   project_id: string | null; version: number; markdown: string | null; byte_length: number | null };
 let sqlite: Database.Database | null = null; let pg: Client | null = null; let config: MemoryConfig | null = null; let busy = false;
 
+/** 仅子进程装配使用；导出便于隔离探针验证实际连接拒写，不接受 IPC SQL。 */
+export function openReadonlyMemorySqlite(path: string): Database.Database {
+  const database = new Database(path, { readonly: true, fileMustExist: true, timeout: 100 });
+  database.pragma("query_only=ON");
+  return database;
+}
+
 async function init(database: MemoryDatabaseDescriptor, values: MemoryConfig): Promise<void> {
   if (config) throw new Error("already initialized");
   config = values;
   if (database.kind === "sqlite") {
-    sqlite = new Database(database.sqlitePath, { readonly: true, fileMustExist: true, timeout: 100 });
-    sqlite.pragma("query_only=ON");
+    sqlite = openReadonlyMemorySqlite(database.sqlitePath);
   } else {
     if (database.schema !== undefined && !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(database.schema)) throw new Error("invalid schema");
     pg = new Client({ connectionString: database.connectionString, connectionTimeoutMillis: 250, statement_timeout: 250,

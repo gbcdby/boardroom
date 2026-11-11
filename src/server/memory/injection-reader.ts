@@ -78,8 +78,8 @@ export function createMemoryInjectionReader(options: MemoryInjectionReaderOption
       instance.once("error", () => { if (child === instance && !closed) openCircuit("memory_reader_process_failed", true); });
       instance.once("exit", () => {
         if (child !== instance) return;
-        clearWatchdog(); child = null; ready = false; retiring = false; active = null;
         if (!closed) { circuitUntil = Date.now() + 30000; failAll("memory_reader_exited"); }
+        clearWatchdog(); child = null; ready = false; retiring = false; active = null;
       });
       instance.send({ type: "init", database: options.database, config }, error => { if (error && child === instance) openCircuit("memory_reader_ipc_failed", true); });
     } catch { openCircuit("memory_reader_process_failed", true); }

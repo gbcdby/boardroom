@@ -99,6 +99,19 @@ for (const engine of ["sqlite", "postgres"] as const) {
     assert.equal(concurrent.filter(r => r.status === "fulfilled").length, 1);
     assert.equal((await service.read(p.own, key)).version, 2);
   }, engine));
+
+  test(`${engine} AC-MEM-03：离项目保留文档可维护，不为从未加入的 Agent 跨域造文档`, { skip: engine === "postgres" ? pgUnavailable : false }, async () => memoryFixture(async repos => {
+    const p = await memoryPeople(repos);
+    const service = createMemoryService({ repos, config: DEFAULT_MEMORY_CONFIG, injectionReader: reader, readVisibleMessages: async () => [] });
+    const unjoined = await repos.agents.create({ displayName: "未加入本项目", hostType: "codex-cli" });
+    const unknown: MemoryKey = { scope: "project-agent", projectId: p.project.id, agentId: unjoined.id };
+    await assert.rejects(service.write(p.owner, unknown, { expectedVersion: 0, clientMutationId: "outside", markdown: "不创建无项目归属的记忆" }), { code: "not_found" });
+    const key: MemoryKey = { scope: "project-agent", projectId: p.project.id, agentId: p.agent.id };
+    await service.write(p.owner, key, { expectedVersion: 0, clientMutationId: "before-leaving", markdown: "项目历史" });
+    await repos.members.delete(p.member.id);
+    assert.equal((await service.read(p.owner, key)).document?.markdown, "项目历史");
+    assert.equal((await service.write(p.owner, key, { expectedVersion: 1, clientMutationId: "after-leaving", markdown: "离岗后人工维护" })).document.version, 2);
+  }, engine));
 }
 
 test("AC-MEM-01/07：自动注入仅传可信绑定给 reader，不借主库追加 ACL 查询", async () => memoryFixture(async repos => {
