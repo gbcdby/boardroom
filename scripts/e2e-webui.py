@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import select
 import subprocess
+import time
 import traceback
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright, expect
@@ -86,6 +87,48 @@ def check_confirmation_layout(page, kind, label, width, height, report, require_
         expect(button).to_be_in_viewport(ratio=1)
         expect(button).to_be_enabled()
         button.click(trial=True)  # 检查真实命中与可操作性，不执行取消或删除。
+
+def observe_reconcile_requests(page, report):
+    """只记录 API 请求阶段；不等待网络、不读取响应正文，也不改变拦截行为。"""
+    started = time.monotonic()
+    trace = {"stage": "observer-installed", "events": [], "requests": [], "active": True}
+    report["memberReconcileNetwork"] = trace
+    records = {}
+    def record(event, request=None, **details):
+        if not trace["active"]:
+            return
+        at = round((time.monotonic() - started) * 1000, 3)
+        entry = {"event": event, "atMs": at, "stage": trace["stage"], **details}
+        if request is not None:
+            parsed = urlsplit(request.url)
+            if not parsed.path.startswith("/api/"):
+                return
+            if request not in records:
+                item = {"id": len(records) + 1, "method": request.method,
+                    "path": parsed.path + ("?" + parsed.query if parsed.query else "")}
+                records[request] = item
+                trace["requests"].append(item)
+            item = records[request]
+            item.update({"lastEvent": event, "lastAtMs": at, **details})
+            item["networkStage" if event in ("request", "response-headers", "request-finished", "request-failed") else "routeStage"] = event
+            entry["requestId"] = item["id"]
+        else:
+            trace["stage"] = event
+            entry["stage"] = event
+        trace["events"].append(entry)
+    handlers = {
+        "request": lambda request: record("request", request),
+        "response": lambda response: record("response-headers", response.request, status=response.status),
+        "requestfinished": lambda request: record("request-finished", request, timing=request.timing),
+        "requestfailed": lambda request: record("request-failed", request, failure=request.failure),
+    }
+    for event, handler in handlers.items():
+        page.on(event, handler)
+    def stop():
+        trace["active"] = False
+        for event, handler in handlers.items():
+            page.remove_listener(event, handler)
+    return record, stop
 
 def confirmation_flows(page, origin, project_id, org_project_id, output, report):
     """真实操作与数据结果；仅对拒绝/响应丢失场景注入传输故障。"""
@@ -195,11 +238,22 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     expect(page.get_by_test_id("confirm-cancel")).to_be_focused()
     reads = []
     reconcile_released = False
+    record_reconcile, stop_reconcile_observer = observe_reconcile_requests(page, report)
     def hold_reconcile(route):
-        if route.request.method == "GET" and not reconcile_released: reads.append(route)
-        else: route.continue_()
+        record_reconcile("route-enter", route.request, released=reconcile_released)
+        if route.request.method == "GET" and not reconcile_released:
+            reads.append(route)
+            record_reconcile("route-held", route.request)
+        else:
+            try:
+                route.continue_()
+                record_reconcile("route-continued", route.request)
+            except Exception as error:
+                record_reconcile("route-error", route.request, error=str(error))
+                raise
     read_pattern = f"**/api/projects/{project_id}/members"
     page.route(read_pattern, hold_reconcile)
+    record_reconcile("reconcile-click")
     with page.expect_request(lambda req: req.method == "GET" and urlsplit(req.url).path == f"/api/projects/{project_id}/members"):
         recovery.click()
     expect(recovery).to_have_count(0)
@@ -208,10 +262,16 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     # unroute 移除最后一个 handler 会自动放行挂起请求；先显式放行并等待响应。
     # 核对释放后，后续成功刷新直接通过，不再次挂起。
     reconcile_released = True
+    record_reconcile("held-read-release")
     with page.expect_response(lambda response: response.request.method == "GET" and urlsplit(response.url).path == f"/api/projects/{project_id}/members"):
         reads[0].continue_()
+        record_reconcile("held-read-continue-returned", reads[0].request)
+    record_reconcile("unroute-start")
     page.unroute(read_pattern, hold_reconcile)
+    record_reconcile("unroute-returned")
     expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
+    record_reconcile("dialog-closed")
+    stop_reconcile_observer()
     expect(page.locator("h1")).to_be_focused()
     expect(page.get_by_test_id("new-member-name")).to_have_value("删除成员期间保留的草稿")
     page.get_by_test_id("new-member-name").fill("")
@@ -742,7 +802,12 @@ def main():
             try:
                 records = seed(page, origin)
                 exercise(page, origin, records, output, report, args.capture_only, fixture_info["workdir"])
-            except Exception:
+            except Exception as error:
+                network = report.get("memberReconcileNetwork")
+                if network and network["active"]:
+                    # 冻结失败时的请求状态，避免 context.close 的取消事件覆盖现场。
+                    network["failure"] = {"stage": network["stage"], "error": str(error)[:5000]}
+                    network["active"] = False
                 if not page.is_closed(): page.screenshot(path=str(output / "failure.png"), full_page=True)
                 raise
             finally:
