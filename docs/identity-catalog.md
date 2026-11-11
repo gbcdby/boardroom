@@ -51,6 +51,8 @@ HTTP 删除分两次：第一次 DELETE 提交 `expectedRevision`，返回 `409 
 
 没有退休标记但目标 Agent 缺失、当前身份缺 alias，或 alias 对应另一个 Agent 时，返回 `migration_identity_ambiguous` 及具体原因；不能当作“未注册”静默创建新身份。未升级到 v14 的数据库仍使用旧名称/宿主查找，读预检标记 `aliasCatalogState: pre-migration`，不写回 alias。
 
+解析入口不以数据库正常情况下的唯一约束代替导入数据校验：同一旧键存在多行时返回 `legacy_alias_duplicate`，预检保留所有冲突行的 Agent 引用。当前名称/宿主键与 alias 目标不一致、目标自身的当前 alias 缺失/损坏、目标的其他 alias 重复或占用了另一活 Agent 当前键，同样拒绝。旧 MCP 接入、repository 查找及改名/追加 alias 在各自入口直接检查，不要求用户先手动预检；失败不创建 Agent/Member，也不改名或合并。检查限定于涉及的身份与别名，其他完整身份继续可解析。
+
 历史 `other → dsh` 转换先在同一事务检查全部目标 alias 冲突，再保留 other alias 并为同一 agentId 追加 dsh alias。任何冲突都回滚整批宿主/alias 变更，显示名保持当前值。示例数据的直接 Agent 插入也登记初始 alias。
 
 ## 4. 旧 Profile 与 Binding 的只读预检
@@ -60,6 +62,8 @@ HTTP 删除分两次：第一次 DELETE 提交 `expectedRevision`，返回 `409 
 报告包含 `observedAt`、`sourceDigest`、问题及来源视图。sourceDigest 只对该次报告捕获的来源行计算，不能当作完整业务库备份摘要。每个问题附带实际 agentId、runtimeId、bindingId、memberId、projectId、groupId 或 alias 引用，便于定位损坏数据。
 
 预检检查 runtime 到 Agent 的一对一关系、成员 Agent/项目、群所属项目、群参与关系、runtime reservation、runner 和 alias。合法的同一 runtime 跨项目/跨群 binding 保留为各自独立来源。孤立引用、身份错配及导入造成的一个 Agent 对应多个 runtime 返回 `migration_identity_ambiguous`；不会任选一个 runtime，也不会改写原数据来消除冲突。
+
+Agent/runtime 公共来源的问题以固定集合传播给相关 binding。单个 binding 的损坏 JSON、快照或局部关联问题只进入该 binding 和报告汇总，不因 ID 排序污染同 runtime 的其他 binding，也不抹去仍有效的公共 Profile 来源。报告可以整体标记存在异常，同时保留健康 binding 的完整 view/effective 和可读快照。
 
 Profile 来源保留 backend、configVersion、runtimeRevision 和完整非目录默认值。旧默认 workdir 单独标为 `legacyWorkdir`，不会提升为跨项目全局写入目录。Binding 则保留：
 

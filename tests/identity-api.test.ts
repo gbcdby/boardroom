@@ -25,6 +25,24 @@ async function fixture() {
   }, async close() { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); await f.close(); } };
 }
 
+test("HTTP R-134-REQ-001：损坏 alias 预检和改名返回歧义且不写身份/审计", async () => {
+  const f = await fixture();
+  try {
+    const a = await f.repos.agents.create({ displayName: "甲身份", hostType: "claude-code" });
+    const b = await f.repos.agents.create({ displayName: "乙身份", hostType: "claude-code" });
+    await f.db.exec("UPDATE agent_legacy_aliases SET agent_id = ? WHERE display_name = ? AND host_type = ?", [a.id, b.displayName, b.hostType]);
+    const capture = () => Promise.all(["agents", "agent_legacy_aliases", "audit_log"].map(table => f.db.query(`SELECT * FROM ${table} ORDER BY 1, 2`)));
+    const before = await capture();
+    const renamed = await f.request(`/api/agents/${b.id}`, "PATCH", { expectedDisplayName: b.displayName, displayName: "不应保存" });
+    assert.equal(renamed.status, 409);
+    assert.equal((await renamed.json() as { error: { code: string } }).error.code, "migration_identity_ambiguous");
+    const preflight = await f.request("/api/legacy-config/preflight");
+    assert.equal(preflight.status, 409);
+    assert.equal((await preflight.json() as { code: string }).code, "migration_identity_ambiguous");
+    assert.deepEqual(await capture(), before);
+  } finally { await f.close(); }
+});
+
 test("HTTP 全局角色 catalog、稳定身份与 user 审计只对可信本地用户开放", async () => {
   const f = await fixture();
   try {

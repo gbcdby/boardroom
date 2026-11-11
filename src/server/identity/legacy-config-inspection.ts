@@ -69,7 +69,7 @@ export function createLegacyConfigInspector({ db, repos = createRepositories(db)
         captured[table] = await tx.query(`SELECT * FROM ${table} ORDER BY ${order}`);
       }
       const persistedAliases = Boolean((await tx.query("SELECT version FROM schema_migrations WHERE version = 14"))[0]);
-      captured["agent_legacy_aliases"] = persistedAliases ? await tx.query("SELECT * FROM agent_legacy_aliases ORDER BY display_name, host_type") : [];
+      captured["agent_legacy_aliases"] = persistedAliases ? await tx.query("SELECT * FROM agent_legacy_aliases ORDER BY display_name, host_type, agent_id, created_at, retired_at") : [];
       const rows = (table: string) => captured[table]!;
       const byId = (table: string) => new Map(rows(table).map(row => [String(row.id), row]));
       const agents = byId("agents"), runtimeRows = byId("agent_runtimes"), members = byId("members"), projects = byId("projects"), groups = byId("groups");
@@ -88,8 +88,19 @@ export function createLegacyConfigInspector({ db, repos = createRepositories(db)
       for (const ids of identities.values()) if (ids.length > 1) {
         ids.forEach(id => invalidAgents.add(id)); issue("migration_identity_ambiguous", "legacy_alias_conflict", { agentIds: ids });
       }
-      const aliases = new Map(rows("agent_legacy_aliases").map(row => [key(row.display_name, row.host_type), row]));
-      for (const alias of aliases.values()) {
+      const aliases = new Map<string, DbRow[]>();
+      for (const row of rows("agent_legacy_aliases")) {
+        const identity = key(row.display_name, row.host_type);
+        aliases.set(identity, [...(aliases.get(identity) ?? []), row]);
+      }
+      for (const [identity, candidates] of aliases) if (candidates.length > 1) {
+        const aliasAgentIds = candidates.map(row => String(row.agent_id));
+        const agentIds = [...new Set([...aliasAgentIds, ...(identities.get(identity) ?? [])])].sort();
+        agentIds.forEach(id => invalidAgents.add(id));
+        issue("migration_identity_ambiguous", "legacy_alias_duplicate", { displayName: String(candidates[0]!.display_name),
+          hostType: String(candidates[0]!.host_type), agentIds, aliasAgentIds });
+      }
+      for (const alias of rows("agent_legacy_aliases")) {
         const agentId = String(alias.agent_id), exists = agents.has(agentId), retired = alias.retired_at !== null;
         if (retired === exists) {
           invalidAgents.add(agentId);
@@ -98,11 +109,14 @@ export function createLegacyConfigInspector({ db, repos = createRepositories(db)
         }
       }
       if (persistedAliases) for (const agent of agents.values()) {
-        const alias = aliases.get(key(agent.display_name, agent.host_type));
+        const candidates = aliases.get(key(agent.display_name, agent.host_type)) ?? [];
+        if (candidates.length > 1) continue; // 上面保留全部冲突引用，不能任选一行继续推导。
+        const alias = candidates[0];
         if (!alias || alias.agent_id !== agent.id || alias.retired_at !== null) {
-          invalidAgents.add(String(agent.id));
+          const agentIds = [...new Set([String(agent.id), ...(alias ? [String(alias.agent_id)] : [])])].sort();
+          agentIds.forEach(id => invalidAgents.add(id));
           issue("migration_identity_ambiguous", alias ? "legacy_alias_conflict" : "agent_legacy_alias_missing", { agentId: String(agent.id),
-            displayName: String(agent.display_name), hostType: String(agent.host_type), ...(alias ? { aliasAgentId: String(alias.agent_id) } : {}) });
+            displayName: String(agent.display_name), hostType: String(agent.host_type), agentIds, ...(alias ? { aliasAgentId: String(alias.agent_id) } : {}) });
         }
       }
       const runtimeIdsByAgent = new Map<string, string[]>();
@@ -135,6 +149,8 @@ export function createLegacyConfigInspector({ db, repos = createRepositories(db)
       for (const runner of runners.values()) if (!bindingRows.has(String(runner.binding_id))) {
         issue("migration_identity_ambiguous", "runner_binding_missing", { bindingId: String(runner.binding_id) });
       }
+      // 固定公共来源问题；后续 binding 的局部错误只加入报告及本 binding，不能成为兄弟的输入。
+      const sourceIssues = [...issues];
       const bindings: LegacyBindingInspection[] = [];
       for (const row of rows("agent_runtime_bindings")) {
         const bindingId = String(row.id), runtimeId = String(row.runtime_id), memberId = String(row.member_id),
@@ -142,7 +158,7 @@ export function createLegacyConfigInspector({ db, repos = createRepositories(db)
         const runtime = runtimeRows.get(runtimeId), member = members.get(memberId), group = groups.get(groupId), runner = runners.get(bindingId);
         const agentId = runtime ? String(runtime.agent_id) : null;
         const refs = { bindingId, runtimeId, memberId, projectId, groupId, ...(agentId ? { agentId } : {}) };
-        const ownIssues: LegacyInspectionIssue[] = issues.filter(entry => entry.refs["agentId"] === agentId || entry.refs["runtimeId"] === runtimeId
+        const ownIssues: LegacyInspectionIssue[] = sourceIssues.filter(entry => entry.refs["agentId"] === agentId || entry.refs["runtimeId"] === runtimeId
           || Array.isArray(entry.refs["agentIds"]) && agentId !== null && entry.refs["agentIds"].includes(agentId)
           || Array.isArray(entry.refs["runtimeIds"]) && entry.refs["runtimeIds"].includes(runtimeId));
         const add = (code: LegacyInspectionIssue["code"], reason: string, extra: Record<string, string> = {}) => { const next = issue(code, reason, { ...refs, ...extra }); ownIssues.push(next); };
@@ -192,7 +208,7 @@ export function createLegacyConfigInspector({ db, repos = createRepositories(db)
         const valid = !invalidAgents.has(agentId) && runtimeIds.length <= 1 && !runtimeIds.some(id => invalidRuntimes.has(id));
         const runtime = runtimeIds.length === 1 ? runtimeRows.get(runtimeIds[0]!) : undefined;
         let source: LegacyProfileSource["source"] = null;
-        if (valid && runtime && !issues.some(entry => entry.code === "legacy_config_invalid" && entry.refs["runtimeId"] === runtime.id)
+        if (valid && runtime && !sourceIssues.some(entry => entry.code === "legacy_config_invalid" && entry.refs["runtimeId"] === runtime.id)
           && validJson(String(runtime.defaults_json), configSchema)) {
           const { workdir, ...nonDirectoryDefaults } = JSON.parse(String(runtime.defaults_json)) as RuntimeConfig;
           source = { runtimeId: String(runtime.id), backend: String(agent.host_type) as RuntimeBackend,

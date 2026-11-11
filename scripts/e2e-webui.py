@@ -49,7 +49,14 @@ def layout(page, label, strict=True):
         assert max(dimensions["document"], dimensions["body"]) <= dimensions["viewport"] + 1, f"{label}: 整页溢出 {dimensions}"
     return {"view": label, **dimensions}
 
+def settle_viewport(page, width, height):
+    # CDP 的 viewport 命令完成后，vw/dvh 和媒体查询可到下一帧才更新。
+    # 先核实实际 viewport，再跨过布局帧；不等待或放宽任何弹窗几何断言。
+    page.wait_for_function("([w, h]) => window.innerWidth === w && window.innerHeight === h", arg=[width, height])
+    page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+
 def check_confirmation_layout(page, kind, label, width, height, report, require_overflow=False):
+    settle_viewport(page, width, height)
     dialog = page.get_by_test_id("confirmation-dialog")
     body = dialog.locator(".confirm-dialog-body")
     impact = page.get_by_test_id(f"{kind}-purge-confirm")
@@ -58,6 +65,7 @@ def check_confirmation_layout(page, kind, label, width, height, report, require_
     before = body.evaluate(measure)
     rect = dialog.bounding_box()
     geometry = {"view": label, "width": width, "height": height, "requireOverflow": require_overflow,
+        "viewport": page.evaluate("() => ({ width: innerWidth, height: innerHeight, documentWidth: document.documentElement.clientWidth })"),
         "dialog": rect, "body": body.bounding_box(), "before": before}
     report.setdefault("confirmationLayouts", []).append(geometry)
     assert rect and rect["x"] >= 0 and rect["y"] >= 0 and rect["x"] + rect["width"] <= width + 1 and rect["y"] + rect["height"] <= height + 1, f"弹窗超出视口: {geometry}"
@@ -101,6 +109,7 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
             previous_viewport = page.viewport_size
             for width, height, minimum in [(1440, 1000, 38), (390, 844, 44)]:
                 page.set_viewport_size({"width": width, "height": height})
+                settle_viewport(page, width, height)
                 rect = close.bounding_box()
                 assert rect and rect["width"] >= minimum and rect["height"] >= minimum, f"Toast关闭命中区不足：{width}px {rect}"
                 filename = f"toast-close-target-{width}-light.png"

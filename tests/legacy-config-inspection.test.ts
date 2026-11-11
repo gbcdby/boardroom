@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir } from "node:fs/promises";
+import { mkdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { createLegacyConfigInspector, selectLegacyConfigSnapshot } from "../src/server/identity/legacy-config-inspection.ts";
 import { createRuntimeRepository } from "../src/server/runtime/repository.ts";
@@ -8,11 +8,45 @@ import { snapshotRuntimeConfig } from "../src/server/runtime/config.ts";
 import { identityEngines, identityFixture, identitySkip } from "./helpers/identity-fixture.ts";
 
 for (const engine of identityEngines) {
+  for (const brokenIndex of [0, 1]) test(`${engine} R-134-STD-002：排序第 ${brokenIndex + 1} 个 binding 损坏不污染同 runtime 的健康 binding`, { skip: identitySkip(engine) }, async () => {
+    const f = await identityFixture(engine);
+    try {
+      const project = await f.repos.projects.create({ name: "独立绑定来源" });
+      const groups = await Promise.all(["前", "后"].map(name => f.repos.groups.create({ projectId: project.id, name })));
+      const runtimes = createRuntimeRepository(f.db, { repos: f.repos });
+      const runtime = await runtimes.create({ name: "同 runtime 不同来源", backend: "claude-code", defaults: { workdir: f.dir },
+        bindings: groups.map((group, i) => ({ projectId: project.id, groupId: group.id, overrides: { model: `独立模型 ${i}` } })) });
+      const ids = runtime.bindings.map(binding => binding.binding.id).sort();
+      const brokenId = ids[brokenIndex]!, healthyId = ids[1 - brokenIndex]!;
+      const expectedHealthy = (await runtimes.getBinding(healthyId))!;
+      await f.db.exec("UPDATE agent_runtime_bindings SET requested_snapshot_json = ? WHERE id = ?", ["{ broken source", brokenId]);
+      const capture = () => Promise.all(["agent_runtimes", "agent_runtime_bindings", "agent_runner_states"].map(table => f.db.query(`SELECT * FROM ${table} ORDER BY 1`)));
+      const before = await capture();
+      const report = await createLegacyConfigInspector({ db: f.db, repos: f.repos }).preflight();
+      assert.equal(report.code, "legacy_config_invalid", "报告仍标记存在无效来源");
+      assert.equal(report.profiles[0]!.source?.runtimeId, runtime.runtime.id, "局部坏请求不抹去完好的公共 Profile 来源");
+      const broken = report.bindings.find(binding => binding.bindingId === brokenId)!;
+      const healthy = report.bindings.find(binding => binding.bindingId === healthyId)!;
+      assert.equal(broken.configurationValid, false); assert.equal(broken.view, null);
+      assert.equal(selectLegacyConfigSnapshot(broken).code, "legacy_config_invalid");
+      assert.equal(broken.raw.requestedSnapshotJson, "{ broken source");
+      assert.equal(healthy.identityValid, true); assert.equal(healthy.configurationValid, true);
+      assert.deepEqual(healthy.view, expectedHealthy);
+      assert.deepEqual(healthy.snapshots.effective!.snapshot, expectedHealthy.effective);
+      assert.ok(healthy.issues.every(issue => issue.refs["bindingId"] !== brokenId));
+      assert.equal(selectLegacyConfigSnapshot(healthy).code, null);
+      assert.equal(selectLegacyConfigSnapshot(healthy).configSnapshotRef?.kind, "effective");
+      assert.deepEqual(await capture(), before);
+    } finally { await f.close(); }
+  });
+
   test(`${engine} readonly preflight 完整保留三快照、原高级选择、跨项目目录与 SID；恢复选择不消费意图`, { skip: identitySkip(engine) }, async () => {
     const f = await identityFixture(engine);
     try {
       const dirs = ["applied", "requested", "effective", "other-project"].map(name => path.join(f.dir, name));
       for (const dir of dirs) await mkdir(dir);
+      // 这些快照由 runtime 写入口产生；它本来就用 realpath 保存目录，macOS /var 是符号链接。
+      const canonicalDirs = await Promise.all(dirs.map(dir => realpath(dir)));
       const runtimes = createRuntimeRepository(f.db, { repos: f.repos });
       const project = await f.repos.projects.create({ name: "原项目" }), otherProject = await f.repos.projects.create({ name: "另一项目" });
       const group = await f.repos.groups.create({ projectId: project.id, name: "三快照" });
@@ -50,9 +84,9 @@ for (const engine of identityEngines) {
       assert.equal(observed.advanced?.validity, "invalidated_by_revision");
       assert.deepEqual(observed.advanced?.raw, { strategy: "bypassPermissions", runtimeRevision: 2, bindingRevision: 3 });
       assert.equal(observed.view!.effective.advancedStrategy, null);
-      assert.equal(observed.snapshots.applied!.workdir, dirs[0]);
-      assert.equal(observed.snapshots.requested!.workdir, dirs[1]);
-      assert.equal(observed.snapshots.effective!.workdir, dirs[2]);
+      assert.equal(observed.snapshots.applied!.workdir, canonicalDirs[0]);
+      assert.equal(observed.snapshots.requested!.workdir, canonicalDirs[1]);
+      assert.equal(observed.snapshots.effective!.workdir, canonicalDirs[2]);
       assert.deepEqual(observed.snapshots.applied!.ref.versions, { runtimeRevision: 1, bindingRevision: 2 });
       assert.deepEqual(observed.snapshots.requested!.ref.versions, { runtimeRevision: 2, bindingRevision: 3 });
       assert.deepEqual(observed.snapshots.effective!.ref.versions, { runtimeRevision: 3, bindingRevision: 3 });
@@ -72,7 +106,7 @@ for (const engine of identityEngines) {
       assert.equal(selectLegacyConfigSnapshot(second).configSnapshotRef?.kind, "applied");
       const third = report.bindings.find(binding => binding.bindingId === other.binding.id)!;
       assert.equal(third.advanced!.validity, "effective");
-      const expected = snapshotRuntimeConfig("claude-code", { model: null, workdir: dirs[3]!, tools: [], systemPrompt: "项目独立覆盖", permissionMode: "auto" },
+      const expected = snapshotRuntimeConfig("claude-code", { model: null, workdir: canonicalDirs[3]!, tools: [], systemPrompt: "项目独立覆盖", permissionMode: "auto" },
         { runtimeRevision: 3, bindingRevision: 2 }, "bypassPermissions");
       assert.equal(third.snapshots.effective!.snapshot.digest, expected.digest);
       assert.deepEqual(third.view!.effective.sources, { model: "override", workdir: "override", tools: "override", systemPrompt: "override", permissionMode: "default" });
@@ -82,6 +116,37 @@ for (const engine of identityEngines) {
       assert.deepEqual(await inspector.preflight(), report, "同一数据与观察时点可重放");
       assert.deepEqual(await Promise.all(tables.map(table => f.db.query(`SELECT * FROM ${table} ORDER BY 1, 2`))), before);
       assert.deepEqual(await runtimes.getBinding(id), viewBefore);
+    } finally { await f.close(); }
+  });
+  test(`${engine} 只读检查保留导入 requested 的非规范原目录、JSON 和 digest，不调用 realpath 重写来源`, { skip: identitySkip(engine) }, async () => {
+    const f = await identityFixture(engine);
+    try {
+      const directory = path.join(f.dir, "source"); await mkdir(directory);
+      const runtimes = createRuntimeRepository(f.db, { repos: f.repos });
+      const project = await f.repos.projects.create({ name: "原始目录" });
+      const group = await f.repos.groups.create({ projectId: project.id, name: "保留原请求" });
+      const runtime = await runtimes.create({ name: "旧目录来源", backend: "claude-code", defaults: { workdir: directory },
+        bindings: [{ projectId: project.id, groupId: group.id }] });
+      const id = runtime.bindings[0]!.binding.id;
+      await runtimes.intent(id, "start");
+      const original = (await runtimes.getBinding(id))!.binding.requestedSnapshot!;
+      const rawWorkdir = `${directory}/../source`;
+      const imported = snapshotRuntimeConfig(original.backend, { ...original.config, workdir: rawWorkdir }, original.versions, original.advancedStrategy);
+      const rawJson = JSON.stringify(imported, null, 2);
+      await f.db.exec("UPDATE agent_runtime_bindings SET requested_snapshot_json = ? WHERE id = ?", [rawJson, id]);
+      const before = await f.db.query("SELECT * FROM agent_runtime_bindings ORDER BY id");
+      const report = await createLegacyConfigInspector({ db: f.db, repos: f.repos }).preflight();
+      const source = report.bindings[0]!;
+      assert.equal(report.code, null);
+      assert.equal(source.snapshots.effective!.workdir, await realpath(directory));
+      assert.equal(source.snapshots.requested!.workdir, rawWorkdir);
+      assert.equal(source.snapshots.requested!.rawJson, rawJson);
+      assert.equal(source.snapshots.requested!.ref.digest, imported.digest);
+      assert.equal(source.snapshots.requested!.digestValid, true);
+      const selected = selectLegacyConfigSnapshot(source);
+      assert.deepEqual(selected.snapshot, imported);
+      assert.equal(selected.rawJson, rawJson);
+      assert.deepEqual(await f.db.query("SELECT * FROM agent_runtime_bindings ORDER BY id"), before);
     } finally { await f.close(); }
   });
   test(`${engine} 非法 Agent/member/项目/群关联与 alias 冲突返回具体引用，不猜身份、不回写`, { skip: identitySkip(engine) }, async () => {

@@ -1013,7 +1013,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
       const existing = bindings.get(selfKey(sessionId));
       if (existing) {
-        const aliasAgent = await repos.agents.findByIdentity(displayName, params.hostType);
+        const aliasAgent = await repos.agents.findByIdentity(displayName, params.hostType).catch((error: unknown) => {
+          throw mapRepoError(error, { projectId: params.projectId, groupId: params.groupId, displayName, hostType: params.hostType });
+        });
         if (
           existing.projectId !== params.projectId ||
           existing.groupId !== params.groupId ||

@@ -801,6 +801,7 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
           throw new ConflictError("runtime_identity_immutable");
         }
         if (await hasIdentityCatalogSchema(ctx)) {
+          await findLegacyAgentId(ctx, existing.displayName, existing.hostType);
           await reserveLegacyAlias(ctx, { agentId: id, displayName: existing.displayName, hostType: existing.hostType, createdAt: existing.createdAt });
           await reserveLegacyAlias(ctx, { agentId: id, displayName, hostType, createdAt: nowIso() });
         }
@@ -818,6 +819,7 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
         if (!await hasIdentityCatalogSchema(ctx)) throw new InvalidArgumentError("identity_catalog_upgrade_required");
         const existing = await this.get(id);
         if (!existing) throw new NotFoundError("agent_not_found");
+        await findLegacyAgentId(ctx, existing.displayName, existing.hostType);
         const at = nowIso();
         // 先以稳定 ID 和旧值取得写锁/CAS；任何后续 alias 冲突都会回滚此次改名。
         const changed = await ctx.exec("UPDATE agents SET display_name = ?, updated_at = ? WHERE id = ? AND display_name = ?",
@@ -839,6 +841,8 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
         if (!await hasIdentityCatalogSchema(ctx)) throw new InvalidArgumentError("identity_catalog_upgrade_required");
         // 同一 Agent 的改名、追加 alias 与删除串行；不持项目或成员的长期租约。
         if (await ctx.exec("UPDATE agents SET updated_at = updated_at WHERE id = ?", [id]) !== 1) throw new NotFoundError("agent_not_found");
+        const existing = (await this.get(id))!;
+        await findLegacyAgentId(ctx, existing.displayName, existing.hostType);
         await reserveLegacyAlias(ctx, { agentId: id, displayName, hostType, createdAt: nowIso() });
         return listLegacyAliases(ctx, id);
       });
