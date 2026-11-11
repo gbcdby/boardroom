@@ -70,3 +70,7 @@ HTTP 仅限当前本地同源管理边界；不接受请求自行声明 actor �
 正文与注入预算按 UTF-8 计算；注入按 grapheme 边界截断，避免切坏 emoji/组合字符。文档保存超限时拒绝，不截断用户草稿。
 
 `npm run e2e:memory` 使用真实 HTTP/MCP SDK 和数据库，检查权限、版本冲突、新请求、证据原子提交、消息阈值与注入；摘要正文是明确标注的协议夹具，报告保留 `realModelSummary: NOT_RUN`。真实 PG 表锁下的主消息/ACK/status 与实际回滚见 `tests/memory-mcp-postgres.test.ts`。没有配置真实 PG 时该项 SKIP，由 CI 的 PG 服务执行，不能以 SQLite 通过代替。
+
+**AC-MEM-04 已收到独立真实宿主验收的 PASS 回传。** [阶段 4 候选记录](https://github.com/gbcdby/boardroom/issues/117#issuecomment-6789491909)绑定 `0182ecee29760430e81ca5511f449c45b7125b12`；[阶段 5 集成补验](https://github.com/gbcdby/boardroom/issues/117#issuecomment-6790050561)绑定 `533e49da5d4e9d4a236d68e0bc23c03411caa5b1`。在 macOS 26.5.2 / SQLite 上，目标 Codex CLI 0.167.0 自身上下文完成三个触发、人工先写冲突与新请求重算，最终注入 v4。执行、原始 hash 核对与平台读回归属于报告中的独立执行者；交付方承接回传，没有把它写成本机或后续候选重新运行。
+
+平台保存 completed 夹具、WebUI 显示成功、调用工作 ACK 或声明正确 hash，仍不能单独证明模型执行。真实模型、协议、PG、浏览器证据及后续候选适用性分别保留在 [Spec #108](https://github.com/gbcdby/boardroom/issues/108)及 [Ticket #117](https://github.com/gbcdby/boardroom/issues/117)。macOS PostgreSQL 未在这次外部执行中覆盖，托管 profile 的支持边界也未改变。
