@@ -10,6 +10,7 @@
 | [architecture/agent-studio.md](architecture/agent-studio.md) | 产品宏观架构、范围与验收基线 |
 | [architecture/data-model.md](architecture/data-model.md) | 持久化数据模型、迁移、v13 事实版本与共同事务边界 |
 | [f2-authorize-guard.md](f2-authorize-guard.md) | 统一权限矩阵、拒绝语义、接入点位 |
+| [policy-kernel.md](policy-kernel.md) | 纯策略求值、默认规则、解释预览与实际执行的边界 |
 | [mcp-tool-contract.md](mcp-tool-contract.md) | 当前工具目录、绑定/CAS 与聊天契约 |
 | [t1-project-group-api.md](t1-project-group-api.md) | 项目/群组/成员 HTTP 与早期 WebUI 契约 |
 | [t3-member-lifecycle.md](t3-member-lifecycle.md) | 当前成员生命周期、移除、审计补偿与删除范围 |
