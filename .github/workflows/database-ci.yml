@@ -58,6 +58,8 @@ jobs:
     name: Node 24 · SQLite / PostgreSQL
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      browser_dependencies_id: ${{ steps.browser_dependencies.outputs.artifact-id }}
 
     services:
       postgres:
@@ -213,6 +215,7 @@ jobs:
           (cd .agent-output/browser-dependencies && sha256sum node_modules.tar.gz > SHA256SUMS)
 
       - name: 交接同候选原生依赖
+        id: browser_dependencies
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: browser-dependencies-${{ github.run_attempt }}
@@ -264,7 +267,8 @@ jobs:
       - name: 取得同次运行的原生依赖
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: browser-dependencies-${{ github.run_attempt }}
+          # 只重跑失败的 browser 时仍引用成功 producer 的实际产物。
+          artifact-ids: ${{ needs.database-tests.outputs.browser_dependencies_id }}
           path: .agent-output/browser-dependencies
           digest-mismatch: error
 
