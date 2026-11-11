@@ -118,6 +118,24 @@ test("R-NATIVE-002 格式：无结论、截断、矛盾结论、仅标记与错�
   }
 });
 
+test("STD-NATIVE-001 格式：Markdown 包装与多行占位不能充当章节正文", () => {
+  const placeholders = [
+    "**TODO**", "_TBD_", "- TODO\n- TBD", "1. **TODO**\n2. `TBD`", "- [ ] **TODO**\n- [x] TBD",
+    "> - **待填写**\n> - _填写内容_", "```markdown\nTODO\nTBD\n```",
+    "~~~text\n**TODO**\n- TBD\n~~~", "### Placeholder\n\n**TODO**\n\n- TBD",
+  ];
+  for (const placeholder of placeholders) {
+    const output = `Review-Axis: spec\nVerdict: PASS\n## Evidence\n${placeholder}\n## Risks and gaps\n${placeholder}\n## Checks\n${placeholder}\n<!-- review-report-complete:spec -->`;
+    const result = validateReviewReport(output, "spec");
+    assert.equal(result.reportComplete, false, placeholder);
+    assert.equal(result.errors.filter(error => error.startsWith("empty_section:")).length, 3, placeholder);
+  }
+  const factual = report("spec").replace("README.md:1 与任务固定输入一致。",
+    "- **TODO**\n- src/tasks.ts:12 的 TODO 注释与当前已实现行为一致，没有遗漏需求。");
+  assert.equal(validateReviewReport(factual, "spec").reportComplete, true,
+    "正常讨论源码 TODO 的完整事实句不能因为包含占位词被拒绝");
+});
+
 test("R-NATIVE-002 夹具：完整 CHANGES_REQUESTED 可 READY，不会冒充两轴 PASS 或提交平台", async () => {
   const result = await collectFixture(report("spec", "CHANGES_REQUESTED"), report("standards"));
   assert.equal(result.code, 0);

@@ -4,6 +4,19 @@ export type CollectedReviewVerdict = "PASS" | "CHANGES_REQUESTED";
 export const REVIEW_REPORT_CONTRACT = "boardroom-review-report/v1";
 const SECTIONS = ["## Evidence", "## Risks and gaps", "## Checks"] as const;
 
+function hasSectionBody(body: string): boolean {
+  return body.replace(/<[^>]*>/g, "").split("\n").some(raw => {
+    let line = raw.trim();
+    // 引用、列表、复选框和代码围栏是包装，不能使占位词成为正文。
+    const prefix = /^(?:>\s*|[-*+]\s+|\d+[.)]\s+)/;
+    while (prefix.test(line)) line = line.replace(prefix, "").trim();
+    line = line.replace(/^\[[ xX]\]\s*/, "");
+    if (/^(?:#{1,6}\s|`{3,}|~{3,})/.test(line)) return false;
+    const words = line.split(/[\p{P}\p{S}\s]+/u).filter(Boolean);
+    return words.some(word => /[\p{L}\p{N}]/u.test(word) && !/^(?:TODO|TBD|待填写|填写内容)$/i.test(word));
+  });
+}
+
 /** 只验证输出结构，不能证明内容正确、证据充分或模型真实执行。 */
 export function validateReviewReport(output: string, axis: ReviewReportAxis): {
   reportComplete: boolean; verdict: CollectedReviewVerdict | null; errors: string[];
@@ -33,8 +46,7 @@ export function validateReviewReport(output: string, axis: ReviewReportAxis): {
       const end = headings[index + 1]?.index ?? lines.length - 1;
       const body = lines.slice(start, end).join("\n").replace(/<!--[\s\S]*?-->/g, "").trim();
       // 不靠字符数判断完整性；纯标记、空标题和未替换的模板占位不能充当章节正文。
-      const content = body.replace(/^#{1,6} .*$/gm, "").replace(/<[^>]*>/g, "").trim();
-      if (!/[\p{L}\p{N}]/u.test(content) || /^(?:[-*]\s*)?(?:TODO|TBD|待填写|填写内容)[.。…\s]*$/i.test(content)) {
+      if (!hasSectionBody(body)) {
         errors.push(`empty_section:${SECTIONS[index]}`);
       }
     }
