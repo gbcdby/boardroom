@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import select
 import subprocess
+import traceback
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright, expect
 
@@ -154,8 +155,9 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     page.keyboard.press("Shift+Tab")
     expect(page.get_by_test_id("confirm-cancel")).to_be_focused()
     reads = []
+    reconcile_released = False
     def hold_reconcile(route):
-        if route.request.method == "GET": reads.append(route)
+        if route.request.method == "GET" and not reconcile_released: reads.append(route)
         else: route.continue_()
     read_pattern = f"**/api/projects/{project_id}/members"
     page.route(read_pattern, hold_reconcile)
@@ -164,8 +166,12 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     expect(recovery).to_have_count(0)
     check_pending_focus()
     assert len(reads) == 1, "权威核对应该读取成员一次"
+    # unroute 移除最后一个 handler 会自动放行挂起请求；先显式放行并等待响应。
+    # 核对释放后，后续成功刷新直接通过，不再次挂起。
+    reconcile_released = True
+    with page.expect_response(lambda response: response.request.method == "GET" and urlsplit(response.url).path == f"/api/projects/{project_id}/members"):
+        reads[0].continue_()
     page.unroute(read_pattern, hold_reconcile)
-    reads.pop().continue_()
     expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
     expect(page.locator("h1")).to_be_focused()
     expect(page.get_by_test_id("new-member-name")).to_have_value("删除成员期间保留的草稿")
@@ -722,6 +728,7 @@ def main():
                 browser.close()
     except Exception as error:
         report["error"] = str(error)[:5000]
+        report["traceback"] = traceback.format_exc()
     finally:
         if fixture:
             fixture.stdin.close()
