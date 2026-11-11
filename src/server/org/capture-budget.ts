@@ -62,7 +62,7 @@ export class CaptureBudget implements RepositorySqlObserver {
 /** DB 端 substr(n+1) 后按真实 UTF-8 再检查，超长时不加载剩余正文。 */
 export function boundedText(value: unknown, maxBytes = 1024, nullable = false): string | null {
   if (value === null && nullable) return null;
-  if (typeof value !== "string" || !value.trim() || Buffer.byteLength(value, "utf8") > maxBytes) exceeded("关系字段缺失或超长");
+  if (typeof value !== "string" || !value.trim() || value.includes("\u0000") || Buffer.byteLength(value, "utf8") > maxBytes) exceeded("关系字段缺失、含 NUL 或超长，无法完整采集");
   return value;
 }
 export function safeRevision(value: unknown): number {

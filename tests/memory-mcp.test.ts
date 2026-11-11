@@ -6,6 +6,7 @@ import path from "node:path";
 import { createDbDriver } from "../src/server/db/driver.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories } from "../src/server/db/repositories.ts";
+import { newId } from "../src/server/db/ids.ts";
 import { createMcpCore } from "../src/server/mcp/core.ts";
 import { createLogger } from "../src/server/logger.ts";
 import { DEFAULT_MEMORY_CONFIG } from "../src/server/config.ts";
@@ -52,6 +53,55 @@ test("真实 MCP core 读写三层记忆并在 join/wait 安全点注入，单�
     assert.equal(stillAvailable.entries[0]?.markdown, "跨项目私有");
   } finally { await other.close(); await f.close(); }
 });
+
+for (const publishNewer of [false, true]) {
+  test(`STD5-005：真实reader取材后wait失权不确认记忆，${publishNewer ? "也不覆盖期间已发布的新版本" : "重试仍携带未发布版本"}`, async () => {
+    const f = await fixture();
+    const runtime = getMemoryRuntime(f.db), readOwn = runtime.reader.readOwn.bind(runtime.reader);
+    try {
+      const identity = { displayName: "记忆接收者", hostType: "other", projectId: f.project.id, groupId: f.group.id };
+      const joined = await f.core.join("reader", identity);
+      assert.deepEqual(joined.context.memory?.entries, []);
+      await f.core.memoryOperation("reader", "write", { scope: "global", expectedVersion: 0, clientMutationId: "publication-v1", markdown: "尚未兑现的版本一" });
+      const sender = await f.repos.members.create({ projectId: f.project.id, kind: "human", displayName: "人" });
+      await f.repos.groups.addParticipant(f.group.id, sender.id);
+      const message = await f.repos.messages.create({ groupId: f.group.id, senderMemberId: sender.id, body: "通过任务关系可读", mentions: [] });
+      const at = new Date().toISOString();
+      const task = await f.repos.tasks.create({ id: newId(), projectId: f.project.id, title: "取材后撤权", body: "", labels: [], state: "todo",
+        assigneeMemberId: joined.memberId, reviewerMemberId: null, repoPath: null, fixedPoint: null, revision: 1,
+        currentReviewRoundId: null, blockedReason: null, author: { kind: "human", actorId: "human:local", displayName: "人" }, createdAt: at, updatedAt: at });
+      await f.repos.tasks.linkMessage(f.project.id, { taskId: task.id, messageId: message.id, groupId: f.group.id, createdAt: at });
+      let shifted = false;
+      runtime.reader.readOwn = async input => {
+        const result = await readOwn(input);
+        if (!shifted) {
+          shifted = true;
+          assert.equal(f.db.currentTransactionContext(), undefined, "真实只读子进程取材后不占业务事务");
+          assert.equal(result.entries[0]?.version, 1);
+          await f.repos.tasks.updateCas(f.project.id, task.id, 1, { assigneeMemberId: sender.id }, at);
+          if (publishNewer) {
+            await f.core.memoryOperation("reader", "write", { scope: "global", expectedVersion: 1, clientMutationId: "publication-v2", markdown: "已经由join兑现的版本二" });
+            const newer = await f.core.join("reader", identity);
+            assert.equal(newer.context.memory?.entries[0]?.version, 2);
+          }
+        }
+        return result;
+      };
+      const cancelled = await f.core.waitForMessages("reader", { timeoutMs: 1000 });
+      assert.equal(shifted, true);
+      assert.equal(cancelled.status, "cancelled"); assert.deepEqual(cancelled.messages, []);
+      assert.equal(cancelled.memory?.state, "unavailable");
+      runtime.reader.readOwn = readOwn;
+      await f.repos.tasks.updateCas(f.project.id, task.id, 2, { assigneeMemberId: joined.memberId }, at);
+      const retry = await f.core.waitForMessages("reader", { timeoutMs: 1000 });
+      assert.equal(retry.status, "message"); assert.equal(retry.messages[0]?.id, message.id);
+      if (publishNewer) assert.equal(retry.memory, undefined, "取消旧wait不能覆盖join已发布的v2指纹");
+      else assert.deepEqual(retry.memory?.entries.map(entry => [entry.version, entry.markdown]), [[1, "尚未兑现的版本一"]]);
+      await f.core.acknowledgeMessage("reader", message.id);
+      assert.equal((await f.core.waitForMessages("reader", { timeoutMs: 10 })).memory, undefined, "成功兑现后仍抑制未变记忆");
+    } finally { runtime.reader.readOwn = readOwn; await f.close(); }
+  });
+}
 
 test("历史读取与直接 ACK 不伪造 MCP 投递，实际 wait 首次投递标记在重投后保持不变", async () => {
   const f = await fixture();

@@ -592,7 +592,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     };
   }
 
-  async function memoryAtSafePoint(binding: SessionBinding, force = false): Promise<MemoryInjection | undefined> {
+  async function prepareMemoryAtSafePoint(binding: SessionBinding): Promise<{ injection: MemoryInjection; fingerprint: string }> {
     let injection: MemoryInjection;
     try {
       await withAccess(binding, "observe", () => guard(binding, "group:view", { projectId: binding.projectId, groupId: binding.groupId }));
@@ -604,9 +604,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     }
     const fingerprint = JSON.stringify({ state: injection.state, errors: injection.errors,
       entries: injection.entries.map(entry => [entry.scope, entry.documentId, entry.version, entry.injectedBytes, entry.truncated]) });
-    if (!force && injectedVersions.get(binding.sessionId) === fingerprint) return undefined;
-    injectedVersions.set(binding.sessionId, fingerprint);
-    return injection;
+    // 取材与发布分开。后续ACL/fence仍可能拒绝整个wait，不能提前消费这个版本。
+    return { injection, fingerprint };
   }
 
   function reconcileMemorySoon(binding: SessionBinding): void {
@@ -811,8 +810,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
   async function settle(entry: PendingWait, result: WaitResult): Promise<void> {
     if (entry.done) return;
-    const finish = (value: WaitResult): void => {
-      if (entry.done) return;
+    const finish = (value: WaitResult): boolean => {
+      if (entry.done) return false;
       entry.done = true; entry.drainRequests.length = 0;
       if (entry.timer) clearTimeout(entry.timer);
       if (entry.pollTimer) clearInterval(entry.pollTimer);
@@ -820,6 +819,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       if (idx >= 0) pendingWaits.splice(idx, 1);
       waitingMembers.delete(entry.memberId);
       entry.settled(); entry.resolve(value);
+      return true;
     };
     const cancelled = (): WaitResult => ({ ok: true, status: 'cancelled', messages: [], cursor: null, drainedBacklog: false,
       memory: unavailableMemory(memoryRuntime.config, 'memory_binding_unavailable') });
@@ -837,7 +837,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         await guard(binding, 'group:view', { projectId: binding.projectId, groupId: binding.groupId });
         await repos.statuses.set(binding.projectId, binding.memberId, 'working');
       });
-      const injection = await memoryAtSafePoint(binding);
+      const preparedMemory = await prepareMemoryAtSafePoint(binding);
       // 投递事实已在drain的consume事务提交。最终发布段只做可信fresh校验：
       // 检查和resolve处在同一持锁边界，没有锁释放后的异步payload返回窗口。
       await withAccess(binding, 'consume', async () => {
@@ -857,8 +857,12 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         await withAccess(binding, 'consume', async () => {
           if (entry.done) return;
           if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError('FORBIDDEN', '等待所绑定的会话已失效。');
-          finish(injection ? { ...result, memory: injection } : result);
-          published = true;
+          const injection = injectedVersions.get(binding.sessionId) === preparedMemory.fingerprint ? undefined : preparedMemory.injection;
+          if (finish(injection ? { ...result, memory: injection } : result)) {
+            // 与成功resolve同步确认，取消的旧wait不会覆盖期间由join发布的新版本。
+            if (injection) injectedVersions.set(binding.sessionId, preparedMemory.fingerprint);
+            published = true;
+          }
         });
       });
     } catch (error) {
@@ -1155,6 +1159,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         await drainWait(entry, binding, { drainedBacklog: true });
       } catch (error) {
         await settle(entry, { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false });
+        // 托管wait已登记后，初次consume也可能遇到真实generation/owner变化。
+        // 与后续wake的fence失效一致，兑现已取消的等待；未登记请求及实际写入错误仍报错。
+        if (options.managed && error instanceof McpToolError && error.code === "CONFLICT") return await waitPromise;
         throw error;
       }
       if (!entry.done) {
@@ -1508,9 +1515,11 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         if (events.length && options.managed) await options.managed.onDelivery();
         return events;
       }) : [];
-      const injection = await memoryAtSafePoint(binding, true);
+      const preparedMemory = await prepareMemoryAtSafePoint(binding);
       reconcileMemorySoon(binding);
-      return { ...result, context: { ...result.context, ...(injection ? { memory: injection } : {}) },
+      // join总是携带一次当前记忆；此处之后无异步操作，再确认已发布版本。
+      injectedVersions.set(binding.sessionId, preparedMemory.fingerprint);
+      return { ...result, context: { ...result.context, memory: preparedMemory.injection },
         ...(workEvents.length ? { workEvents } : {}) };
     },
     acknowledgeMessage: (sid, id) => withAccess(bindingFor(sid), "write", () => core.acknowledgeMessage(sid, id)),

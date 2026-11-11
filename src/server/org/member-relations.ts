@@ -19,7 +19,17 @@ type IdRow = { id: string };
 type TaskMetadataRow = { id: string; revision: number; assignee_member_id: string | null; reviewer_member_id: string | null; state: TaskState; current_review_round_id: string | null };
 type TaskRow = TaskMetadataRow & { blocked_reason: string | null };
 type RoundRow = { id: string; task_id: string; revision: number; state: ReviewRoundState };
-const prefix = (column: string, bytes = 1024) => `substr(${column}, 1, ${bytes + 1}) AS ${column.split('.').at(-1)}`;
+// SQLite substr/length 会在 NUL 停止。追加非 NUL 字符后 length 未增加，说明前缀不能代表完整源。
+// PG TEXT 不接受 NUL；同一表达式对合法文本返回1，对真正的NULL返回NULL。
+// 每字段只增加一个标量，原文本投影、查询次数及64KiB单行上界不变。
+const prefix = (column: string, bytes = 1024) => `substr(${column}, 1, ${bytes + 1}) AS ${column.split('.').at(-1)},
+  length(${column} || '.') - length(${column}) AS __capture_${column.split('.').at(-1)}_terminated`;
+function completePrefixes(row: object | undefined): void {
+  if (!row) return;
+  for (const [key, value] of Object.entries(row)) if (key.startsWith('__capture_') && value !== null && Number(value) !== 1) {
+    captureExceeded("关系文本含 NUL，数据库前缀无法完整采集");
+  }
+}
 // JSON 对控制字符最多扩成6字节。4个1025字符ID的元数据行<25KiB；
 // id + 8193字符文本独立行<56KiB。合并投影在坏输入下可超过64KiB，不能用作分页上界。
 const taskColumns = `${prefix('id')}, revision, ${prefix('assignee_member_id')}, ${prefix('reviewer_member_id')}, state, ${prefix('current_review_round_id')}`;
@@ -47,6 +57,7 @@ async function pages<T extends DbRow>(ctx: RepoCtx, budget: CaptureBudget, colum
     const limit = Math.min(budget.pageSize(), max - result.length + 1);
     const rows = await ctx.query<T>(`SELECT ${columns} FROM ${table} WHERE ${where} AND ${key} > ? ORDER BY ${key} LIMIT ?`, [...params, after, limit]);
     if (rows.length === 0) break;
+    rows.forEach(completePrefixes);
     for (const row of rows) { const current = id(row[key.split('.').at(-1)!]); if (current <= after) conflict("分页关系游标不前进。"); after = current; result.push(row); }
     if (result.length > max) captureExceeded("关系集合超过单类上限");
     if (rows.length < limit) break;
@@ -58,6 +69,7 @@ async function byIds<T extends DbRow>(ctx: RepoCtx, budget: CaptureBudget, colum
   for (let start = 0; start < ids.length;) {
     const batch = ids.slice(start, start + budget.pageSize());
     const found = await ctx.query<T>(`SELECT ${columns} FROM ${table} WHERE project_id = ? AND id IN (${batch.map(() => '?').join(',')}) ORDER BY id`, [projectId, ...batch]);
+    found.forEach(completePrefixes);
     if (found.length !== batch.length) conflict("被观察关系已删除或不属于项目。"); rows.push(...found);
     start += batch.length;
   }
@@ -67,9 +79,11 @@ export async function readLifecycleMember(ctx: RepoCtx, memberId: string): Promi
   const row = await ctx.one<Record<string, unknown>>(`SELECT ${['id', 'project_id', 'agent_id', 'node_id', 'removed_at', 'created_at', 'updated_at'].map(c => prefix(c)).join(',')},
     kind, role, status, membership_revision FROM members WHERE id = ?`, [memberId]);
   if (!row) return null;
+  completePrefixes(row);
   // 7个1025字符字段的元数据<44KiB，名字独立投影<50KiB；原8192字节契约不缩小。
   const name = await ctx.one<{ display_name: string }>(`SELECT ${prefix('display_name', 8192)} FROM members WHERE id = ?`, [memberId]);
   if (!name) conflict("读取有界成员投影期间成员已变化。");
+  completePrefixes(name);
   if (!['human', 'agent'].includes(String(row.kind)) || !['manager', 'normal'].includes(String(row.role)) || !['active', 'disabled', 'pending'].includes(String(row.status))) conflict("成员字段损坏。");
   return { id: id(row.id), projectId: id(row.project_id), agentId: nullable(row.agent_id), nodeId: nullable(row.node_id), removedAt: nullable(row.removed_at),
     displayName: boundedText(name.display_name, 8192)!, kind: row.kind as Member['kind'], role: row.role as Member['role'], status: row.status as Member['status'],
@@ -123,6 +137,7 @@ export async function captureMember(repos: RepositorySet, input: MemberCaptureIn
   // 有旧非当前 ready 行时不把无关 task 混入补偿目标；它已被计入有界读取预算。
   const actualTasks = tasks.filter(t => input.watchedTaskIds.includes(t.taskId) || t.assigneeMemberId === memberId || t.reviewerMemberId === memberId || currentRounds.some(r => r.id === t.currentReviewRoundId));
   const settingsRow = await ctx.one<{ revision: number; default_reviewer_member_id: string | null }>(`SELECT revision, ${prefix('default_reviewer_member_id')} FROM project_task_settings WHERE project_id = ?`, [projectId]);
+  completePrefixes(settingsRow);
   const settings = settingsRow && (input.watchSettings || settingsRow.default_reviewer_member_id === memberId)
     ? { projectId, revision: safeRevision(settingsRow.revision), defaultReviewerMemberId: nullable(settingsRow.default_reviewer_member_id) } : null;
   const retained = await repos.members.retainedFacts(memberId);
@@ -135,6 +150,7 @@ export async function captureMember(repos: RepositorySet, input: MemberCaptureIn
     'agent_runtime_bindings b LEFT JOIN agent_runner_states s ON s.binding_id = b.id', 'b.project_id = ? AND b.member_id = ?', [projectId, memberId], 'b.id'))
     .map(r => ({ id: id(r.id), runtimeId: id(r.runtime_id), groupId: id(r.group_id), revision: safeRevision(r.revision), stopped: Number(r.stopped) === 1 }));
   const reservation = await ctx.one<{ binding_id: string | null; leased: number }>(`SELECT ${prefix('binding_id')}, CASE WHEN lease_owner IS NULL AND lease_expires_at IS NULL THEN 0 ELSE 1 END AS leased FROM agent_runtime_members WHERE project_id = ? AND member_id = ?`, [projectId, memberId]);
+  completePrefixes(reservation);
   cleanup.reservation = reservation ? { bindingId: nullable(reservation.binding_id), leased: Number(reservation.leased) === 1 } : null;
   cleanup.hasStatus = Boolean(await ctx.one("SELECT member_id FROM member_statuses WHERE project_id = ? AND member_id = ?", [projectId, memberId]));
   cleanup.events = (await pages<{ id: string; recipient_member_id: string }>(ctx, tracker, `${prefix('id')}, ${prefix('recipient_member_id')}`, 'work_events', 'project_id = ? AND recipient_member_id = ?', [projectId, memberId]))
@@ -176,6 +192,7 @@ export function discoverMemberRelations(projectId: string, memberId: string, wat
     uniqueIds(events.map(e => id(e.id)));
     const sessions = await pages<{ id: string; group_id: string }>(tx, tracker, `${prefix('id')}, ${prefix('group_id')}`, 'mcp_sessions', "project_id = ? AND member_id = ? AND state = 'connected'", [projectId, memberId]);
     const reservation = await tx.one<{ runtime_id: string }>(`SELECT ${prefix('runtime_id')} FROM agent_runtime_members WHERE project_id = ? AND member_id = ?`, [projectId, memberId]);
+    completePrefixes(reservation);
     return { memberIds: uniqueIds([memberId, ...extraMembers, ...refs.flatMap(r => [nullable(r.assignee_member_id), nullable(r.reviewer_member_id)]).filter((v): v is string => v !== null), ...events.map(e => id(e.recipient_member_id))], 2048),
       groupIds: uniqueIds([...extraGroups, ...groups.map(g => id(g.group_id)), ...bindings.map(b => id(b.group_id)), ...sessions.map(s => id(s.group_id)), ...events.map(e => nullable(e.context_group_id)).filter((v): v is string => v !== null)]),
       runtimeIds: uniqueIds([...bindings.map(b => id(b.runtime_id)), ...(reservation ? [id(reservation.runtime_id)] : [])]) };
@@ -315,7 +332,7 @@ export function validateMemberSnapshot(value: unknown, projectId: string, member
   if (!Array.isArray(s.participants) || !Array.isArray(s.tasks) || !Array.isArray(s.invalidatedRounds) || !Array.isArray(s.retained) || !s.transient || typeof s.transient !== 'object' || Array.isArray(s.transient)) return bad();
   if (s.settings !== null && (typeof s.settings !== 'object' || s.settings === undefined || Array.isArray(s.settings))) return bad();
   if ([...s.participants, ...s.tasks, ...s.invalidatedRounds, ...s.retained].some(v => typeof v !== 'object' || v === null || Array.isArray(v))) return bad();
-  const ids = (values: unknown[], max = 512) => { if (values.length > max || values.some(v => typeof v !== 'string' || !v) || values.length !== new Set(values).size || !isDeepStrictEqual(values, [...values].sort())) bad(); };
+  const ids = (values: unknown[], max = 512) => { if (values.length > max || values.some(v => typeof v !== 'string' || !v) || values.length !== new Set(values).size || !isDeepStrictEqual(values, [...values].sort())) bad(); values.forEach(v => boundedText(v)); };
   ids(s.participants.map(p => p?.groupId), 128); ids(s.tasks.map(t => t?.taskId)); ids(s.invalidatedRounds.map(r => r?.roundId));
   for (const key of ['workEventIds','mcpSessionIds','runtimeBindingIds'] as const) { if (!Array.isArray(s.transient[key])) bad(); ids(s.transient[key]); }
   if (s.presence === 'absent') {
@@ -327,17 +344,22 @@ export function validateMemberSnapshot(value: unknown, projectId: string, member
       !['human','agent'].includes(m.kind) || !['active','disabled','pending'].includes(m.status) || !['manager','normal'].includes(m.role) || typeof m.displayName !== 'string' || !m.displayName.trim() ||
       typeof m.createdAt !== 'string' || typeof m.updatedAt !== 'string' || !(m.agentId === null || typeof m.agentId === 'string') || !(m.nodeId === null || typeof m.nodeId === 'string')) bad();
     boundedText(m.displayName, 8192);
+    [m.id, m.projectId, m.createdAt, m.updatedAt].forEach(v => id(v));
+    [m.agentId, m.nodeId, m.removedAt].forEach(v => nullable(v));
     if (m.kind === 'agent' ? !m.agentId : m.agentId !== null) bad();
     if ((s.presence === 'present') !== (m.removedAt === null) || s.presence === 'removed' && (typeof m.removedAt !== 'string' || m.status !== 'disabled' || m.nodeId !== null || m.role !== 'normal')) bad();
     if (s.retained.length !== 6 || !isDeepStrictEqual(s.retained.map(f => f.kind), [...MEMBER_FACT_KINDS].sort()) || s.retained.some(f => !Number.isSafeInteger(f.revision) || f.revision < 1)) bad();
   }
-  for (const p of s.participants) if (typeof p.joinedAt !== 'string' || !p.joinedAt) bad();
+  for (const p of s.participants) { if (typeof p.joinedAt !== 'string' || !p.joinedAt) bad(); id(p.joinedAt); }
   for (const t of s.tasks) {
     if (!Number.isSafeInteger(t.revision) || t.revision < 1 || !['todo','in-progress','review','blocked','done'].includes(t.state) ||
       [t.assigneeMemberId,t.reviewerMemberId,t.currentReviewRoundId,t.blockedReason].some(v => v !== null && typeof v !== 'string')) bad();
+    [t.assigneeMemberId, t.reviewerMemberId, t.currentReviewRoundId].forEach(v => nullable(v));
+    if (t.blockedReason !== '') boundedText(t.blockedReason, 8192, true);
   }
   for (const r of s.invalidatedRounds) if (!Number.isSafeInteger(r.revision) || r.revision < 1 || typeof r.taskId !== 'string' || !s.tasks.some(t => t.taskId === r.taskId) || !['ready','running','reported','decided','failed','superseded'].includes(r.state)) bad();
   for (const t of s.tasks) if (t.currentReviewRoundId !== null && !s.invalidatedRounds.some(r => r.roundId === t.currentReviewRoundId && r.taskId === t.taskId)) bad();
   if (s.settings !== null && (s.settings.projectId !== projectId || !Number.isSafeInteger(s.settings.revision) || s.settings.revision < 1 || s.settings.defaultReviewerMemberId !== null && typeof s.settings.defaultReviewerMemberId !== 'string')) bad();
+  if (s.settings !== null) nullable(s.settings.defaultReviewerMemberId);
   assertCompleteAuditFields(s); return s;
 }
