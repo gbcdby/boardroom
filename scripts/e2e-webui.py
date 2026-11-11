@@ -51,6 +51,7 @@ def layout(page, label, strict=True):
 def confirmation_flows(page, origin, project_id, org_project_id, output, report):
     """真实操作与数据结果；仅对拒绝/响应丢失场景注入传输故障。"""
     observed = []
+    toast_target_checked = False
     def collect(req):
         if req.method in ("POST", "DELETE"):
             observed.append({"path": urlsplit(req.url).path, "method": req.method, "body": json.loads(req.post_data) if req.post_data else None})
@@ -60,9 +61,24 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     def committed_purges(path):
         return [item for item in writes(path, "DELETE") if item["body"] and item["body"].get("confirm")]
     def toast(message):
+        nonlocal toast_target_checked
         item = page.get_by_test_id("toast").filter(has_text=message)
         expect(item).to_have_count(1)
-        item.get_by_role("button").click()
+        close = item.get_by_role("button")
+        if not toast_target_checked:
+            close.focus()  # 暂停提示计时，测量真实桌面和窄屏命中区。
+            previous_viewport = page.viewport_size
+            for width, height, minimum in [(1440, 1000, 38), (390, 844, 44)]:
+                page.set_viewport_size({"width": width, "height": height})
+                rect = close.bounding_box()
+                assert rect and rect["width"] >= minimum and rect["height"] >= minimum, f"Toast关闭命中区不足：{width}px {rect}"
+                filename = f"toast-close-target-{width}-light.png"
+                page.screenshot(path=str(output / filename), animations="disabled")
+                report["screenshots"].append(filename)
+            page.set_viewport_size(previous_viewport)
+            report["checks"].append("S6-AC04/05: Toast关闭按钮桌面38px/窄屏44px命中区与焦点暂停计时")
+            toast_target_checked = True
+        close.click()
     def cancel_with_keyboard(trigger, cancel_id="confirm-cancel"):
         dialog = page.get_by_test_id("confirmation-dialog")
         expect(dialog).to_be_visible()

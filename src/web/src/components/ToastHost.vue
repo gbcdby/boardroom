@@ -27,7 +27,8 @@ function leaveFocus(id: string, event: FocusEvent): void {
 .toast-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px; }
 .toast { pointer-events: auto; display: flex; align-items: flex-start; gap: 10px; padding: 14px 12px 14px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--card-bg); color: var(--fg); box-shadow: 0 6px 24px rgb(0 0 0 / 12%); }
 .toast > .app-icon { flex: none; margin-top: 3px; color: var(--muted); }.toast-success > .app-icon { color: var(--ok); }
-.toast > span { flex: 1; min-width: 0; overflow-wrap: anywhere; line-height: 1.6; }.toast-close { min-height: 28px; min-width: 28px; border: 0; background: transparent; padding: 4px; margin: -1px 0 0; color: var(--muted); flex: none; }
+.toast > span { flex: 1; min-width: 0; overflow-wrap: anywhere; line-height: 1.6; }.toast-close { min-width: 38px; border: 0; background: transparent; padding: 4px; margin: -1px 0 0; color: var(--muted); flex: none; }
 .toast-queued { margin: 8px 0 0; font-size: 12px; text-align: right; color: var(--muted); }
+@media (max-width: 760px) { .toast-close { min-width: 44px; } }
 @media (max-width: 500px) { .toast-host { right: 16px; bottom: 16px; } }
 </style>
