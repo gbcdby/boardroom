@@ -79,14 +79,23 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
             report["checks"].append("S6-AC04/05: Toast关闭按钮桌面38px/窄屏44px命中区与焦点暂停计时")
             toast_target_checked = True
         close.click()
+    def check_tab_cycle():
+        dialog = page.get_by_test_id("confirmation-dialog")
+        for key in ("Tab", "Shift+Tab"):
+            for _ in range(4):
+                page.keyboard.press(key)
+                assert dialog.evaluate("el => el.contains(document.activeElement)"), f"{key} 焦点离开模态窗口"
+    def check_pending_focus():
+        dialog = page.get_by_test_id("confirmation-dialog")
+        expect(dialog.locator("h2")).to_be_focused()
+        check_tab_cycle()
+        expect(dialog.locator("h2")).to_be_focused()
     def cancel_with_keyboard(trigger, cancel_id="confirm-cancel"):
         dialog = page.get_by_test_id("confirmation-dialog")
         expect(dialog).to_be_visible()
         assert dialog.evaluate("el => el.tagName === 'DIALOG' && el.open"), "必须使用原生模态 dialog"
         expect(page.get_by_test_id(cancel_id)).to_be_focused()
-        for _ in range(3):
-            page.keyboard.press("Tab")
-            assert dialog.evaluate("el => el.contains(document.activeElement)"), "焦点离开模态窗口"
+        check_tab_cycle()
         page.keyboard.press("Escape")
         expect(dialog).not_to_be_visible()
         expect(trigger).to_be_focused()
@@ -116,6 +125,7 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     confirm.click()
     expect(confirm).to_be_disabled()
     expect(page.get_by_test_id("confirm-cancel")).to_be_disabled()
+    check_pending_focus()
     confirm.dispatch_event("click")
     page.keyboard.press("Escape")
     expect(page.get_by_test_id("confirmation-dialog")).to_be_visible()
@@ -123,6 +133,10 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     held.pop().fulfill(status=409, content_type="application/json", body=json.dumps({"error": {"code": "ui_test_conflict", "message": "测试：成员关系已变化，请核对后重试"}}))
     expect(page.get_by_test_id("confirmation-error")).to_contain_text("成员关系已变化")
     expect(confirm).to_be_enabled()
+    page.keyboard.press("Tab")
+    expect(page.get_by_test_id("confirm-cancel")).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(confirm).to_be_focused()
     confirm.click()
     expect(confirm).to_be_disabled()
     assert len(held) == 1
@@ -133,7 +147,25 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     expect(page.get_by_test_id("confirmation-error")).to_contain_text("操作结果未知")
     expect(confirm).to_be_disabled()
     page.unroute(route_pattern, hold_remove)
-    page.get_by_test_id("confirmation-reconcile").click()
+    recovery = page.get_by_test_id("confirmation-reconcile")
+    page.get_by_test_id("confirm-cancel").focus()
+    page.keyboard.press("Tab")
+    expect(recovery).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(page.get_by_test_id("confirm-cancel")).to_be_focused()
+    reads = []
+    def hold_reconcile(route):
+        if route.request.method == "GET": reads.append(route)
+        else: route.continue_()
+    read_pattern = f"**/api/projects/{project_id}/members"
+    page.route(read_pattern, hold_reconcile)
+    with page.expect_request(lambda req: req.method == "GET" and urlsplit(req.url).path == f"/api/projects/{project_id}/members"):
+        recovery.click()
+    expect(recovery).to_have_count(0)
+    check_pending_focus()
+    assert len(reads) == 1, "权威核对应该读取成员一次"
+    page.unroute(read_pattern, hold_reconcile)
+    reads.pop().continue_()
     expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
     expect(page.locator("h1")).to_be_focused()
     expect(page.get_by_test_id("new-member-name")).to_have_value("删除成员期间保留的草稿")
@@ -141,7 +173,7 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     assert len(writes(member_path, "DELETE")) == 2, "一次被拒绝、一次明确重试后，不应再次发送移除"
     assert not request(page, origin, "GET", f"/api/projects/{project_id}/members")["members"]
     toast(f"成员「{member['displayName']}」已移除。")
-    report["checks"].append("S6-AC01/02/05: 成员取消/Escape与还焦；pending单飞；注入409拒绝与提交后响应丢失，权威核对完成且保留草稿")
+    report["checks"].append("S6-AC01/02/05: 成员取消/Escape与还焦；Tab/Shift+Tab边界循环；提交/核对全禁用时标题焦点；恢复slot加入/移除；pending单飞；注入409拒绝与提交后响应丢失，权威核对完成且保留草稿")
 
     group = request(page, origin, "GET", f"/api/projects/{project_id}/groups")["groups"][0]
     group_path = f"/api/groups/{group['id']}"
@@ -178,10 +210,16 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     page.get_by_test_id("confirm-purge-group").click()
     expect(page.get_by_test_id("confirmation-error")).to_contain_text("删除影响已变化")
     expect(page.get_by_test_id("confirm-purge-group")).to_be_disabled()
+    page.get_by_test_id("cancel-purge-group").focus()
+    page.keyboard.press("Tab")
+    expect(page.get_by_test_id("confirmation-preview")).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(page.get_by_test_id("cancel-purge-group")).to_be_focused()
     page.unroute(group_pattern, changed_confirmation)
     with page.expect_response(lambda r: r.url.endswith(group_path) and r.request.method == "DELETE") as latest_response:
         page.get_by_test_id("confirmation-preview").click()
     latest_token = latest_response.value.json()["confirmation"]["token"]
+    expect(page.get_by_test_id("cancel-purge-group")).to_be_focused()
     assert previous_token != latest_token
     assert len(committed_purges(group_path)) == 1, "重新预览不能自动删除"
     page.get_by_test_id("confirm-purge-group").click()
