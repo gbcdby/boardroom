@@ -567,10 +567,10 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   async function memoryAtSafePoint(binding: SessionBinding, force = false): Promise<MemoryInjection | undefined> {
     let injection: MemoryInjection;
     try {
-      await withAccess(binding, "observe", async () => {});
+      await withAccess(binding, "observe", () => guard(binding, "group:view", { projectId: binding.projectId, groupId: binding.groupId }));
       injection = await memory.inject(await memoryAccess(binding));
       if (closed || bindings.get(binding.sessionId) !== binding) throw new Error("stale_memory_binding");
-      await withAccess(binding, "observe", async () => {});
+      await withAccess(binding, "observe", () => guard(binding, "group:view", { projectId: binding.projectId, groupId: binding.groupId }));
     } catch {
       injection = unavailableMemory(memoryRuntime.config, "memory_binding_unavailable");
     }

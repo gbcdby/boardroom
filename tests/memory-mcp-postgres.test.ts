@@ -7,6 +7,7 @@ import { createLogger } from "../src/server/logger.ts";
 import { DEFAULT_MEMORY_CONFIG } from "../src/server/config.ts";
 import { closeMemoryRuntime, registerMemoryRuntime, scheduleMemoryReconciliation } from "../src/server/memory/runtime.ts";
 import { memoryFixture, memoryPgUrl, pgUnavailable } from "./helpers/memory-fixture.ts";
+import type { DbTransaction, DbRow } from "../src/server/db/driver.ts";
 
 test("真实 PG 锁住记忆表时 MCP 投递、ACK、status 可继续；后台真实回滚、释放锁后补扫不丢来源", { skip: pgUnavailable, timeout: 15000 }, async () => memoryFixture(async (repos, db) => {
   const schema = String((await db.query("SELECT current_schema() AS name"))[0]!["name"]);
@@ -17,6 +18,7 @@ test("真实 PG 锁住记忆表时 MCP 投递、ACK、status 可继续；后台�
   const lock = new Client({ connectionString: memoryPgUrl });
   await lock.connect();
   const query = db.query.bind(db);
+  const transaction = db.transaction.bind(db);
   try {
     const project = await repos.projects.create({ name: "记忆锁隔离" });
     const group = await repos.groups.create({ projectId: project.id, name: "真实 MCP" });
@@ -35,6 +37,14 @@ test("真实 PG 锁住记忆表时 MCP 投递、ACK、status 可继续；后台�
       if (/FROM memory_documents\b/.test(sql)) attempted();
       return await query(sql, params);
     };
+    // 仓储在事务里走实际 DbTransaction.query；仅包顶层 db.query 会漏掉真实执行。
+    db.transaction = <T>(body: (tx: DbTransaction) => Promise<T>): Promise<T> => transaction(tx => body({
+      ...tx,
+      query: async <R extends DbRow = DbRow>(sql: string, params?: readonly unknown[]): Promise<R[]> => {
+        if (/FROM memory_documents\b/.test(sql)) attempted();
+        return await tx.query<R>(sql, params);
+      },
+    }));
     await lock.query("BEGIN");
     await lock.query(`LOCK TABLE "${schema}".memory_documents IN ACCESS EXCLUSIVE MODE`);
     const began = performance.now();
@@ -56,6 +66,7 @@ test("真实 PG 锁住记忆表时 MCP 投递、ACK、status 可继续；后台�
     assert.equal(blocked.rows[0].count, 0, "没有遗留等待记忆表锁的数据库工作");
     await lock.query("ROLLBACK");
     db.query = query;
+    db.transaction = transaction;
     await core.waitForMessages("reader", { timeoutMs: 20 });
     const deadline = Date.now() + 2500;
     let requests = await repos.memory.listRequests(project.id, joined.agentId);
@@ -66,6 +77,7 @@ test("真实 PG 锁住记忆表时 MCP 投递、ACK、status 可继续；后台�
     assert.equal((await repos.deliveries.get(message.id, joined.memberId))?.status, "acked", "通知补扫不复活已确认聊天");
   } finally {
     db.query = query;
+    db.transaction = transaction;
     await lock.query("ROLLBACK").catch(() => {}); await lock.end();
     await core.close(); await closeMemoryRuntime(db);
   }

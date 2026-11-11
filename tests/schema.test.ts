@@ -28,10 +28,11 @@ const DOMAIN_TABLES = [
   "agent_runner_states",
   "agent_runtime_members",
   "project_task_settings", "tasks", "task_comments", "task_history", "task_message_links", "task_review_rounds", "task_review_reports", "work_events",
+  "memory_documents", "memory_versions", "memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints",
 ] as const;
 
 /** 期望的最高迁移版本（F2 v1 + T2 #15 v2 + T1 #48 v3 归档 + T2 #49 v4 组织树 + T3 #50 v5 成员状态 + T5 #52 v6 审计）。 */
-const EXPECTED_VERSION = 11;
+const EXPECTED_VERSION = 12;
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-schema-"));

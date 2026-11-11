@@ -101,3 +101,41 @@ test("R-P4-C-REQ-001：投递事实写失败不成功出队；修复后重投仍
     assert.deepEqual(requests[0]?.messageIds, [message.id]);
   } finally { await f.close(); }
 });
+
+for (const revoke of ["member", "group"] as const) {
+  test(`R-P4-C-S-002：真实 reader 返回前撤销${revoke}访问后不附带私有正文`, async () => {
+    const f = await fixture();
+    const runtime = getMemoryRuntime(f.db), read = runtime.reader.readOwn.bind(runtime.reader);
+    let gated = false, observed!: () => void, release!: () => void;
+    const ready = new Promise<void>(resolve => { observed = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    runtime.reader.readOwn = async binding => {
+      const result = await read(binding);
+      if (gated) { observed(); await gate; }
+      return result;
+    };
+    try {
+      const joined = await f.core.join("reader", { displayName: "并发失权成员", hostType: "other", projectId: f.project.id, groupId: f.group.id });
+      const canary = "private-memory-after-revocation";
+      await f.core.memoryOperation("reader", "write", { scope: "global", expectedVersion: 0, clientMutationId: "canary", markdown: canary });
+      await new Promise<void>(resolve => scheduleMemoryReconciliation(f.db, "test:before-revocation", async () => { resolve(); }));
+      gated = true;
+      const waiting = f.core.waitForMessages("reader", { timeoutMs: 5 });
+      watchdog = setTimeout(release, 3000);
+      await ready;
+      if (revoke === "member") await f.repos.members.setStatus(joined.memberId, "disabled");
+      else await f.repos.groups.removeParticipant(f.group.id, joined.memberId);
+      release();
+      const result = await waiting;
+      assert.equal(result.memory?.state, "unavailable");
+      assert.deepEqual(result.memory?.entries, []);
+      assert.ok(!JSON.stringify(result).includes(canary));
+      if (revoke === "member") await assert.rejects(f.core.memoryOperation("reader", "read", { scope: "global" }), { code: "FORBIDDEN" });
+      else await assert.rejects(f.core.readHistory("reader", {}), { code: "FORBIDDEN" });
+    } finally {
+      if (watchdog) clearTimeout(watchdog);
+      release(); runtime.reader.readOwn = read; await f.close();
+    }
+  });
+}

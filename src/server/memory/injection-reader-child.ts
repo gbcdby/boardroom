@@ -25,6 +25,16 @@ async function init(database: MemoryDatabaseDescriptor, values: MemoryConfig): P
     pg = new Client({ connectionString: database.connectionString, connectionTimeoutMillis: 250, statement_timeout: 250,
       options: `-c default_transaction_read_only=on -c lock_timeout=100${database.schema ? ` -c search_path=${database.schema}` : ""}` });
     await pg.connect();
+    // pg 会让 URI 参数覆盖 Client 配置。连接后必须重新设置并核实真实 session，
+    // 然后才允许发 ready；保留 URI 的合法 search_path，显式 schema 则优先。
+    await pg.query("SET SESSION default_transaction_read_only = on; SET SESSION statement_timeout = '250ms'; SET SESSION lock_timeout = '100ms'" +
+      (database.schema ? `; SET SESSION search_path = "${database.schema}"` : ""));
+    const settings = (await pg.query<{ read_only: string; statement_ms: string; lock_ms: string }>(
+      "SELECT current_setting('transaction_read_only') AS read_only, current_setting('statement_timeout') AS statement_ms, current_setting('lock_timeout') AS lock_ms",
+    )).rows[0];
+    if (settings?.read_only !== "on" || settings.statement_ms !== "250ms" || settings.lock_ms !== "100ms") {
+      throw new Error("memory_reader_session_not_protected");
+    }
   }
 }
 

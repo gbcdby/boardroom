@@ -159,9 +159,19 @@ async function postgresReaderFixture(body: (admin: Client, schema: string, conne
   }
 }
 
-test("postgres R-P4-S-003：真实 lock_timeout 结束查询，20次注入仅一个专属连接/子进程", { skip: pgUnavailable }, async () => postgresReaderFixture(async (admin, schema, connectionString, name) => {
+for (const overrideUri of [false, true]) {
+  function readerDatabase(connectionString: string, schema: string): { kind: "postgres"; connectionString: string; schema?: string } {
+    if (!overrideUri) return { kind: "postgres", connectionString, schema };
+    const url = new URL(connectionString);
+    url.searchParams.set("options", `-c search_path=${schema} -c default_transaction_read_only=off -c lock_timeout=0`);
+    url.searchParams.set("statement_timeout", "0");
+    url.searchParams.set("lock_timeout", "0");
+    // 不传 descriptor.schema，验证合法 URI search_path 被保留，而防护参数仍固定生效。
+    return { kind: "postgres", connectionString: url.toString() };
+  }
+test(`postgres R-P4-S-003/C-S-001 URI override=${overrideUri}：真实 lock_timeout 结束查询，20次注入仅一个专属连接/子进程`, { skip: pgUnavailable }, async () => postgresReaderFixture(async (admin, schema, connectionString, name) => {
   const children: ChildProcess[] = [];
-  const reader = createMemoryInjectionReader({ database: { kind: "postgres", connectionString, schema }, config: DEFAULT_MEMORY_CONFIG,
+  const reader = createMemoryInjectionReader({ database: readerDatabase(connectionString, schema), config: DEFAULT_MEMORY_CONFIG,
     spawnChild: () => { const child = fork(fileURLToPath(new URL("../src/server/memory/injection-reader-child.ts", import.meta.url)), [],
       { execArgv: [], stdio: ["ignore", "ignore", "ignore", "ipc"] }); children.push(child); return child; } });
   const input = { memberId: "member", projectId: "project", bindingGeneration: "1" };
@@ -179,9 +189,9 @@ test("postgres R-P4-S-003：真实 lock_timeout 结束查询，20次注入仅一
   } finally { await reader.close(); }
 }));
 
-test("postgres R-P4-S-003：实际 statement_timeout 与 readonly session 拒写", { skip: pgUnavailable }, async () => postgresReaderFixture(async (admin, schema, connectionString) => {
+test(`postgres R-P4-S-003/C-S-001 URI override=${overrideUri}：实际 statement_timeout 与 readonly session 拒写`, { skip: pgUnavailable }, async () => postgresReaderFixture(async (admin, schema, connectionString) => {
   const input = { memberId: "member", projectId: "project", bindingGeneration: "1" };
-  let reader = createMemoryInjectionReader({ database: { kind: "postgres", connectionString, schema }, config: DEFAULT_MEMORY_CONFIG });
+  let reader = createMemoryInjectionReader({ database: readerDatabase(connectionString, schema), config: DEFAULT_MEMORY_CONFIG });
   try {
     assert.equal((await reader.readOwn(input)).state, "available");
     await admin.query(`ALTER TABLE memory_documents RENAME TO memory_documents_raw;
@@ -193,7 +203,7 @@ test("postgres R-P4-S-003：实际 statement_timeout 与 readonly session 拒写
     await admin.query(`DROP VIEW memory_documents; CREATE TABLE write_probe(id INTEGER);
       CREATE FUNCTION forbidden_memory(text) RETURNS text LANGUAGE plpgsql AS $$ BEGIN INSERT INTO write_probe VALUES(1); RETURN $1; END $$;
       CREATE VIEW memory_documents AS SELECT id,scope,project_id,agent_id,version,forbidden_memory(markdown) AS markdown FROM memory_documents_raw;`);
-    reader = createMemoryInjectionReader({ database: { kind: "postgres", connectionString, schema }, config: DEFAULT_MEMORY_CONFIG });
+    reader = createMemoryInjectionReader({ database: readerDatabase(connectionString, schema), config: DEFAULT_MEMORY_CONFIG });
     assert.equal((await reader.readOwn(input)).errors[0]?.code, "memory_reader_query_failed");
     assert.equal(Number((await admin.query("SELECT COUNT(*) AS n FROM write_probe")).rows[0].n), 0, "生产只读session拒绝SELECT函数中的写入");
     await admin.query("BEGIN"); await admin.query("SELECT * FROM memory_documents");
@@ -201,3 +211,4 @@ test("postgres R-P4-S-003：实际 statement_timeout 与 readonly session 拒写
     await admin.query("ROLLBACK");
   } finally { await reader.close(); }
 }));
+}

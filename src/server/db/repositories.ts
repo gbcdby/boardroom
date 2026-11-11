@@ -1456,7 +1456,8 @@ function createDeliveries(ctx: RepoCtx): DeliveriesRepository {
              (id, message_id, member_id, project_id, status, attempt_count,
               first_delivered_at, last_delivered_at, acked_at, created_at, updated_at,
               wake_decision, wake_suppressed_reason)
-           VALUES (?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, ?, ?, ?, ?)
+           ON CONFLICT (message_id, member_id) DO NOTHING`,
           [id, messageId, memberId, member.project_id, at, at,
             wake?.decision ?? null, wake?.decision === "suppressed" ? wake.reason : null],
         );
