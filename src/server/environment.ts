@@ -199,7 +199,7 @@ export async function resolveBoardroomEnvironment(options: ResolveEnvironmentOpt
       if (parsed !== null) { configFile = canonicalizePath(file); values = parsed; break; }
     }
   }
-  const layout = values["layoutVersion"] ?? 1;
+  const layout = values["layoutVersion"] === undefined ? 1 : values["layoutVersion"];
   if (layout !== 1 && layout !== 2) throw new ConfigError("layoutVersion 必须为 1 或 2。");
   const fileBase = layout === 2 && configFile ? path.dirname(configFile) : cwd;
   const stateRoot = pathValue(fileBase, layout === 2 ? values["stateRoot"] ?? path.join(homeRoot, "state") : path.join(homeRoot, "state"), "stateRoot");
@@ -230,7 +230,8 @@ export async function resolveBoardroomEnvironment(options: ResolveEnvironmentOpt
     workspaces: { path: workspacesRoot, status: "planned", protected: false }, artifacts: { path: artifactsRoot, status: "planned", protected: true },
   } as const;
   const diagnostics: EnvironmentDiagnostic[] = layout === 2 ? [{ code: "legacy_migration_required",
-    message: "发现 layoutVersion:2，但本版本没有可验证的数据库激活证据。", recoveryAction: "使用完整一致快照恢复，或等待显式迁移/激活；不要手工标记 active。" }] : [];
+    message: "发现 layoutVersion:2，但本版本没有可验证的数据库激活证据。", recoveryAction: "使用完整一致快照恢复，或等待显式迁移/激活；不要手工标记 active。" }]
+    : declaredId !== undefined ? [{ code: "migration_incomplete", message: "配置带 storageId，但缺少匹配的新格式声明。", recoveryAction: "检查完整配置及迁移提交记录，恢复一致的格式组合。" }] : [];
   const initial = { layoutVersion: layout, homeRoot, configFile, stateRoot, skillsRoot, memoryRoot, runtimeRoot, workspacesRoot, artifactsRoot,
     storageId: typeof declaredId === "string" ? declaredId : null, databaseDescriptor, startupState: layout === 2 ? "recovery_required"
       : databaseDescriptor.kind === "postgres" || databaseDescriptor.identity ? "legacy_found" : "fresh",
@@ -250,6 +251,7 @@ async function collectInventory(environment: Omit<ResolvedBoardroomEnvironment, 
   options: ResolveEnvironmentOptions): Promise<LegacyStorageInventory> {
   const sources = new Map<string, LegacyStorageSource>();
   const diagnostics = [...environment.diagnostics];
+  let hardRecovery = environment.layoutVersion === 1 && environment.storageId !== null;
   const cwd = path.resolve(options.cwd ?? process.cwd());
   const env = options.config ? {} : options.env ?? process.env;
   const explicit = options.config !== undefined || env["AGENT_STUDIO_CONFIG"] !== undefined || env["AGENT_STUDIO_DATA_DIR"] !== undefined || env["AGENT_STUDIO_DB_DRIVER"] !== undefined;
@@ -266,8 +268,11 @@ async function collectInventory(environment: Omit<ResolvedBoardroomEnvironment, 
         const valid = bytesRead === 16 && header.equals(Buffer.from("SQLite format 3\0"));
         facts = { sqliteHeader: valid ? "sqlite3" : "invalid", byteLength: String((await file.stat({ bigint: true })).size),
           walPresent: exists(`${database.sqlitePath}-wal`) };
-        if (!valid) diagnostics.push({ code: "migration_incomplete", message: "已知 SQLite 文件的格式头无效，不能将其当成 fresh 数据库。",
-          recoveryAction: "检查该源的一致备份与完整性后恢复；不要创建替代空库。" });
+        if (!valid) {
+          hardRecovery = true;
+          diagnostics.push({ code: "migration_incomplete", message: "已知 SQLite 文件的格式头无效，不能将其当成 fresh 数据库。",
+            recoveryAction: "检查该源的一致备份与完整性后恢复；不要创建替代空库。" });
+        }
       } finally { await file.close(); }
     } else id = (describeDatabase(database) as Extract<PublicDatabaseDescriptor, { kind: "postgres" }>).locationId;
     const location = { rule, configFile, sourcePath: database.kind === "sqlite" ? database.sourcePath : null };
@@ -290,7 +295,7 @@ async function collectInventory(environment: Omit<ResolvedBoardroomEnvironment, 
     if (explicit && directory === cwd) continue;
     const values = await readObject(file, false);
     if (values === null) continue;
-    const version = values["layoutVersion"] ?? 1;
+    const version = values["layoutVersion"] === undefined ? 1 : values["layoutVersion"];
     if (version !== 1) {
       diagnostics.push({ code: "migration_incomplete", message: "已知旧启动目录存在未验证的新格式配置。", recoveryAction: "检查迁移记录与格式代际；显式完成恢复后再启动。" });
       continue;
@@ -301,12 +306,24 @@ async function collectInventory(environment: Omit<ResolvedBoardroomEnvironment, 
   }
   await add(sqliteAt(environment.stateRoot), 2, "planned-state", null);
   const metadataFile = path.join(environment.stateRoot, "storage.json");
-  const metadata = await readObject(metadataFile, false);
+  async function readMetadata(file: string, required: boolean): Promise<Record<string, unknown> | null> {
+    try { return await readObject(file, required); }
+    catch (error) {
+      if (!(error instanceof ConfigError)) throw error;
+      hardRecovery = true;
+      diagnostics.unshift({ code: "migration_incomplete", message: "存储元数据或迁移 journal 无法读取/解析。",
+        recoveryAction: "核对可读的一致备份和迁移记录后恢复；不猜测丢失字段或创建空库。" });
+      return null;
+    }
+  }
+  const metadata = await readMetadata(metadataFile, false);
   if (metadata !== null) {
     if (environment.storageId !== null && metadata["storageId"] !== environment.storageId) {
+      hardRecovery = true;
       diagnostics.unshift({ code: "storage_root_mismatch", message: "配置与文件存储的 storageId 不一致。",
         recoveryAction: "恢复同一个一致快照的数据库、配置和文件根；不要创建另一份同名空存储。" });
     } else if (metadata["maintenance"] === true) {
+      hardRecovery = true;
       diagnostics.unshift({ code: "storage_maintenance", message: "存储元数据声明正在维护。", recoveryAction: "完成已登记的维护/恢复并核实实际产物后再启动。" });
     } else {
       diagnostics.push({ code: "migration_incomplete", message: "已存在新存储元数据，但数据库格式及 storageId 尚无可核验的激活证据。",
@@ -319,13 +336,22 @@ async function collectInventory(environment: Omit<ResolvedBoardroomEnvironment, 
   catch (error) { if (codeOf(error) !== "ENOENT") throw pathError("迁移记录目录", error); }
   if (journals.length > 4096) throw new ConfigError("迁移记录数量超出只读预检上限，请检查存储恢复记录。");
   for (const name of journals.filter(name => name.endsWith(".json"))) {
-    const journal = await readObject(path.join(journalRoot, name), true);
-    if (journal?.["phase"] !== "completed") diagnostics.push({ code: "migration_incomplete", message: "发现未完成或格式未知的迁移 journal。",
-      recoveryAction: "核对 journal 与实际提交产物，显式恢复或续做迁移；普通启动不会修改它。" });
+    const journal = await readMetadata(path.join(journalRoot, name), true);
+    if (journal?.["phase"] !== "completed") {
+      hardRecovery = true;
+      diagnostics.push({ code: "migration_incomplete", message: "发现未完成或格式未知的迁移 journal。",
+        recoveryAction: "核对 journal 与实际提交产物，显式恢复或续做迁移；普通启动不会修改它。" });
+    } else if (metadata === null) {
+      hardRecovery = true;
+      diagnostics.push({ code: "migration_incomplete", message: "journal 声称完成但缺少相应存储元数据与激活证据。",
+        recoveryAction: "核对完整迁移产物与一致快照；完成状态文字不能替代实际格式证据。" });
+    }
   }
   const list = [...sources.values()];
   let startupState: StartupState;
-  if (diagnostics.length) startupState = "recovery_required";
+  if (!hardRecovery && list.length > 1 && list.some(source => source.layoutVersion === 2)) {
+    startupState = "ambiguous"; diagnostics.unshift(ambiguity());
+  } else if (diagnostics.length) startupState = "recovery_required";
   else if (list.some(source => source.layoutVersion === 2)) {
     startupState = list.length > 1 ? "ambiguous" : "recovery_required";
     diagnostics.push(startupState === "ambiguous" ? ambiguity() : {
@@ -345,12 +371,17 @@ function ambiguity(): EnvironmentDiagnostic {
 }
 
 export async function assertEnvironmentWritable(environment: ResolvedBoardroomEnvironment): Promise<void> {
+  assertEnvironmentSelected(environment);
+  if (environment.databaseDescriptor.kind === "sqlite") assertSqliteSourceUnchanged(environment.databaseDescriptor, true);
+  assertWritableDirectory(environment.config.dataDir);
+}
+
+/** 读旧库的管理命令也必须拒绝歧义、恢复或未激活格式，但不用取得写权限。 */
+export function assertEnvironmentSelected(environment: ResolvedBoardroomEnvironment): void {
   if (!environment.writable) {
     const diagnostic = environment.diagnostics[0]!;
     throw new ConfigError(diagnostic.message, diagnostic.code, diagnostic.recoveryAction);
   }
-  if (environment.databaseDescriptor.kind === "sqlite") assertSqliteSourceUnchanged(environment.databaseDescriptor, true);
-  assertWritableDirectory(environment.config.dataDir);
 }
 
 function assertWritableDirectory(directory: string): void {

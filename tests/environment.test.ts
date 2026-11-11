@@ -72,7 +72,7 @@ async function seed(directory: string, name: string): Promise<string> {
   await mkdir(directory, { recursive: true });
   const file = path.join(directory, "agent-studio.db");
   const db = new Database(file);
-  try { db.exec("CREATE TABLE evidence (name TEXT NOT NULL)"); db.prepare("INSERT INTO evidence VALUES (?)").run(name); }
+  try { db.pragma("journal_mode = WAL"); db.exec("CREATE TABLE evidence (name TEXT NOT NULL)"); db.prepare("INSERT INTO evidence VALUES (?)").run(name); }
   finally { db.close(); }
   return file;
 }
@@ -196,5 +196,48 @@ test("S4 PG: 清单只承诺配置存在，输出白名单不含连接串/未知
     assert.equal(inventory.sources[0]!.database.kind === "postgres" && inventory.sources[0]!.database.verification, "configuration_only");
     assert.equal(JSON.stringify(inventory).includes(canary), false);
     assert.equal(JSON.stringify(inventory).includes("postgres://"), false);
+  });
+});
+
+test("S4 配置: 显式空覆盖是错误，不得偷偷使用文件值或 SQLite 默认", async () => {
+  await fixture(async dir => {
+    const file = path.join(dir, "config.json");
+    await writeFile(file, JSON.stringify({ dataDir: "old", dbDriver: "postgres", pgConnectionString: "postgres://u:p@localhost/db" }));
+    for (const name of ["AGENT_STUDIO_DATA_DIR", "AGENT_STUDIO_DB_DRIVER", "AGENT_STUDIO_PG_CONNECTION_STRING"]) {
+      await assert.rejects(loadConfig({ cwd: dir, env: { BOARDROOM_HOME: path.join(dir, "home"), AGENT_STUDIO_CONFIG: file, [name]: "" } }), { code: "config_invalid" });
+    }
+    assert.deepEqual(await readdir(dir), ["config.json"]);
+  });
+});
+
+test("S4 恢复: 不完整 storageId 配置、损坏 metadata、只有完成 journal 都不能冒充 fresh", async () => {
+  await fixture(async dir => {
+    const home = path.join(dir, "home"); await mkdir(path.join(home, "state/migrations"), { recursive: true });
+    const config = path.join(dir, "config.json");
+    const options = { cwd: dir, env: { BOARDROOM_HOME: home, AGENT_STUDIO_CONFIG: config } };
+    await writeFile(config, JSON.stringify({ storageId: "partial-format" }));
+    assert.equal((await inspectLegacyStorage(options)).startupState, "recovery_required");
+    await assert.rejects(loadConfig(options), { code: "migration_incomplete" });
+    await writeFile(config, "{}");
+    await writeFile(path.join(home, "state/storage.json"), "{ broken metadata");
+    assert.equal((await inspectLegacyStorage(options)).startupState, "recovery_required");
+    await rm(path.join(home, "state/storage.json"));
+    await writeFile(path.join(home, "state/migrations/done.json"), JSON.stringify({ phase: "completed" }));
+    assert.equal((await inspectLegacyStorage(options)).startupState, "recovery_required");
+    await assert.rejects(loadConfig(options), { code: "migration_incomplete" });
+  });
+});
+
+test("S4 旧源: 真实文件别名去重；显式旧路径位于计划 state 也不能仅按目录升级格式", async () => {
+  await fixture(async dir => {
+    const cwd = path.join(dir, "cwd"); await seed(path.join(cwd, "data"), "one-source");
+    const alias = path.join(dir, "alias"); await symlink(cwd, alias);
+    const options = { cwd, env: { BOARDROOM_HOME: path.join(dir, "home") }, knownLegacyCwds: [alias] };
+    const inventory = await inspectLegacyStorage(options);
+    assert.equal(inventory.startupState, "legacy_found"); assert.equal(inventory.sources.length, 1);
+    assert.ok(inventory.sources[0]!.locations.length > 1);
+    const home = path.join(dir, "legacy-home"); const old = path.join(home, "state"); await seed(old, "legacy-state-dir");
+    const config = await loadConfig({ cwd: dir, env: { BOARDROOM_HOME: home, AGENT_STUDIO_DATA_DIR: old } });
+    assert.equal(config.environment?.layoutVersion, 1); assert.equal(config.environment?.startupState, "legacy_found");
   });
 });

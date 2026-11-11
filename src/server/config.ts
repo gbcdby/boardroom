@@ -228,7 +228,8 @@ function parsePgConnectionString(value: unknown, dbDriver: DbDriverKind): string
 
 function pick(...candidates: readonly unknown[]): unknown {
   for (const candidate of candidates) {
-    if (candidate !== undefined && candidate !== null && candidate !== "") return candidate;
+    // 显式空值也是配置值，由字段校验拒绝；不能变成另一个数据源的隐式 fallback。
+    if (candidate !== undefined) return candidate;
   }
   return undefined;
 }
