@@ -4,6 +4,7 @@ import { RouterLink, useRoute, useRouter } from "vue-router";
 import { ApiError, api, type GroupDto, type MemberDto, type MessageDto } from "../api/client.ts";
 
 import { projectPath, useCurrentProject, useProjectDraft } from "../composables/useCurrentProject.ts";
+import { useChatViewport } from "../composables/useChatViewport.ts";
 
 const route = useRoute();
 const router = useRouter();
@@ -25,9 +26,11 @@ const sending = ref(false);
 const composing = ref(false);
 const wsState = ref<"connecting" | "open" | "closed">("closed");
 const messageList = ref<HTMLUListElement | null>(null);
+const conversation = ref<HTMLElement | null>(null);
 const composer = ref<HTMLTextAreaElement | null>(null);
 const atBottom = ref(true);
 const newMessages = ref(false);
+const messageHeight = useChatViewport(messageList, conversation, () => activeGroupId.value, atBottom, scrollToLatest);
 
 let socket: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -309,14 +312,14 @@ onBeforeUnmount(() => {
       <p class="muted">创建项目、添加成员并组建群组后，就可以在这里开始交流。</p>
       <RouterLink class="primary" to="/projects">前往项目与群组</RouterLink>
     </div>
-    <section v-else-if="activeGroupId !== null" class="panel conversation" :aria-label="activeGroup?.name ?? '当前群聊'">
+    <section v-else-if="activeGroupId !== null" ref="conversation" class="panel conversation" :aria-label="activeGroup?.name ?? '当前群聊'">
       <div class="conversation-heading">
         <div><h2>{{ activeGroup?.name }}</h2><span class="muted small">{{ messages.length }} 条消息</span></div>
         <RouterLink v-if="activeProjectId" :to="{ path: '/runtimes', query: { projectId: activeProjectId, groupId: activeGroupId } }" class="text-button">管理托管 Agent</RouterLink>
       </div>
 
       <div role="log" aria-label="群聊消息" :aria-live="historyLoading ? 'off' : 'polite'" aria-relevant="additions" :aria-busy="historyLoading">
-      <ul ref="messageList" class="messages" data-testid="chat-messages" aria-label="群聊记录" tabindex="0" @scroll="updateScrollPosition">
+      <ul ref="messageList" class="messages" :style="{ '--chat-message-height': messageHeight === undefined ? undefined : `${messageHeight}px` }" data-testid="chat-messages" aria-label="群聊记录" tabindex="0" @scroll="updateScrollPosition">
         <li v-if="historyLoading && messages.length === 0" class="conversation-empty" role="status">正在读取消息…</li>
         <li v-else-if="messages.length === 0 && !loadError" class="conversation-empty"><strong>开始这段对话</strong><span class="muted">发送一条消息，让协作开始。</span></li>
         <li v-for="message in messages" :key="message.id" class="message" :class="{ own: message.senderMemberId === senderId }">
@@ -370,7 +373,7 @@ onBeforeUnmount(() => {
 .conversation-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--border); }
 .conversation-heading > div { min-width: 0; }
 .conversation-heading h2 { margin: 0 0 0.2rem; font-size: 1.05rem; overflow-wrap: anywhere; }
-.messages { margin: 0; padding: 1.5rem; list-style: none; display: flex; flex-direction: column; gap: 1.5rem; min-height: 260px; max-height: min(56dvh, 640px); overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
+.messages { margin: 0; padding: 1.5rem; list-style: none; display: flex; flex-direction: column; gap: 1.5rem; min-height: min(260px, var(--chat-message-height, 260px)); max-height: var(--chat-message-height, min(56dvh, 640px)); overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
 .messages:focus-visible { outline-offset: -3px; }
 .conversation-empty { flex: 1; min-height: 200px; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 0.5rem; text-align: center; color: var(--muted); }
 .conversation-empty strong { color: var(--fg); font-weight: 500; }
@@ -397,7 +400,7 @@ onBeforeUnmount(() => {
 @media (max-width: 720px) {
   .chat-controls { grid-template-columns: 1fr; }
   .conversation-heading, .composer, .messages { padding: 1rem; }
-  .messages { max-height: 52dvh; }
+  .messages { max-height: var(--chat-message-height, 52dvh); }
   .conversation > .notice { margin: 0 1rem 1rem; }
   .composer-footer { align-items: flex-end; }
   .composer-footer p { flex: 1 1 160px; }
