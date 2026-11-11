@@ -163,8 +163,28 @@ def exercise_quick_intake(page, fixture, output, report):
     page.unroute(origin + collection, lose_response)
     actual = [t for t in request(page, origin, "GET", collection)["tasks"] if t["title"] == "真实提交后响应丢失"]
     assert len(actual) == 1 and actual[0]["id"] == unknown_writes[0]["id"]
-    page.get_by_test_id("task-create-unknown").get_by_role("link", name="真实提交后响应丢失", exact=True).click()
+    # 查看候选仍会经过真实草稿离开守卫；无dialog handler时Playwright默认取消。
+    # 先验证取消保留未知结果，再明确确认离开，不能绕过守卫或默清草稿。
+    leave_confirmations = []
+    def answer_unknown_leave(dialog, accepted):
+        assert dialog.type == "confirm"
+        assert "未保存的内容" in dialog.message and "是否继续" in dialog.message
+        leave_confirmations.append({"type": dialog.type, "message": dialog.message, "accepted": accepted})
+        if accepted: dialog.accept()
+        else: dialog.dismiss()
+    candidate_link = page.get_by_test_id("task-create-unknown").get_by_role("link", name="真实提交后响应丢失", exact=True)
+    page.once("dialog", lambda dialog: answer_unknown_leave(dialog, False))
+    candidate_link.click()
+    expect(page).to_have_url(origin + f"/projects/{pid}/tasks")
+    expect(page.get_by_test_id("task-title")).to_have_value("真实提交后响应丢失")
+    expect(page.get_by_test_id("task-create")).to_be_disabled()
+    assert len(leave_confirmations) == 1 and len(unknown_writes) == 1
+    page.once("dialog", lambda dialog: answer_unknown_leave(dialog, True))
+    candidate_link.click()
     expect(page.locator("h1")).to_have_text("真实提交后响应丢失")
+    expect(page).to_have_url(origin + f"/projects/{pid}/tasks/{unknown_writes[0]['id']}")
+    assert len(leave_confirmations) == 2 and len(unknown_writes) == 1
+    report["unknownCreateNavigation"] = {"confirmations": leave_confirmations, "taskId": unknown_writes[0]["id"], "writes": len(unknown_writes)}
     report["checks"].append("S5-T1: POST已落库但丢响应、读403、关闭重开与成功核对均不会盲目重试；实际只创建一次")
 
 def exercise_reopen(page, fixture, output, report):

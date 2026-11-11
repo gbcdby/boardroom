@@ -123,6 +123,35 @@ test("任务板：字段拒绝保留输入，错误绑定对应字段并可修�
   });
 });
 
+test("任务板：未知结果的候选详情仍经离开确认，取消保留草稿且确认不重新创建", async () => {
+  let writes = 0, committed = false, confirmed = false, confirmations = 0;
+  const saved = { ...task, title: "真实提交后响应丢失" };
+  await withPage("TasksView", (url, init) => {
+    if (init?.method === "POST") { writes++; committed = true; return Promise.reject(new TypeError("响应断开")); }
+    return read(url, committed ? [saved] : []);
+  }, async (container, { router }) => {
+    byTestId(container, "task-create-open").props.onClick(); await settle();
+    await input(byTestId(container, "task-title"), saved.title);
+    await submit(byTestId(container, "task-create")); await settle();
+    const readButton = find(byTestId(container, "task-create-unknown"), node => node.type === "button");
+    assert.ok(readButton); await readButton.props.onClick(); await settle();
+    const link = find(byTestId(container, "task-create-unknown"), node => node.type === "a");
+    assert.ok(link); assert.equal(link.props.href, "/projects/project-1/tasks/task-1");
+    const click = () => link.props.onClick({ button: 0, metaKey: false, altKey: false, ctrlKey: false, shiftKey: false,
+      defaultPrevented: false, preventDefault() {}, currentTarget: { getAttribute() { return null; } } });
+    await click(); await settle();
+    assert.equal(confirmations, 1);
+    assert.equal(router.currentRoute.value.path, "/projects/project-1/tasks");
+    assert.equal(byTestId(container, "task-title").value, saved.title);
+    assert.equal(byTestId(container, "task-create").props.disabled, true);
+    assert.equal(writes, 1);
+    confirmed = true; await click(); await settle();
+    assert.equal(confirmations, 2);
+    assert.equal(router.currentRoute.value.path, "/projects/project-1/tasks/task-1");
+    assert.equal(writes, 1);
+  }, { confirmDiscard: () => { confirmations++; return confirmed; } });
+});
+
 test("任务板：结果未知时不重复创建，读失败或重开仍保留输入和禁重试", async () => {
   let writes = 0, failRead = false;
   await withPage("TasksView", (url, init) => {
