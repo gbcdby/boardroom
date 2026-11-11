@@ -45,6 +45,10 @@ for (const engine of identityEngines) {
       await assert.rejects(f.service.save(access, project.id,
         { expectedProjectRevision: 1, mutationId: "discussion", rootPath: f.root, mode: "isolated" }), { reason: "workspace_mutation_conflict" });
       assert.deepEqual(await f.service.get(access, project.id), current);
+      const other = await f.repos.projects.create({ name: "同一物理根" });
+      const shared = await f.service.save(access, other.id, { expectedProjectRevision: 1, mutationId: "same-root", rootPath: f.root, mode: "isolated" });
+      assert.equal(shared.workspace?.physicalResourceKey, current.workspace?.physicalResourceKey);
+      assert.equal(shared.workspace?.runReady, false); assert.equal(current.workspace?.runReady, false);
     } finally { await f.close(); }
   });
 
@@ -81,9 +85,10 @@ for (const engine of identityEngines) {
       await assert.rejects(f.service.save(access, project.id, { rootPath: null, mode: "isolated", expectedProjectRevision: 3, mutationId: "archived" }), { code: "archived" });
       await f.repos.projects.restore(project.id);
       assert.equal((await f.service.get(access, project.id)).projectRevision, 4);
-      const saved = await f.service.save(access, project.id, { rootPath: f.root, mode: "isolated", expectedProjectRevision: 4, mutationId: "saved" });
       const group = await f.repos.groups.create({ projectId: project.id, name: "可删群" });
-      await f.repos.groups.purge(group.id);
+      const preview = await f.repos.groups.capturePurge(group.id);
+      const saved = await f.service.save(access, project.id, { rootPath: f.root, mode: "isolated", expectedProjectRevision: 4, mutationId: "saved" });
+      await f.repos.groups.purge(group.id, preview.digest);
       assert.deepEqual(await f.service.get(access, project.id), saved);
       const cleared = await f.service.clear(access, project.id, { expectedProjectRevision: saved.projectRevision, mutationId: "clear" });
       assert.equal(cleared.workspace?.rootPath, null);

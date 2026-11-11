@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, symlink, rename, chmod } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, symlink, rename, chmod, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -90,5 +90,38 @@ test("S3 Git 只读观察：脏文件、未跟踪文件与 index 保持原字节
     assert.deepEqual(await readFile(path.join(f.root, ".git/index")), indexBefore);
     assert.equal(await readFile(path.join(f.root, "tracked.txt"), "utf8"), "after\n");
     assert.equal(await readFile(path.join(f.root, "untracked.txt"), "utf8"), "keep\n");
+  } finally { await f.close(); }
+});
+
+test("R-BR-COLLAB-135-REQ-001：promisor 缺树对象不执行 lazy fetch/remote helper，不改变 .git 或工作树", async () => {
+  const f = await fixture();
+  const git = (...args: string[]) => { const result = spawnSync("git", args, { cwd: f.root, encoding: "utf8" }); assert.equal(result.status, 0, result.stderr); return result.stdout; };
+  async function snapshot(directory: string): Promise<unknown[]> {
+    const rows: unknown[] = [];
+    for (const entry of (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      const file = path.join(directory, entry.name);
+      rows.push(entry.isDirectory() ? [entry.name, await snapshot(file)] : [entry.name, (await readFile(file)).toString("hex")]);
+    }
+    return rows;
+  }
+  try {
+    // 在实际测试 Git 上验证命令行开关被识别；不能依赖旧 Git 会静默忽略的环境变量。
+    assert.match(git("--no-lazy-fetch", "--version"), /^git version /);
+    git("init", "-q"); await writeFile(path.join(f.root, "file.txt"), "fixture\n"); git("add", "file.txt");
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture");
+    const tree = git("rev-parse", "HEAD^{tree}").trim();
+    const helper = path.join(f.dir, "remote-helper"), marker = path.join(f.dir, "helper-ran");
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    await writeFile(helper, `#!/bin/sh\nprintf invoked > ${quote(marker)}\nexit 1\n`); await chmod(helper, 0o700);
+    git("config", "core.repositoryformatversion", "1"); git("config", "extensions.partialClone", "origin");
+    git("config", "remote.origin.url", `ext::${helper}`); git("config", "remote.origin.promisor", "true");
+    git("config", "protocol.ext.allow", "always");
+    await unlink(path.join(f.root, ".git/objects", tree.slice(0, 2), tree.slice(2)));
+    const before = await snapshot(f.root);
+    const observed = await inspectWorkspaceRoot(f.root, f.environment);
+    assert.equal((await readdir(f.dir)).includes("helper-ran"), false, "只读检查不得执行配置中的 remote helper");
+    assert.equal(observed.repositoryInfo?.kind, "unavailable");
+    assert.equal(observed.repositoryInfo?.complete, false);
+    assert.deepEqual(await snapshot(f.root), before, "对象缺失不能引发 .git 或用户文件副作用");
   } finally { await f.close(); }
 });

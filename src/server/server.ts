@@ -216,7 +216,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   let notifyHttpMessage: (message: import("./api.ts").MessageView) => void | Promise<void> = () => {};
   // 权威组织审计由 API 领域服务原子提交；可选 hook 只作提交后观察。
   const t1Api = createT1ApiRouter({
-    db: driver, repos,
+    db: driver, repos, environment,
     logger,
     heartbeat: config.heartbeat,
     onMessage: (message) => notifyHttpMessage(message),

@@ -23,10 +23,13 @@ function pathFailure(error: unknown): never {
 function gitEnvironment(): NodeJS.ProcessEnv {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
   return { ...env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: "/dev/null", GIT_NO_REPLACE_OBJECTS: "1", LC_ALL: "C" };
+    GIT_CONFIG_GLOBAL: "/dev/null", GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1",
+    // 空白名单覆盖仓库级 protocol.*.allow=always，连本地/ext 自定义 helper 也不能启动。
+    GIT_ALLOW_PROTOCOL: "", LC_ALL: "C" };
 }
 async function git(root: string, ...args: string[]): Promise<string> {
-  const result = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+  // 命令行开关必须被当前 Git 识别；旧版本会明确失败为 unavailable，不能静默忽略变量后 lazy fetch。
+  const result = await exec("git", ["--no-lazy-fetch", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
     "-c", "core.untrackedCache=false", "-c", "core.preloadIndex=false", "-c", "core.pager=cat", ...args],
   { cwd: root, env: gitEnvironment(), encoding: "utf8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 });
   return result.stdout;

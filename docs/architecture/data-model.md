@@ -1,7 +1,7 @@
 # 数据模型与持久化
 
 状态：已确认
-日期：2026-10-22 初版；2026-11-11 补 v11–v14 任务、记忆、成员代际、稳定身份与共同事务边界
+日期：2026-10-22 初版；2026-11-11 补 v11–v15 任务、记忆、成员代际、稳定身份、项目工作区与共同事务边界
 来源：F2 #12、阶段 2 Spec #45、阶段 3 Spec #104、阶段 4 Spec #108、阶段 5 Spec #109、协作平台 S2 #126 / T1 #134。
 
 本文描述服务端的持久化实体、关系、约束、迁移与事务边界。具体 DDL 以[迁移入口](../../src/server/db/migrations/index.ts)及其子模块为准。v14 属当前工程候选；实现存在不代表该候选已合并、上线或完成双引擎验收，V1 状态见 [V1 索引](../v1-acceptance.md)，v14 见 [S2-T1 #134](https://github.com/gbcdby/boardroom/issues/134)。运行默认 SQLite，可选 PostgreSQL；产品 AC-CORE-01 的 PostgreSQL 验收要求不等于修改默认驱动。
@@ -160,6 +160,12 @@ alias 从现存 Agent 精确回填，之后只追加不重分配。表内保留�
 
 Profile/Binding 仅提供旧 runtime 的只读来源视图，无第二套配置表。预检保留 raw advanced 与实际有效性、requested/applied/effective 三份来源、原始 SID/意图/目录；纯选择器按 requested → applied → 本次完整 effective 返回固定引用，不启动、不激活失效高级策略、不消费意图。详细契约见[角色库与旧配置来源](../identity-catalog.md)。
 
+### 1.12 项目工作区与配置版本（v15）
+
+[project-workspaces.ts](../../src/server/db/migrations/project-workspaces.ts) 增加项目配置 head 和 `project_workspace_versions` 不可变版本。`project_revision` 从 1 开始，由名称、归档/恢复及工作区保存推进；`workspace_revision` 从 0 开始，仅工作区保存推进，包括显式讨论配置 `root_path=NULL`。固定引用为 `(project_id, workspace_revision)`。
+
+工作区服务复用共同项目锁，将 head CAS、完整路径/根身份/Git 观察、mutation ID/输入摘要与 `project.workspace_update` 审计同事务提交。带工作区的项目创建失败整体回滚。旧 runtime 的配置、原 requested/applied 目录与在途执行保持原值；配置模式不提供真实物理写租约。契约见[项目工作区配置](../project-workspaces.md)，候选与验收状态见 [S3-T1 #135](https://github.com/gbcdby/boardroom/issues/135)。
+
 ## 2. 稳定 ID 方案
 
 - 采用 **UUIDv7 值编码为 26 位 Crockford Base32**（ULID 形状），实现见 `src/server/db/ids.ts`。
@@ -207,12 +213,15 @@ Profile/Binding 仅提供旧 runtime 的只读来源视图，无第二套配置�
   - `12 memory_documents_summaries_and_scan_checkpoints`：三层文档/历史、自总结请求、首次投递收据/计数/游标；追加真实 MCP 投递标记和群上下文事件。
   - `13 member_tombstones_and_retained_fact_revisions`：保留身份墓碑、单调加入代际、六类事实版本/双引擎 trigger 与有界采集索引。
   - `14 identity_catalog_roles_aliases_user_audit`：职责模板头/不可变版本、永久 legacy alias 和 user/project scope 一致性审计；旧 runtime 保持配置写权威。
+  - `15 project_workspace_configuration_versions`：项目配置/CAS head 与不可变工作区版本；不回填或应用旧 runtime 目录。
 - 生产迁移保持 SQLite/PostgreSQL 可执行；跨驱动搬运使用 `migrate-data.ts` 的对应目标 DDL、列复制与逐表校验。托管表、已应用快照、进程归属和观测基线均在搬运范围内。
 - `schema.test.ts` 校验当前版本及老库升级，`runtime-repository.test.ts` 与 `migrate-data.test.ts` 检查非空配置、投递和所有权的保留。只读内核核验不依赖迁移重造 PID。
 
 跨驱动复制不修改旧迁移 checksum。源库使用同版本 schema 后只读打开；目标先迁移，再按外键顺序复制。成员插入和事实表复制会触发目标 revision 递增，因此 **member_fact_revisions 最后复制**：先移除目标自动生成的版本行，再原值写入源版本，并逐键/值核对。不能把目标触发出的临时 revision 当源库事实。
 
 v14 的 alias（含退休记录）、职责头/全部版本和 user 审计进入同一搬运清单。职责版本按复制来源依赖排序，清空时先删版本再删头；固定来源引用不能靠级联删除消除。
+
+v15 的项目配置 head 与全部工作区版本也进入逐值搬运校验；工作区版本随项目 purge 清除并参与确认摘要与计数，删群不清这些版本，用户原目录与文件始终保留。
 
 清空目标时先删六类事实，让仍存在的 Member 基准接收删除 trigger；再删除 Member，随后清理剩余事实版本。不能简单把 copy-last 表放到反向顺序首位，否则删除事实时会失去基准而失败。项目 purge 同样在硬删 Member 前清完依赖事实，成员事实版本由外键级联；普通移除不硬删它们。rollback 只处理指定目标，保留源数据；具体命令见[接入与迁移说明](../getting-started-mcp.md#数据迁移与恢复)。
 
