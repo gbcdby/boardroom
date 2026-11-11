@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import select
 import subprocess
+import traceback
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright, expect
 
@@ -48,6 +49,36 @@ def layout(page, label, strict=True):
         assert max(dimensions["document"], dimensions["body"]) <= dimensions["viewport"] + 1, f"{label}: 整页溢出 {dimensions}"
     return {"view": label, **dimensions}
 
+def check_confirmation_layout(page, kind, label, width, height, report, require_overflow=False):
+    dialog = page.get_by_test_id("confirmation-dialog")
+    body = dialog.locator(".confirm-dialog-body")
+    impact = page.get_by_test_id(f"{kind}-purge-confirm")
+    body.evaluate("el => { el.scrollTop = 0; }")
+    measure = "el => ({ scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth })"
+    before = body.evaluate(measure)
+    rect = dialog.bounding_box()
+    geometry = {"view": label, "width": width, "height": height, "requireOverflow": require_overflow,
+        "dialog": rect, "body": body.bounding_box(), "before": before}
+    report.setdefault("confirmationLayouts", []).append(geometry)
+    assert rect and rect["x"] >= 0 and rect["y"] >= 0 and rect["x"] + rect["width"] <= width + 1 and rect["y"] + rect["height"] <= height + 1, f"弹窗超出视口: {geometry}"
+    assert before["scrollWidth"] <= before["clientWidth"] + 1, f"影响清单横向溢出: {geometry}"
+    expect(impact.locator("li").first).to_be_in_viewport(ratio=1)
+    if require_overflow:
+        assert before["scrollHeight"] > before["clientHeight"], f"受限高度场景必须产生正文溢出: {geometry}"
+    body.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    after = body.evaluate(measure)
+    geometry["after"] = after
+    if before["scrollHeight"] > before["clientHeight"]:
+        assert after["scrollTop"] > before["scrollTop"], f"溢出正文未实际滚动: {geometry}"
+        assert after["scrollTop"] >= after["scrollHeight"] - after["clientHeight"] - 1, f"未滚动到正文末尾: {geometry}"
+    expect(impact.locator("p").filter(has_text="全局托管配置")).to_be_in_viewport(ratio=1)
+    expect(impact.locator("p").last).to_be_in_viewport(ratio=1)
+    for action in ("cancel", "confirm"):
+        button = page.get_by_test_id(f"{action}-purge-{kind}")
+        expect(button).to_be_in_viewport(ratio=1)
+        expect(button).to_be_enabled()
+        button.click(trial=True)  # 检查真实命中与可操作性，不执行取消或删除。
+
 def confirmation_flows(page, origin, project_id, org_project_id, output, report):
     """真实操作与数据结果；仅对拒绝/响应丢失场景注入传输故障。"""
     observed = []
@@ -79,14 +110,23 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
             report["checks"].append("S6-AC04/05: Toast关闭按钮桌面38px/窄屏44px命中区与焦点暂停计时")
             toast_target_checked = True
         close.click()
+    def check_tab_cycle():
+        dialog = page.get_by_test_id("confirmation-dialog")
+        for key in ("Tab", "Shift+Tab"):
+            for _ in range(4):
+                page.keyboard.press(key)
+                assert dialog.evaluate("el => el.contains(document.activeElement)"), f"{key} 焦点离开模态窗口"
+    def check_pending_focus():
+        dialog = page.get_by_test_id("confirmation-dialog")
+        expect(dialog.locator("h2")).to_be_focused()
+        check_tab_cycle()
+        expect(dialog.locator("h2")).to_be_focused()
     def cancel_with_keyboard(trigger, cancel_id="confirm-cancel"):
         dialog = page.get_by_test_id("confirmation-dialog")
         expect(dialog).to_be_visible()
         assert dialog.evaluate("el => el.tagName === 'DIALOG' && el.open"), "必须使用原生模态 dialog"
         expect(page.get_by_test_id(cancel_id)).to_be_focused()
-        for _ in range(3):
-            page.keyboard.press("Tab")
-            assert dialog.evaluate("el => el.contains(document.activeElement)"), "焦点离开模态窗口"
+        check_tab_cycle()
         page.keyboard.press("Escape")
         expect(dialog).not_to_be_visible()
         expect(trigger).to_be_focused()
@@ -116,6 +156,7 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     confirm.click()
     expect(confirm).to_be_disabled()
     expect(page.get_by_test_id("confirm-cancel")).to_be_disabled()
+    check_pending_focus()
     confirm.dispatch_event("click")
     page.keyboard.press("Escape")
     expect(page.get_by_test_id("confirmation-dialog")).to_be_visible()
@@ -123,6 +164,10 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     held.pop().fulfill(status=409, content_type="application/json", body=json.dumps({"error": {"code": "ui_test_conflict", "message": "测试：成员关系已变化，请核对后重试"}}))
     expect(page.get_by_test_id("confirmation-error")).to_contain_text("成员关系已变化")
     expect(confirm).to_be_enabled()
+    page.keyboard.press("Tab")
+    expect(page.get_by_test_id("confirm-cancel")).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(confirm).to_be_focused()
     confirm.click()
     expect(confirm).to_be_disabled()
     assert len(held) == 1
@@ -133,7 +178,30 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     expect(page.get_by_test_id("confirmation-error")).to_contain_text("操作结果未知")
     expect(confirm).to_be_disabled()
     page.unroute(route_pattern, hold_remove)
-    page.get_by_test_id("confirmation-reconcile").click()
+    recovery = page.get_by_test_id("confirmation-reconcile")
+    page.get_by_test_id("confirm-cancel").focus()
+    page.keyboard.press("Tab")
+    expect(recovery).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(page.get_by_test_id("confirm-cancel")).to_be_focused()
+    reads = []
+    reconcile_released = False
+    def hold_reconcile(route):
+        if route.request.method == "GET" and not reconcile_released: reads.append(route)
+        else: route.continue_()
+    read_pattern = f"**/api/projects/{project_id}/members"
+    page.route(read_pattern, hold_reconcile)
+    with page.expect_request(lambda req: req.method == "GET" and urlsplit(req.url).path == f"/api/projects/{project_id}/members"):
+        recovery.click()
+    expect(recovery).to_have_count(0)
+    check_pending_focus()
+    assert len(reads) == 1, "权威核对应该读取成员一次"
+    # unroute 移除最后一个 handler 会自动放行挂起请求；先显式放行并等待响应。
+    # 核对释放后，后续成功刷新直接通过，不再次挂起。
+    reconcile_released = True
+    with page.expect_response(lambda response: response.request.method == "GET" and urlsplit(response.url).path == f"/api/projects/{project_id}/members"):
+        reads[0].continue_()
+    page.unroute(read_pattern, hold_reconcile)
     expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
     expect(page.locator("h1")).to_be_focused()
     expect(page.get_by_test_id("new-member-name")).to_have_value("删除成员期间保留的草稿")
@@ -141,7 +209,7 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     assert len(writes(member_path, "DELETE")) == 2, "一次被拒绝、一次明确重试后，不应再次发送移除"
     assert not request(page, origin, "GET", f"/api/projects/{project_id}/members")["members"]
     toast(f"成员「{member['displayName']}」已移除。")
-    report["checks"].append("S6-AC01/02/05: 成员取消/Escape与还焦；pending单飞；注入409拒绝与提交后响应丢失，权威核对完成且保留草稿")
+    report["checks"].append("S6-AC01/02/05: 成员取消/Escape与还焦；Tab/Shift+Tab边界循环；提交/核对全禁用时标题焦点；恢复slot加入/移除；pending单飞；注入409拒绝与提交后响应丢失，权威核对完成且保留草稿")
 
     group = request(page, origin, "GET", f"/api/projects/{project_id}/groups")["groups"][0]
     group_path = f"/api/groups/{group['id']}"
@@ -178,10 +246,16 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     page.get_by_test_id("confirm-purge-group").click()
     expect(page.get_by_test_id("confirmation-error")).to_contain_text("删除影响已变化")
     expect(page.get_by_test_id("confirm-purge-group")).to_be_disabled()
+    page.get_by_test_id("cancel-purge-group").focus()
+    page.keyboard.press("Tab")
+    expect(page.get_by_test_id("confirmation-preview")).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(page.get_by_test_id("cancel-purge-group")).to_be_focused()
     page.unroute(group_pattern, changed_confirmation)
     with page.expect_response(lambda r: r.url.endswith(group_path) and r.request.method == "DELETE") as latest_response:
         page.get_by_test_id("confirmation-preview").click()
     latest_token = latest_response.value.json()["confirmation"]["token"]
+    expect(page.get_by_test_id("cancel-purge-group")).to_be_focused()
     assert previous_token != latest_token
     assert len(committed_purges(group_path)) == 1, "重新预览不能自动删除"
     page.get_by_test_id("confirm-purge-group").click()
@@ -211,21 +285,13 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     purge_project.click()
     expect(page.get_by_test_id("project-purge-confirm")).to_contain_text("组织岗位")
     expect(page.get_by_test_id("confirm-purge-project")).to_be_enabled()
-    for width, height in [(1440, 1000), (390, 844)]:
+    for width, height in [(1440, 1000), (390, 844), (390, 560)]:
         page.set_viewport_size({"width": width, "height": height})
-        dialog = page.get_by_test_id("confirmation-dialog")
-        body = dialog.locator(".confirm-dialog-body")
-        if width == 390:
-            assert body.evaluate("el => el.scrollHeight > el.clientHeight"), "窄窗长清单应在正文内滚动"
-            body.evaluate("el => { el.scrollTop = el.scrollHeight; }")
-        rect = dialog.bounding_box()
-        assert rect and rect["x"] >= 0 and rect["y"] >= 0 and rect["x"] + rect["width"] <= width + 1 and rect["y"] + rect["height"] <= height + 1
-        expect(page.get_by_test_id("confirm-purge-project")).to_be_in_viewport()
-        expect(page.get_by_test_id("cancel-purge-project")).to_be_in_viewport()
-        filename = f"confirmation-project-purge-{width}-light.png"
+        check_confirmation_layout(page, "project", f"confirmation-{width}x{height}", width, height, report, require_overflow=height == 560)
+        filename = f"confirmation-project-purge-{width}x{height}-light.png"
         page.screenshot(path=str(output / filename), animations="disabled")
         report["screenshots"].append(filename)
-        report["layouts"].append(layout(page, f"confirmation-{width}"))
+        report["layouts"].append(layout(page, f"confirmation-{width}x{height}"))
     cancel_with_keyboard(purge_project, "cancel-purge-project")
     assert not committed_purges(project_path)
     assert any(item["id"] == project_id for item in request(page, origin, "GET", "/api/projects?includeArchived=true")["projects"])
@@ -237,7 +303,7 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     assert len(committed_purges(project_path)) == 1
     assert not any(item["id"] == project_id for item in request(page, origin, "GET", "/api/projects?includeArchived=true")["projects"])
     toast("项目「浏览器操作创建的项目」已永久删除。")
-    report["checks"].append("S6-AC01/03/04/05: 项目归档/恢复与只读保护，purge长清单390/1440截图、取消与单次确认，目标消失后标题还焦及全局Toast")
+    report["checks"].append("S6-AC01/03/04/05: 项目归档/恢复与只读保护，purge清单1440x1000/390x844可达及390x560正文实际滚动、末尾保留说明与按钮可操作，取消与单次确认，目标消失后标题还焦及全局Toast")
 
     org = request(page, origin, "GET", f"/api/projects/{org_project_id}/org")
     target = next(node for node in org["nodes"] if node["name"] == "产品设计")
@@ -352,25 +418,16 @@ def purge_runtime_impact_flows(page, origin, workdir, output, report):
         return impact
 
     def capture_impact(kind, phase, cascade):
-        for width, height in [(1440, 1000), (390, 844)]:
+        for width, height in [(1440, 1000), (390, 844), (390, 560)]:
             page.set_viewport_size({"width": width, "height": height})
             impact = visible_impact(kind, cascade)
-            dialog = page.get_by_test_id("confirmation-dialog")
-            body = dialog.locator(".confirm-dialog-body")
-            body.evaluate("el => { el.scrollTop = el.scrollHeight; }")
-            assert body.evaluate("el => el.scrollWidth <= el.clientWidth + 1"), "托管影响清单不能横向溢出"
-            if kind == "project" and width == 390:
-                assert body.evaluate("el => el.scrollHeight > el.clientHeight"), "窄屏完整项目清单应可滚动"
-            rect = dialog.bounding_box()
-            assert rect and rect["x"] >= 0 and rect["y"] >= 0 and rect["x"] + rect["width"] <= width + 1 and rect["y"] + rect["height"] <= height + 1
+            check_confirmation_layout(page, kind, f"purge-runtime-{kind}-{phase}-{width}x{height}", width, height, report, require_overflow=kind == "project" and height == 560)
             for field, label in runtime_labels.items():
                 expect(impact.get_by_text(f"{label}：{cascade[field]} 条", exact=True)).to_be_in_viewport()
-            expect(page.get_by_test_id(f"cancel-purge-{kind}")).to_be_in_viewport()
-            expect(page.get_by_test_id(f"confirm-purge-{kind}")).to_be_in_viewport()
-            filename = f"purge-runtime-{kind}-{phase}-{width}-light.png"
+            filename = f"purge-runtime-{kind}-{phase}-{width}x{height}-light.png"
             page.screenshot(path=str(output / filename), animations="disabled")
             report["screenshots"].append(filename)
-            report["layouts"].append(layout(page, f"purge-runtime-{kind}-{phase}-{width}"))
+            report["layouts"].append(layout(page, f"purge-runtime-{kind}-{phase}-{width}x{height}"))
         page.set_viewport_size({"width": 1440, "height": 1000})
 
     page.goto(origin + f"/projects/{project_id}/overview")
@@ -684,6 +741,7 @@ def main():
                 browser.close()
     except Exception as error:
         report["error"] = str(error)[:5000]
+        report["traceback"] = traceback.format_exc()
     finally:
         if fixture:
             fixture.stdin.close()
