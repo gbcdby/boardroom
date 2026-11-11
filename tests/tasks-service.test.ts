@@ -50,8 +50,8 @@ async function people(repos: RepositorySet) {
   const worker = await add("实现者"); const reviewer = await add("评审者");
   const group = await repos.groups.create({ projectId: project.id, name: "讨论", participantMemberIds: [worker.id, reviewer.id] });
   return { project, worker, reviewer, group, owner: { actor: ownerActor() },
-    workerAccess: { actor: actorForMember(worker), connection: { projectId: project.id, memberId: worker.id, groupId: group.id } },
-    reviewerAccess: { actor: actorForMember(reviewer), connection: { projectId: project.id, memberId: reviewer.id, groupId: group.id } } };
+    workerAccess: { actor: actorForMember(worker), connection: { projectId: project.id, memberId: worker.id, groupId: group.id, membershipRevision: worker.membershipRevision } },
+    reviewerAccess: { actor: actorForMember(reviewer), connection: { projectId: project.id, memberId: reviewer.id, groupId: group.id, membershipRevision: reviewer.membershipRevision } } };
 }
 
 test("AC-TASK-01/02：有效默认 reviewer、正文创建、普通成员评论与越权拒绝", async () => fixture(async repos => {
@@ -125,7 +125,7 @@ test("AC-TASK-03：blocked 跳过空岗上报，subtree 管理与事件 ACK 不�
   const agent = await repos.agents.create({ displayName: "下级管理", hostType: "codex-cli" });
   const manager = await repos.members.create({ projectId: p.project.id, agentId: agent.id, kind: "agent", displayName: agent.displayName });
   await repos.org.assignNode(manager.id, branch.id);
-  const access = { actor: actorForMember(manager), connection: { projectId: p.project.id, memberId: manager.id, groupId: p.group.id } };
+  const access = { actor: actorForMember(manager), connection: { projectId: p.project.id, memberId: manager.id, groupId: p.group.id, membershipRevision: manager.membershipRevision } };
   const task = await service.create(access, p.project.id, { title: "下级任务", body: "需要支持", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id });
   await assert.rejects(service.update(access, p.project.id, task.id, { expectedRevision: task.revision, assigneeMemberId: p.reviewer.id }), { name: "ForbiddenError" });
   const blocked = await service.transition(p.workerAccess, p.project.id, task.id, { expectedRevision: task.revision, state: "blocked", reason: "等待信息" });
@@ -175,7 +175,7 @@ test("#6：任务评论关系只扩大当前群可读范围，详情与历史不
   const agent = await repos.agents.create({ displayName: "旁观者", hostType: "codex-cli" });
   const observer = await repos.members.create({ projectId: p.project.id, agentId: agent.id, kind: "agent", displayName: agent.displayName });
   await repos.groups.addParticipant(p.group.id, observer.id);
-  const access = { actor: actorForMember(observer), connection: { projectId: p.project.id, memberId: observer.id, groupId: p.group.id } };
+  const access = { actor: actorForMember(observer), connection: { projectId: p.project.id, memberId: observer.id, groupId: p.group.id, membershipRevision: observer.membershipRevision } };
   const task = await service.create(p.owner, p.project.id, { title: "消息关联", body: "限制群范围", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id });
   const message = await repos.messages.create({ groupId: p.group.id, senderMemberId: p.worker.id, body: "可见性测试" });
   await service.linkMessage(p.owner, p.project.id, task.id, message.id);

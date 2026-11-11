@@ -4,7 +4,7 @@ import type { Logger } from "../logger.ts";
 import { createMcpCore, type ManagedCoreAuthority, type McpCore, type SessionBinding } from "../mcp/core.ts";
 import { createMcpServer } from "../mcp/server.ts";
 import { newId } from "../db/ids.ts";
-import { createRepositories } from "../db/repositories.ts";
+import { createRepositories, type RepositorySet } from "../db/repositories.ts";
 import { createOrgActorResolver } from "../authz/org-actors.ts";
 import type { Actor } from "../authz/authorize.ts";
 
@@ -20,6 +20,7 @@ export interface RuntimeGateway {
 
 export async function createRuntimeGateway(options: {
   db: DbDriver;
+  repos?: RepositorySet;
   logger: Logger;
   authority: ManagedCoreAuthority;
   onJoined: () => Promise<void>;
@@ -37,7 +38,8 @@ export async function createRuntimeGateway(options: {
   let loss: Promise<void> | null = null;
   let closing: Promise<void> | null = null;
   const log = options.logger.child({ component: "managed-mcp" });
-  const orgResolver = createOrgActorResolver(createRepositories(options.db));
+  const repos = options.repos ?? createRepositories(options.db);
+  const orgResolver = createOrgActorResolver(repos);
   function closeBusiness(): Promise<void> {
     if (businessClosing) return businessClosing;
     joined = false;
@@ -65,8 +67,8 @@ export async function createRuntimeGateway(options: {
       transport = channel;
       const authority: ManagedCoreAuthority = {
         ...options.authority,
-        run(operation, fn) {
-          const promise = options.authority.run(operation, fn).then(async (result) => {
+        run(operation, fn, discover) {
+          const promise = options.authority.run(operation, fn, discover).then(async (result) => {
             if (operation === "join" && !disconnected && !normalClosing) { joined = true; await options.onJoined(); }
             return result;
           });
@@ -75,7 +77,7 @@ export async function createRuntimeGateway(options: {
           return promise;
         },
       };
-      core = createMcpCore({ db: options.db, logger: options.logger, managed: authority,
+      core = createMcpCore({ db: options.db, ...{ repos }, logger: options.logger, managed: authority,
         memberKey: `managed:${newId()}`,
         authz: { actorFor: options.actorFor ?? (binding => orgResolver.actorForMcpBinding(binding)) } });
       mcp = createMcpServer({ core, logger: options.logger });

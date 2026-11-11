@@ -322,6 +322,7 @@ onBeforeUnmount(() => {
         <li v-for="message in messages" :key="message.id" class="message" :class="{ own: message.senderMemberId === senderId }">
           <div class="message-heading">
             <span class="sender">{{ message.senderDisplayName ?? nameOf(message.senderMemberId) }}</span>
+            <span v-if="message.senderRemoved" class="badge">已移除</span>
             <time :datetime="message.createdAt" :title="fullTimeLabel(message.createdAt)">{{ timeLabel(message.createdAt) }}</time>
             <span class="sequence" :title="`消息序号 ${message.seq}`">#{{ message.seq }}</span>
           </div>

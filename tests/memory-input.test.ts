@@ -4,7 +4,7 @@ import { invokeMemoryOperation, MEMORY_COMMANDS } from "../src/server/memory/mcp
 import type { MemoryService, MemoryAccess } from "../src/server/memory/service.ts";
 import { actorForSession } from "../src/server/authz/actors.ts";
 
-const binding = { projectId: "project-one", agentId: "agent-one", memberId: "member-one", groupId: "group-one" };
+const binding = { projectId: "project-one", agentId: "agent-one", memberId: "member-one", groupId: "group-one", membershipRevision: 1 };
 const access: MemoryAccess = { actor: actorForSession(binding), connection: binding, injectionBindingGeneration: "trusted-generation" };
 function stub() {
   const calls: unknown[] = [];

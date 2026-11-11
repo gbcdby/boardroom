@@ -467,6 +467,7 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
               <li>成员：{{ pendingProjectPurge.cascade.members }} 个</li>
               <li>群聊消息：{{ pendingProjectPurge.cascade.messages }} 条（投递记录 {{ pendingProjectPurge.cascade.deliveries }} 条）</li>
               <li>成员状态：{{ pendingProjectPurge.cascade.memberStatuses }} 条</li>
+              <li>成员关系版本：{{ pendingProjectPurge.cascade.memberFactRevisions }} 条</li>
               <li>MCP 会话记录：{{ pendingProjectPurge.cascade.mcpSessions }} 条</li>
             </ul>
             <p class="muted small">项目共享与成员记忆会随项目删除。Agent 的全局私有记忆保留。</p>

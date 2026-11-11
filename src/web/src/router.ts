@@ -10,6 +10,7 @@ import PlaceholderView from "./views/PlaceholderView.vue";
 import TasksView from "./views/TasksView.vue";
 import TaskDetailView from "./views/TaskDetailView.vue";
 import MemoryView from "./views/MemoryView.vue";
+import SettingsView from "./views/SettingsView.vue";
 import { useCurrentProject } from "./composables/useCurrentProject.ts";
 
 /**
@@ -44,7 +45,7 @@ export const router = createRouter({
     { path: "/memory", name: "memory", component: MemoryView, meta: { projectSection: "memory", title: "记忆" } },
     { path: "/groups", name: "groups", redirect: "/chat" },
     { path: "/members", name: "members", component: ProjectsView, meta: { projectSection: "members" } },
-    { path: "/settings", name: "settings", component: PlaceholderView, props: { title: "设置" } },
+    { path: "/settings", name: "settings", component: SettingsView, meta: { title: "设置" } },
     { path: "/:pathMatch(.*)*", name: "not-found", component: PlaceholderView, props: { title: "页面不存在" } },
   ],
 });

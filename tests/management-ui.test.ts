@@ -11,6 +11,7 @@ const project = { id: "project-1", name: "界面验收", manager: null, archived
 const auditEntry = {
   id: "audit-1", projectId: project.id, action: "member.add", targetKind: "member", targetName: "小林", targetId: "member-1",
   actorKind: "human", actorName: "用户", createdAt: "2026-11-11T01:00:00.000Z", reversedAt: null,
+  before: { schema: "member-relations/v2" }, after: { schema: "member-relations/v2" }, reversible: true, detail: null,
 };
 
 test("审计撤销仅提交一次，刷新列表后仍显示成功反馈", async () => {
@@ -29,7 +30,7 @@ test("审计撤销仅提交一次，刷新列表后仍显示成功反馈", async
     assert.equal(mutations, 1, "请求进行中不能重复撤销同一事件");
     assert.equal(byTestId(container, "audit-revoke").props.disabled, true);
     reversed = true;
-    request.resolve(json({ ok: true }));
+    request.resolve(json({ entry: { ...auditEntry, id: "audit-reversal", action: "member.revoke" } }));
     await Promise.all([first, duplicate]);
     await settle();
     assert.match(textOf(byTestId(container, "audit-notice")), /已撤销/);

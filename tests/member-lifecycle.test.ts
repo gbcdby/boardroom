@@ -423,20 +423,27 @@ test("LIFE-MEM-01：pending 成员可经 HTTP 登记、花名册可见、enable 
 });
 
 test("守卫：顶层 manager 可暂停成员（ORG-07 无需确认）、可归档但不可永久删除（AC-LIFE-01）；普通成员被拒", async () => {
+  let managerId = "", ordinaryId = "";
   await withServer(
     {
       logger: silentLogger,
       authorization: {
         resolveHttpActor: async ({ request, projectId }) => {
           const as = request.headers["x-as"];
-          if (as === "manager") return actorFor(projectId ?? "", "top_manager");
-          if (as === "member") return actorFor(projectId ?? "", "member");
+          if (as === "manager") return { ...actorFor(projectId ?? "", "top_manager"), actorId: managerId };
+          if (as === "member") return { ...actorFor(projectId ?? "", "member"), actorId: ordinaryId };
           return ownerActor(projectId);
         },
       },
     },
     async (server) => {
       const project = await createProject(server, "守卫项目");
+      // 真实持久化身份供锁内重新授权；测试注入点不能虚构一个不存在的 manager。
+      const repos = createRepositories(server.database);
+      const managerAgent = await repos.agents.create({ displayName: "实际主管", hostType: "codex" });
+      managerId = (await repos.members.create({ projectId: project.id, kind: "agent", agentId: managerAgent.id, displayName: "实际主管", role: "manager" })).id;
+      const ordinaryAgent = await repos.agents.create({ displayName: "实际成员", hostType: "codex" });
+      ordinaryId = (await repos.members.create({ projectId: project.id, kind: "agent", agentId: ordinaryAgent.id, displayName: "实际成员" })).id;
       const alice = await addHuman(server, project.id, "Alice");
       const group = await createGroup(server, project.id, "群", [alice.id]);
       const asManager = { "x-as": "manager" };

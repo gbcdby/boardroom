@@ -1,5 +1,6 @@
 /** #83/#84：托管配置、执行意图与观察状态彼此独立。这里只保存非秘密数据。 */
 import type { OwnedProcessIdentity } from "./hosts/types.ts";
+import type { MutationDiscover } from "../db/mutation-scope.ts";
 export type RuntimeBackend = "claude-code" | "codex-cli" | "dsh";
 export type RuntimePermissionMode = "auto" | "manual" | "workspace-write";
 /** 暂只定义已知宿主策略；是否可运行仍由真实版本/OS 能力检查决定。 */
@@ -176,7 +177,7 @@ export interface RuntimeRepository {
   claim(id: string, owner: string, options?: { leaseMs?: number; expectedIntentRevision?: number; expectedConfigDigest?: string }): Promise<RunnerFence>;
   checkFence(fence: RunnerFence, options?: FenceOptions): Promise<RuntimeBindingView>;
   /** fn 只执行同一数据库上的短事务操作；不可在里面等待 CLI/网络/模型。 */
-  withFence<T>(fence: RunnerFence, fn: () => Promise<T>, options?: FenceOptions): Promise<T>;
+  withFence<T>(fence: RunnerFence, fn: () => Promise<T>, options?: FenceOptions, discover?: MutationDiscover): Promise<T>;
   renew(fence: RunnerFence, leaseMs?: number): Promise<void>;
   /** supervisor 在已观察连续健康窗口后调用，不能由消息或 CLI 输出自行重置。 */
   resetFailures(fence: RunnerFence): Promise<void>;
@@ -191,8 +192,8 @@ export interface RuntimeRepository {
   /** 无进程所有权时记录排队原因；不可覆盖活跃 generation。 */
   queued(id: string, reason: string | null, retryAt?: string | null): Promise<RuntimeBindingView>;
   listWakeable(): Promise<WakeableRuntimeBinding[]>;
-  /** 与 MCP join 共用成员行锁；允许嵌入现有 DbDriver 事务。 */
-  withMemberLock<T>(memberId: string, fn: () => Promise<T>): Promise<T>;
+  /** 兼容入口先进入共同项目/完整成员 scope；已持 scope 只允许子集重入。 */
+  withMemberLock<T>(memberId: string, fn: () => Promise<T>, discover?: MutationDiscover): Promise<T>;
   /** 外部 join 须在 withMemberLock 内调用并在同一事务中建立连接。 */
   assertExternalJoinAllowed(memberId: string): Promise<void>;
   removeBinding(id: string): Promise<void>;

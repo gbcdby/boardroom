@@ -31,6 +31,7 @@ import { runtimeObservabilityMigration } from "./migrations/runtime-observabilit
 import { runtimeProcessIdentityMigration } from "./migrations/runtime-process-identity.ts";
 import { tasksMigration } from "./migrations/tasks.ts";
 import { memoryMigration } from "./migrations/memory.ts";
+import { memberLifecycleMigration } from "./migrations/member-lifecycle.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -42,6 +43,8 @@ export interface TableSpec {
   readonly name: string;
   /** 作为主键的「键列」，用于跨库一致性校验（复合主键用多列）。 */
   readonly keyColumns: readonly string[];
+  /** v13 事实代际必须数值一致，不能只核对键集合。 */
+  readonly valueColumns?: readonly string[];
   /** 覆盖默认 `SELECT *` 的源读取 SQL（如 org_nodes 的层级排序）。 */
   readonly readSql?: string;
 }
@@ -98,12 +101,16 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
   { name: "agent_runtime_events", keyColumns: ["id"] },
   { name: "agent_runtime_observation_meta", keyColumns: ["id"] },
   { name: "agent_runtime_usage_snapshots", keyColumns: ["id"] },
+  { name: "member_fact_revisions", keyColumns: ["member_id", "kind"], valueColumns: ["revision"] },
 ];
 
 /** 清空目标表时使用的反向顺序（子表先于父表），避免删除触发外键冲突。 */
 const REVERSE_TABLE_ORDER: readonly string[] = [...BUSINESS_TABLES]
   .map((t) => t.name)
-  .reverse();
+  .filter(name => name !== "member_fact_revisions")
+  .reverse()
+  // 先清六类事实，让 trigger 正常递增；members 删除后版本才可清理。
+  .flatMap(name => name === "members" ? [name, "member_fact_revisions"] : [name]);
 
 // ---------------------------------------------------------------------------
 // PostgreSQL 业务表 DDL（v1–v6 的 PG 方言镜像；生产 SQLite DDL 完全不动）
@@ -315,6 +322,7 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   runtimeProcessIdentityMigration,
   tasksMigration,
   memoryMigration,
+  memberLifecycleMigration,
 ];
 
 // ---------------------------------------------------------------------------
@@ -367,6 +375,8 @@ export async function copyAllTables(
   const counts: Record<string, number> = {};
   await target.transaction(async (tx) => {
     for (const spec of BUSINESS_TABLES) {
+      // 前面的 member/事实 INSERT 已产生临时代际；最后精确覆盖源值，之后不再写监控表。
+      if (spec.name === "member_fact_revisions") await tx.exec("DELETE FROM member_fact_revisions");
       counts[spec.name] = await copyTable(source, tx, spec);
     }
   });
@@ -383,6 +393,7 @@ export interface TableValidation {
   readonly targetCount: number;
   readonly countMatch: boolean;
   readonly keysMatch: boolean;
+  readonly valuesMatch: boolean;
 }
 
 export interface ValidationReport {
@@ -395,23 +406,28 @@ export async function compareData(source: DbDriver, target: DbDriver): Promise<V
   const tables: TableValidation[] = [];
   let ok = true;
   for (const spec of BUSINESS_TABLES) {
+    const columns = [...spec.keyColumns, ...(spec.valueColumns ?? [])];
     const srcRows = await source.query<DbRow>(
-      `SELECT ${spec.keyColumns.join(", ")} FROM ${spec.name}`,
+      `SELECT ${columns.join(", ")} FROM ${spec.name}`,
     );
     const dstRows = await target.query<DbRow>(
-      `SELECT ${spec.keyColumns.join(", ")} FROM ${spec.name}`,
+      `SELECT ${columns.join(", ")} FROM ${spec.name}`,
     );
     const srcKeys = new Set(srcRows.map((r) => keyOf(r, spec.keyColumns)));
     const dstKeys = new Set(dstRows.map((r) => keyOf(r, spec.keyColumns)));
     const countMatch = srcRows.length === dstRows.length;
     const keysMatch = srcKeys.size === dstKeys.size && [...srcKeys].every((k) => dstKeys.has(k));
-    if (!countMatch || !keysMatch) ok = false;
+    const values = (row: DbRow) => JSON.stringify((spec.valueColumns ?? []).map(column => row[column] === null ? null : String(row[column])));
+    const dstValues = new Map(dstRows.map(row => [keyOf(row, spec.keyColumns), values(row)]));
+    const valuesMatch = !spec.valueColumns || srcRows.every(row => dstValues.get(keyOf(row, spec.keyColumns)) === values(row));
+    if (!countMatch || !keysMatch || !valuesMatch) ok = false;
     tables.push({
       table: spec.name,
       sourceCount: srcRows.length,
       targetCount: dstRows.length,
       countMatch,
       keysMatch,
+      valuesMatch,
     });
   }
   return { tables, ok };

@@ -19,8 +19,9 @@
 | 审计与撤销 `/audit` | 变更记录、由人撤销可逆的成员/组织变更；永久删除不可撤销，归档/恢复使用对应正向操作 | [审计页面](src/web/src/views/AuditView.vue) |
 | 跨项目概览 `/` | 展示各项目状态、成员/群组/消息/在线人数、最近活动与归档筛选；数据来自 `GET /api/projects` | [首页实现](src/web/src/views/HomeView.vue)、[HTTP 实现](src/server/api.ts) |
 | 任务 `/projects/:projectId/tasks` | 看板与列表、负责人和 reviewer、状态流转、固定 Git 候选、独立双轴报告和最终裁决、工作通知与历史 | [任务与评审](docs/tasks-and-review.md) |
+| 设置 `/settings` | 当前服务实际生效的只读配置、配置来源与重启生效说明、刷新与 MCP 地址复制 | [设置与配置生效](docs/settings.md) |
 
-项目页面共享顶部“当前项目”，旧 `/chat`、`/org`、`/audit`、`/status`、`/tasks` 链接继续兼容该上下文。`/settings` 仍是占位页，三层记忆尚未提供。任务协议和页面已实现，真实模型双轴执行验收仍待完成。页面入口以[路由表](src/web/src/router.ts)为准。
+项目页面共享顶部“当前项目”，旧 `/chat`、`/org`、`/audit`、`/status`、`/tasks` 链接继续兼容该上下文。`/settings` 是独立于项目的全局只读页面。任务协议和页面已实现，真实模型双轴执行验收仍待完成。页面入口以[路由表](src/web/src/router.ts)为准。
 
 ## 快速开始
 
@@ -86,6 +87,8 @@ npm start
 ## 配置与存储
 
 优先级为 **默认值 → 配置文件 → 环境变量**。`AGENT_STUDIO_CONFIG` 可指定配置文件；未设置时读取 `<cwd>/config.json`，默认文件不存在则使用默认值。参考 [config.example.json](config.example.json)，实际解析规则见 [config.ts](src/server/config.ts)。
+
+在 `/settings` 查看当前进程已经生效的配置与实际 MCP 地址。修改配置文件或启动环境后，正常停止并重新启动服务，再刷新页面核对；页面不保存配置或执行重启。详见[设置与配置生效](docs/settings.md)。
 
 | 配置字段 | 环境变量 | 默认值 / 说明 |
 | --- | --- | --- |

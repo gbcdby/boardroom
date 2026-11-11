@@ -22,6 +22,13 @@ export type RepositoryErrorCode =
   | "invalid_reference"
   | "invalid_argument"
   | "write_failed"
+  | "mutation_scope_changed"
+  | "member_removed"
+  | "compensation_conflict"
+  | "legacy_incomplete_snapshot"
+  | "chain_broken"
+  | "audit_snapshot_too_large"
+  | "audit_capture_budget_exceeded"
   /** 目标项目/群组处于归档态：写路径拒绝，恢复后放行（#48 PROJECT-03 / GROUP-04）。 */
   | "archived";
 

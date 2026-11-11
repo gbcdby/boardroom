@@ -124,6 +124,7 @@ export interface MessageDto {
   seq: number;
   senderMemberId: string;
   senderDisplayName: string | null;
+  senderRemoved?: boolean;
   text: string;
   mentions: string[];
   wakeMemberIds: string[];
@@ -178,6 +179,7 @@ export async function request<T>(method: string, path: string, body?: unknown): 
  * 项目清群组/群聊/投递/成员/状态/会话；群组只清群聊与参与者关系（成员保留）。
  */
 export interface ProjectPurgeCascade {
+  memberFactRevisions: number;
   memoryDocuments: number;
   memoryVersions: number;
   memorySummaryRequests: number;
@@ -241,7 +243,7 @@ export type PurgeOutcome<T> =
   | { readonly state: "confirmation_required"; readonly confirmation: T }
   | { readonly state: "deleted" };
 
-/** T5 #52：审计事件视图（与 `src/server/audit.ts` 的 `auditView` 对应）。JSON 快照以字符串原样透传。 */
+/** 审计事件视图；before/after/detail 是服务端解析后的 JSON 值。 */
 export interface AuditEntryDto {
   id: string;
   projectId: string;
@@ -252,10 +254,11 @@ export interface AuditEntryDto {
   targetKind: string;
   targetId: string;
   targetName: string;
-  changed: string | null;
-  before: string | null;
-  after: string | null;
-  detail: string | null;
+  changed: unknown;
+  before: unknown;
+  after: unknown;
+  detail: unknown;
+  reversible: boolean;
   reversedAt: string | null;
   reversedByAuditId: string | null;
   createdAt: string;

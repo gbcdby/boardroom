@@ -13,11 +13,11 @@ import { beginTaskReviewSchema, commentTaskSchema, createTaskSchema, decideTaskR
   parseTaskInput, startTaskReviewSchema, submitReviewReportSchema, taskSettingsSchema, transitionTaskSchema, updateTaskSchema } from "./schemas.ts";
 import { captureReviewCandidate } from "./candidate.ts";
 import { TaskError } from "./errors.ts";
+import type { MutationDiscover } from "../db/mutation-scope.ts";
+import { discoverDomainMutation, type DomainAccess, type DomainMutationTargets } from "../mutation-access.ts";
 
-export interface TaskAccess {
-  readonly actor: Actor;
-  readonly connection?: { readonly projectId: string; readonly memberId: string; readonly groupId: string };
-  readonly runMutation?: <T>(operation: "write" | "consume", body: () => Promise<T>) => Promise<T>;
+export interface TaskAccess extends DomainAccess {
+  readonly runMutation?: <T>(operation: "write" | "consume", body: () => Promise<T>, discover?: MutationDiscover) => Promise<T>;
 }
 export interface TaskService {
   getSettings(access: TaskAccess, projectId: string): Promise<TaskSettings>;
@@ -65,7 +65,8 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
     let actor = access.actor;
     if (actor.kind === "agent") {
       const member = await repos.members.get(actor.actorId);
-      if (!member || member.kind !== "agent" || member.projectId !== projectId || member.status !== "active") deny("task:view", "成员不存在、已离岗或不属于本项目。", "not_a_member");
+      if (!member || member.removedAt !== null || member.kind !== "agent" || member.projectId !== projectId || member.status !== "active") deny("task:view", "成员不存在、已离岗或不属于本项目。", "not_a_member");
+      if (access.connection && (!Number.isSafeInteger(access.connection.membershipRevision) || access.connection.membershipRevision !== member.membershipRevision)) deny("task:view", "成员授权代际已变化，请重新加入会话。", "out_of_connection");
       actor = (await orgActorForMember(repos, member.id)) ?? actorForMember(member);
     }
     authorizeOrThrow(actor, "task:view", { projectId });
@@ -86,7 +87,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
   async function validMember(projectId: string, id: string | null, reviewer = false): Promise<Member> {
     if (!id) throw new TaskError(reviewer ? "reviewer_required" : "assignee_required", reviewer ? "请先指定有效的评审 Agent。" : "请先指定任务负责人。", "invalid_reference");
     const member = await repos.members.get(id);
-    if (!member || member.projectId !== projectId || member.status !== "active" || (reviewer && member.kind !== "agent")) {
+    if (!member || member.removedAt !== null || member.projectId !== projectId || member.status !== "active" || (reviewer && member.kind !== "agent")) {
       throw new TaskError(reviewer ? "reviewer_invalid" : "assignee_invalid", reviewer ? "评审人必须是本项目在岗的 Agent。" : "负责人必须是本项目在岗成员。", "invalid_reference");
     }
     return member;
@@ -108,9 +109,10 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
   function expect(task: Task, revision: number): void {
     if (task.revision !== revision) throw new TaskError("task_revision_conflict", "任务已被更新，请刷新后重试。", "conflict");
   }
-  async function mutate<T>(access: TaskAccess, projectId: string, body: (ctx: Context) => Promise<T>, operation: "write" | "consume" = "write"): Promise<T> {
+  async function mutate<T>(access: TaskAccess, projectId: string, body: (ctx: Context) => Promise<T>, operation: "write" | "consume" = "write", targets: DomainMutationTargets = {}): Promise<T> {
     const events: WorkEvent[] = []; const changed = new Map<string, number>();
-    const work = () => repos.transaction(async () => {
+    const discover = discoverDomainMutation(access, projectId, targets);
+    const work = () => repos.mutations.run({ projectIds: [projectId], discover }, () => repos.transaction(async () => {
       try {
         const actor = await actorFor(access, projectId, true);
         return await body({ actor, author: await authorFor(actor), at: now(), events, changed });
@@ -118,9 +120,9 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         if (error instanceof ForbiddenError) throw new GuardRollback(error);
         throw error;
       }
-    });
+    }));
     let result: T;
-    try { result = await (access.runMutation ? access.runMutation(operation, work) : work()); }
+    try { result = await (access.runMutation ? access.runMutation(operation, work, discover) : work()); }
     catch (error) { if (error instanceof GuardRollback) throw error.denial; throw error; }
     // 提交后的通知失败不能使调用方误认为事务回滚；DB 队列是可靠来源。
     try { if (events.length) await options.onWorkEvents?.(events); }
@@ -240,7 +242,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         const settings = await repos.tasks.setSettings(projectId, value.expectedRevision, value.defaultReviewerMemberId);
         await appendAuditEntry(repos.audit, { projectId, actor: auditActorFrom(ctx.actor), action: "task.settings_updated", targetKind: "project", targetId: projectId, targetName: "任务设置", after: settings });
         return settings;
-      });
+      }, "write", { memberIds: [value.defaultReviewerMemberId], taskDefaults: true });
     },
     async list(access, projectId, filter = {}) { const parsed = parseTaskInput(listTasksSchema, filter); await actorFor(access, projectId); return repos.tasks.list(projectId, parsed); },
     async get(access, projectId, taskId) {
@@ -263,7 +265,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         await history(ctx, task, "task.created");
         await event(ctx, task, task.assigneeMemberId, "task.assigned", `task:${task.id}:revision:1:assigned`);
         return task;
-      });
+      }, "write", { memberIds: [value.assigneeMemberId, value.reviewerMemberId], taskDefaults: value.reviewerMemberId === undefined });
     },
     async update(access, projectId, taskId, input) {
       const { expectedRevision, ...patch } = parseTaskInput(updateTaskSchema, input);
@@ -282,7 +284,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         await history(ctx, updated, "task.updated", { fields: Object.keys(patch), previousRevision: task.revision });
         if (updated.assigneeMemberId !== task.assigneeMemberId) await event(ctx, updated, updated.assigneeMemberId, "task.assigned", `task:${task.id}:revision:${updated.revision}:assigned`);
         return updated;
-      });
+      }, "write", { taskId, memberIds: [patch.assigneeMemberId, patch.reviewerMemberId] });
     },
     async transition(access, projectId, taskId, input) {
       const value = parseTaskInput(transitionTaskSchema, input);
@@ -302,7 +304,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
           await event(ctx, updated, recipientMemberId, "task.blocked", `task:${taskId}:revision:${updated.revision}:blocked`, { reason: value.reason });
         }
         await history(ctx, updated, "task.transitioned", detail); return updated;
-      });
+      }, "write", { taskId, escalation: value.state === "blocked" });
     },
     async comment(access, projectId, taskId, body) {
       const value = parseTaskInput(commentTaskSchema, { body });
@@ -310,7 +312,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         authorizeOrThrow(ctx.actor, "task:comment", { projectId }); const task = await required(projectId, taskId);
         const comment = await repos.tasks.addComment({ id: newId(), projectId, taskId, kind: "comment", author: ctx.author, body: value.body, createdAt: ctx.at, reviewReportId: null });
         await history(ctx, task, "task.commented", { commentId: comment.id }); return comment;
-      });
+      }, "write", { taskId });
     },
     async linkMessage(access, projectId, taskId, messageId) {
       parseTaskInput(linkTaskMessageSchema, { messageId });
@@ -323,7 +325,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         const link = await repos.tasks.linkMessage(projectId, { taskId, messageId, groupId: message.groupId, createdAt: ctx.at });
         // history 对全项目可读；具体消息引用仅在经过群组过滤的 messageLinks 或受限审计中返回。
         await history(ctx, task, "task.message_linked", { linked: true }, { messageId, groupId: message.groupId }); return link;
-      });
+      }, "write", { taskId, messageId });
     },
     async canReadLinkedMessage(access, projectId, messageId) {
       try { return await messageVisible(access, projectId, messageId, await actorFor(access, projectId)); }
@@ -337,7 +339,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         await validMember(projectId, task.assigneeMemberId); await reviewerFor(task);
         return task;
       };
-      const snapshot = await mutate(access, projectId, prepare, "consume");
+      const snapshot = await mutate(access, projectId, prepare, "consume", { taskId });
       let candidate: ReviewCandidate | null = null; let failure: ReviewRound["failure"] = null;
       // 真正的 Git 工作在任何 DB/managed authority 事务外，提交时再进入短 fence。
       try {
@@ -361,7 +363,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         await history(ctx, updated, "task.review_started", { roundId: round.id, baseCommit: candidate!.baseCommit, candidateCommit: candidate!.candidateCommit, diffSha256: candidate!.diffSha256 });
         await event(ctx, updated, updated.reviewerMemberId, "task.review_ready", `review:${round.id}:ready`, { roundId: round.id });
         return { ready: true as const, task: updated, round };
-      });
+      }, "write", { taskId });
     },
     async beginReview(access, projectId, taskId, roundId, input) {
       const value = parseTaskInput(beginTaskReviewSchema, input);
@@ -371,7 +373,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         currentRound(task, round, value.expectedTaskRevision, value.expectedRoundRevision, ["ready"]);
         const updated = await repos.tasks.updateRoundCas(projectId, roundId, round.revision, { state: "running" }, ctx.at);
         await history(ctx, task, "task.review_begun", { roundId, roundRevision: updated.revision }); return updated;
-      });
+      }, "write", { taskId, roundId });
     },
     async submitReport(access, projectId, taskId, roundId, input) {
       const value = parseTaskInput(submitReviewReportSchema, input);
@@ -394,7 +396,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
           body: value.body, sources: value.sources, evidence: value.evidence, contentSha256, author: ctx.author, createdAt: ctx.at });
         await repos.tasks.addComment({ id: newId(), projectId, taskId, kind: "review_report", author: ctx.author, body: value.body, createdAt: ctx.at, reviewReportId: report.id });
         await history(ctx, task, "task.review_reported", { roundId, reportId: report.id, axis: report.axis, verdict: report.verdict }); return report;
-      });
+      }, "write", { taskId, roundId });
     },
     async decideReview(access, projectId, taskId, roundId, input) {
       const value = parseTaskInput(decideTaskReviewSchema, input);
@@ -417,7 +419,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
           completionRevision: updated.revision, assigneeAgentId: assignee?.kind === "agent" ? assignee.agentId : null,
         });
         return updated;
-      });
+      }, "write", { taskId, roundId });
     },
     async listWorkEvents(access, projectId) {
       const actor = await actorFor(access, projectId);

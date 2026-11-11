@@ -13,12 +13,12 @@ import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
 import { createT1ApiRouter } from "../src/server/api.ts";
 import { createLogger } from "../src/server/logger.ts";
-import { appendAuditEntry, createAuditRecorder } from "../src/server/audit.ts";
+import { appendAuditEntry } from "../src/server/audit.ts";
 
 // 不开监听端口：真实路由、请求体解析、守卫、SQLite 仓储和补偿事务，仅替换 HTTP 传输。
 type Call = (method: string, url: string, body?: unknown) => Promise<{ status: number; body: any }>;
-function routerCall(driver: DbDriver, repos: RepositorySet): Call {
-  const router = createT1ApiRouter({ db: driver, logger: createLogger({ level: "error", write: () => {} }), orgChangeRecorder: createAuditRecorder(repos.audit) });
+function routerCall(driver: DbDriver): Call {
+  const router = createT1ApiRouter({ db: driver, logger: createLogger({ level: "error", write: () => {} }) });
   return async (method, url, body) => {
     const request = Object.assign(Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]), { method, url, headers: {} }) as IncomingMessage;
     let status = 200;
@@ -35,7 +35,7 @@ async function withRouter(run: (repos: RepositorySet, call: Call, driver: Sqlite
     await driver.connect();
     await driver.migrate(migrations);
     const repos = createRepositories(driver);
-    await run(repos, routerCall(driver, repos), driver);
+    await run(repos, routerCall(driver), driver);
   } finally { await driver.close(); await rm(directory, { recursive: true, force: true }); }
 }
 
@@ -51,12 +51,12 @@ test("岗位改名可撤销与重做，补偿快照只序列化一次并读回�
     assert.equal((await repos.org.getNode(node.id))?.name, "项目统筹");
     assert.equal((await repos.org.getNode(node.id))?.sortOrder, 1.5, "合法小数排序快照可恢复");
     const stored = (await repos.audit.get(project.id, undo.body.entry.id))!;
-    assert.equal(JSON.parse(stored.before!).name, "新的统筹");
-    assert.equal(JSON.parse(stored.after!).name, "项目统筹");
+    assert.equal(JSON.parse(stored.before!).node.name, "新的统筹");
+    assert.equal(JSON.parse(stored.after!).node.name, "项目统筹");
     const redo = await call("POST", `/api/projects/${project.id}/audit/${stored.id}/revoke`);
     assert.equal(redo.status, 200, JSON.stringify(redo.body));
     assert.equal((await repos.org.getNode(node.id))?.name, "新的统筹");
-    assert.equal(redo.body.entry.after.name, "新的统筹");
+    assert.equal(redo.body.entry.after.node.name, "新的统筹");
   });
 });
 
@@ -111,7 +111,9 @@ test("损坏、错误目标与跨项目快照拒绝补偿，业务和审计均�
       if (invalid === "{broken") await driver.exec("UPDATE audit_log SET before = ? WHERE id = ?", [invalid, row.id]);
       const count = (await repos.audit.list(project.id)).length;
       const denied = await call("POST", `/api/projects/${project.id}/audit/${row.id}/revoke`);
-      assert.equal(denied.status, 400, JSON.stringify(denied.body));
+      const foreignParent = typeof invalid === "object" && invalid !== null && "parentId" in invalid && invalid.parentId === foreign.id;
+      assert.equal(denied.status, foreignParent ? 409 : 400, JSON.stringify(denied.body));
+      if (foreignParent) assert.equal(denied.body.error.code, "compensation_conflict");
       assert.equal((await repos.org.getNode(before.id))?.name, "当前岗位");
       assert.equal((await repos.org.getNode(foreign.id))?.name, "其他统筹");
       assert.equal((await repos.audit.get(project.id, row.id))?.reversedAt, null);
@@ -175,7 +177,7 @@ test("真实 PostgreSQL 两个事务同时读到未撤销时，仅一个补偿�
     await driver.connect();
     await driver.migrate(migrations);
     const repos = createRepositories(driver);
-    const call = routerCall(driver, repos);
+    const call = routerCall(driver);
     const project = await repos.projects.create({ name: "并发补偿" });
     const node = await repos.org.createNode({ projectId: project.id, name: "之前", role: "top_manager" });
     assert.equal((await call("PUT", `/api/org/nodes/${node.id}`, { name: "之后" })).status, 200);

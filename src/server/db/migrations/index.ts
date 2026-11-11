@@ -1,4 +1,5 @@
 import { memoryMigration } from "./memory.ts";
+import { memberLifecycleMigration } from "./member-lifecycle.ts";
 import type { Migration } from "../migrate.ts";
 import { durableMessageDispatch } from "./message-dispatch.ts";
 import { managedRuntime } from "./runtime.ts";
@@ -434,4 +435,5 @@ export const migrations: readonly Migration[] = [
   runtimeProcessIdentityMigration,
   tasksMigration,
   memoryMigration,
+  memberLifecycleMigration,
 ];

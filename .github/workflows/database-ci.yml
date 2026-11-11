@@ -168,6 +168,9 @@ jobs:
       - name: 记忆编辑、冲突与历史真实浏览器验证
         run: .agent-output/browser-venv/bin/python scripts/e2e-memory-web.py
 
+      - name: 只读设置、配置重启与键盘布局真实浏览器验证
+        run: .agent-output/browser-venv/bin/python scripts/e2e-settings-web.py
+
       - name: 保存浏览器截图与逐项报告
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -179,6 +182,7 @@ jobs:
             .agent-output/webui-before/
             .agent-output/tasks-web-e2e/
             .agent-output/memory-web-e2e/
+            .agent-output/settings-web-e2e/
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7

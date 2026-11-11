@@ -105,7 +105,7 @@ export async function withPage(
     store = context.createCurrentProjectContext({ storage: null, confirmDiscard: options.confirmDiscard ?? (() => true) });
     const placeholder = { render: () => null };
     const router = createRouter({ history: createMemoryHistory(), routes: [
-      { path: "/", component: placeholder }, { path: "/projects", component: placeholder }, { path: "/runtimes", component: placeholder },
+      { path: "/", component: placeholder }, { path: "/projects", component: placeholder }, { path: "/runtimes", component: placeholder }, { path: "/settings", component: placeholder },
       { path: "/projects/:projectId/tasks/:taskId", component: placeholder, meta: { projectSection: "tasks" } },
       { path: "/projects/:projectId/chat/:groupId?", component: placeholder, meta: { projectSection: "chat" } },
       { path: "/memory", component: placeholder, meta: { projectSection: "memory" } },

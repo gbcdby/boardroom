@@ -74,9 +74,9 @@ async function fixture(driver?: DbDriver) {
     let joined = false;
     const gateway = await createRuntimeGateway({ db, logger, onJoined: async () => { joined = true; }, authority: {
       identity: { displayName: v.runtime.name, hostType: v.runtime.backend, projectId: v.binding.projectId, groupId: v.binding.groupId, memberId: v.binding.memberId },
-      run: (operation, fn) => {
+      run: (operation, fn, discover) => {
         if ((operation === "write" || operation === "consume") && !joined) throw new McpToolError("CONFLICT", "托管 MCP 通道尚未就绪");
-        return runtime.withFence(fence, fn, { requireRunningIntent: operation === "consume" });
+        return runtime.withFence(fence, fn, { requireRunningIntent: operation === "consume" }, discover);
       },
       beforeWait: async () => (await runtime.checkFence(fence)).binding.desiredState === "running",
       onDelivery: async () => { await runtime.patchRunner(fence, { phase: "working" }); },
@@ -125,7 +125,8 @@ databaseTest("任务通知在托管 join 就绪后投递，旧 generation 无法
     const events = joined["workEvents"] as { id: string; taskId: string }[];
     assert.equal(events[0]?.taskId, task.id);
     assert.equal((await f.runtime.checkFence(managed.fence)).runner.phase, "working");
-    assert.equal((await managed.call("transition_task", { taskId: task.id, expectedRevision: 1, state: "in-progress" })).ok, true);
+    const progressed = await managed.call("transition_task", { taskId: task.id, expectedRevision: 1, state: "in-progress" });
+    assert.equal(progressed.ok, true, JSON.stringify(progressed));
     await f.runtime.markExit(managed.fence, { exitCode: 0 });
     for (const session of await f.repos.mcpSessions.listByProject(f.project.id)) await f.repos.mcpSessions.disconnect(session.id, new Date().toISOString());
     const next = await f.runtime.claim(f.view.binding.id, "replacement-tasks");

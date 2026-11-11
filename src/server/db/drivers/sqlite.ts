@@ -15,7 +15,7 @@ import {
   type MigrationRunResult,
 } from "../migrate.ts";
 import { sqliteDialect } from "../dialect.ts";
-import type { DbDriver, DbRow, DbTransaction } from "../driver.ts";
+import type { DbDriver, DbRow, DbTransaction, DbTransactionContext } from "../driver.ts";
 
 export interface SqliteDriverOptions {
   readonly dataDir: string;
@@ -30,6 +30,7 @@ export class SqliteDriver implements DbDriver {
   /** SAVEPOINT 计数器：用于嵌套事务（事务内再开事务，#61）。 */
   private spCounter = 0;
   private readonly transactionScope = new AsyncLocalStorage<OperationQueue>();
+  private readonly transactionIdentity = new AsyncLocalStorage<DbTransactionContext & { active: boolean }>();
   private readonly operations = new OperationQueue();
 
   /** 单连接顶层操作排队；只有同一异步调用链中的操作才属于嵌套事务。 */
@@ -39,6 +40,11 @@ export class SqliteDriver implements DbDriver {
 
   constructor(options: SqliteDriverOptions) {
     this.dataDir = options.dataDir;
+  }
+
+  currentTransactionContext(): DbTransactionContext | undefined {
+    const context = this.transactionIdentity.getStore();
+    return context?.active ? context : undefined;
   }
 
   /** better-sqlite3 连接句柄（阶段 1 调用点继续使用）；须先 connect()。 */
@@ -94,6 +100,7 @@ export class SqliteDriver implements DbDriver {
   private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, parent?: OperationQueue): Promise<T> {
     const db = this.handle;
     const nested = parent !== undefined;
+    const identity = this.transactionIdentity.getStore() ?? { values: new Map<symbol, unknown>(), active: true };
     const scope = new OperationQueue(parent);
     const enqueue = <R>(operation: () => Promise<R>): Promise<R> => {
       const current = this.transactionScope.getStore();
@@ -117,7 +124,7 @@ export class SqliteDriver implements DbDriver {
     if (nested) db.exec(`SAVEPOINT ${sp}`);
     else db.exec(this.dialect.beginTransaction());
     try {
-      const result = await this.transactionScope.run(scope, () => fn(tx));
+      const result = await this.transactionIdentity.run(identity, () => this.transactionScope.run(scope, () => fn(tx)));
       await scope.drain();
       if (nested) db.exec(`RELEASE SAVEPOINT ${sp}`);
       else db.exec(this.dialect.commit());
@@ -137,6 +144,7 @@ export class SqliteDriver implements DbDriver {
       throw error;
     } finally {
       scope.close();
+      if (!nested) identity.active = false;
     }
   }
 

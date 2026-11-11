@@ -368,8 +368,10 @@ test("T5-AUDIT-HTTP-02：人撤销可逆事件（member.add）成功——原事
     );
     assert.equal(revoke.status, 200, JSON.stringify(revoke.body));
     assert.equal(revoke.body.entry.action, "member.revoke");
-    assert.equal(revoke.body.entry.detail.kind, "undo");
-    assert.equal(revoke.body.entry.detail.undoes, added.id);
+    assert.equal(revoke.body.entry.detail.reversal.direction, "undo");
+    assert.equal(revoke.body.entry.detail.reversal.undoesAuditId, added.id);
+    assert.equal(revoke.body.entry.detail.reversal.rootAuditId, added.id);
+    assert.equal(revoke.body.entry.detail.reversal.rootAction, "member.add");
     assert.equal(revoke.body.entry.targetId, alice.id);
 
     // 原事件被标记，审计共 2 行。

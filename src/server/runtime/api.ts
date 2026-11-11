@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import type { DbDriver } from "../db/driver.ts";
-import { createRepositories } from "../db/repositories.ts";
+import { createRepositories, type RepositorySet } from "../db/repositories.ts";
 import { RepositoryError, InvalidArgumentError, NotFoundError } from "../db/errors.ts";
 import { ownerActor } from "../authz/actors.ts";
 import { authorizeOrThrow, ForbiddenError } from "../authz/authorize.ts";
@@ -77,14 +77,15 @@ function sameOrigin(req: IncomingMessage): boolean {
 
 export function createRuntimeApi(options: {
   db: DbDriver;
+  repos?: RepositorySet;
   logger: Logger;
   heartbeat: HeartbeatConfig;
   observations: RuntimeObservability;
   supervisor: RuntimeSupervisor;
   resolveActor?: (resolution: ActorResolution) => Promise<Actor | null>;
 }): { handle(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<boolean> } {
-  const repo = createRuntimeRepository(options.db);
-  const repos = createRepositories(options.db);
+  const repos = options.repos ?? createRepositories(options.db);
+  const repo = createRuntimeRepository(options.db, { repos });
 
   async function guard(req: IncomingMessage, projectId: string | null): Promise<void> {
     const actor = options.resolveActor ? await options.resolveActor({ request: req, projectId }) : ownerActor(projectId);
@@ -210,8 +211,8 @@ export function createRuntimeApi(options: {
     } catch (error) {
       if (error instanceof ForbiddenError) json(res, 403, { error: { code: "forbidden", message: "仅本地管理者可管理托管运行时。" } });
       else if (error instanceof RepositoryError) {
-        const status = error.code === "not_found" ? 404 : error.code === "conflict" || error.code === "archived" ? 409 : error.code === "write_failed" ? 500 : 400;
-        const reason = /^runtime_[a-z_]{1,60}$/.test(error.message) ? error.message : error.code;
+        const status = error.code === "not_found" ? 404 : ["conflict", "archived", "mutation_scope_changed"].includes(error.code) ? 409 : error.code === "write_failed" ? 500 : 400;
+        const reason = /^runtime_[a-z_]{1,60}$/.test(error.message) || error.message === "member_removed" ? error.message : error.code;
         json(res, status, { error: { code: error.code, reason, message: status === 409
           ? "状态或版本已变化，请刷新；删除前须确认相关进程已停止。"
           : status === 400 ? "配置无效，请检查字段、工作目录和引用关系。"

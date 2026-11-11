@@ -1,4 +1,8 @@
 import { createMemoryRepository, type MemoryRepository } from "../memory/repository.ts";
+import { getMutationScopeCoordinator, type MutationScopeCoordinator } from "./mutation-scope.ts";
+import { observeSql, repositorySqlObserver } from "./sql-observer.ts";
+import { ForbiddenError } from "../authz/authorize.ts";
+import { coordinateRepositoryWrites } from "./coordinated-repositories.ts";
 import type { DbDriver, DbTransaction, DbRow } from "./driver.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
@@ -11,6 +15,7 @@ import {
   WriteFailedError,
 } from "./errors.ts";
 import { newId } from "./ids.ts";
+import { MEMBER_FACT_KINDS, type MemberFactRevision } from "./types.ts";
 import { createTasksRepository, type TasksRepository } from "../tasks/repository.ts";
 import {
   createAuditRepository,
@@ -104,6 +109,8 @@ export interface AgentsRepository {
  * 删除后作为实际清除的行数返回。项目记忆计数不包含 Agent 的 global 文档与版本。
  */
 export interface PurgeCounts {
+  /** v13：保留历史事实的固定版本行，随最后的成员物理清除。 */
+  readonly memberFactRevisions: number;
   readonly groups: number;
   readonly members: number;
   /** T2 #49：项目组织岗位节点（随项目一起清除，成员先删避免悬空占岗外键）。 */
@@ -172,9 +179,16 @@ export interface ProjectsRepository {
 export interface MembersRepository {
   create(input: NewMember): Promise<Member>;
   get(id: string): Promise<Member | null>;
+  /** server-only 历史作者、补偿和普通 join 的移除判定。 */
+  getIncludingRemoved(id: string): Promise<Member | null>;
   listByProject(projectId: string): Promise<Member[]>;
   /** 查找某 agent 在某项目中的成员关系（T2 幂等入群）。 */
   findByAgent(projectId: string, agentId: string): Promise<Member | null>;
+  findByAgentIncludingRemoved(projectId: string, agentId: string): Promise<Member | null>;
+  retainedFacts(memberId: string): Promise<MemberFactRevision[]>;
+  /** server-only：调用方已持完整 scope，身份不变，仅生命周期/占岗投影 CAS，代际恰好 +1。 */
+  applyLifecycleCas(projectId: string, memberId: string, expectedRevision: number,
+    projection: Pick<Member, "displayName" | "status" | "nodeId" | "role" | "removedAt">, at: string): Promise<Member>;
   getManager(projectId: string): Promise<Member | null>;
   update(id: string, patch: Partial<Pick<Member, "displayName" | "role">>): Promise<Member>;
   /**
@@ -341,6 +355,9 @@ export interface McpSessionsRepository {
 }
 
 export interface RepositorySet {
+  /** server-only：跨领域原语和有界快照复用同一上下文。 */
+  readonly context: RepoCtx;
+  readonly mutations: MutationScopeCoordinator;
   readonly agents: AgentsRepository;
   readonly projects: ProjectsRepository;
   readonly members: MembersRepository;
@@ -402,10 +419,10 @@ export function createRepositories(db: DbDriver): RepositorySet {
 
   const ctx: RepoCtx = {
     query: <T extends DbRow = DbRow>(sql: string, params?: readonly unknown[]): Promise<T[]> =>
-      active().query<T>(sql, params),
-    exec: (sql: string, params?: readonly unknown[]): Promise<number> => active().exec(sql, params),
+      observeSql(sql, "query", () => active().query<T>(sql, params)),
+    exec: (sql: string, params?: readonly unknown[]): Promise<number> => observeSql(sql, "exec", () => active().exec(sql, params)),
     one: async <T extends DbRow = DbRow>(sql: string, params?: readonly unknown[]): Promise<T | undefined> =>
-      (await active().query<T>(sql, params))[0],
+      (await observeSql(sql, "query", () => active().query<T>(sql, params)))[0],
     withTransaction: <T>(fn: () => Promise<T>): Promise<T> =>
       db.transaction(async (tx: DbTransaction) => {
         const scope = { tx, active: true };
@@ -414,6 +431,7 @@ export function createRepositories(db: DbDriver): RepositorySet {
         } catch (error) {
           // #61：与原 runInTransaction 一致，事务体内错误归一化为 RepositoryError
           // （唯一/主键冲突 → ConflictError，跨双方言），避免裸驱动错误逃逸。
+          if (error instanceof ForbiddenError) throw error;
           throw normalizeError(error);
         } finally {
           scope.active = false;
@@ -421,21 +439,23 @@ export function createRepositories(db: DbDriver): RepositorySet {
       }),
   };
 
-  return {
+  return coordinateRepositoryWrites({
+    context: ctx,
+    mutations: getMutationScopeCoordinator(db),
     agents: createAgents(ctx),
-    projects: createProjects(ctx),
-    members: createMembers(ctx),
+    projects: createProjects(ctx, getMutationScopeCoordinator(db)),
+    members: createMembers(ctx, getMutationScopeCoordinator(db)),
     org: createOrg(ctx),
-    groups: createGroups(ctx),
+    groups: createGroups(ctx, getMutationScopeCoordinator(db)),
     messages: createMessages(ctx, db.kind),
     deliveries: createDeliveries(ctx),
     statuses: createStatuses(ctx),
-    mcpSessions: createMcpSessions(ctx),
+    mcpSessions: createMcpSessions(ctx, getMutationScopeCoordinator(db)),
     audit: createAuditRepository(ctx),
     tasks: createTasksRepository(ctx),
     memory: createMemoryRepository(ctx),
     transaction: ctx.withTransaction,
-  };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +471,9 @@ function normalizeError(error: unknown): RepositoryError {
   const err = error as { code?: string; message?: string };
   const code = err?.code ?? "";
   const message = err?.message ?? String(error);
+  if ((code === '55P03' || code === '57014') && repositorySqlObserver()?.bounded) {
+    return new RepositoryError('audit_capture_budget_exceeded', '数据库锁等待或有界语句超时；事务已回滚，请刷新后重试。', { cause: error });
+  }
   // 唯一/主键冲突 → ConflictError（SQLite 与 PostgreSQL 双方言对齐）。
   if (code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT_PRIMARYKEY" || code === "23505") {
     return new ConflictError(`唯一约束冲突：${message}`, error);
@@ -528,6 +551,7 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
   const tasks = await hasTasksSchema(ctx);
   const memory = await hasMemorySchema(ctx);
   return {
+    memberFactRevisions: await hasMemberLifecycleSchema(ctx) ? await count('SELECT COUNT(*) AS c FROM member_fact_revisions WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)') : 0,
     memoryDocuments: memory ? await count("SELECT COUNT(*) AS c FROM memory_documents WHERE project_id = ?") : 0,
     memoryVersions: memory ? await count("SELECT COUNT(*) AS c FROM memory_versions WHERE document_id IN (SELECT id FROM memory_documents WHERE project_id = ?)") : 0,
     memorySummaryRequests: memory ? await count("SELECT COUNT(*) AS c FROM memory_summary_requests WHERE project_id = ?") : 0,
@@ -604,32 +628,48 @@ async function hasMemorySchema(ctx: RepoCtx): Promise<boolean> {
   return (await ctx.one("SELECT version FROM schema_migrations WHERE version = 12")) !== undefined;
 }
 
+export async function hasMemberLifecycleSchema(ctx: RepoCtx): Promise<boolean> {
+  return (await ctx.one("SELECT version FROM schema_migrations WHERE version = 13")) !== undefined;
+}
+
+async function effectiveMemberWhere(ctx: RepoCtx, alias = ""): Promise<string> {
+  return await hasMemberLifecycleSchema(ctx) ? ` AND ${alias}removed_at IS NULL` : "";
+}
+
 /**
  * 永久删除与 runner claim 共用成员行写锁。lease 过期仍须等待真正退出，
  * 不能通过项目/成员级联删除绕过「先停止托管配置」。父级锁也阻止并发新增绑定。
  */
-async function requireManagedStopped(ctx: RepoCtx, kind: "project" | "group" | "member", id: string): Promise<void> {
+async function requireManagedStopped(ctx: RepoCtx, kind: "project" | "group" | "member", id: string, mutations?: MutationScopeCoordinator): Promise<void> {
   if (!await hasRuntimeSchema(ctx)) return;
-  if (kind === "project") await ctx.exec("UPDATE projects SET updated_at = updated_at WHERE id = ?", [id]);
-  if (kind === "group") {
+  const lifecycle = await hasMemberLifecycleSchema(ctx);
+  if (!lifecycle && kind === "project") await ctx.exec("UPDATE projects SET updated_at = updated_at WHERE id = ?", [id]);
+  if (!lifecycle && kind === "group") {
     const group = await ctx.one<GroupIdRow & ProjectIdRow>("SELECT project_id FROM groups WHERE id = ?", [id]);
     if (group) await ctx.exec("UPDATE projects SET updated_at = updated_at WHERE id = ?", [group.project_id]);
     await ctx.exec("UPDATE groups SET updated_at = updated_at WHERE id = ?", [id]);
   }
   const column = kind === "project" ? "project_id" : kind === "group" ? "group_id" : "member_id";
   const members = await ctx.query<MemberIdRow>(`SELECT DISTINCT member_id FROM agent_runtime_bindings WHERE ${column} = ? ORDER BY member_id`, [id]);
-  for (const member of members) await ctx.exec("UPDATE members SET updated_at = updated_at WHERE id = ?", [member.member_id]);
+  if (lifecycle) {
+    const projectId = kind === 'project' ? id : (await ctx.one<ProjectIdRow>(`SELECT project_id FROM ${kind === 'group' ? 'groups' : 'members'} WHERE id = ?`, [id]))?.project_id;
+    const scope = mutations?.current(); if (!scope || !projectId) throw new RepositoryError('mutation_scope_changed', '删除 gate 必须处于共同项目/成员锁范围。');
+    scope.assertCovers([projectId], [...members.map(m => m.member_id), ...(kind === 'member' ? [id] : [])]);
+  } else for (const member of members) await ctx.exec("UPDATE members SET updated_at = updated_at WHERE id = ?", [member.member_id]);
   const active = await ctx.one(`SELECT b.id FROM agent_runtime_bindings b
-    JOIN agent_runner_states s ON s.binding_id = b.id WHERE b.${column} = ?
-      AND (b.desired_state <> 'stopped' OR s.lease_owner IS NOT NULL OR s.exit_confirmed <> 1
-        OR s.state NOT IN ('stopped', 'failed')) LIMIT 1`, [id]);
+    LEFT JOIN agent_runner_states s ON s.binding_id = b.id WHERE b.${column} = ?
+      AND (s.binding_id IS NULL OR b.desired_state <> 'stopped' OR s.lease_owner IS NOT NULL OR s.exit_confirmed <> 1
+        OR s.state NOT IN ('stopped', 'failed') OR EXISTS (SELECT 1 FROM agent_runtime_members rm WHERE rm.binding_id = b.id AND rm.lease_owner IS NOT NULL)) LIMIT 1`, [id]);
   if (active) throw new ConflictError("runtime_must_stop_first");
 }
 
-async function cleanOrphanRuntimeMembers(ctx: RepoCtx): Promise<void> {
+async function cleanOrphanRuntimeMembers(ctx: RepoCtx, projectId: string, memberIds: readonly string[]): Promise<void> {
   if (!await hasRuntimeSchema(ctx)) return;
-  await ctx.exec(`DELETE FROM agent_runtime_members WHERE binding_id IS NULL
-    AND NOT EXISTS (SELECT 1 FROM agent_runtime_bindings b WHERE b.member_id = agent_runtime_members.member_id)`);
+  for (let start = 0; start < memberIds.length; start += 32) {
+    const ids = memberIds.slice(start, start + 32);
+    await ctx.exec(`DELETE FROM agent_runtime_members WHERE project_id = ? AND member_id IN (${ids.map(() => '?').join(',')}) AND binding_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM agent_runtime_bindings b WHERE b.member_id = agent_runtime_members.member_id)`, [projectId, ...ids]);
+  }
 }
 
 function toAgent(row: AgentRow): Agent {
@@ -769,7 +809,7 @@ function toProject(row: ProjectRow): Project {
   };
 }
 
-function createProjects(ctx: RepoCtx): ProjectsRepository {
+function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): ProjectsRepository {
   return {
     async create(input) {
       const name = requireNonEmpty(input.name, "Project.name");
@@ -797,11 +837,14 @@ function createProjects(ctx: RepoCtx): ProjectsRepository {
           [project.id, project.name, project.createdAt, project.updatedAt],
         );
         if (managerAgentId !== null && managerName !== null) {
-          await ctx.exec(
+          const memberId = newId();
+          const insert = () => ctx.exec(
             `INSERT INTO members (id, project_id, agent_id, kind, display_name, role, created_at, updated_at)
              VALUES (?, ?, ?, 'agent', ?, 'manager', ?, ?)`,
-            [newId(), project.id, managerAgentId, managerName, at, at],
+            [memberId, project.id, managerAgentId, managerName, at, at],
           );
+          if (await hasMemberLifecycleSchema(ctx)) await mutations.run({ projectIds: [project.id], discover: async () => ({ memberIds: [], newMemberIds: [memberId], groupIds: [], runtimeIds: [] }) }, insert);
+          else await insert();
         }
       });
       return project;
@@ -855,7 +898,7 @@ function createProjects(ctx: RepoCtx): ProjectsRepository {
     async purge(id) {
       if (!(await this.get(id))) throw new NotFoundError(`Project ${id} 不存在。`);
       return ctx.withTransaction(async () => {
-        await requireManagedStopped(ctx, "project", id);
+        await requireManagedStopped(ctx, "project", id, mutations);
         const counts = await projectPurgeCounts(ctx, id);
         if (await hasMemorySchema(ctx)) {
           for (const table of ["memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints"]) {
@@ -880,9 +923,14 @@ function createProjects(ctx: RepoCtx): ProjectsRepository {
           "DELETE FROM group_participants WHERE group_id IN (SELECT id FROM groups WHERE project_id = ?)",
           [id],
         );
-        await ctx.exec("DELETE FROM groups WHERE project_id = ?", [id]);
         await ctx.exec("DELETE FROM mcp_sessions WHERE project_id = ?", [id]);
         await ctx.exec("DELETE FROM member_statuses WHERE project_id = ?", [id]);
+        if (await hasRuntimeSchema(ctx)) {
+          await ctx.exec('DELETE FROM agent_runtime_members WHERE project_id = ?', [id]);
+          await ctx.exec('DELETE FROM agent_runner_states WHERE binding_id IN (SELECT id FROM agent_runtime_bindings WHERE project_id = ?)', [id]);
+          await ctx.exec('DELETE FROM agent_runtime_bindings WHERE project_id = ?', [id]);
+        }
+        await ctx.exec("DELETE FROM groups WHERE project_id = ?", [id]);
         await ctx.exec("DELETE FROM members WHERE project_id = ?", [id]);
         // T2 #49：members 先删（node_id 外键指向 org_nodes），再清组织岗位，避免悬空引用。
         await ctx.exec("DELETE FROM org_nodes WHERE project_id = ?", [id]);
@@ -893,7 +941,7 @@ function createProjects(ctx: RepoCtx): ProjectsRepository {
     },
     async delete(id) {
       await ctx.withTransaction(async () => {
-        await requireManagedStopped(ctx, "project", id);
+        await requireManagedStopped(ctx, "project", id, mutations);
         const result = await ctx.exec("DELETE FROM projects WHERE id = ?", [id]);
         if (result === 0) throw new NotFoundError(`Project ${id} 不存在。`);
       });
@@ -915,6 +963,8 @@ type MemberRow = {
   node_id: string | null;
   /** T3 #50：生命周期状态（迁移 v5 起恒存在，默认 active）。 */
   status: string;
+  removed_at?: string | null;
+  membership_revision?: number | string;
   created_at: string;
   updated_at: string;
 };
@@ -929,12 +979,14 @@ function toMember(row: MemberRow): Member {
     role: row.role as MemberRole,
     nodeId: row.node_id ?? null,
     status: row.status as MemberLifecycleStatus,
+    removedAt: row.removed_at ?? null,
+    membershipRevision: Number(row.membership_revision ?? 1),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
-function createMembers(ctx: RepoCtx): MembersRepository {
+function createMembers(ctx: RepoCtx, mutations: MutationScopeCoordinator): MembersRepository {
   const projectExistsSql = "SELECT 1 FROM projects WHERE id = ?";
   const agentExistsSql = "SELECT 1 FROM agents WHERE id = ?";
   /**
@@ -966,6 +1018,10 @@ function createMembers(ctx: RepoCtx): MembersRepository {
         throw new InvalidArgumentError(`Member.kind 必须是 agent 或 human，收到：${String(input.kind)}。`);
       }
       let agentId: string | null = input.agentId ?? null;
+      if (agentId !== null && await hasMemberLifecycleSchema(ctx)) {
+        const prior = await ctx.one<{ removed_at: string | null }>('SELECT removed_at FROM members WHERE project_id = ? AND agent_id = ?', [input.projectId, agentId]);
+        if (prior?.removed_at != null) throw new RepositoryError('member_removed', '该 Agent 的历史成员已被人工移除；普通创建/入群不能恢复，请由人显式重新添加。');
+      }
       if (input.kind === "agent") {
         if (agentId === null) {
           throw new InvalidArgumentError("agent 类型成员必须提供 agentId。");
@@ -985,7 +1041,7 @@ function createMembers(ctx: RepoCtx): MembersRepository {
         throw new InvalidArgumentError(`Member.status 必须是 active/disabled/pending，收到：${String(input.status)}。`);
       }
       const at = nowIso();
-      const id = newId();
+      const id = input.id ?? newId();
       await ctx.withTransaction(async () => {
         if (role === "manager") await requireNoOtherManager(input.projectId, id);
         await ctx.exec(
@@ -997,25 +1053,59 @@ function createMembers(ctx: RepoCtx): MembersRepository {
       return (await repo.get(id))!;
     },
     async get(id) {
+      const row = await ctx.one<MemberRow>(`SELECT * FROM members WHERE id = ?${await effectiveMemberWhere(ctx)}`, [id]);
+      return row ? toMember(row) : null;
+    },
+    async getIncludingRemoved(id) {
       const row = await ctx.one<MemberRow>("SELECT * FROM members WHERE id = ?", [id]);
       return row ? toMember(row) : null;
     },
     async listByProject(projectId) {
       return (await ctx.query<MemberRow>(
-        "SELECT * FROM members WHERE project_id = ? ORDER BY created_at, id",
+        `SELECT * FROM members WHERE project_id = ?${await effectiveMemberWhere(ctx)} ORDER BY created_at, id`,
         [projectId],
       )).map(toMember);
     },
     async findByAgent(projectId, agentId) {
       const row = await ctx.one<MemberRow>(
-        "SELECT * FROM members WHERE project_id = ? AND agent_id = ?",
+        `SELECT * FROM members WHERE project_id = ? AND agent_id = ?${await effectiveMemberWhere(ctx)}`,
         [projectId, agentId],
       );
       return row ? toMember(row) : null;
     },
+    async findByAgentIncludingRemoved(projectId, agentId) {
+      const row = await ctx.one<MemberRow>("SELECT * FROM members WHERE project_id = ? AND agent_id = ?", [projectId, agentId]);
+      return row ? toMember(row) : null;
+    },
+    async retainedFacts(memberId) {
+      if (!await hasMemberLifecycleSchema(ctx)) throw new RepositoryError("legacy_incomplete_snapshot", "旧 schema 没有成员事实版本，请先升级。");
+      const rows = await ctx.query<{ kind: string; revision: number | string }>("SELECT kind, revision FROM member_fact_revisions WHERE member_id = ? ORDER BY kind LIMIT 7", [memberId]);
+      if (rows.length !== 6 || rows.some(row => !MEMBER_FACT_KINDS.includes(row.kind as never) || !Number.isSafeInteger(Number(row.revision)) || Number(row.revision) < 1)) {
+        throw new RepositoryError("compensation_conflict", "成员事实版本缺失或损坏，不能推断历史状态。");
+      }
+      return rows.map(row => ({ kind: row.kind as MemberFactRevision["kind"], revision: Number(row.revision) }));
+    },
+    async applyLifecycleCas(projectId, memberId, expectedRevision, projection, at) {
+      const scope = mutations.current();
+      if (!scope) throw new RepositoryError("mutation_scope_changed", "成员生命周期写入必须处于完整的共同锁范围。");
+      scope.assertCovers([projectId], [memberId]);
+      if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1 || expectedRevision >= Number.MAX_SAFE_INTEGER) throw new InvalidArgumentError("成员代际无效或已溢出。");
+      await requireProjectActive(ctx, projectId, "变更成员生命周期");
+      return ctx.withTransaction(async () => {
+        if (!await ctx.exec(`UPDATE members SET display_name = ?, status = ?, node_id = ?, role = ?, removed_at = ?, membership_revision = membership_revision + 1, updated_at = ?
+          WHERE project_id = ? AND id = ? AND membership_revision = ?`,
+          [projection.displayName, projection.status, projection.nodeId, projection.role, projection.removedAt, at, projectId, memberId, expectedRevision])) {
+          throw new RepositoryError("compensation_conflict", "成员已变更或进入新的加入周期，请刷新后重试。");
+        }
+        const row = await ctx.one<MemberRow>(`SELECT id, project_id, agent_id, kind, substr(display_name, 1, 8193) AS display_name, role, status,
+          node_id, removed_at, membership_revision, created_at, updated_at FROM members WHERE project_id = ? AND id = ?`, [projectId, memberId]);
+        if (!row || Buffer.byteLength(row.display_name, 'utf8') > 8192) throw new RepositoryError('audit_capture_budget_exceeded', '成员投影缺失或超过有界读回范围。');
+        return toMember(row);
+      });
+    },
     async getManager(projectId) {
       const row = await ctx.one<MemberRow>(
-        "SELECT * FROM members WHERE project_id = ? AND role = 'manager' LIMIT 1",
+        `SELECT * FROM members WHERE project_id = ? AND role = 'manager'${await effectiveMemberWhere(ctx)} LIMIT 1`,
         [projectId],
       );
       return row ? toMember(row) : null;
@@ -1064,12 +1154,14 @@ function createMembers(ctx: RepoCtx): MembersRepository {
     },
     async delete(id) {
       await ctx.withTransaction(async () => {
-        await requireManagedStopped(ctx, "member", id);
+        await requireManagedStopped(ctx, "member", id, mutations);
+        if (await hasMemberLifecycleSchema(ctx)) throw new InvalidArgumentError('v13 成员移除必须使用生命周期 mutation service；物理删除仅属于项目 purge。');
         const result = await ctx.exec("DELETE FROM members WHERE id = ?", [id]);
         if (result === 0) throw new NotFoundError(`成员 ${id} 不存在。`);
       });
     },
     async restoreRow(member) {
+      if (await hasMemberLifecycleSchema(ctx)) throw new InvalidArgumentError('v13 成员恢复必须使用生命周期 mutation service 与完整关系快照。');
       await ctx.exec(
         `INSERT INTO members (id, project_id, agent_id, kind, display_name, role, status, node_id, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1111,7 +1203,7 @@ function toGroup(row: GroupRow): Group {
   };
 }
 
-function createGroups(ctx: RepoCtx): GroupsRepository {
+function createGroups(ctx: RepoCtx, mutations: MutationScopeCoordinator): GroupsRepository {
   const projectExistsSql = "SELECT 1 FROM projects WHERE id = ?";
   const memberInProjectSql = "SELECT 1 FROM members WHERE id = ? AND project_id = ?";
   const getGroupRowSql = "SELECT * FROM groups WHERE id = ?";
@@ -1125,7 +1217,7 @@ function createGroups(ctx: RepoCtx): GroupsRepository {
       const name = requireNonEmpty(input.name, "Group.name");
       const participants = dedupe(input.participantMemberIds ?? []);
       for (const memberId of participants) {
-        if (!(await ctx.one(memberInProjectSql, [memberId, input.projectId]))) {
+        if (!(await ctx.one(memberInProjectSql + await effectiveMemberWhere(ctx), [memberId, input.projectId]))) {
           throw new InvalidReferenceError(
             `成员 ${memberId} 不属于项目 ${input.projectId}，不能加入该群组。`,
           );
@@ -1189,7 +1281,9 @@ function createGroups(ctx: RepoCtx): GroupsRepository {
     async purge(id) {
       if (!(await repo.get(id))) throw new NotFoundError(`Group ${id} 不存在。`);
       return ctx.withTransaction(async () => {
-        await requireManagedStopped(ctx, "group", id);
+        await requireManagedStopped(ctx, "group", id, mutations);
+        const projectId = (await repo.get(id))!.projectId;
+        const affected = await hasRuntimeSchema(ctx) ? await ctx.query<MemberIdRow>('SELECT DISTINCT member_id FROM agent_runtime_bindings WHERE group_id = ? ORDER BY member_id', [id]) : [];
         const counts = await groupPurgeCounts(ctx, id);
         if (await hasMemorySchema(ctx)) {
           await ctx.exec("DELETE FROM memory_summary_requests WHERE context_group_id = ?", [id]);
@@ -1209,15 +1303,19 @@ function createGroups(ctx: RepoCtx): GroupsRepository {
         await ctx.exec("DELETE FROM messages WHERE group_id = ?", [id]);
         await ctx.exec("DELETE FROM group_participants WHERE group_id = ?", [id]);
         await ctx.exec("DELETE FROM mcp_sessions WHERE group_id = ?", [id]);
+        if (await hasRuntimeSchema(ctx)) {
+          await ctx.exec('DELETE FROM agent_runner_states WHERE binding_id IN (SELECT id FROM agent_runtime_bindings WHERE group_id = ?)', [id]);
+          await ctx.exec('DELETE FROM agent_runtime_bindings WHERE group_id = ?', [id]);
+        }
         const removed = await ctx.exec("DELETE FROM groups WHERE id = ?", [id]);
         if (removed === 0) throw new NotFoundError(`Group ${id} 不存在。`);
-        await cleanOrphanRuntimeMembers(ctx);
+        await cleanOrphanRuntimeMembers(ctx, projectId, affected.map(m => m.member_id));
         return counts;
       });
     },
     async participants(groupId) {
       return (await ctx.query<MemberIdRow>(
-        "SELECT member_id FROM group_participants WHERE group_id = ? ORDER BY joined_at, member_id",
+        `SELECT gp.member_id FROM group_participants gp JOIN members m ON m.id = gp.member_id WHERE gp.group_id = ?${await effectiveMemberWhere(ctx, "m.")} ORDER BY gp.joined_at, gp.member_id`,
         [groupId],
       )).map((row) => row.member_id);
     },
@@ -1226,7 +1324,7 @@ function createGroups(ctx: RepoCtx): GroupsRepository {
       if (!group) throw new NotFoundError(`Group ${groupId} 不存在。`);
       // 归档 = 非活跃态：不再接受新参与者（含 MCP 入群时落到本群组的 addParticipant）。
       await requireGroupActive(ctx, groupId, "把成员加入群组");
-      if (!(await ctx.one(memberInProjectSql, [memberId, group.projectId]))) {
+      if (!(await ctx.one(memberInProjectSql + await effectiveMemberWhere(ctx), [memberId, group.projectId]))) {
         throw new InvalidReferenceError(
           `成员 ${memberId} 不属于项目 ${group.projectId}，不能加入该群组。`,
         );
@@ -1251,12 +1349,7 @@ function createGroups(ctx: RepoCtx): GroupsRepository {
       );
     },
     async delete(id) {
-      await ctx.withTransaction(async () => {
-        await requireManagedStopped(ctx, "group", id);
-        const result = await ctx.exec("DELETE FROM groups WHERE id = ?", [id]);
-        if (result === 0) throw new NotFoundError(`Group ${id} 不存在。`);
-        await cleanOrphanRuntimeMembers(ctx);
-      });
+      await repo.purge(id);
     },
   };
   return repo;
@@ -1301,7 +1394,7 @@ function createMessages(ctx: RepoCtx, driverKind: DbDriver["kind"]): MessagesRep
         await requireGroupActive(ctx, input.groupId, "向群组发送消息");
 
         const sender = await ctx.one<ProjectIdRow>(
-          "SELECT project_id FROM members WHERE id = ?",
+          `SELECT project_id FROM members WHERE id = ?${await effectiveMemberWhere(ctx)}`,
           [input.senderMemberId],
         );
         if (!sender) throw new InvalidReferenceError(`发送者成员 ${input.senderMemberId} 不存在。`);
@@ -1321,7 +1414,7 @@ function createMessages(ctx: RepoCtx, driverKind: DbDriver["kind"]): MessagesRep
         // mentions 里的成员必须存在且属于同项目（避免悬空/跨项目）。
         for (const memberId of mentions) {
           const m = await ctx.one<ProjectIdRow>(
-            "SELECT project_id FROM members WHERE id = ?",
+            `SELECT project_id FROM members WHERE id = ?${await effectiveMemberWhere(ctx)}`,
             [memberId],
           );
           if (!m) throw new InvalidReferenceError(`被 @ 的成员 ${memberId} 不存在。`);
@@ -1441,13 +1534,14 @@ function createDeliveries(ctx: RepoCtx): DeliveriesRepository {
   const repo: DeliveriesRepository = {
     async ensure(messageId, memberId, wake) {
       return ctx.withTransaction(async () => {
+        const member = await ctx.one<ProjectIdRow>(`SELECT project_id FROM members WHERE id = ?${await effectiveMemberWhere(ctx)}`, [memberId]);
+        if (!member) throw new InvalidReferenceError(`成员 ${memberId} 不存在或已移除，无法创建投递。`);
         const existing = await getRow(messageId, memberId);
         if (existing) return toDelivery(existing);
 
-        const message = await ctx.one<GroupIdRow>("SELECT group_id FROM messages WHERE id = ?", [messageId]);
+        const message = await ctx.one<GroupIdRow & ProjectIdRow>("SELECT m.group_id, g.project_id FROM messages m JOIN groups g ON g.id = m.group_id WHERE m.id = ?", [messageId]);
         if (!message) throw new InvalidReferenceError(`消息 ${messageId} 不存在，无法创建投递。`);
-        const member = await ctx.one<ProjectIdRow>("SELECT project_id FROM members WHERE id = ?", [memberId]);
-        if (!member) throw new InvalidReferenceError(`成员 ${memberId} 不存在，无法创建投递。`);
+        if (message.project_id !== member.project_id) throw new InvalidReferenceError('消息与投递成员必须属于同一项目。');
 
         const at = nowIso();
         const id = newId();
@@ -1493,7 +1587,7 @@ function createDeliveries(ctx: RepoCtx): DeliveriesRepository {
         const timestamp = at ?? nowIso();
         const source = await ctx.one(`SELECT m.id FROM messages m JOIN groups g ON g.id = m.group_id
           JOIN members mem ON mem.project_id = g.project_id
-          WHERE m.id = ? AND mem.id = ? AND mem.kind = 'agent' AND mem.status = 'active'`, [messageId, memberId]);
+          WHERE m.id = ? AND mem.id = ? AND mem.kind = 'agent' AND mem.status = 'active'${await effectiveMemberWhere(ctx, 'mem.')}`, [messageId, memberId]);
         if (!source) throw new InvalidReferenceError("真实 MCP 投递必须引用同项目的 active Agent 成员与消息。");
         await requireGroupActive(ctx, (await ctx.one<GroupIdRow>("SELECT group_id FROM messages WHERE id = ?", [messageId]))!.group_id, "投递消息");
         await repo.ensure(messageId, memberId);
@@ -1509,17 +1603,18 @@ function createDeliveries(ctx: RepoCtx): DeliveriesRepository {
     async listPending(projectId, memberId) {
       return (await ctx.query<DeliveryRow>(
         `SELECT d.* FROM message_deliveries d
-           JOIN messages m ON m.id = d.message_id
+           JOIN messages m ON m.id = d.message_id JOIN members mem ON mem.id = d.member_id
           WHERE d.project_id = ? AND d.member_id = ? AND d.status <> 'acked'
+            ${await effectiveMemberWhere(ctx, 'mem.')}
           ORDER BY m.group_id, m.seq`,
         [projectId, memberId],
       )).map(toDelivery);
     },
     async listWakeable(projectId, memberId) {
       return (await ctx.query<DeliveryRow>(
-        `SELECT d.* FROM message_deliveries d JOIN messages m ON m.id = d.message_id
+        `SELECT d.* FROM message_deliveries d JOIN messages m ON m.id = d.message_id JOIN members mem ON mem.id = d.member_id
           WHERE d.project_id = ? AND d.member_id = ? AND d.status <> 'acked'
-            AND d.wake_decision = 'allowed' ORDER BY m.group_id, m.seq`,
+            AND d.wake_decision = 'allowed'${await effectiveMemberWhere(ctx, 'mem.')} ORDER BY m.group_id, m.seq`,
         [projectId, memberId],
       )).map(toDelivery);
     },
@@ -1559,7 +1654,7 @@ function createStatuses(ctx: RepoCtx): StatusesRepository {
       if (!MEMBER_STATES.includes(state)) {
         throw new InvalidArgumentError(`非法成员状态：${String(state)}，允许：${MEMBER_STATES.join("/")}。`);
       }
-      const member = await ctx.one<ProjectIdRow>("SELECT project_id FROM members WHERE id = ?", [memberId]);
+      const member = await ctx.one<ProjectIdRow>(`SELECT project_id FROM members WHERE id = ?${await effectiveMemberWhere(ctx)}`, [memberId]);
       if (!member) throw new InvalidReferenceError(`成员 ${memberId} 不存在，无法记录状态。`);
       if (member.project_id !== projectId) {
         throw new InvalidReferenceError(`成员 ${memberId} 不属于项目 ${projectId}。`);
@@ -1575,14 +1670,14 @@ function createStatuses(ctx: RepoCtx): StatusesRepository {
     },
     async get(projectId, memberId) {
       const row = await ctx.one<StatusRow>(
-        "SELECT * FROM member_statuses WHERE project_id = ? AND member_id = ?",
+        `SELECT s.* FROM member_statuses s JOIN members m ON m.id = s.member_id WHERE s.project_id = ? AND s.member_id = ?${await effectiveMemberWhere(ctx, 'm.')}`,
         [projectId, memberId],
       );
       return row ? toStatus(row) : null;
     },
     async listByProject(projectId) {
       return (await ctx.query<StatusRow>(
-        "SELECT * FROM member_statuses WHERE project_id = ? ORDER BY member_id",
+        `SELECT s.* FROM member_statuses s JOIN members m ON m.id = s.member_id WHERE s.project_id = ?${await effectiveMemberWhere(ctx, 'm.')} ORDER BY s.member_id`,
         [projectId],
       )).map(toStatus);
     },
@@ -1631,10 +1726,14 @@ function toMcpSession(row: McpSessionRow): McpSession {
   };
 }
 
-function createMcpSessions(ctx: RepoCtx): McpSessionsRepository {
+function createMcpSessions(ctx: RepoCtx, mutations: MutationScopeCoordinator): McpSessionsRepository {
   const repo: McpSessionsRepository = {
     async connect(input) {
       return ctx.withTransaction(async () => {
+        if (!await ctx.one(`SELECT id FROM members WHERE id = ? AND project_id = ? AND agent_id = ?${await effectiveMemberWhere(ctx)}`, [input.memberId, input.projectId, input.agentId])) {
+          throw new InvalidReferenceError('MCP 会话成员已移除或 Agent/项目身份不匹配。');
+        }
+        if (!await ctx.one('SELECT id FROM groups WHERE id = ? AND project_id = ?', [input.groupId, input.projectId])) throw new InvalidReferenceError('MCP 会话群组不属于项目。');
         const existing = await repo.findActive(input.agentId, input.projectId, input.groupId);
         const at = nowIso();
         if (existing) {
@@ -1675,22 +1774,23 @@ function createMcpSessions(ctx: RepoCtx): McpSessionsRepository {
     },
     async findActive(agentId, projectId, groupId) {
       const row = await ctx.one<McpSessionRow>(
-        `SELECT * FROM mcp_sessions
-          WHERE agent_id = ? AND project_id = ? AND group_id = ? AND state = 'connected'
-          ORDER BY connected_at DESC, id DESC LIMIT 1`,
+        `SELECT s.* FROM mcp_sessions s JOIN members m ON m.id = s.member_id
+          WHERE s.agent_id = ? AND s.project_id = ? AND s.group_id = ? AND s.state = 'connected'${await effectiveMemberWhere(ctx, 'm.')}
+          ORDER BY s.connected_at DESC, s.id DESC LIMIT 1`,
         [agentId, projectId, groupId],
       );
       return row ? toMcpSession(row) : null;
     },
     async listByProject(projectId) {
       return (await ctx.query<McpSessionRow>(
-        "SELECT * FROM mcp_sessions WHERE project_id = ? ORDER BY connected_at, id",
+        `SELECT s.* FROM mcp_sessions s JOIN members m ON m.id = s.member_id WHERE s.project_id = ?${await effectiveMemberWhere(ctx, 'm.')} ORDER BY s.connected_at, s.id`,
         [projectId],
       )).map(toMcpSession);
     },
     async heartbeat(id, at) {
       const row = await repo.get(id);
       if (!row) throw new NotFoundError(`MCP 会话 ${id} 不存在。`);
+      if (row.state !== 'connected' || !await ctx.one(`SELECT id FROM members WHERE id = ?${await effectiveMemberWhere(ctx)}`, [row.memberId])) throw new InvalidReferenceError('旧 MCP 会话或已移除成员不能更新心跳。');
       await ctx.withTransaction(async () =>
         ctx.exec(
           "UPDATE mcp_sessions SET last_heartbeat_at = ?, updated_at = ? WHERE id = ?",
@@ -1713,11 +1813,18 @@ function createMcpSessions(ctx: RepoCtx): McpSessionsRepository {
     },
     async markAllStale(at) {
       return ctx.withTransaction(async () => {
-        const result = await ctx.exec(
-          "UPDATE mcp_sessions SET state = 'disconnected', disconnected_at = ?, updated_at = ? WHERE state = 'connected'",
-          [at, at],
-        );
-        return result;
+        const rows = await ctx.query<IdRow & ProjectIdRow & MemberIdRow>("SELECT id, project_id, member_id FROM mcp_sessions WHERE state = 'connected' ORDER BY id LIMIT 2049");
+        if (rows.length > 2048) throw new RepositoryError('mutation_scope_changed', '待清理会话超过已捕获范围。');
+        if (await hasMemberLifecycleSchema(ctx)) {
+          const scope = mutations.current(); if (!scope) throw new RepositoryError('mutation_scope_changed', '会话清理缺少共同锁范围。');
+          scope.assertCovers([...new Set(rows.map(r => r.project_id))], [...new Set(rows.map(r => r.member_id))]);
+        }
+        let changes = 0;
+        for (let start = 0; start < rows.length; start += 32) {
+          const ids = rows.slice(start, start + 32).map(r => r.id);
+          changes += await ctx.exec(`UPDATE mcp_sessions SET state = 'disconnected', disconnected_at = ?, updated_at = ? WHERE state = 'connected' AND id IN (${ids.map(() => '?').join(',')})`, [at, at, ...ids]);
+        }
+        return changes;
       });
     },
     async delete(id) {
@@ -1871,7 +1978,7 @@ function createOrg(ctx: RepoCtx): OrgRepository {
       }
 
       const at = nowIso();
-      const id = newId();
+      const id = input.id ?? newId();
       await ctx.withTransaction(async () =>
         ctx.exec(
           `INSERT INTO org_nodes (id, project_id, parent_id, name, role, sort_order, created_at, updated_at)
@@ -1981,7 +2088,7 @@ function createOrg(ctx: RepoCtx): OrgRepository {
     },
 
     async assignNode(memberId, nodeId) {
-      const memberRow = await ctx.one<MemberRow>(memberByIdSql, [memberId]);
+      const memberRow = await ctx.one<MemberRow>(memberByIdSql + await effectiveMemberWhere(ctx), [memberId]);
       if (!memberRow) throw new NotFoundError(`成员 ${memberId} 不存在。`);
       let nodeRow: OrgNodeRow | null = null;
       if (nodeId !== null) {
@@ -1998,7 +2105,7 @@ function createOrg(ctx: RepoCtx): OrgRepository {
     },
 
     async autoPlaceMember(projectId, memberId) {
-      const memberRow = await ctx.one<MemberRow>(memberByIdSql, [memberId]);
+      const memberRow = await ctx.one<MemberRow>(memberByIdSql + await effectiveMemberWhere(ctx), [memberId]);
       if (!memberRow) throw new NotFoundError(`成员 ${memberId} 不存在。`);
       if (memberRow.project_id !== projectId) {
         throw new InvalidReferenceError(`成员 ${memberId} 不属于项目 ${projectId}。`);
@@ -2026,7 +2133,7 @@ function createOrg(ctx: RepoCtx): OrgRepository {
     },
 
     async nodeOfMember(memberId) {
-      const row = await ctx.one<MemberRow>(memberByIdSql, [memberId]);
+      const row = await ctx.one<MemberRow>(memberByIdSql + await effectiveMemberWhere(ctx), [memberId]);
       if (!row || row.node_id === null) return null;
       return get(row.node_id);
     },

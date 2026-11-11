@@ -16,6 +16,7 @@ import type { MemoryInjectionReader } from "./injection-reader.ts";
 import { assertMemoryMarkdown, truncateGraphemes, unavailableMemory } from "./injection.ts";
 import { MemoryError } from "./errors.ts";
 import { reconcileMessageThresholdPage, reconcileTaskCompletionPage } from "./triggers.ts";
+import { discoverDomainMutation, type DomainMutationTargets } from "../mutation-access.ts";
 
 export type MemoryAccess = TaskAccess & { readonly injectionBindingGeneration?: string };
 export interface MemoryService {
@@ -105,7 +106,8 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
     if (actor.kind === "agent") {
       if (!access.connection) deny("memory:read_own", "Agent 必须通过已绑定会话访问记忆。", "out_of_connection");
       member = await repos.members.get(actor.actorId);
-      if (!member || member.kind !== "agent" || member.agentId === null || member.projectId !== projectId || member.status !== "active") deny("memory:read_own", "成员不存在、已离岗或不属于本项目。", "not_a_member");
+      if (!member || member.removedAt !== null || member.kind !== "agent" || member.agentId === null || member.projectId !== projectId || member.status !== "active") deny("memory:read_own", "成员不存在、已离岗或不属于本项目。", "not_a_member");
+      if (!Number.isSafeInteger(access.connection.membershipRevision) || access.connection.membershipRevision !== member.membershipRevision) deny("memory:read_own", "成员授权代际已变化，请重新加入会话。", "out_of_connection");
       actor = (await orgActorForMember(repos, member.id)) ?? actorForMember(member);
     }
     authorizeOrThrow(actor, "memory:read_shared", { projectId });
@@ -133,14 +135,15 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
     authorizeOrThrow(ctx.actor, "memory:manage_agent", { projectId: key.projectId, nodeId: target?.nodeId ?? null });
     if (!target && !await repos.memory.get(key)) throw new NotFoundError("目标 Agent 不在本项目，且没有留存的项目记忆。");
   }
-  async function mutate<T>(access: MemoryAccess, projectId: string, body: (ctx: Context) => Promise<T>, operation: "write" | "consume" = "write"): Promise<T> {
+  async function mutate<T>(access: MemoryAccess, projectId: string, body: (ctx: Context) => Promise<T>, operation: "write" | "consume" = "write", targets: DomainMutationTargets = {}): Promise<T> {
     let events: WorkEvent[] = [];
-    const work = () => repos.transaction(async () => {
+    const discover = discoverDomainMutation(access, projectId, targets);
+    const work = () => repos.mutations.run({ projectIds: [projectId], discover }, () => repos.transaction(async () => {
       try { const ctx = await actorFor(access, projectId, true); events = ctx.events; return await body(ctx); }
       catch (error) { if (error instanceof ForbiddenError) throw new GuardRollback(error); throw error; }
-    });
+    }));
     let result: T;
-    try { result = await (access.runMutation ? access.runMutation(operation, work) : work()); }
+    try { result = await (access.runMutation ? access.runMutation(operation, work, discover) : work()); }
     catch (error) { if (error instanceof GuardRollback) throw error.denial; throw error; }
     try { if (events.length) await options.onWorkEvents?.(events); }
     catch { console.warn("memory_work_event_notification_failed", { projectId }); }
@@ -301,13 +304,14 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
     async write(access, key, input) {
       const projectId = projectOf(access, key); identifier(input.clientMutationId); integer(input.expectedVersion);
       if (typeof input.markdown !== "string") throw new MemoryError("memory_invalid_input", "记忆正文必须是 Markdown 文本。");
-      return mutate(access, projectId, ctx => writeDocument(ctx, key, input));
+      return mutate(access, projectId, ctx => writeDocument(ctx, key, input), "write", { agentIds: [key.agentId] });
     },
     async inject(access) {
       const binding = access.connection; const generation = access.injectionBindingGeneration;
-      if (access.actor.kind !== "agent" || !binding || !generation || binding.memberId !== access.actor.actorId || access.actor.projectId !== binding.projectId) return unavailableMemory(config, "memory_binding_unavailable");
+      if (access.actor.kind !== "agent" || !binding || !generation || binding.memberId !== access.actor.actorId || access.actor.projectId !== binding.projectId ||
+        !Number.isSafeInteger(binding.membershipRevision) || binding.membershipRevision < 1) return unavailableMemory(config, "memory_binding_unavailable");
       // 此处只做可信绑定形状检查；真实身份由隔离 SELECT 复核，绝不退回主库追加 ACL 查询。
-      try { return await options.injectionReader.readOwn({ memberId: binding.memberId, projectId: binding.projectId, bindingGeneration: generation }); }
+      try { return await options.injectionReader.readOwn({ memberId: binding.memberId, projectId: binding.projectId, bindingGeneration: generation, membershipRevision: binding.membershipRevision }); }
       catch { return unavailableMemory(config, "memory_reader_unavailable"); }
     },
     async reconcileTriggers(access) {
@@ -444,7 +448,7 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
           { state: "running", attemptId: newId(), beginMutationId: input.clientMutationId, startedAt: ctx.at });
         await summaryAudit(ctx, updated, "memory.summary_begun");
         return { value: updated };
-      }));
+      }, "write", { summaryRequestId: requestId }));
     },
     async submitSummary(access, requestId, input) {
       integer(input.expectedRequestRevision, 1); identifier(input.attemptId);
@@ -482,7 +486,7 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
           if (conflict) return { error: await finishInvalid(ctx, latest, conflict) };
           throw error;
         }
-      }));
+      }, "write", { summaryRequestId: requestId }));
     },
     async failSummary(access, requestId, input) {
       integer(input.expectedRevision, 1); identifier(input.attemptId);
@@ -497,7 +501,7 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
         const failure = invalid ?? { state: "failed" as const, code: input.code, message: "目标 Agent 报告本次总结失败，原记忆保持不变。" };
         await finishInvalid(ctx, request, failure);
         return getRequest(request.id);
-      });
+      }, "write", { summaryRequestId: requestId });
     },
     async retrySummary(access, requestId, clientMutationId) {
       identifier(clientMutationId); const original = await getRequest(requestId);
@@ -515,7 +519,7 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
         return (await createRequest(ctx, target, { trigger: "retry", triggerKey, contextGroupId: old.contextGroupId,
           taskId: old.taskId, completedTaskRevision: task?.revision ?? null, messageIds: [...old.messageIds],
           sourceWorkEventId: old.sourceWorkEventId, retryOfRequestId: old.id })).request;
-      });
+      }, "write", { summaryRequestId: requestId });
     },
   };
   return service;

@@ -113,6 +113,10 @@ async function seedSqliteDir(dir: string): Promise<void> {
       const scope = { kind, projectId: "pr1", agentId: "ag1", groupId: kind === "message_threshold" ? "gp1" : null };
       await repos.memory.updateScanCheckpointCas({ scope, after: null, through: await repos.memory.scanHighWater(scope), sweep: 1, revision: 1 }, 0);
     }
+    await driver.exec("UPDATE members SET removed_at = ?, membership_revision = 2, status = 'disabled', node_id = NULL, role = 'normal' WHERE id = 'mb3'", [at]);
+    for (const [index, kind] of ["authored-messages", "deliveries", "memory-requests", "memory-receipts", "memory-counters", "memory-checkpoints"].entries()) {
+      await driver.exec("UPDATE member_fact_revisions SET revision = ? WHERE kind = ?", [101 + index, kind]);
+    }
 
   } finally {
     await driver.close();
@@ -137,6 +141,12 @@ async function assertDispatchValues(options: DbDriverOptions): Promise<void> {
     assert.equal(Number((await driver.query<{ n: number | string }>("SELECT COUNT(*) AS n FROM memory_documents"))[0]!.n), 3);
     assert.equal((await driver.query<{ first_mcp_delivered_at: string }>("SELECT first_mcp_delivered_at FROM message_deliveries WHERE message_id='msg1' AND member_id='mb1'"))[0]!.first_mcp_delivered_at, "2026-11-10T12:00:00.000Z");
     assert.equal((await driver.query<{ context_group_id: string }>("SELECT context_group_id FROM work_events WHERE id='memory-event-copy'"))[0]!.context_group_id, "gp1");
+    const factRows = await driver.query<{ member_id: string; kind: string; revision: number | string }>("SELECT member_id, kind, revision FROM member_fact_revisions ORDER BY member_id, kind");
+    const expected = ["mb1", "mb2", "mb3"].flatMap(member_id => ["authored-messages", "deliveries", "memory-requests", "memory-receipts", "memory-counters", "memory-checkpoints"]
+      .map((kind, index) => ({ member_id, kind, revision: 101 + index })).sort((a, b) => a.kind.localeCompare(b.kind)));
+    assert.deepEqual(factRows.map(row => ({ ...row, revision: Number(row.revision) })), expected);
+    assert.deepEqual(await driver.query("SELECT removed_at, membership_revision, status, node_id, role FROM members WHERE id = 'mb3'"),
+      [{ removed_at: "2026-11-10T12:00:00.000Z", membership_revision: 2, status: "disabled", node_id: null, role: "normal" }]);
   } finally { await driver.close(); }
 }
 
@@ -168,9 +178,10 @@ const FK_DEPS: Record<string, string[]> = {
   memory_trigger_counters: ["projects", "agents", "groups"], memory_scan_checkpoints: ["projects", "agents", "groups"],
 };
 
-test("业务表清单：32 张表、不含 schema_migrations、外键顺序合法", () => {
+test("业务表清单：33 张表、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
   const names = BUSINESS_TABLES.map((t) => t.name);
-  assert.equal(names.length, 32);
+  assert.equal(names.length, 33);
+  assert.equal(names.at(-1), "member_fact_revisions");
   assert.ok(!names.includes("schema_migrations"));
   for (const expected of [
     "agents",
@@ -295,10 +306,12 @@ test("SQLite → SQLite：目标键集完整（含复合主键表与 id 保留�
           `SELECT group_id, member_id FROM group_participants WHERE group_id = 'gp1' AND member_id = 'mb2'`,
         );
         assert.equal(gp.length, 1);
+        await dstDriver.exec("UPDATE member_fact_revisions SET revision = revision + 1 WHERE member_id = 'mb1' AND kind = 'deliveries'");
       } finally {
         await dstDriver.close();
       }
       assert.equal(report.validation.ok, true);
+      assert.equal((await validateData(srcOpts, dstOpts)).ok, false, "事实版本数值变化不能仅凭相同主键集通过校验");
     });
   });
 });
@@ -312,7 +325,7 @@ test("回滚：清空目标业务表，源库不受影响；可重新迁移恢�
       await migrateData(srcOpts, dstOpts);
 
       const rb = await rollbackTarget(dstOpts);
-      assert.equal(rb.clearedTables.length, 32);
+      assert.equal(rb.clearedTables.length, 33);
 
       // 目标业务表已清空，校验失败。
       const afterRollback = await validateData(srcOpts, dstOpts);

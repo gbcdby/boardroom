@@ -135,6 +135,9 @@ for (const change of ["项目归档", "群归档", "成员停用"] as const) {
       const f = await fixture();
       try {
         const host = await f.start();
+        const connection = (await f.repos.mcpSessions.listByProject(f.binding.projectId))
+          .find(session => session.memberId === f.binding.memberId && session.state === "connected");
+        assert.ok(connection, "托管 runner join 后必须有真实连接记录");
         host.event({ type: "session", sessionId: "lifecycle-session" });
         await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.harnessSessionId === "lifecycle-session", "sid 应持久化");
         if (phase === "working") await f.message("当前轮次");
@@ -165,6 +168,8 @@ for (const change of ["项目归档", "群归档", "成员停用"] as const) {
 
         host.finish();
         await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.exitConfirmed, "真实退出后才释放所有权");
+        assert.equal((await f.repos.mcpSessions.get(connection.id))?.state, "disconnected",
+          "退出清理必须关闭同代连接，停用资格不能留下 connected 记录阻塞恢复");
         const claimsBefore = f.claimCalls.get(f.binding.id);
         const preflightsBefore = f.preflightCalls.get(f.binding.id);
         for (let i = 0; i < 3; i += 1) await f.supervisor.tick();
@@ -177,6 +182,11 @@ for (const change of ["项目归档", "群归档", "成员停用"] as const) {
         await until(async () => f.hosts.length === 2 && (await f.runtime.getBinding(f.binding.id))!.runner.state === "running", "恢复资格后应重建 runner");
         const resumed = (await f.runtime.getBinding(f.binding.id))!;
         const nextHost = f.hosts[1]!;
+        const nextConnection = (await f.repos.mcpSessions.listByProject(f.binding.projectId))
+          .find(session => session.memberId === f.binding.memberId && session.state === "connected");
+        assert.ok(nextConnection);
+        assert.notEqual(nextConnection.id, connection.id, "恢复保留宿主 sid，但建立新的 MCP 连接记录");
+        assert.equal((await f.repos.mcpSessions.get(connection.id))?.state, "disconnected");
         assert.equal(resumed.binding.desiredState, "running");
         assert.equal(resumed.runner.applied!.digest, before.runner.applied!.digest);
         assert.equal(resumed.runner.harnessSessionId, "lifecycle-session");

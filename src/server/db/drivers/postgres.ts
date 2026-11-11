@@ -20,7 +20,7 @@ import {
   type MigrationRunResult,
 } from "../migrate.ts";
 import { postgresDialect } from "../dialect.ts";
-import { DriverConnectionError, type DbDriver, type DbRow, type DbTransaction } from "../driver.ts";
+import { DriverConnectionError, type DbDriver, type DbRow, type DbTransaction, type DbTransactionContext } from "../driver.ts";
 
 export interface PostgresDriverOptions {
   readonly connectionString: string;
@@ -40,6 +40,7 @@ export class PostgresDriver implements DbDriver {
   private pool: Pool | null = null;
   /** 按异步调用链绑定连接；不相关请求不能共享另一个事务的客户端。 */
   private readonly transactionScope = new AsyncLocalStorage<{ client: PoolClient; queue: OperationQueue }>();
+  private readonly transactionIdentity = new AsyncLocalStorage<DbTransactionContext & { active: boolean }>();
   /** SAVEPOINT 计数器。 */
   private spCounter = 0;
 
@@ -51,6 +52,11 @@ export class PostgresDriver implements DbDriver {
         `PG schema 名 "${this.schema}" 不是合法标识符（仅允许字母、数字、下划线，不能以数字开头）。`,
       );
     }
+  }
+
+  currentTransactionContext(): DbTransactionContext | undefined {
+    const context = this.transactionIdentity.getStore();
+    return context?.active ? context : undefined;
   }
 
   async connect(): Promise<void> {
@@ -152,6 +158,7 @@ export class PostgresDriver implements DbDriver {
 
   private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, client: PoolClient, parent?: OperationQueue): Promise<T> {
     const nested = parent !== undefined;
+    const identity = this.transactionIdentity.getStore() ?? { values: new Map<symbol, unknown>(), active: true };
     const queue = new OperationQueue(parent);
     const enqueue = <R>(operation: () => Promise<R>): Promise<R> => {
       const current = this.transactionScope.getStore()?.queue;
@@ -173,7 +180,7 @@ export class PostgresDriver implements DbDriver {
       else await client.query(this.dialect.beginTransaction());
       const scope = { client, queue };
       try {
-        const result = await this.transactionScope.run(scope, () => fn(tx));
+        const result = await this.transactionIdentity.run(identity, () => this.transactionScope.run(scope, () => fn(tx)));
         await queue.drain();
         if (nested) await client.query(`RELEASE SAVEPOINT ${sp}`);
         else await client.query(this.dialect.commit());
@@ -193,6 +200,7 @@ export class PostgresDriver implements DbDriver {
       }
     } finally {
       queue.close();
+      if (!nested) identity.active = false;
     }
   }
 

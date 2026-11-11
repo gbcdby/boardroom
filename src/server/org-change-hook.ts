@@ -1,10 +1,7 @@
 /**
- * T2（#49）预留、T5（#52）落地的**审计钩子**。
- *
- * T2/T3 在组织/汇报线/占岗/成员状态变更的入口处调用 `OrgChangeRecorder.record`。
- * T5 实现本接口（`createAuditRecorder`）并经 `StartServerOptions.orgChangeRecorder`
- * **默认注入**，即把变更写入统一 `audit_log` 并支撑人的撤销权；无需改动 T2/T3 的守卫与 repository。
- * 注入自定义 recorder（如测试替身）时优先于默认实现，既有调用点与断言不变。
+ * 组织与成员变更的提交后观察接口。权威审计由 mutation service 与业务同事务写入；
+ * 此 hook 不承担原子性、撤销快照或失败判定。调用方捕获同步及异步观察失败，
+ * 不改变已提交结果。旧 recorder 可用于显式的离线适配，不再由服务器默认装配。
  */
 export type OrgChangeAction =
   | "node.create"
@@ -44,8 +41,9 @@ export interface OrgChange {
 }
 
 export interface OrgChangeRecorder {
-  record(change: OrgChange): void;
+  /** 提交后观察钩子；权威审计由 mutation service 在事务内持久化。 */
+  record(change: OrgChange): void | Promise<void>;
 }
 
-/** 缺省空实现；T5 在 StartServerOptions 默认注入真实 recorder 前不产生任何写入。 */
+/** 缺省空观察者；不会额外写入审计。 */
 export const noopOrgChangeRecorder: OrgChangeRecorder = { record: () => {} };

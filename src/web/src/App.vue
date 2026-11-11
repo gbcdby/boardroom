@@ -9,6 +9,8 @@ const context = useCurrentProject();
 const { projects, currentProjectId, currentProject, loading: projectsLoading, error: projectError, notice: projectNotice } = context;
 const menuOpen = ref(false);
 const menuButton = ref<HTMLButtonElement | null>(null);
+const projectContextVisible = computed(() => route.name !== "settings");
+const viewKey = computed(() => `${String(route.name)}:${projectContextVisible.value ? currentProjectId.value ?? '' : ''}:${String(route.params['taskId'] ?? '')}`);
 const projectTo = (section: string) => currentProjectId.value ? projectPath(currentProjectId.value, section) : `/${section}`;
 const navigation = computed(() => [
   { label: "工作空间", items: [
@@ -24,6 +26,7 @@ const navigation = computed(() => [
     { to: projectTo("members"), label: "成员", icon: "people" },
     { to: projectTo("org"), label: "组织与角色", icon: "people" },
     { to: projectTo("audit"), label: "审计与撤销", icon: "history" },
+    { to: "/settings", label: "设置", icon: "settings" },
   ] },
 ]);
 const currentPage = computed(() => typeof route.meta["title"] === "string" ? route.meta["title"] : navigation.value.flatMap((group) => group.items).find((item) => item.to === route.path)?.label ?? (route.path === "/settings" ? "设置" : "页面不存在"));
@@ -54,14 +57,14 @@ watch(() => route.path, async () => {
 <template>
   <a class="skip-link" href="#main-content">跳到主要内容</a>
   <div class="layout" @keydown.esc="closeMenu">
-    <header class="workspace-topbar"><button ref="menuButton" type="button" class="menu-toggle" :aria-expanded="menuOpen" aria-controls="main-navigation" :aria-label="menuOpen ? '收起导航' : '展开导航'" @click="menuOpen = !menuOpen"><AppIcon :name="menuOpen ? 'close' : 'menu'" :size="21" /></button><span class="current-page">{{ currentPage }}</span><label class="workspace-project"><span>当前项目</span><select :value="currentProjectId ?? ''" :disabled="projectsLoading || projects.length === 0" data-testid="current-project" @change="selectProject"><option v-if="currentProjectId === null" value="" disabled>{{ projectsLoading ? '正在加载…' : '选择项目' }}</option><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}{{ project.archivedAt ? ' · 已归档' : '' }}</option></select></label><span class="local-label"><AppIcon name="server" :size="15" />本地运行</span></header>
+    <header class="workspace-topbar" :class="{ 'global-page': !projectContextVisible }"><button ref="menuButton" type="button" class="menu-toggle" :aria-expanded="menuOpen" aria-controls="main-navigation" :aria-label="menuOpen ? '收起导航' : '展开导航'" @click="menuOpen = !menuOpen"><AppIcon :name="menuOpen ? 'close' : 'menu'" :size="21" /></button><span class="current-page">{{ currentPage }}</span><label v-if="projectContextVisible" class="workspace-project"><span>当前项目</span><select :value="currentProjectId ?? ''" :disabled="projectsLoading || projects.length === 0" data-testid="current-project" @change="selectProject"><option v-if="currentProjectId === null" value="" disabled>{{ projectsLoading ? '正在加载…' : '选择项目' }}</option><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}{{ project.archivedAt ? ' · 已归档' : '' }}</option></select></label><span class="local-label"><AppIcon name="server" :size="15" />本地运行</span></header>
     <aside class="sidebar" :class="{ 'is-open': menuOpen }" aria-label="工作空间导航">
       <RouterLink to="/" class="brand" aria-label="Agent Studio 概览"><span class="brand-mark"><AppIcon name="layers" :size="21" /></span><span>Agent Studio<span class="brand-caption">你的协作工作空间</span></span></RouterLink>
       <nav id="main-navigation" class="nav" aria-label="主导航"><div v-for="group in navigation" :key="group.label" class="nav-group"><p class="nav-group-title">{{ group.label }}</p><RouterLink v-for="item in group.items" :key="item.to" :to="item.to" class="nav-link" :class="{ selected: route.path === item.to || (item.to !== '/' && item.to !== '/projects' && route.path.startsWith(`${item.to}/`)) }"><AppIcon :name="item.icon" :size="19" /><span>{{ item.label }}</span></RouterLink></div></nav>
       <div class="sidebar-footer"><AppIcon name="server" :size="18" /><span>本地工作空间<small>仅在这台设备上访问</small></span></div>
     </aside>
     <div class="workspace">
-      <main id="main-content" class="content" tabindex="-1"><div v-if="projectError" class="error" role="alert">{{ projectError }} <button type="button" class="text-button" :disabled="projectsLoading" @click="retryProjects">重新加载项目</button></div><div v-if="projectNotice" class="notice" role="status" data-testid="context-notice">{{ projectNotice }} <button type="button" class="text-button" @click="context.dismissNotice">知道了</button></div><p v-if="!projectsLoading && !projectError && !currentProject" class="muted small">暂无当前项目。可在顶栏选择项目，或<RouterLink to="/projects?archived=1">查看归档项目</RouterLink>。</p><RouterView v-slot="{ Component }"><component :is="Component" :key="`${String(route.name)}:${currentProjectId ?? ''}:${String(route.params['taskId'] ?? '')}`" /></RouterView></main>
+      <main id="main-content" class="content" tabindex="-1"><div v-if="projectContextVisible && projectError" class="error" role="alert">{{ projectError }} <button type="button" class="text-button" :disabled="projectsLoading" @click="retryProjects">重新加载项目</button></div><div v-if="projectContextVisible && projectNotice" class="notice" role="status" data-testid="context-notice">{{ projectNotice }} <button type="button" class="text-button" @click="context.dismissNotice">知道了</button></div><p v-if="projectContextVisible && !projectsLoading && !projectError && !currentProject" class="muted small">暂无当前项目。可在顶栏选择项目，或<RouterLink to="/projects?archived=1">查看归档项目</RouterLink>。</p><RouterView v-slot="{ Component }"><component :is="Component" :key="viewKey" /></RouterView></main>
       <footer class="footer">Agent Studio<span aria-hidden="true"> · </span>让协作井然有序</footer>
     </div>
   </div>

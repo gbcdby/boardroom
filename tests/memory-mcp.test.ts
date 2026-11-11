@@ -47,7 +47,7 @@ test("真实 MCP core 读写三层记忆并在 join/wait 安全点注入，单�
     assert.deepEqual(second.context.memory?.entries.map(entry => entry.markdown), ["跨项目私有"]);
     await assert.rejects(f.core.memoryOperation("worker", "read", { scope: "project-agent", projectId: secondProject.id }), { code: "FORBIDDEN" });
     await f.core.close();
-    const stillAvailable = await getMemoryRuntime(f.db).reader.readOwn({ projectId: secondProject.id, memberId: second.memberId, bindingGeneration: "second" });
+    const stillAvailable = await getMemoryRuntime(f.db).reader.readOwn({ projectId: secondProject.id, memberId: second.memberId, membershipRevision: (await f.repos.members.get(second.memberId))!.membershipRevision, bindingGeneration: "second" });
     assert.equal(stillAvailable.state, "available");
     assert.equal(stillAvailable.entries[0]?.markdown, "跨项目私有");
   } finally { await other.close(); await f.close(); }

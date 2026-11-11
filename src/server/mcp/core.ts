@@ -8,6 +8,7 @@ import {
   RepositoryError,
 } from "../db/errors.ts";
 import { createRepositories, type RepositorySet } from "../db/repositories.ts";
+import type { MutationDiscover } from "../db/mutation-scope.ts";
 import { newId } from "../db/ids.ts";
 import type { McpSession, Member, MemberKind, Message as DbMessage } from "../db/types.ts";
 import { invalidArgument, McpToolError, notInGroup } from "./errors.ts";
@@ -102,6 +103,7 @@ export interface SessionBinding {
   readonly sessionId: string;
   readonly agentId: string;
   readonly memberId: string;
+  readonly membershipRevision: number;
   readonly projectId: string;
   readonly groupId: string;
   readonly role: MemberRole;
@@ -391,7 +393,7 @@ export interface AntiLoopRuntimeOptions {
 /** 只能由父 supervisor 的专用传输注入；工具参数不能提供此授权。 */
 export interface ManagedCoreAuthority {
   readonly identity: JoinParams & { readonly memberId: string };
-  run<T>(operation: "join" | "observe" | "write" | "consume" | "disconnect", fn: () => Promise<T>): Promise<T>;
+  run<T>(operation: "join" | "observe" | "write" | "consume" | "disconnect", fn: () => Promise<T>, discover?: MutationDiscover): Promise<T>;
   /** wait 边界决定是否允许下一轮；false 返回取消且不投递新消息。 */
   beforeWait(): Promise<boolean>;
   /** 与投递同一短事务执行，记录离开安全点。 */
@@ -401,6 +403,7 @@ export interface ManagedCoreAuthority {
 export interface McpCoreOptions {
   readonly logger: Logger;
   readonly db: DbDriver;
+  readonly repos?: RepositorySet;
   readonly heartbeat?: Heartbeat;
   readonly now?: () => Date;
   /**
@@ -468,7 +471,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   const now = options.now ?? (() => new Date());
   const memberKey = options.memberKey ?? "default";
 
-  const repos: RepositorySet = createRepositories(options.db);
+  const repos: RepositorySet = options.repos ?? createRepositories(options.db);
   const tasks = createTaskService({ repos, now,
     onWorkEvents: events => notifyWorkEventCommit(options.db, events) });
   const memoryRuntime = getMemoryRuntime(options.db);
@@ -488,7 +491,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       return messages;
     },
   });
-  const runtimes = createRuntimeRepository(options.db);
+  const runtimes = createRuntimeRepository(options.db, { repos });
   /** T7：进程级共享的防环/限流器。 */
   const antiLoop = getSharedAntiLoop(options.antiLoop);
   /** 会话键 → 绑定（运行时对象，进程内维护；持久化部分在 mcp_sessions/members/agents）。 */
@@ -504,19 +507,42 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
   const selfKey = (sessionId: string): string => `${memberKey}:${sessionId}`;
 
+  async function currentBindingMember(binding: SessionBinding, allowInactive = false): Promise<Member> {
+    const member = await repos.members.getIncludingRemoved(binding.memberId);
+    if (!member || member.projectId !== binding.projectId || member.removedAt !== null) {
+      throw new McpToolError("FORBIDDEN", "成员已移除，不能沿用旧连接。", { reason: "member_removed" });
+    }
+    if (!Number.isSafeInteger(binding.membershipRevision) || member.membershipRevision !== binding.membershipRevision) {
+      throw new McpToolError("FORBIDDEN", "成员授权代际已变化，请重新加入会话。", { reason: "membership_changed" });
+    }
+    if (!allowInactive && member.status !== "active") throw new McpToolError("FORBIDDEN", "当前成员已停用，不能继续访问。", { reason: "inactive_member" });
+    return member;
+  }
+
   async function withAccess<T>(binding: SessionBinding | null,
-    operation: "join" | "observe" | "write" | "consume" | "disconnect", fn: () => Promise<T>): Promise<T> {
+    operation: "join" | "observe" | "write" | "consume" | "disconnect", fn: () => Promise<T>, discover?: MutationDiscover): Promise<T> {
     try {
-      if (options.managed) return await options.managed.run(operation, fn);
-      if (binding) return await runtimes.withMemberLock(binding.memberId, async () => {
-        await runtimes.assertExternalJoinAllowed(binding.memberId);
-        return await fn();
-      });
-      return await fn();
+      if (!binding) return options.managed ? await options.managed.run(operation, fn, discover) : await fn();
+      const complete: MutationDiscover = async tx => {
+        const found = discover ? await discover(tx) : { memberIds: [], groupIds: [], runtimeIds: [] };
+        return { ...found, memberIds: [...new Set([...found.memberIds, binding.memberId])],
+          groupIds: [...new Set([...found.groupIds, binding.groupId])] };
+      };
+      const run = async () => {
+        // 停用仍允许同代连接记录退出事实；移除或代际变化不能清理恢复后的新状态。
+        await currentBindingMember(binding, operation === "disconnect");
+        if (!options.managed) await runtimes.assertExternalJoinAllowed(binding.memberId);
+        return fn();
+      };
+      if (options.managed) return await options.managed.run(operation, run, complete);
+      return await repos.mutations.run({ projectIds: [binding.projectId], discover: complete }, run);
     } catch (error) {
       if (error instanceof McpToolError) throw error;
       if (error instanceof RepositoryError && error.code === "conflict") {
         throw new McpToolError("CONFLICT", "运行所有权已变化或成员已由托管运行时预留");
+      }
+      if (error instanceof RepositoryError && error.code === "mutation_scope_changed") {
+        throw new McpToolError("CONFLICT", error.message, { reason: error.code });
       }
       throw error;
     }
@@ -526,23 +552,23 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     return {
       // 任务主体只取真实连接身份，领域服务随后按 DB 当前岗位/状态重新解析权限。
       actor: actorForSession(binding),
-      connection: { projectId: binding.projectId, memberId: binding.memberId, groupId: binding.groupId },
-      runMutation: (operation, body) => withAccess(binding, operation, async () => {
+      connection: { projectId: binding.projectId, memberId: binding.memberId, groupId: binding.groupId, membershipRevision: binding.membershipRevision },
+      runMutation: (operation, body, discover) => withAccess(binding, operation, async () => {
         // 领域冲突先转换，避免被外层运行时 fence 错认成所有权冲突。
         try { return await body(); }
         catch (error) {
           if (error instanceof RepositoryError && error.code === "conflict") throw mapTaskToolError(error);
           throw error;
         }
-      }),
+      }, discover),
     };
   }
 
   async function memoryAccess(binding: SessionBinding, background = false): Promise<MemoryAccess> {
     return { actor: actorForSession(binding),
-      connection: { projectId: binding.projectId, memberId: binding.memberId, groupId: binding.groupId },
+      connection: { projectId: binding.projectId, memberId: binding.memberId, groupId: binding.groupId, membershipRevision: binding.membershipRevision },
       injectionBindingGeneration: memoryCoreKey + binding.sessionId,
-      runMutation: async (operation, body) => {
+      runMutation: async (operation, body, discover) => {
         const invoke = () => withAccess(binding, operation, async () => {
           if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError("CONFLICT", "记忆会话绑定已失效。");
           try { return await body(); }
@@ -552,7 +578,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
             if (error instanceof RepositoryError && error.code === "conflict") throw mapMemoryToolError(error);
             throw error;
           }
-        });
+        }, discover);
         if (!background || options.db.kind !== "postgres") return await invoke();
         // 自动补偿先设置真实数据库超时，再取得成员/fence 锁；不留下后台占池或锁等待。
         return await options.db.transaction(async () => {
@@ -617,53 +643,47 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       throw new McpToolError("INVALID_ARGUMENT", `群组 ${groupId} 不属于项目 ${projectId}`, { projectId, groupId });
     }
 
+    const newMemberId = newId();
+    const discover: MutationDiscover = async tx => {
+      const member = await tx.one<{ id: string }>(`SELECT m.id FROM members m JOIN agents a ON a.id = m.agent_id
+        WHERE m.project_id = ? AND a.display_name = ? AND a.host_type = ?`, [projectId, displayName, hostType]);
+      return { memberIds: member ? [member.id] : [], newMemberIds: member ? [] : [newMemberId], groupIds: [groupId], runtimeIds: [] };
+    };
     try {
-      return await (repos.transaction(async () => {
-        // 1) 全局身份：按 (displayName, hostType) 查找或创建（唯一索引兜底）。
-        let agent = await (repos.agents.findByIdentity(displayName, hostType));
-        if (!agent) agent = await (repos.agents.create({ displayName, hostType }));
-        const agentId = agent.id;
-
-        // 2) 项目成员：同 agent 在同项目唯一（(project_id, agent_id) 唯一索引）。
-        let member = await (repos.members.findByAgent(projectId, agentId));
-        if (!member) {
-          // 阶段 1 一个项目只有一个岗位（D2）；入群保留已有 manager，不覆盖。
-          member = await (repos.members.create({
-            projectId,
-            kind: "agent",
-            agentId,
-            displayName,
-            role: role === "manager" ? "manager" : "normal",
-          }));
-        } else if (member.displayName !== displayName) {
-          member = await (repos.members.update(member.id, { displayName }));
+      return await repos.mutations.run({ projectIds: [projectId], discover }, async scope => {
+        // 所有授权与身份事实在项目及成员范围锁取得后重读，不能让普通 join 复活 tombstone。
+        const currentProject = await repos.projects.get(projectId), currentGroup = await repos.groups.get(groupId);
+        if (!currentProject || !currentGroup || currentGroup.projectId !== projectId) {
+          throw new McpToolError("CONFLICT", "项目或群组已变化，请刷新后重新加入。");
         }
-
-        // external join 与托管预留必须锁定同一 Member，防止 PG 检查后竞争。
-        return await runtimes.withMemberLock(member.id, async () => {
+        if (currentProject.archivedAt !== null || currentGroup.archivedAt !== null) {
+          throw new McpToolError("CONFLICT", "已归档项目或群组不能建立新连接。");
+        }
+        let agent = await repos.agents.findByIdentity(displayName, hostType);
+        if (!agent) agent = await repos.agents.create({ displayName, hostType });
+        const agentId = agent.id;
+        let member = await repos.members.findByAgentIncludingRemoved(projectId, agentId);
+        if (member && member.removedAt !== null) {
+          throw new McpToolError("FORBIDDEN", "成员已移除，请由有权限的用户恢复成员后重新加入。", { reason: "member_removed" });
+        }
+        if (member && member.status !== "active") {
+          throw new McpToolError("FORBIDDEN", "成员未激活或已停用，不能建立新连接。", { reason: "inactive_member" });
+        }
+        if (!member) {
+          member = await repos.members.create({ id: newMemberId, projectId, kind: "agent", agentId, displayName,
+            role: role === "manager" ? "manager" : "normal" });
+        }
+        scope.assertCovers([projectId], [member.id]);
         if (!options.managed) await runtimes.assertExternalJoinAllowed(member.id);
         else if (options.managed.identity.memberId !== member.id) {
           throw new McpToolError("FORBIDDEN", "托管通道不能切换成员身份");
         }
-        // 3) 群组参与者（幂等）。
-        await (repos.groups.addParticipant(groupId, member.id));
-
-        // 4) MCP 会话（连接状态，D1）：建立或复用活跃会话。
-        const session = await (repos.mcpSessions.connect({
-          agentId,
-          projectId,
-          groupId,
-          memberId: member.id,
-          displayName,
-          hostType,
-        }));
-
-        // 5) 成员运行状态：连接建立 → online（与连接心跳分开记录）。
-        await (repos.statuses.set(projectId, member.id, "online"));
-
+        if (member.displayName !== displayName) member = await repos.members.update(member.id, { displayName });
+        await repos.groups.addParticipant(groupId, member.id);
+        const session = await repos.mcpSessions.connect({ agentId, projectId, groupId, memberId: member.id, displayName, hostType });
+        await repos.statuses.set(projectId, member.id, "online");
         return { agentId, member, session };
-        });
-      }));
+      });
     } catch (error) {
       throw mapRepoError(error, { projectId, groupId, displayName, hostType });
     }
@@ -695,10 +715,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 拒绝时按 MCP 契约抛 `FORBIDDEN`，并在 details 里给出稳定拒绝码。
    */
   async function guard(binding: SessionBinding, capability: Capability, scope: GuardScope, denyMessage?: string): Promise<void> {
-    const member = await repos.members.get(binding.memberId);
-    if (!member || member.projectId !== binding.projectId || member.status !== "active") {
-      throw new McpToolError("FORBIDDEN", "当前成员已退出或停用，不能继续访问。", { reason: "inactive_member" });
-    }
+    const member = await currentBindingMember(binding);
     const decision = authorize(
       (await options.authz?.actorFor?.(binding)) ?? (await orgActorForMember(repos, binding.memberId)) ?? actorForMember(member),
       capability,
@@ -995,6 +1012,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         sessionId: selfKey(sessionId),
         agentId: joined.agentId,
         memberId: joined.member.id,
+        membershipRevision: joined.member.membershipRevision,
         projectId: params.projectId,
         groupId: params.groupId,
         role: joined.member.role,
@@ -1149,56 +1167,52 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       // F2（#47）：跨群组写入由统一守卫判定（conn 作用域 + group:post 参与范围）。
       await (guard(binding, "group:post", { projectId: binding.projectId, groupId }, "只能向当前入群的群组发送消息"));
 
-      if (params.clientMessageId) {
-        const existing = await repos.messages.findByClientKey(binding.memberId, params.clientMessageId);
-        if (existing) {
-          return {
-            ok: true,
-            messageId: existing.id,
-            createdAt: existing.createdAt,
-            duplicate: true,
-          };
-        }
-      }
-
-      // T3：mention 解析。显式 mentions 入参（稳定 ID）+ 正文里的 @ 名称/@all 合并。
-      const roster = await (buildRosterFor(groupId));
-      const parsed = parseMentions(text, roster);
-      if (parsed.unknownNames.length > 0) {
-        // 无效 mention 明确报错（失败路径之一），不静默丢弃。
-        throw new McpToolError("INVALID_ARGUMENT", `无法解析 @ 名称：${parsed.unknownNames.join("、")}`, {
-          unknownNames: parsed.unknownNames,
-        });
-      }
-      const explicitMentions = (params.mentions ?? []).filter((id) => {
-        // 显式 mention 必须是本群参与者（防止跨群/外部 ID 泄漏）。
-        if (!roster.some((m) => m.id === id)) {
-          throw new McpToolError("INVALID_ARGUMENT", `被 @ 的成员 ${id} 不是当前群组参与者`, { memberId: id });
-        }
-        return true;
-      });
-      const mentionIds = [...new Set([...explicitMentions, ...parsed.mentionIds])];
-
-      // @all：展开为发送时在线参与者快照，并把快照成员写入持久化 mentions，
-      // 使历史/投递与「发送时在线」一致（CHAT-02）。
-      const plan = resolveWakeAndVisibility(
-        { senderMemberId: binding.memberId, mentionIds, mentionsAll: parsed.all },
-        roster,
-      );
-      const persistedMentions = [...new Set([...mentionIds, ...plan.allRecipients])];
-
       // T5：消息落库与「可见成员的 pending 投递」在同一事务内完成，避免中途崩溃留下
       // 消息可见却无任何投递记录的半成品（NFR-01/NFR-09）。即便极端情况下缺失投递记录，
       // wait_for_messages 的 deliverableSince 仍按「未 acked」补投，不丢消息（见测试）。
+      const discover: MutationDiscover = async tx => {
+        const rows = await tx.query<{ id: string }>(`SELECT m.id FROM group_participants gp JOIN members m ON m.id = gp.member_id
+          JOIN groups g ON g.id = gp.group_id WHERE gp.group_id = ? AND g.project_id = ? AND m.project_id = ? ORDER BY m.id LIMIT 2049`,
+          [groupId, binding.projectId, binding.projectId]);
+        if (rows.length > 2048) throw new RepositoryError("mutation_scope_changed", "当前群组接收成员超过有界变更范围。");
+        return { memberIds: rows.map(row => row.id), groupIds: [groupId], runtimeIds: [] };
+      };
       let persisted: { message: DbMessage; duplicate: true } |
-        { message: DbMessage; duplicate: false; decision: WakeDecision };
+        { message: DbMessage; duplicate: false; decision: WakeDecision; plan: ReturnType<typeof resolveWakeAndVisibility> };
       try {
-        persisted = await withAccess(binding, "write", () => repos.transaction(async () => {
+        persisted = await withAccess(binding, "write", async () => {
+          await guard(binding, "group:post", { projectId: binding.projectId, groupId }, "只能向当前入群的群组发送消息");
           // 事务外查重只是优化；并发请求必须在实际提交范围内再查，并由唯一索引兜底。
           if (params.clientMessageId) {
             const existing = await repos.messages.findByClientKey(binding.memberId, params.clientMessageId);
             if (existing) return { message: existing, duplicate: true as const };
           }
+          // T3：mention 解析。显式 mentions 入参（稳定 ID）+ 正文里的 @ 名称/@all 合并。
+          const roster = await (buildRosterFor(groupId));
+          const parsed = parseMentions(text, roster);
+          if (parsed.unknownNames.length > 0) {
+            // 无效 mention 明确报错（失败路径之一），不静默丢弃。
+            throw new McpToolError("INVALID_ARGUMENT", `无法解析 @ 名称：${parsed.unknownNames.join("、")}`, {
+              unknownNames: parsed.unknownNames,
+            });
+          }
+          const explicitMentions = (params.mentions ?? []).filter((id) => {
+            // 显式 mention 必须是本群参与者（防止跨群/外部 ID 泄漏）。
+            if (!roster.some((m) => m.id === id)) {
+              throw new McpToolError("INVALID_ARGUMENT", `被 @ 的成员 ${id} 不是当前群组参与者`, { memberId: id });
+            }
+            return true;
+          });
+          const mentionIds = [...new Set([...explicitMentions, ...parsed.mentionIds])];
+
+          // @all：展开为发送时在线参与者快照，并把快照成员写入持久化 mentions，
+          // 使历史/投递与「发送时在线」一致（CHAT-02）。
+          const plan = resolveWakeAndVisibility(
+            { senderMemberId: binding.memberId, mentionIds, mentionsAll: parsed.all },
+            roster,
+          );
+          const persistedMentions = [...new Set([...mentionIds, ...plan.allRecipients])];
+
           const message = await (repos.messages.create({
             groupId,
             senderMemberId: binding.memberId,
@@ -1223,8 +1237,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
               reason ? { decision: "suppressed", reason } :
                 allowed.has(memberId) ? { decision: "allowed" } : undefined);
           }
-          return { message, duplicate: false as const, decision };
-        }));
+          return { message, duplicate: false as const, decision, plan };
+        }, discover);
       } catch (error) {
         // 跨连接/进程竞争唯一键：失败事务已经回滚，再读取已提交胜者。
         if (params.clientMessageId && error instanceof RepositoryError && error.code === "conflict") {
@@ -1235,7 +1249,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       }
       const created = persisted.message;
       if (persisted.duplicate) return { ok: true, messageId: created.id, createdAt: created.createdAt, duplicate: true };
-      const decision = persisted.decision;
+      const { decision, plan } = persisted;
       await notifyMessageCommit(options.db, created.id);
       log.info("message_sent", {
         memberId: binding.memberId,
@@ -1478,7 +1492,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     ...core,
     join: async (sid, params) => {
       // gateway 的 join 完成回调先确认通道就绪，再以 consume fence 领取持久工作事件。
-      const result = await withAccess(null, "join", () => core.join(sid, params));
+      const result = await withAccess(bindings.get(selfKey(sid)) ?? null, "join", () => core.join(sid, params));
       const binding = bindingFor(sid);
       const access = await taskAccess(binding);
       const pending = await withAccess(binding, "observe", () => tasks.listWorkEvents(access, binding.projectId));

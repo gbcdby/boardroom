@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DbDriver } from "./db/driver.ts";
 import type { HeartbeatConfig } from "./config.ts";
@@ -20,6 +19,11 @@ import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "./c
 import { buildRoster } from "./chat/roster.ts";
 import { resetGroupConsecutiveCount } from "./mcp/core.ts";
 import { createTaskService } from "./tasks/service.ts";
+import { createOrgMutationService } from "./org/mutations.ts";
+import { createAuditCompensationService } from "./audit-compensation.ts";
+import { createOrgHttpCommands } from "./org/http-commands.ts";
+import type { OrgMutationAccess } from "./org/compensation-types.ts";
+import { authorizeMutation } from "./org/boundary.ts";
 import { buildStatusBoard, deriveEffectiveStatus } from "./status.ts";
 import {
   AUTHZ_ROLES,
@@ -33,7 +37,7 @@ import {
   type GuardScope,
 } from "./authz/authorize.ts";
 import { actorForMember, ownerActor } from "./authz/actors.ts";
-import { noopOrgChangeRecorder, type OrgChangeRecorder } from "./org-change-hook.ts";
+import { noopOrgChangeRecorder, type OrgChangeRecorder, type OrgChange } from "./org-change-hook.ts";
 import {
   AUDIT_ACTIONS,
   appendAuditEntry,
@@ -80,6 +84,7 @@ export interface ActorResolution {
 
 export interface T1ApiOptions {
   readonly db: DbDriver;
+  readonly repos?: RepositorySet;
   readonly logger: Logger;
   /**
    * T3：人发送消息后，把消息广播给 WebUI（WebSocket）。可选：测试或无 WS 环境时省略。
@@ -98,8 +103,8 @@ export interface T1ApiOptions {
    */
   readonly resolveActor?: (resolution: ActorResolution) => Promise<Actor | null>;
   /**
-   * T5（#52）审计/撤销接口钩子：本票只在组织/占岗变更处调用，不写 audit_log。
-   * 省略时用空实现；T5 注入真实 recorder 即接上统一审计表与人的撤销权。
+   * 提交后观察钩子；权威审计由 mutation service 与业务在同一事务写入。
+   * 观察失败被记录，不改变已提交结果或对外成功响应。
    */
   readonly orgChangeRecorder?: OrgChangeRecorder;
 }
@@ -118,6 +123,7 @@ export interface MessageView {
   readonly groupId: string;
   readonly seq: number;
   readonly senderMemberId: string;
+  readonly senderRemoved: boolean;
   readonly senderDisplayName: string | null;
   readonly text: string;
   readonly mentions: readonly string[];
@@ -134,6 +140,9 @@ const ERROR_STATUS: Record<string, number> = {
   invalid_reference: 400,
   invalid_argument: 400,
   write_failed: 500,
+  mutation_scope_changed: 409, member_removed: 409, compensation_conflict: 409,
+  legacy_incomplete_snapshot: 409, chain_broken: 409,
+  audit_snapshot_too_large: 409, audit_capture_budget_exceeded: 409,
 };
 
 const MAX_BODY_BYTES = 1_000_000;
@@ -144,11 +153,14 @@ const PURGE_CONFIRM_TTL_MS = 5 * 60 * 1000;
 /** 创建 T1 API 路由。日志不记录消息正文等敏感字段（本模块无正文）。 */
 export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   const { db, logger } = options;
-  const repos = createRepositories(db);
+  const repos = options.repos ?? createRepositories(db);
   const tasks = createTaskService({ repos });
   const log = logger.child({ component: "api" });
   const heartbeat: HeartbeatConfig = options.heartbeat ?? { intervalMs: 10_000, timeoutMs: 30_000 };
   const now = options.now ?? (() => new Date());
+  const orgMutations = createOrgMutationService({ repos, now });
+  const compensations = createAuditCompensationService({ repos, now });
+  const orgCommands = createOrgHttpCommands({ repos, now });
 
   /**
    * 待确认的永久删除（T1 #48）：`project:<id>` / `group:<id>` → 一次性凭据与到期时间。
@@ -163,6 +175,32 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
 
   // T2 #49 / T5 #52：审计钩子缺省空实现。同样必须在提前 return 之前初始化（TDZ 坑）。
   const orgChangeRecorder: OrgChangeRecorder = options.orgChangeRecorder ?? noopOrgChangeRecorder;
+  function notifyOrgChange(change: OrgChange): void {
+    void Promise.resolve().then(() => orgChangeRecorder.record(change)).catch(error => {
+      log.warn("org_change_observer_failed", { error, projectId: change.projectId, action: change.action });
+    });
+  }
+  function mutationAccess(actor: Actor, request: IncomingMessage, response: ServerResponse): OrgMutationAccess {
+    const controller = new AbortController();
+    if (request.aborted || response.destroyed) controller.abort();
+    request.once("aborted", () => controller.abort());
+    response.once?.("close", () => { if (!response.writableEnded) controller.abort(); });
+    return { actor, signal: controller.signal };
+  }
+
+
+  async function withHttpMutation<T>(r: RepositorySet, projectId: string, memberIds: readonly string[], groupIds: readonly string[], body: () => Promise<T>): Promise<T> {
+    const wantedMembers = [...new Set(memberIds)], wantedGroups = [...new Set(groupIds)];
+    if (wantedMembers.length > 2048 || wantedGroups.length > 2048) throw new RepositoryError("mutation_scope_changed", "变更目标超过有界范围。");
+    return r.transaction(() => r.mutations.run({ projectIds: [projectId], discover: async tx => {
+      const rows = await tx.query<{ id: string }>(`SELECT DISTINCT m.id FROM members m LEFT JOIN group_participants gp ON gp.member_id = m.id
+        WHERE m.project_id = ? AND (m.id IN (${wantedMembers.map(() => "?").join(",") || "NULL"})
+          OR gp.group_id IN (${wantedGroups.map(() => "?").join(",") || "NULL"})) ORDER BY m.id LIMIT 2049`, [projectId, ...wantedMembers, ...wantedGroups]);
+      if (rows.length > 2048) throw new RepositoryError("mutation_scope_changed", "实际变更成员超过有界范围。");
+      const groups = wantedGroups.length ? await tx.query<{ id: string }>(`SELECT id FROM groups WHERE project_id = ? AND id IN (${wantedGroups.map(() => "?").join(",")}) ORDER BY id`, [projectId, ...wantedGroups]) : [];
+      return { memberIds: rows.map(row => row.id), groupIds: groups.map(row => row.id), runtimeIds: [] };
+    } }, body));
+  }
 
   /** 默认主体：阶段 1 的人（owner）；给定 memberId 时用其成员行推导静态角色。 */
   async function resolveDefaultActor(r: RepositorySet, resolution: ActorResolution): Promise<Actor> {
@@ -214,125 +252,6 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
    */
   async function recordAudit(actor: Actor, entry: Omit<AuditEntry, "actor">): Promise<AuditRow> {
     return await (appendAuditEntry(repos.audit, { actor: auditActorFrom(actor), ...entry }));
-  }
-
-  /** 审计列存储 JSON 文本；只解码一次，损坏/双重编码快照不能进入补偿写入。 */
-  function decodeAuditSnapshot(value: string | null): Record<string, unknown> | null {
-    if (value === null) return null;
-    let parsed: unknown;
-    try { parsed = JSON.parse(value); }
-    catch { throw new RepositoryError("invalid_argument", "审计快照不是有效 JSON，无法撤销。"); }
-    if (parsed === null) return null;
-    if (typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new RepositoryError("invalid_argument", "审计快照必须是对象或 null，无法撤销。");
-    }
-    return parsed as Record<string, unknown>;
-  }
-
-  function snapshotError(): never {
-    throw new RepositoryError("invalid_argument", "审计快照字段不完整或与事件目标不一致，无法撤销。");
-  }
-
-  function snapshotText(value: unknown): value is string {
-    return typeof value === "string" && value.trim() !== "";
-  }
-
-  function snapshotReference(value: unknown): value is string | null {
-    return value === null || snapshotText(value);
-  }
-
-  function memberSnapshot(value: Record<string, unknown> | null, row: AuditRow, memberId: string): Member | null {
-    if (value === null) return null;
-    if (value.id !== memberId || value.projectId !== row.projectId || !snapshotText(value.displayName) ||
-      !snapshotText(value.createdAt) || !snapshotText(value.updatedAt) || !snapshotReference(value.nodeId) ||
-      !snapshotReference(value.agentId) || (value.kind !== "human" && value.kind !== "agent") ||
-      (value.role !== "manager" && value.role !== "normal") ||
-      (value.status !== "active" && value.status !== "disabled" && value.status !== "pending") ||
-      (value.kind === "human" ? value.agentId !== null : value.agentId === null)) snapshotError();
-    return value as unknown as Member;
-  }
-
-  function nodeSnapshot(value: Record<string, unknown> | null, row: AuditRow): OrgNode | null {
-    if (value === null) return null;
-    if (value.id !== row.targetId || value.projectId !== row.projectId || !snapshotText(value.name) ||
-      !snapshotText(value.createdAt) || !snapshotText(value.updatedAt) || !snapshotReference(value.parentId) ||
-      (value.role !== "top_manager" && value.role !== "sub_manager" && value.role !== "member") ||
-      typeof value.sortOrder !== "number" || !Number.isFinite(value.sortOrder) ||
-      ((value.parentId === null) !== (value.role === "top_manager"))) snapshotError();
-    return value as unknown as OrgNode;
-  }
-
-  async function requireSnapshotNode(r: RepositorySet, projectId: string, nodeId: string | null): Promise<void> {
-    if (nodeId === null) return;
-    const node = await r.org.getNode(nodeId);
-    if (!node || node.projectId !== projectId) {
-      throw new RepositoryError("invalid_reference", "审计快照引用的岗位不存在或不属于当前项目。");
-    }
-  }
-
-  /** 复用既有补偿语义，所有形状、目标及引用检查均在写入前完成。 */
-  async function applyMemberOrgSnapshot(r: RepositorySet, row: AuditRow, redo: boolean): Promise<void> {
-    const before = decodeAuditSnapshot(row.before);
-    const after = decodeAuditSnapshot(row.after);
-    const project = await r.projects.get(row.projectId);
-    if (!project) throw new RepositoryError("not_found", "审计所属项目不存在。");
-    if (project.archivedAt) throw new RepositoryError("archived", "请先恢复项目，再撤销变更。");
-
-    if (row.action === AUDIT_ACTIONS.org_assign || row.action === AUDIT_ACTIONS.org_auto_place) {
-      // assign 的 targetId 是成员；auto_place 的 targetId 是岗位，但 before/after 均为成员快照。
-      const memberId = row.action === AUDIT_ACTIONS.org_auto_place ? after?.id : row.targetId;
-      if (!snapshotText(memberId) || row.targetKind !== (row.action === AUDIT_ACTIONS.org_auto_place ? "node" : "member")) snapshotError();
-      const previous = memberSnapshot(before, row, memberId);
-      const next = memberSnapshot(after, row, memberId);
-      if (!previous || !next || (row.action === AUDIT_ACTIONS.org_auto_place && next.nodeId !== row.targetId)) snapshotError();
-      const member = await r.members.get(memberId);
-      if (!member || member.projectId !== row.projectId) throw new RepositoryError("invalid_reference", "审计目标成员不存在或不属于当前项目。");
-      const target = redo ? next : previous;
-      await requireSnapshotNode(r, row.projectId, target.nodeId);
-      await r.org.assignNode(memberId, target.nodeId);
-      return;
-    }
-
-    if (row.action === AUDIT_ACTIONS.member_add || row.action === AUDIT_ACTIONS.member_remove ||
-      row.action === AUDIT_ACTIONS.member_pause || row.action === AUDIT_ACTIONS.member_resume ||
-      row.action === AUDIT_ACTIONS.member_status_change) {
-      if (row.targetKind !== "member") snapshotError();
-      const previous = memberSnapshot(before, row, row.targetId);
-      const next = memberSnapshot(after, row, row.targetId);
-      if (row.action === AUDIT_ACTIONS.member_add ? previous !== null || next === null :
-        row.action === AUDIT_ACTIONS.member_remove ? previous === null || next !== null : previous === null || next === null) snapshotError();
-      const current = await r.members.get(row.targetId);
-      if (current && current.projectId !== row.projectId) throw new RepositoryError("invalid_reference", "审计目标成员不属于当前项目。");
-      const target = redo ? next : previous;
-      if (target === null) await r.members.delete(row.targetId);
-      else {
-        await requireSnapshotNode(r, row.projectId, target.nodeId);
-        await r.members.restoreRow(target);
-      }
-      return;
-    }
-
-    if (row.action === AUDIT_ACTIONS.org_node_create || row.action === AUDIT_ACTIONS.org_node_delete ||
-      row.action === AUDIT_ACTIONS.org_node_update) {
-      if (row.targetKind !== "node") snapshotError();
-      const previous = nodeSnapshot(before, row);
-      const next = nodeSnapshot(after, row);
-      if (row.action === AUDIT_ACTIONS.org_node_create ? previous !== null || next === null :
-        row.action === AUDIT_ACTIONS.org_node_delete ? previous === null || next !== null : previous === null || next === null) snapshotError();
-      const current = await r.org.getNode(row.targetId);
-      if (current && current.projectId !== row.projectId) throw new RepositoryError("invalid_reference", "审计目标岗位不属于当前项目。");
-      const target = redo ? next : previous;
-      if (target === null) await r.org.deleteNode(row.targetId);
-      else {
-        await requireSnapshotNode(r, row.projectId, target.parentId);
-        if (target.parentId !== null && (target.parentId === target.id || (await r.org.subtreeNodeIds(target.id)).includes(target.parentId))) {
-          throw new RepositoryError("invalid_reference", "恢复此岗位会形成循环汇报关系，无法撤销。");
-        }
-        await r.org.restoreRow(target);
-      }
-      return;
-    }
-    throw new RepositoryError("invalid_argument", `事件 ${row.action} 不支持补偿。`);
   }
 
   /** 撤销被拒绝时的中文说明（前端据此置灰并说明原因）。 */
@@ -445,20 +364,17 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         // 归档与恢复共用 `project:archive` 能力点：恢复 = 取消归档，权限同位。
         // 顶层 manager 可归档（LIFE-ARC-01），但矩阵里没有 project:purge → 不能永久删除。
         const { actor } = (await (guard(r, request, "project:archive", { projectId: project.id })));
-        const next =
-          segments[3] === "archive" ? (await (r.projects.archive(project.id))) : (await (r.projects.restore(project.id)));
+        const next = await withHttpMutation(r, projectId, actor.kind === "agent" ? [actor.actorId] : [], [], async () => {
+          const current = await requireProject(r, projectId);
+          await authorizeMutation(r, { actor }, "project:archive", { projectId });
+          const updated = segments[3] === "archive" ? await r.projects.archive(projectId) : await r.projects.restore(projectId);
+          await recordAudit(actor, {
+            projectId, action: segments[3] === "archive" ? AUDIT_ACTIONS.project_archive : AUDIT_ACTIONS.project_restore,
+            targetKind: "project", targetId: projectId, targetName: current.name, before: current, after: updated,
+          });
+          return updated;
+        });
         log.info(segments[3] === "archive" ? "归档项目" : "恢复项目", { projectId });
-        // T5 #52：归档/恢复本就是状态可逆，不进可撤销集；仍留痕供人查阅。
-        await (recordAudit(actor, {
-          projectId: project.id,
-          action:
-            segments[3] === "archive" ? AUDIT_ACTIONS.project_archive : AUDIT_ACTIONS.project_restore,
-          targetKind: "project",
-          targetId: project.id,
-          targetName: project.name,
-          before: project,
-          after: next,
-        }));
         writeJson(response, 200, { project: (await (projectView(r, next))) });
         return true;
       }
@@ -482,7 +398,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         const status = optionalLifecycleStatus(body);
         // F2：增成员 = member:manage（ORG-07；下级 manager 的子树限制待 T2 注入节点数据）。
         const { actor } = (await (guard(r, request, "member:manage", { projectId })));
-        const member = (await (r.members.create({
+        const { member } = await orgMutations.addMember(mutationAccess(actor, request, response), {
           projectId,
           kind: requireMemberKind(body),
           displayName: requireString(body, "displayName"),
@@ -490,17 +406,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           ...(role === undefined ? {} : { role }),
           // T3 #50：可显式登记为 pending（待激活）；省略 = active（阶段 1 行为不变）。
           ...(status === undefined ? {} : { status }),
-        })));
-        // T5 #52：成员新增可撤销（撤销＝删除），写审计。
-        await (recordAudit(actor, {
-          projectId,
-          action: AUDIT_ACTIONS.member_add,
-          targetKind: "member",
-          targetId: member.id,
-          targetName: member.displayName,
-          before: null,
-          after: member,
-        }));
+        });
         log.info("添加项目成员", { projectId, memberId: member.id });
         writeJson(response, 201, { member: memberView(member) });
         return true;
@@ -531,17 +437,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         }
         // F2：移除成员 = member:manage。
         const { actor } = (await (guard(r, request, "member:manage", { projectId, memberId })));
-        (await (r.members.delete(memberId)));
-        // T5 #52：成员移除可撤销（撤销＝按 before 复原整行），写审计。
-        await (recordAudit(actor, {
-          projectId,
-          action: AUDIT_ACTIONS.member_remove,
-          targetKind: "member",
-          targetId: member.id,
-          targetName: member.displayName,
-          before: member,
-          after: null,
-        }));
+        await orgMutations.removeMember(mutationAccess(actor, request, response), projectId, memberId);
         log.info("移除项目成员", { projectId, memberId });
         response.writeHead(204, { "cache-control": "no-store" });
         response.end();
@@ -588,9 +484,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       }
       const { actor } = (await (guard(r, request, "member:manage", { projectId, nodeId: member.nodeId })));
       const from = member.status;
-      const updated = (await (r.members.setStatus(memberId, status)));
+      const { member: updated } = await orgMutations.setMemberStatus(mutationAccess(actor, request, response), projectId, memberId, status);
       // T5 #52：经审计钩子写入 audit_log（含真实主体与 before/after 快照，供撤销复原）。
-      orgChangeRecorder.record({
+      notifyOrgChange({
         projectId,
         action: hookAction,
         nodeId: updated.nodeId,
@@ -666,21 +562,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
           throw new RepositoryError("not_found", `成员 ${memberId} 不属于项目 ${projectId}，无法指定为 manager。`);
         }
         // F2：指定/更换顶层 manager = org:manage（ORG-04：人可撤销、manager 在管辖范围内调整）。
-        (await (guard(r, request, "org:manage", { projectId, memberId })));
-        const current = (await (r.members.getManager(projectId)));
-        if (current && current.id !== memberId) {
-          // 支持「更换」：事务内先把旧 manager 降为 normal，再把新成员升为 manager。
-          // 顺序保证任一时刻最多一个 manager（部分唯一索引 ux_members_project_manager）。
-          (await (r.transaction(async () => {
-            (await (r.members.update(current.id, { role: "normal" })));
-            (await (r.members.update(memberId, { role: "manager" })));
-          })));
-          log.info("更换项目 manager", { projectId, from: current.id, to: memberId });
-        } else if (member.role !== "manager") {
-          // 无现有 manager（或已指定同一成员）：仅提升该成员；留空创建后在此首次指定。
-          (await (r.members.update(memberId, { role: "manager" })));
-          log.info("指定项目 manager", { projectId, memberId });
-        }
+        const { actor } = await guard(r, request, "org:manage", { projectId, memberId });
+        const result = await orgCommands.setManager(mutationAccess(actor, request, response), projectId, memberId);
+        if (result.auditId) log.info("指定项目 manager", { projectId, memberId, auditId: result.auditId });
         writeJson(response, 200, { project: (await (projectView(r, (await (r.projects.get(projectId)))!))) });
         return true;
       }
@@ -703,20 +587,17 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         const participantMemberIds = optionalStringArray(body, "participantMemberIds");
         // F2：建群组 = group:create（GROUP-03）。T2 #49：附上参与者岗位节点，
         // 下级 manager 建群时由守卫的 subtree 边界判定「参与者必须全部落在本子树内」（ORG-05）。
-        (await (guard(r, request, "group:create", {
-          projectId,
-          ...(participantMemberIds === undefined
-            ? {}
-            : {
-                groupMemberIds: participantMemberIds,
-                groupMemberNodeIds: await (nodeIdsOfMembers(r, participantMemberIds)),
-              }),
-        })));
-        const group = (await (r.groups.create({
-          projectId,
-          name,
-          ...(participantMemberIds === undefined ? {} : { participantMemberIds }),
-        })));
+        const scope = { projectId, ...(participantMemberIds === undefined ? {} : {
+          groupMemberIds: participantMemberIds, groupMemberNodeIds: await nodeIdsOfMembers(r, participantMemberIds),
+        }) };
+        const { actor } = await guard(r, request, "group:create", scope);
+        const group = await withHttpMutation(r, projectId,
+          [...(participantMemberIds ?? []), ...(actor.kind === "agent" ? [actor.actorId] : [])], [], async () => {
+            await authorizeMutation(r, { actor }, "group:create", { projectId, ...(participantMemberIds === undefined ? {} : {
+              groupMemberIds: participantMemberIds, groupMemberNodeIds: await nodeIdsOfMembers(r, participantMemberIds),
+            }) });
+            return r.groups.create({ projectId, name, ...(participantMemberIds === undefined ? {} : { participantMemberIds }) });
+          });
         log.info("创建群组", { projectId, groupId: group.id });
         writeJson(response, 201, { group: groupView(group) });
         return true;
@@ -762,21 +643,16 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       if (method === "POST") {
         // 归档与恢复共用 `group:archive`（owner / 顶层 manager / 下级 manager 限子树）。
         const { actor } = (await (guard(r, request, "group:archive", { projectId: group.projectId, groupId })));
-        const next = segments[3] === "archive" ? (await (r.groups.archive(groupId))) : (await (r.groups.restore(groupId)));
-        log.info(segments[3] === "archive" ? "归档群组" : "恢复群组", {
-          projectId: group.projectId,
-          groupId,
+        const next = await withHttpMutation(r, group.projectId, actor.kind === "agent" ? [actor.actorId] : [], [groupId], async () => {
+          const before = await requireGroup(r, groupId);
+          const fresh = await authorizeMutation(r, { actor }, "group:archive", { projectId: group.projectId, groupId, ...(await groupGuardFacts(r, groupId)) });
+          const next = segments[3] === "archive" ? await r.groups.archive(groupId) : await r.groups.restore(groupId);
+          await recordAudit(fresh, { projectId: group.projectId,
+            action: segments[3] === "archive" ? AUDIT_ACTIONS.group_archive : AUDIT_ACTIONS.group_restore,
+            targetKind: "group", targetId: group.id, targetName: before.name, before, after: next });
+          return next;
         });
-        // T5 #52：归档/恢复属状态可逆，不进可撤销集；仍留痕供人查阅。
-        await (recordAudit(actor, {
-          projectId: group.projectId,
-          action: segments[3] === "archive" ? AUDIT_ACTIONS.group_archive : AUDIT_ACTIONS.group_restore,
-          targetKind: "group",
-          targetId: group.id,
-          targetName: group.name,
-          before: group,
-          after: next,
-        }));
+        log.info(segments[3] === "archive" ? "归档群组" : "恢复群组", { projectId: group.projectId, groupId });
         writeJson(response, 200, { group: groupView(next) });
         return true;
       }
@@ -860,41 +736,45 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         const text = requireString(body, "text");
         const explicitMentions = optionalStringArray(body, "mentions") ?? [];
 
-        const sender = (await (r.members.get(senderMemberId)));
-        if (!sender || sender.projectId !== group.projectId) {
-          throw new RepositoryError("invalid_reference", `发送者 ${senderMemberId} 不属于该群组所在项目。`);
+        // 先保留公开输入的引用错误语义；提交范围内还会重新读取全部事实。
+        const requestedSender = await r.members.get(senderMemberId);
+        if (!requestedSender || requestedSender.projectId !== group.projectId || requestedSender.status !== "active") {
+          throw new RepositoryError("invalid_reference", `发送者 ${senderMemberId} 不属于该群组所在项目或已停用。`);
         }
-        if (!(await (r.groups.participants(groupId))).includes(senderMemberId)) {
+        if (!(await r.groups.participants(groupId)).includes(senderMemberId)) {
           throw new RepositoryError("invalid_reference", `发送者 ${senderMemberId} 不是该群组参与者。`);
         }
-        // F2：发言 = group:post，以发送者为主体（参与范围由 group_participants 判定）。
-        // T2 #49：group:post 是 participation 边界——子树只读可见性不会扩成发言权。
-        (await (guard(
-          r,
-          request,
-          "group:post",
-          { projectId: group.projectId, groupId, ...(await (groupGuardFacts(r, groupId))) },
-          senderMemberId,
-        )));
-
-        const roster = (await (buildRosterFor(r, groupId)));
-        const parsed = parseMentions(text, roster);
-        if (parsed.unknownNames.length > 0) {
-          throw new RepositoryError("invalid_argument", `无法解析 @ 名称：${parsed.unknownNames.join("、")}。`);
-        }
-        for (const id of explicitMentions) {
-          if (!roster.some((m) => m.id === id)) {
-            throw new RepositoryError("invalid_argument", `被 @ 的成员 ${id} 不是该群组参与者。`);
+        const { actor } = await guard(r, request, "group:post", { projectId: group.projectId, groupId, ...(await groupGuardFacts(r, groupId)) }, senderMemberId);
+        const { message: created, plan, senderKind } = await withHttpMutation(r, group.projectId,
+          [senderMemberId, ...explicitMentions, ...(actor.kind === "agent" ? [actor.actorId] : [])], [groupId], async () => {
+          const sender = (await (r.members.get(senderMemberId)));
+          if (!sender || sender.projectId !== group.projectId || sender.status !== "active") {
+            throw new RepositoryError("invalid_reference", `发送者 ${senderMemberId} 不属于该群组所在项目。`);
           }
-        }
-        const mentionIds = [...new Set([...explicitMentions, ...parsed.mentionIds])];
-        const plan = resolveWakeAndVisibility(
-          { senderMemberId, mentionIds, mentionsAll: parsed.all },
-          roster,
-        );
-        const persistedMentions = [...new Set([...mentionIds, ...plan.allRecipients])];
+          if (!(await (r.groups.participants(groupId))).includes(senderMemberId)) {
+            throw new RepositoryError("invalid_reference", `发送者 ${senderMemberId} 不是该群组参与者。`);
+          }
+          // F2：发言 = group:post，以发送者为主体（参与范围由 group_participants 判定）。
+          // T2 #49：group:post 是 participation 边界——子树只读可见性不会扩成发言权。
+          await authorizeMutation(r, { actor }, "group:post", { projectId: group.projectId, groupId, ...(await groupGuardFacts(r, groupId)) });
 
-        const created = (await (r.transaction(async () => {
+          const roster = (await (buildRosterFor(r, groupId)));
+          const parsed = parseMentions(text, roster);
+          if (parsed.unknownNames.length > 0) {
+            throw new RepositoryError("invalid_argument", `无法解析 @ 名称：${parsed.unknownNames.join("、")}。`);
+          }
+          for (const id of explicitMentions) {
+            if (!roster.some((m) => m.id === id)) {
+              throw new RepositoryError("invalid_argument", `被 @ 的成员 ${id} 不是该群组参与者。`);
+            }
+          }
+          const mentionIds = [...new Set([...explicitMentions, ...parsed.mentionIds])];
+          const plan = resolveWakeAndVisibility(
+            { senderMemberId, mentionIds, mentionsAll: parsed.all },
+            roster,
+          );
+          const persistedMentions = [...new Set([...mentionIds, ...plan.allRecipients])];
+
           const message = (await (r.messages.create({
             groupId,
             senderMemberId,
@@ -907,11 +787,11 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
             await r.deliveries.ensure(message.id, memberId,
               wakeMembers.has(memberId) ? { decision: "allowed" } : undefined);
           }
-          return message;
-        })));
+          return { message, plan, senderKind: sender.kind };
+        });
         const view = (await (messageView(r, created, plan)));
         // T7：人类消息重置该群组的「连续自动回复」计数（防环恢复条件之一）。
-        if (sender.kind === "human") resetGroupConsecutiveCount(groupId);
+        if (senderKind === "human") resetGroupConsecutiveCount(groupId);
         log.info("发送群组消息", { groupId, messageId: created.id, senderMemberId, via: "http" });
         await options.onMessage?.(view);
         writeJson(response, 201, { message: view });
@@ -990,15 +870,15 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         const sortOrder = optionalSortOrder(body);
         // ORG-05：新岗位的父节点必须落在调用者的管辖子树内（root 仅 owner/top_manager 可建）。
         const { actor } = (await (guard(r, request, "org:manage", { projectId, nodeId: parentId })));
-        const node = (await (r.org.createNode({
+        const { node } = await orgMutations.createNode(mutationAccess(actor, request, response), {
           projectId,
           parentId,
           name,
           role,
           ...(sortOrder === undefined ? {} : { sortOrder }),
-        })));
+        });
         // T5 #52：建岗可撤销（撤销＝删岗），写审计。
-        orgChangeRecorder.record({
+        notifyOrgChange({
           projectId,
           action: "node.create",
           nodeId: node.id,
@@ -1032,9 +912,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         const memberId = requireString(body, "memberId");
         const { actor } = (await (guard(r, request, "member:manage", { projectId })));
         const beforeMember = (await (r.members.get(memberId)));
-        const node = (await (r.org.autoPlaceMember(projectId, memberId)));
+        const { node } = await orgMutations.autoPlaceMember(mutationAccess(actor, request, response), projectId, memberId);
         // T5 #52：自动分配可撤销（撤销＝腾岗回 nodeId=null），写审计。
-        orgChangeRecorder.record({
+        notifyOrgChange({
           projectId,
           action: "member.auto_place",
           nodeId: node?.id ?? null,
@@ -1076,9 +956,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         if (parentId !== undefined && parentId !== null) {
           (await (guard(r, request, "org:manage", { projectId: node.projectId, nodeId: parentId })));
         }
-        const updated = (await (r.org.updateNode(nodeId, patch)));
+        const { node: updated } = await orgMutations.updateNode(mutationAccess(actor, request, response), node.projectId, nodeId, patch);
         // T5 #52：改岗可撤销（撤销＝按 before 复原整行），写审计。
-        orgChangeRecorder.record({
+        notifyOrgChange({
           projectId: node.projectId,
           action: "node.update",
           nodeId,
@@ -1094,9 +974,9 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       }
       if (method === "DELETE") {
         const { actor } = (await (guard(r, request, "org:manage", { projectId: node.projectId, nodeId: node.id })));
-        (await (r.org.deleteNode(nodeId)));
+        await orgMutations.deleteNode(mutationAccess(actor, request, response), node.projectId, nodeId);
         // T5 #52：删岗可撤销（撤销＝按 before 复原整行），写审计。
-        orgChangeRecorder.record({
+        notifyOrgChange({
           projectId: node.projectId,
           action: "node.delete",
           nodeId,
@@ -1131,30 +1011,24 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         // memberId 为 null = 腾出该岗位当前占据者；否则把指定成员指派到该岗位。
         const memberId = optionalStringOrNull(body, "memberId") ?? null;
         const { actor } = (await (guard(r, request, "member:manage", { projectId: node.projectId, nodeId: node.id })));
-        let targetId = memberId;
-        if (targetId === null) {
-          const current = (await (memberAtNode(r, node.projectId, nodeId)));
-          if (!current) {
-            writeJson(response, 200, { member: null });
-            return true;
-          }
-          targetId = current.id;
-        }
-        const beforeMember = (await (r.members.get(targetId)));
-        const member = (await (r.org.assignNode(targetId, memberId === null ? null : nodeId)));
+        const beforeMember = memberId === null ? null : await r.members.get(memberId);
+        const access = mutationAccess(actor, request, response);
+        const { member } = memberId === null
+          ? await orgCommands.clearNode(access, node.projectId, nodeId)
+          : await orgMutations.assignNode(access, node.projectId, memberId, nodeId);
         // T5 #52：占岗/腾岗可撤销（撤销＝按 before 的 nodeId 复原占岗），写审计。
-        orgChangeRecorder.record({
+        if (member) notifyOrgChange({
           projectId: node.projectId,
           action: "node.assign",
           nodeId,
-          memberId: targetId,
+          memberId: member.id,
           actor: auditActorFrom(actor),
           targetName: member.displayName,
           before: beforeMember ?? null,
           after: member,
           detail: { assigned: memberId !== null },
         });
-        writeJson(response, 200, { member: memberView(member) });
+        writeJson(response, 200, { member: member ? memberView(member) : null });
         return true;
       }
       methodNotAllowed(response, ["PUT"]);
@@ -1219,50 +1093,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         if (isTruncated(row)) {
           throw new HttpError(403, "truncated", REVOKE_REASON_MESSAGE.truncated ?? "该审计事件被截断，不可撤销。");
         }
-        const at = new Date().toISOString();
-        // 撤销一个「撤销事件」＝链式回滚（重放原变更，#30 §3）。
-        let compensationAction: AuditAction = row.action.startsWith("member.")
-          ? AUDIT_ACTIONS.member_revoke
-          : AUDIT_ACTIONS.org_revoke;
-        let originalForRedo: AuditRow | null = null;
-        if (row.action === AUDIT_ACTIONS.member_revoke || row.action === AUDIT_ACTIONS.org_revoke) {
-          const originalId = row.reversedByAuditId;
-          if (!originalId) throw new HttpError(409, "chain_broken", "撤销链断裂：缺少原始事件引用。");
-          const original = (await (r.audit.get(projectId, originalId)));
-          if (!original) throw new HttpError(409, "chain_broken", "撤销链断裂：原始事件已不存在。");
-          if (original.projectId !== row.projectId || original.targetId !== row.targetId || original.targetKind !== row.targetKind) {
-            throw new RepositoryError("invalid_reference", "撤销链引用的事件目标不一致。");
-          }
-          originalForRedo = original;
-          compensationAction = row.action;
-        }
-        let newRow!: AuditRow;
-        (await (r.transaction(async () => {
-          const latest = await r.audit.get(projectId, row.id);
-          if (!latest || latest.reversedAt) throw new RepositoryError("conflict", "该审计事件已被撤销，不能重复撤销。");
-          // 先解码补偿自身的快照，不能先改业务数据再发现审计数据损坏。
-          const compensationBefore = decodeAuditSnapshot(row.after);
-          const compensationAfter = decodeAuditSnapshot(row.before);
-          if (originalForRedo && (!isDeepStrictEqual(compensationBefore, decodeAuditSnapshot(originalForRedo.before)) ||
-            !isDeepStrictEqual(compensationAfter, decodeAuditSnapshot(originalForRedo.after)))) snapshotError();
-          await applyMemberOrgSnapshot(r, originalForRedo ?? row, originalForRedo !== null);
-          // 写撤销记录（记录被撤销的原事件 id；本身仍可再被撤销＝链式）。
-          newRow = await (appendAuditEntry(repos.audit, {
-            projectId,
-            actor: auditActorFrom(actor),
-            action: compensationAction,
-            targetKind: row.targetKind,
-            targetId: row.targetId,
-            targetName: row.targetName,
-            before: compensationBefore,
-            after: compensationAfter,
-            detail: { undoes: row.id, ...(originalForRedo ? { kind: "redo" } : { kind: "undo" }) },
-            reversedByAuditId: row.id,
-          }));
-          if (!await repos.audit.markReversed(projectId, row.id, newRow.id, at)) {
-            throw new RepositoryError("conflict", "该审计事件已被撤销，不能重复撤销。");
-          }
-        })));
+        const newRow = await compensations.revoke(mutationAccess(actor, request, response), projectId, auditId);
         writeJson(response, 200, { entry: auditView(newRow) });
         return true;
       }
@@ -1479,7 +1310,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
 
   /** 消息视图（HTTP/WS 共用）。 */
   async function messageView(r: RepositorySet, message: DbMessage, plan?: { wake: readonly string[]; visible: readonly string[] }): Promise<MessageView> {
-    const sender = (await (r.members.get(message.senderMemberId)));
+    const sender = (await (r.members.getIncludingRemoved(message.senderMemberId)));
     const resolvedPlan =
       plan ??
       resolveWakeAndVisibility(
@@ -1492,6 +1323,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       seq: message.seq,
       senderMemberId: message.senderMemberId,
       senderDisplayName: sender?.displayName ?? null,
+      senderRemoved: sender?.removedAt != null,
       text: message.body,
       mentions: message.mentions,
       wakeMemberIds: resolvedPlan.wake,
