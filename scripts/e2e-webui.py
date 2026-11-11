@@ -323,7 +323,139 @@ def purge_snapshot_flows(page, origin, output, report):
         report["purgeSnapshotFlows"].append({"kind": kind, "target": target, "newMessageId": message["id"], "before": initial["cascade"], "after": latest["cascade"], "rejection": refused, "consumedTokenStatus": consumed.status, "confirmedStatus": deleted_response.value.status, "preservedBeforeReconfirmation": True})
     report["checks"].append("S6-AC03 / #130: 项目与群均走真实预览→另一HTTP入口新增消息→409 confirmation_changed且完整保留→旧token作废→重预览不自动删除→再次点击才204；群成员与其他群保留")
 
-def exercise(page, origin, records, output, report, capture_only):
+def purge_runtime_impact_flows(page, origin, workdir, output, report):
+    """R-S6-CONFIRM-REQ-001：真实托管关系变动；只有预留关系删除数量从0变1。"""
+    project = request(page, origin, "POST", "/api/projects", {"name": "托管删除影响清单"})["project"]
+    project_id = project["id"]
+    groups = [request(page, origin, "POST", f"/api/projects/{project_id}/groups", {"name": name})["group"] for name in ["托管清单目标群", "保留成员关系的其他群"]]
+    retained_project = request(page, origin, "POST", "/api/projects", {"name": "托管配置的其他项目"})["project"]
+    retained_group = request(page, origin, "POST", f"/api/projects/{retained_project['id']}/groups", {"name": "保留托管绑定"})["group"]
+    runtime = request(page, origin, "POST", "/api/runtimes", {
+        "name": "跨群与跨项目的托管配置", "backend": "claude-code", "defaults": {"workdir": workdir},
+        "bindings": [{"projectId": project_id, "groupId": group["id"]} for group in groups]
+        + [{"projectId": retained_project["id"], "groupId": retained_group["id"]}],
+    })["runtime"]
+    selected = next(item["binding"] for item in runtime["bindings"] if item["binding"]["groupId"] == groups[0]["id"])
+    sibling = next(item["binding"] for item in runtime["bindings"] if item["binding"]["groupId"] == groups[1]["id"])
+    retained = next(item["binding"] for item in runtime["bindings"] if item["binding"]["groupId"] == retained_group["id"])
+    assert selected["memberId"] == sibling["memberId"]
+    assert all(item["binding"]["desiredState"] == "stopped" and item["runner"]["state"] == "stopped" for item in runtime["bindings"]), "创建验证配置不得启动模型"
+    runtime_path = f"/api/runtimes/{runtime['runtime']['id']}"
+    project_path = f"/api/projects/{project_id}"
+    group_path = f"/api/groups/{groups[0]['id']}"
+    runtime_labels = {"agentRuntimeBindings": "托管群绑定", "agentRunnerStates": "托管运行状态", "agentRuntimeMembers": "托管成员预留关系"}
+
+    def visible_impact(kind, cascade):
+        impact = page.get_by_test_id(f"{kind}-purge-confirm")
+        for field, label in runtime_labels.items():
+            expect(impact.get_by_text(f"{label}：{cascade[field]} 条", exact=True)).to_be_visible()
+        return impact
+
+    def capture_impact(kind, phase, cascade):
+        for width, height in [(1440, 1000), (390, 844)]:
+            page.set_viewport_size({"width": width, "height": height})
+            impact = visible_impact(kind, cascade)
+            dialog = page.get_by_test_id("confirmation-dialog")
+            body = dialog.locator(".confirm-dialog-body")
+            body.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+            assert body.evaluate("el => el.scrollWidth <= el.clientWidth + 1"), "托管影响清单不能横向溢出"
+            if kind == "project" and width == 390:
+                assert body.evaluate("el => el.scrollHeight > el.clientHeight"), "窄屏完整项目清单应可滚动"
+            rect = dialog.bounding_box()
+            assert rect and rect["x"] >= 0 and rect["y"] >= 0 and rect["x"] + rect["width"] <= width + 1 and rect["y"] + rect["height"] <= height + 1
+            for field, label in runtime_labels.items():
+                expect(impact.get_by_text(f"{label}：{cascade[field]} 条", exact=True)).to_be_in_viewport()
+            expect(page.get_by_test_id(f"cancel-purge-{kind}")).to_be_in_viewport()
+            expect(page.get_by_test_id(f"confirm-purge-{kind}")).to_be_in_viewport()
+            filename = f"purge-runtime-{kind}-{phase}-{width}-light.png"
+            page.screenshot(path=str(output / filename), animations="disabled")
+            report["screenshots"].append(filename)
+            report["layouts"].append(layout(page, f"purge-runtime-{kind}-{phase}-{width}"))
+        page.set_viewport_size({"width": 1440, "height": 1000})
+
+    page.goto(origin + f"/projects/{project_id}/overview")
+    row = page.get_by_test_id("group-list").locator("li").filter(has_text=groups[0]["name"])
+    row.get_by_test_id("group-management").locator("summary").click()
+    with page.expect_response(lambda r: r.url.endswith(group_path) and r.request.method == "DELETE") as initial_response:
+        row.get_by_test_id("purge-group").click()
+    assert initial_response.value.status == 409
+    initial = initial_response.value.json()["confirmation"]
+    assert {key: initial["cascade"][key] for key in runtime_labels} == {"agentRuntimeBindings": 1, "agentRunnerStates": 1, "agentRuntimeMembers": 0}
+    expect(visible_impact("group", initial["cascade"])).to_contain_text("全局托管配置和项目成员保留")
+    capture_impact("group", "before", initial["cascade"])
+    request(page, origin, "DELETE", f"/api/runtime-bindings/{sibling['id']}")
+    confirm = page.get_by_test_id("confirm-purge-group")
+    with page.expect_response(lambda r: r.url.endswith(group_path) and r.request.method == "DELETE") as refused_response:
+        confirm.click()
+    refused = refused_response.value.json()
+    assert refused_response.value.status == 409 and refused["error"]["code"] == "confirmation_changed"
+    expect(page.get_by_test_id("confirmation-error")).to_contain_text("影响范围已变化")
+    expect(confirm).to_be_disabled()
+    visible_impact("group", initial["cascade"])
+    assert page.request.get(origin + group_path).status == 200
+    assert page.request.get(origin + f"/api/runtime-bindings/{selected['id']}").status == 200, "被拒的确认不能删除原绑定"
+    consumed = page.request.delete(origin + group_path, data={"confirm": initial["token"]})
+    assert consumed.status == 400 and consumed.json()["error"]["code"] == "invalid_confirmation"
+    with page.expect_response(lambda r: r.url.endswith(group_path) and r.request.method == "DELETE") as latest_response:
+        page.get_by_test_id("confirmation-preview").click()
+    latest = latest_response.value.json()["confirmation"]
+    assert latest["token"] != initial["token"]
+    assert latest["cascade"] == {**initial["cascade"], "agentRuntimeMembers": 1}, "此场景只允许预留关系的删除影响从0变1"
+    impact = visible_impact("group", latest["cascade"])
+    expect(impact.get_by_text("托管成员预留关系：0 条", exact=True)).to_have_count(0)
+    expect(impact).to_contain_text("其他群的托管绑定与运行状态保留")
+    expect(impact).to_contain_text("仅清除删除后不再有其他群绑定的未占用预留关系")
+    capture_impact("group", "repreview", latest["cascade"])
+    assert page.request.get(origin + group_path).status == 200, "新清单显示后仍须再次明确确认"
+    expect(confirm).to_be_enabled()
+    with page.expect_response(lambda r: r.url.endswith(group_path) and r.request.method == "DELETE") as group_deleted:
+        confirm.click()
+    assert group_deleted.value.status == 204
+    assert json.loads(group_deleted.value.request.post_data)["confirm"] == latest["token"]
+    expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
+    assert page.request.get(origin + group_path).status == 404
+    assert page.request.get(origin + f"/api/runtime-bindings/{selected['id']}").status == 404
+    assert any(item["id"] == selected["memberId"] for item in request(page, origin, "GET", project_path + "/members")["members"])
+    assert any(item["id"] == selected["memberId"] for item in request(page, origin, "GET", f"/api/groups/{groups[1]['id']}/participants")["participants"]), "其他群的成员关系必须保留"
+    after_group = page.request.delete(origin + project_path)
+    assert after_group.status == 409
+    after_group_counts = after_group.json()["confirmation"]["cascade"]
+    assert all(after_group_counts[key] == 0 for key in runtime_labels), "删群后确实清除目标项目的托管预留关系"
+    surviving_runtime = request(page, origin, "GET", runtime_path)["runtime"]
+    assert [item["binding"]["id"] for item in surviving_runtime["bindings"]] == [retained["id"]]
+
+    # 重新绑定保留下来的成员，让项目确认分支也展示真实非零的三项影响。
+    request(page, origin, "POST", runtime_path + "/bindings", {"projectId": project_id, "groupId": groups[1]["id"], "expectedRuntimeRevision": surviving_runtime["runtime"]["revision"]})
+    details = page.get_by_test_id("project-actions")
+    if not details.evaluate("el => el.open"): details.locator("summary").click()
+    with page.expect_response(lambda r: r.url.endswith(project_path) and r.request.method == "DELETE") as project_preview:
+        page.get_by_test_id("purge-project").click()
+    project_confirmation = project_preview.value.json()["confirmation"]
+    assert {key: project_confirmation["cascade"][key] for key in runtime_labels} == {"agentRuntimeBindings": 1, "agentRunnerStates": 1, "agentRuntimeMembers": 1}
+    project_impact = visible_impact("project", project_confirmation["cascade"])
+    expect(project_impact).to_contain_text("全局托管配置和 Agent 身份保留")
+    expect(project_impact).to_contain_text("其他项目的成员、托管群绑定与运行状态保留")
+    capture_impact("project", "preview", project_confirmation["cascade"])
+    assert page.request.get(origin + project_path).status == 200
+    with page.expect_response(lambda r: r.url.endswith(project_path) and r.request.method == "DELETE") as project_deleted:
+        page.get_by_test_id("confirm-purge-project").click()
+    assert project_deleted.value.status == 204
+    assert json.loads(project_deleted.value.request.post_data)["confirm"] == project_confirmation["token"]
+    expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
+    assert page.request.get(origin + project_path).status == 404
+    preserved_runtime = request(page, origin, "GET", runtime_path)["runtime"]
+    assert preserved_runtime["runtime"] == runtime["runtime"], "永久删除项目不能修改全局托管配置"
+    assert [item["binding"]["id"] for item in preserved_runtime["bindings"]] == [retained["id"]]
+    assert preserved_runtime["bindings"][0]["runner"]["state"] == "stopped"
+    assert page.request.get(origin + f"/api/groups/{retained_group['id']}").status == 200
+    assert any(item["id"] == retained["memberId"] for item in request(page, origin, "GET", f"/api/projects/{retained_project['id']}/members")["members"])
+    report["purgeRuntimeImpactFlows"] = {"groupBefore": initial["cascade"], "groupAfter": latest["cascade"], "rejection": refused,
+        "consumedTokenStatus": consumed.status, "groupConfirmedStatus": group_deleted.value.status, "afterGroup": after_group_counts,
+        "projectPreview": project_confirmation["cascade"], "projectConfirmedStatus": project_deleted.value.status,
+        "preservedRuntimeId": runtime["runtime"]["id"], "preservedBindingId": retained["id"], "preservedMemberId": retained["memberId"]}
+    report["checks"].append("R-S6-CONFIRM-REQ-001 / S6-AC03/05: 实际托管绑定与状态非零，跨群关系变化仅使预留关系0→1；旧确认409且作废，新预览明确展示1并等待再次确认；项目分支显示1/1/1，390/1440长清单与动作可达，全局配置/项目成员/其他群与其他项目关系按政策保留")
+
+def exercise(page, origin, records, output, report, capture_only, workdir):
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
     report["pageErrors"] = errors
@@ -508,6 +640,7 @@ def exercise(page, origin, records, output, report, capture_only):
     report["checks"].append("UI-05: 组织按需编辑、实际改名与审计撤销")
     confirmation_flows(page, origin, created_project_id, project_id, output, report)
     purge_snapshot_flows(page, origin, output, report)
+    purge_runtime_impact_flows(page, origin, workdir, output, report)
     assert not errors, f"页面JavaScript错误: {errors}"
     report["status"] = "PASS"
 
@@ -530,7 +663,8 @@ def main():
         assert ready, "临时服务启动超时"
         line = fixture.stdout.readline()
         assert line, "临时服务未返回地址"
-        origin = json.loads(line)["url"]
+        fixture_info = json.loads(line)
+        origin = fixture_info["url"]
         parsed = urlsplit(origin)
         assert parsed.hostname == "127.0.0.1" and parsed.scheme == "http"
         with sync_playwright() as p:
@@ -541,7 +675,7 @@ def main():
             page.set_default_timeout(15000)
             try:
                 records = seed(page, origin)
-                exercise(page, origin, records, output, report, args.capture_only)
+                exercise(page, origin, records, output, report, args.capture_only, fixture_info["workdir"])
             except Exception:
                 if not page.is_closed(): page.screenshot(path=str(output / "failure.png"), full_page=True)
                 raise

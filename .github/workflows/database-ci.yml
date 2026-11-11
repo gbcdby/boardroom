@@ -195,6 +195,13 @@ jobs:
     name: Chromium · 工作台与托管 Agent 页面
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # 与下方 Python 包版本一致；镜像已安装浏览器及完整系统依赖，避免 apt 镜像 DNS 故障。
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.62.0-noble@sha256:aa81288e738725378becba5b3e06cb0f3a7f012a610e87e8d767a090ea3f740d
+      options: --init --shm-size=1g
+    defaults:
+      run:
+        shell: bash
     services:
       postgres:
         image: postgres:16-alpine
@@ -228,29 +235,20 @@ jobs:
           npm ci
           npm run build
 
-      - name: 安装固定版本 Playwright 与 Chromium
+      - name: 安装固定版本 Playwright 并核对预置 Chromium
         run: |
-          python3 -m venv .agent-output/browser-venv
+          python3 -m virtualenv .agent-output/browser-venv
           .agent-output/browser-venv/bin/python -m pip install playwright==1.62.0
-          # Azure 镜像 DNS 失败会耗尽作业时间；沿用 runner 已配置的 Ubuntu 官方备用源。
-          # 不替换签名密钥，不跳过任何系统依赖或浏览器检查。
-          sudo python3 - <<'PY'
+          .agent-output/browser-venv/bin/python - <<'PY'
+          from importlib.metadata import version
           from pathlib import Path
-          from urllib.parse import urlsplit
-          for mirror_file in Path('/etc/apt').glob('apt-mirrors*.txt'):
-              lines = mirror_file.read_text().splitlines()
-              def host(line):
-                  text = line.strip()
-                  return urlsplit(text.split()[0]).hostname if text and not text.startswith('#') else None
-              if not any(host(line) == 'azure.archive.ubuntu.com' for line in lines):
-                  continue
-              remaining = [line for line in lines if host(line) != 'azure.archive.ubuntu.com']
-              if not any(host(line) in {'archive.ubuntu.com', 'security.ubuntu.com'} for line in remaining):
-                  raise SystemExit(f'{mirror_file}: 缺少已配置的 Ubuntu 官方备用源')
-              mirror_file.write_text('\n'.join(remaining) + '\n')
-              print(f'{mirror_file}: 已移除故障 Azure 镜像，保留已有备用源')
+          from playwright.sync_api import sync_playwright
+          assert version('playwright') == '1.62.0'
+          with sync_playwright() as playwright:
+              executable = Path(playwright.chromium.executable_path)
+              assert executable.is_file(), f'固定版本 Chromium 缺失: {executable}'
+              print(f'Playwright {version("playwright")} / {executable}')
           PY
-          .agent-output/browser-venv/bin/python -m playwright install --with-deps chromium
 
       - name: 真实浏览器操作临时 SQLite 服务
         run: .agent-output/browser-venv/bin/python scripts/e2e-managed-web.py --ci
@@ -284,7 +282,7 @@ jobs:
 
       - name: PostgreSQL 固定负载与真实 DOM 消息时延
         env:
-          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@postgres:5432/boardroom_ci
         run: .agent-output/browser-venv/bin/python scripts/e2e-v1-load-web.py --ci --db postgres
 
       - name: 保存浏览器截图与逐项报告
