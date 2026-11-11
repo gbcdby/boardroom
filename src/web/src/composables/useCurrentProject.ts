@@ -122,7 +122,9 @@ export function createCurrentProjectContext(options: ContextOptions = {}) {
         delete query["projectId"];
         if (legacySection === "org") query["tab"] = "organization";
         if (legacySection === "status") query["tab"] = "status";
-        const group = to.params["groupId"] ?? query["groupId"];
+        // 可选路径参数缺省时 Vue Router 给出空字符串，仍须兼容旧 query 深链。
+        const pathGroup = to.params["groupId"];
+        const group = typeof pathGroup === "string" && pathGroup.length > 0 ? pathGroup : query["groupId"];
         const item = section === "chat" ? group : to.params["taskId"];
         if (section === "chat") delete query["groupId"];
         const target = { path: choice.id ? projectPath(choice.id, section, typeof item === "string" ? item : undefined) : "/projects", query, hash: to.hash, replace: true };

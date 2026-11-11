@@ -310,6 +310,7 @@ jobs:
           npm run build
 
       - name: 安装固定版本 Playwright 并核对预置 Chromium
+        id: browser_ready
         run: |
           python3 -m virtualenv .agent-output/browser-venv
           .agent-output/browser-venv/bin/python -m pip install playwright==1.62.0
@@ -324,11 +325,13 @@ jobs:
               print(f'Playwright {version("playwright")} / {executable}')
           PY
 
+      # 各脚本独立启动临时服务；准备成功后分别收证，任一失败仍使 job 失败。
       - name: 真实浏览器操作临时 SQLite 服务
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-managed-web.py --ci
 
       - name: 保存主线页面对照截图
-        if: github.event_name == 'pull_request'
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' && github.event_name == 'pull_request' }}
         env:
           WEBUI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -340,27 +343,35 @@ jobs:
           .agent-output/browser-venv/bin/python scripts/e2e-webui.py --capture-only --web-root .agent-output/ui-before/dist/web --artifacts .agent-output/webui-before
 
       - name: 工作台真实浏览器交互与布局验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-webui.py
 
       - name: 任务与项目切换真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-tasks-web.py
 
       - name: 记忆编辑、冲突与历史真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-memory-web.py
 
       - name: 只读设置、配置重启与键盘布局真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-settings-web.py
 
       - name: 聊天式导航、项目范围与草稿保护真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-navigation-web.py --artifacts .agent-output/navigation-web-e2e
 
       - name: 三态主题、首帧与页面状态保持真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-theme-web.py
 
       - name: SQLite 固定负载与真实 DOM 消息时延
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-v1-load-web.py --ci --db sqlite
 
       - name: PostgreSQL 固定负载与真实 DOM 消息时延
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         env:
           AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@postgres:5432/boardroom_ci
         run: .agent-output/browser-venv/bin/python scripts/e2e-v1-load-web.py --ci --db postgres
