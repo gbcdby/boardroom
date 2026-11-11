@@ -51,6 +51,8 @@ for (const value of invalidTimes) {
 test("S1-AC04: valid explicit UTC offsets retain authorization reuse", () => {
   const base = policyFixture("delivery.merge");
   const grant = policyGrantFixture(base);
+  assert.ok(grant.validFrom);
+  assert.ok(grant.expiresAt);
   const evaluation = evaluateAction({
     ...base,
     stage: "execution",
@@ -64,7 +66,7 @@ test("S1-AC04: valid explicit UTC offsets retain authorization reuse", () => {
           existingAuthorization: false,
           grants: [{
             ...grant,
-            validFrom: grant.validFrom?.replace(/Z$/, "+00:00") ?? null,
+            validFrom: grant.validFrom.replace(/Z$/, "+00:00"),
             expiresAt: grant.expiresAt.replace(/Z$/, "+00:00"),
           }],
         },

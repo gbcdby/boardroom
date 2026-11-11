@@ -91,7 +91,9 @@ export const policyDocumentsSchema = z.object({
 }).strict();
 
 const units = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
-const timestamp = z.string().max(40).datetime({ offset: true });
+// 格式合法仍可能得到 NaN；拒绝不能解析的时间，避免授权期限比较失效。
+const timestamp = z.string().max(40).datetime({ offset: true })
+  .refine(value => Number.isFinite(Date.parse(value)), { message: "时间必须可解析为有效时刻" });
 const grantSchema = z.object({
   grantId: id, revision, currentRevision: revision, authorizationEpoch: units, provenanceRef: id, actorId: id, projectId: id.nullable(),
   actionKinds: z.array(z.enum(POLICY_ACTION_KINDS)).min(1).max(POLICY_ACTION_KINDS.length),
