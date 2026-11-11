@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { inspectLocalSkillPackages } from "../src/server/skills/inventory.ts";
+import { parseMetadataYaml } from "../src/server/skills/metadata.ts";
 
 const root = path.resolve(import.meta.dirname, "..");
 const hash = (data: Buffer | string) => createHash("sha256").update(data).digest("hex");
@@ -222,5 +223,50 @@ test("work-suite 的导出变换必须发生在 frontmatter，正文同名片段
       { name: "sample", path: ".agents/skills/sample", invocation: "explicit-user", files: [{ path: "SKILL.md", sha256: hash(transformed), source_sha256: hash(original), transform: "add-disable-model-invocation" }] }] }));
     const result = await inspectLocalSkillPackages({ workSuites: [{ rootPath: f.dir, manifestPath }] });
     assert.equal(result.packages.length, 0); assert.equal(result.issues[0]?.code, "manifest_mismatch");
+  } finally { await f.close(); }
+});
+
+test("STD-001：低于字节预算的 5000 层 YAML 应受控拒绝，不泄露栈溢出异常或正文", () => {
+  const canary = "deep-metadata-secret-canary";
+  const payload = `name: sample\ndescription: ${canary}\nnested: ${"[".repeat(5000)}0${"]".repeat(5000)}\n`;
+  assert.ok(Buffer.byteLength(payload) < 64 * 1024, "不能用超出字节预算替代深度漏洞回归");
+  assert.throws(() => parseMetadataYaml(payload), error => {
+    assert.ok(error instanceof Error); assert.ok(!(error instanceof RangeError), "上游应将递归溢出转换为受控解析错误");
+    assert.equal(error.message.includes(canary), false); return true;
+  });
+});
+
+test("STD-001：深层 SKILL、策略和清单均经正式入口结构化失败，源树与激活限制不变", async () => {
+  const f = await fixture();
+  try {
+    const nesting = "[".repeat(5000) + "0" + "]".repeat(5000), canary = "deep-source-secret-canary";
+    const p = await f.package("sample", `nested: ${nesting}\n`, canary);
+    let before = await capture(f.dir), report = await inspectLocalSkillPackages({ packageRoots: [p] });
+    assert.equal(report.issues[0]?.code, "metadata_invalid"); assert.deepEqual(report.packages, []);
+    assert.equal(report.readOnly, true); assert.equal(report.activationAllowed, false);
+    assert.equal(JSON.stringify(report).includes(canary), false); assert.deepEqual(await capture(f.dir), before);
+
+    await f.package(); await mkdir(path.join(p, "agents"));
+    const policy = `policy:\n  allow_implicit_invocation: false\nsecret: ${canary}\nnested: ${nesting}\n`;
+    assert.ok(Buffer.byteLength(policy) < 64 * 1024);
+    await writeFile(path.join(p, "agents/openai.yaml"), policy); before = await capture(f.dir);
+    report = await inspectLocalSkillPackages({ packageRoots: [p] });
+    assert.equal(report.issues[0]?.code, "metadata_invalid"); assert.deepEqual(report.packages, []);
+    assert.equal(report.activationAllowed, false); assert.equal(JSON.stringify(report).includes(canary), false);
+    assert.deepEqual(await capture(f.dir), before);
+
+    const manifestPath = path.join(f.dir, "work-suite.json");
+    const manifest = `{"schema_version":"work-suite/v1","suite_version":"test","skills":[],"secret":"${canary}","nested":${nesting}}`;
+    assert.ok(Buffer.byteLength(manifest) < 64 * 1024);
+    await writeFile(manifestPath, manifest); before = await capture(f.dir);
+    report = await inspectLocalSkillPackages({ workSuites: [{ rootPath: f.dir, manifestPath }] });
+    assert.equal(report.issues[0]?.code, "manifest_invalid"); assert.deepEqual(report.packages, []);
+    assert.equal(report.readOnly, true); assert.equal(report.activationAllowed, false);
+    assert.equal(JSON.stringify(report).includes(canary), false); assert.deepEqual(await capture(f.dir), before);
+
+    await rm(path.join(p, "agents/openai.yaml"));
+    report = await inspectLocalSkillPackages({ packageRoots: [p] });
+    assert.deepEqual(report.issues, []); assert.equal(report.packages[0]?.skillName, "sample", "拒绝深层输入后仍可处理正常包");
+    assert.equal(report.activationAllowed, false);
   } finally { await f.close(); }
 });
