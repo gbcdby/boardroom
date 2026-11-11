@@ -1,10 +1,10 @@
 # V1 验收证据索引
 
-状态：工程证据与独立真实宿主回传已承接；修复后最终交付仍为 BLOCKED
+状态：固定候选的 V1 验收 PASS；实际合并和主线交付结果以 PR / Spec 记录为准
 日期：2026-11-11
 范围：[主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)、[阶段 5 Spec #109](https://github.com/gbcdby/boardroom/issues/109)、[Ticket #112](https://github.com/gbcdby/boardroom/issues/112)。验收要求取自[产品基线 §8](architecture/agent-studio.md#8-产品验收基线)。
 
-**本索引承接全部 46 个 V1 验收项：45 项 PASS、0 项 NOT_RUN、1 项 BLOCKED。** 原 37 项工程/安装结果保留固定 CI 对象；六项 Core、REVIEW-04、MEM-04 已有独立真实宿主执行者的对应候选回传，见 §2.2。macOS 首要平台 NFR-07 为 **PASS（SQLite 范围）**，macOS PostgreSQL 未覆盖。报告新发现的任务 schema 与采集完整性修复已实现，正在独立复审；修复候选的必经 CI、证据适用性及最终交付尚待核对，HARD-05 因此仍为 BLOCKED。本版不宣告新候选已经在真实宿主重跑、PR 已合并或产品已部署。
+**固定候选的全部 46 个 V1 验收项为 PASS，0 项 NOT_RUN、0 项 BLOCKED。** 原 37 项工程/安装证据与六项 Core、REVIEW-04、MEM-04 的外部真实回传保留各自对象；报告发现的修复已通过独立需求/标准复审、证据适用性核对和当前集成 CI，见 §2.3。macOS 首要平台 NFR-07 为 **PASS（SQLite 范围）**，macOS PostgreSQL 未覆盖，31 个可选托管隔离 SKIP 未算通过。HARD-05 的候选验收条件已经满足；PR ready、实际合并、各次 main 检查与任务收尾是另外核对的交付事实，见 [PR #119](https://github.com/gbcdby/boardroom/pull/119)及 [Spec #109](https://github.com/gbcdby/boardroom/issues/109)。本版不宣称修复后原生模型已重跑或产品已部署。
 
 ## 1. 候选与记录口径
 
@@ -122,15 +122,25 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 
 原报告整体 HARD-05 仍为 BLOCKED，并反馈两个新问题；本索引保留该历史结论，不将逐项实测通过直接当作已完成修复、独立复审或交付。早期评论的“PR119 REVIEW/MEM 未复验”已被上述补充评论取代。
 
-### 2.3 修复候选的适用性与尚待检查
+### 2.3 已核对的修复候选与证据适用性
 
-真实回传发现 `expectedRoundRevision` 的兄弟属性 `$ref` 使 Codex reviewer 发送字符串，以及 220 字节不完整轴报告被采集器标为 READY。初始阶段 3 修复候选 `74a3003f0b60036f0202ad18fc915fdf3881839b` 的标准审查另发现纯 Markdown 占位正文仍可通过，稳定 finding 为 `STD-NATIVE-001`。新增回归后，修正候选为本地 `58a405861ed6f9c4ed5a980df252c7d4c35104c9` / tree `1955f508da8a5d052b0be8d60b2a4b9e739317b8`；它尚不是本索引的最终阶段 5 交付候选。该增量和有序带入阶段 4/5 后的实际候选，仍须以各 PR 记录固定身份、必要 CI 和独立复审结果。
+真实回传发现 `expectedRoundRevision` 的兄弟属性 `$ref` 使 Codex reviewer 发送字符串，以及 220 字节不完整轴报告被采集器标为 READY。初始修复的标准审查另发现纯 Markdown 占位正文仍可通过，稳定 finding 为 `STD-NATIVE-001`；新增回归后，原审查者独立重跑同一反例，确认拒绝并保留原始输出，finding 已由 OPEN 转为 VERIFIED。首轮失败与最终复审原文均保存在 [PR #99](https://github.com/gbcdby/boardroom/pull/99)。
+
+`E-RESUME` 为本次修复后的工程检查。三个候选的六个共同实现/测试文件完全一致；原任务状态机、权限、CAS、聊天、记忆、数据库、runtime、UI、依赖及 CI 配置未变。两轴分别核对实际差异、消费者、说明和原生证据适用性，对下列三个对象均 PASS：需求轴 r2 SHA-256 `94bb86b621af43c0619fd6a1b42ccdb276893f1ba97245c5767a214ea50adacf`，标准轴 r2 `10c9287d5abc920e49e850b9aee8711ba695c3ceece96940918054ce8ed71bdc`。完整报告在上述 PR 中按原文归档。
+
+| 阶段 | 实际 PR head / tree | 当前工程证据 |
+| --- | --- | --- |
+| P3 | `135a69b5b2277c78cf6014e55d3fa2eba24e88e1` / `1955f508da8a5d052b0be8d60b2a4b9e739317b8` | [CI 42990197102](https://github.com/gbcdby/boardroom/actions/runs/42990197102)，实际 checkout `48e5ed1eaa9f8d8e13a1925b570ac1547e15002a` 同树；两 jobs SUCCESS，640 项 = 609 PASS / 31 SKIP / 0 FAIL。 |
+| P4 | `6ea13d9cc60d525a52ace900ffb1aa6de709e40e` / `754a15161bd73fd31e2867df69739a0880f1b32c` | [CI 42990232081](https://github.com/gbcdby/boardroom/actions/runs/42990232081)，实际 checkout `ae83d743f69b4f0af4f4ee956b4f4a42902deafd` 同树；两 jobs SUCCESS，741 项 = 710 PASS / 31 SKIP / 0 FAIL。 |
+| P5 | `8887b4d5b8e85a3cf96bb719cb24a0d96caeabef` / `e56e0766052487572abd024e857e66dbbe4aee7f` | [CI 42990435658](https://github.com/gbcdby/boardroom/actions/runs/42990435658)，实际 checkout `b8978a20bc5fc29bee4f0da6d929c2825d853cd4` 同树；两 jobs SUCCESS，1013 项 = 982 PASS / 31 SKIP / 0 FAIL；另有固定生命周期负载 4/4、双 DB 协议/安装重启、Chromium 与双 DB DOM 负载通过。 |
+
+交付方已回读上述原始 job 日志与实际 Git 对象。阶段 5 源码对应本地 `1467a15333db6f4cc41960d8edfe709d3a9b4af6`，当前结论更新相对它只改本索引；这项文档增量的独立检查、最新 CI 与之后的 main 结果继续保留在 PR，不能改写上表的实际运行身份。两轴和 CI 通过不是新 Codex reviewer 或新 prompt 的原生重跑证明。
 
 | 受影响范围 | 复用前提与增量验证 | 当前边界 |
 | --- | --- | --- |
-| 任务工具 schema | 仅改变重复 Zod 字段实例/描述，使导出类型内联；核对原类型、范围、required、严格校验、CAS、权限与业务路径均未放宽。通过实际 tools/list、合法数字流程和非法/过时修订拒绝验证 | 原 Claude reviewer 路径保留原实测身份；修复后 Codex reviewer 尚未真实重跑，schema/协议回归不能改称原生复验 |
-| 采集完整性 | 新格式校验应拒绝半句、缺结论、缺章节和矛盾元数据，完整 PASS / CHANGES_REQUESTED 均可供 reviewer；保留 CLI argv、上下文隔离、真实事件、时间重叠、候选前后相同及原始输出一致性 | 新 prompt/格式尚无新原生运行；校验回归与原候选 CLI 执行分开取证，旧报告不得补写标记后充当新格式实测 |
-| 六项 Core、记忆与 macOS 安装 | 按最终实际 diff 确认未改变聊天/投递/重连、记忆触发/冲突或平台安装路径，再记录证据 transfer；仍执行项目规定的当前候选 CI | 不能只因提交 hash 变化撤销旧结果，也不能仅凭“改动小”覆盖受影响路径；新增影响应定向验证 |
+| 任务工具 schema | 已核对仅改变重复 Zod 字段实例/描述，使导出类型内联；原类型、范围、required、严格校验、CAS、权限与业务路径未放宽。实际 tools/list、合法数字流程和非法/过时修订拒绝已回归 | 原 Claude reviewer 路径保留原实测身份并在未变业务范围内复用；修复后 Codex reviewer 尚未真实重跑，schema/协议回归不能改称原生复验 |
+| 采集完整性 | 新回归确认拒绝半句、缺结论、缺章节、矛盾元数据及 Markdown 纯占位；完整 PASS / CHANGES_REQUESTED 仍可供 reviewer。CLI argv、上下文隔离、真实事件、时间重叠、候选前后相同及原始输出一致性检查未删减 | 新 prompt/格式尚无新原生运行；校验回归与原候选 CLI 执行分开取证，旧报告不得补写标记后充当新格式实测 |
+| 六项 Core、记忆与 macOS 安装 | 两轴已按三个实际 diff 确认未改变聊天/投递/重连、记忆触发/冲突或平台安装路径，按该范围承接原生证据；新候选 CI 另行执行并通过 | 没有把旧 applicationCommit 改成新候选，亦没有将 macOS SQLite 扩为 macOS PG；未来新增影响仍应定向验证 |
 
 原 AC-REVIEW-04 要求 Claude **或** Codex 完成真实评审，未要求两种 reviewer 都完整重跑。现行主 Spec / NFR-07 与阶段 5 §5/6 也未规定每个 OS × 数据库 × 宿主的全组合矩阵；Linux SQLite/PG 工程证据与 macOS SQLite 实际使用证据按环境分列，macOS PostgreSQL 保持未覆盖。当前 31 个可选托管隔离 SKIP 仍不能计作 PASS，既有 [Spec #83](https://github.com/gbcdby/boardroom/issues/83) 例外只在原范围内有效，生产 profile 继续 unsupported；外部实测不扩大该例外。
 
@@ -203,11 +213,11 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 
 | acceptanceId | 验收要求 | command / evidence 入口 | status | limitation / nextAction |
 | --- | --- | --- | --- | --- |
-| AC-HARD-01 | 自动化覆盖 mention/权限/状态/记忆/隔离 | `E-BASE/E-CORE/E-TASK/E-MEM`；`C-BASE`、`C-DB`、`C-CORE`、`C-TASK`、`C-MEM`；各域测试见前表 | PASS | 同一 tree 的类型、构建与全量测试通过；1006 项中的 31 个环境 SKIP 明列，不以多个旧候选拼接。 |
+| AC-HARD-01 | 自动化覆盖 mention/权限/状态/记忆/隔离 | `E-RESUME/E-BASE/E-CORE/E-TASK/E-MEM`；`C-BASE`、`C-DB`、`C-CORE`、`C-TASK`、`C-MEM`；各域测试见前表 | PASS | 修复后 P5 同一 tree 的类型、构建与 1013 项全量测试通过；31 个环境 SKIP 明列，原 1006 项工程证据保留原对象。 |
 | AC-HARD-02 | 重启、断线、MCP 超时、无效 ref 等故障 | `E-BASE/E-CORE/E-TASK/E-MEM/E-LOAD-SQL/E-LOAD-WEB`；`C-CORE`、`C-TASK`、`C-MEM`、`C-DB`；§4 故障矩阵 | PASS | 故障/并发/预算/重启/无效 ref 均有固定工程候选证据；模型环境失败仅记录阻塞，不记作模型成功路径。 |
 | AC-HARD-03 | 跨项目/群隔离与未授权读拒绝 | `E-BASE/E-TASK/E-MEM/E-UI`；`C-DB`、`C-TASK`、`C-MEM`、`C-UI`；`tests/current-project-ui.test.ts`、`tests/domain-mutation-scope.test.ts`、`tests/mcp-lifecycle-scope.test.ts` | PASS | 数据、领域、HTTP/MCP 与 Chromium 分层通过，包含切项目草稿/旧请求、成员移除后的旧加入代际。 |
 | AC-HARD-04 | 可复现安装/启动/三宿主配置和限制说明 | `E-INSTALL/H-HOST/H-DSH`；`C-INSTALL`；[接入](getting-started-mcp.md)、[任务](tasks-and-review.md)、[记忆](memory.md)、[设置与审计](settings-and-audit.md) | PASS | 干净 Linux CI 真实安装/启动与双数据库重启通过；三宿主配置及限制有文档。外部真实宿主与 macOS SQLite 回传分别归六项 Core 和 NFR-07，不由本项自动推广。 |
-| AC-HARD-05 | 全部 V1 AC 通过，或有明确有效例外 | `全部证据组及独立审查`；§2.3、当前 PR/主线记录 | BLOCKED | 45 项已承接；尚待两项修复及说明的独立复审、最终集成候选必经 CI 与交付核对。逐项 PASS 不等于已合并；不新增验收豁免。 |
+| AC-HARD-05 | 全部 V1 AC 通过，或有明确有效例外 | `E-RESUME`、其余证据组及独立两轴；§2.3 | PASS | 45 项证据已按原对象承接，反馈修复、独立复审和当前集成树 CI 通过，候选验收条件满足。实际合并/main 核对与任务收尾另按 §6 和平台记录，不新增豁免。 |
 
 ## 4. 横切故障、负载与迁移门禁
 
@@ -252,11 +262,11 @@ CI artifact 的保存期限为 7 天。最终交付记录应保留可读取的�
 
 历史证据若用于本轮结论，需记录新旧候选差异、受影响权限/协议/宿主路径、哪些结论仍适用、哪些要重跑。主架构 §8 的 DSH 历史注释与 §10.2 的保守声明存在旧文字差异；本索引采用随库证据与当前适配器的实际边界，不因此修改主 Spec 要求。T8 原报告的日期、对象和结论保持原样。
 
-## 6. 尚需完成的验收与交付记录
+## 6. 交付核对与保留边界
 
-1. 将报告发现的 schema 表示与采集完整性修复有序带入阶段 3/4/5，固定各自实际候选；按 §2.3 完成增量验证、独立需求/标准复审与证据适用性记录。未执行的新 Codex reviewer / 新 prompt 原生运行保持未执行，不将回归夹具改标。
-2. 对最终集成候选执行项目规定的数据库/SDK 与 Chromium CI，保留真实 checkout/tree、日志、通过/失败/跳过范围。§2.1 的旧工程全绿不能直接替代新候选必经 CI。
-3. 按 #99 → #118 → #119 推进 ready、合并与各次 main 检查，回读平台实际结果并更新 HARD-05 及 [Spec #109](https://github.com/gbcdby/boardroom/issues/109)。PR 就绪不以“已经合并”为循环前置条件；整体交付结论另需实际合并和主线核对。
+1. schema 表示与采集完整性修复已有序带入三个固定候选，增量验证、独立双轴及证据适用性见 §2.3。新 Codex reviewer / 新 prompt 原生运行仍未执行，不将回归夹具改标。
+2. 修复候选的数据库/SDK 与 Chromium CI 已执行并通过；本文最后的纯文档增量仍按项目要求检查，当前实际 head 与最新结果以 PR 为准。§2.1 旧工程全绿、§2.3 修复运行和后续 CI 不混用身份。
+3. 交付按 #99 → #118 → #119 实际合并并完成各次 main 检查，结果回写 [Spec #109](https://github.com/gbcdby/boardroom/issues/109)和主 Spec。候选验收 PASS 与 PR 就绪不以“已经合并”为循环前置条件；整体交付完成仍需平台合并、main 核对和任务状态回读，不由本索引的 PASS 自动推导。
 4. 持续保留原 `E-*` 工程产物、外部正式回传与 `B-NATIVE` 历史记录的生产者、对象和边界。Mac 本地原始包并未挂载到交付环境，本次不声称已逐帧重审或重新计算整包摘要；出现具体冲突时再核对对应最小原始片段。
 5. macOS PostgreSQL、DSH 未证实能力和可选托管 profile 限制继续明列。未部署、未关闭父 Spec 或未删除分支不是新增功能验收门槛；这些动作只在相应任务与授权内处理。
 
