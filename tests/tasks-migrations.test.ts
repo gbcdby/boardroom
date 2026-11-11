@@ -33,7 +33,8 @@ test(`${engine} v10 升级 v11 保留审计快照/撤销字段/索引，并允�
     await repos.audit.markReversed("deleted-project", old.id, "compensation", "2026-11-10T00:00:00.000Z");
     const before = await repos.audit.get("deleted-project", old.id);
     const appliedBefore = (await driver.migrationState()).applied;
-    const result = await driver.migrate(migrations);
+    const taskMigrations = migrations.filter(migration => migration.version <= 11);
+    const result = await driver.migrate(taskMigrations);
     assert.equal(result.version, 11);
     assert.deepEqual(await repos.audit.get("deleted-project", old.id), before);
     assert.deepEqual((await driver.migrationState()).applied.slice(0, 10), appliedBefore);
@@ -46,7 +47,7 @@ test(`${engine} v10 升级 v11 保留审计快照/撤销字段/索引，并允�
       targetKind: "task", targetId: "task", targetName: "任务", after: { title: "任务" },
     });
     assert.equal((await repos.audit.get("deleted-project", row.id))?.targetKind, "task");
-    assert.equal((await driver.migrate(migrations)).applied.length, 0);
+    assert.equal((await driver.migrate(taskMigrations)).applied.length, 0);
   } finally {
     await driver.close();
     if (engine === "postgres") {

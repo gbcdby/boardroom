@@ -134,3 +134,33 @@ test("岗位逐项保存不会丢掉同一编辑区其他尚未保存的修改",
     assert.equal(role.options[role.selectedIndex]?.value, "sub_manager", "未提交的角色修改应留在编辑区");
   });
 });
+
+test("删除预览展示记忆级联数量，并区分项目删除与群组删除的保留政策", async () => {
+  const group = { id: "group-1", projectId: project.id, name: "协作群", archivedAt: null };
+  const cascade = { groups: 1, members: 0, orgNodes: 0, messages: 2, deliveries: 3, memberStatuses: 0, mcpSessions: 0, participants: 0, taskSettings: 0, tasks: 0, taskComments: 0, taskHistory: 0, taskMessageLinks: 0, reviewRounds: 0, reviewReports: 0, workEvents: 8, memoryDocuments: 2, memoryVersions: 7, memorySummaryRequests: 3, memoryMessageReceipts: 4, memoryTriggerCounters: 5, memoryScanCheckpoints: 6 };
+  let confirmedDeletes = 0;
+  await withPage("ProjectsView", (url, init) => {
+    if (init?.method === "DELETE") {
+      if (init.body) confirmedDeletes++;
+      const kind = url.includes("/groups/") ? "group" : "project";
+      return json({ error: { code: "confirmation_required" }, confirmation: { kind, projectId: project.id, projectName: project.name, groupId: group.id, groupName: group.name, cascade, token: "preview-only", expiresAt: "2026-11-12T01:00:00Z" } }, 409);
+    }
+    if (url.endsWith("/groups")) return json({ groups: [group] });
+    if (url.endsWith("/members")) return json({ members: [] });
+    if (url.includes("/member-statuses")) return json({ memberStatuses: [] });
+    return json({ projects: [project] });
+  }, async (container) => {
+    await byTestId(container, "purge-project").props.onClick(); await settle();
+    const projectPreview = textOf(byTestId(container, "project-purge-confirm"));
+    assert.match(projectPreview, /记忆文档：2.*历史版本 7/);
+    assert.match(projectPreview, /自总结请求：3/);
+    assert.match(projectPreview, /全局私有记忆.*保留/);
+    await byTestId(container, "cancel-purge-project").props.onClick(); await settle();
+    await byTestId(container, "purge-group").props.onClick(); await settle();
+    const groupPreview = textOf(byTestId(container, "group-purge-confirm"));
+    assert.match(groupPreview, /记忆正文与版本历史.*保留/);
+    assert.match(groupPreview, /该群工作事件：8/);
+    assert.match(groupPreview, /自总结请求：3/);
+    assert.equal(confirmedDeletes, 0, "展示删除预览不能提交确认删除");
+  });
+});

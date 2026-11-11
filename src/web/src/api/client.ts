@@ -178,6 +178,12 @@ export async function request<T>(method: string, path: string, body?: unknown): 
  * 项目清群组/群聊/投递/成员/状态/会话；群组只清群聊与参与者关系（成员保留）。
  */
 export interface ProjectPurgeCascade {
+  memoryDocuments: number;
+  memoryVersions: number;
+  memorySummaryRequests: number;
+  memoryMessageReceipts: number;
+  memoryTriggerCounters: number;
+  memoryScanCheckpoints: number;
   taskSettings: number;
   tasks: number;
   taskComments: number;
@@ -197,6 +203,11 @@ export interface ProjectPurgeCascade {
 }
 
 export interface GroupPurgeCascade {
+  memorySummaryRequests: number;
+  memoryMessageReceipts: number;
+  memoryTriggerCounters: number;
+  memoryScanCheckpoints: number;
+  workEvents: number;
   taskMessageLinks: number;
   messages: number;
   deliveries: number;

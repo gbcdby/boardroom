@@ -5,6 +5,7 @@ import type { McpCore } from "./core.ts";
 import { McpToolError } from "./errors.ts";
 import { isRegistered, listAdapterIds } from "./adapters/index.ts";
 import { TASK_COMMANDS, type TaskOperation } from "../tasks/mcp.ts";
+import { MEMORY_COMMANDS, type MemoryOperation } from "../memory/mcp.ts";
 
 /**
  * MCP 工具注册层：把 {@link McpCore} 暴露为符合 docs/mcp-tool-contract.md 的工具。
@@ -79,6 +80,15 @@ export function createMcpServer(options: CreateMcpServerOptions): McpServer {
       description: `${definition.title}。项目由当前 join 绑定确定；写入需要修订，外部执行证据按声明记录。`,
       inputSchema: definition.schema,
     }, (args: Record<string, unknown>, extra: ToolExtra) => runTool(log, definition.name, () => core.taskOperation(sessionOf(extra), operation, args) as Promise<ToolPayload>));
+  }
+  for (const operation of Object.keys(MEMORY_COMMANDS) as MemoryOperation[]) {
+    const definition = MEMORY_COMMANDS[operation];
+    server.registerTool(definition.name, {
+      title: definition.title,
+      description: definition.title + "。身份与项目来自当前绑定；总结由目标 Agent 自己完成，保存的执行证据仅为来源声明。",
+      inputSchema: definition.schema,
+    }, (args: Record<string, unknown>, extra: ToolExtra) => runTool(log, definition.name,
+      () => core.memoryOperation(sessionOf(extra), operation, args) as Promise<ToolPayload>));
   }
 
   server.registerTool(

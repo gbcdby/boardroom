@@ -9,6 +9,7 @@ import RuntimesView from "./views/RuntimesView.vue";
 import PlaceholderView from "./views/PlaceholderView.vue";
 import TasksView from "./views/TasksView.vue";
 import TaskDetailView from "./views/TaskDetailView.vue";
+import MemoryView from "./views/MemoryView.vue";
 import { useCurrentProject } from "./composables/useCurrentProject.ts";
 
 /**
@@ -33,12 +34,14 @@ export const router = createRouter({
     { path: "/projects/:projectId/status", name: "project-status", component: StatusBoardView, meta: { projectSection: "status", title: "状态看板" } },
     { path: "/projects/:projectId/tasks", name: "project-tasks", component: TasksView, meta: { projectSection: "tasks", title: "任务" } },
     { path: "/projects/:projectId/tasks/:taskId", name: "task-detail", component: TaskDetailView, meta: { projectSection: "tasks", title: "任务详情" } },
+    { path: "/projects/:projectId/memory", name: "project-memory", component: MemoryView, meta: { projectSection: "memory", title: "记忆" } },
     { path: "/org", name: "org", component: OrgView, meta: { projectSection: "org" } },
     { path: "/audit", name: "audit", component: AuditView, meta: { projectSection: "audit" } },
     { path: "/runtimes", name: "runtimes", component: RuntimesView },
     { path: "/chat", name: "chat", component: ChatView, meta: { projectSection: "chat" } },
     { path: "/status", name: "status", component: StatusBoardView, meta: { projectSection: "status" } },
     { path: "/tasks", name: "tasks", component: TasksView, meta: { projectSection: "tasks" } },
+    { path: "/memory", name: "memory", component: MemoryView, meta: { projectSection: "memory", title: "记忆" } },
     { path: "/groups", name: "groups", redirect: "/chat" },
     { path: "/members", name: "members", component: ProjectsView, meta: { projectSection: "members" } },
     { path: "/settings", name: "settings", component: PlaceholderView, props: { title: "设置" } },

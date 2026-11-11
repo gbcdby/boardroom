@@ -1,3 +1,4 @@
+import { createMemoryRepository, type MemoryRepository } from "../memory/repository.ts";
 import type { DbDriver, DbTransaction, DbRow } from "./driver.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
@@ -100,8 +101,7 @@ export interface AgentsRepository {
 
 /**
  * 永久删除的级联清单（#48 / LIFE-ARC-02）：删除前给人看的「会被清掉什么」，
- * 删除后作为实际清除的行数返回。口径 = 当前已落库的范围（阶段 1/2/3）；
- * 阶段 4 记忆落库时继续按同一形状补进清单。
+ * 删除后作为实际清除的行数返回。项目记忆计数不包含 Agent 的 global 文档与版本。
  */
 export interface PurgeCounts {
   readonly groups: number;
@@ -123,10 +123,21 @@ export interface PurgeCounts {
   readonly reviewRounds: number;
   readonly reviewReports: number;
   readonly workEvents: number;
+  readonly memoryDocuments: number;
+  readonly memoryVersions: number;
+  readonly memorySummaryRequests: number;
+  readonly memoryMessageReceipts: number;
+  readonly memoryTriggerCounters: number;
+  readonly memoryScanCheckpoints: number;
 }
 
 /** 群组级联清单（#48）：删群组只清群聊与参与者关系，**不动成员本身**。 */
 export interface GroupPurgeCounts {
+  readonly memorySummaryRequests: number;
+  readonly memoryMessageReceipts: number;
+  readonly memoryTriggerCounters: number;
+  readonly memoryScanCheckpoints: number;
+  readonly workEvents: number;
   readonly taskMessageLinks: number;
   readonly messages: number;
   readonly deliveries: number;
@@ -285,6 +296,8 @@ export interface DeliveriesRepository {
    * 重连补发才能重投「已投递但未确认」的消息（NFR-02）；只有 acked 才视为不需要再投。
    */
   listPending(projectId: string, memberId: string): Promise<MessageDelivery[]>;
+  /** 仅真实 MCP wait 返回消息的内部投递边界调用；ACK/历史读取不得使用。 */
+  markMcpDelivered(messageId: string, memberId: string, at?: string): Promise<MessageDelivery>;
   /** 可自动触发的持久化积压；ACK 与唤醒判定分别过滤，不重新评估历史抑制。 */
   listWakeable(projectId: string, memberId: string): Promise<MessageDelivery[]>;
   delete(messageId: string, memberId: string): Promise<void>;
@@ -341,6 +354,7 @@ export interface RepositorySet {
   /** T5（#52）：最小审计单表仓储（append-only + 撤销两列回写）。 */
   readonly audit: AuditRepository;
   readonly tasks: TasksRepository;
+  readonly memory: MemoryRepository;
   /** 在单个写事务内运行 fn；失败回滚并抛出归一化后的错误。 */
   transaction<T>(fn: () => Promise<T>): Promise<T>;
 }
@@ -419,6 +433,7 @@ export function createRepositories(db: DbDriver): RepositorySet {
     mcpSessions: createMcpSessions(ctx),
     audit: createAuditRepository(ctx),
     tasks: createTasksRepository(ctx),
+    memory: createMemoryRepository(ctx),
     transaction: ctx.withTransaction,
   };
 }
@@ -511,7 +526,14 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
   };
   const managed = await hasRuntimeSchema(ctx);
   const tasks = await hasTasksSchema(ctx);
+  const memory = await hasMemorySchema(ctx);
   return {
+    memoryDocuments: memory ? await count("SELECT COUNT(*) AS c FROM memory_documents WHERE project_id = ?") : 0,
+    memoryVersions: memory ? await count("SELECT COUNT(*) AS c FROM memory_versions WHERE document_id IN (SELECT id FROM memory_documents WHERE project_id = ?)") : 0,
+    memorySummaryRequests: memory ? await count("SELECT COUNT(*) AS c FROM memory_summary_requests WHERE project_id = ?") : 0,
+    memoryMessageReceipts: memory ? await count("SELECT COUNT(*) AS c FROM memory_message_receipts WHERE project_id = ?") : 0,
+    memoryTriggerCounters: memory ? await count("SELECT COUNT(*) AS c FROM memory_trigger_counters WHERE project_id = ?") : 0,
+    memoryScanCheckpoints: memory ? await count("SELECT COUNT(*) AS c FROM memory_scan_checkpoints WHERE project_id = ?") : 0,
     taskSettings: tasks ? await count("SELECT COUNT(*) AS c FROM project_task_settings WHERE project_id = ?") : 0,
     tasks: tasks ? await count("SELECT COUNT(*) AS c FROM tasks WHERE project_id = ?") : 0,
     taskComments: tasks ? await count("SELECT COUNT(*) AS c FROM task_comments WHERE project_id = ?") : 0,
@@ -545,7 +567,13 @@ async function groupPurgeCounts(ctx: RepoCtx, groupId: string): Promise<GroupPur
     return Number(r?.c ?? 0);
   };
   const managed = await hasRuntimeSchema(ctx);
+  const memory = await hasMemorySchema(ctx);
   return {
+    memorySummaryRequests: memory ? await count("SELECT COUNT(*) AS c FROM memory_summary_requests WHERE context_group_id = ?") : 0,
+    memoryMessageReceipts: memory ? await count("SELECT COUNT(*) AS c FROM memory_message_receipts WHERE group_id = ?") : 0,
+    memoryTriggerCounters: memory ? await count("SELECT COUNT(*) AS c FROM memory_trigger_counters WHERE group_id = ?") : 0,
+    memoryScanCheckpoints: memory ? await count("SELECT COUNT(*) AS c FROM memory_scan_checkpoints WHERE group_id = ?") : 0,
+    workEvents: memory ? await count("SELECT COUNT(*) AS c FROM work_events WHERE context_group_id = ?") : 0,
     taskMessageLinks: await hasTasksSchema(ctx) ? await count("SELECT COUNT(*) AS c FROM task_message_links WHERE group_id = ?") : 0,
     messages: await count("SELECT COUNT(*) AS c FROM messages WHERE group_id = ?"),
     deliveries: await count(
@@ -569,6 +597,11 @@ async function hasRuntimeSchema(ctx: RepoCtx): Promise<boolean> {
 /** 老版本迁移 fixture 尚无阶段 3 表，计数/清理不能提前访问它们。 */
 async function hasTasksSchema(ctx: RepoCtx): Promise<boolean> {
   return (await ctx.one("SELECT version FROM schema_migrations WHERE version = 11")) !== undefined;
+}
+
+/** v12 之前的迁移 fixture 没有记忆表与 work_events 群绑定列。 */
+async function hasMemorySchema(ctx: RepoCtx): Promise<boolean> {
+  return (await ctx.one("SELECT version FROM schema_migrations WHERE version = 12")) !== undefined;
 }
 
 /**
@@ -824,6 +857,13 @@ function createProjects(ctx: RepoCtx): ProjectsRepository {
       return ctx.withTransaction(async () => {
         await requireManagedStopped(ctx, "project", id);
         const counts = await projectPurgeCounts(ctx, id);
+        if (await hasMemorySchema(ctx)) {
+          for (const table of ["memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints"]) {
+            await ctx.exec(`DELETE FROM ${table} WHERE project_id = ?`, [id]);
+          }
+          await ctx.exec("DELETE FROM memory_versions WHERE document_id IN (SELECT id FROM memory_documents WHERE project_id = ?)", [id]);
+          await ctx.exec("DELETE FROM memory_documents WHERE project_id = ?", [id]);
+        }
         if (await hasTasksSchema(ctx)) {
           for (const table of ["work_events", "task_comments", "task_history", "task_message_links", "task_review_reports", "task_review_rounds", "tasks", "project_task_settings"]) {
             await ctx.exec(`DELETE FROM ${table} WHERE project_id = ?`, [id]);
@@ -1151,6 +1191,13 @@ function createGroups(ctx: RepoCtx): GroupsRepository {
       return ctx.withTransaction(async () => {
         await requireManagedStopped(ctx, "group", id);
         const counts = await groupPurgeCounts(ctx, id);
+        if (await hasMemorySchema(ctx)) {
+          await ctx.exec("DELETE FROM memory_summary_requests WHERE context_group_id = ?", [id]);
+          await ctx.exec("DELETE FROM work_events WHERE context_group_id = ?", [id]);
+          for (const table of ["memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints"]) {
+            await ctx.exec(`DELETE FROM ${table} WHERE group_id = ?`, [id]);
+          }
+        }
         if (await hasTasksSchema(ctx)) await ctx.exec("DELETE FROM task_message_links WHERE group_id = ?", [id]);
         // 只清「群聊 + 参与者关系」（LIFE-ARC-02）：投递记录随消息一起清，
         // 会话记录随群组一起清；**members 与 member_statuses 一行都不动**。
@@ -1359,6 +1406,7 @@ type DeliveryRow = {
   wake_suppressed_reason: MessageDelivery["wakeSuppressedReason"];
   attempt_count: number;
   first_delivered_at: string | null;
+  first_mcp_delivered_at?: string | null;
   last_delivered_at: string | null;
   acked_at: string | null;
   created_at: string;
@@ -1376,6 +1424,7 @@ function toDelivery(row: DeliveryRow): MessageDelivery {
     wakeSuppressedReason: row.wake_suppressed_reason,
     attemptCount: row.attempt_count,
     firstDeliveredAt: row.first_delivered_at,
+    firstMcpDeliveredAt: row.first_mcp_delivered_at ?? null,
     lastDeliveredAt: row.last_delivered_at,
     ackedAt: row.acked_at,
     createdAt: row.created_at,
@@ -1435,6 +1484,24 @@ function createDeliveries(ctx: RepoCtx): DeliveriesRepository {
            WHERE message_id = ? AND member_id = ?`,
           [status, firstDelivered, timestamp, ackedAt, timestamp, messageId, memberId],
         );
+        return toDelivery((await getRow(messageId, memberId))!);
+      });
+    },
+    async markMcpDelivered(messageId, memberId, at) {
+      return ctx.withTransaction(async () => {
+        const timestamp = at ?? nowIso();
+        const source = await ctx.one(`SELECT m.id FROM messages m JOIN groups g ON g.id = m.group_id
+          JOIN members mem ON mem.project_id = g.project_id
+          WHERE m.id = ? AND mem.id = ? AND mem.kind = 'agent' AND mem.status = 'active'`, [messageId, memberId]);
+        if (!source) throw new InvalidReferenceError("真实 MCP 投递必须引用同项目的 active Agent 成员与消息。");
+        await requireGroupActive(ctx, (await ctx.one<GroupIdRow>("SELECT group_id FROM messages WHERE id = ?", [messageId]))!.group_id, "投递消息");
+        await repo.ensure(messageId, memberId);
+        await ctx.exec(`UPDATE message_deliveries SET
+          first_mcp_delivered_at = COALESCE(first_mcp_delivered_at, ?),
+          status = CASE WHEN status = 'acked' THEN 'acked' ELSE 'delivered' END,
+          attempt_count = attempt_count + 1,
+          first_delivered_at = COALESCE(first_delivered_at, ?), last_delivered_at = ?, updated_at = ?
+          WHERE message_id = ? AND member_id = ?`, [timestamp, timestamp, timestamp, timestamp, messageId, memberId]);
         return toDelivery((await getRow(messageId, memberId))!);
       });
     },

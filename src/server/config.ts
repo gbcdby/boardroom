@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import type { MemoryConfig } from "../shared/memory.ts";
 
 /** 默认监听端口；仅绑定 127.0.0.1。 */
 export const DEFAULT_PORT = 4317;
@@ -22,6 +23,29 @@ export type DbDriverKind = "sqlite" | "postgres";
 
 /** F1 #46：默认持久化驱动。阶段 1 行为保持 SQLite，PG 需显式配置。 */
 export const DEFAULT_DB_DRIVER: DbDriverKind = "sqlite";
+
+/** 阶段 4 有效缺省；旧的手工 AppConfig 由 resolveMemoryConfig 补齐。 */
+export const DEFAULT_MEMORY_CONFIG: Readonly<MemoryConfig> = Object.freeze({
+  messageThreshold: 50, maxDocumentBytes: 32768, maxInjectedBytes: 8192,
+  summaryInputBytes: 65536, summaryAttemptTimeoutMs: 900000,
+});
+const MEMORY_LIMITS: Readonly<Record<keyof MemoryConfig, readonly [number, number]>> = {
+  messageThreshold: [1, 10000], maxDocumentBytes: [1024, 1048576], maxInjectedBytes: [512, 65536],
+  summaryInputBytes: [1024, 262144], summaryAttemptTimeoutMs: [30000, 3600000],
+};
+export function resolveMemoryConfig(value: Partial<MemoryConfig> = {}): MemoryConfig {
+  if (!isObject(value)) throw new ConfigError("memory 必须是配置对象。");
+  const result = { ...DEFAULT_MEMORY_CONFIG };
+  for (const key of Object.keys(MEMORY_LIMITS) as (keyof MemoryConfig)[]) {
+    const number = value[key] === undefined ? result[key] : value[key];
+    const [min, max] = MEMORY_LIMITS[key];
+    if (typeof number !== "number" || !Number.isInteger(number) || number < min || number > max) {
+      throw new ConfigError(`memory.${key} 必须是 ${min}～${max} 的整数。`);
+    }
+    result[key] = number;
+  }
+  return result;
+}
 
 export interface HeartbeatConfig {
   /** 心跳发送间隔，毫秒。 */
@@ -47,6 +71,8 @@ export interface AppConfig {
   readonly heartbeat: HeartbeatConfig;
   /** T7 防环/限流配置（D5）；缺省时使用 D5 默认值。 */
   readonly antiLoop?: AntiLoopConfig;
+  /** 启动时解析的记忆限额；缺省兼容旧调用方。 */
+  readonly memory?: MemoryConfig;
   /**
    * 持久化驱动（F1 #46）。默认 `sqlite`，阶段 1 行为不变；
    * 可切 `postgres`——驱动层已接入，但业务仓储在 M1（#54）迁移前仅支持 SQLite。
@@ -131,11 +157,30 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<AppCo
     dbDriver,
   );
 
+  if (fileValues["memory"] !== undefined && !isObject(fileValues["memory"])) throw new ConfigError("memory 必须是配置对象。");
+  const memoryValues = isObject(fileValues["memory"]) ? fileValues["memory"] : {};
+  const memoryOverrides: Partial<MemoryConfig> = {};
+  const memoryEnv: Record<keyof MemoryConfig, string> = {
+    messageThreshold: "AGENT_STUDIO_MEMORY_MESSAGE_THRESHOLD", maxDocumentBytes: "AGENT_STUDIO_MEMORY_MAX_DOCUMENT_BYTES",
+    maxInjectedBytes: "AGENT_STUDIO_MEMORY_MAX_INJECTED_BYTES", summaryInputBytes: "AGENT_STUDIO_MEMORY_SUMMARY_INPUT_BYTES",
+    summaryAttemptTimeoutMs: "AGENT_STUDIO_MEMORY_SUMMARY_ATTEMPT_TIMEOUT_MS",
+  };
+  for (const key of Object.keys(memoryEnv) as (keyof MemoryConfig)[]) {
+    const fromEnv = env[memoryEnv[key]];
+    const value = fromEnv !== undefined ? Number(fromEnv) : memoryValues[key];
+    if (value !== undefined) {
+      if (typeof value !== "number") throw new ConfigError(`memory.${key} 必须是整数。`);
+      memoryOverrides[key] = value;
+    }
+  }
+  const memory = resolveMemoryConfig(memoryOverrides);
+
   return {
     port,
     dataDir,
     heartbeat: { intervalMs, timeoutMs },
     antiLoop: { maxConsecutiveAutoReplies, maxWakesPerMinutePerMember },
+    memory,
     dbDriver,
     ...(pgConnectionString === undefined ? {} : { pgConnectionString }),
     configFile: loadedFile === null ? null : configFile,

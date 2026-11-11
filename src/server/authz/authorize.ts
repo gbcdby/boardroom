@@ -118,6 +118,10 @@ export type Capability =
   | "task:settings"
   | "work_event:own"
   | "memory:write_own"
+  | "memory:read_own"
+  | "memory:read_shared"
+  | "memory:write_shared"
+  | "memory:manage_agent"
   | "interrupt:self"
   // T5（#52）最小审计：查看（可分配，默认人 + top_manager）与撤销（人内建特权）。
   | "audit:view"
@@ -164,6 +168,10 @@ const CAPABILITY_BOUNDARY: Readonly<Record<Capability, BoundaryKind>> = {
   "task:settings": "project",
   "work_event:own": "self",
   "memory:write_own": "self",
+  "memory:read_own": "self",
+  "memory:read_shared": "project",
+  "memory:write_shared": "project",
+  "memory:manage_agent": "subtree",
   "interrupt:self": "self",
   // T5 #52：审计查看/撤销都是项目级动作（具体谁能做由矩阵 + 主体类别决定）。
   "audit:view": "project",
@@ -182,6 +190,7 @@ const CAPABILITY_BOUNDARY: Readonly<Record<Capability, BoundaryKind>> = {
  */
 export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capability>>> = {
   owner: new Set<Capability>([
+    "memory:read_shared", "memory:write_shared", "memory:manage_agent",
     "task:view", "task:create", "task:manage", "task:comment", "task:review", "task:override", "task:settings", "work_event:own",
     "project:create",
     "project:view",
@@ -210,6 +219,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
     "runtime:manage",
   ]),
   top_manager: new Set<Capability>([
+    "memory:read_own", "memory:read_shared", "memory:write_shared", "memory:manage_agent",
     "task:view", "task:create", "task:manage", "task:comment", "task:review", "task:override", "task:settings", "work_event:own",
     "project:view",
     "member:view",
@@ -233,6 +243,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
     "audit:view",
   ]),
   sub_manager: new Set<Capability>([
+    "memory:read_own", "memory:read_shared", "memory:write_shared", "memory:manage_agent",
     "task:view", "task:create", "task:manage", "task:comment", "task:review", "task:override", "work_event:own",
     "project:view",
     "member:view",
@@ -252,6 +263,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<AuthzRole, ReadonlySet<Capabilit
     "session:heartbeat",
   ]),
   member: new Set<Capability>([
+    "memory:read_own", "memory:read_shared",
     "task:view", "task:comment", "task:review", "work_event:own",
     "project:view",
     "group:view",

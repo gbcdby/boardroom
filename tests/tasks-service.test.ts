@@ -94,6 +94,16 @@ async function reviewConcurrency(repos: RepositorySet): Promise<void> {
   assert.equal(currentRound.state, "reported");
   task = await service.decideReview(p.reviewerAccess, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "pass", reason: "两轴完成" });
   assert.equal(task.state, "done");
+  let decidedEvents = (await repos.tasks.listUnackedWorkEvents(p.project.id, p.worker.id)).filter(event => event.kind === "task.review_decided");
+  assert.equal(decidedEvents.length, 1);
+  assert.equal(decidedEvents[0]!.payload["enteredDone"], true, "记忆触发只依据真实非 done→done 边");
+  assert.equal(decidedEvents[0]!.payload["completionRevision"], task.revision);
+  assert.equal(decidedEvents[0]!.payload["assigneeAgentId"], p.worker.agentId);
+  currentRound = (await repos.tasks.getRound(p.project.id, task.id, round.id))!;
+  task = await service.decideReview(p.owner, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "pass", reason: "补充确认，未重新完成任务", override: true });
+  decidedEvents = (await repos.tasks.listUnackedWorkEvents(p.project.id, p.worker.id)).filter(event => event.kind === "task.review_decided");
+  assert.equal(decidedEvents.filter(event => event.payload["enteredDone"] === true).length, 1, "重复 done 裁决不能再次触发总结");
+  assert.equal(decidedEvents.find(event => event.payload["completionRevision"] === task.revision)?.payload["enteredDone"], false);
   currentRound = (await repos.tasks.getRound(p.project.id, task.id, round.id))!;
   task = await service.decideReview(p.owner, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "changes_requested", reason: "管理者需要补充验收", override: true });
   assert.equal(task.state, "in-progress");
@@ -130,6 +140,34 @@ test("AC-TASK-03：blocked 跳过空岗上报，subtree 管理与事件 ACK 不�
   await assert.rejects(service.listWorkEvents(p.owner, p.project.id), { name: "ForbiddenError" });
   const detail = await service.get(p.owner, p.project.id, task.id);
   assert.deepEqual(detail.history.at(-1)?.detail["escalation"], { recipientMemberId: manager.id, unresolved: false });
+}));
+
+test("P4 工作事件按当前群在 LIMIT 前过滤，退群后不再投递该群记忆通知", async () => fixture(async repos => {
+  const p = await people(repos); const service = createTaskService({ repos });
+  const other = await repos.groups.create({ projectId: p.project.id, name: "另一群", participantMemberIds: [p.worker.id] });
+  const put = async (id: string, groupId: string, at: string) => {
+    await repos.memory.createRequest({ id, projectId: p.project.id, agentId: p.worker.agentId!, recipientMemberId: p.worker.id,
+      contextGroupId: groupId, documentId: null, baseVersion: 0, revision: 1, state: "pending", trigger: "session_end", triggerKey: id,
+      taskId: null, completedTaskRevision: null, messageIds: [], sourceWorkEventId: null, retryOfRequestId: null,
+      attemptId: null, beginMutationId: null, resultVersion: null, resultSha256: null, error: null, evidence: null,
+      createdAt: at, startedAt: null, finishedAt: null });
+    return repos.tasks.enqueueWorkEvent({ id, projectId: p.project.id,
+    recipientMemberId: p.worker.id, taskId: null, contextGroupId: groupId, kind: "memory.summary_requested", eventKey: id,
+    payload: { requestId: id, trigger: "session_end", requestRevision: 1 }, deliveryState: "pending", attempts: 0,
+    createdAt: at, firstDeliveredAt: null, lastDeliveredAt: null, ackedAt: null });
+  };
+  const foreign = await put(randomUUID(), other.id, "2026-11-10T00:00:00.000Z");
+  const visible = await put(randomUUID(), p.group.id, "2026-11-10T00:00:01.000Z");
+  assert.deepEqual((await service.listWorkEvents(p.workerAccess, p.project.id)).map(event => event.id), [visible.id]);
+  assert.deepEqual((await service.deliverWorkEvents(p.workerAccess, p.project.id, 1)).map(event => event.id), [visible.id]);
+  assert.equal((await repos.tasks.listUnackedWorkEvents(p.project.id, p.worker.id, 10, { contextGroupId: other.id })).find(event => event.id === foreign.id)?.deliveryState, "pending");
+  await assert.rejects(service.acknowledgeWorkEvent(p.workerAccess, p.project.id, foreign.id), { code: "not_found" });
+  assert.equal((await service.acknowledgeWorkEvent(p.workerAccess, p.project.id, visible.id)).alreadyAcknowledged, false);
+  assert.equal((await service.acknowledgeWorkEvent(p.workerAccess, p.project.id, visible.id)).alreadyAcknowledged, true);
+  await put(randomUUID(), p.group.id, "2026-11-10T00:00:02.000Z");
+  await repos.groups.removeParticipant(p.group.id, p.worker.id);
+  assert.deepEqual(await service.listWorkEvents(p.workerAccess, p.project.id), []);
+  assert.deepEqual(await service.deliverWorkEvents(p.workerAccess, p.project.id), []);
 }));
 
 test("#6：任务评论关系只扩大当前群可读范围，详情与历史不泄露隐藏消息 ID", async () => fixture(async repos => {

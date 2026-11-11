@@ -7,6 +7,8 @@
  *   PG→SQLite 反向校验（与源库逐键一致）、回滚（DROP schema），并在 finally 清理。
  */
 import test from "node:test";
+import { createHash } from "node:crypto";
+import type { MemoryDocument, MemorySummaryRequest } from "../src/shared/memory.ts";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -84,6 +86,34 @@ async function seedSqliteDir(dir: string): Promise<void> {
       payload: { roundId: round.id, revision: 2 }, deliveryState: "pending", attempts: 0, createdAt: at, firstDeliveredAt: null, lastDeliveredAt: null, ackedAt: null });
     await repos.tasks.markWorkEventsDelivered("pr1", "mb2", ["event-copy"], at);
     await appendAuditEntry(repos.audit, { projectId: "pr1", actor: { kind: "human", name: "人" }, action: "task.review_started", targetKind: "task", targetId: task.id, targetName: task.title });
+    // v12 每张表非空，包含 global 私有版本及群绑定事件，验证真实 FK 复制顺序。
+    const memoryAuthor = { ...author, agentId: null };
+    for (const key of [{ scope: "global" as const, projectId: null, agentId: "ag1" },
+      { scope: "project" as const, projectId: "pr1", agentId: null },
+      { scope: "project-agent" as const, projectId: "pr1", agentId: "ag1" }]) {
+      const markdown = `# ${key.scope} 记忆 🧠`;
+      const doc: MemoryDocument = { id: `memory-${key.scope}`, key, version: 1, markdown, byteLength: Buffer.byteLength(markdown), updatedAt: at, updatedBy: memoryAuthor, source: "human" };
+      await repos.memory.insertHead(doc);
+      await repos.memory.insertVersion({ id: `version-${key.scope}`, documentId: doc.id, version: 1, parentVersion: 0, markdown,
+        byteLength: doc.byteLength, contentSha256: createHash("sha256").update(markdown).digest("hex"), author: memoryAuthor, source: "human",
+        clientMutationId: `copy-${key.scope}`, summaryRequestId: null, createdAt: at });
+    }
+    await repos.deliveries.markMcpDelivered("msg1", "mb1", at);
+    await driver.exec("UPDATE message_deliveries SET id = 'md3' WHERE message_id = 'msg1' AND member_id = 'mb1'");
+    await repos.memory.observeDeliveredMessage({ projectId: "pr1", agentId: "ag1", groupId: "gp1", messageId: "msg1", threshold: 1, at });
+    const request: MemorySummaryRequest = { id: "memory-request-copy", projectId: "pr1", agentId: "ag1", recipientMemberId: "mb1", contextGroupId: "gp1",
+      documentId: "memory-project-agent", baseVersion: 1, revision: 1, state: "pending", trigger: "message_threshold", triggerKey: "threshold:1",
+      taskId: null, completedTaskRevision: null, messageIds: ["msg1"], sourceWorkEventId: null, retryOfRequestId: null, attemptId: null,
+      beginMutationId: null, resultVersion: null, resultSha256: null, error: null, evidence: null, createdAt: at, startedAt: null, finishedAt: null };
+    await repos.memory.createRequest(request);
+    await repos.tasks.enqueueWorkEvent({ id: "memory-event-copy", projectId: "pr1", recipientMemberId: "mb1", taskId: null, contextGroupId: "gp1",
+      kind: "memory.summary_requested", eventKey: "memory:request-copy", payload: { requestId: request.id, requestRevision: 1, trigger: request.trigger },
+      deliveryState: "pending", attempts: 0, createdAt: at, firstDeliveredAt: null, lastDeliveredAt: null, ackedAt: null });
+    for (const kind of ["message_threshold", "task_completed"] as const) {
+      const scope = { kind, projectId: "pr1", agentId: "ag1", groupId: kind === "message_threshold" ? "gp1" : null };
+      await repos.memory.updateScanCheckpointCas({ scope, after: null, through: await repos.memory.scanHighWater(scope), sweep: 1, revision: 1 }, 0);
+    }
+
   } finally {
     await driver.close();
   }
@@ -102,7 +132,11 @@ async function assertDispatchValues(options: DbDriverOptions): Promise<void> {
     ), [
       { id: "md1", wake_decision: "allowed", wake_suppressed_reason: null },
       { id: "md2", wake_decision: "suppressed", wake_suppressed_reason: "rate_limited" },
+      { id: "md3", wake_decision: null, wake_suppressed_reason: null },
     ]);
+    assert.equal(Number((await driver.query<{ n: number | string }>("SELECT COUNT(*) AS n FROM memory_documents"))[0]!.n), 3);
+    assert.equal((await driver.query<{ first_mcp_delivered_at: string }>("SELECT first_mcp_delivered_at FROM message_deliveries WHERE message_id='msg1' AND member_id='mb1'"))[0]!.first_mcp_delivered_at, "2026-11-10T12:00:00.000Z");
+    assert.equal((await driver.query<{ context_group_id: string }>("SELECT context_group_id FROM work_events WHERE id='memory-event-copy'"))[0]!.context_group_id, "gp1");
   } finally { await driver.close(); }
 }
 
@@ -127,12 +161,16 @@ const FK_DEPS: Record<string, string[]> = {
   task_comments: ["projects", "tasks", "task_review_reports"],
   task_history: ["projects", "tasks"],
   task_message_links: ["projects", "tasks", "messages", "groups"],
-  work_events: ["projects", "tasks", "members"],
+  work_events: ["projects", "tasks", "members", "groups"],
+  memory_documents: ["projects", "agents"], memory_versions: ["memory_documents"],
+  memory_summary_requests: ["projects", "agents", "members", "groups", "tasks", "memory_documents"],
+  memory_message_receipts: ["projects", "agents", "groups", "messages"],
+  memory_trigger_counters: ["projects", "agents", "groups"], memory_scan_checkpoints: ["projects", "agents", "groups"],
 };
 
-test("业务表清单：26 张表、不含 schema_migrations、外键顺序合法", () => {
+test("业务表清单：32 张表、不含 schema_migrations、外键顺序合法", () => {
   const names = BUSINESS_TABLES.map((t) => t.name);
-  assert.equal(names.length, 26);
+  assert.equal(names.length, 32);
   assert.ok(!names.includes("schema_migrations"));
   for (const expected of [
     "agents",
@@ -154,6 +192,7 @@ test("业务表清单：26 张表、不含 schema_migrations、外键顺序合�
     "agent_runtime_observation_meta",
     "agent_runtime_usage_snapshots",
     "project_task_settings", "tasks", "task_review_rounds", "task_review_reports", "task_comments", "task_history", "task_message_links", "work_events",
+    "memory_documents", "memory_versions", "memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints",
   ]) {
     assert.ok(names.includes(expected), `缺少业务表 ${expected}`);
   }
@@ -221,7 +260,11 @@ test("SQLite → SQLite：全量拷贝、一致性校验、源库只读、幂等
       assert.equal(srcCounts["org_nodes"], 4);
       assert.equal(srcCounts["messages"], 2);
       assert.equal(srcCounts["audit_log"], 2);
-      for (const table of ["project_task_settings", "tasks", "task_review_rounds", "task_review_reports", "task_comments", "task_history", "task_message_links", "work_events"]) assert.equal(srcCounts[table], 1, table);
+      for (const table of ["project_task_settings", "tasks", "task_review_rounds", "task_review_reports", "task_comments", "task_history", "task_message_links"]) assert.equal(srcCounts[table], 1, table);
+      assert.equal(srcCounts["work_events"], 2);
+      for (const table of ["memory_documents", "memory_versions"]) assert.equal(srcCounts[table], 3, table);
+      for (const table of ["memory_summary_requests", "memory_message_receipts", "memory_trigger_counters"]) assert.equal(srcCounts[table], 1, table);
+      assert.equal(srcCounts["memory_scan_checkpoints"], 2);
 
       // 幂等重跑：再次迁移仍一致。
       const again = await migrateData(srcOpts, dstOpts);
@@ -269,7 +312,7 @@ test("回滚：清空目标业务表，源库不受影响；可重新迁移恢�
       await migrateData(srcOpts, dstOpts);
 
       const rb = await rollbackTarget(dstOpts);
-      assert.equal(rb.clearedTables.length, 26);
+      assert.equal(rb.clearedTables.length, 32);
 
       // 目标业务表已清空，校验失败。
       const afterRollback = await validateData(srcOpts, dstOpts);
@@ -286,12 +329,11 @@ test("回滚：清空目标业务表，源库不受影响；可重新迁移恢�
   });
 });
 
-if (PG_URL !== undefined) {
-  test("PG 端到端：SQLite→PG 迁移校验 → PG→SQLite 反向校验 → 回滚 DROP schema", async () => {
+  test("PG 端到端：SQLite→PG 迁移校验 → PG→SQLite 反向校验 → 回滚 DROP schema", { skip: !PG_URL ? "未配置真实 PostgreSQL；交既有 CI 门控执行" : false }, async () => {
     const schema = `boardroom_m1_${Math.random().toString(16).slice(2, 10)}`;
     const pgOpts: DbDriverOptions = {
       dbDriver: "postgres",
-      pgConnectionString: PG_URL,
+      pgConnectionString: PG_URL!,
       pgSchema: schema,
     };
     await withTempDir(async (srcDir) => {
@@ -331,4 +373,3 @@ if (PG_URL !== undefined) {
       });
     });
   });
-}

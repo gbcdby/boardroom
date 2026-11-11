@@ -205,6 +205,8 @@ export interface MessageDelivery {
   readonly wakeSuppressedReason: "consecutive_limit" | "rate_limited" | null;
   readonly attemptCount: number;
   readonly firstDeliveredAt: string | null;
+  /** 真实 MCP wait 首次返回的时间；ACK 与普通 delivered 状态不能推导此事实。 */
+  readonly firstMcpDeliveredAt: string | null;
   readonly lastDeliveredAt: string | null;
   readonly ackedAt: string | null;
   readonly createdAt: string;

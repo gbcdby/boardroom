@@ -190,6 +190,16 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
     authorizeOrThrow(actor, "work_event:own", { projectId, memberId: actor.actorId });
     return actor.actorId;
   }
+  async function workContext(access: TaskAccess, actor: Actor, projectId: string): Promise<{ contextGroupId?: string }> {
+    if (!access.connection) return {};
+    const group = await repos.groups.get(access.connection.groupId);
+    if (!group || group.projectId !== projectId || group.archivedAt !== null) return {};
+    const members = await repos.groups.participants(group.id);
+    const decision = authorize(actor, "group:view", { projectId, groupId: group.id, groupMemberIds: members,
+      groupMemberNodeIds: await Promise.all(members.map(async id => (await repos.members.get(id))?.nodeId ?? null)),
+      conn: { projectId, groupIds: [access.connection.groupId] } });
+    return decision.allowed ? { contextGroupId: group.id } : {};
+  }
   async function requiredRound(projectId: string, taskId: string, roundId: string): Promise<ReviewRound> {
     const round = await repos.tasks.getRound(projectId, taskId, roundId);
     if (!round) throw new NotFoundError("评审轮次不存在或不属于当前任务。");
@@ -401,23 +411,31 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         const decision: NonNullable<ReviewRound["decision"]> = { verdict: value.verdict, actor: ctx.author, reason: value.reason, override: value.override ?? false, taskRevision: updated.revision };
         await history(ctx, updated, "task.review_decided", { roundId, previousDecision: round.decision, decision });
         await repos.tasks.updateRoundCas(projectId, roundId, round.revision, { state: "decided", decision }, ctx.at);
-        await event(ctx, updated, updated.assigneeMemberId, "task.review_decided", `review:${roundId}:revision:${round.revision + 1}:decided`, { roundId, decision });
+        const assignee = updated.assigneeMemberId ? await repos.members.get(updated.assigneeMemberId) : null;
+        await event(ctx, updated, updated.assigneeMemberId, "task.review_decided", `review:${roundId}:revision:${round.revision + 1}:decided`, {
+          roundId, decision, enteredDone: task.state !== "done" && updated.state === "done",
+          completionRevision: updated.revision, assigneeAgentId: assignee?.kind === "agent" ? assignee.agentId : null,
+        });
         return updated;
       });
     },
     async listWorkEvents(access, projectId) {
-      const actor = await actorFor(access, projectId); return repos.tasks.listUnackedWorkEvents(projectId, ownRecipient(access, actor, projectId));
+      const actor = await actorFor(access, projectId);
+      const memberId = ownRecipient(access, actor, projectId);
+      return repos.tasks.listUnackedWorkEvents(projectId, memberId, 100, await workContext(access, actor, projectId));
     },
     async deliverWorkEvents(access, projectId, limit = 50) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new TaskError("work_event_limit_invalid", "工作事件数量须为 1～100。");
       return mutate(access, projectId, async ctx => {
         const memberId = ownRecipient(access, ctx.actor, projectId);
-        const events = await repos.tasks.listUnackedWorkEvents(projectId, memberId, limit);
-        return repos.tasks.markWorkEventsDelivered(projectId, memberId, events.map(item => item.id), ctx.at);
+        const context = await workContext(access, ctx.actor, projectId);
+        const events = await repos.tasks.listUnackedWorkEvents(projectId, memberId, limit, context);
+        return repos.tasks.markWorkEventsDelivered(projectId, memberId, events.map(item => item.id), ctx.at, context);
       }, "consume");
     },
     async acknowledgeWorkEvent(access, projectId, eventId) {
-      return mutate(access, projectId, async ctx => repos.tasks.acknowledgeWorkEvent(projectId, ownRecipient(access, ctx.actor, projectId), eventId, ctx.at));
+      return mutate(access, projectId, async ctx => repos.tasks.acknowledgeWorkEvent(projectId, ownRecipient(access, ctx.actor, projectId),
+        eventId, ctx.at, await workContext(access, ctx.actor, projectId)));
     },
   };
   return service;

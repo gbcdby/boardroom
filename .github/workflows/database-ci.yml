@@ -94,6 +94,27 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: SQLite 记忆协议端到端
+        env:
+          AGENT_STUDIO_DB_DRIVER: sqlite
+        run: npm run e2e:memory
+
+      - name: PostgreSQL 记忆协议端到端
+        env:
+          AGENT_STUDIO_DB_DRIVER: postgres
+          AGENT_STUDIO_PG_CONNECTION_STRING: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: npm run e2e:memory
+
+      - name: 保存记忆协议报告（不作为模型验收）
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: memory-protocol-${{ github.run_attempt }}
+          path: .agent-output/memory-e2e/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
   managed-web-browser:
     name: Chromium · 工作台与托管 Agent 页面
     runs-on: ubuntu-24.04
@@ -144,6 +165,9 @@ jobs:
       - name: 任务与项目切换真实浏览器验证
         run: .agent-output/browser-venv/bin/python scripts/e2e-tasks-web.py
 
+      - name: 记忆编辑、冲突与历史真实浏览器验证
+        run: .agent-output/browser-venv/bin/python scripts/e2e-memory-web.py
+
       - name: 保存浏览器截图与逐项报告
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -154,6 +178,7 @@ jobs:
             .agent-output/webui-e2e/
             .agent-output/webui-before/
             .agent-output/tasks-web-e2e/
+            .agent-output/memory-web-e2e/
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
