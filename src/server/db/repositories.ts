@@ -15,6 +15,7 @@ import {
   WriteFailedError,
 } from "./errors.ts";
 import { newId } from "./ids.ts";
+import { findLegacyAgentId, hasIdentityCatalogSchema, listLegacyAliases, reserveLegacyAlias, type LegacyAgentAlias } from "../identity/aliases.ts";
 import { MEMBER_FACT_KINDS, type MemberFactRevision } from "./types.ts";
 import { createTasksRepository, type TasksRepository } from "../tasks/repository.ts";
 import {
@@ -94,12 +95,16 @@ export interface AgentsRepository {
   insertRaw(agent: Agent): Promise<Agent>;
   get(id: string): Promise<Agent | null>;
   /**
-   * 按全局身份键（displayName + hostType）查找 agent（T2 身份唯一性）。
+   * 按永久 legacy alias（displayName + hostType）查找稳定 Agent；v14 前保持旧键查询。
    * 命中返回已有 agent；未命中返回 null，由调用方决定创建。
    */
   findByIdentity(displayName: string, hostType: string): Promise<Agent | null>;
   list(): Promise<Agent[]>;
   update(id: string, patch: Partial<Pick<Agent, "displayName" | "hostType">>): Promise<Agent>;
+  /** 本地管理服务的显示名 CAS；不修改宿主、权限、成员代际或运行配置。 */
+  rename(id: string, expectedDisplayName: string, displayName: string): Promise<Agent>;
+  aliases(id: string): Promise<LegacyAgentAlias[]>;
+  addAlias(id: string, input: Pick<LegacyAgentAlias, "displayName" | "hostType">): Promise<LegacyAgentAlias[]>;
   touchLastSeen(id: string, at: string): Promise<Agent>;
   delete(id: string): Promise<void>;
 }
@@ -731,6 +736,8 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
         agent.updatedAt,
         agent.lastSeenAt,
       ]);
+      if (await hasIdentityCatalogSchema(ctx)) await reserveLegacyAlias(ctx, { agentId: agent.id,
+        displayName: agent.displayName, hostType: agent.hostType, createdAt: agent.createdAt });
     } catch (error) {
       throw normalizeError(error);
     }
@@ -753,7 +760,7 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
       return agent;
     },
     async insertRaw(agent) {
-      await insertRow(agent);
+      await ctx.withTransaction(async () => insertRow(agent));
       return agent;
     },
     async get(id) {
@@ -761,11 +768,8 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
       return row ? toAgent(row) : null;
     },
     async findByIdentity(displayName, hostType) {
-      const row = await ctx.one<AgentRow>(
-        "SELECT * FROM agents WHERE display_name = ? AND host_type = ?",
-        [displayName, hostType],
-      );
-      return row ? toAgent(row) : null;
+      const id = await findLegacyAgentId(ctx, displayName, hostType);
+      return id === null ? null : this.get(id);
     },
     async list() {
       return (await ctx.query<AgentRow>("SELECT * FROM agents ORDER BY created_at, id")).map(toAgent);
@@ -782,12 +786,48 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
           && await ctx.one("SELECT id FROM agent_runtimes WHERE agent_id = ?", [id])) {
           throw new ConflictError("runtime_identity_immutable");
         }
+        if (await hasIdentityCatalogSchema(ctx)) {
+          await reserveLegacyAlias(ctx, { agentId: id, displayName: existing.displayName, hostType: existing.hostType, createdAt: existing.createdAt });
+          await reserveLegacyAlias(ctx, { agentId: id, displayName, hostType, createdAt: nowIso() });
+        }
         await ctx.exec(
           "UPDATE agents SET display_name = ?, host_type = ?, updated_at = ? WHERE id = ?",
           [displayName, hostType, nowIso(), id],
         );
       });
       return (await this.get(id))!;
+    },
+    async rename(id, expectedDisplayName, value) {
+      const displayName = requireNonEmpty(value, "Agent.displayName");
+      requireNonEmpty(expectedDisplayName, "Agent.expectedDisplayName");
+      return ctx.withTransaction(async () => {
+        if (!await hasIdentityCatalogSchema(ctx)) throw new InvalidArgumentError("identity_catalog_upgrade_required");
+        const existing = await this.get(id);
+        if (!existing) throw new NotFoundError("agent_not_found");
+        const at = nowIso();
+        // 先以稳定 ID 和旧值取得写锁/CAS；任何后续 alias 冲突都会回滚此次改名。
+        const changed = await ctx.exec("UPDATE agents SET display_name = ?, updated_at = ? WHERE id = ? AND display_name = ?",
+          [displayName, at, id, expectedDisplayName]);
+        if (changed !== 1) throw new ConflictError("agent_name_conflict");
+        await reserveLegacyAlias(ctx, { agentId: id, displayName: existing.displayName, hostType: existing.hostType, createdAt: existing.createdAt });
+        await reserveLegacyAlias(ctx, { agentId: id, displayName, hostType: existing.hostType, createdAt: at });
+        return (await this.get(id))!;
+      });
+    },
+    async aliases(id) {
+      if (!await this.get(id)) throw new NotFoundError("agent_not_found");
+      return listLegacyAliases(ctx, id);
+    },
+    async addAlias(id, input) {
+      const displayName = requireNonEmpty(input.displayName, "AgentAlias.displayName");
+      const hostType = requireNonEmpty(input.hostType, "AgentAlias.hostType");
+      return ctx.withTransaction(async () => {
+        if (!await hasIdentityCatalogSchema(ctx)) throw new InvalidArgumentError("identity_catalog_upgrade_required");
+        // 同一 Agent 的改名、追加 alias 与删除串行；不持项目或成员的长期租约。
+        if (await ctx.exec("UPDATE agents SET updated_at = updated_at WHERE id = ?", [id]) !== 1) throw new NotFoundError("agent_not_found");
+        await reserveLegacyAlias(ctx, { agentId: id, displayName, hostType, createdAt: nowIso() });
+        return listLegacyAliases(ctx, id);
+      });
     },
     async touchLastSeen(id, at) {
       const existing = await this.get(id);
@@ -801,8 +841,14 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
       return (await this.get(id))!;
     },
     async delete(id) {
-      const result = await ctx.exec("DELETE FROM agents WHERE id = ?", [id]);
-      if (result === 0) throw new NotFoundError(`Agent ${id} 不存在。`);
+      await ctx.withTransaction(async () => {
+        if (await hasIdentityCatalogSchema(ctx)) {
+          if (await ctx.exec("UPDATE agents SET updated_at = updated_at WHERE id = ?", [id]) !== 1) throw new NotFoundError(`Agent ${id} 不存在。`);
+          await ctx.exec("UPDATE agent_legacy_aliases SET retired_at = ? WHERE agent_id = ? AND retired_at IS NULL", [nowIso(), id]);
+        }
+        const result = await ctx.exec("DELETE FROM agents WHERE id = ?", [id]);
+        if (result === 0) throw new NotFoundError(`Agent ${id} 不存在。`);
+      });
     },
   };
 }

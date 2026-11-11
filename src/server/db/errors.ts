@@ -26,6 +26,7 @@ export type RepositoryErrorCode =
   | "member_removed"
   | "compensation_conflict"
   | "legacy_incomplete_snapshot"
+  | "migration_identity_ambiguous"
   | "chain_broken"
   | "audit_snapshot_too_large"
   | "audit_capture_budget_exceeded"

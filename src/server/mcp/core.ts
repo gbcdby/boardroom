@@ -10,6 +10,7 @@ import {
 import { createRepositories, type RepositorySet } from "../db/repositories.ts";
 import type { MutationDiscover } from "../db/mutation-scope.ts";
 import { newId } from "../db/ids.ts";
+import { findLegacyAgentId } from "../identity/aliases.ts";
 import type { McpSession, Member, MemberKind, Message as DbMessage } from "../db/types.ts";
 import { invalidArgument, McpToolError, notInGroup } from "./errors.ts";
 import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "../chat/routing.ts";
@@ -646,8 +647,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
     const newMemberId = newId();
     const discover: MutationDiscover = async tx => {
-      const member = await tx.one<{ id: string }>(`SELECT m.id FROM members m JOIN agents a ON a.id = m.agent_id
-        WHERE m.project_id = ? AND a.display_name = ? AND a.host_type = ?`, [projectId, displayName, hostType]);
+      const agentId = await findLegacyAgentId(tx, displayName, hostType);
+      const member = agentId === null ? undefined : await tx.one<{ id: string }>(
+        "SELECT id FROM members WHERE project_id = ? AND agent_id = ?", [projectId, agentId]);
       return { memberIds: member ? [member.id] : [], newMemberIds: member ? [] : [newMemberId], groupIds: [groupId], runtimeIds: [] };
     };
     try {
@@ -671,7 +673,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
           throw new McpToolError("FORBIDDEN", "成员未激活或已停用，不能建立新连接。", { reason: "inactive_member" });
         }
         if (!member) {
-          member = await repos.members.create({ id: newMemberId, projectId, kind: "agent", agentId, displayName,
+          member = await repos.members.create({ id: newMemberId, projectId, kind: "agent", agentId, displayName: agent.displayName,
             role: role === "manager" ? "manager" : "normal" });
         }
         scope.assertCovers([projectId], [member.id]);
@@ -679,9 +681,10 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         else if (options.managed.identity.memberId !== member.id) {
           throw new McpToolError("FORBIDDEN", "托管通道不能切换成员身份");
         }
-        if (member.displayName !== displayName) member = await repos.members.update(member.id, { displayName });
+        // 旧客户端的名称只是接入 alias；不能把用户已改的新显示名写回旧名。
+        if (member.displayName !== agent.displayName) member = await repos.members.update(member.id, { displayName: agent.displayName });
         await repos.groups.addParticipant(groupId, member.id);
-        const session = await repos.mcpSessions.connect({ agentId, projectId, groupId, memberId: member.id, displayName, hostType });
+        const session = await repos.mcpSessions.connect({ agentId, projectId, groupId, memberId: member.id, displayName: agent.displayName, hostType });
         await repos.statuses.set(projectId, member.id, "online");
         return { agentId, member, session };
       });
@@ -1010,10 +1013,11 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
       const existing = bindings.get(selfKey(sessionId));
       if (existing) {
+        const aliasAgent = await repos.agents.findByIdentity(displayName, params.hostType);
         if (
           existing.projectId !== params.projectId ||
           existing.groupId !== params.groupId ||
-          existing.displayName !== displayName ||
+          existing.agentId !== aliasAgent?.id ||
           existing.hostType !== params.hostType
         ) {
           throw new McpToolError("CONFLICT", "该会话已以不同身份入群，不能重复声明不同身份");
@@ -1030,7 +1034,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         projectId: params.projectId,
         groupId: params.groupId,
         role: joined.member.role,
-        displayName,
+        displayName: joined.member.displayName,
         hostType: params.hostType,
         mcpSessionId: joined.session.id,
       };
@@ -1660,6 +1664,8 @@ function buildInterruptReason(result: InterruptResult, hostType: HostType, targe
     switch (error.code) {
       case "conflict":
         return new McpToolError("CONFLICT", `身份或成员冲突：${error.message}`, ctx);
+      case "migration_identity_ambiguous":
+        return new McpToolError("CONFLICT", error.message, { ...ctx, reason: error.code });
       case "archived":
         // #48：目标项目/群组已归档，写路径拒绝（恢复后放行）。
         return new McpToolError("CONFLICT", error.message, ctx);
