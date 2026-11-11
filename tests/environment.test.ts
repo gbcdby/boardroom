@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile, readdir, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readdir, readFile, symlink, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { inspectLegacyStorage, resolveBoardroomEnvironment } from "../src/server/environment.ts";
+import { databaseDriverOptions, inspectLegacyStorage, resolveBoardroomEnvironment } from "../src/server/environment.ts";
 import { loadConfig } from "../src/server/config.ts";
+import { createDbDriver } from "../src/server/db/driver.ts";
 
 async function fixture<T>(run: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "boardroom-env-"));
@@ -30,6 +31,40 @@ test("S4 resolver: 未激活布局保留 fresh v1 的 cwd/data，新路径仅 pl
     assert.equal(env.storageId, null);
     assert.equal(env.writable, true);
     assert.deepEqual(await readdir(dir), ["cwd"]);
+  });
+});
+
+test("S4 SQLite: 使用 DB symlink 的真实非默认文件名，连接前移动/替换/改链不能创建替代库", async () => {
+  await fixture(async dir => {
+    const actualDir = path.join(dir, "actual");
+    const seeded = await seed(actualDir, "exact-original");
+    const actual = path.join(actualDir, "original.sqlite"); await rename(seeded, actual);
+    const legacy = path.join(dir, "legacy"); await mkdir(legacy);
+    const link = path.join(legacy, "agent-studio.db"); await symlink(actual, link);
+    const options = { cwd: dir, env: { BOARDROOM_HOME: path.join(dir, "home"), AGENT_STUDIO_DATA_DIR: legacy } };
+    const resolved = await resolveBoardroomEnvironment(options);
+    assert.equal(resolved.config.dataDir, legacy);
+    assert.equal(resolved.databaseDescriptor.kind, "sqlite");
+    assert.equal(resolved.databaseDescriptor.kind === "sqlite" && resolved.databaseDescriptor.sqlitePath, actual);
+    const driver = createDbDriver(databaseDriverOptions(resolved));
+    try { await driver.connect(); assert.deepEqual(await driver.query("SELECT name FROM evidence"), [{ name: "exact-original" }]); }
+    finally { await driver.close(); }
+    assert.equal((await readdir(actualDir)).includes("agent-studio.db"), false);
+
+    const beforeMove = await resolveBoardroomEnvironment(options);
+    await rename(actual, path.join(actualDir, "moved.sqlite"));
+    const moved = createDbDriver(databaseDriverOptions(beforeMove));
+    await assert.rejects(moved.connect(), { code: "storage_source_changed" });
+    assert.equal((await readdir(actualDir)).includes("original.sqlite"), false);
+    await seed(actualDir, "replacement");
+    await rename(path.join(actualDir, "agent-studio.db"), actual);
+    const replaced = createDbDriver(databaseDriverOptions(beforeMove));
+    await assert.rejects(replaced.connect(), { code: "storage_source_changed" });
+
+    const beforeLink = await resolveBoardroomEnvironment(options);
+    await rm(link); await symlink(path.join(actualDir, "moved.sqlite"), link);
+    const switched = createDbDriver(databaseDriverOptions(beforeLink));
+    await assert.rejects(switched.connect(), { code: "storage_source_changed" });
   });
 });
 
@@ -87,5 +122,79 @@ test("S4-AC02: 新目标 metadata/journal 不足以激活，显式旧选择也�
     const mismatched = await inspectLegacyStorage(options);
     assert.ok(mismatched.diagnostics.some(d => d.code === "storage_root_mismatch"));
     await assert.rejects(loadConfig(options), { code: "storage_root_mismatch" });
+  });
+});
+
+test("S4-AC01: 显式配置 > 用户根 > 旧 cwd；v1 相对数据保持启动 cwd，env 覆盖不重写 HOME", async () => {
+  await fixture(async dir => {
+    const cwd = path.join(dir, "cwd"); const home = path.join(dir, "home"); const files = path.join(dir, "configs");
+    for (const directory of [cwd, home, files]) await mkdir(directory);
+    await writeFile(path.join(cwd, "config.json"), JSON.stringify({ port: 4401, dataDir: "cwd-selected" }));
+    await writeFile(path.join(home, "config.json"), JSON.stringify({ port: 4402, dataDir: "home-selected" }));
+    const explicit = path.join(files, "explicit.json"); await writeFile(explicit, JSON.stringify({ port: 4403, dataDir: "old-relative" }));
+    const homeBefore = process.env["HOME"];
+    const base = { cwd, env: { BOARDROOM_HOME: home } };
+    const fromHome = await loadConfig(base);
+    assert.equal(fromHome.port, 4402); assert.equal(fromHome.dataDir, path.join(cwd, "home-selected"));
+    await writeFile(path.join(cwd, "config.json"), "not selected JSON, must not override explicit selection");
+    const selected = await loadConfig({ cwd, env: { BOARDROOM_HOME: home, AGENT_STUDIO_CONFIG: explicit } });
+    assert.equal(selected.port, 4403); assert.equal(selected.dataDir, path.join(cwd, "old-relative"));
+    const override = await loadConfig({ cwd, env: { BOARDROOM_HOME: home, AGENT_STUDIO_CONFIG: explicit,
+      AGENT_STUDIO_DATA_DIR: "env-relative", AGENT_STUDIO_PORT: "4404" } });
+    assert.equal(override.dataDir, path.join(cwd, "env-relative")); assert.equal(override.port, 4404);
+    assert.equal(process.env["HOME"], homeBefore);
+  });
+});
+
+test("S4-AC01: v2 相对文件资源按配置目录，仅返回 planned，匹配 metadata 也不伪造 active", async () => {
+  await fixture(async dir => {
+    const cwd = path.join(dir, "cwd"); const files = path.join(dir, "config-dir"); await mkdir(cwd); await mkdir(files);
+    const file = path.join(files, "config.json");
+    await writeFile(file, JSON.stringify({ layoutVersion: 2, storageId: "store-A", dataDir: "db", stateRoot: "state",
+      memoryRoot: "mem", skillsRoot: "skills", runtimeRoot: "runtime", workspacesRoot: "workspaces", artifactsRoot: "artifacts" }));
+    const options = { cwd, env: { BOARDROOM_HOME: path.join(dir, "home"), AGENT_STUDIO_CONFIG: file } };
+    const resolved = await resolveBoardroomEnvironment(options);
+    assert.equal(resolved.config.dataDir, path.join(files, "db"));
+    for (const [key, relative] of [["stateRoot", "state"], ["memoryRoot", "mem"], ["skillsRoot", "skills"], ["runtimeRoot", "runtime"], ["workspacesRoot", "workspaces"], ["artifactsRoot", "artifacts"]] as const) {
+      assert.equal(resolved[key], path.join(files, relative));
+    }
+    assert.equal(resolved.storageId, "store-A"); assert.equal(resolved.writable, false);
+    assert.ok(Object.values(resolved.paths).every(item => item.status === "planned"));
+    await assert.rejects(loadConfig(options), { code: "legacy_migration_required" });
+    assert.deepEqual(await readdir(files), ["config.json"]);
+    await mkdir(path.join(files, "state"));
+    await writeFile(path.join(files, "state/storage.json"), JSON.stringify({ layoutVersion: 2, storageId: "store-A", active: true }));
+    assert.equal((await inspectLegacyStorage(options)).startupState, "recovery_required");
+    const overridden = await resolveBoardroomEnvironment({ cwd, env: { ...options.env, AGENT_STUDIO_DATA_DIR: "v1-env-relative" } });
+    assert.equal(overridden.config.dataDir, path.join(cwd, "v1-env-relative"));
+  });
+});
+
+test("S4-AC02: 显式已有旧源可以解开多个 legacy 源，新旧混存仍硬阻断", async () => {
+  await fixture(async dir => {
+    const old = path.join(dir, "old"); const cwd = path.join(dir, "cwd");
+    await seed(old, "selected"); await seed(path.join(cwd, "data"), "other");
+    const options = { cwd, env: { BOARDROOM_HOME: path.join(dir, "home"), AGENT_STUDIO_DATA_DIR: old } };
+    const config = await loadConfig(options);
+    assert.equal(config.dataDir, old); assert.equal(config.environment?.startupState, "legacy_found");
+    assert.equal(config.environment?.inventory.sources.length, 2);
+    await seed(path.join(dir, "home/state"), "unverified-new");
+    assert.equal((await inspectLegacyStorage(options)).startupState, "ambiguous");
+    await assert.rejects(loadConfig(options), { code: "storage_source_ambiguous" });
+  });
+});
+
+test("S4 PG: 清单只承诺配置存在，输出白名单不含连接串/未知配置字段", async () => {
+  await fixture(async dir => {
+    const file = path.join(dir, "config.json");
+    const canary = "secret-canary-never-public";
+    await writeFile(file, JSON.stringify({ dbDriver: "postgres", pgConnectionString: `postgres://user:${canary}@localhost:5432/example?password=${canary}`,
+      password: canary, extra: { token: canary } }));
+    const inventory = await inspectLegacyStorage({ cwd: dir, env: { BOARDROOM_HOME: path.join(dir, "home"), AGENT_STUDIO_CONFIG: file } });
+    assert.equal(inventory.startupState, "legacy_found");
+    assert.deepEqual(Object.keys(inventory.sources[0]!.database).sort(), ["kind", "locationId", "verification"]);
+    assert.equal(inventory.sources[0]!.database.kind === "postgres" && inventory.sources[0]!.database.verification, "configuration_only");
+    assert.equal(JSON.stringify(inventory).includes(canary), false);
+    assert.equal(JSON.stringify(inventory).includes("postgres://"), false);
   });
 });

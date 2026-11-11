@@ -1,10 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, readdir, writeFile, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { loadConfig } from "../src/server/config.ts";
+import { createDbDriver } from "../src/server/db/driver.ts";
+import { migrations } from "../src/server/db/migrations/index.ts";
+import { startServer } from "../src/server/server.ts";
+import { createLogger } from "../src/server/logger.ts";
 
 const root = path.resolve(import.meta.dirname, "..");
 const stdioEntry = path.join(root, "src/server/mcp/stdio.ts");
@@ -34,5 +39,21 @@ for (const method of ['connect', 'migrate']) {
     assert.deepEqual({ code: result.status, stdout: result.stdout, calls: result.output[3], files: await readdir(dir) },
       { code: 1, stdout: "", calls: "", files: before });
     assert.match(result.stderr, /config_invalid/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("S4 HTTP: 既有源解析后被移动时启动拒绝，不能创建新的空库", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "boardroom-http-source-"));
+  try {
+    const db = createDbDriver({ dataDir: dir });
+    await db.connect(); await db.migrate(migrations); await db.close();
+    const config = await loadConfig({ cwd: dir, env: { BOARDROOM_HOME: path.join(dir, "home"), AGENT_STUDIO_DATA_DIR: dir } });
+    const original = path.join(dir, "agent-studio.db");
+    await rename(original, path.join(dir, "moved.sqlite"));
+    await assert.rejects(async () => {
+      const server = await startServer({ config: { ...config, port: 0 }, logger: createLogger({ level: "error", write: () => {} }) });
+      await server.close();
+    }, { code: "storage_source_changed" });
+    assert.deepEqual(await readdir(dir), ["moved.sqlite"]);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

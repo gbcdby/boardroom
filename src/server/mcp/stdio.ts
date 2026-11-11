@@ -12,8 +12,8 @@
  *   node src/server/mcp/stdio.ts
  */
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import path from "node:path";
 import { ConfigError, loadConfig } from "../config.ts";
+import { databaseDriverOptions, databaseForConnectedReader } from "../environment.ts";
 import { createDbDriver } from "../db/driver.ts";
 import { migrations } from "../db/migrations/index.ts";
 import { createLogger } from "../logger.ts";
@@ -32,18 +32,13 @@ async function main(): Promise<void> {
   const heartbeat = config.heartbeat;
 
   // 打开持久化驱动并执行迁移（幂等）；stdio 与 HTTP 服务共享同一数据目录。
-  const dataDir = config.dataDir;
-  const driver = createDbDriver({
-    dbDriver: config.dbDriver ?? "sqlite",
-    dataDir,
-    ...(config.pgConnectionString === undefined ? {} : { pgConnectionString: config.pgConnectionString }),
-  });
+  const environment = config.environment!;
+  const driver = createDbDriver(databaseDriverOptions(environment));
   await driver.connect();
   try {
     await driver.migrate(migrations);
     registerMemoryRuntime(driver, {
-      database: driver.kind === "sqlite" ? { kind: "sqlite", sqlitePath: path.join(dataDir, "agent-studio.db") }
-        : { kind: "postgres", connectionString: config.pgConnectionString! },
+      database: databaseForConnectedReader(environment.databaseDescriptor),
       ...(config.memory ? { config: config.memory } : {}),
       onDiagnostic: code => logger.warn("memory_reader_unavailable", { code }),
     });

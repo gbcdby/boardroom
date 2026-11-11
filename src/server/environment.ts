@@ -5,6 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { DEFAULT_DATA_DIR, parseConfigValues, type AppConfig, type LoadConfigOptions } from "./config.ts";
 import { ConfigError, type ConfigErrorCode } from "./config-error.ts";
+import type { DbDriverOptions } from "./db/driver.ts";
 
 export type StartupState = "fresh" | "active" | "legacy_found" | "ambiguous" | "recovery_required";
 export interface FileIdentity { readonly device: string; readonly inode: string }
@@ -142,6 +143,43 @@ export function describeDatabase(database: DatabaseDescriptor): PublicDatabaseDe
     verification: "configuration_only" };
 }
 
+export function databaseDriverOptions(environment: ResolvedBoardroomEnvironment): DbDriverOptions {
+  const database = environment.databaseDescriptor;
+  return database.kind === "sqlite" ? { dbDriver: "sqlite", dataDir: database.dataDir, sqlitePath: database.sqlitePath, sqliteSource: database }
+    : { dbDriver: "postgres", dataDir: environment.config.dataDir, pgConnectionString: database.connectionString,
+      ...(database.schema === undefined ? {} : { pgSchema: database.schema }) };
+}
+
+/** 连接边界再次核实原入口、规范路径与 inode；不能因源被移走而新建替代空库。 */
+export function assertSqliteSourceUnchanged(database: Pick<SqliteDatabaseDescriptor, "sqlitePath" | "sourcePath" | "identity">,
+  writable = false): void {
+  try {
+    if (canonicalizePath(database.sourcePath) !== database.sqlitePath) throw new Error("changed");
+    const actual = identityOf(database.sourcePath);
+    if (actual?.device !== database.identity?.device || actual?.inode !== database.identity?.inode) throw new Error("changed");
+  } catch {
+    throw new ConfigError("已解析的 SQLite 源被移动、替换、不可访问或符号链接发生变化。", "storage_source_changed",
+      "停止启动，检查原数据与链接后重新解析配置；不会新建替代空库。");
+  }
+  if (writable) {
+    assertWritableDirectory(path.dirname(database.sqlitePath));
+    if (database.identity) {
+      try { accessSync(database.sqlitePath, constants.R_OK | constants.W_OK); }
+      catch (error) { throw pathError("SQLite 数据源", error); }
+    }
+  }
+}
+
+/** 仅在主库 connect 成功后，为 fresh v1 捕获新建文件身份；传给只读子进程的仍是同一物理源。 */
+export function databaseForConnectedReader(database: DatabaseDescriptor): DatabaseDescriptor {
+  if (database.kind === "postgres") return database;
+  if (database.identity) { assertSqliteSourceUnchanged(database); return database; }
+  if (canonicalizePath(database.sourcePath) !== database.sqlitePath) throw new ConfigError("连接后的 SQLite 源发生变化。", "storage_source_changed");
+  const identity = identityOf(database.sqlitePath);
+  if (!identity) throw new ConfigError("连接后的 SQLite 源不存在。", "storage_source_changed");
+  return { ...database, identity };
+}
+
 export async function resolveBoardroomEnvironment(options: ResolveEnvironmentOptions = {}): Promise<ResolvedBoardroomEnvironment> {
   if (options.config?.environment) return options.config.environment;
   const cwd = path.resolve(options.cwd ?? process.cwd());
@@ -248,6 +286,8 @@ async function collectInventory(environment: Omit<ResolvedBoardroomEnvironment, 
     await add(sqliteAt(path.join(directory, "data")), 1, directory === cwd ? "cwd-data" : "known-legacy-data", null);
     const file = path.join(directory, "config.json");
     if (canonicalizePath(file) === environment.configFile) continue;
+    // 显式选择不会再加载当前 cwd 的另一份默认配置；仍检查旧 data 与新目标恢复标记。
+    if (explicit && directory === cwd) continue;
     const values = await readObject(file, false);
     if (values === null) continue;
     const version = values["layoutVersion"] ?? 1;
@@ -309,15 +349,19 @@ export async function assertEnvironmentWritable(environment: ResolvedBoardroomEn
     const diagnostic = environment.diagnostics[0]!;
     throw new ConfigError(diagnostic.message, diagnostic.code, diagnostic.recoveryAction);
   }
-  // 下阶段连接之前只做真实权限预检，不 mkdir、不打开 SQLite、不执行迁移。
-  let parent = environment.databaseDescriptor.kind === "sqlite" ? path.dirname(environment.databaseDescriptor.sqlitePath) : environment.config.dataDir;
+  if (environment.databaseDescriptor.kind === "sqlite") assertSqliteSourceUnchanged(environment.databaseDescriptor, true);
+  assertWritableDirectory(environment.config.dataDir);
+}
+
+function assertWritableDirectory(directory: string): void {
+  // 真实权限预检，不 mkdir、不打开 SQLite、不执行迁移；由真实父目录承担 WAL 文件。
+  let parent = directory;
   while (!exists(parent)) parent = path.dirname(parent);
-  try { accessSync(parent, constants.R_OK | constants.W_OK | constants.X_OK); }
-  catch (error) { throw pathError("数据库/运行时父目录", error); }
-  if (environment.databaseDescriptor.kind === "sqlite" && environment.databaseDescriptor.identity) {
-    try { accessSync(environment.databaseDescriptor.sqlitePath, constants.R_OK | constants.W_OK); }
-    catch (error) { throw pathError("SQLite 数据源", error); }
+  try {
+    if (!statSync(parent).isDirectory()) throw new ConfigError("数据库/运行时父路径必须是目录。");
+    accessSync(parent, constants.R_OK | constants.W_OK | constants.X_OK);
   }
+  catch (error) { throw pathError("数据库/运行时父目录", error); }
 }
 
 function exists(file: string): boolean {
