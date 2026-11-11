@@ -39,6 +39,10 @@ export interface NewAgent {
 export interface Project {
   readonly id: string;
   readonly name: string;
+  /** v15：名称、归档/恢复、工作区保存推进，普通观测及子对象活动不推进。旧 schema 投影为 1。 */
+  readonly projectRevision: number;
+  /** 0 表示尚未显式配置；root=null 保存仍生成不可变的正数版本。 */
+  readonly workspaceRevision: number;
   readonly createdAt: string;
   readonly updatedAt: string;
   /**

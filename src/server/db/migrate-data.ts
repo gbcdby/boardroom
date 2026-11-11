@@ -33,6 +33,7 @@ import { tasksMigration } from "./migrations/tasks.ts";
 import { memoryMigration } from "./migrations/memory.ts";
 import { memberLifecycleMigration } from "./migrations/member-lifecycle.ts";
 import { identityCatalogMigration } from "./migrations/identity-catalog.ts";
+import { projectWorkspacesMigration } from "./migrations/project-workspaces.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -70,7 +71,10 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
         JOIN version_depth p ON c.copied_from_role_template_id = p.role_template_id AND c.copied_from_revision = p.revision
     ) SELECT v.* FROM role_template_versions v JOIN version_depth d
       ON v.role_template_id = d.role_template_id AND v.revision = d.revision ORDER BY d.depth, v.role_template_id, v.revision` },
-  { name: "projects", keyColumns: ["id"] },
+  { name: "projects", keyColumns: ["id"], valueColumns: ["project_revision", "workspace_revision"] },
+  { name: "project_workspace_versions", keyColumns: ["project_id", "workspace_revision"], valueColumns: ["project_revision",
+    "root_path", "canonical_root", "mode", "root_identity_json", "physical_resource_key", "repository_info_json", "observed_at",
+    "mutation_id", "input_digest", "updated_at"] },
   { name: "memory_documents", keyColumns: ["id"] },
   { name: "memory_versions", keyColumns: ["id"] },
   {
@@ -336,6 +340,7 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   memoryMigration,
   memberLifecycleMigration,
   identityCatalogMigration,
+  projectWorkspacesMigration,
 ];
 
 // ---------------------------------------------------------------------------

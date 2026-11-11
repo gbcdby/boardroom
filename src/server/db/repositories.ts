@@ -115,6 +115,7 @@ export interface AgentsRepository {
  * 删除后作为实际清除的行数返回。项目记忆计数不包含 Agent 的 global 文档与版本。
  */
 export interface PurgeCounts {
+  readonly workspaceVersions: number;
   /** v13：保留历史事实的固定版本行，随最后的成员物理清除。 */
   readonly memberFactRevisions: number;
   readonly groups: number;
@@ -586,6 +587,7 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
   const tasks = await hasTasksSchema(ctx);
   const memory = await hasMemorySchema(ctx);
   return {
+    workspaceVersions: await hasWorkspaceSchema(ctx) ? await count("SELECT COUNT(*) AS c FROM project_workspace_versions WHERE project_id = ?") : 0,
     memberFactRevisions: await hasMemberLifecycleSchema(ctx) ? await count('SELECT COUNT(*) AS c FROM member_fact_revisions WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)') : 0,
     memoryDocuments: memory ? await count("SELECT COUNT(*) AS c FROM memory_documents WHERE project_id = ?") : 0,
     memoryVersions: memory ? await count("SELECT COUNT(*) AS c FROM memory_versions WHERE document_id IN (SELECT id FROM memory_documents WHERE project_id = ?)") : 0,
@@ -875,12 +877,18 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
 // Projects
 // ---------------------------------------------------------------------------
 
+export async function hasWorkspaceSchema(ctx: RepoCtx): Promise<boolean> {
+  return Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 15"));
+}
+
 type ProjectRow = {
   id: string;
   name: string;
   created_at: string;
   updated_at: string;
   archived_at: string | null;
+  project_revision?: number;
+  workspace_revision?: number;
 };
 
 function toProject(row: ProjectRow): Project {
@@ -890,6 +898,8 @@ function toProject(row: ProjectRow): Project {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     archivedAt: row.archived_at ?? null,
+    projectRevision: Number(row.project_revision ?? 1),
+    workspaceRevision: Number(row.workspace_revision ?? 0),
   };
 }
 
@@ -914,7 +924,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
         managerName = agent.display_name;
       }
       const at = nowIso();
-      const project: Project = { id: newId(), name, createdAt: at, updatedAt: at, archivedAt: null };
+      const project: Project = { id: newId(), name, createdAt: at, updatedAt: at, archivedAt: null, projectRevision: 1, workspaceRevision: 0 };
       await ctx.withTransaction(async () => {
         await ctx.exec(
           "INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
@@ -944,7 +954,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
     async rename(id, name) {
       const value = requireNonEmpty(name, "Project.name");
       const result = await ctx.exec(
-        "UPDATE projects SET name = ?, updated_at = ? WHERE id = ?",
+        `UPDATE projects SET name = ?, updated_at = ?${await hasWorkspaceSchema(ctx) ? ", project_revision = project_revision + 1" : ""} WHERE id = ?`,
         [value, nowIso(), id],
       );
       if (result === 0) throw new NotFoundError(`Project ${id} 不存在。`);
@@ -957,7 +967,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
       const stamp = at ?? nowIso();
       await ctx.withTransaction(async () =>
         ctx.exec(
-          "UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?",
+          `UPDATE projects SET archived_at = ?, updated_at = ?${await hasWorkspaceSchema(ctx) ? ", project_revision = project_revision + 1" : ""} WHERE id = ?`,
           [stamp, stamp, id],
         ),
       );
@@ -969,7 +979,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
       if (existing.archivedAt === null) return existing;
       await ctx.withTransaction(async () =>
         ctx.exec(
-          "UPDATE projects SET archived_at = NULL, updated_at = ? WHERE id = ?",
+          `UPDATE projects SET archived_at = NULL, updated_at = ?${await hasWorkspaceSchema(ctx) ? ", project_revision = project_revision + 1" : ""} WHERE id = ?`,
           [nowIso(), id],
         ),
       );
@@ -994,6 +1004,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
           throw new RepositoryError("confirmation_changed", "永久删除的影响范围已变化，请重新获取级联清单并再次确认。");
         }
         const counts = await projectPurgeCounts(ctx, id);
+        if (await hasWorkspaceSchema(ctx)) await ctx.exec("DELETE FROM project_workspace_versions WHERE project_id = ?", [id]);
         if (await hasMemorySchema(ctx)) {
           for (const table of ["memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints"]) {
             await ctx.exec(`DELETE FROM ${table} WHERE project_id = ?`, [id]);
