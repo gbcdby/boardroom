@@ -14,14 +14,16 @@ import TaskDetailView from "./views/TaskDetailView.vue";
 import MemoryView from "./views/MemoryView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import { useCurrentProject } from "./composables/useCurrentProject.ts";
+import { createTaskListScrollBehavior } from "./composables/useTaskListViewState.ts";
 
 /**
  * S6：全局页与项目容器分别组织。旧入口由共享项目守卫规范化，
  * 保留 query/hash 与显式项目身份；未实现的协作图和实例会话不注册占位入口。
  */
+const context = useCurrentProject();
 export const router = createRouter({
   history: createWebHistory(),
-  scrollBehavior(to, _from, saved) { return saved ?? (to.hash ? { el: to.hash, top: 24 } : { top: 0 }); },
+  scrollBehavior: createTaskListScrollBehavior(context, () => router.currentRoute.value),
   routes: [
     { path: "/", name: "home", component: HomeView, meta: { title: "协作总览" } },
     { path: "/projects", name: "projects", component: ProjectsView, meta: { title: "所有项目" } },
@@ -52,4 +54,4 @@ export const router = createRouter({
     { path: "/:pathMatch(.*)*", name: "not-found", component: PlaceholderView, props: { title: "页面不存在" } },
   ],
 });
-useCurrentProject().installRouter(router);
+context.installRouter(router);

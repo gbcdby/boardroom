@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import { ApiError, api, type MemberDto, type OrgNodeDto } from "../api/client.ts";
 import { draftInput, emptyTaskDraft, taskStates, taskStateLabel, tasksApi, type Task, type TaskSettings } from "../api/tasks.ts";
 import TaskFields from "../components/TaskFields.vue";
 import { projectPath, useCurrentProject, useProjectDraft } from "../composables/useCurrentProject.ts";
-import { useTaskListViewState } from "../composables/useTaskListViewState.ts";
+import { beginTaskListRender, useTaskListViewState } from "../composables/useTaskListViewState.ts";
 
 const context = useCurrentProject();
 const { currentProjectId, readonly: projectReadonly } = context;
@@ -24,6 +24,7 @@ const notice = ref<string | null>(null);
 const conflict = ref(false);
 let request = 0;
 let scopeVersion = 0;
+let pendingRender: ReturnType<typeof beginTaskListRender> | null = null;
 let disposed = false;
 const activeAgents = computed(() => members.value.filter((member) => member.kind === "agent" && member.status === "active"));
 const defaultReviewerName = computed(() => settings.value?.reviewerValid ? members.value.find((member) => member.id === settings.value?.defaultReviewerMemberId)?.displayName ?? null : null);
@@ -42,6 +43,8 @@ async function load(): Promise<void> {
   if (!projectId) return;
   const version = ++request;
   const generation = context.generation.value, scope = scopeVersion;
+  const render = beginTaskListRender(context, projectId);
+  pendingRender = render;
   loading.value = true; error.value = null;
   try {
     const [result, settingResult, org] = await Promise.all([tasksApi.list(projectId), tasksApi.settings(projectId), api.getOrg(projectId)]);
@@ -51,7 +54,13 @@ async function load(): Promise<void> {
     settings.value = settingResult.settings;
     if (!keepSelection) defaultReviewer.value = settingResult.settings.defaultReviewerMemberId ?? "";
   } catch (err) { if (current(projectId, generation, scope) && version === request) error.value = err instanceof Error ? err.message : "任务读取失败，请重试。"; }
-  finally { if (current(projectId, generation, scope) && version === request) loading.value = false; }
+  finally {
+    if (current(projectId, generation, scope) && version === request) {
+      loading.value = false;
+      await nextTick();
+      if (current(projectId, generation, scope) && version === request) render.complete();
+    }
+  }
 }
 
 async function createTask(): Promise<void> {
@@ -90,11 +99,12 @@ function cancelCreate(): void {
   draft.value = emptyTaskDraft(); createOpen.value = false;
 }
 watch(currentProjectId, () => {
+  pendingRender?.cancel(); pendingRender = null;
   scopeVersion++; request++;
   busy.value = false; loading.value = false; error.value = null; notice.value = null; conflict.value = false;
   tasks.value = []; settings.value = null; members.value = []; nodes.value = []; void load();
 }, { immediate: true });
-onBeforeUnmount(() => { disposed = true; request++; });
+onBeforeUnmount(() => { disposed = true; request++; pendingRender?.cancel(); });
 </script>
 
 <template>

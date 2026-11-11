@@ -61,7 +61,7 @@ async function withConfirmation(check: (container: UiElement, host: ReturnType<t
     find(container, node => node.type === "button" && textOf(node) === "移除")!.props.onClick();
     await settle();
     await check(container, focusHost(byTestId(container, "confirmation-dialog")));
-  }, { path: "/projects" });
+  }, { path: "/projects/project-1/overview" });
 }
 
 test("S6-AC05：确认框末端 Tab 和首端 Shift+Tab 循环，内部与系统快捷键保留默认行为", async () => {
@@ -165,5 +165,5 @@ test("S6-AC03/05：重新预览移除当前恢复按钮后还焦取消，确认�
     assert.equal(confirm.props.disabled, false);
     assert.equal(previews, 2);
     assert.equal(submissions, 1, "重新预览不得自动提交删除");
-  }, { path: "/projects" });
+  }, { path: "/projects/project-1/overview" });
 });
