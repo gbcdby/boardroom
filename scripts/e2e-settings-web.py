@@ -139,6 +139,9 @@ def exercise(page, context, fixture, process, output, report):
     expect(page.get_by_test_id("settings-refresh")).to_be_enabled()
     # 刷新结束后从刷新控件继续检查正常的 Tab 顺序。
     page.get_by_test_id("settings-refresh").focus()
+    for preference in ("system", "light", "dark"):
+        page.keyboard.press("Tab")
+        expect(page.get_by_test_id(f"theme-{preference}")).to_be_focused()
     page.keyboard.press("Tab")
     expect(page.get_by_test_id("settings-copy-mcp")).to_be_focused()
     context.grant_permissions(["clipboard-read", "clipboard-write"], origin=origin)
