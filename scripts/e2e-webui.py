@@ -259,18 +259,18 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     expect(recovery).to_have_count(0)
     check_pending_focus()
     assert len(reads) == 1, "权威核对应该读取成员一次"
-    # unroute 移除最后一个 handler 会自动放行挂起请求；先显式放行并等待响应。
+    # 先显式放行被持住的核对请求并等待响应；原弹窗关闭断言通过后，再清理 handler。
     # 核对释放后，后续成功刷新直接通过，不再次挂起。
     reconcile_released = True
     record_reconcile("held-read-release")
     with page.expect_response(lambda response: response.request.method == "GET" and urlsplit(response.url).path == f"/api/projects/{project_id}/members"):
         reads[0].continue_()
         record_reconcile("held-read-continue-returned", reads[0].request)
+    expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
+    record_reconcile("dialog-closed")
     record_reconcile("unroute-start")
     page.unroute(read_pattern, hold_reconcile)
     record_reconcile("unroute-returned")
-    expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
-    record_reconcile("dialog-closed")
     stop_reconcile_observer()
     expect(page.locator("h1")).to_be_focused()
     expect(page.get_by_test_id("new-member-name")).to_have_value("删除成员期间保留的草稿")
