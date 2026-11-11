@@ -793,15 +793,11 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     messages: DbMessage[],
   ): Promise<{ messages: Message[]; lastSeq: number }> {
     return await withAccess(binding, "consume", async () => {
-    const result: Message[] = [];
-    for (const message of messages) {
       // 投递事实是可恢复性的组成部分；持久化失败时整批回滚、保留积压，
       // 不成功返回消息后再让 ACK 永久抹掉缺失的首次投递来源。
-      await (repos.deliveries.markMcpDelivered(message.id, binding.memberId));
-      result.push(toMessage(message));
-    }
-    if (options.managed) await options.managed.onDelivery();
-    return { messages: result, lastSeq: messages[messages.length - 1]!.seq };
+      await repos.deliveries.markMcpDeliveredBatch(binding, messages.map(message => message.id));
+      if (options.managed) await options.managed.onDelivery();
+      return { messages: messages.map(toMessage), lastSeq: messages[messages.length - 1]!.seq };
     });
   }
 
@@ -847,10 +843,10 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         if (entry.done) return;
         if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError('FORBIDDEN', '等待所绑定的会话已失效。');
         await guard(binding, 'group:view', { projectId: binding.projectId, groupId: binding.groupId });
-        for (const message of result.messages) {
-          if (!(await repos.messages.listVisibleForMember(binding, { messageId: message.id, limit: 1 })).length) {
-            throw new McpToolError('FORBIDDEN', '消息在最终兑现前已失去可见权限。');
-          }
+        const messageIds = result.messages.map(message => message.id);
+        const visible = new Set(await repos.messages.listVisibleIdsForMember(binding, messageIds, { requireActive: true }));
+        if (visible.size !== messageIds.length || messageIds.some(id => !visible.has(id))) {
+          throw new McpToolError('FORBIDDEN', '消息在最终兑现前已失去可见权限。');
         }
         if (result.workEvents?.length) {
           const current = new Set((await tasks.listWorkEvents(await taskAccess(binding), binding.projectId)).map(event => event.id));
