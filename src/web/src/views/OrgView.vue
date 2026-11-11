@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
+import ConfirmDialog from "../components/ConfirmDialog.vue";
+import { useConfirmedAction } from "../composables/useConfirmedAction.ts";
+import { useToast } from "../composables/useToast.ts";
 import {
   ApiError,
   api,
@@ -34,7 +37,9 @@ const mutating = ref(false);
 const busy = computed(() => loading.value || mutating.value || projectReadonly.value);
 const editingNodeId = ref<string | null>(null);
 const error = ref<string | null>(null);
-const notice = ref<string | null>(null);
+const toast = useToast();
+const confirmation = useConfirmedAction({ success: toast.success, refreshError: (message) => { error.value = message; } });
+const { action: confirmationAction, phase: confirmationPhase, error: confirmationError, pending: confirmationPending, canConfirm } = confirmation;
 
 // 表单状态
 const rootName = ref("项目统筹");
@@ -60,7 +65,6 @@ const childRoles = computed(() =>
 
 function clearMessages(): void {
   error.value = null;
-  notice.value = null;
 }
 
 async function refresh(): Promise<void> {
@@ -110,7 +114,7 @@ async function act<T>(fn: () => Promise<T>, success: string): Promise<boolean> {
   try {
     await fn();
     if (disposed || projectId !== activeProjectId.value || generation !== context.generation.value) return false;
-    notice.value = success;
+    toast.success(success);
     try {
       await refresh();
     } catch (err) {
@@ -129,6 +133,7 @@ useProjectDraft(() => !!newNodeName.value.trim() || rootName.value !== "项目�
   nameEdits.value[node.id] !== node.name || roleEdits.value[node.id] !== node.role || parentEdits.value[node.id] !== (node.parentId ?? "") || assignEdits.value[node.id] !== (node.memberId ?? "")),
   () => { newNodeName.value = ""; rootName.value = "项目统筹"; nameEdits.value = {}; roleEdits.value = {}; parentEdits.value = {}; assignEdits.value = {}; });
 watch(activeProjectId, () => void selectProject(), { immediate: true });
+watch(() => context.generation.value, () => confirmation.reset());
 onBeforeUnmount(() => { disposed = true; request++; });
 
 async function selectProject(): Promise<void> {
@@ -222,7 +227,23 @@ function assign(node: OrgNodeDto, memberId: string | null): void {
 }
 
 function remove(node: OrgNodeDto): void {
-  void act(() => api.deleteOrgNode(node.id), "岗位已删除（子树提升到父、成员保留）");
+  if (busy.value || confirmationAction.value || !activeProjectId.value) return;
+  const projectId = activeProjectId.value, nodeId = node.id, name = node.name, generation = context.generation.value;
+  clearMessages();
+  void confirmation.open({ key: `org.delete:${projectId}:${nodeId}`, title: `删除岗位「${name}」？`, description: "下级岗位会移交给上级，岗位成员与历史记录保留。请核对影响后确认。",
+    confirmLabel: "确认删除岗位", successMessage: `岗位「${name}」已删除，成员与历史保留。`,
+    isCurrent: () => !disposed && projectId === activeProjectId.value && generation === context.generation.value,
+    execute: () => api.deleteOrgNode(nodeId),
+    reconcile: async (isActive) => {
+      const latest = (await api.getOrg(projectId)).nodes.find(item => item.id === nodeId);
+      if (isActive() && latest && confirmationAction.value) {
+        confirmationAction.value.title = `删除岗位「${latest.name}」？`;
+        confirmationAction.value.successMessage = `岗位「${latest.name}」已删除，成员与历史保留。`;
+      }
+      return !latest;
+    },
+    afterSuccess: refresh,
+  });
 }
 
 function autoPlace(): void {
@@ -236,6 +257,9 @@ function autoPlace(): void {
 
 <template>
   <section class="page org-page">
+    <ConfirmDialog :open="!!confirmationAction" :title="confirmationAction?.title ?? ''" :description="confirmationAction?.description ?? ''" :confirm-label="confirmationAction?.confirmLabel ?? '确认'" :cancel-label="confirmationPhase === 'unknown' ? '关闭' : '取消'" :pending="confirmationPending" :disabled="!canConfirm" :error="confirmationError" @cancel="confirmation.cancel" @confirm="confirmation.confirm">
+      <template #recovery><button v-if="confirmationPhase === 'unknown'" type="button" data-testid="confirmation-reconcile" @click="confirmation.reconcile">核对操作结果</button></template>
+    </ConfirmDialog>
     <header class="page-header">
       <div><h1>组织与角色</h1><p class="page-description">明确岗位、汇报关系和成员分工。</p></div>
 
@@ -243,7 +267,6 @@ function autoPlace(): void {
 
     <p v-if="projectReadonly" class="notice" role="status">项目已归档，组织与岗位仅供查看。</p>
     <p v-if="error" class="error" role="alert" data-testid="error">{{ error }}</p>
-    <p v-if="notice" class="notice" role="status" data-testid="notice">{{ notice }}</p>
     <p v-if="loading" class="muted small" role="status">正在加载组织信息…</p>
     <div v-else-if="!activeProjectId && !error" class="panel empty-state"><h2>还没有项目</h2><p>创建项目后，就可以安排岗位与成员。</p><RouterLink to="/projects">前往项目与群组</RouterLink></div>
 

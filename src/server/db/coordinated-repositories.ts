@@ -83,6 +83,8 @@ export function coordinateRepositoryWrites(repos: RepositorySet): RepositorySet 
   repos.projects.rename = coordinate(repos.projects.rename.bind(repos.projects), ([id]) => projectPlan(id));
   repos.projects.archive = coordinate(repos.projects.archive.bind(repos.projects), ([id]) => projectPlan(id));
   repos.projects.restore = coordinate(repos.projects.restore.bind(repos.projects), ([id]) => projectPlan(id));
+  repos.projects.previewPurge = coordinate(repos.projects.previewPurge.bind(repos.projects), ([id]) => projectPlan(id, purgeDiscovery(id)));
+  repos.projects.capturePurge = coordinate(repos.projects.capturePurge.bind(repos.projects), ([id]) => projectPlan(id, purgeDiscovery(id)));
   repos.projects.purge = coordinate(repos.projects.purge.bind(repos.projects), ([id]) => projectPlan(id, purgeDiscovery(id)));
   repos.projects.delete = async id => { await repos.projects.purge(id); };
 
@@ -107,6 +109,8 @@ export function coordinateRepositoryWrites(repos: RepositorySet): RepositorySet 
   repos.groups.addParticipant = coordinate(repos.groups.addParticipant.bind(repos.groups), ([id, memberId]) => group(id, [memberId]));
   repos.groups.removeParticipant = coordinate(repos.groups.removeParticipant.bind(repos.groups), ([id, memberId]) => group(id, [memberId]));
   repos.groups.restoreParticipant = coordinate(repos.groups.restoreParticipant.bind(repos.groups), ([id, memberId]) => group(id, [memberId]));
+  repos.groups.previewPurge = coordinate(repos.groups.previewPurge.bind(repos.groups), async ([id]) => { const projectId = await requireProjectOf(ctx, 'groups', id); return projectPlan(projectId, purgeDiscovery(projectId, id)); });
+  repos.groups.capturePurge = coordinate(repos.groups.capturePurge.bind(repos.groups), async ([id]) => { const projectId = await requireProjectOf(ctx, 'groups', id); return projectPlan(projectId, purgeDiscovery(projectId, id)); });
   repos.groups.purge = coordinate(repos.groups.purge.bind(repos.groups), async ([id]) => { const projectId = await requireProjectOf(ctx, 'groups', id); return projectPlan(projectId, purgeDiscovery(projectId, id)); });
   repos.groups.delete = async id => { await repos.groups.purge(id); };
 
