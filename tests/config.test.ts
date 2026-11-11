@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { loadConfig } from "../src/server/config.ts";
@@ -19,7 +19,7 @@ test("没有配置文件时使用默认值", async () => {
     const config = await loadConfig({ cwd: dir, env: {} });
 
     assert.equal(config.port, 4317);
-    assert.equal(config.dataDir, path.join(dir, "data"));
+    assert.equal(config.dataDir, path.join(await realpath(dir), "data"));
     assert.equal(config.heartbeat.intervalMs, 10_000);
     assert.equal(config.heartbeat.timeoutMs, 30_000);
     assert.equal(config.antiLoop?.maxConsecutiveAutoReplies, 6);
@@ -42,7 +42,7 @@ test("配置文件覆盖默认值", async () => {
     const config = await loadConfig({ cwd: dir, env: {} });
 
     assert.equal(config.port, 5555);
-    assert.equal(config.dataDir, path.join(dir, "var/data"));
+    assert.equal(config.dataDir, path.join(await realpath(dir), "var/data"));
     assert.equal(config.heartbeat.intervalMs, 5000);
     assert.equal(config.heartbeat.timeoutMs, 20_000);
   });
@@ -71,7 +71,7 @@ test("环境变量覆盖配置文件", async () => {
     });
 
     assert.equal(config.port, 6001);
-    assert.equal(config.dataDir, path.join(dir, "from-env"));
+    assert.equal(config.dataDir, path.join(await realpath(dir), "from-env"));
     assert.equal(config.heartbeat.intervalMs, 7000);
     assert.equal(config.heartbeat.timeoutMs, 21_000);
   });

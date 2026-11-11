@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, readdir, writeFile, rename, symlink, chmod, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readdir, writeFile, rename, symlink, chmod, readFile, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync, fork } from "node:child_process";
@@ -210,7 +210,7 @@ process.on('message', async () => { await server.close(); process.disconnect(); 
   const httpExit = once(http, "exit"); let errors = ""; http.stderr!.on("data", chunk => { errors += String(chunk); });
   try {
     const [ready] = await Promise.race([once(http, "message"), httpExit.then(() => { throw new Error(`HTTP fixture exited: ${errors}`); })]) as [{ url: string; mcpUrl: string; sqlitePath: string }];
-    assert.equal(ready.sqlitePath, actual);
+    assert.equal(ready.sqlitePath, await realpath(actual));
     const list = await (await fetch(`${ready.url}/api/projects`)).json() as { projects: { id: string }[] };
     assert.deepEqual(list.projects.map(p => p.id).sort(), fixtures.map(p => p.projectId).sort());
     for (const fixture of fixtures) {

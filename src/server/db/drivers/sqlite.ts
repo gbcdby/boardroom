@@ -8,8 +8,8 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { OperationQueue } from "../operation-queue.ts";
-import { openDatabase, DatabaseSetupError, probeReadWrite } from "../database.ts";
-import { assertSqliteSourceUnchanged, type SqliteDatabaseDescriptor } from "../../environment.ts";
+import { openDatabase, DatabaseSetupError, probeReadWrite, DATABASE_FILE_NAME } from "../database.ts";
+import { assertSqliteSingleLink, assertSqliteSourceUnchanged, type SqliteDatabaseDescriptor } from "../../environment.ts";
 import { ConfigError } from "../../config-error.ts";
 import {
   readMigrationState,
@@ -79,6 +79,7 @@ export class SqliteDriver implements DbDriver {
     if (this.opened !== null) return;
     // openDatabase 抛 DatabaseSetupError（含恢复路径），原样向上传播。
     if (this.sqliteSource) assertSqliteSourceUnchanged(this.sqliteSource, true);
+    else assertSqliteSingleLink(this.sqlitePath ?? path.resolve(this.dataDir, DATABASE_FILE_NAME));
     if (this.sqlitePath === undefined) { this.opened = openDatabase(this.dataDir); return; }
     let db: Database.Database | undefined;
     try {
@@ -86,6 +87,7 @@ export class SqliteDriver implements DbDriver {
       // 已存在源不得触发 CREATE；先核实 inode，再允许任何 pragma/迁移写入。
       db = new Database(this.sqlitePath, { fileMustExist: this.sqliteSource?.identity != null });
       if (this.sqliteSource?.identity) assertSqliteSourceUnchanged(this.sqliteSource, true);
+      else assertSqliteSingleLink(this.sqlitePath);
       db.pragma("journal_mode = WAL");
       db.pragma("synchronous = NORMAL");
       db.pragma("foreign_keys = ON");

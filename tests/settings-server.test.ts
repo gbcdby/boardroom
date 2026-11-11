@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { loadConfig } from "../src/server/config.ts";
@@ -65,11 +65,11 @@ test("S5-CONFIG-01/02/04：生产服务展示实际配置与随机端口，读�
     assert.equal(first.service.httpBaseUrl, server.url);
     assert.equal(first.service.websocketUrl, server.wsUrl);
     assert.equal(first.service.mcpHttpUrl, server.mcpUrl);
-    assert.deepEqual(first.storage, { driver: "sqlite", dataDirectory: path.join(directory, "live-data"), postgresConfigured: true });
+    assert.deepEqual(first.storage, { driver: "sqlite", dataDirectory: await realpath(path.join(directory, "live-data")), postgresConfigured: true });
     assert.deepEqual(first.heartbeat, { intervalMs: 7000, timeoutMs: 22000 });
     assert.deepEqual(first.antiLoop, { maxConsecutiveAutoReplies: 8, maxWakesPerMinutePerMember: 18 });
     assert.deepEqual(first.memory, { messageThreshold: 90, maxDocumentBytes: 16384, maxInjectedBytes: 4096, summaryInputBytes: 32768, summaryAttemptTimeoutMs: 120000 });
-    assert.equal(first.configuration.filePath, configFile);
+    assert.equal(first.configuration.filePath, await realpath(configFile));
     assert.deepEqual(first.configuration.precedence, ["defaults", "file", "environment"]);
     assert.equal(first.configuration.activation, "restart-required");
     assert.ok(Date.parse(first.configuration.startedAt) >= beforeStart);

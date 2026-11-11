@@ -37,7 +37,7 @@ AGENT_STUDIO_CONFIG=/absolute/path/config.json node src/server/mcp/stdio.ts
 | `storageId` | 配置声明的实例 ID，可能为 null；单凭此字段不代表新存储已激活 |
 | `writable` | 是否允许本版本沿用选中的 v1 源；真正启动还会核实文件身份及实际目录权限 |
 
-`loadConfig` 会调用 `assertEnvironmentWritable`，然后将同一 environment 附到配置。`startServer` 对手工 `AppConfig` 也做相同解析和门禁。`databaseDriverOptions` 将 descriptor 交给驱动；SQLite 驱动连接前再次验证原路径、真实位置与设备/inode，对已有文件使用 `fileMustExist`。移动、替换、链接改向或不可访问会返回 `storage_source_changed`，不会创建替代空库。
+`loadConfig` 会调用 `assertEnvironmentWritable`，然后将同一 environment 附到配置。`startServer` 对手工 `AppConfig` 也做相同解析和门禁。`databaseDriverOptions` 将 descriptor 交给驱动；SQLite 驱动连接前再次验证原路径、真实位置、设备/inode 及硬链接数，对已有文件使用 `fileMustExist`。移动、替换、符号链接改向或不可访问会返回 `storage_source_changed`，不会创建替代空库。解析后新增硬链接也会在连接门禁被拒绝。
 
 SQLite 权限检查针对数据库的真实父目录，那里需要保存 WAL 辅助文件；管理目录有写权限不能代替真实父目录权限。路径规范化不会创建缺失目录，也不会把悬挂链接当成 fresh 目录。
 
@@ -47,7 +47,7 @@ SQLite 权限检查针对数据库的真实父目录，那里需要保存 WAL �
 
 ## 来源发现与启动状态
 
-`inspectLegacyStorage` 只检查所选源、当前或明确传入的旧启动目录，以及已解析的新目标位置。不递归扫描机器，不按修改时间选择，不打开 SQLite 驱动，不连接 PostgreSQL。SQLite 证据来自普通文件、16 字节格式头、大小、设备/inode 和 WAL 是否存在；它不读取业务行或验证全库完整性。
+`inspectLegacyStorage` 只检查所选源、当前或明确传入的旧启动目录，以及已解析的新目标位置。不递归扫描机器，不按修改时间选择，不打开 SQLite 驱动，不连接 PostgreSQL。SQLite 证据来自普通文件、16 字节格式头、大小、设备/inode、硬链接数和 WAL 是否存在；它不读取业务行或验证全库完整性。
 
 | 状态 | 当前行为 |
 | --- | --- |
@@ -55,10 +55,12 @@ SQLite 权限检查针对数据库的真实父目录，那里需要保存 WAL �
 | `legacy_found`，当前源已命中 | 继续使用该确切旧源。显式配置或数据目录可作为多个纯 legacy 来源中的明确选择 |
 | `legacy_found`，仅别处发现 | 当前源为空而另一个已知旧目录有库；拒绝新建空库，返回 `legacy_migration_required`，要求明确旧配置/绝对数据目录 |
 | `ambiguous` | 多个未明确选择的旧源，或新旧不同源混存；拒绝写入，不合并、不按时间猜选 |
-| `recovery_required` | 未完成/无法解析的 journal、格式证据缺失、storageId 不一致、维护标记或无效 SQLite 头；返回相应恢复动作 |
+| `recovery_required` | 未完成/无法解析的 journal、悬挂迁移目录、格式证据缺失、storageId 不一致、维护标记、无效 SQLite 头或多硬链接数据库；返回相应恢复动作 |
 | `active` | 保留给未来可核验的新格式激活状态。本实现没有 v2 数据库激活验证能力，因此不会返回此状态 |
 
-同一真实 SQLite 文件的别名按设备/inode 去重。显式旧目录刚好名为 `state` 不会因此被升级为 v2。反过来，显式选择旧源不能绕过新目标的维护、journal、storageId 或新旧混存问题。
+只有规范路径和设备/inode 均相同的 SQLite 别名才会去重；普通符号链接因此沿用真实文件对应的 WAL。主数据库的硬链接数大于 1 时返回 `storage_source_ambiguous` 并要求恢复，即使只发现其中一个名字，也不能继续选择或连接。硬链接共享 inode，但不同文件名可能对应不同 WAL，不能由 inode 相同推断它们包含相同的已提交内容。操作方需停止相关连接，核对原数据库及其 WAL 的一致快照，恢复到唯一文件入口；预检不会删除硬链接或辅助文件。
+
+只有真正不存在的迁移记录目录可以忽略。`state/migrations` 目录项存在但链接目标缺失时返回 `migration_incomplete`；目录不可读等访问错误同样阻断启动，不会新建目录或将其当成 fresh。显式旧目录刚好名为 `state` 不会因此被升级为 v2。反过来，显式选择旧源不能绕过新目标的维护、journal、storageId 或新旧混存问题。
 
 `layoutVersion: 2`、配置和 `storage.json` 中相同的 storageId、`active: true` 或 journal 的 `completed` 文字都不是数据库激活证据。只有配置 storageId 却没有格式声明，或只有完成 journal 却缺少元数据，同样要求恢复。本阶段不创建新格式标记。
 

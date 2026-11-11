@@ -33,6 +33,7 @@ export interface LegacyStorageSource {
   readonly locations: readonly { readonly rule: string; readonly configFile: string | null; readonly sourcePath: string | null }[];
   readonly sqliteHeader?: "sqlite3" | "invalid";
   readonly byteLength?: string;
+  readonly linkCount?: string;
   readonly walPresent?: boolean;
 }
 export interface LegacyStorageInventory {
@@ -134,6 +135,22 @@ function identityOf(file: string): FileIdentity | null {
   }
 }
 
+function hardlinkedSqlite(): EnvironmentDiagnostic {
+  return { code: "storage_source_ambiguous", message: "SQLite 主数据库存在多个硬链接，不同文件名可能使用不同 WAL，不能安全选择。",
+    recoveryAction: "停止相关数据库连接，核对原数据库及其 WAL 的完整一致快照，恢复到唯一文件入口后重新解析；不会删除硬链接或辅助文件。" };
+}
+
+/** 同 inode 的硬链接仍可能有不同 WAL；必须在实际打开连接前重新检查。 */
+export function assertSqliteSingleLink(file: string): void {
+  let multiple: boolean;
+  try { multiple = statSync(file, { bigint: true }).nlink > 1n; }
+  catch (error) { if (codeOf(error) === "ENOENT") return; throw pathError("SQLite 数据源", error); }
+  if (multiple) {
+    const diagnostic = hardlinkedSqlite();
+    throw new ConfigError(diagnostic.message, diagnostic.code, diagnostic.recoveryAction);
+  }
+}
+
 export function describeDatabase(database: DatabaseDescriptor): PublicDatabaseDescriptor {
   if (database.kind === "sqlite") return {
     kind: "sqlite", sqlitePath: database.sqlitePath, sourcePath: database.sourcePath, identity: database.identity,
@@ -161,6 +178,7 @@ export function assertSqliteSourceUnchanged(database: Pick<SqliteDatabaseDescrip
     throw new ConfigError("已解析的 SQLite 源被移动、替换、不可访问或符号链接发生变化。", "storage_source_changed",
       "停止启动，检查原数据与链接后重新解析配置；不会新建替代空库。");
   }
+  assertSqliteSingleLink(database.sqlitePath);
   if (writable) {
     assertWritableDirectory(path.dirname(database.sqlitePath));
     if (database.identity) {
@@ -177,6 +195,7 @@ export function databaseForConnectedReader(database: DatabaseDescriptor): Databa
   if (canonicalizePath(database.sourcePath) !== database.sqlitePath) throw new ConfigError("连接后的 SQLite 源发生变化。", "storage_source_changed");
   const identity = identityOf(database.sqlitePath);
   if (!identity) throw new ConfigError("连接后的 SQLite 源不存在。", "storage_source_changed");
+  assertSqliteSingleLink(database.sqlitePath);
   return { ...database, identity };
 }
 
@@ -257,17 +276,23 @@ async function collectInventory(environment: Omit<ResolvedBoardroomEnvironment, 
   const explicit = options.config !== undefined || env["AGENT_STUDIO_CONFIG"] !== undefined || env["AGENT_STUDIO_DATA_DIR"] !== undefined || env["AGENT_STUDIO_DB_DRIVER"] !== undefined;
   async function add(database: DatabaseDescriptor, layoutVersion: 1 | 2, rule: string, configFile: string | null): Promise<string | null> {
     let id: string;
-    let facts: Pick<LegacyStorageSource, "sqliteHeader" | "byteLength" | "walPresent"> = {};
+    let facts: Pick<LegacyStorageSource, "sqliteHeader" | "byteLength" | "linkCount" | "walPresent"> = {};
     if (database.kind === "sqlite") {
       if (!database.identity) return null;
-      id = `sqlite:${database.identity.device}:${database.identity.inode}`;
+      // 仅规范路径相同的符号链接别名可共用 WAL；硬链接的不同路径不能只按 inode 合并。
+      id = `sqlite:${database.identity.device}:${database.identity.inode}:${createHash("sha256").update(database.sqlitePath).digest("hex").slice(0, 24)}`;
       const file = await open(database.sqlitePath, "r").catch(error => { throw pathError("SQLite 数据源", error); });
       try {
+        const stats = await file.stat({ bigint: true });
         const header = Buffer.alloc(16);
         const { bytesRead } = await file.read(header, 0, 16, 0);
         const valid = bytesRead === 16 && header.equals(Buffer.from("SQLite format 3\0"));
-        facts = { sqliteHeader: valid ? "sqlite3" : "invalid", byteLength: String((await file.stat({ bigint: true })).size),
+        facts = { sqliteHeader: valid ? "sqlite3" : "invalid", byteLength: String(stats.size), linkCount: String(stats.nlink),
           walPresent: exists(`${database.sqlitePath}-wal`) };
+        if (stats.nlink > 1n) {
+          hardRecovery = true;
+          if (!sources.has(id)) diagnostics.push(hardlinkedSqlite());
+        }
         if (!valid) {
           hardRecovery = true;
           diagnostics.push({ code: "migration_incomplete", message: "已知 SQLite 文件的格式头无效，不能将其当成 fresh 数据库。",
@@ -333,7 +358,16 @@ async function collectInventory(environment: Omit<ResolvedBoardroomEnvironment, 
   const journalRoot = path.join(environment.stateRoot, "migrations");
   let journals: string[] = [];
   try { journals = await readdir(journalRoot); }
-  catch (error) { if (codeOf(error) !== "ENOENT") throw pathError("迁移记录目录", error); }
+  catch (error) {
+    if (codeOf(error) !== "ENOENT") throw pathError("迁移记录目录", error);
+    // ENOENT 也可能来自现存悬挂链接，只有目录项本身真正缺失才允许 fresh。
+    try {
+      lstatSync(journalRoot);
+      hardRecovery = true;
+      diagnostics.push({ code: "migration_incomplete", message: "迁移记录目录存在但无法解析，不能视为没有迁移记录。",
+        recoveryAction: "核对迁移目录链接、原始 journal 与一致快照后恢复；不会创建目录或忽略丢失的迁移状态。" });
+    } catch (entryError) { if (codeOf(entryError) !== "ENOENT") throw pathError("迁移记录目录", entryError); }
+  }
   if (journals.length > 4096) throw new ConfigError("迁移记录数量超出只读预检上限，请检查存储恢复记录。");
   if (journals.some(name => !name.endsWith(".json"))) {
     hardRecovery = true;

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { loadConfig, type AppConfig } from "../src/server/config.ts";
@@ -28,11 +28,11 @@ test("S5-CONFIG-01/02：设置来自实际解析值，逐字段白名单不泄�
     const result = buildEffectiveSettings({ config: polluted, address: { host: "127.0.0.1", port: 49321 }, startedAt: "2026-11-11T03:00:00.000Z" });
     assert.deepEqual(result, {
       service: { host: "127.0.0.1", port: 49321, httpBaseUrl: "http://127.0.0.1:49321", websocketUrl: "ws://127.0.0.1:49321/ws", mcpHttpUrl: "http://127.0.0.1:49321/mcp" },
-      storage: { driver: "sqlite", dataDirectory: path.join(directory, "from-env"), postgresConfigured: true },
+      storage: { driver: "sqlite", dataDirectory: path.join(await realpath(directory), "from-env"), postgresConfigured: true },
       heartbeat: { intervalMs: 7000, timeoutMs: 20000 },
       antiLoop: { maxConsecutiveAutoReplies: 4, maxWakesPerMinutePerMember: 15 },
       memory: { messageThreshold: 90, maxDocumentBytes: 16384, maxInjectedBytes: 8192, summaryInputBytes: 65536, summaryAttemptTimeoutMs: 900000 },
-      configuration: { filePath: path.join(directory, "config.json"), precedence: ["defaults", "file", "environment"], activation: "restart-required", startedAt: "2026-11-11T03:00:00.000Z" },
+      configuration: { filePath: await realpath(path.join(directory, "config.json")), precedence: ["defaults", "file", "environment"], activation: "restart-required", startedAt: "2026-11-11T03:00:00.000Z" },
     });
     assert.doesNotMatch(JSON.stringify(result), /secret|canary|private-user|internal-db|private-env-value|rawArgv|nestedUnknown|pgConnectionString/);
     assert.equal(config.port, 6001, "展示真实监听端口不回写启动配置");
