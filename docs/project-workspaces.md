@@ -8,7 +8,7 @@
 
 工作区配置由项目持有。已有托管 runtime 的默认目录、绑定覆盖、requested/applied 快照、SID 和实际 cwd 继续保持原值。此入口只保存后续运行可消费的配置；`isolated` 与 `serialized` 是偏好，不表示已创建工作副本或取得写租约。预检和保存结果始终带 `runReady: false`、`requiresRevalidation: true`。
 
-目录检查复用已经选定的 S4 环境及 `canonicalizePath`。生产 HTTP 装配显式传入 `ResolvedBoardroomEnvironment`；其他嵌入式调用方没有传入环境时，工作区入口返回 `workspace_environment_unavailable`，不根据 cwd 猜数据库和保护范围。`~/.boardroom` 新布局仍处于原环境描述的 planned 状态，不因项目保存而创建或启用。
+目录检查复用已经选定的 S4 环境和保护范围。工作根必须存在，对原始输入先做文件系统 `realpath` 解析；S4 用于已有前缀和 planned 路径的 `canonicalizePath` 保持原契约。生产 HTTP 装配显式传入 `ResolvedBoardroomEnvironment`；其他嵌入式调用方没有传入环境时，工作区入口返回 `workspace_environment_unavailable`，不根据 cwd 猜数据库和保护范围。`~/.boardroom` 新布局仍处于原环境描述的 planned 状态，不因项目保存而创建或启用。
 
 ## 配置版本与稳定引用
 
@@ -19,7 +19,7 @@
 | `workspaceRef` | `{ projectId, workspaceRevision }`，可读取对应历史配置；项目永久删除后失效 |
 | `savedProjectRevision` | 某个工作区版本保存成功时的项目配置版本 |
 | `rootPath` | 用户提交的原绝对路径，保留符号链接入口和原始拼写 |
-| `canonicalRoot` | S4 规范化得到的真实目录 |
+| `canonicalRoot` | 对原始 `rootPath` 按文件系统语义解析得到的现有真实目录 |
 | `rootIdentity` | 设备、inode 和创建时间观察值；按字符串保存，避免整数精度损失 |
 | `physicalResourceKey` | 从真实根身份派生。同一物理根在不同项目或不同符号链接入口下得到相同 key |
 
@@ -94,11 +94,15 @@
 
 已有目录必须可读且可进入。系统 state、skills、memory、runtime、artifacts、实际数据源、选定配置文件和应用目录的保护范围由 S4 提供；工作目录不能与这些范围重叠，父目录与符号链接别名也会检查。预检不创建缺失目录，不写 `AGENTS.md` 或 Skills。
 
+原始路径中的符号链接和 `..` 按操作系统的实际访问顺序解析，不先词法折叠。例如 `code/link/..` 中的 `link` 指向 `skills/child` 时，实际根是 `skills`，必须按该根拒绝；指向普通项目目录时则可正常使用。目录身份、权限检查、保护范围比较和 Git cwd 均使用解析得到的同一真实根，保存的 `rootPath` 仍保留原始拼写。
+
 Git 检查只读取仓库元数据、索引和原文件字节。命令关闭 optional locks、fsmonitor、hooks 和外部 diff/textconv，排除继承的 `GIT_*` 定向变量，避免工作目录内配置触发外部程序；不会调用可能运行 clean filters 的工作树状态转换。所有命令必须识别 `--no-lazy-fetch`，另以空的 `GIT_ALLOW_PROTOCOL` 白名单禁止传输；partial clone/promisor 缺少对象时只报告观察不可用，不补取对象、不执行 remote helper。旧 Git 若不支持该命令行开关则明确失败为 `unavailable`，不会仅依赖可能被忽略的环境变量继续检查。
 
 `repositoryInfo` 区分 `git`、`not_git`、`unavailable`，并报告 HEAD、索引变化、原始文件差异和未跟踪文件数量。`comparison=raw_bytes_no_filters` 表示保守的原始字节比较：例如 Git clean filter 或换行转换可能让原始字节与索引不同，因此脏状态只是观察。子模块、超出读取上限或读取不完整时使用 `complete=false`，不能在缺少依据时报告干净。
 
 预检开始和完成时会比较根身份；保存提交前再次核对。上述时点检查无法替代后续 Run 的权限核对、文件系统边界检查、物理资源租约和实际 cwd 回执。
+
+历史快照如果保存了与原始路径实际目录不一致的规范根或身份，重新验证会返回 `workspace_changed`，不会静默改写历史版本；调用方需重新预检并显式保存。
 
 ## 旧目录映射
 
@@ -118,4 +122,4 @@ v15 追加 `projects.project_revision`、`projects.workspace_revision` 和 `proj
 
 跨库复制按父表到子表写入工作区版本，校验 head、全部版本内容、根身份、观察、mutation ID 与输入摘要；清库以反向外键顺序处理。原有 v13 成员事实版本的最后复制/最后清理顺序继续保留。v1–v14 迁移正文与 checksum 不变。
 
-针对性检查入口为 `tests/workspace-preflight.test.ts`、`tests/workspace-service.test.ts`、`tests/workspace-mapping.test.ts` 和 `tests/workspace-api.test.ts`。SQLite、真实 PostgreSQL、浏览器与最终组合候选证据分别记录，单库通过不能代替其他门控。
+针对性检查入口为 `tests/workspace-preflight.test.ts`、`tests/workspace-path-semantics.test.ts`、`tests/workspace-service.test.ts`、`tests/workspace-mapping.test.ts` 和 `tests/workspace-api.test.ts`。SQLite、真实 PostgreSQL、浏览器与最终组合候选证据分别记录，单库通过不能代替其他门控。

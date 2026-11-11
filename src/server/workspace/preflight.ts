@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, lstat, readFile, readlink, stat } from "node:fs/promises";
+import { access, lstat, readFile, readlink, realpath, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -42,7 +42,7 @@ async function repository(root: string): Promise<WorkspaceRepositoryInfo> {
   let topLevel: string;
   try {
     if ((await git(root, "rev-parse", "--is-inside-work-tree")).trim() !== "true") return unknownRepository("unavailable", "not_a_worktree");
-    topLevel = canonicalizePath((await git(root, "rev-parse", "--show-toplevel")).trim());
+    topLevel = await realpath((await git(root, "rev-parse", "--show-toplevel")).trim());
   } catch (error) {
     return (error as { stderr?: string }).stderr?.includes("not a git repository")
       ? unknownRepository("not_git", null) : unknownRepository("unavailable", "git_metadata_unavailable");
@@ -91,10 +91,11 @@ async function rootFacts(rootPath: string, environment: ResolvedBoardroomEnviron
   if (typeof rootPath !== "string" || rootPath.length === 0 || rootPath.length > 4096 || rootPath.includes("\0")) failure("path_invalid", "工作目录必须是有效路径字符串或 null。");
   if (!path.isAbsolute(rootPath)) failure("path_not_absolute", "工作目录必须使用绝对路径。");
   try {
-    const info = await stat(rootPath, { bigint: true });
+    // 现有根先按文件系统语义解析原输入；path.resolve 会提前折叠 link/..，指向另一目录。
+    const canonicalRoot = await realpath(rootPath);
+    const info = await stat(canonicalRoot, { bigint: true });
     if (!info.isDirectory()) failure("path_not_directory", "工作目录必须指向现有目录。");
-    await access(rootPath, constants.R_OK | constants.X_OK);
-    const canonicalRoot = canonicalizePath(rootPath);
+    await access(canonicalRoot, constants.R_OK | constants.X_OK);
     for (const protectedPath of environment.protectedPaths) {
       const canonicalProtected = canonicalizePath(protectedPath);
       if (within(canonicalProtected, canonicalRoot) || within(canonicalRoot, canonicalProtected)) failure("protected_path", "工作目录与系统数据、技能、记忆或应用目录重叠，请选择项目专用目录。");
@@ -105,7 +106,7 @@ async function rootFacts(rootPath: string, environment: ResolvedBoardroomEnviron
   } catch (error) { return pathFailure(error); }
 }
 
-/** S4 统一规范化与保护范围；只读现有目录，不激活 planned 根，也不写入工作目录。 */
+/** 原输入按现有目录真实语义解析，保护范围仍由 S4 提供；不激活 planned 根或写入工作目录。 */
 export async function inspectWorkspaceRoot(rootPath: string | null, environment: ResolvedBoardroomEnvironment,
   now: () => Date = () => new Date()): Promise<WorkspacePreflight> {
   const base = { rootPath, observationOnly: true as const, requiresRevalidation: true as const, runReady: false as const };
