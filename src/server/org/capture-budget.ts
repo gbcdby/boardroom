@@ -3,6 +3,8 @@ import { repositorySqlObserver, withRepositorySqlObserver, type RepositorySqlObs
 import { MEMBER_CAPTURE_BUDGET, type MemberCaptureBudget } from "./compensation-types.ts";
 
 function exceeded(message: string): never { throw new RepositoryError("audit_capture_budget_exceeded", `${message}；本次事务将完整回滚，请缩小操作范围。`); }
+/** 各有界投影须从 SQL 字段宽度证明此上界，不能只在接收后截断整行。 */
+export const MAX_CAPTURE_ROW_BYTES = 65536;
 /** 500ms 是语句间/语句返回后的真实检查，绝不以 Promise 超时伪装 native SQLite 已取消。 */
 export class CaptureBudget implements RepositorySqlObserver {
   readonly bounded = true;
@@ -28,11 +30,14 @@ export class CaptureBudget implements RepositorySqlObserver {
   after(sql: string, result: unknown, kind: "query" | "exec"): void {
     if (this.startedAt === null && /^\s*UPDATE projects SET updated_at = updated_at/i.test(sql)) this.startedAt = performance.now();
     if (kind === "query" && Array.isArray(result)) {
+      let oversizedRow = false;
       for (const row of result) {
         const bytes = Buffer.byteLength(JSON.stringify(row, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value), "utf8");
         this.stats.rows++; this.stats.bytes += bytes;
-        if (bytes > 65536 || this.stats.rows > this.limits.maxRows || this.stats.bytes > this.limits.maxReturnedBytes) exceeded("返回行/UTF-8 字节预算已耗尽");
+        oversizedRow ||= bytes > MAX_CAPTURE_ROW_BYTES;
       }
+      // 驱动已将整批数组交回；即使第一行越界，后续行也已经消耗资源，必须全部计费。
+      if (oversizedRow || this.stats.rows > this.limits.maxRows || this.stats.bytes > this.limits.maxReturnedBytes) exceeded("返回行/UTF-8 字节预算已耗尽");
     } else if (kind === "exec" && typeof result === "number" && !/^\s*(SET|UPDATE \w+ SET updated_at = updated_at)/i.test(sql)) {
       this.stats.changedRows += result;
       if (this.stats.changedRows > this.limits.maxPlannedChangedRows) exceeded("实际写入行预算已耗尽");
@@ -46,7 +51,12 @@ export class CaptureBudget implements RepositorySqlObserver {
       this.stats.sql + cost.sql > this.limits.maxSqlStatements || this.stats.changedRows + cost.changedRows > this.limits.maxPlannedChangedRows) exceeded("完整补偿计划与读回预留超出预算");
     this.stats.phase = "apply";
   }
-  pageSize(): number { this.check(); return Math.max(1, Math.min(32, this.limits.maxRows - this.stats.rows + 1)); }
+  pageSize(): number {
+    this.check();
+    // 最后一行是完整性哨兵：返回量至多为剩余预算 + 一行，而非再取一整页。
+    const byteRows = Math.floor((this.limits.maxReturnedBytes - this.stats.bytes) / MAX_CAPTURE_ROW_BYTES) + 1;
+    return Math.max(1, Math.min(this.limits.pageRows, this.limits.maxRows - this.stats.rows + 1, byteRows));
+  }
   run<T>(body: () => Promise<T>): Promise<T> { return withRepositorySqlObserver(this, body); }
 }
 /** DB 端 substr(n+1) 后按真实 UTF-8 再检查，超长时不加载剩余正文。 */

@@ -1508,7 +1508,7 @@ function createMessages(ctx: RepoCtx, driverKind: DbDriver["kind"]): MessagesRep
         WHERE g.project_id = ? AND m.group_id = ? AND viewer.membership_revision = ?
           AND viewer.removed_at IS NULL AND viewer.status = 'active'
           AND (viewer.kind = 'human' OR n.role = 'top_manager' OR (n.id IS NULL AND viewer.role = 'manager') OR ${participant})
-          AND (viewer.kind = 'human' OR viewer.role = 'manager' OR n.role IN ('top_manager', 'sub_manager')
+          AND (viewer.kind = 'human' OR (n.id IS NULL AND viewer.role = 'manager') OR n.role IN ('top_manager', 'sub_manager')
             OR m.sender_member_id = viewer.id OR ${mentionContains}
             OR EXISTS (SELECT 1 FROM task_message_links link
               JOIN tasks task ON task.project_id = link.project_id AND task.id = link.task_id

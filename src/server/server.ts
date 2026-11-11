@@ -11,7 +11,7 @@ import type { Logger } from "./logger.ts";
 import { createStaticHandler, isWebUiBuilt } from "./static.ts";
 import { createWebSocketHub, type ServerEvent, type WebSocketHub } from "./ws.ts";
 import { MCP_HTTP_PATH, createMcpSessionsHandler, type McpSessionsHandler } from "./mcp/transport.ts";
-import { createT1ApiRouter, type ActorResolution } from "./api.ts";
+import { createT1ApiRouter, messageView, type ActorResolution } from "./api.ts";
 import type { WsActorContext } from "./ws.ts";
 import type { Actor } from "./authz/authorize.ts";
 import type { SessionBinding } from "./mcp/core.ts";
@@ -23,7 +23,7 @@ import { createRuntimeObservability } from "./runtime/observability.ts";
 import { createRuntimeSupervisor, type RuntimeSupervisor } from "./runtime/supervisor.ts";
 import { createHostLauncher } from "./runtime/hosts/launcher.ts";
 import type { HostLauncher } from "./runtime/hosts/types.ts";
-import { notifyMessageCommit } from "./runtime/dispatch-events.ts";
+import { notifyMessageCommit, onMessageCommit } from "./runtime/dispatch-events.ts";
 import { createTaskApi } from "./tasks/api.ts";
 import { createMemoryApi } from "./memory/api.ts";
 import { registerMemoryRuntime, closeMemoryRuntime } from "./memory/runtime.ts";
@@ -214,14 +214,14 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     antiLoop: { ...(config.antiLoop ? { config: config.antiLoop } : {}) },
     ...(authorization.resolveMcpActor ? { actorFor: authorization.resolveMcpActor } : {}),
   });
-  // T3：人的消息广播目标。hub 在 httpServer 之后创建，这里用晚绑定回调占位。
-  let broadcastMessage: (message: import("./api.ts").MessageView) => void | Promise<void> = () => {};
+  // hub 在 httpServer 之后创建；HTTP 提交后的通知使用晚绑定回调。
+  let notifyHttpMessage: (message: import("./api.ts").MessageView) => void | Promise<void> = () => {};
   // 权威组织审计由 API 领域服务原子提交；可选 hook 只作提交后观察。
   const t1Api = createT1ApiRouter({
     db: driver, repos,
     logger,
     heartbeat: config.heartbeat,
-    onMessage: (message) => broadcastMessage(message),
+    onMessage: (message) => notifyHttpMessage(message),
     ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}),
     ...(options.orgChangeRecorder ? { orgChangeRecorder: options.orgChangeRecorder } : {}),
   });
@@ -310,11 +310,18 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     ...(authorization.resolveWsActor ? { resolveActor: authorization.resolveWsActor } : {}),
   });
 
-  // T3：把人的消息通过 WebSocket 广播给 WebUI（阶段 1 WebUI = 人，可见全部群组消息）。
-  // 注意：广播范围受本票约束「只推送允许范围内的消息」；目前 WebUI 连接即人的视角，
-  // 单群组内全部消息都在人的可见范围内。MCP agent 的投递不经过 WS（走 wait_for_messages）。
-  broadcastMessage = async (message) => {
-    hub.broadcast({ type: "message", message });
+  // WebUI 是人的视角，实时读取所有来源的已提交消息。MCP core 与 HTTP 都发送
+  // 同一提交通知，因此 Agent 的消息也可见，HTTP 消息不会重复广播。
+  const unsubscribeMessages = onMessageCommit(driver, async (messageId) => {
+    if (!messageId) return;
+    try {
+      const message = await repos.messages.get(messageId);
+      if (message) hub.broadcast({ type: "message", message: await messageView(repos, message) });
+    } catch (error) {
+      log.warn("广播已提交消息失败", { error, messageId });
+    }
+  });
+  notifyHttpMessage = async (message) => {
     await notifyMessageCommit(driver, message.id);
     // T8（#21）修复：人的消息经 HTTP 写入后，唤醒 HTTP 会话中在该群组等待、且被该消息
     // 路由 wake 的 agent。否则 agent 只能等 wait 超时或下次 wait 才拿到积压（定向消息不及时）。
@@ -377,6 +384,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     await runtimeSupervisor.close();
     await mcpHandler.close();
     clearInterval(statusTimer);
+    unsubscribeMessages();
     await hub.close();
     await closeMemoryRuntime(driver);
     await driver.close();
@@ -438,6 +446,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
       clearInterval(statusTimer);
       await runtimeSupervisor.close();
       await mcpHandler.close();
+      unsubscribeMessages();
       await hub.close();
       // 先在途的连接一并断开：Streamable HTTP 的 SSE 响应会持续保持连接，
       // 仅 close() 不会中断它们；closeAllConnections 让进行中的等待随连接结束。

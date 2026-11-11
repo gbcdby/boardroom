@@ -83,13 +83,9 @@ export class SqliteDriver implements DbDriver {
   }
 
   async exec(sql: string, params: readonly unknown[] = []): Promise<number> {
-    return this.serialize(async () => {
-      if (params.length === 0) {
-        this.handle.exec(sql);
-        return 0;
-      }
-      return this.handle.prepare(sql).run(...params).changes;
-    });
+    // DbDriver.exec 是单语句接口：无参数的 DML 也必须返回真实顶层 changes。
+    // prepare 同时在执行前拒绝多语句；迁移仍由 runMigrations 使用原生 exec。
+    return this.serialize(async () => this.handle.prepare(sql).run(...params).changes);
   }
 
   async transaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T> {
@@ -111,13 +107,8 @@ export class SqliteDriver implements DbDriver {
       query: async <R extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []) =>
         enqueue(async () => db.prepare(sql).all(...params) as R[]),
       // 事务内 exec：返回影响行数，与 SQLite `changes` 对齐（#61）。
-      exec: async (sql, params: readonly unknown[] = []) => enqueue(async () => {
-        if (params.length === 0) {
-          db.exec(sql);
-          return 0;
-        }
-        return db.prepare(sql).run(...params).changes;
-      }),
+      exec: async (sql, params: readonly unknown[] = []) =>
+        enqueue(async () => db.prepare(sql).run(...params).changes),
     };
     // 嵌套事务（事务内再开事务，#61）用 SAVEPOINT 实现，回滚时只回到保存点，
     // 不影响外层；非嵌套走阶段 1 的 BEGIN IMMEDIATE 语义。

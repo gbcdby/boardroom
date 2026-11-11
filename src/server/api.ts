@@ -131,6 +131,28 @@ export interface MessageView {
   readonly createdAt: string;
 }
 
+/** HTTP 历史、发送响应与提交后的 WebSocket 广播共用同一视图。 */
+export async function messageView(r: RepositorySet, message: DbMessage, plan?: { wake: readonly string[]; visible: readonly string[] }): Promise<MessageView> {
+  const sender = await r.members.getIncludingRemoved(message.senderMemberId);
+  const resolvedPlan = plan ?? resolveWakeAndVisibility(
+    { senderMemberId: message.senderMemberId, mentionIds: message.mentions, mentionsAll: false },
+    await buildRoster(r, message.groupId),
+  );
+  return {
+    id: message.id,
+    groupId: message.groupId,
+    seq: message.seq,
+    senderMemberId: message.senderMemberId,
+    senderDisplayName: sender?.displayName ?? null,
+    senderRemoved: sender?.removedAt != null,
+    text: message.body,
+    mentions: message.mentions,
+    wakeMemberIds: resolvedPlan.wake,
+    visibleMemberIds: resolvedPlan.visible,
+    createdAt: message.createdAt,
+  };
+}
+
 /** 错误码 → HTTP 状态。与 repository 层错误码一一对应。 */
 const ERROR_STATUS: Record<string, number> = {
   not_found: 404,
@@ -1319,30 +1341,6 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   /** T3：从群组参与者构建路由 roster（在线以 connected MCP 会话为准，人视为在线）。 */
   async function buildRosterFor(r: RepositorySet, groupId: string): Promise<RoutingMember[]> {
     return (await (buildRoster(r, groupId)));
-  }
-
-  /** 消息视图（HTTP/WS 共用）。 */
-  async function messageView(r: RepositorySet, message: DbMessage, plan?: { wake: readonly string[]; visible: readonly string[] }): Promise<MessageView> {
-    const sender = (await (r.members.getIncludingRemoved(message.senderMemberId)));
-    const resolvedPlan =
-      plan ??
-      resolveWakeAndVisibility(
-        { senderMemberId: message.senderMemberId, mentionIds: message.mentions, mentionsAll: false },
-        (await (buildRosterFor(r, message.groupId))),
-      );
-    return {
-      id: message.id,
-      groupId: message.groupId,
-      seq: message.seq,
-      senderMemberId: message.senderMemberId,
-      senderDisplayName: sender?.displayName ?? null,
-      senderRemoved: sender?.removedAt != null,
-      text: message.body,
-      mentions: message.mentions,
-      wakeMemberIds: resolvedPlan.wake,
-      visibleMemberIds: resolvedPlan.visible,
-      createdAt: message.createdAt,
-    };
   }
 
   async function projectView(r: RepositorySet, project: Project) {

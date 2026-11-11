@@ -33,6 +33,27 @@ async function task(repos: RepositorySet, projectId: string, assigneeMemberId: s
 
 for (const engine of ['sqlite', 'postgres'] as const) {
   const gate = { skip: engine === 'postgres' ? pgUnavailable : false };
+  test(`${engine} 已有普通岗位时旧legacy manager不得扩大消息权限，未落位兼容角色仍有效`, gate, async () => memoryFixture(async (repos, db) => {
+    const r = await room(repos, db);
+    try {
+      const root = await repos.org.createNode({ projectId: r.project.id, name: '根', role: 'top_manager' });
+      const ordinary = await repos.org.createNode({ projectId: r.project.id, parentId: root.id, name: '普通岗', role: 'member' });
+      await repos.org.assignNode(r.receiver.id, ordinary.id);
+      // 既有成员仓储仍允许独立修改兼容 role，模拟升级数据/历史调用留下的旧投影；没有篡改 SQL。
+      await repos.members.update(r.receiver.id, { role: 'manager' });
+      const hidden = await repos.messages.create({ groupId: r.group.id, senderMemberId: r.sender.id, body: '真实岗位不应读取的无提及正文' });
+      const scope = { projectId: r.project.id, groupId: r.group.id, memberId: r.receiver.id, membershipRevision: r.receiver.membershipRevision };
+      assert.deepEqual(await repos.messages.listVisibleForMember(scope), []);
+      assert.deepEqual((await r.core.readHistory('receiver', {})).messages, []);
+      assert.equal((await r.core.waitForMessages('receiver', { timeoutMs: 20 })).status, 'timeout');
+      await assert.rejects(r.core.acknowledgeMessage('receiver', hidden.id), { code: 'FORBIDDEN' });
+      assert.equal(await repos.deliveries.get(hidden.id, r.receiver.id), null);
+      await repos.org.assignNode(r.receiver.id, null);
+      await repos.members.update(r.receiver.id, { role: 'manager' });
+      assert.deepEqual((await r.core.readHistory('receiver', {})).messages.map(m => m.id), [hidden.id]);
+      assert.deepEqual((await r.core.waitForMessages('receiver', { timeoutMs: 100 })).messages.map(m => m.id), [hidden.id]);
+    } finally { await r.core.close(); }
+  }, engine));
   test(`${engine} 不可见大前缀与已ACK消息在数据库内过滤，原始seq及真实投递事实不丢失`, gate, async () => memoryFixture(async (repos, db) => {
     const r = await room(repos, db);
     const hiddenBody = '不可见历史正文🙂'.repeat(256), at = new Date().toISOString();
@@ -152,24 +173,43 @@ for (const engine of ['sqlite', 'postgres'] as const) {
       assert.deepEqual((await repos.messages.listVisibleForMember({ ...scope, membershipRevision: current.membershipRevision })).map(m => m.id), [own.id]);
     } finally { await r.core.close(); }
   }, engine));
-  test(`${engine} 可见积压全部保留；历史SQL分页只按既有limit收窄并保留raw seq`, gate, async () => memoryFixture(async (repos, db) => {
+  test(`${engine} 129条可见积压全部保留；历史SQL分页只按既有limit收窄并保留raw seq`, gate, async t => memoryFixture(async (repos, db) => {
     const r = await room(repos, db);
+    async function measuredWait(label: string, afterCursor?: string) {
+      const query = repos.context.query, one = repos.context.one;
+      let sql = 0, messageBodyRows = 0;
+      const observe = (rows: DbRow[]) => { for (const row of rows) if ('body' in row && 'mentions' in row) messageBodyRows++; };
+      repos.context.query = async <T extends DbRow = DbRow>(statement: string, params?: readonly unknown[]) => {
+        sql++; const rows = await query<T>(statement, params); observe(rows); return rows;
+      };
+      repos.context.one = async <T extends DbRow = DbRow>(statement: string, params?: readonly unknown[]) => {
+        sql++; const row = await one<T>(statement, params); if (row) observe([row]); return row;
+      };
+      const started = performance.now();
+      try {
+        const result = await r.core.waitForMessages('receiver', { timeoutMs: 100, ...(afterCursor ? { afterCursor } : {}) });
+        const elapsedMs = performance.now() - started;
+        t.diagnostic(JSON.stringify({ label, messages: result.messages.length, elapsedMs, sql, messageBodyRows }));
+        assert.ok(elapsedMs < 2000, `${label} 完整积压读取耗时 ${elapsedMs}ms`);
+        return result;
+      } finally { repos.context.query = query; repos.context.one = one; }
+    }
     try {
       const all = [];
       const invisible = await repos.messages.create({ groupId: r.group.id, senderMemberId: r.sender.id, body: '不改变历史beforeCursor含义' });
-      for (let i = 0; i < 65; i++) all.push(await repos.messages.create({ groupId: r.group.id, senderMemberId: r.sender.id, body: `积压 ${i}`, mentions: [r.receiver.id] }));
+      for (let i = 0; i < 129; i++) all.push(await repos.messages.create({ groupId: r.group.id, senderMemberId: r.sender.id, body: `积压 ${i}`, mentions: [r.receiver.id] }));
       const first = await r.core.readHistory('receiver', { limit: 7 });
-      assert.deepEqual(first.messages.map(m => m.id), all.slice(-7).map(m => m.id)); assert.equal(first.hasMore, true); assert.equal(first.cursor, 'c_66');
+      assert.deepEqual(first.messages.map(m => m.id), all.slice(-7).map(m => m.id)); assert.equal(first.hasMore, true); assert.equal(first.cursor, 'c_130');
       const preceding = await r.core.readHistory('receiver', { limit: 7, beforeCursor: `c_${all.at(-7)!.seq}` });
       assert.deepEqual(preceding.messages.map(m => m.id), all.slice(-14, -7).map(m => m.id));
       assert.deepEqual(await r.core.readHistory('receiver', { limit: 7, beforeCursor: `c_${invisible.seq}` }), first);
       assert.deepEqual(await r.core.readHistory('receiver', { limit: 7, beforeCursor: 'c_999999' }), first);
-      const backlog = await r.core.waitForMessages('receiver', { timeoutMs: 100 });
+      const backlog = await measuredWait('首次129条积压');
       assert.deepEqual(backlog.messages.map(m => m.id), all.map(m => m.id), '没有引入32/50条内部截断');
       await r.core.acknowledgeMessage('receiver', all[0]!.id);
-      const partial = await r.core.waitForMessages('receiver', { timeoutMs: 100, afterCursor: `c_${all[59]!.seq}` });
+      const partial = await measuredWait('显式游标后69条', `c_${all[59]!.seq}`);
       assert.deepEqual(partial.messages.map(m => m.id), all.slice(60).map(m => m.id));
-      const again = await r.core.waitForMessages('receiver', { timeoutMs: 100 });
+      const again = await measuredWait('未ACK的128条重投');
       assert.deepEqual(again.messages.map(m => m.id), all.slice(1).map(m => m.id), '显式游标不把较早的未ACK积压静默标记已读');
     } finally { await r.core.close(); }
   }, engine));

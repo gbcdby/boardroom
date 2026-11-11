@@ -28,6 +28,44 @@ async function withDb(engine: "sqlite" | "postgres", body: (repos: RepositorySet
 }
 for (const engine of ["sqlite", "postgres"] as const) {
   const skip = engine === "postgres" && !pgUrl ? "未配置真实 PostgreSQL；交 CI 执行" : false;
+  test(`${engine} R-P5-C-REQ-005：恢复节点与子边合并后再查环，损坏快照零写入`, { skip }, async () => withDb(engine, async (repos, db) => {
+    const service = createOrgMutationService({ repos }), compensation = createAuditCompensationService({ repos });
+    for (const mode of ['child', 'descendant', 'child-root'] as const) {
+      const p = await repos.projects.create({ name: `完整恢复图 ${mode}` });
+      const root = await repos.org.createNode({ projectId: p.id, name: '根', role: 'top_manager' });
+      const node = await repos.org.createNode({ projectId: p.id, parentId: root.id, name: '被删团队', role: 'sub_manager' });
+      const child = await repos.org.createNode({ projectId: p.id, parentId: node.id, name: '直属孩子', role: 'member' });
+      const descendant = await repos.org.createNode({ projectId: p.id, parentId: child.id, name: '更深后代', role: 'member' });
+      const occupant = await repos.members.create({ projectId: p.id, kind: 'human', displayName: '原占岗人' });
+      await repos.org.assignNode(occupant.id, node.id);
+      const removed = await service.deleteNode(access, p.id, node.id);
+      const audit = (await repos.audit.get(p.id, removed.auditId))!;
+      const before = JSON.parse(audit.before!);
+      if (mode === 'child-root') {
+        before.childEdges[0].parentId = null;
+        before.directChildIds = [];
+      } else before.node.parentId = mode === 'child' ? child.id : descendant.id;
+      await db.exec('UPDATE audit_log SET before = ? WHERE id = ?', [JSON.stringify(before), audit.id]);
+      const nodesBefore = await db.query('SELECT * FROM org_nodes WHERE project_id = ? ORDER BY id', [p.id]);
+      const memberBefore = await repos.members.get(occupant.id);
+      const auditsBefore = await repos.audit.list(p.id);
+      let businessWrites = 0;
+      const exec = repos.context.exec;
+      repos.context.exec = async (sql, params) => {
+        if (/^\s*(INSERT|UPDATE|DELETE)/i.test(sql) && !/^\s*UPDATE \w+ SET updated_at = updated_at/i.test(sql)) businessWrites++;
+        return exec(sql, params);
+      };
+      try { await assert.rejects(compensation.revoke(access, p.id, audit.id), { code: 'compensation_conflict' }); }
+      finally { repos.context.exec = exec; }
+      assert.equal(businessWrites, 0, '完整图校验在任何业务 DML 之前失败');
+      assert.deepEqual(await db.query('SELECT * FROM org_nodes WHERE project_id = ? ORDER BY id', [p.id]), nodesBefore);
+      assert.deepEqual(await repos.members.get(occupant.id), memberBefore);
+      assert.deepEqual(await repos.audit.list(p.id), auditsBefore);
+      assert.equal(await repos.org.getNode(node.id), null);
+      assert.equal((await repos.org.getNode(child.id))!.parentId, root.id);
+      assert.equal((await repos.org.getNode(descendant.id))!.parentId, child.id);
+    }
+  }));
   test(`${engine} R-P5-C-REQ-001：岗位图绑定占岗成员代际，移除后重新加入或恢复不能继承旧岗位`, { skip }, async () => withDb(engine, async repos => {
     const service = createOrgMutationService({ repos }), compensation = createAuditCompensationService({ repos });
     for (const mode of ['readd', 'undo-remove'] as const) {

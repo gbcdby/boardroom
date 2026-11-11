@@ -16,10 +16,14 @@ import type { TaskState, ReviewRoundState } from "../../shared/tasks.ts";
 type TaskProjection = MemberRelationsSnapshotV2["tasks"][number];
 type RoundProjection = MemberRelationsSnapshotV2["invalidatedRounds"][number];
 type IdRow = { id: string };
-type TaskRow = { id: string; revision: number; assignee_member_id: string | null; reviewer_member_id: string | null; state: TaskState; blocked_reason: string | null; current_review_round_id: string | null };
+type TaskMetadataRow = { id: string; revision: number; assignee_member_id: string | null; reviewer_member_id: string | null; state: TaskState; current_review_round_id: string | null };
+type TaskRow = TaskMetadataRow & { blocked_reason: string | null };
 type RoundRow = { id: string; task_id: string; revision: number; state: ReviewRoundState };
 const prefix = (column: string, bytes = 1024) => `substr(${column}, 1, ${bytes + 1}) AS ${column.split('.').at(-1)}`;
-const taskColumns = `${prefix('id')}, revision, ${prefix('assignee_member_id')}, ${prefix('reviewer_member_id')}, state, ${prefix('blocked_reason', 8192)}, ${prefix('current_review_round_id')}`;
+// JSON 对控制字符最多扩成6字节。4个1025字符ID的元数据行<25KiB；
+// id + 8193字符文本独立行<56KiB。合并投影在坏输入下可超过64KiB，不能用作分页上界。
+const taskColumns = `${prefix('id')}, revision, ${prefix('assignee_member_id')}, ${prefix('reviewer_member_id')}, state, ${prefix('current_review_round_id')}`;
+const taskTextColumns = `${prefix('id')}, ${prefix('blocked_reason', 8192)}`;
 const roundColumns = `${prefix('id')}, ${prefix('task_id')}, revision, state`;
 function id(value: unknown): string { return boundedText(value)!; }
 function nullable(value: unknown): string | null { return boundedText(value, 1024, true); }
@@ -49,22 +53,26 @@ async function pages<T extends DbRow>(ctx: RepoCtx, budget: CaptureBudget, colum
   }
   return result;
 }
-async function byIds<T extends DbRow>(ctx: RepoCtx, columns: string, table: string, projectId: string, values: readonly string[]): Promise<T[]> {
+async function byIds<T extends DbRow>(ctx: RepoCtx, budget: CaptureBudget, columns: string, table: string, projectId: string, values: readonly string[]): Promise<T[]> {
   const ids = uniqueIds(values); const rows: T[] = [];
-  for (let start = 0; start < ids.length; start += 32) {
-    const batch = ids.slice(start, start + 32);
+  for (let start = 0; start < ids.length;) {
+    const batch = ids.slice(start, start + budget.pageSize());
     const found = await ctx.query<T>(`SELECT ${columns} FROM ${table} WHERE project_id = ? AND id IN (${batch.map(() => '?').join(',')}) ORDER BY id`, [projectId, ...batch]);
     if (found.length !== batch.length) conflict("被观察关系已删除或不属于项目。"); rows.push(...found);
+    start += batch.length;
   }
   return rows;
 }
 export async function readLifecycleMember(ctx: RepoCtx, memberId: string): Promise<Member | null> {
   const row = await ctx.one<Record<string, unknown>>(`SELECT ${['id', 'project_id', 'agent_id', 'node_id', 'removed_at', 'created_at', 'updated_at'].map(c => prefix(c)).join(',')},
-    ${prefix('display_name', 8192)}, kind, role, status, membership_revision FROM members WHERE id = ?`, [memberId]);
+    kind, role, status, membership_revision FROM members WHERE id = ?`, [memberId]);
   if (!row) return null;
+  // 7个1025字符字段的元数据<44KiB，名字独立投影<50KiB；原8192字节契约不缩小。
+  const name = await ctx.one<{ display_name: string }>(`SELECT ${prefix('display_name', 8192)} FROM members WHERE id = ?`, [memberId]);
+  if (!name) conflict("读取有界成员投影期间成员已变化。");
   if (!['human', 'agent'].includes(String(row.kind)) || !['manager', 'normal'].includes(String(row.role)) || !['active', 'disabled', 'pending'].includes(String(row.status))) conflict("成员字段损坏。");
   return { id: id(row.id), projectId: id(row.project_id), agentId: nullable(row.agent_id), nodeId: nullable(row.node_id), removedAt: nullable(row.removed_at),
-    displayName: boundedText(row.display_name, 8192)!, kind: row.kind as Member['kind'], role: row.role as Member['role'], status: row.status as Member['status'],
+    displayName: boundedText(name.display_name, 8192)!, kind: row.kind as Member['kind'], role: row.role as Member['role'], status: row.status as Member['status'],
     membershipRevision: safeRevision(row.membership_revision), createdAt: id(row.created_at), updatedAt: id(row.updated_at) };
 }
 export interface MemberWatch { watchedTaskIds: string[]; watchedRoundIds: string[]; watchSettings: boolean }
@@ -97,18 +105,20 @@ export async function captureMember(repos: RepositorySet, input: MemberCaptureIn
   if (member.projectId !== projectId) conflict("成员身份跨项目。");
   const participants = (await pages<{ group_id: string; joined_at: string }>(ctx, tracker, `${prefix('group_id')}, ${prefix('joined_at')}`, 'group_participants', 'member_id = ?', [memberId], 'group_id', 128))
     .map(row => ({ groupId: id(row.group_id), joinedAt: id(row.joined_at) }));
-  const taskRows: TaskRow[] = [];
-  for (const field of ['assignee_member_id', 'reviewer_member_id']) taskRows.push(...await pages<TaskRow>(ctx, tracker, taskColumns, 'tasks', `project_id = ? AND ${field} = ?`, [projectId, memberId]));
-  const tasksById = new Map(taskRows.map(r => [id(r.id), taskProjection(r)]));
-  for (const row of await byIds<TaskRow>(ctx, taskColumns, 'tasks', projectId, input.watchedTaskIds)) tasksById.set(id(row.id), taskProjection(row));
+  const taskRows: TaskMetadataRow[] = [];
+  for (const field of ['assignee_member_id', 'reviewer_member_id']) taskRows.push(...await pages<TaskMetadataRow>(ctx, tracker, taskColumns, 'tasks', `project_id = ? AND ${field} = ?`, [projectId, memberId]));
+  taskRows.push(...await byIds<TaskMetadataRow>(ctx, tracker, taskColumns, 'tasks', projectId, input.watchedTaskIds));
   // 当前评审可能只保留 reviewer 快照；每类 state 使用独立 seek，绝不扫描历史已终态轮次。
   const currentRounds: RoundRow[] = [];
   for (const state of ['ready', 'running', 'reported']) currentRounds.push(...await pages<RoundRow>(ctx, tracker, roundColumns, 'task_review_rounds', 'project_id = ? AND reviewer_member_id = ? AND state = ?', [projectId, memberId, state]));
   uniqueIds(currentRounds.map(r => id(r.id)));
-  for (const row of await byIds<TaskRow>(ctx, taskColumns, 'tasks', projectId, currentRounds.map(r => id(r.task_id)))) tasksById.set(id(row.id), taskProjection(row));
+  taskRows.push(...await byIds<TaskMetadataRow>(ctx, tracker, taskColumns, 'tasks', projectId, currentRounds.map(r => id(r.task_id))));
+  const reasons = new Map((await byIds<{ id: string; blocked_reason: string | null }>(ctx, tracker,
+    taskTextColumns, 'tasks', projectId, taskRows.map(r => id(r.id)))).map(r => [id(r.id), r.blocked_reason]));
+  const tasksById = new Map(taskRows.map(r => [id(r.id), taskProjection({ ...r, blocked_reason: reasons.get(id(r.id))! })]));
   const currentIds = new Set([...tasksById.values()].map(t => t.currentReviewRoundId).filter((v): v is string => v !== null));
   const roundIds = uniqueIds([...input.watchedRoundIds, ...currentIds]);
-  const rounds = (await byIds<RoundRow>(ctx, roundColumns, 'task_review_rounds', projectId, roundIds)).map(roundProjection);
+  const rounds = (await byIds<RoundRow>(ctx, tracker, roundColumns, 'task_review_rounds', projectId, roundIds)).map(roundProjection);
   const tasks = sorted([...tasksById.values()], t => t.taskId); uniqueIds(tasks.map(t => t.taskId));
   // 有旧非当前 ready 行时不把无关 task 混入补偿目标；它已被计入有界读取预算。
   const actualTasks = tasks.filter(t => input.watchedTaskIds.includes(t.taskId) || t.assigneeMemberId === memberId || t.reviewerMemberId === memberId || currentRounds.some(r => r.id === t.currentReviewRoundId));
@@ -153,11 +163,11 @@ export function discoverMemberRelations(projectId: string, memberId: string, wat
     const refs: Array<{ id: string; assignee_member_id: string | null; reviewer_member_id: string | null }> = [];
     for (const field of ['assignee_member_id', 'reviewer_member_id']) refs.push(...await pages<{ id: string; assignee_member_id: string | null; reviewer_member_id: string | null }>(tx, tracker,
       columns, 'tasks', `project_id = ? AND ${field} = ?`, [projectId, memberId]));
-    refs.push(...await byIds<{ id: string; assignee_member_id: string | null; reviewer_member_id: string | null }>(tx, `${prefix('id')}, ${prefix('assignee_member_id')}, ${prefix('reviewer_member_id')}`, 'tasks', projectId, watch.watchedTaskIds));
+    refs.push(...await byIds<{ id: string; assignee_member_id: string | null; reviewer_member_id: string | null }>(tx, tracker, `${prefix('id')}, ${prefix('assignee_member_id')}, ${prefix('reviewer_member_id')}`, 'tasks', projectId, watch.watchedTaskIds));
     const rounds: Array<{ id: string; task_id: string }> = [];
     for (const state of ['ready', 'running', 'reported']) rounds.push(...await pages<{ id: string; task_id: string }>(tx, tracker,
       `${prefix('id')}, ${prefix('task_id')}`, 'task_review_rounds', 'project_id = ? AND reviewer_member_id = ? AND state = ?', [projectId, memberId, state]));
-    refs.push(...await byIds<{ id: string; assignee_member_id: string | null; reviewer_member_id: string | null }>(tx, columns, 'tasks', projectId, rounds.map(r => id(r.task_id))));
+    refs.push(...await byIds<{ id: string; assignee_member_id: string | null; reviewer_member_id: string | null }>(tx, tracker, columns, 'tasks', projectId, rounds.map(r => id(r.task_id))));
     const groups = await pages<{ group_id: string }>(tx, tracker, prefix('group_id'), 'group_participants', 'member_id = ?', [memberId], 'group_id', 128);
     const bindings = await pages<{ id: string; runtime_id: string; group_id: string }>(tx, tracker, `${prefix('id')}, ${prefix('runtime_id')}, ${prefix('group_id')}`, 'agent_runtime_bindings', 'project_id = ? AND member_id = ?', [projectId, memberId]);
     const events = await pages<{ id: string; recipient_member_id: string; context_group_id: string | null }>(tx, tracker, `${prefix('id')}, ${prefix('recipient_member_id')}, ${prefix('context_group_id')}`, 'work_events', 'project_id = ? AND recipient_member_id = ?', [projectId, memberId]);

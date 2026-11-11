@@ -3,8 +3,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createLogger } from "../src/server/logger.ts";
 import { startServer, type RunningServer } from "../src/server/server.ts";
+import type { MessageView } from "../src/server/api.ts";
 import type { ServerEvent } from "../src/server/ws.ts";
 
 const silentLogger = createLogger({ level: "error", write: () => {} });
@@ -165,5 +168,64 @@ test("WebSocket 实时收到 message 事件，顺序与持久化一致", async (
     socket.close();
     assert.deepEqual(received.map((m) => m.text), ["A", "B", "C"]);
     assert.deepEqual(received.map((m) => m.seq), [1, 2, 3], "WS 顺序应与持久化 seq 一致");
+  });
+});
+
+test("MCP 与 HTTP 已提交消息共用 WebSocket 视图，幂等重试不重复广播", { timeout: 10_000 }, async () => {
+  await withServer(async (server) => {
+    const { project, alice, group } = await seed(server);
+    const transport = new StreamableHTTPClientTransport(new URL(server.mcpUrl));
+    const client = new Client({ name: "webui-message-regression", version: "1.0.0" });
+    const socket = new WebSocket(server.wsUrl);
+    const received: MessageView[] = [];
+    let resolveReady!: () => void;
+    let resolveDrained!: () => void;
+    const ready = new Promise<void>(resolve => { resolveReady = resolve; });
+    const drained = new Promise<void>(resolve => { resolveDrained = resolve; });
+    socket.addEventListener("message", (event) => {
+      const frame = JSON.parse(String(event.data)) as ServerEvent;
+      if (frame.type === "welcome") resolveReady();
+      if (frame.type === "message") received.push(frame.message);
+      if (frame.type === "pong" && frame.sentAt === "after-all-commits") resolveDrained();
+    });
+    const tool = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      assert.notEqual(result.isError, true, JSON.stringify(result));
+      const part = (result.content as Array<{ type: string; text?: string }>).find(item => item.type === "text");
+      assert.ok(part?.text);
+      const payload = JSON.parse(part.text) as Record<string, unknown>;
+      assert.equal(payload.ok, true, JSON.stringify(payload));
+      return payload;
+    };
+    try {
+      await client.connect(transport as unknown as Parameters<typeof client.connect>[0]);
+      await ready;
+      const joined = await tool("join", { displayName: "实时 Agent", hostType: "other", projectId: project.id, groupId: group.id });
+      const first = await tool("send_message", { text: "Agent 第一条", mentions: [alice.id], clientMessageId: "ws-once" });
+      const duplicate = await tool("send_message", { text: "Agent 第一条", mentions: [alice.id], clientMessageId: "ws-once" });
+      assert.equal(duplicate.duplicate, true);
+      assert.equal(duplicate.messageId, first.messageId);
+      const human = await post(server, `/api/groups/${group.id}/messages`, { senderMemberId: alice.id, text: "人回复" });
+      assert.equal(human.status, 201);
+      await tool("send_message", { text: "Agent 第二条", clientMessageId: "ws-next" });
+
+      // 所有发送都已返回；同一连接的 pong 是前序广播帧已排出的确定性屏障。
+      socket.send(JSON.stringify({ type: "ping", sentAt: "after-all-commits" }));
+      await drained;
+      const response = await fetch(`${server.url}/api/groups/${group.id}/messages`);
+      const history = await response.json() as { messages: MessageView[] };
+      assert.deepEqual(received.map(message => message.text), ["Agent 第一条", "人回复", "Agent 第二条"]);
+      assert.deepEqual(received.map(message => message.seq), [1, 2, 3]);
+      assert.deepEqual(received, history.messages, "实时与刷新读取使用同一持久化消息视图");
+      assert.equal(received[0]!.senderMemberId, joined.memberId);
+      assert.equal(received[0]!.senderDisplayName, "实时 Agent");
+      assert.equal(received[0]!.senderRemoved, false);
+      assert.deepEqual(received[0]!.mentions, [alice.id]);
+      assert.deepEqual(received[1], human.body.message, "HTTP 消息也只广播一次");
+    } finally {
+      socket.close();
+      await client.close();
+      await transport.terminateSession().catch(() => {});
+    }
   });
 });

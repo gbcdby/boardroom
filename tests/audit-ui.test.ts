@@ -97,3 +97,29 @@ test("旧项目列表延迟失败不能污染新项目，也不能提前清除�
     assert.equal(byTestId(container, "audit-refresh").props.disabled, false);
   }, { path: "/projects/project-1/audit" });
 });
+
+test("离开再返回同一项目，旧成功响应不能结束新撤销或显示成功提示", async () => {
+  const other = { ...project, id: "project-2", name: "另一个项目" };
+  const first = deferred<Response>(), second = deferred<Response>();
+  let posts = 0;
+  await withPage("AuditView", (url, init) => {
+    if (url.startsWith("/api/projects?")) return json({ projects: [project, other] });
+    if (init?.method === "POST") return ++posts === 1 ? first.promise : second.promise;
+    return json({ entries: url.includes(project.id) ? [entry] : [] });
+  }, async (container, { store }) => {
+    const oldOperation = byTestId(container, "audit-revoke").props.onClick(); await settle();
+    await store.selectProject(other.id); await settle();
+    await store.selectProject(project.id); await settle();
+    const newOperation = byTestId(container, "audit-revoke").props.onClick(); await settle();
+    assert.equal(posts, 2);
+    first.resolve(json({ entry: { ...entry, action: "member.revoke" } }));
+    await oldOperation; await settle();
+    assert.equal(find(container, node => node.props["data-testid"] === "audit-notice"), undefined);
+    assert.equal(byTestId(container, "audit-revoke").props.disabled, true);
+    second.resolve(json({ error: { code: "compensation_conflict", message: "新请求发现冲突" } }, 409));
+    await newOperation; await settle();
+    assert.match(textOf(byTestId(container, "audit-error")), /当前状态已经变化/);
+    assert.equal(find(container, node => node.props["data-testid"] === "audit-notice"), undefined);
+    assert.equal(byTestId(container, "audit-revoke").props.disabled, false);
+  }, { path: "/projects/project-1/audit" });
+});
