@@ -49,6 +49,36 @@ def layout(page, label, strict=True):
         assert max(dimensions["document"], dimensions["body"]) <= dimensions["viewport"] + 1, f"{label}: 整页溢出 {dimensions}"
     return {"view": label, **dimensions}
 
+def check_confirmation_layout(page, kind, label, width, height, report, require_overflow=False):
+    dialog = page.get_by_test_id("confirmation-dialog")
+    body = dialog.locator(".confirm-dialog-body")
+    impact = page.get_by_test_id(f"{kind}-purge-confirm")
+    body.evaluate("el => { el.scrollTop = 0; }")
+    measure = "el => ({ scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth })"
+    before = body.evaluate(measure)
+    rect = dialog.bounding_box()
+    geometry = {"view": label, "width": width, "height": height, "requireOverflow": require_overflow,
+        "dialog": rect, "body": body.bounding_box(), "before": before}
+    report.setdefault("confirmationLayouts", []).append(geometry)
+    assert rect and rect["x"] >= 0 and rect["y"] >= 0 and rect["x"] + rect["width"] <= width + 1 and rect["y"] + rect["height"] <= height + 1, f"弹窗超出视口: {geometry}"
+    assert before["scrollWidth"] <= before["clientWidth"] + 1, f"影响清单横向溢出: {geometry}"
+    expect(impact.locator("li").first).to_be_in_viewport(ratio=1)
+    if require_overflow:
+        assert before["scrollHeight"] > before["clientHeight"], f"受限高度场景必须产生正文溢出: {geometry}"
+    body.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    after = body.evaluate(measure)
+    geometry["after"] = after
+    if before["scrollHeight"] > before["clientHeight"]:
+        assert after["scrollTop"] > before["scrollTop"], f"溢出正文未实际滚动: {geometry}"
+        assert after["scrollTop"] >= after["scrollHeight"] - after["clientHeight"] - 1, f"未滚动到正文末尾: {geometry}"
+    expect(impact.locator("p").filter(has_text="全局托管配置")).to_be_in_viewport(ratio=1)
+    expect(impact.locator("p").last).to_be_in_viewport(ratio=1)
+    for action in ("cancel", "confirm"):
+        button = page.get_by_test_id(f"{action}-purge-{kind}")
+        expect(button).to_be_in_viewport(ratio=1)
+        expect(button).to_be_enabled()
+        button.click(trial=True)  # 检查真实命中与可操作性，不执行取消或删除。
+
 def confirmation_flows(page, origin, project_id, org_project_id, output, report):
     """真实操作与数据结果；仅对拒绝/响应丢失场景注入传输故障。"""
     observed = []
@@ -255,21 +285,13 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     purge_project.click()
     expect(page.get_by_test_id("project-purge-confirm")).to_contain_text("组织岗位")
     expect(page.get_by_test_id("confirm-purge-project")).to_be_enabled()
-    for width, height in [(1440, 1000), (390, 844)]:
+    for width, height in [(1440, 1000), (390, 844), (390, 560)]:
         page.set_viewport_size({"width": width, "height": height})
-        dialog = page.get_by_test_id("confirmation-dialog")
-        body = dialog.locator(".confirm-dialog-body")
-        if width == 390:
-            assert body.evaluate("el => el.scrollHeight > el.clientHeight"), "窄窗长清单应在正文内滚动"
-            body.evaluate("el => { el.scrollTop = el.scrollHeight; }")
-        rect = dialog.bounding_box()
-        assert rect and rect["x"] >= 0 and rect["y"] >= 0 and rect["x"] + rect["width"] <= width + 1 and rect["y"] + rect["height"] <= height + 1
-        expect(page.get_by_test_id("confirm-purge-project")).to_be_in_viewport()
-        expect(page.get_by_test_id("cancel-purge-project")).to_be_in_viewport()
-        filename = f"confirmation-project-purge-{width}-light.png"
+        check_confirmation_layout(page, "project", f"confirmation-{width}x{height}", width, height, report, require_overflow=height == 560)
+        filename = f"confirmation-project-purge-{width}x{height}-light.png"
         page.screenshot(path=str(output / filename), animations="disabled")
         report["screenshots"].append(filename)
-        report["layouts"].append(layout(page, f"confirmation-{width}"))
+        report["layouts"].append(layout(page, f"confirmation-{width}x{height}"))
     cancel_with_keyboard(purge_project, "cancel-purge-project")
     assert not committed_purges(project_path)
     assert any(item["id"] == project_id for item in request(page, origin, "GET", "/api/projects?includeArchived=true")["projects"])
@@ -281,7 +303,7 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     assert len(committed_purges(project_path)) == 1
     assert not any(item["id"] == project_id for item in request(page, origin, "GET", "/api/projects?includeArchived=true")["projects"])
     toast("项目「浏览器操作创建的项目」已永久删除。")
-    report["checks"].append("S6-AC01/03/04/05: 项目归档/恢复与只读保护，purge长清单390/1440截图、取消与单次确认，目标消失后标题还焦及全局Toast")
+    report["checks"].append("S6-AC01/03/04/05: 项目归档/恢复与只读保护，purge清单1440x1000/390x844可达及390x560正文实际滚动、末尾保留说明与按钮可操作，取消与单次确认，目标消失后标题还焦及全局Toast")
 
     org = request(page, origin, "GET", f"/api/projects/{org_project_id}/org")
     target = next(node for node in org["nodes"] if node["name"] == "产品设计")
@@ -396,25 +418,16 @@ def purge_runtime_impact_flows(page, origin, workdir, output, report):
         return impact
 
     def capture_impact(kind, phase, cascade):
-        for width, height in [(1440, 1000), (390, 844)]:
+        for width, height in [(1440, 1000), (390, 844), (390, 560)]:
             page.set_viewport_size({"width": width, "height": height})
             impact = visible_impact(kind, cascade)
-            dialog = page.get_by_test_id("confirmation-dialog")
-            body = dialog.locator(".confirm-dialog-body")
-            body.evaluate("el => { el.scrollTop = el.scrollHeight; }")
-            assert body.evaluate("el => el.scrollWidth <= el.clientWidth + 1"), "托管影响清单不能横向溢出"
-            if kind == "project" and width == 390:
-                assert body.evaluate("el => el.scrollHeight > el.clientHeight"), "窄屏完整项目清单应可滚动"
-            rect = dialog.bounding_box()
-            assert rect and rect["x"] >= 0 and rect["y"] >= 0 and rect["x"] + rect["width"] <= width + 1 and rect["y"] + rect["height"] <= height + 1
+            check_confirmation_layout(page, kind, f"purge-runtime-{kind}-{phase}-{width}x{height}", width, height, report, require_overflow=kind == "project" and height == 560)
             for field, label in runtime_labels.items():
                 expect(impact.get_by_text(f"{label}：{cascade[field]} 条", exact=True)).to_be_in_viewport()
-            expect(page.get_by_test_id(f"cancel-purge-{kind}")).to_be_in_viewport()
-            expect(page.get_by_test_id(f"confirm-purge-{kind}")).to_be_in_viewport()
-            filename = f"purge-runtime-{kind}-{phase}-{width}-light.png"
+            filename = f"purge-runtime-{kind}-{phase}-{width}x{height}-light.png"
             page.screenshot(path=str(output / filename), animations="disabled")
             report["screenshots"].append(filename)
-            report["layouts"].append(layout(page, f"purge-runtime-{kind}-{phase}-{width}"))
+            report["layouts"].append(layout(page, f"purge-runtime-{kind}-{phase}-{width}x{height}"))
         page.set_viewport_size({"width": 1440, "height": 1000})
 
     page.goto(origin + f"/projects/{project_id}/overview")
