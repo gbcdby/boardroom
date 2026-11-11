@@ -14,6 +14,7 @@
 | --- | --- | --- |
 | Agent vs Member | Agent 是跨项目的全局身份；Member 是 agent 或人在某个项目中的成员关系与岗位。 | `docs/architecture/agent-studio.md` §4.1 |
 | 项目配置版本 vs 工作区版本 | v15 的 `expectedProjectRevision` 比较项目名称/归档/工作区配置的真实版本，`workspaceRevision` 只标识追加的工作区快照；锁、消息与心跳不推进前者。重放旧 mutation 返回旧固定结果，不重新应用旧目录，须 GET 才取得当前状态。 | 2026-11-11 #135；`docs/project-workspaces.md`、`tests/workspace-service.test.ts` |
+| 策略配置版本 vs 执行授权 | #151 的 v17 候选以 DB head + 不可变版本为唯一策略权威；可信启动原子初始化默认与 system/user-scope 审计，GET 不 seed。项目保存核对 expectedGlobalRevision；全局更新须核对所有项目覆盖（含 archived），不兼容整次拒绝。配置/预览始终 observation/not-issued，不创建执行授权。 | 2026-11-11；`docs/policy-kernel.md`、`tests/policy-config*.test.ts`，当前实现候选，PG/独立审查/CI 按 #151 单列 |
 | Project vs Group | Project 是协作容器（成员、组织树、任务板、记忆）；Group 是项目内的聊天空间，参与者是项目成员子集。 | 同上 |
 | Status vs 任务状态 | Status 是成员的在线/离线、等待/工作中的运行状态；任务状态属于 Task，两者分开建模。 | 同上 |
 | Agent 连接状态 vs Status | Agent 连接状态是全局 MCP 会话状态（connected/disconnected、最后心跳）；Status 是项目成员的 online/offline/waiting/working，按 `(project_id, member_id)` 记录。 | 决策票 #4（D1，2026-10-18） |

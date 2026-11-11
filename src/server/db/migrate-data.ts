@@ -34,6 +34,7 @@ import { memoryMigration } from "./migrations/memory.ts";
 import { memberLifecycleMigration } from "./migrations/member-lifecycle.ts";
 import { identityCatalogMigration } from "./migrations/identity-catalog.ts";
 import { projectWorkspacesMigration } from "./migrations/project-workspaces.ts";
+import { policyConfigurationMigration } from "./migrations/policy-configuration.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -72,6 +73,9 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
     ) SELECT v.* FROM role_template_versions v JOIN version_depth d
       ON v.role_template_id = d.role_template_id AND v.revision = d.revision ORDER BY d.depth, v.role_template_id, v.revision` },
   { name: "projects", keyColumns: ["id"], valueColumns: ["project_revision", "workspace_revision"] },
+  { name: "policy_documents", keyColumns: ["scope_key"], valueColumns: ["scope", "project_id", "revision", "created_at", "updated_at"] },
+  { name: "policy_document_versions", keyColumns: ["document_id", "revision"], valueColumns: ["schema_version", "document_json", "content_digest",
+    "based_on_global_revision", "default_revision", "created_by_kind", "created_by_id", "created_at"] },
   { name: "project_workspace_versions", keyColumns: ["project_id", "workspace_revision"], valueColumns: ["project_revision",
     "root_path", "canonical_root", "mode", "root_identity_json", "physical_resource_key", "repository_info_json", "observed_at",
     "mutation_id", "input_digest", "updated_at"] },
@@ -341,6 +345,7 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   memberLifecycleMigration,
   identityCatalogMigration,
   projectWorkspacesMigration,
+  policyConfigurationMigration,
 ];
 
 // ---------------------------------------------------------------------------

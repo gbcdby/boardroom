@@ -16,6 +16,8 @@ import { ConfigError, loadConfig } from "../config.ts";
 import { databaseDriverOptions, databaseForConnectedReader } from "../environment.ts";
 import { createDbDriver } from "../db/driver.ts";
 import { migrations } from "../db/migrations/index.ts";
+import { createRepositories } from "../db/repositories.ts";
+import { initializePolicyConfiguration } from "../policy/configuration.ts";
 import { createLogger } from "../logger.ts";
 import { createMcpCore } from "./core.ts";
 import { createMcpServer } from "./server.ts";
@@ -37,6 +39,7 @@ async function main(): Promise<void> {
   await driver.connect();
   try {
     await driver.migrate(migrations);
+    await initializePolicyConfiguration(createRepositories(driver));
     registerMemoryRuntime(driver, {
       database: databaseForConnectedReader(environment.databaseDescriptor),
       ...(config.memory ? { config: config.memory } : {}),

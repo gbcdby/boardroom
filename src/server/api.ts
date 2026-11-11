@@ -22,6 +22,7 @@ import { resetGroupConsecutiveCount } from "./mcp/core.ts";
 import { createTaskService } from "./tasks/service.ts";
 import { createIdentityApi } from "./identity/api.ts";
 import { createWorkspaceApi, writeWorkspaceError } from "./workspace/api.ts";
+import { createPolicyApi } from "./policy/api.ts";
 import { WorkspaceError } from "./workspace/errors.ts";
 import type { ResolvedBoardroomEnvironment } from "./environment.ts";
 import { createOrgMutationService } from "./org/mutations.ts";
@@ -192,6 +193,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   const orgCommands = createOrgHttpCommands({ repos, now });
   const identityApi = createIdentityApi({ ...options, repos });
   const workspaceApi = createWorkspaceApi({ ...options, repos });
+  const policyApi = createPolicyApi({ ...options, repos });
 
   /**
    * 待确认的永久删除（T1 #48）：`project:<id>` / `group:<id>` → 一次性凭据与到期时间。
@@ -300,6 +302,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       try {
         if (await identityApi.handle(request, response, pathname)) return true;
         if (await workspaceApi.handle(request, response, pathname)) return true;
+        if (await policyApi.handle(request, response, pathname)) return true;
         return await route(repos, request, response, method, pathname);
       } catch (error) {
         if (error instanceof WorkspaceError) { writeWorkspaceError(response, error); return true; }

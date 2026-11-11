@@ -70,6 +70,8 @@ export const AUDIT_ACTIONS = {
   role_template_delete: "role_template.delete",
   agent_rename: "agent.rename",
   agent_alias_add: "agent.alias_add",
+  policy_initialize: "policy.initialize",
+  policy_update: "policy.update",
 } as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[keyof typeof AUDIT_ACTIONS];
@@ -142,7 +144,7 @@ export function isTruncated(row: { before: string | null; after: string | null }
 // 形状
 // ---------------------------------------------------------------------------
 
-export type AuditTargetKind = "member" | "node" | "role" | "capability" | "group" | "project" | "task" | "memory" | "role_template" | "agent";
+export type AuditTargetKind = "member" | "node" | "role" | "capability" | "group" | "project" | "task" | "memory" | "role_template" | "agent" | "policy_document";
 
 /** 全局目录使用 user/NULL；project 审计的历史调用形状与查询边界保持兼容。 */
 export type AuditContext = { readonly scope: "user"; readonly projectId: null }

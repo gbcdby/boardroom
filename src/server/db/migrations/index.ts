@@ -8,6 +8,7 @@ import { runtimeProcessIdentityMigration } from "./runtime-process-identity.ts";
 import { tasksMigration } from "./tasks.ts";
 import { identityCatalogMigration } from "./identity-catalog.ts";
 import { projectWorkspacesMigration } from "./project-workspaces.ts";
+import { policyConfigurationMigration } from "./policy-configuration.ts";
 
 /**
  * 生产迁移列表。
@@ -440,4 +441,5 @@ export const migrations: readonly Migration[] = [
   memberLifecycleMigration,
   identityCatalogMigration,
   projectWorkspacesMigration,
+  policyConfigurationMigration,
 ];

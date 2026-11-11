@@ -27,7 +27,8 @@ async function sourceFixture() {
 }
 
 async function fixture(engine: typeof identityEngines[number]) {
-  const f = await identityFixture(engine, 15), source = await sourceFixture();
+  // 全业务表无副作用快照使用当前 schema，包含后来追加的策略表。
+  const f = await identityFixture(engine), source = await sourceFixture();
   const environment = await resolveBoardroomEnvironment({ cwd: f.dir,
     env: { BOARDROOM_HOME: path.join(f.dir, "home"), AGENT_STUDIO_DATA_DIR: f.dir } });
   const service = createWorkspaceService({ repos: f.repos, environment });

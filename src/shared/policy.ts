@@ -247,3 +247,49 @@ export interface PolicyPreview {
   readonly sideEffects: "none";
   readonly evaluation: PolicyEvaluation;
 }
+
+/** S1-T2：持久配置引用仅标识规则来源，不是批准、grant 或执行许可。 */
+export type PolicyDocument = GlobalPolicyDocument | ProjectPolicyDocument;
+export interface PolicyDocumentRef {
+  readonly scope: "user" | "project";
+  readonly projectId: string | null;
+  readonly revision: number;
+  readonly contentDigest: string;
+}
+export interface PolicyVersionMetadata {
+  readonly ref: PolicyDocumentRef;
+  readonly defaultRevision: number;
+  /** 保存项目配置时实际校验的全局版本；全局文档为 null。 */
+  readonly basedOnGlobalRevision: number | null;
+  readonly createdBy: { readonly kind: "human" | "system"; readonly id: string };
+  readonly createdAt: string;
+}
+export interface PersistedPolicyDocument<D extends PolicyDocument = PolicyDocument> extends PolicyVersionMetadata {
+  readonly document: D;
+}
+export interface EffectivePolicyConfiguration extends ComposedPolicyRules {
+  readonly policyRevision: string;
+  readonly defaultRevision: number;
+  readonly global: PersistedPolicyDocument<GlobalPolicyDocument>;
+  readonly project: PersistedPolicyDocument<ProjectPolicyDocument> | null;
+  readonly mode: "observation";
+  readonly executionAdmission: "not-issued";
+}
+export interface PolicyCombinationConflict {
+  readonly projectId: string;
+  readonly projectRevision: number;
+  readonly fields: readonly string[];
+  readonly repairEndpoint: string;
+}
+
+/** 草稿的 candidate 仅用于比较；base 是当前已持久版本，草稿不改变它。 */
+export interface PolicyConfigurationPreview {
+  readonly kind: "policy-configuration-preview";
+  readonly source: "current" | "draft";
+  readonly mode: "observation";
+  readonly executionAdmission: "not-issued";
+  readonly sideEffects: "none";
+  readonly base: { readonly global: PolicyDocumentRef; readonly project: PolicyDocumentRef | null; readonly policyRevision: string };
+  readonly candidate: ComposedPolicyRules & { readonly global: GlobalPolicyDocument; readonly project: ProjectPolicyDocument | null };
+  readonly action: { readonly availability: "unavailable"; readonly reason: "trusted_adapter_unavailable"; readonly preview: PolicyPreview } | null;
+}

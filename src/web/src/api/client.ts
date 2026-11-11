@@ -180,6 +180,8 @@ export async function request<T>(method: string, path: string, body?: unknown): 
  * 群删除保留项目成员，仅清除不再被其他群绑定使用的未占用托管成员预留关系。
  */
 export interface ProjectPurgeCascade {
+  policyDocuments: number;
+  policyVersions: number;
   workspaceVersions: number;
   memberFactRevisions: number;
   memoryDocuments: number;
