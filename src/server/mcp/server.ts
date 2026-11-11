@@ -4,6 +4,7 @@ import type { Logger } from "../logger.ts";
 import type { McpCore } from "./core.ts";
 import { McpToolError } from "./errors.ts";
 import { isRegistered, listAdapterIds } from "./adapters/index.ts";
+import { TASK_COMMANDS, type TaskOperation } from "../tasks/mcp.ts";
 
 /**
  * MCP 工具注册层：把 {@link McpCore} 暴露为符合 docs/mcp-tool-contract.md 的工具。
@@ -47,7 +48,7 @@ async function runTool(
 ) {
   try {
     const payload = await handler();
-    return toToolResult(payload);
+    return toToolResult(payload, payload.ok === false);
   } catch (error) {
     if (error instanceof McpToolError) {
       logger.debug("tool_business_error", { tool: toolName, code: error.code });
@@ -70,6 +71,15 @@ export function createMcpServer(options: CreateMcpServerOptions): McpServer {
     { name: "agent-studio", version: "0.1.0" },
     { capabilities: { logging: {}, tools: {} } },
   );
+
+  for (const operation of Object.keys(TASK_COMMANDS) as TaskOperation[]) {
+    const definition = TASK_COMMANDS[operation];
+    server.registerTool(definition.name, {
+      title: definition.title,
+      description: `${definition.title}。项目由当前 join 绑定确定；写入需要修订，外部执行证据按声明记录。`,
+      inputSchema: definition.schema,
+    }, (args: Record<string, unknown>, extra: ToolExtra) => runTool(log, definition.name, () => core.taskOperation(sessionOf(extra), operation, args) as Promise<ToolPayload>));
+  }
 
   server.registerTool(
     "join",
@@ -106,7 +116,7 @@ export function createMcpServer(options: CreateMcpServerOptions): McpServer {
     {
       title: "等待或接收消息",
       description:
-        "由工具自身挂起，在有可投递消息、超时或取消时返回。status 取值 message / timeout / cancelled。",
+        "由工具自身挂起，在有消息、工作通知、超时或取消时返回。status 为 message / work / timeout / cancelled；工作通知 ACK 不改变任务状态。",
       inputSchema: {
         timeoutMs: z.number().int().min(1).max(300_000).optional().describe("单次等待上限，默认 30000ms"),
         afterCursor: z.string().optional().describe("断线重连后从该游标之后拉取积压"),

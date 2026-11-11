@@ -54,7 +54,7 @@ def exercise(page, origin, records, output, report, capture_only):
     report["pageErrors"] = errors
     project_id = records[0]["project"]["id"]
     group_a, group_b = [g["id"] for g in records[0]["groups"]]
-    paths = {"home": "/", "projects": "/projects", "chat": f"/chat?projectId={project_id}&groupId={group_a}", "status": f"/status?projectId={project_id}", "org": "/org", "audit": "/audit", "runtimes": "/runtimes"}
+    paths = {"home": "/", "projects": "/projects", "chat": f"/chat?projectId={project_id}&groupId={group_a}", "status": f"/status?projectId={project_id}", "org": f"/org?projectId={project_id}", "audit": f"/audit?projectId={project_id}", "runtimes": f"/runtimes?projectId={project_id}", "tasks": f"/tasks?projectId={project_id}"}
     report["layouts"] = []
     report["screenshots"] = []
     report["checks"] = []
@@ -65,11 +65,7 @@ def exercise(page, origin, records, output, report, capture_only):
             page.goto(origin + path)
             expect(page.locator("h1")).to_be_visible()
             page.wait_for_timeout(450)
-            if name == "org":
-                page.locator("select").first.select_option(project_id)
-            elif name == "audit":
-                page.get_by_test_id("audit-project-select").select_option(project_id)
-            elif name == "projects":
+            if name == "projects":
                 page.get_by_test_id("project-list").get_by_role("button", name=records[0]["project"]["name"], exact=True).click()
             if name in ("org", "audit", "projects"):
                 page.wait_for_timeout(250)
@@ -82,7 +78,7 @@ def exercise(page, origin, records, output, report, capture_only):
     if capture_only:
         report["status"] = "CAPTURED_BASELINE"
         return
-    report["checks"].append("UI-01/02: 7个路由×4种视口/主题，标题与页面无横向溢出")
+    report["checks"].append("UI-01/02: 8个路由×4种视口/主题，标题与页面无横向溢出")
 
     page.set_viewport_size({"width": 390, "height": 844})
     page.emulate_media(color_scheme="light")
@@ -103,13 +99,17 @@ def exercise(page, origin, records, output, report, capture_only):
     page.set_viewport_size({"width": 1440, "height": 1000})
     page.goto(origin + paths["status"])
     target_id = records[1]["project"]["id"]
-    target = page.get_by_test_id(f"overview-item-{target_id}")
-    expect(target).to_have_js_property("tagName", "BUTTON")
+    target = page.get_by_test_id("current-project")
+    expect(target).to_have_js_property("tagName", "SELECT")
     target.focus()
-    page.keyboard.press("Space")
-    expect(target).to_have_attribute("aria-pressed", "true")
-    expect(page.get_by_test_id("project-select")).to_have_value(target_id)
-    report["checks"].append("UI-03: 状态概览原生按钮可用Space选择，并同步当前项目")
+    page.keyboard.press("End")
+    page.keyboard.press("Enter")
+    selected_id = target.input_value()
+    expect(page).to_have_url(origin + f"/projects/{selected_id}/status")
+    target.select_option(target_id)
+    expect(page).to_have_url(origin + f"/projects/{target_id}/status")
+    expect(target).to_have_value(target_id)
+    report["checks"].append("UI-03/#39: 顶栏项目原生选择器可键盘操作，URL和页面同步")
 
     page.goto(origin + paths["chat"])
     draft = page.get_by_test_id("chat-input")
@@ -184,6 +184,7 @@ def exercise(page, origin, records, output, report, capture_only):
     draft.fill("发送后立即切换群组")
     draft.press("Enter")
     expect(send).to_be_disabled()
+    page.once("dialog", lambda dialog: dialog.accept())
     page.get_by_test_id("chat-group").select_option(group_b)
     expect(page.get_by_test_id("chat-messages")).to_contain_text("这条消息只属于设计讨论。")
     with page.expect_response(lambda r: r.request.method == "POST" and "/messages" in r.url):
@@ -200,7 +201,7 @@ def exercise(page, origin, records, output, report, capture_only):
     name.fill("浏览器操作创建的项目")
     page.get_by_test_id("create-project").click()
     expect(page.get_by_test_id("project-detail")).to_contain_text("浏览器操作创建的项目")
-    expect(page.get_by_test_id("notice")).to_be_visible()
+    expect(page.get_by_test_id("context-notice")).to_be_visible()
     member = page.get_by_test_id("new-member-name")
     member.fill("可访问性验证成员")
     page.get_by_test_id("add-member").click()
@@ -216,16 +217,14 @@ def exercise(page, origin, records, output, report, capture_only):
     page.get_by_test_id("cancel-purge-project").click()
     expect(page.get_by_test_id("project-detail")).to_contain_text("浏览器操作创建的项目")
     report["checks"].append("UI-05: 真实项目/成员/群组创建、成功反馈与取消永久删除")
-    page.goto(origin + "/org")
-    page.locator("#org-project").select_option(project_id)
+    page.goto(origin + f"/projects/{project_id}/org")
     page.get_by_test_id("org-edit-node").first.click()
     editor = page.get_by_role("region", name="编辑岗位：项目统筹", exact=True)
     editor.get_by_label("岗位名称", exact=True).fill("协作统筹")
     editor.get_by_role("button", name="改名", exact=True).click()
     expect(page.get_by_test_id("notice")).to_contain_text("岗位已改名")
     expect(page.get_by_test_id("org-node-list")).to_contain_text("协作统筹")
-    page.goto(origin + "/audit")
-    page.get_by_test_id("audit-project-select").select_option(project_id)
+    page.goto(origin + f"/projects/{project_id}/audit")
     page.get_by_test_id("audit-revoke").first.click()
     expect(page.get_by_test_id("audit-notice")).to_contain_text("已撤销")
     nodes = request(page, origin, "GET", f"/api/projects/{project_id}/org")["nodes"]

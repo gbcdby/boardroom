@@ -10,6 +10,7 @@ import {
   WriteFailedError,
 } from "./errors.ts";
 import { newId } from "./ids.ts";
+import { createTasksRepository, type TasksRepository } from "../tasks/repository.ts";
 import {
   createAuditRepository,
   type AuditRepository,
@@ -99,8 +100,8 @@ export interface AgentsRepository {
 
 /**
  * 永久删除的级联清单（#48 / LIFE-ARC-02）：删除前给人看的「会被清掉什么」，
- * 删除后作为实际清除的行数返回。口径 = 当前已落库的范围（阶段 1/2）；
- * 任务、评论、记忆分别在阶段 3、阶段 4 落库，届时按同一形状补进清单。
+ * 删除后作为实际清除的行数返回。口径 = 当前已落库的范围（阶段 1/2/3）；
+ * 阶段 4 记忆落库时继续按同一形状补进清单。
  */
 export interface PurgeCounts {
   readonly groups: number;
@@ -114,10 +115,19 @@ export interface PurgeCounts {
   readonly agentRuntimeBindings: number;
   readonly agentRunnerStates: number;
   readonly agentRuntimeMembers: number;
+  readonly taskSettings: number;
+  readonly tasks: number;
+  readonly taskComments: number;
+  readonly taskHistory: number;
+  readonly taskMessageLinks: number;
+  readonly reviewRounds: number;
+  readonly reviewReports: number;
+  readonly workEvents: number;
 }
 
 /** 群组级联清单（#48）：删群组只清群聊与参与者关系，**不动成员本身**。 */
 export interface GroupPurgeCounts {
+  readonly taskMessageLinks: number;
   readonly messages: number;
   readonly deliveries: number;
   readonly participants: number;
@@ -330,6 +340,7 @@ export interface RepositorySet {
   readonly mcpSessions: McpSessionsRepository;
   /** T5（#52）：最小审计单表仓储（append-only + 撤销两列回写）。 */
   readonly audit: AuditRepository;
+  readonly tasks: TasksRepository;
   /** 在单个写事务内运行 fn；失败回滚并抛出归一化后的错误。 */
   transaction<T>(fn: () => Promise<T>): Promise<T>;
 }
@@ -407,6 +418,7 @@ export function createRepositories(db: DbDriver): RepositorySet {
     statuses: createStatuses(ctx),
     mcpSessions: createMcpSessions(ctx),
     audit: createAuditRepository(ctx),
+    tasks: createTasksRepository(ctx),
     transaction: ctx.withTransaction,
   };
 }
@@ -498,7 +510,16 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
     return Number(r?.c ?? 0);
   };
   const managed = await hasRuntimeSchema(ctx);
+  const tasks = await hasTasksSchema(ctx);
   return {
+    taskSettings: tasks ? await count("SELECT COUNT(*) AS c FROM project_task_settings WHERE project_id = ?") : 0,
+    tasks: tasks ? await count("SELECT COUNT(*) AS c FROM tasks WHERE project_id = ?") : 0,
+    taskComments: tasks ? await count("SELECT COUNT(*) AS c FROM task_comments WHERE project_id = ?") : 0,
+    taskHistory: tasks ? await count("SELECT COUNT(*) AS c FROM task_history WHERE project_id = ?") : 0,
+    taskMessageLinks: tasks ? await count("SELECT COUNT(*) AS c FROM task_message_links WHERE project_id = ?") : 0,
+    reviewRounds: tasks ? await count("SELECT COUNT(*) AS c FROM task_review_rounds WHERE project_id = ?") : 0,
+    reviewReports: tasks ? await count("SELECT COUNT(*) AS c FROM task_review_reports WHERE project_id = ?") : 0,
+    workEvents: tasks ? await count("SELECT COUNT(*) AS c FROM work_events WHERE project_id = ?") : 0,
     groups: await count("SELECT COUNT(*) AS c FROM groups WHERE project_id = ?"),
     members: await count("SELECT COUNT(*) AS c FROM members WHERE project_id = ?"),
     orgNodes: await count("SELECT COUNT(*) AS c FROM org_nodes WHERE project_id = ?"),
@@ -525,6 +546,7 @@ async function groupPurgeCounts(ctx: RepoCtx, groupId: string): Promise<GroupPur
   };
   const managed = await hasRuntimeSchema(ctx);
   return {
+    taskMessageLinks: await hasTasksSchema(ctx) ? await count("SELECT COUNT(*) AS c FROM task_message_links WHERE group_id = ?") : 0,
     messages: await count("SELECT COUNT(*) AS c FROM messages WHERE group_id = ?"),
     deliveries: await count(
       "SELECT COUNT(*) AS c FROM message_deliveries WHERE message_id IN (SELECT id FROM messages WHERE group_id = ?)",
@@ -542,6 +564,11 @@ async function groupPurgeCounts(ctx: RepoCtx, groupId: string): Promise<GroupPur
 /** 迁移测试允许暂时操作旧库；升级后的正常运行总是具备 v8。 */
 async function hasRuntimeSchema(ctx: RepoCtx): Promise<boolean> {
   return (await ctx.one("SELECT version FROM schema_migrations WHERE version = 8")) !== undefined;
+}
+
+/** 老版本迁移 fixture 尚无阶段 3 表，计数/清理不能提前访问它们。 */
+async function hasTasksSchema(ctx: RepoCtx): Promise<boolean> {
+  return (await ctx.one("SELECT version FROM schema_migrations WHERE version = 11")) !== undefined;
 }
 
 /**
@@ -797,6 +824,11 @@ function createProjects(ctx: RepoCtx): ProjectsRepository {
       return ctx.withTransaction(async () => {
         await requireManagedStopped(ctx, "project", id);
         const counts = await projectPurgeCounts(ctx, id);
+        if (await hasTasksSchema(ctx)) {
+          for (const table of ["work_events", "task_comments", "task_history", "task_message_links", "task_review_reports", "task_review_rounds", "tasks", "project_task_settings"]) {
+            await ctx.exec(`DELETE FROM ${table} WHERE project_id = ?`, [id]);
+          }
+        }
         // 显式「子 → 父」顺序，而不是只依赖外键级联：清单与实际清除的行必须一一对得上，
         // 也让 PG 重写（M1 #54）时不依赖特定级联顺序。
         await ctx.exec("DELETE FROM message_deliveries WHERE project_id = ?", [id]);
@@ -1119,6 +1151,7 @@ function createGroups(ctx: RepoCtx): GroupsRepository {
       return ctx.withTransaction(async () => {
         await requireManagedStopped(ctx, "group", id);
         const counts = await groupPurgeCounts(ctx, id);
+        if (await hasTasksSchema(ctx)) await ctx.exec("DELETE FROM task_message_links WHERE group_id = ?", [id]);
         // 只清「群聊 + 参与者关系」（LIFE-ARC-02）：投递记录随消息一起清，
         // 会话记录随群组一起清；**members 与 member_statuses 一行都不动**。
         await ctx.exec(

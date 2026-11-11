@@ -1,12 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import {
   ApiError,
   api,
   type OrgNodeDto,
   type OrgSnapshot,
-  type ProjectDto,
 } from "../api/client.ts";
 
 /**
@@ -20,15 +19,19 @@ import {
  * 撤销/审计界面属 T5（#52），本页不提供。
  */
 
+import { useCurrentProject, useProjectDraft } from "../composables/useCurrentProject.ts";
+
 type NodeRole = "top_manager" | "sub_manager" | "member";
 
-const projects = ref<ProjectDto[]>([]);
-const activeProjectId = ref<string | null>(null);
+const context = useCurrentProject();
+const { projects, currentProjectId: activeProjectId, readonly: projectReadonly } = context;
+let disposed = false;
+let request = 0;
 const snapshot = ref<OrgSnapshot | null>(null);
 
 const loading = ref(true);
 const mutating = ref(false);
-const busy = computed(() => loading.value || mutating.value);
+const busy = computed(() => loading.value || mutating.value || projectReadonly.value);
 const editingNodeId = ref<string | null>(null);
 const error = ref<string | null>(null);
 const notice = ref<string | null>(null);
@@ -66,9 +69,10 @@ async function refresh(): Promise<void> {
     snapshot.value = null;
     return;
   }
+  const version = ++request;
   const previousNodes = new Map(nodes.value.map((node) => [node.id, node]));
   const result = await api.getOrg(projectId);
-  if (activeProjectId.value !== projectId) return;
+  if (disposed || version !== request || activeProjectId.value !== projectId) return;
   snapshot.value = result;
   const names: Record<string, string> = {};
   const roleValues: Record<string, string> = {};
@@ -102,8 +106,10 @@ async function act<T>(fn: () => Promise<T>, success: string): Promise<boolean> {
   if (busy.value) return false;
   clearMessages();
   mutating.value = true;
+  const projectId = activeProjectId.value, generation = context.generation.value;
   try {
     await fn();
+    if (disposed || projectId !== activeProjectId.value || generation !== context.generation.value) return false;
     notice.value = success;
     try {
       await refresh();
@@ -119,20 +125,14 @@ async function act<T>(fn: () => Promise<T>, success: string): Promise<boolean> {
   }
 }
 
-onMounted(async () => {
-  try {
-    const list = await api.listProjects();
-    projects.value = list.projects;
-    if (list.projects.length > 0) activeProjectId.value = list.projects[0]!.id;
-    await refresh();
-  } catch (err) {
-    error.value = err instanceof ApiError ? err.message : (err as Error).message;
-  } finally {
-    loading.value = false;
-  }
-});
+useProjectDraft(() => !!newNodeName.value.trim() || rootName.value !== "项目统筹" || nodes.value.some((node) =>
+  nameEdits.value[node.id] !== node.name || roleEdits.value[node.id] !== node.role || parentEdits.value[node.id] !== (node.parentId ?? "") || assignEdits.value[node.id] !== (node.memberId ?? "")),
+  () => { newNodeName.value = ""; rootName.value = "项目统筹"; nameEdits.value = {}; roleEdits.value = {}; parentEdits.value = {}; assignEdits.value = {}; });
+watch(activeProjectId, () => void selectProject(), { immediate: true });
+onBeforeUnmount(() => { disposed = true; request++; });
 
 async function selectProject(): Promise<void> {
+  request++;
   clearMessages();
   editingNodeId.value = null;
   snapshot.value = null;
@@ -238,16 +238,17 @@ function autoPlace(): void {
   <section class="page org-page">
     <header class="page-header">
       <div><h1>组织与角色</h1><p class="page-description">明确岗位、汇报关系和成员分工。</p></div>
-      <label class="field org-project-field" for="org-project">项目<select id="org-project" v-model="activeProjectId" :disabled="busy || projects.length === 0" @change="selectProject"><option v-if="projects.length === 0" :value="null">暂无项目</option><option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option></select></label>
+
     </header>
 
+    <p v-if="projectReadonly" class="notice" role="status">项目已归档，组织与岗位仅供查看。</p>
     <p v-if="error" class="error" role="alert" data-testid="error">{{ error }}</p>
     <p v-if="notice" class="notice" role="status" data-testid="notice">{{ notice }}</p>
     <p v-if="loading" class="muted small" role="status">正在加载组织信息…</p>
-    <div v-else-if="projects.length === 0 && !error" class="panel empty-state"><h2>还没有项目</h2><p>创建项目后，就可以安排岗位与成员。</p><RouterLink to="/projects">前往项目与群组</RouterLink></div>
+    <div v-else-if="!activeProjectId && !error" class="panel empty-state"><h2>还没有项目</h2><p>创建项目后，就可以安排岗位与成员。</p><RouterLink to="/projects">前往项目与群组</RouterLink></div>
 
     <template v-if="activeProjectId !== null && snapshot">
-      <section class="panel org-tree-panel" aria-labelledby="org-tree-title" :aria-busy="busy">
+      <section class="panel org-tree-panel" aria-labelledby="org-tree-title" :aria-busy="loading || mutating">
         <div class="section-heading"><div><h2 id="org-tree-title">组织树</h2><p class="muted small">{{ nodes.length }} 个岗位 · {{ unplacedMembers.length }} 位成员待分配</p></div></div>
         <div v-if="root === null" class="root-setup">
           <h3>先建立一个统筹岗位</h3><p class="muted small">顶层 manager 负责整个项目。建立岗位后，可以再指派成员。</p>

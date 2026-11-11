@@ -1,4 +1,5 @@
 import test from "node:test";
+import { EXPECTED_MCP_TOOL_NAMES } from "./helpers/mcp-contract.ts";
 import assert from "node:assert/strict";
 import { get } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -87,15 +88,7 @@ test("Streamable HTTP /mcp 暴露契约工具列表", async () => {
     try {
       const { tools } = await client.listTools();
       const names = tools.map((tool) => tool.name).sort();
-      assert.deepEqual(names, [
-        "acknowledge_message",
-        "heartbeat",
-        "join",
-        "read_history",
-        "report_status",
-        "send_message",
-        "wait_for_messages",
-      ]);
+      assert.deepEqual(names, EXPECTED_MCP_TOOL_NAMES);
       assert.ok(server.mcpSessionCount >= 1);
     } finally {
       await client.close();
@@ -172,7 +165,7 @@ test("优雅关闭后端口可立即被重新监听（不泄漏）", async () =>
       assert.equal(health.statusCode, 200);
       const probe = await connectClient(second, "restart-client-2");
       const listed = await probe.client.listTools();
-      assert.equal(listed.tools.length, 7);
+      assert.deepEqual(listed.tools.map(tool => tool.name).sort(), EXPECTED_MCP_TOOL_NAMES);
       await probe.client.close();
       await probe.transport.terminateSession().catch(() => {});
     } finally {

@@ -1,4 +1,5 @@
 import test from "node:test";
+import { EXPECTED_MCP_TOOL_NAMES } from "./helpers/mcp-contract.ts";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -93,22 +94,14 @@ async function spawn(ctx: Ctx, key: string, hostType: "claude-code" | "codex-cli
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-test("打断能力不新增 MCP 工具名：工具清单保持 7 个固定工具", async () => {
+test("打断能力不新增 MCP 工具名：保持聊天、任务与工作事件公开清单", async () => {
   await withDb(async (ctx) => {
     const b = await spawn(ctx, "b");
     try {
       const names = await b.toolNames();
       assert.deepEqual(
         names.sort(),
-        [
-          "acknowledge_message",
-          "heartbeat",
-          "join",
-          "read_history",
-          "report_status",
-          "send_message",
-          "wait_for_messages",
-        ].sort(),
+        EXPECTED_MCP_TOOL_NAMES,
       );
     } finally {
       await b.close();

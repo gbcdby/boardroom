@@ -29,6 +29,7 @@ import { durableMessageDispatch } from "./migrations/message-dispatch.ts";
 import { managedRuntime } from "./migrations/runtime.ts";
 import { runtimeObservabilityMigration } from "./migrations/runtime-observability.ts";
 import { runtimeProcessIdentityMigration } from "./migrations/runtime-process-identity.ts";
+import { tasksMigration } from "./migrations/tasks.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -68,9 +69,17 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
     ].join("\n"),
   },
   { name: "members", keyColumns: ["id"] },
+  { name: "project_task_settings", keyColumns: ["project_id"] },
+  { name: "tasks", keyColumns: ["id"] },
+  { name: "task_review_rounds", keyColumns: ["id"] },
+  { name: "task_review_reports", keyColumns: ["id"] },
+  { name: "task_comments", keyColumns: ["id"] },
+  { name: "task_history", keyColumns: ["id"] },
+  { name: "work_events", keyColumns: ["id"] },
   { name: "groups", keyColumns: ["id"] },
   { name: "group_participants", keyColumns: ["group_id", "member_id"] },
   { name: "messages", keyColumns: ["id"] },
+  { name: "task_message_links", keyColumns: ["task_id", "message_id"] },
   { name: "message_deliveries", keyColumns: ["id"] },
   { name: "member_statuses", keyColumns: ["project_id", "member_id"] },
   { name: "mcp_sessions", keyColumns: ["id"] },
@@ -297,6 +306,7 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   managedRuntime,
   runtimeObservabilityMigration,
   runtimeProcessIdentityMigration,
+  tasksMigration,
 ];
 
 // ---------------------------------------------------------------------------

@@ -184,6 +184,30 @@ def exercise(page, fixture: dict, artifacts: Path, report: dict) -> None:
     expect(card.get_by_test_id("runtime-summary")).to_have_text("已停止")
     stopped = api(page, origin, f"/api/runtime-bindings/{binding_id}")["binding"]
     assert stopped["binding"]["desiredState"] == "stopped" and stopped["runner"]["exitConfirmed"] is True
+
+    # 全局 Runtime 可复用到新项目；当前项目只有一个，身份选择不另设项目上下文。
+    created_project = page.request.post(origin + "/api/projects", data={"name": "复用托管身份的项目"})
+    assert created_project.status == 201
+    other_project_id = created_project.json()["project"]["id"]
+    created_group = page.request.post(origin + f"/api/projects/{other_project_id}/groups", data={"name": "复用验收群", "participantMemberIds": []})
+    assert created_group.status == 201
+    other_group_id = created_group.json()["group"]["id"]
+    page.goto(f"{origin}/runtimes?projectId={other_project_id}")
+    page.get_by_test_id("runtime-reuse-open").click()
+    expect(page.get_by_test_id("runtime-existing-select")).to_have_value(runtime_id)
+    page.set_viewport_size({"width": 390, "height": 844})
+    report["layouts"].append(check_layout(page, "mobile-reuse-390"))
+    screenshot("06-reuse-existing-mobile.png")
+    reused = mutation(page, "POST", runtime_url + "/bindings", page.get_by_test_id("runtime-add-binding").click, 201)["binding"]
+    assert reused["binding"]["runtimeId"] == runtime_id
+    assert reused["binding"]["projectId"] == other_project_id and reused["binding"]["groupId"] == other_group_id
+    assert reused["binding"]["memberId"] != member_id and reused["binding"]["desiredState"] == "stopped"
+    bindings = api(page, origin, f"/api/runtimes/{runtime_id}")["runtime"]["bindings"]
+    assert len(bindings) == 2 and any(item["binding"]["id"] == binding_id for item in bindings)
+    passed("R5-cross-project-reuse", "在新项目选择已有全局身份，新增停止的独立绑定并保留原项目绑定。")
+    page.set_viewport_size({"width": 1440, "height": 1000})
+    page.goto(f"{origin}/runtimes?projectId={fixture['projectId']}")
+    expect(card.get_by_test_id("runtime-summary")).to_have_text("已停止")
     remove = page.get_by_role("button", name="删除配置", exact=True)
     remove.click()
     dialog = page.get_by_role("dialog")

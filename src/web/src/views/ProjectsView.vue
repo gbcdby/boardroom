@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-import { RouterLink } from "vue-router";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { RouterLink, useRoute, useRouter } from "vue-router";
 import {
   ApiError,
   api,
@@ -8,7 +8,6 @@ import {
   type GroupPurgeConfirmation,
   type MemberDto,
   type MemberStatusDto,
-  type ProjectDto,
   type ProjectPurgeConfirmation,
 } from "../api/client.ts";
 
@@ -27,8 +26,14 @@ import {
  * 阶段 1 只验收单个项目；页面允许切换项目。真实 agent 成员由 T2（MCP 入群）产生。
  */
 
-const projects = ref<ProjectDto[]>([]);
-const activeProjectId = ref<string | null>(null);
+import { projectPath, useCurrentProject, useProjectDraft } from "../composables/useCurrentProject.ts";
+const route = useRoute();
+const router = useRouter();
+const context = useCurrentProject();
+const { currentProjectId: activeProjectId, currentProject: activeProject, readonly: projectReadonly } = context;
+const projects = computed(() => context.projects.value.filter((project) => showArchived.value || !project.archivedAt));
+let disposed = false;
+let projectRequest = 0;
 const members = ref<MemberDto[]>([]);
 const groups = ref<GroupDto[]>([]);
 /** 群组 id → 参与者列表。 */
@@ -36,7 +41,7 @@ const participants = ref<Record<string, MemberDto[]>>({});
 /** 项目成员在线/连接状态（T2）：memberId → 状态视图。 */
 const statuses = ref<Record<string, MemberStatusDto>>({});
 /** 「显示已归档」开关：项目与群组列表一起受影响。 */
-const showArchived = ref(false);
+const showArchived = ref(route.query["archived"] === "1");
 /** 等待人二次确认的永久删除（#48）。 */
 const pendingProjectPurge = ref<ProjectPurgeConfirmation | null>(null);
 const pendingGroupPurge = ref<GroupPurgeConfirmation | null>(null);
@@ -54,7 +59,6 @@ const newGroupName = ref("");
 /** 新群组默认选中的成员 id。 */
 const newGroupSelection = ref<string[]>([]);
 
-const activeProject = computed(() => projects.value.find((p) => p.id === activeProjectId.value) ?? null);
 const manager = computed<MemberDto | null>(() => activeProject.value?.manager ?? null);
 
 function clearMessages(): void {
@@ -64,13 +68,15 @@ function clearMessages(): void {
 
 async function run<T>(fn: () => Promise<T>, success?: string, preserveFeedback = false): Promise<T | null> {
   if (!preserveFeedback) clearMessages();
+  const generation = context.generation.value;
   pendingRequests.value++;
   try {
     const result = await fn();
+    if (disposed || generation !== context.generation.value) return null;
     if (success !== undefined) notice.value = success;
     return result;
   } catch (err) {
-    error.value = err instanceof ApiError ? err.message : (err as Error).message;
+    if (!disposed && generation === context.generation.value) error.value = err instanceof ApiError ? err.message : (err as Error).message;
     return null;
   } finally {
     pendingRequests.value--;
@@ -79,20 +85,8 @@ async function run<T>(fn: () => Promise<T>, success?: string, preserveFeedback =
 
 async function loadProjects(): Promise<void> {
   loading.value = true;
-  try {
-    const result = await run(() => api.listProjects({ includeArchived: showArchived.value }), undefined, true);
-    if (!result) return;
-    projects.value = result.projects;
-    if (activeProjectId.value === null || !projects.value.some((p) => p.id === activeProjectId.value)) {
-      activeProjectId.value = projects.value[0]?.id ?? null;
-      newGroupSelection.value = [];
-      pendingProjectPurge.value = null;
-      pendingGroupPurge.value = null;
-    }
-    await loadActiveProject();
-  } finally {
-    loading.value = false;
-  }
+  try { await context.refreshProjects(); if (!disposed) await loadActiveProject(); }
+  finally { if (!disposed) loading.value = false; }
 }
 
 async function toggleShowArchived(): Promise<void> {
@@ -111,13 +105,14 @@ async function loadActiveProject(): Promise<void> {
     statuses.value = {};
     return;
   }
+  const version = ++projectRequest;
   loadingProject.value = true;
   try {
     const [memberResult, groupResult] = await Promise.all([
       run(() => api.listMembers(projectId), undefined, true),
       run(() => api.listGroups(projectId, { includeArchived: showArchived.value }), undefined, true),
     ]);
-    if (activeProjectId.value !== projectId) return;
+    if (disposed || version !== projectRequest || activeProjectId.value !== projectId) return;
     if (memberResult) members.value = memberResult.members;
     if (groupResult) {
       groups.value = groupResult.groups;
@@ -125,7 +120,7 @@ async function loadActiveProject(): Promise<void> {
     }
     await loadStatuses();
   } finally {
-    loadingProject.value = false;
+    if (!disposed && version === projectRequest) loadingProject.value = false;
   }
 }
 
@@ -153,21 +148,9 @@ async function loadStatuses(): Promise<void> {
   statuses.value = map;
 }
 
-async function selectProject(projectId: string): Promise<void> {
-  if (busy.value || activeProjectId.value === projectId) return;
-  clearMessages();
-  activeProjectId.value = projectId;
-  newGroupSelection.value = [];
-  newMemberName.value = "";
-  newGroupName.value = "";
-  members.value = [];
-  groups.value = [];
-  participants.value = {};
-  statuses.value = {};
-  pendingProjectPurge.value = null;
-  pendingGroupPurge.value = null;
-  await loadActiveProject();
-}
+async function selectProject(projectId: string): Promise<void> { await router.push(projectPath(projectId)); }
+useProjectDraft(() => !!newProjectName.value || !!newMemberName.value || !!newGroupName.value || newGroupSelection.value.length > 0,
+  () => { newProjectName.value = ""; newMemberName.value = ""; newGroupName.value = ""; newGroupSelection.value = []; pendingProjectPurge.value = null; pendingGroupPurge.value = null; });
 
 async function createProject(): Promise<void> {
   if (busy.value) return;
@@ -179,12 +162,13 @@ async function createProject(): Promise<void> {
   const result = await run(() => api.createProject(name), "项目已创建。");
   if (!result) return;
   newProjectName.value = "";
-  activeProjectId.value = result.project.id;
-  await loadProjects();
+  await context.refreshProjects();
+  await context.selectProject(result.project.id);
+  context.announce("项目已创建。");
 }
 
 async function addMember(): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || projectReadonly.value) return;
   const projectId = activeProjectId.value;
   const name = newMemberName.value.trim();
   if (projectId === null) return;
@@ -199,7 +183,7 @@ async function addMember(): Promise<void> {
 }
 
 async function removeMember(member: MemberDto): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || projectReadonly.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
   const result = await run(
@@ -225,7 +209,7 @@ function lifecycleLabel(member: MemberDto): string {
 
 /** T3 #50：暂停 / 恢复成员（无需逐次确认；可恢复、不物理删除）。 */
 async function toggleMemberStatus(member: MemberDto): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || projectReadonly.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
   const toActive = member.status !== "active";
@@ -240,7 +224,7 @@ async function toggleMemberStatus(member: MemberDto): Promise<void> {
 }
 
 async function assignManager(member: MemberDto): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || projectReadonly.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
   const result = await run(
@@ -258,7 +242,7 @@ function toggleGroupSelection(memberId: string): void {
 }
 
 async function createGroup(): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || projectReadonly.value) return;
   const projectId = activeProjectId.value;
   const name = newGroupName.value.trim();
   if (projectId === null) return;
@@ -318,8 +302,8 @@ async function confirmProjectPurge(): Promise<void> {
   pendingProjectPurge.value = null;
   if (outcome.state === "deleted") {
     notice.value = "项目已永久删除。";
-    activeProjectId.value = null;
     await loadProjects();
+    context.announce("项目已永久删除。");
   }
 }
 
@@ -329,21 +313,21 @@ function cancelProjectPurge(): void {
 }
 
 async function archiveGroup(group: GroupDto): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || projectReadonly.value) return;
   const result = await run(() => api.archiveGroup(group.id), `群组「${group.name}」已归档（可恢复）。`);
   if (!result) return;
   await loadActiveProject();
 }
 
 async function restoreGroup(group: GroupDto): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || projectReadonly.value) return;
   const result = await run(() => api.restoreGroup(group.id), `群组「${group.name}」已恢复。`);
   if (!result) return;
   await loadActiveProject();
 }
 
 async function requestGroupPurge(group: GroupDto): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || projectReadonly.value) return;
   const outcome = await run(() => api.purgeGroup(group.id));
   if (!outcome) return;
   if (outcome.state === "confirmation_required") pendingGroupPurge.value = outcome.confirmation;
@@ -351,7 +335,7 @@ async function requestGroupPurge(group: GroupDto): Promise<void> {
 }
 
 async function confirmGroupPurge(): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || projectReadonly.value) return;
   const confirmation = pendingGroupPurge.value;
   if (confirmation === null) return;
   const outcome = await run(() => api.purgeGroup(confirmation.groupId, confirmation.token));
@@ -415,14 +399,15 @@ function participantNames(groupId: string): string {
   return (participants.value[groupId] ?? []).map((m) => m.displayName).join("、") || "（暂无参与者）";
 }
 
-onMounted(() => void loadProjects());
+watch(activeProjectId, () => { projectRequest++; members.value = []; groups.value = []; participants.value = {}; statuses.value = {}; loading.value = false; void loadActiveProject(); }, { immediate: true });
+onBeforeUnmount(() => { disposed = true; projectRequest++; });
 </script>
 
 <template>
   <section class="page projects-page">
     <header class="page-header">
       <div>
-        <h1>项目与群组</h1>
+        <h1>{{ route.meta["projectSection"] === "members" ? "成员" : route.params["projectId"] ? "项目概览" : "项目与群组" }}</h1>
         <p class="page-description">把成员和对话放在同一个项目中，让协作井然有序。</p>
       </div>
     </header>
@@ -430,14 +415,14 @@ onMounted(() => void loadProjects());
     <p v-if="error" class="error" role="alert" data-testid="error">{{ error }}</p>
     <p v-if="notice" class="notice" role="status" data-testid="notice">{{ notice }}</p>
 
-    <section class="panel project-picker" aria-labelledby="project-picker-title" :aria-busy="loading">
+    <section v-if="!route.params['projectId']" class="panel project-picker" aria-labelledby="project-picker-title" :aria-busy="loading">
       <div class="section-heading">
         <h2 id="project-picker-title">我的项目 <span class="count">{{ projects.length }}</span></h2>
         <button type="button" class="text-button" :disabled="busy" :aria-pressed="showArchived" data-testid="toggle-archived" @click="toggleShowArchived">
           {{ showArchived ? "隐藏已归档" : "显示已归档" }}
         </button>
       </div>
-      <div v-if="projects.length > 0" class="project-tabs" role="group" aria-label="选择项目" data-testid="project-list">
+      <div v-if="projects.length > 0" class="project-tabs" role="group" aria-label="浏览项目" data-testid="project-list">
         <button v-for="project in projects" :key="project.id" type="button" class="project-tab" :class="{ active: project.id === activeProjectId }" :aria-pressed="project.id === activeProjectId" :disabled="busy" @click="selectProject(project.id)">
           {{ project.name }}<span v-if="project.archivedAt" class="muted small"> · 已归档</span>
         </button>
@@ -473,6 +458,9 @@ onMounted(() => void loadProjects());
             <p class="muted small">此操作不可恢复，将同时删除以下内容：</p>
             <ul class="small">
               <li>群组：{{ pendingProjectPurge.cascade.groups }} 个</li>
+              <li>任务：{{ pendingProjectPurge.cascade.tasks }} 项（评论 {{ pendingProjectPurge.cascade.taskComments }} 条，历史 {{ pendingProjectPurge.cascade.taskHistory }} 条）</li>
+              <li>评审：{{ pendingProjectPurge.cascade.reviewRounds }} 轮，报告 {{ pendingProjectPurge.cascade.reviewReports }} 份</li>
+              <li>任务关联消息：{{ pendingProjectPurge.cascade.taskMessageLinks }} 条，工作事件 {{ pendingProjectPurge.cascade.workEvents }} 条，任务设置 {{ pendingProjectPurge.cascade.taskSettings }} 条</li>
               <li>成员：{{ pendingProjectPurge.cascade.members }} 个</li>
               <li>群聊消息：{{ pendingProjectPurge.cascade.messages }} 条（投递记录 {{ pendingProjectPurge.cascade.deliveries }} 条）</li>
               <li>成员状态：{{ pendingProjectPurge.cascade.memberStatuses }} 条</li>
@@ -531,7 +519,7 @@ onMounted(() => void loadProjects());
           </details>
         </section>
 
-        <section class="panel groups-panel" aria-labelledby="groups-title">
+        <section v-if="route.meta['projectSection'] !== 'members'" class="panel groups-panel" aria-labelledby="groups-title">
           <div class="section-heading"><h2 id="groups-title">群组 <span class="count">{{ groups.length }}</span></h2></div>
           <p class="muted small section-description">按协作主题建群，为每个群组选择参与者。</p>
           <details class="create-section" data-testid="group-create" :open="groups.length === 0">
@@ -551,13 +539,13 @@ onMounted(() => void loadProjects());
             <li v-for="group in groups" :key="group.id" class="group-item">
               <div class="group-heading"><strong>{{ group.name }}</strong><span v-if="group.archivedAt" class="badge" data-testid="group-archived-badge">已归档</span><span v-if="group.writable === false && !(participants[group.id] ?? []).some(m => m.kind === 'human' && m.status === 'active')" class="badge" data-testid="group-readonly-badge">只读可见</span></div>
               <p class="small muted group-participants">参与者：{{ participantNames(group.id) }}</p>
-              <div class="actions group-links"><RouterLink :to="{ path: '/chat', query: { projectId: group.projectId, groupId: group.id } }">进入群聊 <span aria-hidden="true">↗</span></RouterLink><RouterLink :to="{ path: '/runtimes', query: { projectId: group.projectId, groupId: group.id } }">托管 Agent</RouterLink></div>
+              <div class="actions group-links"><RouterLink :to="projectPath(group.projectId, 'chat', group.id)">进入群聊 <span aria-hidden="true">↗</span></RouterLink><RouterLink :to="{ path: '/runtimes', query: { projectId: group.projectId, groupId: group.id } }">托管 Agent</RouterLink></div>
               <details class="group-management" data-testid="group-management">
                 <summary>群组管理</summary>
                 <div class="actions" data-testid="group-lifecycle">
-                  <button v-if="!group.archivedAt" type="button" class="secondary" :disabled="busy" data-testid="archive-group" @click="archiveGroup(group)">归档群组</button>
-                  <button v-else type="button" class="secondary" :disabled="busy" data-testid="restore-group" @click="restoreGroup(group)">恢复群组</button>
-                  <button type="button" class="text-button danger" :disabled="busy" data-testid="purge-group" @click="requestGroupPurge(group)">永久删除群组</button>
+                  <button v-if="!group.archivedAt" type="button" class="secondary" :disabled="busy || projectReadonly" data-testid="archive-group" @click="archiveGroup(group)">归档群组</button>
+                  <button v-else type="button" class="secondary" :disabled="busy || projectReadonly" data-testid="restore-group" @click="restoreGroup(group)">恢复群组</button>
+                  <button type="button" class="text-button danger" :disabled="busy || projectReadonly" data-testid="purge-group" @click="requestGroupPurge(group)">永久删除群组</button>
                 </div>
               </details>
             </li>
@@ -569,6 +557,7 @@ onMounted(() => void loadProjects());
             <ul class="small">
               <li>群聊消息：{{ pendingGroupPurge.cascade.messages }} 条（投递记录 {{ pendingGroupPurge.cascade.deliveries }} 条）</li>
               <li>参与者关系：{{ pendingGroupPurge.cascade.participants }} 条</li>
+              <li>任务关联消息：{{ pendingGroupPurge.cascade.taskMessageLinks }} 条（任务、评审与工作事件保留）</li>
               <li>MCP 会话记录：{{ pendingGroupPurge.cascade.mcpSessions }} 条</li>
             </ul>
             <div class="actions"><button type="button" class="secondary" :disabled="busy" data-testid="cancel-purge-group" @click="cancelGroupPurge">取消</button><button type="button" :disabled="busy" class="danger" data-testid="confirm-purge-group" @click="confirmGroupPurge">确认永久删除</button></div>

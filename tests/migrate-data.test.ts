@@ -24,6 +24,9 @@ import {
   validateData,
 } from "../src/server/db/migrate-data.ts";
 import { seedSampleData } from "../src/server/db/seed-sample-data.ts";
+import { createRepositories } from "../src/server/db/repositories.ts";
+import { appendAuditEntry } from "../src/server/audit.ts";
+import type { Task, ReviewRound, ReviewReport } from "../src/shared/tasks.ts";
 
 const PG_URL =
   process.env["AGENT_STUDIO_PG_TEST_URL"] ?? process.env["AGENT_STUDIO_PG_CONNECTION_STRING"];
@@ -54,6 +57,33 @@ async function seedSqliteDir(dir: string): Promise<void> {
     await driver.exec(
       "UPDATE message_deliveries SET wake_decision = 'suppressed', wake_suppressed_reason = 'rate_limited' WHERE id = 'md2'",
     );
+    // 阶段 3 每张新表都有非空数据，copy 不能靠「空表一致」获得绿灯。
+    const repos = createRepositories(driver);
+    const at = "2026-11-10T12:00:00.000Z";
+    const author = { kind: "human" as const, actorId: "owner", displayName: "人" };
+    const task: Task = { id: "task-copy", projectId: "pr1", title: "迁移任务", body: "验收正文", labels: ["迁移"], state: "in-progress",
+      assigneeMemberId: "mb1", reviewerMemberId: "mb2", repoPath: "/repo", fixedPoint: "HEAD~1", revision: 1,
+      currentReviewRoundId: null, blockedReason: null, author, createdAt: at, updatedAt: at };
+    await repos.tasks.setSettings("pr1", 0, "mb2");
+    await repos.tasks.create(task);
+    const round: ReviewRound = { id: "round-copy", taskId: task.id, projectId: "pr1", revision: 1, taskRevision: 2, state: "ready", reviewerMemberId: "mb2",
+      specSnapshot: { title: task.title, body: task.body, labels: task.labels }, candidate: { repositoryRoot: "/repo", fixedPointInput: "HEAD~1", baseCommit: "base", candidateCommit: "candidate",
+        policy: "committed-clean", gitVersion: "test", diff: "diff --git a/a b/a\n+任务", diffSha256: "diff", commits: [{ sha: "candidate", subject: "任务提交" }], commands: [], capturedAt: at },
+      failure: null, decision: null, createdAt: at, updatedAt: at };
+    await repos.tasks.createRound(round);
+    await repos.tasks.updateCas("pr1", task.id, 1, { state: "review", currentReviewRoundId: round.id }, at);
+    const report: ReviewReport = { id: "report-copy", roundId: round.id, taskId: task.id, projectId: "pr1", axis: "spec", verdict: "pass", body: "通过", sources: ["spec"],
+      evidence: { provenance: "reviewer-declared", host: "test", hostVersion: "1", parentRunId: "parent", invocationId: "run", contextId: "context", startedAt: at, completedAt: at,
+        command: { argv: ["test"], cwd: "/repo", startedAt: at, completedAt: at, exitCode: 0 }, promptSha256: "prompt", transcriptSha256: "transcript", evidenceRef: "log",
+        baseCommit: "base", candidateCommit: "candidate", diffSha256: "diff" }, contentSha256: "content", author, createdAt: at };
+    await repos.tasks.addReport(report);
+    await repos.tasks.addComment({ id: "comment-copy", taskId: task.id, projectId: "pr1", kind: "review_report", author, body: "通过", createdAt: at, reviewReportId: report.id });
+    await repos.tasks.appendHistory({ id: "history-copy", taskId: task.id, projectId: "pr1", action: "task.review_started", actor: author, taskRevision: 2, detail: { roundId: round.id }, createdAt: at });
+    await repos.tasks.linkMessage("pr1", { taskId: task.id, messageId: "msg1", groupId: "gp1", createdAt: at });
+    await repos.tasks.enqueueWorkEvent({ id: "event-copy", projectId: "pr1", recipientMemberId: "mb2", taskId: task.id, kind: "task.review_ready", eventKey: "review:round-copy:ready",
+      payload: { roundId: round.id, revision: 2 }, deliveryState: "pending", attempts: 0, createdAt: at, firstDeliveredAt: null, lastDeliveredAt: null, ackedAt: null });
+    await repos.tasks.markWorkEventsDelivered("pr1", "mb2", ["event-copy"], at);
+    await appendAuditEntry(repos.audit, { projectId: "pr1", actor: { kind: "human", name: "人" }, action: "task.review_started", targetKind: "task", targetId: task.id, targetName: task.title });
   } finally {
     await driver.close();
   }
@@ -90,11 +120,19 @@ const FK_DEPS: Record<string, string[]> = {
   agent_runtime_bindings: ["agent_runtimes", "projects", "groups", "members"],
   agent_runner_states: ["agent_runtime_bindings"],
   agent_runtime_members: ["agent_runtimes", "projects", "members", "agent_runtime_bindings"],
+  project_task_settings: ["projects", "members"],
+  tasks: ["projects", "members"],
+  task_review_rounds: ["projects", "tasks"],
+  task_review_reports: ["projects", "tasks", "task_review_rounds"],
+  task_comments: ["projects", "tasks", "task_review_reports"],
+  task_history: ["projects", "tasks"],
+  task_message_links: ["projects", "tasks", "messages", "groups"],
+  work_events: ["projects", "tasks", "members"],
 };
 
-test("业务表清单：18 张表、不含 schema_migrations、外键顺序合法", () => {
+test("业务表清单：26 张表、不含 schema_migrations、外键顺序合法", () => {
   const names = BUSINESS_TABLES.map((t) => t.name);
-  assert.equal(names.length, 18);
+  assert.equal(names.length, 26);
   assert.ok(!names.includes("schema_migrations"));
   for (const expected of [
     "agents",
@@ -115,6 +153,7 @@ test("业务表清单：18 张表、不含 schema_migrations、外键顺序合�
     "agent_runtime_events",
     "agent_runtime_observation_meta",
     "agent_runtime_usage_snapshots",
+    "project_task_settings", "tasks", "task_review_rounds", "task_review_reports", "task_comments", "task_history", "task_message_links", "work_events",
   ]) {
     assert.ok(names.includes(expected), `缺少业务表 ${expected}`);
   }
@@ -181,7 +220,8 @@ test("SQLite → SQLite：全量拷贝、一致性校验、源库只读、幂等
       assert.equal(srcCounts["members"], 3);
       assert.equal(srcCounts["org_nodes"], 4);
       assert.equal(srcCounts["messages"], 2);
-      assert.equal(srcCounts["audit_log"], 1);
+      assert.equal(srcCounts["audit_log"], 2);
+      for (const table of ["project_task_settings", "tasks", "task_review_rounds", "task_review_reports", "task_comments", "task_history", "task_message_links", "work_events"]) assert.equal(srcCounts[table], 1, table);
 
       // 幂等重跑：再次迁移仍一致。
       const again = await migrateData(srcOpts, dstOpts);
@@ -229,7 +269,7 @@ test("回滚：清空目标业务表，源库不受影响；可重新迁移恢�
       await migrateData(srcOpts, dstOpts);
 
       const rb = await rollbackTarget(dstOpts);
-      assert.equal(rb.clearedTables.length, 18);
+      assert.equal(rb.clearedTables.length, 26);
 
       // 目标业务表已清空，校验失败。
       const afterRollback = await validateData(srcOpts, dstOpts);

@@ -25,6 +25,7 @@ import { createRuntimeSupervisor, type RuntimeSupervisor } from "./runtime/super
 import { createHostLauncher } from "./runtime/hosts/launcher.ts";
 import type { HostLauncher } from "./runtime/hosts/types.ts";
 import { notifyMessageCommit } from "./runtime/dispatch-events.ts";
+import { createTaskApi } from "./tasks/api.ts";
 
 /** WebSocket 端点路径。 */
 export const WS_PATH = "/ws";
@@ -223,6 +224,8 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     supervisor: runtimeSupervisor, observations: runtimeObservations,
     ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}),
   });
+  const taskApi = createTaskApi({ db: driver, logger,
+    ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}) });
 
   const httpServer = createServer((request, response) => {
     void handleRequest(request, response).catch((error: unknown) => {
@@ -255,6 +258,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     }
 
     if (pathname.startsWith("/api/")) {
+      if (await taskApi.handle(request, response, pathname)) return;
       if (await runtimeApi.handle(request, response, pathname)) return;
       // T1（#14）项目/群组/成员 API；未匹配时落到统一的 404。
       if (await t1Api.handle(request, response, pathname)) return;

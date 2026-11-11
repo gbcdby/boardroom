@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { RouterLink, useRoute } from "vue-router";
-import { ApiError, api, type GroupDto, type MemberDto, type MessageDto, type ProjectDto } from "../api/client.ts";
+import { RouterLink, useRoute, useRouter } from "vue-router";
+import { ApiError, api, type GroupDto, type MemberDto, type MessageDto } from "../api/client.ts";
+
+import { projectPath, useCurrentProject, useProjectDraft } from "../composables/useCurrentProject.ts";
 
 const route = useRoute();
+const router = useRouter();
+const context = useCurrentProject();
+const { projects, currentProjectId: activeProjectId, currentProject: activeProject, loading: projectsLoading } = context;
 const queryValue = (value: unknown): string => typeof value === "string" ? value : "";
-const projects = ref<ProjectDto[]>([]);
-const activeProjectId = ref<string | null>(null);
 const groups = ref<GroupDto[]>([]);
 const members = ref<MemberDto[]>([]);
 const participants = ref<MemberDto[]>([]);
@@ -16,7 +19,6 @@ const messages = ref<MessageDto[]>([]);
 const draft = ref("");
 const error = ref<string | null>(null);
 const loadError = ref<"projects" | "project" | "history" | null>(null);
-const projectsLoading = ref(true);
 const projectLoading = ref(false);
 const historyLoading = ref(false);
 const sending = ref(false);
@@ -35,7 +37,6 @@ let historyRequest = 0;
 let contextRevision = 0;
 let draftRevision = 0;
 
-const activeProject = computed(() => projects.value.find((p) => p.id === activeProjectId.value) ?? null);
 const activeGroup = computed(() => groups.value.find((g) => g.id === activeGroupId.value) ?? null);
 const humanMembers = computed(() => participants.value.filter((m) => m.kind === "human" && m.status === "active"));
 const isArchived = computed(() => activeProject.value?.archivedAt != null || activeGroup.value?.archivedAt != null);
@@ -48,39 +49,17 @@ function errorMessage(err: unknown): string {
   return err instanceof ApiError || err instanceof Error ? err.message : "请求失败，请重试。";
 }
 
-async function loadProjects(): Promise<void> {
-  projectsLoading.value = true;
-  error.value = null;
-  loadError.value = null;
-  try {
-    const result = await api.listProjects();
-    if (disposed) return;
-    projects.value = result.projects;
-    if (activeProjectId.value === null || !projects.value.some((p) => p.id === activeProjectId.value)) {
-      const requested = queryValue(route.query["projectId"]);
-      activeProjectId.value = projects.value.find((p) => p.id === requested)?.id ?? projects.value[0]?.id ?? null;
-    }
-  } catch (err) {
-    if (!disposed) {
-      error.value = errorMessage(err);
-      loadError.value = "projects";
-    }
-  } finally {
-    if (!disposed) projectsLoading.value = false;
-  }
-}
-
 async function loadProject(projectId: string): Promise<void> {
   const request = ++projectRequest;
   projectLoading.value = true;
   error.value = null;
   loadError.value = null;
   try {
-    const [groupResult, memberResult] = await Promise.all([api.listGroups(projectId), api.listMembers(projectId)]);
+    const [groupResult, memberResult] = await Promise.all([api.listGroups(projectId, { includeArchived: true }), api.listMembers(projectId)]);
     if (disposed || request !== projectRequest || activeProjectId.value !== projectId) return;
     groups.value = groupResult.groups;
     members.value = memberResult.members;
-    const requested = queryValue(route.query["groupId"]);
+    const requested = queryValue(route.params["groupId"]);
     activeGroupId.value = groups.value.find((g) => g.id === requested)?.id ?? groups.value[0]?.id ?? null;
   } catch (err) {
     if (!disposed && request === projectRequest && activeProjectId.value === projectId) {
@@ -126,8 +105,7 @@ async function loadHistory(groupId: string): Promise<void> {
 }
 
 function retryLoad(): void {
-  if (loadError.value === "projects") void loadProjects();
-  else if (loadError.value === "project" && activeProjectId.value) void loadProject(activeProjectId.value);
+  if (loadError.value === "project" && activeProjectId.value) void loadProject(activeProjectId.value);
   else if (loadError.value === "history" && activeGroupId.value) void loadHistory(activeGroupId.value);
 }
 
@@ -162,13 +140,13 @@ function connectWs(): void {
   });
 }
 
-function selectProject(projectId: string): void {
-  activeProjectId.value = projectId || null;
+async function selectGroup(event: Event): Promise<void> {
+  const control = event.target as HTMLSelectElement;
+  if (activeProjectId.value) await router.push({ path: projectPath(activeProjectId.value, "chat", control.value), query: route.query });
+  control.value = activeGroupId.value ?? "";
 }
 
-function selectGroup(groupId: string): void {
-  activeGroupId.value = groupId || null;
-}
+useProjectDraft(() => draft.value.trim() !== "", () => { draft.value = ""; composing.value = false; newMessages.value = false; });
 
 function insertMention(member: MemberDto): void {
   if (!canCompose.value) return;
@@ -252,7 +230,7 @@ watch(activeProjectId, (id) => {
   activeGroupId.value = null;
   if (id !== null) void loadProject(id);
   else projectLoading.value = false;
-}, { flush: "sync" });
+}, { flush: "sync", immediate: true });
 watch(activeGroupId, (id) => {
   historyRequest += 1;
   contextRevision += 1;
@@ -274,18 +252,13 @@ watch(() => messages.value.length, async (length, previous) => {
   if (follow) scrollToLatest();
   else if (length > previous) newMessages.value = true;
 });
-watch(() => route.query, (query) => {
-  const projectId = queryValue(query["projectId"]);
-  const groupId = queryValue(query["groupId"]);
-  if (projectId && projects.value.some((p) => p.id === projectId)) {
-    if (activeProjectId.value !== projectId) activeProjectId.value = projectId;
-    else if (groups.value.some((g) => g.id === groupId)) activeGroupId.value = groupId;
-  }
+watch(() => route.params["groupId"], (value) => {
+  const groupId = queryValue(value);
+  if (groups.value.some((group) => group.id === groupId)) activeGroupId.value = groupId;
 });
 
 onMounted(() => {
   connectWs();
-  void loadProjects();
 });
 
 onBeforeUnmount(() => {
@@ -315,15 +288,8 @@ onBeforeUnmount(() => {
 
     <div class="panel chat-controls">
       <label class="field">
-        项目
-        <select :value="activeProjectId ?? ''" :disabled="projectsLoading || projects.length === 0" data-testid="chat-project" @change="selectProject(($event.target as HTMLSelectElement).value)">
-          <option v-if="projects.length === 0" value="">{{ projectsLoading ? '正在加载项目…' : '暂无项目' }}</option>
-          <option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}</option>
-        </select>
-      </label>
-      <label class="field">
         群组
-        <select :value="activeGroupId ?? ''" :disabled="projectLoading || groups.length === 0" data-testid="chat-group" @change="selectGroup(($event.target as HTMLSelectElement).value)">
+        <select :value="activeGroupId ?? ''" :disabled="projectLoading || groups.length === 0" data-testid="chat-group" @change="selectGroup($event)">
           <option v-if="groups.length === 0" value="">{{ projectLoading ? '正在加载群组…' : '暂无群组' }}</option>
           <option v-for="group in groups" :key="group.id" :value="group.id">{{ group.name }}</option>
         </select>
@@ -397,7 +363,7 @@ onBeforeUnmount(() => {
 .connection-badge { flex: 0 1 auto; }
 .connection-badge.open { color: var(--ok); }
 .connection-badge.closed { color: var(--warn); }
-.chat-controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+.chat-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
 .chat-controls .field, .chat-controls select { width: 100%; min-width: 0; }
 .conversation { position: relative; padding: 0; overflow: hidden; }
 .conversation-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--border); }

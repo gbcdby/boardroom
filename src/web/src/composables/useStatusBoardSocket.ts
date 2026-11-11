@@ -54,13 +54,17 @@ export function createStatusBoardSocket(endpoint?: string): StatusBoardSocket {
   }
 
   function connect(): void {
+    if (disposed) return;
     connection.value = "connecting";
-    socket = new WebSocket(wsUrl());
-    socket.addEventListener("open", () => {
+    const current = new WebSocket(wsUrl());
+    socket = current;
+    current.addEventListener("open", () => {
+      if (disposed || current !== socket) return;
       connection.value = "connected";
       sendPresence();
     });
-    socket.addEventListener("message", (event) => {
+    current.addEventListener("message", (event) => {
+      if (disposed || current !== socket) return;
       let data: unknown;
       try {
         data = JSON.parse(String(event.data));
@@ -68,7 +72,7 @@ export function createStatusBoardSocket(endpoint?: string): StatusBoardSocket {
         return;
       }
       const evt = data as { type?: string };
-      if (evt.type === "status_update") {
+      if (evt && evt.type === "status_update") {
         const update = data as StatusUpdateEvent;
         if (update.scope === "project" && update.projectId === currentProjectId) {
           statuses.value = update.statuses;
@@ -76,19 +80,24 @@ export function createStatusBoardSocket(endpoint?: string): StatusBoardSocket {
         }
       }
     });
-    socket.addEventListener("close", () => {
+    current.addEventListener("close", () => {
+      if (disposed || current !== socket) return;
       connection.value = "disconnected";
       if (!disposed) reconnectTimer = setTimeout(connect, 2000);
     });
-    socket.addEventListener("error", () => {
+    current.addEventListener("error", () => {
+      if (disposed || current !== socket) return;
       connection.value = "disconnected";
     });
   }
 
   function setProject(projectId: string | null, memberId?: string): void {
-    const changed = projectId !== currentProjectId || memberId !== currentMemberId;
+    const projectChanged = projectId !== currentProjectId;
+    const changed = projectChanged || memberId !== currentMemberId;
     currentProjectId = projectId;
     currentMemberId = memberId;
+    // 同项目补充 presence 身份不改变快照作用域，也不能重置 HTTP/WS 的新旧判定。
+    if (projectChanged) { statuses.value = []; serverTime.value = null; }
     if (projectId === null) {
       statuses.value = [];
       return;

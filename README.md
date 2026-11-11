@@ -14,12 +14,13 @@
 | 托管 Agent `/runtimes` | 配置、继承/覆盖、显式应用、启停意图、分层状态与有界观测；真实 CLI 执行按证据门控，当前均未开放 | [运行时说明](#可选托管-agent-运行时)、[子 spec #83](https://github.com/gbcdby/boardroom/issues/83) |
 | 成员生命周期 `/projects` | 暂停与恢复成员，保留历史、数据与岗位；与在线/离线状态分开 | [成员生命周期](docs/t3-member-lifecycle.md) |
 | 群聊 `/chat` | 人与 agent 发消息、`@` / `@all`、历史持久化、按成员范围投递与确认 | [聊天与路由](docs/t3-chat-and-routing.md) |
-| 状态看板 `/status` | 项目成员在线/离线、等待/工作、断线与陈旧状态，WebSocket 更新 | [状态与心跳](docs/t4-status-and-heartbeat.md) |
+| 状态看板 `/projects/:projectId/status` | 当前项目成员在线/离线、等待/工作、断线与陈旧状态，WebSocket 更新 | [状态与心跳](docs/t4-status-and-heartbeat.md) |
 | 组织与角色 `/org` | 组织树、岗位、汇报线、成员占岗，以及静态角色与能力范围 | [权限守卫](docs/f2-authorize-guard.md)、[页面实现](src/web/src/views/OrgView.vue) |
 | 审计与撤销 `/audit` | 变更记录、由人撤销可逆的成员/组织变更；永久删除不可撤销，归档/恢复使用对应正向操作 | [审计页面](src/web/src/views/AuditView.vue) |
-| 跨项目概览 `/status` | 展示各项目状态、成员/群组/消息/在线人数、最近活动与归档筛选；数据来自 `GET /api/projects` | [状态页实现](src/web/src/views/StatusBoardView.vue)、[HTTP 实现](src/server/api.ts) |
+| 跨项目概览 `/` | 展示各项目状态、成员/群组/消息/在线人数、最近活动与归档筛选；数据来自 `GET /api/projects` | [首页实现](src/web/src/views/HomeView.vue)、[HTTP 实现](src/server/api.ts) |
+| 任务 `/projects/:projectId/tasks` | 看板与列表、负责人和 reviewer、状态流转、固定 Git 候选、独立双轴报告和最终裁决、工作通知与历史 | [任务与评审](docs/tasks-and-review.md) |
 
-首页 `/` 目前展示健康与连接信息，仍保留早期“工程骨架”文案；跨项目概览请打开 `/status`。`/settings` 仍是占位页。**任务板、任务认领/调度和三层记忆尚未提供**，不应把架构规划当作当前能力。页面入口以[路由表](src/web/src/router.ts)为准。
+项目页面共享顶部“当前项目”，旧 `/chat`、`/org`、`/audit`、`/status`、`/tasks` 链接继续兼容该上下文。`/settings` 仍是占位页，三层记忆尚未提供。任务协议和页面已实现，真实模型双轴执行验收仍待完成。页面入口以[路由表](src/web/src/router.ts)为准。
 
 ## 快速开始
 
@@ -60,7 +61,7 @@ npm start
 }
 ```
 
-服务注册了 `join`、`wait_for_messages`、`send_message`、`acknowledge_message`、`report_status`、`heartbeat`、`read_history` 七个工具。参数、游标、可见范围和错误格式见 [MCP 工具契约](docs/mcp-tool-contract.md)；当前注册以[工具实现](src/server/mcp/server.ts)为准。每个 MCP 会话绑定一个项目/群组，连接成功不等于已经入群。
+服务注册了 `join`、`wait_for_messages`、`send_message`、`acknowledge_message`、`report_status`、`heartbeat`、`read_history` 七个聊天工具，以及十五个任务、评审与工作通知工具，共二十二个。参数、游标、可见范围和错误格式见 [MCP 工具契约](docs/mcp-tool-contract.md)与[任务扩展契约](docs/tasks-and-review.md)；当前注册以[工具实现](src/server/mcp/server.ts)为准。每个 MCP 会话绑定一个项目/群组，连接成功不等于已经入群。
 
 另有 [stdio 入口](src/server/mcp/stdio.ts)：由宿主运行 `node /绝对路径/src/server/mcp/stdio.ts`。它独立打开数据库，必须与 Web 服务使用同一存储配置（SQLite 使用相同的绝对数据目录）。**共享数据库不会共享进程内唤醒通知**；跨进程新消息需在再次调用 `wait_for_messages` 时读取积压。需要 WebUI 发消息及时结束挂起等待时，使用同一服务上的 Streamable HTTP。
 

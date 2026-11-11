@@ -73,6 +73,27 @@ jobs:
           AGENT_STUDIO_PG_CONNECTION_STRING: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
         run: npm run e2e
 
+      - name: SQLite 任务与评审协议端到端
+        env:
+          AGENT_STUDIO_DB_DRIVER: sqlite
+        run: npm run e2e:tasks
+
+      - name: PostgreSQL 任务与评审协议端到端
+        env:
+          AGENT_STUDIO_DB_DRIVER: postgres
+          AGENT_STUDIO_PG_CONNECTION_STRING: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: npm run e2e:tasks
+
+      - name: 保存任务协议报告（不作为模型验收）
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tasks-protocol-${{ github.run_attempt }}
+          path: .agent-output/tasks-e2e/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
   managed-web-browser:
     name: Chromium · 工作台与托管 Agent 页面
     runs-on: ubuntu-24.04
@@ -120,6 +141,9 @@ jobs:
       - name: 工作台真实浏览器交互与布局验证
         run: .agent-output/browser-venv/bin/python scripts/e2e-webui.py
 
+      - name: 任务与项目切换真实浏览器验证
+        run: .agent-output/browser-venv/bin/python scripts/e2e-tasks-web.py
+
       - name: 保存浏览器截图与逐项报告
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -129,6 +153,7 @@ jobs:
             .agent-output/managed-web-e2e/
             .agent-output/webui-e2e/
             .agent-output/webui-before/
+            .agent-output/tasks-web-e2e/
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7

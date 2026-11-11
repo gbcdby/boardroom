@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
-import { ApiError, api, type AuditEntryDto, type ProjectDto } from "../api/client.ts";
+import { ApiError, api, type AuditEntryDto } from "../api/client.ts";
 
 /**
  * T5（#52）审计查看与人的撤销权（最小可用）。
@@ -11,8 +11,11 @@ import { ApiError, api, type AuditEntryDto, type ProjectDto } from "../api/clien
  * 永久删除（project.delete / group.delete）与状态可逆（archive/restore）在页面侧置灰并说明原因。
  */
 
-const projects = ref<ProjectDto[]>([]);
-const activeProjectId = ref<string | null>(null);
+import { useCurrentProject } from "../composables/useCurrentProject.ts";
+const context = useCurrentProject();
+const { projects, currentProjectId: activeProjectId, currentProject: activeProject, readonly: projectReadonly } = context;
+let disposed = false;
+let request = 0;
 const entries = ref<AuditEntryDto[]>([]);
 
 const loading = ref(true);
@@ -20,6 +23,7 @@ const revokingId = ref<string | null>(null);
 const busy = computed(() => loading.value || revokingId.value !== null);
 const error = ref<string | null>(null);
 const notice = ref<string | null>(null);
+const visibleError = computed(() => error.value ?? context.error.value);
 
 // 与 `src/server/audit.ts` 的可逆/永久/状态可逆集合保持一致（仅用于前端置灰与提示）。
 const REVERSIBLE = new Set([
@@ -72,22 +76,20 @@ const TARGET_LABEL: Record<string, string> = {
   capability: "能力",
   group: "群组",
   project: "项目",
+  task: "任务",
 };
-
-const activeProject = computed(
-  () => projects.value.find((p) => p.id === activeProjectId.value) ?? null,
-);
 
 function actionLabel(action: string): string {
   return ACTION_LABEL[action] ?? action;
 }
 
 function canRevoke(entry: AuditEntryDto): boolean {
-  return !entry.reversedAt && REVERSIBLE.has(entry.action);
+  return !projectReadonly.value && !entry.reversedAt && REVERSIBLE.has(entry.action);
 }
 
 function revokeReason(entry: AuditEntryDto): string | null {
   if (entry.reversedAt) return "已撤销";
+  if (projectReadonly.value) return "项目已归档，仅供查看";
   if (PERMANENT.has(entry.action)) return "永久删除，不可撤销";
   if (STATE_REVERSIBLE.has(entry.action)) return "归档/恢复属状态可逆，请用正向操作复原";
   if (!REVERSIBLE.has(entry.action)) return "该操作不可撤销";
@@ -100,33 +102,23 @@ function clearMessages(): void {
 }
 
 async function loadProjects(): Promise<void> {
-  loading.value = true;
-  clearMessages();
-  try {
-    const res = await api.listProjects({ includeArchived: true });
-    projects.value = res.projects;
-    if (activeProjectId.value === null && projects.value.length > 0) {
-      activeProjectId.value = projects.value[0]!.id;
-    }
-    await loadAudit(true);
-  } catch (e) {
-    error.value = e instanceof ApiError ? e.message : String(e);
-  } finally {
-    loading.value = false;
-  }
+  await context.refreshProjects();
+  if (activeProjectId.value) await loadAudit();
 }
 
 async function loadAudit(preserveFeedback = false): Promise<void> {
   const projectId = activeProjectId.value;
   if (projectId === null) {
     entries.value = [];
+    loading.value = false;
     return;
   }
+  const version = ++request;
   loading.value = true;
   if (!preserveFeedback) clearMessages();
   try {
     const res = await api.listAudit(projectId);
-    if (activeProjectId.value === projectId) entries.value = res.entries;
+    if (!disposed && version === request && activeProjectId.value === projectId) entries.value = res.entries;
   } catch (e) {
     error.value = e instanceof ApiError ? e.message : String(e);
   } finally {
@@ -137,10 +129,12 @@ async function loadAudit(preserveFeedback = false): Promise<void> {
 async function revoke(entry: AuditEntryDto): Promise<void> {
   const projectId = activeProjectId.value;
   if (busy.value || projectId === null || !canRevoke(entry)) return;
+  const generation = context.generation.value;
   revokingId.value = entry.id;
   clearMessages();
   try {
     await api.revokeAudit(projectId, entry.id);
+    if (disposed || activeProjectId.value !== projectId || generation !== context.generation.value) return;
     notice.value = `已撤销「${actionLabel(entry.action)}」事件。`;
     await loadAudit(true);
   } catch (e) {
@@ -161,7 +155,8 @@ function formatTime(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
 }
 
-onMounted(loadProjects);
+watch(activeProjectId, () => { request++; selectProject(); }, { immediate: true });
+onBeforeUnmount(() => { disposed = true; request++; });
 </script>
 
 <template>
@@ -174,7 +169,7 @@ onMounted(loadProjects);
       <button type="button" class="secondary" :disabled="busy" data-testid="audit-refresh" @click="activeProjectId === null ? loadProjects() : loadAudit()">刷新记录</button>
     </header>
 
-    <p v-if="error" class="error" role="alert" data-testid="audit-error">{{ error }}</p>
+    <p v-if="visibleError" class="error" role="alert" data-testid="audit-error">{{ visibleError }}</p>
     <p v-if="notice" class="notice" role="status" data-testid="audit-notice">{{ notice }}</p>
 
     <section class="panel audit-panel" aria-labelledby="audit-records-title" :aria-busy="busy">
@@ -183,22 +178,16 @@ onMounted(loadProjects);
           <h2 id="audit-records-title">变更记录</h2>
           <p class="muted small">{{ entries.length }} 条记录<span v-if="activeProject?.archivedAt"> · 项目已归档</span></p>
         </div>
-        <label class="field audit-project-field" for="audit-project">
-          项目
-          <select id="audit-project" v-model="activeProjectId" :disabled="busy || projects.length === 0" @change="selectProject" data-testid="audit-project-select">
-            <option v-if="projects.length === 0" :value="null">{{ loading ? '正在加载项目…' : error ? '未能加载项目' : '暂无项目' }}</option>
-            <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
-          </select>
-        </label>
+
       </div>
 
       <p v-if="loading" class="muted small" role="status">正在加载变更记录…</p>
-      <div v-else-if="projects.length === 0 && !error" class="empty-state">
+      <div v-else-if="!activeProjectId && !visibleError" class="empty-state">
         <h3>还没有项目</h3>
         <p>创建项目并开始协作后，变更记录会显示在这里。</p>
         <RouterLink to="/projects">前往项目与群组</RouterLink>
       </div>
-      <div v-else-if="entries.length === 0 && !error" class="empty-state">
+      <div v-else-if="entries.length === 0 && !visibleError" class="empty-state">
         <h3>该项目暂无审计事件</h3>
         <p>成员和岗位的变更会自动留下记录。</p>
       </div>

@@ -22,7 +22,12 @@ import {
   type GuardScope,
   ROLE_REACH,
 } from "../authz/authorize.ts";
-import { actorForSession } from "../authz/actors.ts";
+import { actorForMember, actorForSession } from "../authz/actors.ts";
+import { orgActorForMember } from "../authz/org-actors.ts";
+import { createTaskService, type TaskAccess } from "../tasks/service.ts";
+import { invokeTaskOperation, mapTaskToolError, TASK_OBSERVATIONS, type TaskOperation } from "../tasks/mcp.ts";
+import { notifyWorkEventCommit, onWorkEventCommit } from "../tasks/events.ts";
+import type { WorkEvent } from "../../shared/tasks.ts";
 import { getAdapter, isRegistered, listAdapterIds } from "./adapters/index.ts";
 import { createRuntimeRepository } from "../runtime/repository.ts";
 import { notifyMessageCommit } from "../runtime/dispatch-events.ts";
@@ -166,6 +171,7 @@ export interface JoinResult {
   readonly heartbeat: Heartbeat;
   /** T6（#53）：入群即注入的会话上下文。 */
   readonly context: McpSessionContext;
+  readonly workEvents?: WorkEvent[];
 }
 
 export interface SendMessageParams {
@@ -216,7 +222,7 @@ export interface ReadHistoryResult {
   readonly hasMore: boolean;
 }
 
-export type WaitStatus = "message" | "timeout" | "cancelled";
+export type WaitStatus = "message" | "work" | "timeout" | "cancelled";
 
 export interface WaitResult {
   readonly ok: true;
@@ -224,6 +230,7 @@ export interface WaitResult {
   readonly messages: Message[];
   readonly cursor: string | null;
   readonly drainedBacklog: boolean;
+  readonly workEvents?: WorkEvent[];
 }
 
 export interface WaitParams {
@@ -287,14 +294,25 @@ export const MAX_HISTORY_LIMIT = 100;
 export const DEFAULT_HISTORY_LIMIT = 20;
 
 /** 挂起中的等待（运行时对象，不落库）。 */
+interface WaitDrainRequest {
+  readonly drainedBacklog: boolean;
+  readonly workOnly?: boolean;
+  readonly wakeOnly?: boolean;
+}
+
 interface PendingWait {
   readonly ownerKey: string;
   readonly memberId: string;
   readonly groupId: string;
+  readonly afterSeq: number | undefined;
   readonly resolve: (result: WaitResult) => void;
   readonly settled: () => void;
   done: boolean;
+  deadlineReached: boolean;
   timer: NodeJS.Timeout | null;
+  pollTimer: NodeJS.Timeout | null;
+  draining: Promise<boolean> | null;
+  readonly drainRequests: WaitDrainRequest[];
   abortListener: (() => void) | null;
 }
 
@@ -414,6 +432,7 @@ export interface McpCore {
   attemptInterrupt(sessionId: string, params?: InterruptParams): Promise<InterruptAttempt>;
   heartbeat(sessionId: string): Promise<HeartbeatResult>;
   readHistory(sessionId: string, params: ReadHistoryParams): Promise<ReadHistoryResult>;
+  taskOperation(sessionId: string, operation: TaskOperation, input: unknown): Promise<Record<string, unknown>>;
   /**
    * T8（#21）：唤醒本 core 中在该群组等待、且属于 `wakeGate` 放行集合的成员。
    * 供人的 HTTP 消息路径显式触发（该路径不经过任何 core 的 send_message，因此需外部调用）。
@@ -442,6 +461,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   const memberKey = options.memberKey ?? "default";
 
   const repos: RepositorySet = createRepositories(options.db);
+  const tasks = createTaskService({ repos, now,
+    onWorkEvents: events => notifyWorkEventCommit(options.db, events) });
   const runtimes = createRuntimeRepository(options.db);
   /** T7：进程级共享的防环/限流器。 */
   const antiLoop = getSharedAntiLoop(options.antiLoop);
@@ -452,6 +473,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   /** 每位成员最多一个并发等待。 */
   const waitingMembers = new Set<string>();
   let closed = false;
+  let unsubscribeWorkEvents = () => {};
 
   const selfKey = (sessionId: string): string => `${memberKey}:${sessionId}`;
 
@@ -471,6 +493,22 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       }
       throw error;
     }
+  }
+
+  async function taskAccess(binding: SessionBinding): Promise<TaskAccess> {
+    return {
+      // 任务主体只取真实连接身份，领域服务随后按 DB 当前岗位/状态重新解析权限。
+      actor: actorForSession(binding),
+      connection: { projectId: binding.projectId, memberId: binding.memberId, groupId: binding.groupId },
+      runMutation: (operation, body) => withAccess(binding, operation, async () => {
+        // 领域冲突先转换，避免被外层运行时 fence 错认成所有权冲突。
+        try { return await body(); }
+        catch (error) {
+          if (error instanceof RepositoryError && error.code === "conflict") throw mapTaskToolError(error);
+          throw error;
+        }
+      }),
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -579,8 +617,12 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 拒绝时按 MCP 契约抛 `FORBIDDEN`，并在 details 里给出稳定拒绝码。
    */
   async function guard(binding: SessionBinding, capability: Capability, scope: GuardScope, denyMessage?: string): Promise<void> {
+    const member = await repos.members.get(binding.memberId);
+    if (!member || member.projectId !== binding.projectId || member.status !== "active") {
+      throw new McpToolError("FORBIDDEN", "当前成员已退出或停用，不能继续访问。", { reason: "inactive_member" });
+    }
     const decision = authorize(
-      (await (options.authz?.actorFor?.(binding))) ?? actorForSession(binding),
+      (await options.authz?.actorFor?.(binding)) ?? (await orgActorForMember(repos, binding.memberId)) ?? actorForMember(member),
       capability,
       {
         ...scope,
@@ -644,11 +686,12 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       },
       roster,
     );
-    return plan.visible.includes(binding.memberId);
+    return plan.visible.includes(binding.memberId) || await tasks.canReadLinkedMessage(await taskAccess(binding), binding.projectId, message.id);
   }
 
   /** 从 afterSeq 之后取该成员可见、且未 acked 的消息（积压/唤醒）。 */
   async function deliverableSince(binding: SessionBinding, afterSeq: number | undefined): Promise<DbMessage[]> {
+    await guard(binding, "group:view", { projectId: binding.projectId, groupId: binding.groupId });
     const list = await (repos.messages.listByGroup(binding.groupId, {
       ...(afterSeq === undefined ? {} : { afterSeq }),
     }));
@@ -660,7 +703,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         { senderMemberId: message.senderMemberId, mentionIds: message.mentions, mentionsAll: false },
         roster,
       );
-      if (!plan.visible.includes(binding.memberId)) continue;
+      if (!plan.visible.includes(binding.memberId) && !await tasks.canReadLinkedMessage(await taskAccess(binding), binding.projectId, message.id)) continue;
       const delivery = await (repos.deliveries.get(message.id, binding.memberId));
       if (delivery?.status === "acked") continue;
       pending.push(message);
@@ -703,7 +746,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   async function settle(entry: PendingWait, result: WaitResult): Promise<void> {
     if (entry.done) return;
     entry.done = true;
+    entry.drainRequests.length = 0;
     if (entry.timer) clearTimeout(entry.timer);
+    if (entry.pollTimer) clearInterval(entry.pollTimer);
     const idx = pendingWaits.indexOf(entry);
     if (idx >= 0) pendingWaits.splice(idx, 1);
     waitingMembers.delete(entry.memberId);
@@ -718,6 +763,68 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     entry.resolve(result);
   }
 
+  /** 串行结算同一次等待，工作事件不会扩大聊天的 mention 唤醒范围。 */
+  async function drainWait(entry: PendingWait, binding: SessionBinding, input: WaitDrainRequest, finalCheck = false): Promise<boolean> {
+    if (entry.done || (entry.deadlineReached && !finalCheck)) return false;
+    // 正在读取的快照可能早于新通知。最多保留积压、聊天唤醒、工作通知各一次重扫；
+    // 保留各自的唤醒限制，不能用工作轮询覆盖聊天唤醒，也不能放宽 anti-loop 门控。
+    if (!entry.drainRequests.some(request => request.drainedBacklog === input.drainedBacklog
+      && request.workOnly === input.workOnly && request.wakeOnly === input.wakeOnly)) {
+      entry.drainRequests.push(input);
+    }
+    if (entry.draining) return await entry.draining;
+    async function drainSnapshot(input: WaitDrainRequest): Promise<boolean> {
+      const access = await taskAccess(binding);
+      const available = await withAccess(binding, "observe", () => tasks.listWorkEvents(access, binding.projectId));
+      if (input.workOnly && available.length === 0) return false;
+      let messages = await deliverableSince(binding, entry.afterSeq);
+      if (input.wakeOnly && available.length === 0) {
+        const roster = await buildRosterFor(binding.groupId);
+        messages = messages.filter(message => resolveWakeAndVisibility({ senderMemberId: message.senderMemberId,
+          mentionIds: message.mentions, mentionsAll: false }, roster).wake.includes(binding.memberId));
+      }
+      if (entry.done || (messages.length === 0 && available.length === 0)) return false;
+      const delivered = await withAccess(binding, "consume", async () => {
+        if (entry.done) return null;
+        const workEvents = available.length ? await tasks.deliverWorkEvents(access, binding.projectId) : [];
+        const batch = messages.length ? await markDelivered(binding, messages) : null;
+        if (workEvents.length && !batch && options.managed) await options.managed.onDelivery();
+        return { workEvents, batch };
+      });
+      if (!delivered || entry.done) return false;
+      if (!delivered.batch && delivered.workEvents.length === 0) return false;
+      await settle(entry, { ok: true, status: delivered.batch ? "message" : "work",
+        messages: delivered.batch?.messages ?? [],
+        cursor: delivered.batch ? seqCursor(delivered.batch.lastSeq) : await lastDeliveredCursor(binding),
+        drainedBacklog: input.drainedBacklog,
+        ...(delivered.workEvents.length ? { workEvents: delivered.workEvents } : {}),
+      });
+      return true;
+    }
+    const pending = (async () => {
+      try {
+        while (!entry.done && entry.drainRequests.length > 0) {
+          if (await drainSnapshot(entry.drainRequests.shift()!)) return true;
+        }
+        return false;
+      } finally { entry.draining = null; }
+    })();
+    entry.draining = pending;
+    return await pending;
+  }
+
+  async function resolveWorkEvents(events?: readonly WorkEvent[]): Promise<void> {
+    for (const entry of [...pendingWaits]) {
+      const binding = bindingByMember(entry.memberId);
+      if (!binding || (events && !events.some(event => event.projectId === binding.projectId && event.recipientMemberId === binding.memberId))) continue;
+      try { await drainWait(entry, binding, { drainedBacklog: false, workOnly: true }); }
+      catch (error) {
+        log.warn("work_event_delivery_failed", { error, memberId: binding.memberId });
+        await settle(entry, { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false });
+      }
+    }
+  }
+
   /**
    * 唤醒本 core 中在该群组等待、且「按路由规则应被唤醒」的成员。
    * 由「写入消息的 core」调用，跨 core 时通过注册表遍历所有 core。
@@ -726,37 +833,16 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    * 发送者排除）。可见但非唤醒的消息（例如普通 agent 自己发的）不会触发等待方返回。
    */
   async function resolveGroupInternal(groupId: string, wakeGate?: ReadonlySet<string>): Promise<void> {
-    const roster = await (buildRosterFor(groupId));
     for (const entry of [...pendingWaits]) {
       const binding = bindingByMember(entry.memberId);
       if (!binding || binding.groupId !== groupId) continue;
       // T7：限流门控——某成员不在放行集合内则本次不唤醒（其消息仍为 pending，后续补投）。
       if (wakeGate && !wakeGate.has(binding.memberId)) continue;
-      const messages = await (deliverableSince(binding, undefined));
-      if (messages.length === 0) continue;
-      // 逐条判定是否属于该成员的唤醒范围；有任一消息唤醒才结算。
-      const wakeMessages = messages.filter((message) => {
-        const plan = resolveWakeAndVisibility(
-          { senderMemberId: message.senderMemberId, mentionIds: message.mentions, mentionsAll: false },
-          roster,
-        );
-        return plan.wake.includes(binding.memberId);
-      });
-      if (wakeMessages.length === 0) continue;
-      let delivered: { messages: Message[]; lastSeq: number };
-      try { delivered = await markDelivered(binding, wakeMessages); } catch (error) {
+      try { await drainWait(entry, binding, { drainedBacklog: false, wakeOnly: true }); } catch (error) {
         await settle(entry, { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false });
         if (options.managed) continue;
         throw error;
       }
-      await (settle(entry, {
-        ok: true,
-        status: "message",
-        messages: delivered.messages,
-        cursor: seqCursor(delivered.lastSeq),
-        drainedBacklog: false,
-      }));
-      return;
     }
   }
 
@@ -848,7 +934,22 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         hostType: binding.hostType,
         mcpSessionId: binding.mcpSessionId,
       });
-      return toJoinResult(binding, heartbeat, await (buildSessionContext(binding)));
+      return toJoinResult(binding, heartbeat, await buildSessionContext(binding));
+    },
+
+    async taskOperation(sessionId, operation, input) {
+      const binding = bindingFor(sessionId);
+      try {
+        const access = await taskAccess(binding);
+        const invoke = async () => {
+          try { return await invokeTaskOperation(tasks, access, binding.projectId, operation, input); }
+          catch (error) { throw mapTaskToolError(error); }
+        };
+        if (TASK_OBSERVATIONS.has(operation)) return await withAccess(binding, "observe", invoke);
+        // 长 Git 采集不持有运行时/数据库锁，服务的每次短提交重新使用 runMutation fence。
+        await withAccess(binding, "observe", async () => {});
+        return await invoke();
+      } catch (error) { throw mapTaskToolError(error); }
     },
 
     async waitForMessages(sessionId, params) {
@@ -872,6 +973,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       // #61/PG：先登记挂起等待（入队 pendingWaits + waitingMembers），再做任何异步读取。
       // PostgreSQL 下 deliverableSince / markWaiting 是网络往返、延迟更大；若不先登记，
       // 唤醒（resolveGroup）可能在等待登记前执行，导致消息漏投（SQLite 延迟小不易暴露）。
+      const afterSeq = cursorToSeq(params.afterCursor);
       waitingMembers.add(binding.memberId);
       let entry!: PendingWait;
       const waitPromise = new Promise<WaitResult>((resolve) => {
@@ -879,6 +981,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
           ownerKey: memberKey,
           memberId: binding.memberId,
           groupId: binding.groupId,
+          afterSeq,
           resolve,
           settled: () => {
             if (entry.abortListener && params.signal) {
@@ -886,19 +989,30 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
             }
           },
           done: false,
+          deadlineReached: false,
           timer: null,
+          pollTimer: null,
+          draining: null,
+          drainRequests: [],
           abortListener: null,
         };
         entry.timer = setTimeout(async () => {
+          // 到期后不再接收新重扫，收束已有有限队列和一次最终检查。
+          // 不强行中断 DB 查询，但慢查询也不能被每秒 poll 无限续期。
+          entry.deadlineReached = true;
+          if (entry.pollTimer) clearInterval(entry.pollTimer);
           log.debug("wait_timeout", { memberId: binding.memberId, timeoutMs });
-          await (settle(entry, {
-            ok: true,
-            status: "timeout",
-            messages: [],
-            cursor: await (lastDeliveredCursor(binding)),
-            drainedBacklog: false,
-          }));
+          try {
+            if (await drainWait(entry, binding, { drainedBacklog: false, workOnly: true }, true)) return;
+            await settle(entry, { ok: true, status: "timeout", messages: [], cursor: await lastDeliveredCursor(binding), drainedBacklog: false });
+          } catch (error) {
+            log.warn("wait_work_event_check_failed", { error, memberId: binding.memberId });
+            await settle(entry, { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false });
+          }
         }, timeoutMs);
+        // stdio 与 HTTP 可处于不同进程；持久查询补足进程内通知，仍只在宿主已挂起的 wait 安全点返回。
+        entry.pollTimer = setInterval(() => { void resolveWorkEvents(); }, 1000);
+        entry.pollTimer.unref();
         if (params.signal) {
           entry.abortListener = async () => {
             log.debug("wait_cancelled", { memberId: binding.memberId });
@@ -915,38 +1029,16 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         pendingWaits.push(entry);
       });
 
-      const afterSeq = cursorToSeq(params.afterCursor);
-      let backlog: DbMessage[];
-      let delivered: { messages: Message[]; lastSeq: number } | undefined;
       try {
-        backlog = await deliverableSince(binding, afterSeq);
-        if (backlog.length > 0) delivered = await markDelivered(binding, backlog);
+        await drainWait(entry, binding, { drainedBacklog: true });
       } catch (error) {
         await settle(entry, { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false });
         throw error;
       }
-      if (delivered) {
-        // 立即拿到积压：不在等待循环中停留，跳过 waiting 直接进入 working（处理收到的消息）。
-        await (markWorking(binding));
-        log.debug("wait_drained_backlog", { memberId: binding.memberId, count: delivered.messages.length });
-        await (settle(entry, {
-          ok: true,
-          status: "message",
-          messages: delivered.messages,
-          cursor: seqCursor(delivered.lastSeq),
-          drainedBacklog: true,
-        }));
-        return {
-          ok: true,
-          status: "message",
-          messages: delivered.messages,
-          cursor: seqCursor(delivered.lastSeq),
-          drainedBacklog: true,
-        };
+      if (!entry.done) {
+        await markWaiting(binding);
+        if (entry.done && !closed) await markWorking(binding);
       }
-
-      // 进入等待循环 = 显式「在等待」→ waiting（T4/AGENT-04）。
-      await (markWaiting(binding));
       return await waitPromise;
     },
 
@@ -1251,6 +1343,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     async close() {
       if (closed) return;
       closed = true;
+      unsubscribeWorkEvents();
       activeRegistrations.delete(registration);
       let drained = 0;
       for (const entry of [...pendingWaits]) {
@@ -1284,11 +1377,25 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
   const registration: CoreInternals = { core, resolveGroup: resolveGroupInternal };
   activeRegistrations.add(registration);
+  unsubscribeWorkEvents = onWorkEventCommit(options.db, resolveWorkEvents);
 
   // 短工具整体与 fence 检查处于同一事务；长等待在真正出队时再次检查。
   return {
     ...core,
-    join: (sid, params) => withAccess(null, "join", () => core.join(sid, params)),
+    join: async (sid, params) => {
+      // gateway 的 join 完成回调先确认通道就绪，再以 consume fence 领取持久工作事件。
+      const result = await withAccess(null, "join", () => core.join(sid, params));
+      const binding = bindingFor(sid);
+      const access = await taskAccess(binding);
+      const pending = await withAccess(binding, "observe", () => tasks.listWorkEvents(access, binding.projectId));
+      if (pending.length === 0) return result;
+      const workEvents = await withAccess(binding, "consume", async () => {
+        const events = await tasks.deliverWorkEvents(access, binding.projectId);
+        if (events.length && options.managed) await options.managed.onDelivery();
+        return events;
+      });
+      return workEvents.length ? { ...result, workEvents } : result;
+    },
     acknowledgeMessage: (sid, id) => withAccess(bindingFor(sid), "write", () => core.acknowledgeMessage(sid, id)),
     reportStatus: (sid, params) => withAccess(bindingFor(sid), "observe", () => core.reportStatus(sid, params)),
     heartbeat: (sid) => withAccess(bindingFor(sid), "observe", () => core.heartbeat(sid)),
