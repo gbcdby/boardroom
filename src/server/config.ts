@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { MemoryConfig } from "../shared/memory.ts";
+import { ConfigError } from "./config-error.ts";
+export { ConfigError } from "./config-error.ts";
 
 /** 默认监听端口；仅绑定 127.0.0.1。 */
 export const DEFAULT_PORT = 4317;
@@ -83,11 +85,6 @@ export interface AppConfig {
   readonly pgConnectionString?: string;
   /** 实际加载的配置文件绝对路径；没有配置文件时为 null。 */
   readonly configFile: string | null;
-}
-
-/** 配置加载失败；message 面向用户，包含可恢复路径所需的上下文。 */
-export class ConfigError extends Error {
-  override readonly name = "ConfigError";
 }
 
 export interface LoadConfigOptions {
