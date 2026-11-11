@@ -45,7 +45,23 @@ for (const engine of identityEngines) {
       assert.equal(tombstones.length, 2); assert.ok(tombstones.every(row => typeof row.retired_at === "string"));
       await assert.rejects(f.repos.agents.findByIdentity("待删除", "other"), /agent_identity_retired/);
       await assert.rejects(f.repos.agents.create({ displayName: "待删除", hostType: "other" }), /agent_alias_conflict/);
+      await assert.rejects(f.repos.agents.insertRaw({ ...a, displayName: "换名复活旧 ID" }), /agent_identity_retired/);
       assert.equal((await f.repos.agents.list()).length, 0);
+      assert.deepEqual(await f.db.query("SELECT * FROM agent_legacy_aliases WHERE agent_id = ?", [a.id]), tombstones);
+    } finally { await f.close(); }
+  });
+
+  test(`${engine} 被 Member 引用的 Agent 删除失败，alias 退休标记同事务回滚`, { skip: identitySkip(engine) }, async () => {
+    const f = await identityFixture(engine);
+    try {
+      const agent = await f.repos.agents.create({ displayName: "仍被引用", hostType: "other" });
+      const project = await f.repos.projects.create({ name: "身份保留" });
+      const member = await f.repos.members.create({ projectId: project.id, kind: "agent", agentId: agent.id, displayName: agent.displayName });
+      const before = await f.repos.agents.aliases(agent.id);
+      await assert.rejects(f.repos.agents.delete(agent.id));
+      assert.deepEqual(await f.repos.agents.aliases(agent.id), before);
+      assert.equal((await f.repos.agents.findByIdentity(agent.displayName, agent.hostType))?.id, agent.id);
+      assert.equal((await f.repos.members.get(member.id))?.agentId, agent.id);
     } finally { await f.close(); }
   });
 
@@ -88,6 +104,15 @@ for (const engine of identityEngines) {
       assert.equal((await f.repos.messages.get(message.id))!.senderMemberId, first.memberId);
       assert.equal((await f.repos.agents.list()).length, 1);
       assert.equal((await next.call(args)).ok, true, "同一连接以原 alias 重试仍幂等");
+
+      const retired = await f.repos.agents.create({ displayName: "已退休接入", hostType: args.hostType });
+      await f.repos.agents.delete(retired.id);
+      const retiredPeer = await peer("retired-reconnect");
+      const denied = await retiredPeer.call({ ...args, displayName: retired.displayName });
+      assert.equal(denied.ok, false);
+      assert.equal(denied.error.code, "CONFLICT");
+      assert.equal(denied.error.details.reason, "agent_identity_retired");
+      assert.equal((await f.repos.agents.list()).length, 1, "旧 alias 被拒绝后不能偷偷注册新身份");
     } finally { for (const p of peers) await p.close(); await f.close(); }
   });
 }

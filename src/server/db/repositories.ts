@@ -736,8 +736,14 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
         agent.updatedAt,
         agent.lastSeenAt,
       ]);
-      if (await hasIdentityCatalogSchema(ctx)) await reserveLegacyAlias(ctx, { agentId: agent.id,
-        displayName: agent.displayName, hostType: agent.hostType, createdAt: agent.createdAt });
+      if (await hasIdentityCatalogSchema(ctx)) {
+        // 放在 INSERT 获得 ID 的排他性之后检查，避免与旧身份删除交错时复活同一 ID。
+        if (await ctx.one("SELECT agent_id FROM agent_legacy_aliases WHERE agent_id = ? AND retired_at IS NOT NULL LIMIT 1", [agent.id])) {
+          throw new ConflictError("agent_identity_retired");
+        }
+        await reserveLegacyAlias(ctx, { agentId: agent.id,
+          displayName: agent.displayName, hostType: agent.hostType, createdAt: agent.createdAt });
+      }
     } catch (error) {
       throw normalizeError(error);
     }

@@ -1663,7 +1663,8 @@ function buildInterruptReason(result: InterruptResult, hostType: HostType, targe
   if (error instanceof RepositoryError) {
     switch (error.code) {
       case "conflict":
-        return new McpToolError("CONFLICT", `身份或成员冲突：${error.message}`, ctx);
+        return new McpToolError("CONFLICT", `身份或成员冲突：${error.message}`,
+          ["agent_identity_retired", "agent_alias_conflict"].includes(error.message) ? { ...ctx, reason: error.message } : ctx);
       case "migration_identity_ambiguous":
         return new McpToolError("CONFLICT", error.message, { ...ctx, reason: error.code });
       case "archived":
