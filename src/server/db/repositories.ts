@@ -3,6 +3,7 @@ import { getMutationScopeCoordinator, type MutationScopeCoordinator } from "./mu
 import { observeSql, repositorySqlObserver } from "./sql-observer.ts";
 import { ForbiddenError } from "../authz/authorize.ts";
 import { coordinateRepositoryWrites } from "./coordinated-repositories.ts";
+import { groupOrphanRuntimeMembers, purgeImpactDigest } from "./purge-impact.ts";
 import type { DbDriver, DbTransaction, DbRow } from "./driver.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
@@ -155,6 +156,13 @@ export interface GroupPurgeCounts {
   readonly agentRuntimeMembers: number;
 }
 
+/** 服务端持有的删除预览；target、cascade 与 digest 来自同一事务/协调范围。 */
+export interface PurgeSnapshot<T, C> {
+  readonly target: T;
+  readonly cascade: C;
+  readonly digest: string;
+}
+
 export interface ProjectsRepository {
   create(input: NewProject): Promise<Project>;
   get(id: string): Promise<Project | null>;
@@ -167,12 +175,13 @@ export interface ProjectsRepository {
   restore(id: string): Promise<Project>;
   /** 永久删除前的级联清单（只读，不改数据）。项目不存在时抛 NotFoundError。 */
   previewPurge(id: string): Promise<PurgeCounts>;
+  capturePurge(id: string): Promise<PurgeSnapshot<Project, PurgeCounts>>;
   /**
    * 永久删除项目：在**单个事务**内按「子 → 父」顺序级联清除群组、群聊消息、投递、
    * 参与者关系、成员、成员状态与 MCP 会话，最后删项目本身；返回实际清除的行数。
    * 只应在人二次确认后由入口调用（PROJECT-03）：agent 主体没有 `project:purge` 能力点。
    */
-  purge(id: string): Promise<PurgeCounts>;
+  purge(id: string, expectedDigest?: string): Promise<PurgeCounts>;
   delete(id: string): Promise<void>;
 }
 
@@ -269,12 +278,13 @@ export interface GroupsRepository {
   restore(id: string): Promise<Group>;
   /** 永久删除前的级联清单（只读）。群组不存在时抛 NotFoundError。 */
   previewPurge(id: string): Promise<GroupPurgeCounts>;
+  capturePurge(id: string): Promise<PurgeSnapshot<Group, GroupPurgeCounts>>;
   /**
    * 永久删除群组（#48 / GROUP-04、LIFE-ARC-02）：单事务内清除**该群组的群聊**
    * （消息与投递记录）、**参与者关系**，以及随群组消失的连接会话记录。
    * 项目成员本身**不动**——这是与 {@link ProjectsRepository.purge} 的关键差别。
    */
-  purge(id: string): Promise<GroupPurgeCounts>;
+  purge(id: string, expectedDigest?: string): Promise<GroupPurgeCounts>;
   participants(groupId: string): Promise<string[]>;
   addParticipant(groupId: string, memberId: string): Promise<void>;
   removeParticipant(groupId: string, memberId: string): Promise<void>;
@@ -627,9 +637,7 @@ async function groupPurgeCounts(ctx: RepoCtx, groupId: string): Promise<GroupPur
     mcpSessions: await count("SELECT COUNT(*) AS c FROM mcp_sessions WHERE group_id = ?"),
     agentRuntimeBindings: managed ? await count("SELECT COUNT(*) AS c FROM agent_runtime_bindings WHERE group_id = ?") : 0,
     agentRunnerStates: managed ? await count("SELECT COUNT(*) AS c FROM agent_runner_states WHERE binding_id IN (SELECT id FROM agent_runtime_bindings WHERE group_id = ?)") : 0,
-    agentRuntimeMembers: managed ? await count(`SELECT COUNT(*) AS c FROM agent_runtime_members rm
-      WHERE rm.member_id IN (SELECT member_id FROM agent_runtime_bindings WHERE group_id = ?)
-        AND (SELECT COUNT(*) FROM agent_runtime_bindings b WHERE b.member_id = rm.member_id) = 1`) : 0,
+    agentRuntimeMembers: managed ? Number((await ctx.one<CountRow>(`SELECT COUNT(*) AS c FROM (${groupOrphanRuntimeMembers}) affected`, [groupId, groupId, groupId]))?.c ?? 0) : 0,
   };
 }
 
@@ -915,10 +923,20 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
       if (!(await this.get(id))) throw new NotFoundError(`Project ${id} 不存在。`);
       return projectPurgeCounts(ctx, id);
     },
-    async purge(id) {
+    async capturePurge(id) {
+      return ctx.withTransaction(async () => {
+        const target = await this.get(id);
+        if (!target) throw new NotFoundError(`Project ${id} 不存在。`);
+        return { target, cascade: await projectPurgeCounts(ctx, id), digest: await purgeImpactDigest(ctx, "project", id) };
+      });
+    },
+    async purge(id, expectedDigest) {
       if (!(await this.get(id))) throw new NotFoundError(`Project ${id} 不存在。`);
       return ctx.withTransaction(async () => {
         await requireManagedStopped(ctx, "project", id, mutations);
+        if (expectedDigest !== undefined && expectedDigest !== await purgeImpactDigest(ctx, "project", id)) {
+          throw new RepositoryError("confirmation_changed", "永久删除的影响范围已变化，请重新获取级联清单并再次确认。");
+        }
         const counts = await projectPurgeCounts(ctx, id);
         if (await hasMemorySchema(ctx)) {
           for (const table of ["memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints"]) {
@@ -1298,10 +1316,20 @@ function createGroups(ctx: RepoCtx, mutations: MutationScopeCoordinator): Groups
       if (!(await repo.get(id))) throw new NotFoundError(`Group ${id} 不存在。`);
       return groupPurgeCounts(ctx, id);
     },
-    async purge(id) {
+    async capturePurge(id) {
+      return ctx.withTransaction(async () => {
+        const target = await repo.get(id);
+        if (!target) throw new NotFoundError(`Group ${id} 不存在。`);
+        return { target, cascade: await groupPurgeCounts(ctx, id), digest: await purgeImpactDigest(ctx, "group", id) };
+      });
+    },
+    async purge(id, expectedDigest) {
       if (!(await repo.get(id))) throw new NotFoundError(`Group ${id} 不存在。`);
       return ctx.withTransaction(async () => {
         await requireManagedStopped(ctx, "group", id, mutations);
+        if (expectedDigest !== undefined && expectedDigest !== await purgeImpactDigest(ctx, "group", id)) {
+          throw new RepositoryError("confirmation_changed", "永久删除的影响范围已变化，请重新获取级联清单并再次确认。");
+        }
         const projectId = (await repo.get(id))!.projectId;
         const affected = await hasRuntimeSchema(ctx) ? await ctx.query<MemberIdRow>('SELECT DISTINCT member_id FROM agent_runtime_bindings WHERE group_id = ? ORDER BY member_id', [id]) : [];
         const counts = await groupPurgeCounts(ctx, id);

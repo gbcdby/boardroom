@@ -176,7 +176,8 @@ export async function request<T>(method: string, path: string, body?: unknown): 
 
 /**
  * 永久删除的级联清单（T1 #48）：确认弹窗里给「人」看清楚会清掉什么。
- * 项目清群组/群聊/投递/成员/状态/会话；群组只清群聊与参与者关系（成员保留）。
+ * 项目与群各自包含实际删除的托管绑定、运行状态和成员预留关系；全局托管配置保留。
+ * 群删除保留项目成员，仅清除不再被其他群绑定使用的未占用托管成员预留关系。
  */
 export interface ProjectPurgeCascade {
   memberFactRevisions: number;
@@ -202,6 +203,9 @@ export interface ProjectPurgeCascade {
   deliveries: number;
   memberStatuses: number;
   mcpSessions: number;
+  agentRuntimeBindings: number;
+  agentRunnerStates: number;
+  agentRuntimeMembers: number;
 }
 
 export interface GroupPurgeCascade {
@@ -215,6 +219,9 @@ export interface GroupPurgeCascade {
   deliveries: number;
   participants: number;
   mcpSessions: number;
+  agentRuntimeBindings: number;
+  agentRunnerStates: number;
+  agentRuntimeMembers: number;
 }
 
 export interface ProjectPurgeConfirmation {

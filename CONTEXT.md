@@ -61,6 +61,7 @@
 | feature 分支 HEAD 上 `npm test` / `tsc` 全绿，合并到 `main` 后同一套命令立刻变成 2 个测试失败 + 5 个 tsc 错误 | `main` 在分支分叉后由 `c345f3a` 新增了 `tests/host-adapter-converge.test.ts` 的 AC-HOST-01/04 用例，按旧同步 API 编写；#61 把 `core.join` / `attemptInterrupt` / `close` / `ctx.spawn` 改为 async，Git 文本合并无冲突但语义不兼容（未 `await`） | 验收不能只在 feature 分支做；**合并后必须在合并后的 `main` 树复跑** `tsc` / `npm test` / e2e 才能宣布通过；凡改动公共 API 签名（尤其 sync→async），把分叉点之后 `main` 的改动视为集成风险 | 所有改动公共 API 签名的票；长期分支与 `main` 并行演进时 | 2026-11-06 PR #75 合并（`a7081d8`）后复验、PR #76（`9d75ea8`）修复；#61 更正评论 |
 | v13 复制/清库不能简单使用完全相反表序 | 成员和六类事实的真实 trigger 会生成/推进 member_fact_revisions；过早清它会使后续事实删除缺基准 | 复制最后用源值替换事实版本；清空先删事实、再删 Member/事实版本。不要停用 trigger 或伪造 revision | SQLite/PG 非空复制与项目 purge；当前工程实现，最终双引擎结果单列 | 2026-11-11 静态核对 `src/server/db/migrate-data.ts`、`tests/member-facts.test.ts`、`tests/migrate-data.test.ts` |
 | Agent 的 send/wait/ACK 通过，但网页实时列表仍停在旧消息 | 原 WebSocket 广播只装配在 HTTP 发消息回调，MCP 提交通知没有 WebUI 订阅者 | 同一服务进程的 WebUI 订阅 driver 粒度提交后通知，HTTP/MCP 共用消息视图；幂等重试不重播。协议与真实 DOM 分开验收 | 同进程 HTTP/MCP 服务；不扩大为跨进程 stdio 广播保证 | 2026-11-11 CI 42955289947 浏览器负例；`tests/chat-http-ws.test.ts` 真实 MCP/HTTP/WebSocket RED→GREEN，最新 DOM 结果单列 |
+| 群删除若直接用整个成员事实版本，其他群写入/ACK/空扫描也会使确认失效；原 API 删除提交后才写审计 | `member_fact_revisions` 按成员汇总多群事实，且观测推进不等于删除范围增加；分开事务会留下已删业务但无审计 | 捕获实际删除对象/关系的稳定投影；compare、purge 和审计共用原项目锁/事务。删群还需捕获最后绑定消失后才删除的 runtime reservation | #130 项目/群永久删除快照；不改变成员补偿的事实版本语义 | 2026-11-11 `src/server/db/purge-impact.ts`、`tests/purge-confirmation.test.ts` SQLite 同数替换/无关群/观测字段/失败回滚实测；PG/Chromium 由各自 CI 记录单列 |
 
 ## 待验证
 
