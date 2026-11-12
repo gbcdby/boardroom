@@ -195,15 +195,21 @@ def contrast(page, name, report):
       const result=[];
       for(const el of document.querySelectorAll('main h1,main h2,main p,main label,main button,main input,main select,main textarea,main code,main a,main .badge,.toast > span,.toast > .app-icon')) {
         if(!el.getClientRects().length||el.matches(':disabled')||el.closest('[inert]'))continue;
+        // 原生渲染可见性覆盖 closed details 等未绘制子树，不启用额外 opacity/auto 选项。
+        if(!el.checkVisibility())continue;
         const s=getComputedStyle(el);if(s.visibility!=='visible')continue;
         const text=[...el.childNodes].some(n=>n.nodeType===3&&n.textContent.trim())||el.matches('input,select,textarea,button,.badge');
         const b=background(el),fg=blend(rgba(s.color),b);
         const id=el.dataset.testid||el.id||el.className||el.tagName;
-        if(text)result.push({target:String(id),kind:'text',ratio:ratio(fg,b),minimum:parseFloat(s.fontSize)>=24||(parseFloat(s.fontSize)>=18.66&&parseInt(s.fontWeight)>=700)?3:4.5,fg,background:b});
-        if(el.matches('.toast > .app-icon'))result.push({target:'toast-status-icon',kind:'icon',ratio:ratio(fg,b),minimum:3,fg,background:b});
+        const closed=el.closest('details:not([open])');
+        const node={tag:el.tagName.toLowerCase(),id:el.id||null,testid:el.dataset.testid||null,for:el.getAttribute('for'),
+          text:[...el.childNodes].filter(n=>n.nodeType===3).map(n=>n.textContent).join('').trim().replace(/\\s+/g,' ').slice(0,100),
+          closedDetails:closed?{id:closed.id||null,testid:closed.dataset.testid||null}:null};
+        if(text)result.push({target:String(id),node,kind:'text',ratio:ratio(fg,b),minimum:parseFloat(s.fontSize)>=24||(parseFloat(s.fontSize)>=18.66&&parseInt(s.fontWeight)>=700)?3:4.5,fg,background:b});
+        if(el.matches('.toast > .app-icon'))result.push({target:'toast-status-icon',node,kind:'icon',ratio:ratio(fg,b),minimum:3,fg,background:b});
         if(el.matches('input:not([type=checkbox]):not([type=radio]),select,textarea')&&parseFloat(s.borderTopWidth)>0) {
           const outside=background(el.parentElement),border=blend(rgba(s.borderTopColor),outside);
-          result.push({target:String(id),kind:'control-boundary',ratio:ratio(border,outside),minimum:3,fg:border,background:outside});
+          result.push({target:String(id),node,kind:'control-boundary',ratio:ratio(border,outside),minimum:3,fg:border,background:outside});
         }
       }
       return result;
@@ -212,6 +218,77 @@ def contrast(page, name, report):
     report["contrast"].extend({"view": name, **sample} for sample in samples)
     failures = [sample for sample in samples if sample["ratio"] + .001 < sample["minimum"]]
     assert not failures, (name, failures)
+
+
+def contrast_visibility_controls(browser, output, report):
+    # 仅在正式 exercise 全部结束后运行；空白 context 的预期负例不混入产品 contrast。
+    evidence = {"scope": "isolated native checker controls; not product acceptance", "status": "FAIL", "cases": []}
+    report["contrastControls"] = evidence
+    context = browser.new_context(viewport={"width": 640, "height": 480}, reduced_motion="reduce")
+    context.tracing.start(screenshots=True, snapshots=True, sources=True)
+    page = context.new_page(); page.set_default_timeout(15000)
+    def check(name, expected_failure=None):
+        case = {"view": name, "contrast": [], "expectedFailure": expected_failure}
+        evidence["cases"].append(case)
+        case["visibility"] = page.evaluate("""() => ({open:document.querySelector('details').open,
+          nodes:[...document.querySelectorAll('#control-summary,#control-label,#control-input')].map(el=>({
+            id:el.id,rendered:el.checkVisibility(),rects:el.getClientRects().length,visibility:getComputedStyle(el).visibility}))})""")
+        try:
+            contrast(page, name, case)
+        except AssertionError as error:
+            if expected_failure is None: raise
+            assert len(error.args) == 1 and isinstance(error.args[0], tuple) and len(error.args[0]) == 2, error
+            failed_name, failures = error.args[0]
+            assert failed_name == name and isinstance(failures, list) and len(failures) == 1, error
+            failure = failures[0]
+            assert failure["target"] == expected_failure and failure["node"]["id"] == expected_failure, failure
+            assert failure["kind"] == "text" and failure["minimum"] == 4.5 and failure["ratio"] + .001 < 4.5, failure
+            case["observedFailure"] = failure
+        else:
+            assert expected_failure is None, f"可见低对比目标未被原阈值拒绝：{name}/{expected_failure}"
+        case["screenshot"] = f"{name}.png"
+        page.screenshot(path=str(output / case["screenshot"]))
+        return case
+    try:
+        page.set_content("""<!doctype html><meta charset="utf-8"><style>
+          body { background:var(--bg); color:var(--fg); font:16px/1.5 sans-serif; }
+          label { display:block; color:var(--low); }
+          input { background:var(--bg); color:var(--fg); border:1px solid var(--fg); }
+        </style><main><p id="control-body">可见正常正文</p>
+          <details id="control-details" data-testid="control-details">
+            <summary id="control-summary" class="badge">可见摘要</summary>
+            <label id="control-label" class="field" for="control-input">成员显示名
+              <input id="control-input" data-testid="control-input">
+            </label>
+          </details></main>""")
+        for theme, bg, fg, low in [("light", "#fff", "#1d1d1f", "#f5f5f7"), ("dark", "#232326", "#f5f5f7", "#29292c")]:
+            page.evaluate("""({bg,fg,low}) => {
+              const style=document.documentElement.style;
+              style.setProperty('--bg',bg);style.setProperty('--fg',fg);style.setProperty('--low',low);
+              document.querySelector('details').open=false;
+              document.querySelector('label').style.removeProperty('color');
+              document.querySelector('summary').style.removeProperty('color');
+            }""", {"bg": bg, "fg": fg, "low": low})
+            closed = check(f"contrast-control-{theme}-closed")
+            assert not closed["visibility"]["open"]
+            assert {n["id"] for n in closed["visibility"]["nodes"] if n["rendered"]} == {"control-summary"}, closed
+            assert {s["node"]["id"] for s in closed["contrast"]} == {"control-body", "control-summary"}, closed
+            page.locator("#control-summary").click()
+            opened = check(f"contrast-control-{theme}-open-low", "control-label")
+            assert opened["visibility"]["open"] and all(n["rendered"] for n in opened["visibility"]["nodes"]), opened
+            page.locator("#control-label").evaluate("el => el.style.color='var(--fg)'")
+            readable = check(f"contrast-control-{theme}-open-readable")
+            assert {s["node"]["id"] for s in readable["contrast"]} == {"control-body", "control-summary", "control-label", "control-input"}, readable
+            page.locator("#control-summary").click()
+            page.locator("#control-summary").evaluate("el => el.style.color='var(--low)'")
+            summary = check(f"contrast-control-{theme}-summary-low", "control-summary")
+            assert not summary["visibility"]["open"] and summary["observedFailure"]["node"]["closedDetails"]["id"] == "control-details", summary
+        evidence["status"] = "VERIFIED"
+    except Exception:
+        if not page.is_closed(): page.screenshot(path=str(output / "contrast-controls-failure.png"))
+        raise
+    finally:
+        context.tracing.stop(path=str(output / "contrast-controls-trace.zip")); context.close()
 
 
 def first_frame(browser, origin, report):
@@ -522,6 +599,8 @@ def main():
             try:
                 report["phase"] = "exercise"
                 exercise(browser, data["url"], data["workdir"], output, report)
+                report["phase"] = "contrast_controls"
+                contrast_visibility_controls(browser, output, report)
                 report["status"] = "PASS"
             finally: browser.close()
     except Exception as error:
