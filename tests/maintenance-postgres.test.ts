@@ -18,6 +18,7 @@ import { auditPublicArchiveToc, readPublicRestoreCatalogBinding } from "../src/s
 import type { PostgresDatabaseIdentity } from "../src/server/storage/maintenance/postgres-identity.ts";
 import type { PostgresDescriptor } from "../src/server/storage/maintenance/postgres-tools.ts";
 import type { ControlRootIdentity, Json, MaintenanceAdapter, OperationMutex } from "../src/server/storage/maintenance/types.ts";
+import { observePostgresWriters } from "./fixtures/maintenance-postgres-writer-observation.ts";
 
 test("#152 PG typed cells preserve int8/numeric precision, NULL, binary and duplicate rows", () => {
   const integer = encodePostgresCell("20", "9223372036854775807");
@@ -495,14 +496,27 @@ else{fs.renameSync(target,target+'.original');fs.copyFileSync(target+'.original'
     let adapter: MaintenanceAdapter;
     try { process.env.PATH = `${directory}:${oldPath ?? ""}`; adapter = await createPostgresMaintenanceAdapter(f.source, f.target); }
     finally { if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath; }
+    const observation = observePostgresWriters({ scenario, sourceDescriptorDigest: parsePostgresConnection(f.source).descriptorDigest });
     try {
+      observation.mark("scenario-start");
       const before = await namespaceState(f), mutex = await acquire(adapter, f); await seal(adapter, f, mutex);
       await adapter.withSourceLock("snapshot", async lock => {
+        observation.mark("backup-start");
         const archive = join(f.directory, "immutable.dump"), backup = await lock.backup(archive);
+        observation.mark("backup-returned"); observation.mark("verify-start");
         await assert.rejects(adapter.verifyDatabase(archive, backup.manifests, f.directory), /snapshot_invalid/);
+        observation.mark("verify-rejected-as-expected");
       });
       assert.deepEqual(await namespaceState(f), before); await mutex.release();
-    } finally { await adapter.close(); await f.close(); }
+      observation.mark("assertions-complete");
+    } catch (error) { observation.failure("case", error); throw error; }
+    finally {
+      try {
+        observation.mark("adapter-close-start"); await adapter.close(); observation.mark("adapter-close-returned");
+        observation.mark("fixture-close-start"); await f.close(); observation.mark("fixture-close-returned");
+      } catch (error) { observation.failure("cleanup", error); throw error; }
+      finally { observation.close(); }
+    }
   }
 });
 

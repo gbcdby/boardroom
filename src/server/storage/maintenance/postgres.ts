@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { channel } from "node:diagnostics_channel";
 import { constants } from "node:fs";
 import { lstat, open, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -27,6 +28,9 @@ interface Session {
   ending: boolean;
   ended: boolean;
 }
+const writerObservation = channel("boardroom.maintenance.postgres.writer-observation");
+const observationRows = 32;
+type WriterPhase = "external" | "backup-before" | "backup-after";
 interface HeldMutex {
   readonly session: Session;
   readonly root: ControlRootIdentity;
@@ -116,14 +120,28 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   let assertSnapshotLock: ((check?: () => void) => Promise<void>) | undefined;
   let publicBackup: { readonly sha256: string; readonly manifestDigest: string; readonly binding: PublicRestoreCatalogBinding } | undefined;
   const activeVerifications = new Set<Promise<Json>>();
+  let inspectionSequence = 0;
+  // The diagnostic projection never owns a business result or changes a query.
+  // Only the scoped test subscriber consumes it; bounded synchronous observation
+  // still perturbs timing and is not proof that an unobserved race is absent.
+  const note = (event: Readonly<Record<string, unknown>>) => {
+    if (writerObservation.hasSubscribers) writerObservation.publish(Object.freeze({ version: 1,
+      sourceDescriptorDigest: sourceConnection.descriptorDigest, atMilliseconds: performance.now(), ...event }));
+  };
+  const sessionMetadata = (session: Session) => Object.freeze({ pid: session.pid,
+    backendStart: session.backendStart.slice(0, 128), source: session.source, critical: session.critical,
+    ending: session.ending, ended: session.ended, truncated: session.backendStart.length > 128 });
   const invalidate = () => { lost = true; abort.abort(); };
   function assertOpen(): void {
     if (closed || lost) throw new MaintenanceFailure("maintenance_lost");
   }
   async function endSession(session: Session): Promise<void> {
     session.ending = true;
-    await session.client.end().catch(() => {});
+    if (writerObservation.hasSubscribers) note({ kind: "session-end-start", session: sessionMetadata(session) });
+    let outcome = "fulfilled";
+    await session.client.end().catch(() => { outcome = "rejected"; });
     session.ended = true; sessions.delete(session);
+    if (writerObservation.hasSubscribers) note({ kind: "session-end-complete", outcome, session: sessionMetadata(session) });
   }
   async function connect(connection: PostgresConnection, sourceSession: boolean, critical = false): Promise<Session> {
     assertOpen();
@@ -267,8 +285,10 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       await endSession(session); throw safeError(error, "maintenance_lost");
     }
   }
-  async function inspectWriters(current: SourceObservation): Promise<readonly Blocker[]> {
+  async function inspectWriters(current: SourceObservation, phase: WriterPhase = "external"): Promise<readonly Blocker[]> {
     const session = await connect(sourceConnection, true);
+    const observing = writerObservation.hasSubscribers, inspectionId = observing ? ++inspectionSequence : 0;
+    let stage = "source-identity";
     try {
       const identity = await readIdentity(session, sourceConnection, true);
       if (!same(current.sourceIdentity, stablePostgresSourceIdentity(identity,
@@ -284,24 +304,60 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           }
         } catch { /* An invalid registration cannot exempt any real backend. */ }
       }
+      stage = "activity-query";
       const actual = (await session.client.query(`SELECT pid,backend_start::text,backend_type,state,
         EXISTS(SELECT 1 FROM pg_catalog.pg_locks l WHERE l.pid=a.pid AND l.granted
           AND l.mode IN ('RowExclusiveLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock')) AS write_lock
         FROM pg_catalog.pg_stat_activity a WHERE datid=$1::oid ORDER BY pid`, [identity.databaseOid])).rows;
+      const activityAtMilliseconds = observing ? performance.now() : undefined;
+      const ownSessionCount = sessions.size;
+      let truncated = actual.length > observationRows || ownSessionCount > observationRows;
+      const ownSessions = observing ? Object.freeze([...sessions].slice(0, observationRows).map(sessionMetadata)) : undefined;
+      if (ownSessions?.some(value => value.truncated)) truncated = true;
+      const rows: Readonly<Record<string, unknown>>[] = [];
+      const text = (value: unknown) => {
+        if (value === null) return null;
+        if (typeof value !== "string") { truncated = true; return null; }
+        if (value.length > 128) truncated = true;
+        return value.slice(0, 128);
+      };
+      const observeRow = (backend: Record<string, unknown>, own: boolean, known: boolean | null) => {
+        if (!observing || rows.length >= observationRows) return;
+        const pid = Number.isSafeInteger(backend.pid) ? backend.pid : null;
+        const writeLock = typeof backend.write_lock === "boolean" ? backend.write_lock : null;
+        if (pid === null || writeLock === null) truncated = true;
+        rows.push(Object.freeze({ pid, backendStart: text(backend.backend_start), backendType: text(backend.backend_type),
+          state: text(backend.state), writeLock, own, registered: known }));
+      };
       const blockers: Blocker[] = [];
       for (const backend of actual) {
         const own = [...sessions].some(candidate => candidate.source && !candidate.ended
           && candidate.pid === backend.pid && candidate.backendStart === backend.backend_start);
-        if (own) continue;
+        if (own) { observeRow(backend, true, null); continue; }
         const known = registered.has(`${backend.pid}:${backend.backend_start}`);
+        observeRow(backend, false, known);
         blockers.push({ code: known ? "source_writer_active" : "source_writer_unknown",
           subjectRef: `postgres-backend:${sha256(`${backend.pid}:${backend.backend_start}`).slice(0, 24)}` });
       }
       // A prepared transaction survives its backend and can later commit; pg_stat_activity alone misses it.
-      if ((await session.client.query("SELECT 1 FROM pg_catalog.pg_prepared_xacts WHERE database=current_database() LIMIT 1")).rows.length)
+      stage = "prepared-query";
+      const prepared = (await session.client.query("SELECT 1 FROM pg_catalog.pg_prepared_xacts WHERE database=current_database() LIMIT 1")).rows.length > 0;
+      if (prepared)
         blockers.push({ code: "source_writer_unknown", subjectRef: "postgres-prepared-transaction" });
+      if (observing) note({ kind: "inspection", phase, inspectionId, databaseOid: identity.databaseOid,
+        activityAtMilliseconds, preparedAtMilliseconds: performance.now(), actualCount: actual.length,
+        registeredCount: registered.size, ownSessionCount, ownSessions, rows: Object.freeze(rows), prepared,
+        blockerCount: blockers.length, blockers: Object.freeze(blockers.slice(0, observationRows).map(blocker => Object.freeze({
+          code: blocker.code, subjectRef: blocker.subjectRef }))), truncated: truncated || blockers.length > observationRows });
       return blockers;
-    } catch (error) { throw safeError(error, "source_writer_unknown"); }
+    } catch (error) {
+      if (observing) {
+        const code = (error as { code?: unknown } | null)?.code;
+        note({ kind: "inspection-error", phase, inspectionId, stage,
+          code: typeof code === "string" ? code.slice(0, 64) : null, truncated: typeof code === "string" && code.length > 64 });
+      }
+      throw safeError(error, "source_writer_unknown");
+    }
     finally { await endSession(session); }
   }
   async function withPassfile<T>(connection: PostgresConnection, directory: string,
@@ -369,7 +425,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           backupUsed = true;
           const capture = await lock.observe();
           if (capture.state.admission !== "sealed") throw new MaintenanceFailure("phase_conflict");
-          const writers = await inspectWriters(capture);
+          const writers = await inspectWriters(capture, "backup-before");
           if (writers.length) throw new MaintenanceFailure(writers[0]!.code);
           const versions = await postgresToolVersions(sourceConnection.childEnvironment, abort.signal, "backup_capability_unavailable");
           const publicBinding = sourceConnection.schema === "public"
@@ -400,10 +456,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
               if (abort.signal.aborted) throw new MaintenanceFailure("maintenance_lost");
             });
           } finally { clearInterval(monitor); await output.close(); }
+          if (writerObservation.hasSubscribers) note({ kind: "backup-file-complete" });
           await assertHeld();
           const after = await observe();
           if (!same(after.manifests, capture.manifests) || !same(after.source, capture.source)) throw new MaintenanceFailure("source_changed");
-          if ((await inspectWriters(after)).length) throw new MaintenanceFailure("source_writer_unknown");
+          if ((await inspectWriters(after, "backup-after")).length) throw new MaintenanceFailure("source_writer_unknown");
           const identity = await readIdentity(locked, sourceConnection, true);
           frozenCapture = capture.manifests;
           if (publicBinding && publicArchiveDigest) publicBackup = { sha256: publicArchiveDigest,
