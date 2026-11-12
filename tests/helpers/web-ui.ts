@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { compileScript, parse } from "@vue/compiler-sfc";
 import ts from "typescript";
 import { createRenderer, nextTick } from "vue";
-import { createMemoryHistory, createRouter } from "vue-router";
+import { createMemoryHistory, createRouter, RouterView } from "vue-router";
 
 // 编译真正的 SFC，再由 Vue renderer 触发控件事件。此证据不替代 Chromium 布局/焦点验收。
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -74,7 +74,7 @@ export async function withPage(
   name: string,
   respond: (url: string, init: RequestInit | undefined) => Promise<Response> | Response,
   check: (container: UiElement, context: { store: any; router: ReturnType<typeof createRouter> }) => Promise<void>,
-  options: { path?: string; confirmDiscard?: () => boolean } = {},
+  options: { path?: string; confirmDiscard?: () => boolean; renderRoute?: string } = {},
 ): Promise<void> {
   const directory = await mkdtemp(path.join(tmpdir(), "boardroom-ui-"));
   const previousFetch = globalThis.fetch;
@@ -109,12 +109,12 @@ export async function withPage(
       { path: "/projects/:projectId/tasks/:taskId", component: placeholder, meta: { projectSection: "tasks" } },
       { path: "/projects/:projectId/chat/:groupId?", component: placeholder, meta: { projectSection: "chat" } },
       { path: "/memory", component: placeholder, meta: { projectSection: "memory" } },
-      ...["overview", "tasks", "org", "audit", "status", "members", "memory"].map((section) => ({ path: `/projects/:projectId/${section}`, component: placeholder, meta: { projectSection: section } })),
-    ] });
+      ...["overview", "tasks", "org", "audit", "status", "members", "memory", "knowledge", "activity", "settings"].map((section) => ({ path: `/projects/:projectId/${section}`, component: placeholder, meta: { projectSection: section } })),
+    ].map(record => ({ ...record, component: record.path === options.renderRoute ? component : record.component })) });
     store.installRouter(router);
     await router.push(options.path ?? "/projects/project-1/tasks");
     const container = element("root");
-    app = renderer.createApp(component); app.use(router); app.provide(context.currentProjectKey, store); app.mount(container);
+    app = renderer.createApp(options.renderRoute ? RouterView : component); app.use(router); app.provide(context.currentProjectKey, store); app.mount(container);
     await settle(); await check(container, { store, router });
   } finally {
     app?.unmount(); store?.dispose(); globalThis.fetch = previousFetch;

@@ -246,13 +246,16 @@ def main() -> int:
         parser.error("CI 验收不能用 --fixture-only 替代 Chromium")
     artifacts = (args.artifacts or ROOT / ".agent-output/v1-load-web" / args.db).resolve()
     artifacts.mkdir(parents=True, exist_ok=True)
+    worktree_status = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True)
     report = {"status": "FAIL", "startedAt": datetime.now(timezone.utc).isoformat(), "engine": args.db,
         "acceptance": ["S5-AUDIT-16", "NFR-03", "NFR-04"], "limits": LIMITS, "modelInvocation": "NOT_RUN",
         "os": {"system": platform.system(), "release": platform.release(), "machine": platform.machine()},
         "node": subprocess.check_output(["node", "--version"], text=True).strip(),
         "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True).strip(),
-        "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip()),
+        "dirty": bool(worktree_status.strip()),
+        "worktreeStatus": worktree_status.splitlines(),
+        "trackedChanges": subprocess.check_output(["git", "diff", "--name-status", "HEAD"], cwd=ROOT, text=True).splitlines(),
         "harnessSha256": {name: hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest()
             for name in ("v1-load-web-fixture.mjs", "e2e-v1-load-web.py")},
         "scenarios": [], "scope": "两个独立固定规模临时实例；每档六次翻转，默认防环不变；Linux 证据不外推 macOS。",
