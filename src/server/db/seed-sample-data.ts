@@ -41,6 +41,12 @@ export function seedSampleData(db: Database.Database): void {
     TS,
   );
 
+  // v14 的 raw seed 也登记永久身份映射；旧 schema fixture 不要求新表。
+  if (db.prepare("SELECT version FROM schema_migrations WHERE version = 14").get()) {
+    run(`INSERT INTO agent_legacy_aliases (display_name, host_type, agent_id, created_at)
+      SELECT display_name, host_type, id, created_at FROM agents WHERE id IN ('ag1', 'ag2')`);
+  }
+
   // projects
   run(
     `INSERT INTO projects (id, name, created_at, updated_at) VALUES (?,?,?,?)`,

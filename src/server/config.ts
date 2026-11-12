@@ -1,6 +1,8 @@
-import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { MemoryConfig } from "../shared/memory.ts";
+import type { ResolvedBoardroomEnvironment } from "./environment.ts";
+import { ConfigError } from "./config-error.ts";
+export { ConfigError } from "./config-error.ts";
 
 /** 默认监听端口；仅绑定 127.0.0.1。 */
 export const DEFAULT_PORT = 4317;
@@ -15,7 +17,7 @@ export const DEFAULT_MAX_CONSECUTIVE_AUTO_REPLIES = 6;
 /** T7 / D5：每成员滚动 1 分钟默认最多被唤醒 20 次。 */
 export const DEFAULT_MAX_WAKES_PER_MINUTE_PER_MEMBER = 20;
 
-/** 默认只读的配置文件路径（相对 cwd）。 */
+/** 配置文件名；统一 resolver 选择 homeRoot 或兼容旧 cwd。 */
 export const DEFAULT_CONFIG_FILE = "config.json";
 
 /** 持久化驱动种类（F1 #46）；与连接工厂的 DbDriver.kind 对应。 */
@@ -83,11 +85,8 @@ export interface AppConfig {
   readonly pgConnectionString?: string;
   /** 实际加载的配置文件绝对路径；没有配置文件时为 null。 */
   readonly configFile: string | null;
-}
-
-/** 配置加载失败；message 面向用户，包含可恢复路径所需的上下文。 */
-export class ConfigError extends Error {
-  override readonly name = "ConfigError";
+  /** 受信启动装配的唯一路径结果；手工 AppConfig 仍可省略。勿将整个对象写入日志。 */
+  readonly environment?: ResolvedBoardroomEnvironment;
 }
 
 export interface LoadConfigOptions {
@@ -95,26 +94,33 @@ export interface LoadConfigOptions {
   readonly cwd?: string;
   /** 环境变量来源，默认 process.env。 */
   readonly env?: Record<string, string | undefined>;
+  /** 仅受信装配提供的系统用户目录/已知旧启动目录，不是 HTTP/MCP 参数。 */
+  readonly homeDir?: string;
+  readonly knownLegacyCwds?: readonly string[];
 }
 
 type JsonObject = Record<string, unknown>;
 
 /**
- * 按「默认值 → 配置文件 → 环境变量」的优先级加载配置。
- *
- * 配置文件位置：`$AGENT_STUDIO_CONFIG`，否则 `<cwd>/config.json`（不存在则跳过）。
+ * 兼容入口；文件、路径、数据库选择全部委托给统一 resolver。
  */
 export async function loadConfig(options: LoadConfigOptions = {}): Promise<AppConfig> {
-  const cwd = options.cwd ?? process.cwd();
-  const env = options.env ?? process.env;
+  const { resolveBoardroomEnvironment, assertEnvironmentWritable } = await import("./environment.ts");
+  const environment = await resolveBoardroomEnvironment(options);
+  await assertEnvironmentWritable(environment);
+  return { ...environment.config, environment };
+}
 
-  const explicitConfig = env["AGENT_STUDIO_CONFIG"];
-  const configFile = explicitConfig ? path.resolve(cwd, explicitConfig) : path.join(cwd, DEFAULT_CONFIG_FILE);
-  const loadedFile = await readConfigFile(configFile, explicitConfig !== undefined);
-  const fileValues = loadedFile ?? {};
-
+/** 纯配置字段解析；路径规则和文件读取只由 environment.ts 决定。 */
+export function parseConfigValues(input: {
+  cwd: string; env: Record<string, string | undefined>; fileValues: JsonObject;
+  configFile: string | null; filePathBase: string; defaultDataDir: string;
+}): AppConfig {
+  const { cwd, env, fileValues, configFile } = input;
   const port = parsePort(pick(env["AGENT_STUDIO_PORT"], fileValues["port"], DEFAULT_PORT));
-  const dataDir = resolveDataDir(cwd, pick(env["AGENT_STUDIO_DATA_DIR"], fileValues["dataDir"], DEFAULT_DATA_DIR));
+  const fromEnv = env["AGENT_STUDIO_DATA_DIR"];
+  const dataDir = resolveDataDir(fromEnv !== undefined ? cwd : input.filePathBase,
+    pick(fromEnv, fileValues["dataDir"], input.defaultDataDir));
 
   const fileHeartbeat = isObject(fileValues["heartbeat"]) ? fileValues["heartbeat"] : {};
   const intervalMs = parsePositiveInt(
@@ -183,7 +189,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<AppCo
     memory,
     dbDriver,
     ...(pgConnectionString === undefined ? {} : { pgConnectionString }),
-    configFile: loadedFile === null ? null : configFile,
+    configFile,
   };
 }
 
@@ -220,39 +226,10 @@ function parsePgConnectionString(value: unknown, dbDriver: DbDriverKind): string
   return connectionString;
 }
 
-async function readConfigFile(configFile: string, required: boolean): Promise<JsonObject | null> {
-  let raw: string;
-  try {
-    raw = await readFile(configFile, "utf8");
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" && !required) return null;
-    throw new ConfigError(
-      `无法读取配置文件 ${configFile}（${code ?? "unknown"}）。` +
-        `请检查 AGENT_STUDIO_CONFIG 指向的路径是否存在且可读，或删除该环境变量以使用默认值。`,
-    );
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    // JSON.parse 的异常可包含配置原文；配置中可能有 PG 凭据，不能转发该文本。
-    throw new ConfigError(
-      `配置文件 ${configFile} 不是合法 JSON。` +
-        `请修正 JSON 语法，或参考 config.example.json。`,
-    );
-  }
-
-  if (!isObject(parsed)) {
-    throw new ConfigError(`配置文件 ${configFile} 的顶层必须是 JSON 对象。`);
-  }
-  return parsed;
-}
-
 function pick(...candidates: readonly unknown[]): unknown {
   for (const candidate of candidates) {
-    if (candidate !== undefined && candidate !== null && candidate !== "") return candidate;
+    // 显式空值也是配置值，由字段校验拒绝；不能变成另一个数据源的隐式 fallback。
+    if (candidate !== undefined) return candidate;
   }
   return undefined;
 }

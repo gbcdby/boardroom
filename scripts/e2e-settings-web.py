@@ -122,7 +122,7 @@ def exercise(page, context, fixture, process, output, report):
     page.set_viewport_size({"width": 1440, "height": 1000})
     page.emulate_media(color_scheme="light")
     page.goto(origin + "/projects")
-    expect(page.get_by_test_id("current-project")).to_have_count(1)
+    expect(page.get_by_test_id("current-project")).to_have_count(0)
     page.get_by_role("link", name="设置", exact=True).focus()
     page.keyboard.press("Enter")
     expect(page).to_have_url(origin + "/settings")
@@ -139,6 +139,9 @@ def exercise(page, context, fixture, process, output, report):
     expect(page.get_by_test_id("settings-refresh")).to_be_enabled()
     # 刷新结束后从刷新控件继续检查正常的 Tab 顺序。
     page.get_by_test_id("settings-refresh").focus()
+    for preference in ("system", "light", "dark"):
+        page.keyboard.press("Tab")
+        expect(page.get_by_test_id(f"theme-{preference}")).to_be_focused()
     page.keyboard.press("Tab")
     expect(page.get_by_test_id("settings-copy-mcp")).to_be_focused()
     context.grant_permissions(["clipboard-read", "clipboard-write"], origin=origin)

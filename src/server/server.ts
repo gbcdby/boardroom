@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import type { AppConfig } from "./config.ts";
+import { resolveBoardroomEnvironment, assertEnvironmentWritable, databaseDriverOptions, databaseForConnectedReader } from "./environment.ts";
 import { createDbDriver, type DbDriver } from "./db/driver.ts";
 import type { MigrationState } from "./db/migrate.ts";
 import { migrations } from "./db/migrations/index.ts";
@@ -111,15 +112,13 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   const log = logger.child({ component: "server" });
   const webRoot = options.webRoot ?? defaultWebRoot();
   const startedAt = Date.now();
+  const environment = await resolveBoardroomEnvironment({ config });
+  await assertEnvironmentWritable(environment);
 
   // F1（#46）：经连接工厂打开持久化驱动；默认 SQLite，阶段 1 行为不变。
   let driver: DbDriver;
   try {
-    driver = createDbDriver({
-      dbDriver: config.dbDriver ?? "sqlite",
-      dataDir: config.dataDir,
-      ...(config.pgConnectionString === undefined ? {} : { pgConnectionString: config.pgConnectionString }),
-    });
+    driver = createDbDriver(databaseDriverOptions(environment));
   } catch (error) {
     log.error("数据库驱动配置无效", { error, dataDir: config.dataDir });
     throw new ServerStartupError((error as Error).message);
@@ -152,8 +151,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
 
   try {
     registerMemoryRuntime(driver, {
-      database: driver.kind === "sqlite" ? { kind: "sqlite", sqlitePath: path.join(config.dataDir, "agent-studio.db") }
-        : { kind: "postgres", connectionString: config.pgConnectionString! },
+      database: databaseForConnectedReader(environment.databaseDescriptor),
       ...(config.memory ? { config: config.memory } : {}),
       onDiagnostic: code => log.warn("memory_reader_unavailable", { code }),
     });
@@ -218,7 +216,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   let notifyHttpMessage: (message: import("./api.ts").MessageView) => void | Promise<void> = () => {};
   // 权威组织审计由 API 领域服务原子提交；可选 hook 只作提交后观察。
   const t1Api = createT1ApiRouter({
-    db: driver, repos,
+    db: driver, repos, environment,
     logger,
     heartbeat: config.heartbeat,
     onMessage: (message) => notifyHttpMessage(message),
@@ -226,13 +224,12 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     ...(options.orgChangeRecorder ? { orgChangeRecorder: options.orgChangeRecorder } : {}),
   });
   const runtimeObservations = createRuntimeObservability({ db: driver, logger });
-  const runtimeStateRoot = path.join(config.dataDir, "managed");
+  const runtimeStateRoot = environment.runtimeRoot;
   const runtimeSupervisor = createRuntimeSupervisor({ db: driver, repos, logger, observations: runtimeObservations,
     stateRoot: runtimeStateRoot,
     ...(authorization.resolveMcpActor ? { actorFor: authorization.resolveMcpActor } : {}),
     launcher: options.runtimeLauncher ?? createHostLauncher({ stateRoot: runtimeStateRoot,
-      protectedPaths: [path.resolve(import.meta.dirname, "../.."), config.dataDir,
-        ...(config.configFile ? [config.configFile] : [])] }),
+      protectedPaths: environment.protectedPaths }),
   });
   const runtimeApi = createRuntimeApi({ db: driver, repos, logger, heartbeat: config.heartbeat,
     supervisor: runtimeSupervisor, observations: runtimeObservations,

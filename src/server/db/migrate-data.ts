@@ -32,6 +32,8 @@ import { runtimeProcessIdentityMigration } from "./migrations/runtime-process-id
 import { tasksMigration } from "./migrations/tasks.ts";
 import { memoryMigration } from "./migrations/memory.ts";
 import { memberLifecycleMigration } from "./migrations/member-lifecycle.ts";
+import { identityCatalogMigration } from "./migrations/identity-catalog.ts";
+import { projectWorkspacesMigration } from "./migrations/project-workspaces.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -58,7 +60,21 @@ export interface TableSpec {
  */
 export const BUSINESS_TABLES: readonly TableSpec[] = [
   { name: "agents", keyColumns: ["id"] },
-  { name: "projects", keyColumns: ["id"] },
+  { name: "agent_legacy_aliases", keyColumns: ["display_name", "host_type"], valueColumns: ["agent_id", "retired_at"] },
+  { name: "role_templates", keyColumns: ["id"], valueColumns: ["revision"] },
+  { name: "role_template_versions", keyColumns: ["role_template_id", "revision"],
+    valueColumns: ["name", "purpose", "instructions", "recommended_skill_refs_json", "archived_at", "copied_from_role_template_id", "copied_from_revision"],
+    readSql: `WITH RECURSIVE version_depth AS (
+      SELECT role_template_id, revision, 0 AS depth FROM role_template_versions WHERE copied_from_role_template_id IS NULL
+      UNION ALL
+      SELECT c.role_template_id, c.revision, p.depth + 1 FROM role_template_versions c
+        JOIN version_depth p ON c.copied_from_role_template_id = p.role_template_id AND c.copied_from_revision = p.revision
+    ) SELECT v.* FROM role_template_versions v JOIN version_depth d
+      ON v.role_template_id = d.role_template_id AND v.revision = d.revision ORDER BY d.depth, v.role_template_id, v.revision` },
+  { name: "projects", keyColumns: ["id"], valueColumns: ["project_revision", "workspace_revision"] },
+  { name: "project_workspace_versions", keyColumns: ["project_id", "workspace_revision"], valueColumns: ["project_revision",
+    "root_path", "canonical_root", "mode", "root_identity_json", "physical_resource_key", "repository_info_json", "observed_at",
+    "mutation_id", "input_digest", "updated_at"] },
   { name: "memory_documents", keyColumns: ["id"] },
   { name: "memory_versions", keyColumns: ["id"] },
   {
@@ -323,6 +339,8 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   tasksMigration,
   memoryMigration,
   memberLifecycleMigration,
+  identityCatalogMigration,
+  projectWorkspacesMigration,
 ];
 
 // ---------------------------------------------------------------------------

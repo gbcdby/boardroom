@@ -8,7 +8,9 @@
 | --- | --- |
 | [agent-workflow.md](agent-workflow.md) | 可调整的 Agent 工作流程 |
 | [architecture/agent-studio.md](architecture/agent-studio.md) | 产品宏观架构、范围与验收基线 |
-| [architecture/data-model.md](architecture/data-model.md) | 持久化数据模型、迁移、v13 事实版本与共同事务边界 |
+| [architecture/data-model.md](architecture/data-model.md) | 持久化数据模型、v13 事实版本、v14 角色/别名、v15 项目工作区与共同事务边界 |
+| [identity-catalog.md](identity-catalog.md) | 角色不可变版本、稳定身份与永久 alias、旧配置只读来源及本地管理 API |
+| [project-workspaces.md](project-workspaces.md) | 项目工作目录、v15 配置版本/CAS、原子创建、路径预检、旧目录来源映射及删除/复制边界 |
 | [f2-authorize-guard.md](f2-authorize-guard.md) | 统一权限矩阵、拒绝语义、接入点位 |
 | [policy-kernel.md](policy-kernel.md) | 纯策略求值、默认规则、解释预览与实际执行的边界 |
 | [mcp-tool-contract.md](mcp-tool-contract.md) | 当前工具目录、绑定/CAS 与聊天契约 |
@@ -18,6 +20,7 @@
 | [tasks-and-review.md](tasks-and-review.md) | 任务、固定 Git 候选与独立双轴评审 |
 | [memory.md](memory.md) | 三层记忆、版本/冲突与目标 Agent 自总结 |
 | [settings.md](settings.md) | 只读有效配置、来源、刷新与重启生效 |
+| [environment-resolution.md](environment-resolution.md) | HTTP/stdio 共用环境解析、旧源只读预检、严格失败与存储恢复边界 |
 | [settings-and-audit.md](settings-and-audit.md) | 设置、审计撤销/重做、移除与恢复的用户操作 |
 | [v1-acceptance.md](v1-acceptance.md) | 全部 46 项 AC 的证据索引与实际缺口 |
 | [t8-acceptance-report.md](t8-acceptance-report.md) | 保留原日期和对象的阶段 1 历史验收报告 |

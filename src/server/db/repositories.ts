@@ -16,6 +16,7 @@ import {
   WriteFailedError,
 } from "./errors.ts";
 import { newId } from "./ids.ts";
+import { findLegacyAgentId, hasIdentityCatalogSchema, listLegacyAliases, reserveLegacyAlias, type LegacyAgentAlias } from "../identity/aliases.ts";
 import { MEMBER_FACT_KINDS, type MemberFactRevision } from "./types.ts";
 import { createTasksRepository, type TasksRepository } from "../tasks/repository.ts";
 import {
@@ -95,12 +96,16 @@ export interface AgentsRepository {
   insertRaw(agent: Agent): Promise<Agent>;
   get(id: string): Promise<Agent | null>;
   /**
-   * 按全局身份键（displayName + hostType）查找 agent（T2 身份唯一性）。
+   * 按永久 legacy alias（displayName + hostType）查找稳定 Agent；v14 前保持旧键查询。
    * 命中返回已有 agent；未命中返回 null，由调用方决定创建。
    */
   findByIdentity(displayName: string, hostType: string): Promise<Agent | null>;
   list(): Promise<Agent[]>;
   update(id: string, patch: Partial<Pick<Agent, "displayName" | "hostType">>): Promise<Agent>;
+  /** 本地管理服务的显示名 CAS；不修改宿主、权限、成员代际或运行配置。 */
+  rename(id: string, expectedDisplayName: string, displayName: string): Promise<Agent>;
+  aliases(id: string): Promise<LegacyAgentAlias[]>;
+  addAlias(id: string, input: Pick<LegacyAgentAlias, "displayName" | "hostType">): Promise<LegacyAgentAlias[]>;
   touchLastSeen(id: string, at: string): Promise<Agent>;
   delete(id: string): Promise<void>;
 }
@@ -110,6 +115,7 @@ export interface AgentsRepository {
  * 删除后作为实际清除的行数返回。项目记忆计数不包含 Agent 的 global 文档与版本。
  */
 export interface PurgeCounts {
+  readonly workspaceVersions: number;
   /** v13：保留历史事实的固定版本行，随最后的成员物理清除。 */
   readonly memberFactRevisions: number;
   readonly groups: number;
@@ -581,6 +587,7 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
   const tasks = await hasTasksSchema(ctx);
   const memory = await hasMemorySchema(ctx);
   return {
+    workspaceVersions: await hasWorkspaceSchema(ctx) ? await count("SELECT COUNT(*) AS c FROM project_workspace_versions WHERE project_id = ?") : 0,
     memberFactRevisions: await hasMemberLifecycleSchema(ctx) ? await count('SELECT COUNT(*) AS c FROM member_fact_revisions WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)') : 0,
     memoryDocuments: memory ? await count("SELECT COUNT(*) AS c FROM memory_documents WHERE project_id = ?") : 0,
     memoryVersions: memory ? await count("SELECT COUNT(*) AS c FROM memory_versions WHERE document_id IN (SELECT id FROM memory_documents WHERE project_id = ?)") : 0,
@@ -739,6 +746,14 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
         agent.updatedAt,
         agent.lastSeenAt,
       ]);
+      if (await hasIdentityCatalogSchema(ctx)) {
+        // 放在 INSERT 获得 ID 的排他性之后检查，避免与旧身份删除交错时复活同一 ID。
+        if (await ctx.one("SELECT agent_id FROM agent_legacy_aliases WHERE agent_id = ? AND retired_at IS NOT NULL LIMIT 1", [agent.id])) {
+          throw new ConflictError("agent_identity_retired");
+        }
+        await reserveLegacyAlias(ctx, { agentId: agent.id,
+          displayName: agent.displayName, hostType: agent.hostType, createdAt: agent.createdAt });
+      }
     } catch (error) {
       throw normalizeError(error);
     }
@@ -761,7 +776,7 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
       return agent;
     },
     async insertRaw(agent) {
-      await insertRow(agent);
+      await ctx.withTransaction(async () => insertRow(agent));
       return agent;
     },
     async get(id) {
@@ -769,11 +784,8 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
       return row ? toAgent(row) : null;
     },
     async findByIdentity(displayName, hostType) {
-      const row = await ctx.one<AgentRow>(
-        "SELECT * FROM agents WHERE display_name = ? AND host_type = ?",
-        [displayName, hostType],
-      );
-      return row ? toAgent(row) : null;
+      const id = await findLegacyAgentId(ctx, displayName, hostType);
+      return id === null ? null : this.get(id);
     },
     async list() {
       return (await ctx.query<AgentRow>("SELECT * FROM agents ORDER BY created_at, id")).map(toAgent);
@@ -790,12 +802,52 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
           && await ctx.one("SELECT id FROM agent_runtimes WHERE agent_id = ?", [id])) {
           throw new ConflictError("runtime_identity_immutable");
         }
+        if (await hasIdentityCatalogSchema(ctx)) {
+          await findLegacyAgentId(ctx, existing.displayName, existing.hostType);
+          await reserveLegacyAlias(ctx, { agentId: id, displayName: existing.displayName, hostType: existing.hostType, createdAt: existing.createdAt });
+          await reserveLegacyAlias(ctx, { agentId: id, displayName, hostType, createdAt: nowIso() });
+        }
         await ctx.exec(
           "UPDATE agents SET display_name = ?, host_type = ?, updated_at = ? WHERE id = ?",
           [displayName, hostType, nowIso(), id],
         );
       });
       return (await this.get(id))!;
+    },
+    async rename(id, expectedDisplayName, value) {
+      const displayName = requireNonEmpty(value, "Agent.displayName");
+      requireNonEmpty(expectedDisplayName, "Agent.expectedDisplayName");
+      return ctx.withTransaction(async () => {
+        if (!await hasIdentityCatalogSchema(ctx)) throw new InvalidArgumentError("identity_catalog_upgrade_required");
+        const existing = await this.get(id);
+        if (!existing) throw new NotFoundError("agent_not_found");
+        await findLegacyAgentId(ctx, existing.displayName, existing.hostType);
+        const at = nowIso();
+        // 先以稳定 ID 和旧值取得写锁/CAS；任何后续 alias 冲突都会回滚此次改名。
+        const changed = await ctx.exec("UPDATE agents SET display_name = ?, updated_at = ? WHERE id = ? AND display_name = ?",
+          [displayName, at, id, expectedDisplayName]);
+        if (changed !== 1) throw new ConflictError("agent_name_conflict");
+        await reserveLegacyAlias(ctx, { agentId: id, displayName: existing.displayName, hostType: existing.hostType, createdAt: existing.createdAt });
+        await reserveLegacyAlias(ctx, { agentId: id, displayName, hostType: existing.hostType, createdAt: at });
+        return (await this.get(id))!;
+      });
+    },
+    async aliases(id) {
+      if (!await this.get(id)) throw new NotFoundError("agent_not_found");
+      return listLegacyAliases(ctx, id);
+    },
+    async addAlias(id, input) {
+      const displayName = requireNonEmpty(input.displayName, "AgentAlias.displayName");
+      const hostType = requireNonEmpty(input.hostType, "AgentAlias.hostType");
+      return ctx.withTransaction(async () => {
+        if (!await hasIdentityCatalogSchema(ctx)) throw new InvalidArgumentError("identity_catalog_upgrade_required");
+        // 同一 Agent 的改名、追加 alias 与删除串行；不持项目或成员的长期租约。
+        if (await ctx.exec("UPDATE agents SET updated_at = updated_at WHERE id = ?", [id]) !== 1) throw new NotFoundError("agent_not_found");
+        const existing = (await this.get(id))!;
+        await findLegacyAgentId(ctx, existing.displayName, existing.hostType);
+        await reserveLegacyAlias(ctx, { agentId: id, displayName, hostType, createdAt: nowIso() });
+        return listLegacyAliases(ctx, id);
+      });
     },
     async touchLastSeen(id, at) {
       const existing = await this.get(id);
@@ -809,8 +861,14 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
       return (await this.get(id))!;
     },
     async delete(id) {
-      const result = await ctx.exec("DELETE FROM agents WHERE id = ?", [id]);
-      if (result === 0) throw new NotFoundError(`Agent ${id} 不存在。`);
+      await ctx.withTransaction(async () => {
+        if (await hasIdentityCatalogSchema(ctx)) {
+          if (await ctx.exec("UPDATE agents SET updated_at = updated_at WHERE id = ?", [id]) !== 1) throw new NotFoundError(`Agent ${id} 不存在。`);
+          await ctx.exec("UPDATE agent_legacy_aliases SET retired_at = ? WHERE agent_id = ? AND retired_at IS NULL", [nowIso(), id]);
+        }
+        const result = await ctx.exec("DELETE FROM agents WHERE id = ?", [id]);
+        if (result === 0) throw new NotFoundError(`Agent ${id} 不存在。`);
+      });
     },
   };
 }
@@ -819,12 +877,18 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
 // Projects
 // ---------------------------------------------------------------------------
 
+export async function hasWorkspaceSchema(ctx: RepoCtx): Promise<boolean> {
+  return Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 15"));
+}
+
 type ProjectRow = {
   id: string;
   name: string;
   created_at: string;
   updated_at: string;
   archived_at: string | null;
+  project_revision?: number;
+  workspace_revision?: number;
 };
 
 function toProject(row: ProjectRow): Project {
@@ -834,6 +898,8 @@ function toProject(row: ProjectRow): Project {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     archivedAt: row.archived_at ?? null,
+    projectRevision: Number(row.project_revision ?? 1),
+    workspaceRevision: Number(row.workspace_revision ?? 0),
   };
 }
 
@@ -858,7 +924,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
         managerName = agent.display_name;
       }
       const at = nowIso();
-      const project: Project = { id: newId(), name, createdAt: at, updatedAt: at, archivedAt: null };
+      const project: Project = { id: newId(), name, createdAt: at, updatedAt: at, archivedAt: null, projectRevision: 1, workspaceRevision: 0 };
       await ctx.withTransaction(async () => {
         await ctx.exec(
           "INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
@@ -888,7 +954,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
     async rename(id, name) {
       const value = requireNonEmpty(name, "Project.name");
       const result = await ctx.exec(
-        "UPDATE projects SET name = ?, updated_at = ? WHERE id = ?",
+        `UPDATE projects SET name = ?, updated_at = ?${await hasWorkspaceSchema(ctx) ? ", project_revision = project_revision + 1" : ""} WHERE id = ?`,
         [value, nowIso(), id],
       );
       if (result === 0) throw new NotFoundError(`Project ${id} 不存在。`);
@@ -901,7 +967,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
       const stamp = at ?? nowIso();
       await ctx.withTransaction(async () =>
         ctx.exec(
-          "UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?",
+          `UPDATE projects SET archived_at = ?, updated_at = ?${await hasWorkspaceSchema(ctx) ? ", project_revision = project_revision + 1" : ""} WHERE id = ?`,
           [stamp, stamp, id],
         ),
       );
@@ -913,7 +979,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
       if (existing.archivedAt === null) return existing;
       await ctx.withTransaction(async () =>
         ctx.exec(
-          "UPDATE projects SET archived_at = NULL, updated_at = ? WHERE id = ?",
+          `UPDATE projects SET archived_at = NULL, updated_at = ?${await hasWorkspaceSchema(ctx) ? ", project_revision = project_revision + 1" : ""} WHERE id = ?`,
           [nowIso(), id],
         ),
       );
@@ -938,6 +1004,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
           throw new RepositoryError("confirmation_changed", "永久删除的影响范围已变化，请重新获取级联清单并再次确认。");
         }
         const counts = await projectPurgeCounts(ctx, id);
+        if (await hasWorkspaceSchema(ctx)) await ctx.exec("DELETE FROM project_workspace_versions WHERE project_id = ?", [id]);
         if (await hasMemorySchema(ctx)) {
           for (const table of ["memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints"]) {
             await ctx.exec(`DELETE FROM ${table} WHERE project_id = ?`, [id]);

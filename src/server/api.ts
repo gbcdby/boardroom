@@ -20,6 +20,10 @@ import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "./c
 import { buildRoster } from "./chat/roster.ts";
 import { resetGroupConsecutiveCount } from "./mcp/core.ts";
 import { createTaskService } from "./tasks/service.ts";
+import { createIdentityApi } from "./identity/api.ts";
+import { createWorkspaceApi, writeWorkspaceError } from "./workspace/api.ts";
+import { WorkspaceError } from "./workspace/errors.ts";
+import type { ResolvedBoardroomEnvironment } from "./environment.ts";
 import { createOrgMutationService } from "./org/mutations.ts";
 import { createAuditCompensationService } from "./audit-compensation.ts";
 import { createOrgHttpCommands } from "./org/http-commands.ts";
@@ -84,6 +88,8 @@ export interface ActorResolution {
 
 export interface T1ApiOptions {
   readonly db: DbDriver;
+  /** 生产入口注入已选择的 S4 环境，不重新推导数据库或保护范围。 */
+  readonly environment?: ResolvedBoardroomEnvironment;
   readonly repos?: RepositorySet;
   readonly logger: Logger;
   /**
@@ -184,6 +190,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   const orgMutations = createOrgMutationService({ repos, now });
   const compensations = createAuditCompensationService({ repos, now });
   const orgCommands = createOrgHttpCommands({ repos, now });
+  const identityApi = createIdentityApi({ ...options, repos });
+  const workspaceApi = createWorkspaceApi({ ...options, repos });
 
   /**
    * 待确认的永久删除（T1 #48）：`project:<id>` / `group:<id>` → 一次性凭据与到期时间。
@@ -290,8 +298,11 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     async handle(request, response, pathname) {
       const method = request.method ?? "GET";
       try {
+        if (await identityApi.handle(request, response, pathname)) return true;
+        if (await workspaceApi.handle(request, response, pathname)) return true;
         return await route(repos, request, response, method, pathname);
       } catch (error) {
+        if (error instanceof WorkspaceError) { writeWorkspaceError(response, error); return true; }
         if (error instanceof RepositoryError) {
           const status = ERROR_STATUS[error.code] ?? 500;
           writeError(response, status, error.code, error.message);
@@ -328,15 +339,17 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
       if (method === "POST") {
         const body = await readObjectBody(request);
         // F2：创建项目 = project:create（阶段 1 默认人=owner 放行；manager 无此能力点）。
-        (await (guard(r, request, "project:create", {})));
+        const { actor } = await guard(r, request, "project:create", {});
         // #48 / PROJECT-02：可选「创建时指定」顶层 manager（已有全局 agent）；省略 = 留空待分配。
         const managerAgentId = optionalStringOrNull(body, "managerAgentId");
-        const project = (await (r.projects.create({
+        const input = {
           name: requireString(body, "name"),
           ...(managerAgentId === undefined ? {} : { managerAgentId }),
-        })));
+        };
+        const configured = Object.hasOwn(body, "workspace") ? await workspaceApi.createProject(request, actor, input, body["workspace"]) : null;
+        const project = configured?.project ?? await r.projects.create(input);
         log.info("创建项目", { projectId: project.id });
-        writeJson(response, 201, { project: (await (projectView(r, project))) });
+        writeJson(response, 201, { project: (await (projectView(r, project))), ...(configured ? { workspace: configured.workspace.workspace, workspaceRef: configured.workspace.workspaceRef } : {}) });
         return true;
       }
       if (method === "GET") {
@@ -1365,6 +1378,8 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     return {
       id: project.id,
       name: project.name,
+      projectRevision: project.projectRevision,
+      workspaceRevision: project.workspaceRevision,
       createdAt: project.createdAt,
       updatedAt: project.updatedAt,
       // T1 #48：归档时间（null = 未归档）。归档对象默认不出现在列表里，但形状一致。

@@ -40,6 +40,7 @@ export const AUDIT_ACTIONS = {
   project_archive: "project.archive",
   project_restore: "project.restore",
   project_delete: "project.delete",
+  project_workspace_update: "project.workspace_update",
   group_archive: "group.archive",
   group_restore: "group.restore",
   group_delete: "group.delete",
@@ -61,6 +62,14 @@ export const AUDIT_ACTIONS = {
   memory_summary_failed: "memory.summary_failed",
   memory_summary_conflicted: "memory.summary_conflicted",
   memory_summary_cancelled: "memory.summary_cancelled",
+  role_template_create: "role_template.create",
+  role_template_copy: "role_template.copy",
+  role_template_update: "role_template.update",
+  role_template_archive: "role_template.archive",
+  role_template_restore: "role_template.restore",
+  role_template_delete: "role_template.delete",
+  agent_rename: "agent.rename",
+  agent_alias_add: "agent.alias_add",
 } as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[keyof typeof AUDIT_ACTIONS];
@@ -133,7 +142,11 @@ export function isTruncated(row: { before: string | null; after: string | null }
 // 形状
 // ---------------------------------------------------------------------------
 
-export type AuditTargetKind = "member" | "node" | "role" | "capability" | "group" | "project" | "task" | "memory";
+export type AuditTargetKind = "member" | "node" | "role" | "capability" | "group" | "project" | "task" | "memory" | "role_template" | "agent";
+
+/** 全局目录使用 user/NULL；project 审计的历史调用形状与查询边界保持兼容。 */
+export type AuditContext = { readonly scope: "user"; readonly projectId: null }
+  | { readonly scope: "project"; readonly projectId: string };
 
 /** 审计主体快照（不依赖 JOIN；人的变更一律记录，agent 记其成员 id）。 */
 export interface AuditActor {
@@ -150,6 +163,7 @@ export function auditActorFrom(actor: Actor): AuditActor {
 
 /** 写入一条审计事件的入参；before/after 用 JSON 可序列化值，null 表示「事前/事后不存在」。 */
 export interface AuditEntry {
+  readonly scope?: "project";
   readonly projectId: string;
   readonly actor: AuditActor;
   readonly action: AuditAction | string;
@@ -162,6 +176,11 @@ export interface AuditEntry {
   readonly changed?: unknown;
   readonly detail?: unknown;
   readonly reversedByAuditId?: string | null;
+}
+
+export interface UserAuditEntry extends Omit<AuditEntry, "scope" | "projectId"> {
+  readonly scope: "user";
+  readonly projectId: null;
 }
 
 /** 插入行（reversed_at 由 markReversed 回写，插入时恒为 null）。 */
@@ -187,6 +206,9 @@ export interface AuditRow extends NewAuditRow {
   readonly reversedAt: string | null;
 }
 
+export type NewUserAuditRow = Omit<NewAuditRow, "projectId"> & { readonly scope: "user"; readonly projectId: null };
+export type UserAuditRow = NewUserAuditRow & { readonly reversedAt: string | null };
+
 type AuditRowDb = {
   id: string;
   project_id: string;
@@ -206,7 +228,7 @@ type AuditRowDb = {
   created_at: string;
 };
 
-function toAuditRow(row: AuditRowDb): AuditRow {
+function toAuditRow<T extends string | null>(row: Omit<AuditRowDb, "project_id"> & { project_id: T }): Omit<AuditRow, "projectId"> & { projectId: T } {
   return {
     id: row.id,
     projectId: row.project_id,
@@ -298,6 +320,9 @@ export interface AuditFilter {
 
 export interface AuditRepository {
   append(row: NewAuditRow): Promise<AuditRow>;
+  appendUser(row: NewUserAuditRow): Promise<UserAuditRow>;
+  getUser(id: string): Promise<UserAuditRow | null>;
+  listUser(filter?: AuditFilter): Promise<UserAuditRow[]>;
   get(projectId: string, id: string): Promise<AuditRow | null>;
   list(projectId: string, filter?: AuditFilter): Promise<AuditRow[]>;
   /** 仅首次回写原事件，竞争失败返回 false；调用者须回滚整个补偿事务。 */
@@ -316,12 +341,38 @@ export function createAuditRepository(ctx: RepoCtx): AuditRepository {
 
   return {
     async append(row) {
+      if (typeof row.projectId !== "string" || !row.projectId) throw new RepositoryError("invalid_argument", "audit_project_scope_invalid");
       await ctx.exec(insertSql, [
         row.id, row.projectId, row.actorKind, row.actorMemberId, row.actorName, row.action,
         row.targetKind, row.targetId, row.targetName, row.changed, row.before, row.after,
         row.detail, row.reversedByAuditId, row.createdAt,
       ]);
       return { ...row, reversedAt: null };
+    },
+    async appendUser(row) {
+      if (row.scope !== "user" || row.projectId !== null) throw new RepositoryError("invalid_argument", "audit_user_scope_invalid");
+      await ctx.exec(`INSERT INTO audit_log (id, scope, project_id, actor_kind, actor_member_id, actor_name, action,
+        target_kind, target_id, target_name, changed, before, after, detail, reversed_at, reversed_by_audit_id, created_at)
+        VALUES (?, 'user', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+      [row.id, row.actorKind, row.actorMemberId, row.actorName, row.action, row.targetKind, row.targetId, row.targetName,
+        row.changed, row.before, row.after, row.detail, row.reversedByAuditId, row.createdAt]);
+      return { ...row, reversedAt: null };
+    },
+    async getUser(id) {
+      const row = await ctx.one<Omit<AuditRowDb, "project_id"> & { project_id: null }>(
+        "SELECT * FROM audit_log WHERE scope = 'user' AND project_id IS NULL AND id = ?", [id]);
+      return row ? { ...toAuditRow(row), scope: "user" } : null;
+    },
+    async listUser(filter = {}) {
+      const clauses = ["scope = 'user'", "project_id IS NULL"], params: unknown[] = [];
+      if (filter.action !== undefined) { clauses.push("action = ?"); params.push(filter.action); }
+      if (filter.targetKind !== undefined) { clauses.push("target_kind = ?"); params.push(filter.targetKind); }
+      if (filter.targetId !== undefined) { clauses.push("target_id = ?"); params.push(filter.targetId); }
+      if (filter.beforeId !== undefined) { clauses.push("id < ?"); params.push(filter.beforeId); }
+      params.push(Math.min(Math.max(filter.limit ?? 50, 1), 200));
+      const rows = await ctx.query<Omit<AuditRowDb, "project_id"> & { project_id: null }>(
+        `SELECT * FROM audit_log WHERE ${clauses.join(" AND ")} ORDER BY id DESC LIMIT ?`, params);
+      return rows.map(row => ({ ...toAuditRow(row), scope: "user" as const }));
     },
     async get(projectId, id) {
       const row = await ctx.one<AuditRowDb>(getOneSql, [projectId, id]);
@@ -346,11 +397,16 @@ export function createAuditRepository(ctx: RepoCtx): AuditRepository {
 }
 
 /** 写入一条审计事件（供 api.ts 直接埋点与 recorder 复用）。 */
+export function appendAuditEntry(repo: AuditRepository, entry: AuditEntry, opts?: { readonly id?: string; readonly createdAt?: string }): Promise<AuditRow>;
+export function appendAuditEntry(repo: AuditRepository, entry: UserAuditEntry, opts?: { readonly id?: string; readonly createdAt?: string }): Promise<UserAuditRow>;
 export async function appendAuditEntry(
   repo: AuditRepository,
-  entry: AuditEntry,
+  entry: AuditEntry | UserAuditEntry,
   opts: { readonly id?: string; readonly createdAt?: string } = {},
-): Promise<AuditRow> {
+): Promise<AuditRow | UserAuditRow> {
+  if (entry.scope === "user" ? entry.projectId !== null : typeof entry.projectId !== "string" || !entry.projectId) {
+    throw new RepositoryError("invalid_argument", "audit_context_invalid");
+  }
   if (typeof entry.detail === "object" && entry.detail !== null &&
       (entry.detail as { reversal?: { version?: unknown } }).reversal?.version === 2) {
     assertCompleteAuditFields(entry.before, entry.after, entry.detail);
@@ -366,9 +422,8 @@ export async function appendAuditEntry(
       ? { ...(entry.detail as Record<string, unknown>), ...(truncated ? { truncated: true } : {}) }
       : { ...(entry.detail === undefined ? {} : { value: entry.detail }), ...(truncated ? { truncated: true } : {}) };
 
-  const row: NewAuditRow = {
+  const row: Omit<NewAuditRow, "projectId"> = {
     id: opts.id ?? newId(),
-    projectId: entry.projectId,
     actorKind: entry.actor.kind,
     actorMemberId: entry.actor.memberId ?? null,
     actorName: entry.actor.name,
@@ -383,7 +438,7 @@ export async function appendAuditEntry(
     reversedByAuditId: entry.reversedByAuditId ?? null,
     createdAt: opts.createdAt ?? new Date().toISOString(),
   };
-  return repo.append(row);
+  return entry.scope === "user" ? repo.appendUser({ ...row, scope: "user", projectId: null }) : repo.append({ ...row, projectId: entry.projectId });
 }
 
 // ---------------------------------------------------------------------------
@@ -438,9 +493,10 @@ export function createAuditRecorder(repo: AuditRepository): { record(change: Org
 // 视图（HTTP 响应 / WebUI 共用）
 // ---------------------------------------------------------------------------
 
-export function auditView(row: AuditRow) {
+export function auditView(row: AuditRow | UserAuditRow) {
   return {
     id: row.id,
+    scope: row.projectId === null ? "user" : "project",
     projectId: row.projectId,
     actorKind: row.actorKind,
     actorName: row.actorName,

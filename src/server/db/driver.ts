@@ -9,7 +9,8 @@
  * Seam：本文件的 DbDriver 接口 + createDbDriver 工厂（ticket #46 确认的测试 seam）。
  */
 import type { DbDriverKind } from "../config.ts";
-import { ConfigError } from "../config.ts";
+import { ConfigError } from "../config-error.ts";
+import type { SqliteDatabaseDescriptor } from "../environment.ts";
 import type { AppliedMigration, Migration, MigrationRunResult } from "./migrate.ts";
 import type { SqlDialect } from "./dialect.ts";
 import { createSqliteDriver } from "./drivers/sqlite.ts";
@@ -66,6 +67,10 @@ export interface DbDriverOptions {
   readonly dbDriver?: DbDriverKind;
   /** SQLite 数据目录；dbDriver=sqlite 时必须。 */
   readonly dataDir?: string;
+  /** 统一 resolver 指定的真实 SQLite 文件；可与管理 dataDir 不同。 */
+  readonly sqlitePath?: string;
+  /** 既有源的原入口与身份；连接前重新核实，拒绝移动/替换后创建空库。 */
+  readonly sqliteSource?: SqliteDatabaseDescriptor;
   /** PostgreSQL 连接串；dbDriver=postgres 时必须。 */
   readonly pgConnectionString?: string;
   /**
@@ -94,7 +99,9 @@ export function createDbDriver(options: DbDriverOptions): DbDriver {
         "dbDriver=sqlite 需要 dataDir。请设置 AGENT_STUDIO_DATA_DIR 或配置文件中的 dataDir 字段。",
       );
     }
-    return createSqliteDriver({ dataDir: options.dataDir });
+    return createSqliteDriver({ dataDir: options.dataDir,
+      ...(options.sqlitePath === undefined ? {} : { sqlitePath: options.sqlitePath }),
+      ...(options.sqliteSource === undefined ? {} : { sqliteSource: options.sqliteSource }) });
   }
   if (options.pgConnectionString === undefined || options.pgConnectionString.trim() === "") {
     throw new ConfigError(
