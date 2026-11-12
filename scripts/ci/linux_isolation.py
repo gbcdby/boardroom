@@ -359,7 +359,7 @@ def cleanup_owned(stage, request, state):
     account, group = account_record(state['name']), group_record(state['name'])
     if account:
         if account.pw_uid != state.get('uid') or account.pw_gid != state.get('gid') or \
-           account.pw_dir != str(stage / 'home') or account.pw_gecos != 'boardroom-ci:' + request['token']:
+           account.pw_dir != str(stage / 'home') or account.pw_gecos != 'boardroom-ci-' + request['token']:
             raise IsolationError('New account ownership no longer matches this job')
         result['terminated_processes'] = stop_owned_processes(account.pw_uid)
     elif state.get('uid') and process_rows(state['uid']):
@@ -486,7 +486,7 @@ def supervise(stage, cleanup_only=False):
             tool(['/usr/sbin/useradd', '--system', '--uid', str(uid), '--gid', str(uid), '--no-user-group',
                   '--no-create-home', '--no-log-init',
                   '--home-dir', str(stage / 'home'), '--shell', '/usr/sbin/nologin',
-                  '--comment', 'boardroom-ci:' + request['token'], state['name']])
+                  '--comment', 'boardroom-ci-' + request['token'], state['name']])
             for name in ('work', 'home', 'tmp', 'npm-cache'):
                 path = stage / name
                 path.mkdir(mode=0o700)
@@ -532,7 +532,7 @@ def supervise(stage, cleanup_only=False):
         # Root stops only the verified new UID, then reads independent regular artifacts.
         try:
             account = account_record(state['name'])
-            if account and account.pw_uid == state.get('uid') and account.pw_gecos == 'boardroom-ci:' + request['token']:
+            if account and account.pw_uid == state.get('uid') and account.pw_gecos == 'boardroom-ci-' + request['token']:
                 lingering = stop_owned_processes(account.pw_uid)
                 if lingering:
                     report['terminated_after_command'] = lingering

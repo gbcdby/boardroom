@@ -1,4 +1,5 @@
 """Launcher contracts using owned local fixtures; account/UID changes are hosted-only."""
+import ast
 import copy
 import importlib.util
 import io
@@ -11,7 +12,9 @@ import sys
 import tarfile
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('linux_isolation', Path(__file__).with_name('linux_isolation.py'))
@@ -187,6 +190,88 @@ result=module.run_command([sys.executable,'-c',code,str(base/'ready')],base,{'PA
                              env=env, text=True, capture_output=True, timeout=3)
         self.assertNotEqual(run.returncode, 0)
         self.assertIn('GitHub Actions', run.stderr)
+
+    def account_argv(self, program, stage, token, uid=42001, entry='sqlite'):
+        # Evaluate only the actual argv expression; never execute account/setpriv commands.
+        source = Path(__file__).with_name('linux_isolation.py').read_text()
+        expressions = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.List)
+                       and node.elts and isinstance(node.elts[0], ast.Constant) and node.elts[0].value == program]
+        self.assertEqual(len(expressions), 1)
+        values = {'uid': uid, 'stage': stage, 'request': {'token': token},
+                  'state': {'name': ci.job_name('43291999828', '1', entry)}, 'str': str}
+        return eval(compile(ast.Expression(expressions[0]), '<fixed argv fixture>', 'eval'),
+                    {'__builtins__': {}}, values)
+
+    def test_account_argv_uses_valid_passwd_fields_and_supported_privilege_options(self):
+        # Shadow 4.13 useradd VALID rejects ':' and newline, independently of launcher spelling.
+        token = '4b033c3841b2c655a49fd1133017d730'
+        for entry in ci.ENTRIES:
+            stage = Path('/home/runner/work/_temp') / ci.stage_name('43291999828', '1', entry)
+            argv = self.account_argv('/usr/sbin/useradd', stage, token, entry=entry)
+            field = lambda option: argv[argv.index(option) + 1]
+            for option in ('--comment', '--home-dir', '--shell'):
+                self.assertNotRegex(field(option), '[:\n\x00]', option)
+            self.assertEqual(field('--comment').count(token), 1)
+            self.assertTrue(field('--comment').endswith(token))
+            self.assertEqual(field('--home-dir'), str(stage / 'home'))
+            self.assertTrue(Path(field('--home-dir')).is_absolute())
+            self.assertEqual(field('--shell'), '/usr/sbin/nologin')
+            self.assertRegex(argv[-1], r'^[a-z_][a-z0-9_-]{0,31}$')
+            self.assertEqual(field('--uid'), '42001')
+            self.assertEqual(field('--gid'), field('--uid'))
+            self.assertTrue({'--system', '--no-user-group', '--no-create-home', '--no-log-init'} <= set(argv))
+            self.assertNotIn('-K', argv)
+            self.assertNotIn('--badname', argv)
+            self.assertEqual(self.account_argv('/usr/sbin/groupadd', stage, token, entry=entry),
+                             ['/usr/sbin/groupadd', '--gid', field('--gid'), argv[-1]])
+            privilege = self.account_argv('/usr/bin/setpriv', stage, token, entry=entry)
+            self.assertEqual(privilege[1:8], ['--reuid=42001', '--regid=42001', '--clear-groups',
+                                           '--inh-caps=-all', '--ambient-caps=-all', '--bounding-set=-all',
+                                           '--no-new-privs'])
+            self.assertEqual(privilege[8:], ['/usr/bin/python3', '-I', str(stage / 'launcher.py'), '--child', str(stage)])
+
+    def test_account_cleanup_rejects_changed_nonce_uid_gid_home_or_marker(self):
+        # NSS records are fixtures. Stop at the first process boundary; no accounts are created/deleted.
+        class ProcessBoundaryReached(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = Path(temporary).resolve()
+            sentinel = stage / 'preserve.txt'
+            sentinel.write_text('unchanged')
+            token = '4b033c3841b2c655a49fd1133017d730'
+            name = ci.job_name('43291999828', '1', 'sqlite')
+            info = stage.stat()
+            request = {'token': token, 'name': name, 'directory_identity': [info.st_dev, info.st_ino]}
+            state = {'token': token, 'name': name, 'stage': str(stage), 'uid': 42001, 'gid': 42001}
+            argv = self.account_argv('/usr/sbin/useradd', stage, token)
+            account = {'pw_uid': 42001, 'pw_gid': 42001, 'pw_dir': str(stage / 'home'),
+                       'pw_gecos': argv[argv.index('--comment') + 1]}
+            bad_accounts = [dict(account, **change) for change in [
+                {'pw_uid': 42002}, {'pw_gid': 42002}, {'pw_dir': str(stage / 'another-home')},
+                {'pw_gecos': account['pw_gecos'][:-1]},
+                {'pw_gecos': account['pw_gecos'].replace(token, '0' + token[1:])},
+            ]]
+            for bad in bad_accounts:
+                with self.subTest(changed=bad), mock.patch.object(ci, 'account_record', return_value=SimpleNamespace(**bad)), \
+                     mock.patch.object(ci, 'group_record', return_value=None), \
+                     mock.patch.object(ci, 'stop_owned_processes') as stop, mock.patch.object(ci, 'tool') as tool:
+                    with self.assertRaisesRegex(ci.IsolationError, 'ownership'):
+                        ci.cleanup_owned(stage, request, state)
+                    stop.assert_not_called()
+                    tool.assert_not_called()
+            for change in ({'token': '0' + token[1:]}, {'stage': str(stage / 'other')}, {'name': name + 'x'}):
+                with self.assertRaisesRegex(ci.IsolationError, 'marker'):
+                    ci.verify_marker(stage, request, dict(state, **change))
+            with self.assertRaisesRegex(ci.IsolationError, 'marker'):
+                ci.verify_marker(stage, dict(request, directory_identity=[info.st_dev, info.st_ino + 1]), state)
+            with mock.patch.object(ci, 'account_record', return_value=SimpleNamespace(**account)), \
+                 mock.patch.object(ci, 'group_record', return_value=None), \
+                 mock.patch.object(ci, 'stop_owned_processes', side_effect=ProcessBoundaryReached) as stop:
+                with self.assertRaises(ProcessBoundaryReached):
+                    ci.cleanup_owned(stage, request, state)
+                stop.assert_called_once_with(42001)
+            self.assertEqual(sentinel.read_text(), 'unchanged')
 
 
 if __name__ == '__main__':

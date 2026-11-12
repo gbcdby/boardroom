@@ -1,5 +1,6 @@
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
@@ -135,12 +136,9 @@ async function sendFile(response: ServerResponse, file: string, headOnly: boolea
     response.end();
     return;
   }
-  await new Promise<void>((resolve, reject) => {
-    const stream = createReadStream(file);
-    stream.on("error", reject);
-    stream.on("end", () => resolve());
-    stream.pipe(response);
-  });
+  // A response can close after Content-Length bytes but before the file's EOF.
+  // Account for both endpoints and the source FD's close before releasing this request.
+  await pipeline(createReadStream(file), response);
 }
 
 function writeNotFound(response: ServerResponse): void {

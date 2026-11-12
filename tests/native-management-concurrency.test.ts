@@ -14,6 +14,7 @@ const root = path.resolve(import.meta.dirname, "..");
 const databaseUrl = pathToFileURL(createRequire(import.meta.url).resolve("better-sqlite3")).href;
 const admissionUrl = new URL("../src/server/storage/native-management-admission.ts", import.meta.url).href;
 const helperUrl = new URL("../src/server/db/migrate-host-type.ts", import.meta.url).href;
+const environmentUrl = new URL("../src/server/environment.ts", import.meta.url).href;
 
 async function fixture(body: (db: Database.Database, dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(path.join(tmpdir(), "boardroom-native-concurrency-"));
@@ -148,10 +149,12 @@ Database.prototype.prepare = function(sql) {
     await writeFile(script, `import {statSync} from 'node:fs';
 import {openNativeManagementSource} from ${JSON.stringify(admissionUrl)};
 import {migrateOtherToDsh} from ${JSON.stringify(helperUrl)};
-const sqlitePath = ${JSON.stringify(path.join(dir, "agent-studio.db"))};
+import {canonicalizePath} from ${JSON.stringify(environmentUrl)};
+const sourcePath = ${JSON.stringify(path.join(dir, "agent-studio.db"))};
+const sqlitePath = canonicalizePath(sourcePath);
 const stat = statSync(sqlitePath, {bigint:true});
 const lease = await openNativeManagementSource({mode:'write',source:{kind:'sqlite',dataDir:${JSON.stringify(dir)},
-  sourcePath:sqlitePath,sqlitePath,identity:{device:String(stat.dev),inode:String(stat.ino)}}});
+  sourcePath,sqlitePath,identity:{device:String(stat.dev),inode:String(stat.ino)}}});
 try {
   const report = migrateOtherToDsh(lease);
   console.log(JSON.stringify({report}));
