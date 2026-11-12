@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID, createHash } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import fsPromises, { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "pg";
@@ -23,6 +24,70 @@ const connect = async (url: string) => {
     application_name: "boardroom-r05-fixture" });
   client.on("error", () => {}); await client.connect(); return client;
 };
+
+function diagnosticError(error: unknown): Record<string, unknown> {
+  // Only bounded error metadata: no cause traversal, SQL, environment or file contents.
+  try {
+    const value = error as { name?: unknown; message?: unknown; code?: unknown; errno?: unknown; syscall?: unknown; stack?: unknown } | null;
+    return { name: String(value?.name ?? "unknown").slice(0, 80), message: String(value?.message ?? "").slice(0, 512),
+      code: typeof value?.code === "string" ? value.code.slice(0, 80) : null,
+      errno: typeof value?.errno === "number" ? value.errno : null,
+      syscall: typeof value?.syscall === "string" ? value.syscall.slice(0, 80) : null,
+      stack: typeof value?.stack === "string" ? value.stack.split("\n").slice(0, 5).join("\n").slice(0, 1536) : null };
+  } catch { return { metadataUnavailable: true }; }
+}
+
+function observeRejection<T>(operation: Promise<T>, result: Record<string, unknown>): Promise<T> {
+  return operation.catch(error => {
+    result.verificationRejection = diagnosticError(error);
+    throw error; // Preserve the same rejection object for the original assertion/source-lock path.
+  });
+}
+
+function observeOwnedOpen(directory: string, archive: string, result: Record<string, unknown>): () => void {
+  const original = fsPromises.open;
+  let directoryFd: number | undefined, nextId = 0;
+  const events: Record<string, unknown>[] = [];
+  const trace = { eventLimit: 64, truncated: false, metadataUnavailable: false, restored: false, events };
+  result.openObservation = trace;
+  const record = (event: Record<string, unknown>) => {
+    try { if (events.length < trace.eventLimit) events.push(event); else trace.truncated = true; }
+    catch { trace.metadataUnavailable = true; }
+  };
+  const classify = (path: unknown): string | undefined => {
+    if (path === directory) return "restore-directory";
+    if (path === archive) return "source-archive";
+    if (directoryFd !== undefined && typeof path === "string") {
+      const prefix = `/dev/fd/${directoryFd}/`;
+      if (path.startsWith(prefix) && /^\.public-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}-(archive\.dump|complete\.toc|namespace\.list|body\.list|namespace\.sql|body\.sql)$/.test(path.slice(prefix.length)))
+        return "bound-public-file";
+    }
+    return undefined;
+  };
+  const observed: typeof fsPromises.open = (...args) => {
+    const stage = classify(args[0]);
+    if (!stage) return Reflect.apply(original, fsPromises, args) as ReturnType<typeof original>;
+    const id = ++nextId;
+    record({ id, stage, event: "begin", path: String(args[0]).slice(0, 512), flags: args[1], mode: args[2] ?? null });
+    let operation: ReturnType<typeof original>;
+    try { operation = Reflect.apply(original, fsPromises, args) as ReturnType<typeof original>; }
+    catch (error) { record({ id, stage, event: "rejected", error: diagnosticError(error) }); throw error; }
+    return operation.then(handle => {
+      if (stage === "restore-directory") directoryFd = handle.fd;
+      record({ id, stage, event: "fulfilled", fd: handle.fd });
+      return handle; // No extra fstat/read/open; return the original FileHandle and untouched offset.
+    }, error => { record({ id, stage, event: "rejected", error: diagnosticError(error) }); throw error; });
+  };
+  // Production imports open by name. Synchronize that existing live builtin binding;
+  // assigning only the default object's method would not observe the production call.
+  fsPromises.open = observed;
+  syncBuiltinESMExports();
+  return () => {
+    fsPromises.open = original;
+    syncBuiltinESMExports();
+    trace.restored = true;
+  };
+}
 
 function wrapper(program: "pg_restore" | "psql", native: string, directory: string, log: string, scenario: Scenario) {
   // Metadata reads do not change file offsets. Native argv, input/output FDs and SQL stay unchanged.
@@ -172,15 +237,21 @@ test("#152 PUB-R05 Darwin native public FD pipeline and immutable-input controls
           const archive = join(f!.directory, "source.dump"), backup = await lock.backup(archive);
           result.archiveSha256 = digest(await readFile(archive));
           result.phase = "production-public-verification";
-          if (scenario === "normal") {
-            const verified = await f!.adapter.verifyDatabase(archive, backup.manifests, f!.directory) as Record<string, Json>;
-            const restored = verified.restoredWith as Record<string, Json>;
-            assert.equal(restored.profile, "pg16-public-native-segments-v1");
-            assert.equal(restored.pgRestore, "16.15"); assert.equal(restored.psql, "16.15");
-            assert.equal(restored.singleTransaction, true); assert.equal(restored.ownershipPreserved, true); assert.equal(restored.aclPreserved, true);
-            assert.equal(verified.exactFullDataAndControlMatched, true);
-            result.verification = verified;
-          } else await assert.rejects(f!.adapter.verifyDatabase(archive, backup.manifests, f!.directory), /snapshot_invalid/);
+          const restoreOpen = observeOwnedOpen(f!.directory, archive, result);
+          try {
+            if (scenario === "normal") {
+              const verified = await observeRejection(f!.adapter.verifyDatabase(archive, backup.manifests, f!.directory), result) as Record<string, Json>;
+              const restored = verified.restoredWith as Record<string, Json>;
+              assert.equal(restored.profile, "pg16-public-native-segments-v1");
+              assert.equal(restored.pgRestore, "16.15"); assert.equal(restored.psql, "16.15");
+              assert.equal(restored.singleTransaction, true); assert.equal(restored.ownershipPreserved, true); assert.equal(restored.aclPreserved, true);
+              assert.equal(verified.exactFullDataAndControlMatched, true);
+              result.verification = verified;
+            } else await assert.rejects(observeRejection(f!.adapter.verifyDatabase(archive, backup.manifests, f!.directory), result), /snapshot_invalid/);
+          } catch (error) {
+            result.callbackFailureBeforeSourceLock = diagnosticError(error);
+            throw error;
+          } finally { restoreOpen(); }
         });
         result.phase = "native-evidence-and-postconditions";
         const events = (await readFile(f.log, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as NativeEvent);
