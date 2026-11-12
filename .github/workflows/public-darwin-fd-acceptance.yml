@@ -1,0 +1,54 @@
+name: Darwin public 受控 FD 有限验收
+
+on:
+  push:
+    branches: [qualification/152-darwin-public-fd]
+    paths:
+      - .github/workflows/public-darwin-fd-acceptance.yml
+      - scripts/ci/run_public_darwin_fd.py
+      - tests/maintenance-postgres-public-darwin.acceptance.ts
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualification-152-darwin-public-fd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  darwin-public-fd:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - name: 检出本次固定资格候选
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: 准备 Node 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: 按原锁文件安装依赖
+        timeout-minutes: 3
+        run: npm ci
+
+      - name: 一次实际 Darwin FD 验收及自有 PG 完整收尾
+        timeout-minutes: 11
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: python3 scripts/ci/run_public_darwin_fd.py --expected-commit "$EXPECTED_COMMIT"
+
+      - name: 保存实际环境、阶段日志、案例与清理事实
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: darwin-public-fd-r05-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .agent-output/darwin-public-fd-r05/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
