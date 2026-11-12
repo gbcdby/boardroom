@@ -363,8 +363,13 @@ jobs:
         run: .agent-output/browser-venv/bin/python scripts/e2e-navigation-web.py --artifacts .agent-output/navigation-web-e2e
 
       - name: 三态主题、首帧与页面状态保持真实浏览器验证
+        id: theme_acceptance
         if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-theme-web.py
+
+      - name: 正式验收后的首次聊天独立诊断样本
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' && (steps.theme_acceptance.outcome == 'success' || steps.theme_acceptance.outcome == 'failure') }}
+        run: .agent-output/browser-venv/bin/python scripts/e2e-chat-follow-diagnostic.py --original-report .agent-output/theme-web-e2e/report.json
 
       - name: SQLite 固定负载与真实 DOM 消息时延
         if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
@@ -390,6 +395,7 @@ jobs:
             .agent-output/settings-web-e2e/
             .agent-output/navigation-web-e2e/
             .agent-output/theme-web-e2e/
+            .agent-output/chat-follow-diagnostic/
             .agent-output/v1-load-web/
           include-hidden-files: true
           if-no-files-found: warn
