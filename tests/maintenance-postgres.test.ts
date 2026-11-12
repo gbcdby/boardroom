@@ -1,4 +1,5 @@
-import test from "node:test";
+import test, { after } from "node:test";
+import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -18,7 +19,9 @@ import { auditPublicArchiveToc, readPublicRestoreCatalogBinding } from "../src/s
 import type { PostgresDatabaseIdentity } from "../src/server/storage/maintenance/postgres-identity.ts";
 import type { PostgresDescriptor } from "../src/server/storage/maintenance/postgres-tools.ts";
 import type { ControlRootIdentity, Json, MaintenanceAdapter, OperationMutex } from "../src/server/storage/maintenance/types.ts";
-import { observePostgresWriters } from "./fixtures/maintenance-postgres-writer-observation.ts";
+import { closePostgresWriterObservations, observePostgresWriters } from "./fixtures/maintenance-postgres-writer-observation.ts";
+
+after(closePostgresWriterObservations);
 
 test("#152 PG typed cells preserve int8/numeric precision, NULL, binary and duplicate rows", () => {
   const integer = encodePostgresCell("20", "9223372036854775807");
@@ -71,6 +74,7 @@ interface Fixture {
   readonly root: ControlRootIdentity;
   readonly role: string;
   readonly admin: Client;
+  readonly observation: ReturnType<typeof observePostgresWriters>;
   connectSource(): Promise<Client>;
   connectTarget(): Promise<Client>;
   close(): Promise<void>;
@@ -81,7 +85,8 @@ async function connectDescriptor(descriptor: PostgresDescriptor): Promise<Client
   await client.query(`SET search_path TO ${quoted(parsed.schema)},pg_catalog`);
   return client;
 }
-async function fixture(seed = true, schema = "app", options: {
+async function fixture(t: TestContext, caseId: string, seed = true, schema = "app", options: {
+  readonly scenario?: string;
   readonly recreatePublic?: boolean; readonly unprivileged?: boolean; readonly databaseNameWithSpaces?: boolean; readonly specialRoleName?: boolean;
 } = {}): Promise<Fixture> {
   if (!testUrl) throw new Error("PG fixture requires explicit AGENT_STUDIO_PG_TEST_URL");
@@ -94,6 +99,16 @@ async function fixture(seed = true, schema = "app", options: {
     return { kind: "postgres", connectionString: url.toString(), schema };
   };
   const source = descriptor(sourceName), target = descriptor(targetName);
+  let observationDigest = "";
+  try { observationDigest = parsePostgresConnection(source).descriptorDigest; }
+  catch { /* An unavailable diagnostic scope must not change original setup. */ }
+  const observation = observePostgresWriters({ caseId, scenario: options.scenario ?? "main",
+    sourceDescriptorDigest: observationDigest });
+  // This hook only closes diagnostic resources if original setup/cleanup exits
+  // early. It never cleans business fixtures or replaces their original error.
+  try { t.after(() => observation.close("test-hook")); } catch { observation.close("test-hook"); }
+  observation.mark("fixture-start");
+  try {
   const directory = await mkdtemp(join(tmpdir(), "boardroom-pg-maintenance-")); await chmod(directory, 0o700);
   const info = await lstat(directory, { bigint: true });
   const root = { path: directory, device: info.dev.toString(), inode: info.ino.toString(), hostIdentityDigest: await maintenanceHostIdentityDigest() };
@@ -101,9 +116,14 @@ async function fixture(seed = true, schema = "app", options: {
   const created: string[] = [];
   let roleCreated = false;
   const cleanup = async () => {
-    for (const name of created.reverse()) await admin.query(`DROP DATABASE ${quoted(name)}`);
-    if (roleCreated) await admin.query(`DROP ROLE ${quoted(role)}`);
-    await admin.end(); await rm(directory, { recursive: true, force: true });
+    observation.mark("fixture-close-start");
+    try {
+      for (const name of created.reverse()) await admin.query(`DROP DATABASE ${quoted(name)}`);
+      if (roleCreated) await admin.query(`DROP ROLE ${quoted(role)}`);
+      await admin.end(); await rm(directory, { recursive: true, force: true });
+      observation.mark("fixture-close-returned");
+    } catch (error) { observation.failure("cleanup", error); throw error; }
+    finally { observation.close(); }
   };
   try {
     await admin.query(`CREATE ROLE ${quoted(role)} ${options.unprivileged ? `LOGIN PASSWORD '${password}'` : "NOLOGIN"}`); roleCreated = true;
@@ -160,9 +180,11 @@ async function fixture(seed = true, schema = "app", options: {
         await extendPostgresStorageGuards(client); await client.query("COMMIT");
       } finally { await client.end(); }
     }
-    return { source, target, directory, root, role, admin,
+    observation.mark("fixture-returned");
+    return { source, target, directory, root, role, admin, observation,
       connectSource: () => connectDescriptor(source), connectTarget: () => connectDescriptor(target), close: cleanup };
-  } catch (error) { await cleanup(); throw error; }
+  } catch (error) { observation.failure("setup", error); await cleanup(); throw error; }
+  } catch (error) { observation.failure("setup", error); observation.close(); throw error; }
 }
 async function acquire(adapter: MaintenanceAdapter, f: Fixture): Promise<OperationMutex> {
   return adapter.acquireMutex(f.root, (await adapter.observe()).state);
@@ -180,8 +202,8 @@ async function seal(adapter: MaintenanceAdapter, f: Fixture, mutex: OperationMut
   });
 }
 
-pgTest("#152 PG column ACL preserves grants and grant options while accepting NULL and empty privilege sets", async () => {
-  const f = await fixture(false), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+pgTest("#152 PG column ACL preserves grants and grant options while accepting NULL and empty privilege sets", async t => {
+  const f = await fixture(t, "pg-column-acl", false), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
   const client = await f.connectSource();
   const columnState = async () => (await client.query(`SELECT attacl IS NULL AS absent,
     cardinality(attacl) AS count,array_ndims(attacl) AS dimensions FROM pg_catalog.pg_attribute
@@ -233,7 +255,7 @@ pgTest("#152 PG column ACL preserves grants and grant options while accepting NU
 });
 
 pgTest("#152 PG migration catalog orders two-digit versions numerically and rejects changed migration identity", async t => {
-  const f = await fixture(false), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+  const f = await fixture(t, "pg-migration-identity", false), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
   try {
     const baseline = await adapter.observe();
     const applied = (baseline.manifests.schema as Record<string, Json>).migrations as Record<string, Json>[];
@@ -264,8 +286,8 @@ pgTest("#152 PG migration catalog orders two-digit versions numerically and reje
   } finally { await adapter.close(); await f.close(); }
 });
 
-pgTest("#152 PG16 real nonempty native dump/restore preserves catalog, owner/ACL, controls, typed values and migration identity sequence", async () => {
-  const f = await fixture(), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+pgTest("#152 PG16 real nonempty native dump/restore preserves catalog, owner/ACL, controls, typed values and migration identity sequence", async t => {
+  const f = await fixture(t, "pg-native-roundtrip"), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
   try {
     const mutex = await acquire(adapter, f); await seal(adapter, f, mutex);
     const evidence = await adapter.withSourceLock("snapshot", async lock => {
@@ -308,7 +330,7 @@ async function namespaceState(f: Fixture): Promise<unknown> {
 pgTest("#152 public native restore preserves six owner/ACL profiles with present or absent target public", { timeout: 180_000 }, async t => {
   for (const kind of ["default", "custom-public-usage", "custom-no-public", "recreated", "owner-no-privileges", "grantor-chain"] as const)
     for (const present of [true, false]) await t.test(`${kind} / target ${present ? "present" : "absent"}`, async () => {
-      const f = await fixture(kind === "default" && present, "public", { recreatePublic: kind === "recreated", specialRoleName: kind !== "default" });
+      const f = await fixture(t, "public-owner-profiles", kind === "default" && present, "public", { recreatePublic: kind === "recreated", specialRoleName: kind !== "default", scenario: `${kind}-target-${present ? "present" : "absent"}` });
       const adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
       const extraRole = `br_pub_grantor_${randomUUID().replaceAll("-", "")}`;
       let extraCreated = false;
@@ -353,8 +375,8 @@ pgTest("#152 public native restore preserves six owner/ACL profiles with present
     });
 });
 
-pgTest("#152 public valid source DATABASE envelope is audited but target database properties and ACL remain unchanged", async () => {
-  const f = await fixture(false, "public", { databaseNameWithSpaces: true }), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+pgTest("#152 public valid source DATABASE envelope is audited but target database properties and ACL remain unchanged", async t => {
+  const f = await fixture(t, "public-database-envelope", false, "public", { databaseNameWithSpaces: true }), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
   const databaseState = async (target: boolean) => {
     const client = await (target ? f.connectTarget() : f.connectSource());
     try { return (await client.query(`SELECT oid::text,datname,datdba::text,datacl::text,datconnlimit,
@@ -380,8 +402,8 @@ pgTest("#152 public valid source DATABASE envelope is audited but target databas
   } finally { await adapter.close(); await f.close(); }
 });
 
-pgTest("#152 public native restore supports an authorized non-superuser database owner", async () => {
-  const f = await fixture(false, "public", { unprivileged: true }), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+pgTest("#152 public native restore supports an authorized non-superuser database owner", async t => {
+  const f = await fixture(t, "public-owner-non-superuser", false, "public", { unprivileged: true }), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
   try {
     const source = await f.connectSource();
     try { assert.equal((await source.query("SELECT rolsuper FROM pg_roles WHERE rolname=current_user")).rows[0].rolsuper, false); }
@@ -395,9 +417,9 @@ pgTest("#152 public native restore supports an authorized non-superuser database
   } finally { await adapter.close(); await f.close(); }
 });
 
-pgTest("#152 public target unknown namespace dependencies block before DROP and preserve their identity", async () => {
+pgTest("#152 public target unknown namespace dependencies block before DROP and preserve their identity", async t => {
   for (const kind of ["collation", "operator"] as const) {
-    const f = await fixture(false, "public"), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+    const f = await fixture(t, "public-namespace-dependencies", false, "public", { scenario: kind }), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
     try {
       const target = await f.connectTarget();
       try { await target.query(kind === "collation" ? "CREATE COLLATION public.unknown_collation FROM pg_catalog.\"C\""
@@ -419,8 +441,8 @@ pgTest("#152 public target unknown namespace dependencies block before DROP and 
   }
 });
 
-pgTest("#152 public archive bytes must still match this active snapshot before target writes", async () => {
-  const f = await fixture(false, "public"), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+pgTest("#152 public archive bytes must still match this active snapshot before target writes", async t => {
+  const f = await fixture(t, "public-archive-bytes", false, "public"), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
   try {
     const before = await namespaceState(f), mutex = await acquire(adapter, f); await seal(adapter, f, mutex);
     await adapter.withSourceLock("snapshot", async lock => {
@@ -432,10 +454,10 @@ pgTest("#152 public archive bytes must still match this active snapshot before t
   } finally { await adapter.close(); await f.close(); }
 });
 
-pgTest("#152 public missing or mismatched psql capability blocks before target writes", async () => {
+pgTest("#152 public missing or mismatched psql capability blocks before target writes", async t => {
   const realDump = await locateTool("pg_dump"), realRestore = await locateTool("pg_restore");
   for (const scenario of ["missing", "mismatch"] as const) {
-    const f = await fixture(false, "public"), directory = join(f.directory, "capability-tools"); await mkdir(directory, { mode: 0o700 });
+    const f = await fixture(t, "public-psql-capability", false, "public", { scenario }), directory = join(f.directory, "capability-tools"); await mkdir(directory, { mode: 0o700 });
     await symlink(realDump, join(directory, "pg_dump")); await symlink(realRestore, join(directory, "pg_restore"));
     if (scenario === "mismatch") await writeFile(join(directory, "psql"), `#!${process.execPath}\nprocess.stdout.write('psql (PostgreSQL) 16.14\\n');\n`, { mode: 0o700 });
     const oldPath = process.env.PATH;
@@ -453,8 +475,8 @@ pgTest("#152 public missing or mismatched psql capability blocks before target w
   }
 });
 
-pgTest("#152 public native CREATE permission failure rolls back the already executed DROP", async () => {
-  const f = await fixture(false, "public", { unprivileged: true }), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+pgTest("#152 public native CREATE permission failure rolls back the already executed DROP", async t => {
+  const f = await fixture(t, "public-create-rollback", false, "public", { unprivileged: true }), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
   try {
     const targetName = parsePostgresConnection(f.target).database, adminName = (await f.admin.query("SELECT current_user AS name")).rows[0].name;
     const target = await f.connectTarget();
@@ -470,11 +492,11 @@ pgTest("#152 public native CREATE permission failure rolls back the already exec
   } finally { await adapter.close(); await f.close(); }
 });
 
-pgTest("#152 public archive, selection and native SQL replacement or truncation fail before target execution", async () => {
+pgTest("#152 public archive, selection and native SQL replacement or truncation fail before target execution", async t => {
   assert.equal(process.platform, "linux", "this owned FD fault injector uses Linux procfs; Darwin needs its native acceptance");
   const realRestore = await locateTool("pg_restore");
   for (const scenario of ["archive-replace", "selection-replace", "sql-replace", "sql-truncate"] as const) {
-    const f = await fixture(false, "public"), directory = join(f.directory, "tamper-tools");
+    const f = await fixture(t, "public-input-fault", false, "public", { scenario }), directory = join(f.directory, "tamper-tools");
     await mkdir(directory, { mode: 0o700 });
     // Real pg_restore produces each output first. The owned shim then changes one already-bound
     // private input to challenge the production post-child/pre-executor identity checks.
@@ -496,7 +518,7 @@ else{fs.renameSync(target,target+'.original');fs.copyFileSync(target+'.original'
     let adapter: MaintenanceAdapter;
     try { process.env.PATH = `${directory}:${oldPath ?? ""}`; adapter = await createPostgresMaintenanceAdapter(f.source, f.target); }
     finally { if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath; }
-    const observation = observePostgresWriters({ scenario, sourceDescriptorDigest: parsePostgresConnection(f.source).descriptorDigest });
+    const observation = f.observation;
     try {
       observation.mark("scenario-start");
       const before = await namespaceState(f), mutex = await acquire(adapter, f); await seal(adapter, f, mutex);
@@ -513,9 +535,9 @@ else{fs.renameSync(target,target+'.original');fs.copyFileSync(target+'.original'
     finally {
       try {
         observation.mark("adapter-close-start"); await adapter.close(); observation.mark("adapter-close-returned");
-        observation.mark("fixture-close-start"); await f.close(); observation.mark("fixture-close-returned");
+        await f.close();
       } catch (error) { observation.failure("cleanup", error); throw error; }
-      finally { observation.close(); }
+      finally { observation.close("test-hook"); }
     }
   }
 });
@@ -536,7 +558,7 @@ async function publicPsqlFaultAdapter(f: Fixture, command: string) {
 
 pgTest("#152 public native error, abort and source/target lock loss roll back and await actual child/backend exit", { timeout: 90_000 }, async t => {
   for (const scenario of ["native-error", "abort", "source-lock-loss", "target-lock-loss"] as const) await t.test(scenario, async () => {
-    const f = await fixture(false, "public"), fault = await publicPsqlFaultAdapter(f, scenario === "native-error" ? "SELECT 1/0" : "SELECT pg_sleep(30)"), adapter = fault.adapter;
+    const f = await fixture(t, "public-native-fault", false, "public", { scenario }), fault = await publicPsqlFaultAdapter(f, scenario === "native-error" ? "SELECT 1/0" : "SELECT pg_sleep(30)"), adapter = fault.adapter;
     let closing: Promise<void> | undefined;
     try {
       const target = await f.connectTarget();
@@ -581,8 +603,8 @@ pgTest("#152 public native error, abort and source/target lock loss roll back an
   });
 });
 
-pgTest("#152 complete public TOC rejects actual LO, VIEW, cross-schema and foreign-database archives", async () => {
-  const f = await fixture(false, "public"), other = await fixture(false, "public"), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+pgTest("#152 complete public TOC rejects actual LO, VIEW, cross-schema and foreign-database archives", async t => {
+  const f = await fixture(t, "public-toc-scope", false, "public", { scenario: "source" }), other = await fixture(t, "public-toc-scope", false, "public", { scenario: "foreign-archive" }), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
   const source = await f.connectSource();
   try {
     // Match the adapter's canonical TIMESTAMPTZ projection before comparing complete manifests.
@@ -622,10 +644,12 @@ pgTest("#152 complete public TOC rejects actual LO, VIEW, cross-schema and forei
   } finally { await source.end(); await adapter.close(); await f.close(); await other.close(); }
 });
 
-pgTest("#152 PG actual-source advisory mutex excludes aliases and leaves an independent source available", async () => {
-  const f = await fixture(false), other = await fixture(false);
+pgTest("#152 PG actual-source advisory mutex excludes aliases and leaves an independent source available", async t => {
+  const f = await fixture(t, "pg-source-alias", false, "app", { scenario: "source" }), other = await fixture(t, "pg-source-alias", false, "app", { scenario: "independent" });
   const aliasUrl = new URL(f.source.connectionString); aliasUrl.protocol = aliasUrl.protocol === "postgres:" ? "postgresql:" : "postgres:";
   const alias = { ...f.source, connectionString: aliasUrl.toString() };
+  try { f.observation.registerAlias(parsePostgresConnection(alias).descriptorDigest); }
+  catch { f.observation.registerAlias(""); }
   assert.notEqual(alias.connectionString, f.source.connectionString);
   const one = await createPostgresMaintenanceAdapter(f.source, f.target), two = await createPostgresMaintenanceAdapter(alias, f.target);
   const independent = await createPostgresMaintenanceAdapter(other.source, other.target);
@@ -638,8 +662,8 @@ pgTest("#152 PG actual-source advisory mutex excludes aliases and leaves an inde
   } finally { await Promise.all([one.close(), two.close(), independent.close()]); await f.close(); await other.close(); }
 });
 
-pgTest("#152 PG physical locks reject an in-flight writer; unknown idle backend is still a blocker", async () => {
-  const f = await fixture(), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+pgTest("#152 PG physical locks reject an in-flight writer; unknown idle backend is still a blocker", async t => {
+  const f = await fixture(t, "pg-writer-guards"), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
   let writer: Client | undefined;
   try {
     const mutex = await acquire(adapter, f); writer = await f.connectSource();
@@ -657,8 +681,8 @@ pgTest("#152 PG physical locks reject an in-flight writer; unknown idle backend 
   } finally { await writer?.end(); await adapter.close(); await f.close(); }
 });
 
-pgTest("#152 PG scope rejects extra sequence, cross-schema FK, extension, RLS and unknown type without silently excluding them", async () => {
-  const f = await fixture(false), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+pgTest("#152 PG scope rejects extra sequence, cross-schema FK, extension, RLS and unknown type without silently excluding them", async t => {
+  const f = await fixture(t, "pg-rejected-schema", false), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
   try {
     for (const [setup, teardown] of [
       ["CREATE SEQUENCE extra_sequence", "DROP SEQUENCE extra_sequence"],
@@ -680,8 +704,8 @@ pgTest("#152 PG scope rejects extra sequence, cross-schema FK, extension, RLS an
   } finally { await adapter.close(); await f.close(); }
 });
 
-pgTest("#152 PG restore refuses source/occupied target, missing declared owner role and corrupt dump; never clears a target", async () => {
-  const f = await fixture(), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+pgTest("#152 PG restore refuses source/occupied target, missing declared owner role and corrupt dump; never clears a target", async t => {
+  const f = await fixture(t, "pg-restore-refusal"), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
   try {
     const mutex = await acquire(adapter, f); await seal(adapter, f, mutex);
     await adapter.withSourceLock("snapshot", async lock => {
@@ -730,8 +754,8 @@ async function wrappedAdapter(f: Fixture, script: string): Promise<MaintenanceAd
   finally { if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath; }
 }
 
-pgTest("#152 PG missing/failed native dump stays sealed and never leaks tool stderr", async () => {
-  const f = await fixture(false);
+pgTest("#152 PG missing/failed native dump stays sealed and never leaks tool stderr", async t => {
+  const f = await fixture(t, "pg-dump-capability", false);
   let adapter: MaintenanceAdapter | undefined;
   try {
     const oldPath = process.env.PATH;
@@ -749,10 +773,10 @@ pgTest("#152 PG missing/failed native dump stays sealed and never leaks tool std
   } finally { await adapter?.close(); await f.close(); }
 });
 
-pgTest("#152 PG exporter loss cancels its dump and sequence drift invalidates an attempted snapshot", async () => {
+pgTest("#152 PG exporter loss cancels its dump and sequence drift invalidates an attempted snapshot", async t => {
   const realDump = await locateTool("pg_dump");
   for (const scenario of ["sequence", "exporter"] as const) {
-    const f = await fixture(false);
+    const f = await fixture(t, "pg-exporter-drift", false, "app", { scenario });
     const beforeReal = process.env.BOARDROOM_TEST_REAL_DUMP, beforeStarted = process.env.BOARDROOM_TEST_DUMP_STARTED;
     const started = join(f.directory, "dump-started");
     process.env.BOARDROOM_TEST_REAL_DUMP = realDump; process.env.BOARDROOM_TEST_DUMP_STARTED = started;

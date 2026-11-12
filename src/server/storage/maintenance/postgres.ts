@@ -30,7 +30,8 @@ interface Session {
 }
 const writerObservation = channel("boardroom.maintenance.postgres.writer-observation");
 const observationRows = 32;
-type WriterPhase = "external" | "backup-before" | "backup-after";
+let writerObservationAdapterSequence = 0;
+type WriterPhase = "external" | "backup-before" | "backup-after" | "snapshot-final";
 interface HeldMutex {
   readonly session: Session;
   readonly root: ControlRootIdentity;
@@ -121,13 +122,15 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   let publicBackup: { readonly sha256: string; readonly manifestDigest: string; readonly binding: PublicRestoreCatalogBinding } | undefined;
   const activeVerifications = new Set<Promise<Json>>();
   let inspectionSequence = 0;
+  const adapterObservationId = ++writerObservationAdapterSequence;
   // The diagnostic projection never owns a business result or changes a query.
   // Only the scoped test subscriber consumes it; bounded synchronous observation
   // still perturbs timing and is not proof that an unobserved race is absent.
   const note = (event: Readonly<Record<string, unknown>>) => {
     if (writerObservation.hasSubscribers) writerObservation.publish(Object.freeze({ version: 1,
-      sourceDescriptorDigest: sourceConnection.descriptorDigest, atMilliseconds: performance.now(), ...event }));
+      sourceDescriptorDigest: sourceConnection.descriptorDigest, adapterObservationId, atMilliseconds: performance.now(), ...event }));
   };
+  note({ kind: "adapter-created" });
   const sessionMetadata = (session: Session) => Object.freeze({ pid: session.pid,
     backendStart: session.backendStart.slice(0, 128), source: session.source, critical: session.critical,
     ending: session.ending, ended: session.ended, truncated: session.backendStart.length > 128 });
@@ -480,7 +483,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         const final = await observation(locked);
         if (final.manifests.frozenBusinessManifestDigest !== frozenCapture.frozenBusinessManifestDigest)
           throw new MaintenanceFailure("source_changed");
-        if ((await inspectWriters(final)).length) throw new MaintenanceFailure("source_writer_unknown");
+        if ((await inspectWriters(final, "snapshot-final")).length) throw new MaintenanceFailure("source_writer_unknown");
       }
       if (lockedSchemaDigest) {
         const fresh = await connect(sourceConnection, true);
