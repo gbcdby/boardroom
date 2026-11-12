@@ -3,10 +3,14 @@
  * 对外提供 DbDriver 接口；`handle` 暴露 better-sqlite3 连接，
  * 让既有 repository/HTTP/MCP 调用点在 M1 迁移前保持不变。
  */
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
+import { mkdirSync } from "node:fs";
+import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { OperationQueue } from "../operation-queue.ts";
-import { openDatabase } from "../database.ts";
+import { openDatabase, DatabaseSetupError, probeReadWrite, DATABASE_FILE_NAME } from "../database.ts";
+import { assertSqliteSingleLink, assertSqliteSourceUnchanged, type SqliteDatabaseDescriptor } from "../../environment.ts";
+import { ConfigError } from "../../config-error.ts";
 import {
   readMigrationState,
   runMigrations,
@@ -19,6 +23,8 @@ import type { DbDriver, DbRow, DbTransaction, DbTransactionContext } from "../dr
 
 export interface SqliteDriverOptions {
   readonly dataDir: string;
+  readonly sqlitePath?: string;
+  readonly sqliteSource?: SqliteDatabaseDescriptor;
 }
 
 export class SqliteDriver implements DbDriver {
@@ -26,6 +32,8 @@ export class SqliteDriver implements DbDriver {
   readonly dialect = sqliteDialect;
 
   private readonly dataDir: string;
+  private readonly sqlitePath: string | undefined;
+  private readonly sqliteSource: SqliteDatabaseDescriptor | undefined;
   private opened: { db: Database.Database; file: string } | null = null;
   /** SAVEPOINT 计数器：用于嵌套事务（事务内再开事务，#61）。 */
   private spCounter = 0;
@@ -40,6 +48,10 @@ export class SqliteDriver implements DbDriver {
 
   constructor(options: SqliteDriverOptions) {
     this.dataDir = options.dataDir;
+    this.sqlitePath = options.sqlitePath;
+    this.sqliteSource = options.sqliteSource;
+    if ((this.sqlitePath !== undefined && !path.isAbsolute(this.sqlitePath)) ||
+      (this.sqliteSource && this.sqliteSource.sqlitePath !== this.sqlitePath)) throw new ConfigError("SQLite descriptor 的规范文件路径不一致。");
   }
 
   currentTransactionContext(): DbTransactionContext | undefined {
@@ -66,7 +78,27 @@ export class SqliteDriver implements DbDriver {
   async connect(): Promise<void> {
     if (this.opened !== null) return;
     // openDatabase 抛 DatabaseSetupError（含恢复路径），原样向上传播。
-    this.opened = openDatabase(this.dataDir);
+    if (this.sqliteSource) assertSqliteSourceUnchanged(this.sqliteSource, true);
+    else assertSqliteSingleLink(this.sqlitePath ?? path.resolve(this.dataDir, DATABASE_FILE_NAME));
+    if (this.sqlitePath === undefined) { this.opened = openDatabase(this.dataDir); return; }
+    let db: Database.Database | undefined;
+    try {
+      if (!this.sqliteSource?.identity) mkdirSync(path.dirname(this.sqlitePath), { recursive: true });
+      // 已存在源不得触发 CREATE；先核实 inode，再允许任何 pragma/迁移写入。
+      db = new Database(this.sqlitePath, { fileMustExist: this.sqliteSource?.identity != null });
+      if (this.sqliteSource?.identity) assertSqliteSourceUnchanged(this.sqliteSource, true);
+      else assertSqliteSingleLink(this.sqlitePath);
+      db.pragma("journal_mode = WAL");
+      db.pragma("synchronous = NORMAL");
+      db.pragma("foreign_keys = ON");
+      db.pragma("busy_timeout = 5000");
+      probeReadWrite(db);
+      this.opened = { db, file: this.sqlitePath };
+    } catch (error) {
+      db?.close();
+      if (error instanceof ConfigError) throw error;
+      throw new DatabaseSetupError(`无法打开已解析的 SQLite 数据源（${(error as NodeJS.ErrnoException).code ?? "unknown"}）。请检查原文件与实际父目录权限后重试。`);
+    }
   }
 
   async migrate(migrations: readonly Migration[]): Promise<MigrationRunResult> {

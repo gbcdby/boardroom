@@ -54,7 +54,9 @@ npm start
 | 防环阈值 | `AGENT_STUDIO_MAX_CONSECUTIVE_AUTO_REPLIES` / `..._MAX_WAKES_PER_MINUTE_PER_MEMBER` | 6 / 20（D5） |
 | 记忆预算与阈值 | `AGENT_STUDIO_MEMORY_*` | [完整默认值与范围](memory.md#配置与验证) |
 
-`AGENT_STUDIO_CONFIG` 可指定配置文件；未指定则尝试 `<cwd>/config.json`，默认文件不存在时用默认值。`dataDir` 相对启动工作目录解析；stdio 与 HTTP 应使用明确的绝对路径。SQLite 首次启动创建 `agent-studio.db` 并迁移，重启继续使用相同数据目录。`/settings` 显示已解析配置与来源；文件修改不会热加载，正常停止并重启后才生效。
+`AGENT_STUDIO_CONFIG` 显式指定配置文件；未指定时先尝试 `<homeRoot>/config.json`，再尝试旧 `<cwd>/config.json`，两者均不存在才使用默认值。`homeRoot` 取绝对路径的 `BOARDROOM_HOME`，未设置时为系统用户目录下的 `.boardroom`，不会改写 `HOME`。显式配置缺失或无效会直接失败，不回退其他配置或另开 SQLite。
+
+v1 配置或环境变量中的相对 `dataDir` 仍按原启动工作目录解析；stdio 与 HTTP 应使用明确的绝对数据路径。合法 fresh v1 的 SQLite 首次启动创建 `agent-studio.db` 并迁移，重启继续使用相同数据目录；新目录规划、v2 相对路径和恢复阻断见[环境解析与旧数据来源预检](environment-resolution.md)。`/settings` 显示已解析配置与来源；文件修改不会热加载，正常停止并重启后才生效。
 
 PostgreSQL 需先准备可连接的专用数据库；以下为替换成自己配置的示例，不含真实凭据：
 

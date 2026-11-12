@@ -5,9 +5,10 @@ import type { MemoryConfig, MemoryInjection } from "../../shared/memory.ts";
 import { resolveMemoryConfig } from "../config.ts";
 import { unavailableMemory } from "./injection.ts";
 import { MemoryError } from "./errors.ts";
+import type { SqliteDatabaseDescriptor } from "../environment.ts";
 
 export type MemoryDatabaseDescriptor =
-  | { kind: "sqlite"; sqlitePath: string }
+  | ({ kind: "sqlite"; sqlitePath: string } & Partial<Pick<SqliteDatabaseDescriptor, "sourcePath" | "identity">>)
   | { kind: "postgres"; connectionString: string; schema?: string };
 export interface MemoryReadBinding { memberId: string; projectId: string; bindingGeneration: string; membershipRevision: number }
 export interface MemoryInjectionReader { readOwn(input: MemoryReadBinding): Promise<MemoryInjection>; close(): Promise<void> }
