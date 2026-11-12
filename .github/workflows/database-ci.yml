@@ -93,6 +93,15 @@ jobs:
       - name: 按锁文件安装依赖
         run: npm ci
 
+      - name: 准备 PostgreSQL 16 原生备份与恢复工具
+        run: |
+          sudo apt-get update
+          apt-cache policy postgresql-client-16
+          sudo apt-get install --yes --no-install-recommends postgresql-client-16
+          echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/16/bin/pg_dump --version
+          /usr/lib/postgresql/16/bin/pg_restore --version
+
       - name: 类型检查
         run: npm run typecheck
 

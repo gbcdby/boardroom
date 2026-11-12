@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import Database from "better-sqlite3";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -14,6 +15,8 @@ import { createRuntimeObservability } from "../src/server/runtime/observability.
 import { createRuntimeSupervisor } from "../src/server/runtime/supervisor.ts";
 import { createRuntimeGateway, type RuntimeGateway } from "../src/server/runtime/gateway.ts";
 import { createLogger } from "../src/server/logger.ts";
+import { databaseForConnectedReader } from "../src/server/environment.ts";
+import { registerStorageSourceClient } from "../src/server/storage/source-client.ts";
 import { createHostOutputParser } from "../src/server/runtime/hosts/parser.ts";
 import type { HostEvent, HostLauncher, HostLaunchSnapshot, HostPreflight, OwnedHostProcess, OwnedProcessIdentity, OwnedProcessInspection, VerifiedUsageSchema } from "../src/server/runtime/hosts/types.ts";
 
@@ -54,9 +57,11 @@ class ControlledHost implements OwnedHostProcess {
 
 async function fixture(options: { announceMode?: boolean; preflight?: HostPreflight; launchFails?: boolean; launchError?: string; startupTimeoutMs?: number;
   announcePermission?: "auto" | "manual"; checkPreflight?: HostLauncher["preflight"];
-  processIdentity?: OwnedProcessIdentity; inspectPrevious?: NonNullable<HostLauncher["inspectPrevious"]> } = {}) {
+  processIdentity?: OwnedProcessIdentity; inspectPrevious?: NonNullable<HostLauncher["inspectPrevious"]>; storage?: boolean } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "runtime-supervisor-"));
   const db = new SqliteDriver({ dataDir: dir }); await db.connect(); await db.migrate(migrations);
+  const sourceClient = options.storage ? await registerStorageSourceClient({ db, entrypoint: "http",
+    database: databaseForConnectedReader({ kind: "sqlite", dataDir: dir, sqlitePath: db.file, sourcePath: db.file, identity: null }) }) : undefined;
   const repos = createRepositories(db);
   let clock = Date.now();
   const runtime = createRuntimeRepository(db, { now: () => new Date(clock) });
@@ -94,9 +99,13 @@ async function fixture(options: { announceMode?: boolean; preflight?: HostPrefli
   const supervisor = createRuntimeSupervisor({ db, logger, launcher, observations, stateRoot: dir, repository: runtime,
     now: () => clock, random: () => 1, manual: true,
     gatewayFactory: async (input) => { const gateway = await createRuntimeGateway(input); gateways.push(gateway); return gateway; },
-    ...(options.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: options.startupTimeoutMs }) });
+    ...(options.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: options.startupTimeoutMs }),
+    ...(sourceClient ? { storageClient: sourceClient } : {}) });
+  if (sourceClient) await sourceClient.bind({ stopNewWork: epoch => supervisor.beginMaintenanceDrain(epoch),
+    async disconnectSessions() {}, closeMemory: async () => {}, stopOwnedRuntime: () => supervisor.drainMaintenance(),
+    observeOwnedExit: input => supervisor.observeMaintenanceExit(input) });
   return {
-    db, dir, repos, runtime, project, group, otherGroup, created, binding, hosts, gateways, supervisor, observations,
+    db, dir, repos, runtime, project, group, otherGroup, created, binding, hosts, gateways, supervisor, observations, sourceClient,
     get launches() { return launches; },
     advance(ms: number) { clock += ms; },
     async start() { await runtime.intent(binding.id, "start"); await supervisor.tick(); return hosts.at(-1); },
@@ -107,6 +116,12 @@ async function fixture(options: { announceMode?: boolean; preflight?: HostPrefli
       return message;
     },
     async close() {
+      if (sourceClient) {
+        for (const host of hosts) host.finish();
+        await supervisor.close().catch(() => {}); await sourceClient.close().catch(() => {});
+        for (const host of hosts) await host.client.close();
+        await db.close(); await rm(dir, { recursive: true, force: true }); return;
+      }
       for (const view of await runtime.listBindings()) await runtime.intent(view.binding.id, "stop");
       const closing = supervisor.close();
       for (const host of hosts) host.finish();
@@ -127,6 +142,102 @@ test("R6 常驻已就绪runner在无待应用配置时保持等待，不将null 
     await nextTurn();
     assert.equal(host.stops, 0); assert.equal(host.forced, 0);
   } finally { await f.close(); }
+});
+
+function requestStorageDrain(db: Database.Database) {
+  db.prepare(`UPDATE storage_maintenance SET admission='draining',fence_epoch=1,owner_generation=1,
+    active_migration_id='fixture',plan_digest=?,control_root_json='{}',mutex_identity_json='{}',
+    journal_record_ref='fixture',journal_digest=?,journal_sequence=1`).run("a".repeat(64), "b".repeat(64));
+}
+const maintenanceIdentity: OwnedProcessIdentity = { version: 1, launcherProtocol: "linux-private-net-v1", pid: 4321,
+  kernelBootId: "11111111-1111-1111-1111-111111111111", pidNamespace: "pid:[42]", startTicks: "1234" };
+
+test("#152 maintenance等待忙碌runner的安全点和owned handle实际退出；保留真实意图/SID", async () => {
+  // Host is explicitly controlled; database, gate, gateway and MCP are production code.
+  const f = await fixture({ storage: true, processIdentity: maintenanceIdentity });
+  const control = new Database(path.join(f.dir, "agent-studio.db"));
+  try {
+    const host = (await f.start())!;
+    host.event({ type: "session", sessionId: "actual-observed-session" });
+    await until(async () => (await f.runtime.getBinding(f.binding.id))!.runner.harnessSessionId !== null, "session observation missing");
+    await f.runtime.updateBinding(f.binding.id, { runtimeRevision: 1, bindingRevision: 1, overrides: { model: "future-model" } });
+    await f.runtime.intent(f.binding.id, "apply", undefined, { runtimeRevision: 1, bindingRevision: 2 });
+    const before = (await f.runtime.getBinding(f.binding.id))!;
+    requestStorageDrain(control); await f.sourceClient!.refresh(); await nextTurn();
+    assert.equal(host.stops, 0); assert.equal(host.forced, 0);
+    host.event({ type: "exit", code: 0, signal: null }); await nextTurn();
+    assert.equal(f.sourceClient!.diagnostic.status, "draining", "输出exit不是owned exit");
+    assert.equal((await host.call("wait_for_messages", { timeoutMs: 10 })).status, "cancelled");
+    await until(async () => host.stops === 1, "safe stop missing");
+    assert.equal((control.prepare("SELECT exit_confirmed FROM agent_runner_states WHERE binding_id=?").get(f.binding.id) as { exit_confirmed: number }).exit_confirmed, 0);
+    host.finish(); const receipt = await f.sourceClient!.waitForDrain();
+    assert.equal(receipt.ownedExits.length, 1); assert.equal(receipt.ownedExits[0]!.fence.owner, before.runner.owner);
+    const binding = control.prepare("SELECT * FROM agent_runtime_bindings WHERE id=?").get(f.binding.id) as Record<string, unknown>;
+    const runner = control.prepare("SELECT * FROM agent_runner_states WHERE binding_id=?").get(f.binding.id) as Record<string, unknown>;
+    assert.equal(binding.desired_state, "running"); assert.equal(binding.intent_revision, before.binding.intentRevision);
+    assert.deepEqual(JSON.parse(String(binding.requested_snapshot_json)), before.binding.requestedSnapshot);
+    assert.equal(binding.reset_session_requested, Number(before.binding.resetSessionRequested));
+    assert.deepEqual(JSON.parse(String(runner.applied_json)), before.runner.applied);
+    assert.equal(runner.harness_session_id, "actual-observed-session"); assert.equal(runner.exit_confirmed, 1);
+    await f.supervisor.tick(); assert.equal(f.launches, 1, "maintenance不可自动claim/retry");
+  } finally { control.close(); await f.close(); }
+});
+
+test("#152 maintenance在preflight期间停新，不取得新claim/launch", async () => {
+  const entered = deferred<void>(), release = deferred<void>();
+  const f = await fixture({ storage: true, checkPreflight: async () => {
+    entered.resolve(); await release.promise;
+    return { supported: true, reason: "supported", expectedPermissionMode: "auto", isolation: "verified" };
+  } });
+  const control = new Database(path.join(f.dir, "agent-studio.db"));
+  try {
+    const starting = f.start(); await entered.promise;
+    requestStorageDrain(control); await f.sourceClient!.refresh(); release.resolve(); await starting;
+    await f.sourceClient!.waitForDrain(); assert.equal(f.launches, 0);
+    const runner = control.prepare("SELECT generation,exit_confirmed FROM agent_runner_states WHERE binding_id=?").get(f.binding.id);
+    assert.deepEqual(runner, { generation: 0, exit_confirmed: 1 });
+  } finally { release.resolve(); control.close(); await f.close(); }
+});
+
+test("#152 不可核实的runner身份阻断drain；不kill、不以超时确认退出", async () => {
+  const f = await fixture({ storage: true }); const control = new Database(path.join(f.dir, "agent-studio.db"));
+  try {
+    const host = (await f.start())!;
+    requestStorageDrain(control); await f.sourceClient!.refresh();
+    await assert.rejects(f.sourceClient!.waitForDrain(), /source_writer_unknown/);
+    assert.equal(host.forced, 0); assert.equal(host.stops, 0);
+    assert.equal((control.prepare("SELECT exit_confirmed FROM agent_runner_states WHERE binding_id=?").get(f.binding.id) as { exit_confirmed: number }).exit_confirmed, 0);
+  } finally { control.close(); await f.close(); }
+});
+
+for (const alreadyStopping of [false, true]) test(`#152 取消维护${alreadyStopping ? "必须等待已发停止的实际退出" : "可以撤回尚未发送的停止"}，不修改用户意图`, async () => {
+  const f = await fixture({ storage: true, processIdentity: maintenanceIdentity });
+  const control = new Database(path.join(f.dir, "agent-studio.db"));
+  try {
+    const host = (await f.start())!;
+    const before = (await f.runtime.getBinding(f.binding.id))!.binding;
+    requestStorageDrain(control); await f.sourceClient!.refresh(); await nextTurn();
+    if (alreadyStopping) {
+      await host.call("wait_for_messages", { timeoutMs: 10 });
+      await until(async () => host.stops === 1, "safe stop missing");
+    }
+    let cancelled = false;
+    const cancel = f.supervisor.cancelMaintenanceDrain(1).then(result => { cancelled = true; return result; });
+    await nextTurn();
+    if (alreadyStopping) assert.equal(cancelled, false, "送信号不等于已退出");
+    else {
+      assert.deepEqual(await cancel, { status: "withdrawn", pending: 1 });
+      await assert.rejects(f.sourceClient!.waitForDrain(), /drain_incomplete/);
+      await host.call("wait_for_messages", { timeoutMs: 10 }); await nextTurn();
+      assert.equal(host.stops, 0, "未发的维护停止已撤回");
+    }
+    host.finish(); await cancel;
+    await until(async () => f.sourceClient!.diagnostic.status === "drained", "真实退出后应可完成原epoch收束");
+    const receipt = await f.sourceClient!.waitForDrain(); assert.equal(receipt.ownedExits.length, 1);
+    const saved = control.prepare("SELECT desired_state,intent_revision FROM agent_runtime_bindings WHERE id=?").get(f.binding.id);
+    assert.deepEqual(saved, { desired_state: before.desiredState, intent_revision: before.intentRevision });
+    assert.deepEqual(await f.supervisor.cancelMaintenanceDrain(1), { status: "settled", pending: 0 });
+  } finally { control.close(); await f.close(); }
 });
 
 test("R6 preflight期间显式应用新权限配置，旧能力结果不能领取新配置", async () => {

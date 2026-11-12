@@ -28,6 +28,26 @@ async function room(repos: RepositorySet, db: DbDriver) {
   return { project, group, core, joined, identity, message };
 }
 
+test("#152 explicit core drain waits for a real in-flight wait after immediate cancellation", async () => memoryFixture(async (repos, db) => {
+  const database = { kind: 'sqlite' as const,
+    sqlitePath: String((await db.query('PRAGMA database_list')).find(row => row['name'] === 'main')!['file']) };
+  const runtime = registerMemoryRuntime(db, { database });
+  const r = await room(repos, db), entered = gate(), release = gate();
+  const original = runtime.reader.readOwn.bind(runtime.reader);
+  let drained = false;
+  try {
+    await r.message();
+    runtime.reader.readOwn = async input => { const result = await original(input); entered.resolve(); await release.promise; return result; };
+    const waiting = r.core.waitForMessages('receiver', { timeoutMs: 1000 });
+    await entered.promise;
+    await r.core.close(); assert.equal(r.core.pendingWaitCount, 0);
+    const closing = r.core.close({ drain: true }).then(() => { drained = true; });
+    await new Promise<void>(resolve => setImmediate(resolve)); assert.equal(drained, false);
+    release.resolve(); await closing;
+    assert.equal((await waiting).status, 'cancelled'); assert.equal(drained, true);
+  } finally { release.resolve(); await r.core.close({ drain: true }); await closeMemoryRuntime(db); }
+}));
+
 for (const engine of ['sqlite', 'postgres'] as const) {
   const options = { skip: engine === 'postgres' ? pgUnavailable : false, timeout: 15000 };
   for (const point of ['consume', 'reader', 'final-acl', 'close-final-acl'] as const) {

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3";
@@ -10,6 +10,7 @@ import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories, type RepositorySet } from "../src/server/db/repositories.ts";
+import { openNativeManagementSource, type NativeManagementLease } from "../src/server/storage/native-management-admission.ts";
 import {
   migrateOtherToDsh,
   HostTypeMigrationCollisionError,
@@ -36,6 +37,8 @@ const silentLogger = createLogger({ level: "error", write: () => {} });
 
 interface Ctx {
   readonly db: Database.Database;
+  readonly lease: NativeManagementLease;
+  readonly readonlyLease: NativeManagementLease;
   readonly repos: RepositorySet;
   readonly projectId: string;
   readonly groupId: string;
@@ -50,6 +53,12 @@ async function withCtx<T>(fn: (ctx: Ctx) => Promise<T> | T): Promise<T> {
     await driver.migrate(migrations);
     const db = driver.handle;
   runMigrations(db, migrations);
+  const sqlitePath = path.join(dir, "agent-studio.db");
+  const file = await stat(sqlitePath, { bigint: true });
+  const source = { kind: "sqlite" as const, dataDir: dir, sourcePath: sqlitePath, sqlitePath,
+    identity: { device: String(file.dev), inode: String(file.ino) } };
+  const lease = await openNativeManagementSource({ source, mode: "write" });
+  const readonlyLease = await openNativeManagementSource({ source, mode: "readonly-dry-run" });
   const repos = createRepositories(driver);
   const project = (await ((await (repos.projects.create({ name: "P" })))));
   const group = (await ((await (repos.groups.create({ projectId: project.id, name: "G" })))));
@@ -66,9 +75,11 @@ async function withCtx<T>(fn: (ctx: Ctx) => Promise<T> | T): Promise<T> {
     return { core, memberId: result.memberId };
   };
   try {
-    return await fn({ db, repos, projectId: project.id, groupId: group.id, join });
+    return await fn({ db, lease, readonlyLease, repos, projectId: project.id, groupId: group.id, join });
   } finally {
-    for (const c of cores) c.close();
+    for (const c of cores) await c.close();
+    await readonlyLease.close();
+    await lease.close();
     await driver.close();
     await rm(dir, { recursive: true, force: true });
   }
@@ -89,11 +100,11 @@ test("S2 alias：other→dsh 保留旧 alias 与已改显示名；隐藏的历�
     await ctx.repos.agents.rename(reserved.id, "改名后", "另一个稳定身份");
     const beforeAgents = ctx.db.prepare("SELECT * FROM agents ORDER BY id").all();
     const beforeAliases = ctx.db.prepare("SELECT * FROM agent_legacy_aliases ORDER BY display_name, host_type").all();
-    assert.throws(() => migrateOtherToDsh(ctx.db), HostTypeMigrationCollisionError);
+    assert.throws(() => migrateOtherToDsh(ctx.lease), HostTypeMigrationCollisionError);
     assert.deepEqual(ctx.db.prepare("SELECT * FROM agents ORDER BY id").all(), beforeAgents);
     assert.deepEqual(ctx.db.prepare("SELECT * FROM agent_legacy_aliases ORDER BY display_name, host_type").all(), beforeAliases);
     await ctx.repos.agents.rename(old.id, "改名后", "无冲突的新名字");
-    assert.equal(migrateOtherToDsh(ctx.db).changedAgents, 1);
+    assert.equal(migrateOtherToDsh(ctx.lease).changedAgents, 1);
     for (const name of ["改名前", "改名后", "无冲突的新名字"]) {
       const agent = await ctx.repos.agents.findByIdentity(name, "other");
       assert.equal(agent?.id, old.id); assert.equal(agent?.displayName, "无冲突的新名字");
@@ -112,7 +123,7 @@ test("T3-1：迁移把历史 other→dsh，已 dsh 行不变", async () => {
     assert.equal(countAgents(ctx.db, "other"), 2);
     assert.equal(countAgents(ctx.db, "dsh"), 1);
 
-    const report = migrateOtherToDsh(ctx.db);
+    const report = migrateOtherToDsh(ctx.lease);
     assert.equal(report.changedAgents, 2);
     assert.equal(report.changedSessions, 2);
     assert.equal(report.skippedAgents, 1);
@@ -136,11 +147,11 @@ test("T3-2：幂等 —— 重跑改变 0 行、报告 0", async () => {
     await ctx.join("k1", "X", "other");
     await ctx.join("k2", "Y", "dsh");
 
-    const r1 = migrateOtherToDsh(ctx.db);
+    const r1 = migrateOtherToDsh(ctx.lease);
     assert.equal(r1.changedAgents, 1);
     assert.equal(r1.changedSessions, 1);
 
-    const r2 = migrateOtherToDsh(ctx.db);
+    const r2 = migrateOtherToDsh(ctx.lease);
     assert.equal(r2.changedAgents, 0, "第二次应改变 0 行");
     assert.equal(r2.changedSessions, 0, "第二次应改变 0 行");
     assert.equal(r2.skippedAgents, 2);
@@ -156,7 +167,7 @@ test("T3-2：幂等 —— 重跑改变 0 行、报告 0", async () => {
 test("T3-3：D4 —— 迁移后 'other' 仍可作为新未知宿主合法值", async () => {
   await withCtx(async (ctx) => {
     await ctx.join("k1", "Hist", "other");
-    migrateOtherToDsh(ctx.db);
+    migrateOtherToDsh(ctx.lease);
 
     // 迁移后，新未知宿主仍可用 'other' 入群（不禁止 'other'）。
     const fresh = (await ((await (ctx.repos.agents.create({ displayName: "BrandNewUnknown", hostType: "other" })))));
@@ -181,7 +192,7 @@ test("T3-4：ux_agents_identity 冲突时中止且不改动任何数据", async 
 
     let thrown: unknown;
     try {
-      migrateOtherToDsh(ctx.db);
+      migrateOtherToDsh(ctx.lease);
       thrown = null;
     } catch (e) {
       thrown = e;
@@ -222,7 +233,7 @@ test("T3-6：dry-run 只报告、不执行", async () => {
     await ctx.join("k1", "X", "other");
     await ctx.join("k2", "Y", "dsh");
 
-    const report: MigrationReport = migrateOtherToDsh(ctx.db, { dryRun: true });
+    const report: MigrationReport = migrateOtherToDsh(ctx.readonlyLease);
     assert.equal(report.dryRun, true);
     assert.equal(report.changedAgents, 1);
     assert.equal(report.changedSessions, 1);

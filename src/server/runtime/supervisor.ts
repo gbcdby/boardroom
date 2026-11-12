@@ -13,13 +13,21 @@ import type { RuntimeObservability, RuntimeReasonCode } from "./observation-type
 import type { HostEvent, HostLaunchSnapshot, HostLauncher, HostPreflight, OwnedHostProcess } from "./hosts/types.ts";
 import { createRuntimeGateway, type RuntimeGateway } from "./gateway.ts";
 import { onMessageCommit } from "./dispatch-events.ts";
+import { StorageMaintenanceError } from "../storage/admission.ts";
+import type { StorageSourceClient, StorageOwnedExitEvidence, StorageRuntimeDrainEvidence } from "../storage/source-client.ts";
 
 export interface RuntimeSupervisor {
+  start(): void;
   notify(): void;
   tick(): Promise<void>;
   capability(bindingId: string): HostPreflight | null;
   /** 保留 desired_state；服务停止只在安全点回收自有进程。 */
   close(): Promise<void>;
+  /** Local lifecycle only: never a user intent/retry/config change. */
+  beginMaintenanceDrain(epoch: number): void;
+  drainMaintenance(): Promise<StorageRuntimeDrainEvidence>;
+  cancelMaintenanceDrain(epoch: number): Promise<{ status: "withdrawn" | "settled"; pending: number }>;
+  observeMaintenanceExit(input: unknown): Promise<void>;
 }
 
 interface ActiveRunner {
@@ -44,6 +52,8 @@ interface ActiveRunner {
   failure: RuntimeReasonCode | null;
   eventChain: Promise<void>;
   completion: Promise<void> | null;
+  deferredEvents: HostEvent[];
+  observationFailed: boolean;
 }
 
 /** 独立于消息 anti-loop：只决定何时重新检查运行资格。 */
@@ -117,6 +127,7 @@ export function createRuntimeSupervisor(options: {
   actorFor?: (binding: SessionBinding) => Promise<Actor>;
   /** 测试用显式 tick，不自动开启时钟；不能改变生产宿主支持判定。 */
   manual?: boolean;
+  storageClient?: StorageSourceClient;
 }): RuntimeSupervisor {
   const repo = options.repository ?? createRuntimeRepository(options.db, options.repos ? { repos: options.repos } : {});
   const now = options.now ?? Date.now;
@@ -131,6 +142,13 @@ export function createRuntimeSupervisor(options: {
   let tickAgain = false;
   let notificationScheduled = false;
   const observationsInFlight = new Set<Promise<void>>();
+  let maintenance: { epoch: number; cancelled: boolean; result: Promise<StorageRuntimeDrainEvidence> | null } | null = null;
+  const maintenanceWake = new Set<() => void>();
+  const ownedExits: StorageOwnedExitEvidence[] = [];
+  const unverifiableOwnedExits = new Set<string>();
+  const exitTokens = new WeakMap<object, { item: ActiveRunner; result: { code: number | null; signal: string | null } }>();
+  const wakeMaintenance = () => { for (const wake of maintenanceWake) wake(); maintenanceWake.clear(); };
+  let timer: ReturnType<typeof setInterval> | undefined;
 
   const record = async (view: RuntimeBindingView, event: Parameters<RuntimeObservability["record"]>[0]["event"],
     extra: Partial<Parameters<RuntimeObservability["record"]>[0]> = {}) => {
@@ -152,13 +170,19 @@ export function createRuntimeSupervisor(options: {
     item.stopping = true;
     item.yielded = isYield;
     if (isYield) yielded.set(item.fence.memberId, item.fence.bindingId);
-    try { await repo.markStopping(item.fence); } catch { /* 陈旧 owner 仍只能回收本地自有句柄。 */ }
+    try { await repo.markStopping(item.fence); }
+    catch (error) { if (maintenance) { item.stopping = false; throw error; } /* 陈旧 owner 仍只能回收本地自有句柄。 */ }
     // MCP 与停止指令复用父进程管道。先让 CLI 优雅落盘；真实退出后统一关闭通道。
     // 提前 close transport 会截断 stop 控制帧并把正常停止变成启动失败。
     item.child?.stopAtSafePoint();
   }
 
   async function beforeWait(item: ActiveRunner): Promise<boolean> {
+    if (maintenance) {
+      // The bound managed channel establishes only a safe point. It does not gain
+      // cleanup SQL or new consume/write permission from this ordinary MCP request.
+      item.safe = true; wakeMaintenance(); return false;
+    }
     // 到达 wait 是自有进程的安全点事实，不授予已归档/停用范围的新业务权限。
     const view = await repo.checkFence(item.fence, { requireActiveScope: false });
     item.safe = true;
@@ -274,12 +298,15 @@ export function createRuntimeSupervisor(options: {
 
   async function exited(item: ActiveRunner, result: { code: number | null; signal: string | null }): Promise<void> {
     await item.eventChain;
-    await item.gateway?.close();
+    if (maintenance && item.child && !item.child.processIdentity) unverifiableOwnedExits.add(item.fence.bindingId);
+    for (const event of item.deferredEvents.splice(0)) await onHostEvent(item, event);
+    if (maintenance && item.observationFailed) throw new Error("runtime_observation_incomplete");
+    await item.gateway?.close({ strict: maintenance !== null });
     const view = await repo.getBinding(item.fence.bindingId);
     if (!view) { active.delete(item.fence.bindingId); return; }
     const deliberate = item.stopping && item.failure === null;
     const retryable = !deliberate && !requiresExplicitRetry(item.failure);
-    const retryAt = retryable && !closing && view.binding.desiredState === "running"
+    const retryAt = retryable && !closing && !maintenance && view.binding.desiredState === "running"
       ? new Date(now() + retryDelay(view.runner.attemptCount, options.random)).toISOString() : null;
     const reason = deliberate ? null : item.failure ?? "process_exit";
     try {
@@ -289,11 +316,16 @@ export function createRuntimeSupervisor(options: {
         ...(result.code === null ? {} : { exitCode: result.code }), durationMs: Math.max(0, now() - item.startedAt) });
       if (retryAt) await record(final, "retry_scheduled", { attemptId: item.attemptId,
         reasonCode: "backoff", retryAt: Date.parse(retryAt), attempt: final.runner.attemptCount });
-    } finally { active.delete(item.fence.bindingId); }
+      if (maintenance && item.child?.processIdentity) ownedExits.push({ fence: { ...item.fence }, processIdentity: { ...item.child.processIdentity },
+        observation: "owned_handle_exited", exitCode: result.code, signal: result.signal, observedAt: new Date(now()).toISOString() });
+      active.delete(item.fence.bindingId);
+    } finally { wakeMaintenance(); }
     supervisor.notify();
   }
 
   async function start(view: RuntimeBindingView): Promise<void> {
+    if (closing || maintenance) return;
+    await options.storageClient?.assertAdmission();
     const b = view.binding;
     if (b.desiredState !== "running" || !view.runner.exitConfirmed || view.runner.owner) return;
     if (!await repo.isScopeActive(b.id)) {
@@ -314,6 +346,8 @@ export function createRuntimeSupervisor(options: {
     const key = `${b.intentRevision}:${b.requestedSnapshot?.digest ?? view.runner.applied?.digest ?? view.effective.digest}`;
     const old = capabilities.get(b.id);
     const preflight = old?.key === key ? old.value : await options.launcher.preflight(snapshot);
+    if (closing || maintenance) return;
+    await options.storageClient?.assertAdmission();
     capabilities.set(b.id, { key, value: preflight });
     if (!preflight.supported) {
       const reason = hostReason(preflight.reason);
@@ -342,7 +376,8 @@ export function createRuntimeSupervisor(options: {
     const item: ActiveRunner = { fence, attemptId: newId(), epochId: newId(), startedAt: now(),
       snapshot: launchSnapshot(claimed, owner, ""), preflight, gateway: null, child: null,
       joined: false, ready: false, readyAt: null, safe: false, delivered: false, stopping: false, yielded: false,
-      permission: "unknown", observedSessionId: null, failure: null, eventChain: Promise.resolve(), completion: null };
+      permission: "unknown", observedSessionId: null, failure: null, eventChain: Promise.resolve(), completion: null,
+      deferredEvents: [], observationFailed: false };
     active.set(b.id, item);
     try {
       item.gateway = await (options.gatewayFactory ?? createRuntimeGateway)({ db: options.db, ...(options.repos ? { repos: options.repos } : {}), logger: options.logger,
@@ -351,6 +386,7 @@ export function createRuntimeSupervisor(options: {
         onJoined: async () => { item.joined = true; await maybeReady(item); },
         onDisconnected: async () => {
           item.joined = false;
+          if (maintenance) return;
           if (!item.stopping && active.get(b.id) === item) {
             item.failure ??= "transport_lost";
             const disconnected = await repo.patchRunner(item.fence, { lastErrorCode: item.failure });
@@ -359,17 +395,29 @@ export function createRuntimeSupervisor(options: {
           supervisor.notify();
         } });
       const launch = item.snapshot;
+      await options.storageClient?.assertAdmission();
+      if (maintenance || closing) throw new StorageMaintenanceError("active");
       item.child = await options.launcher.launch(launch, {
         onMcpTransport: channel => item.gateway!.attach(channel),
         onEvent(event) {
-        item.eventChain = item.eventChain.then(() => onHostEvent(item, event)).catch(() => {
+        item.eventChain = item.eventChain.then(async () => {
+          if (maintenance) { item.deferredEvents.push(event); return; }
+          await onHostEvent(item, event);
+        }).catch(error => {
+          if (error instanceof StorageMaintenanceError) { item.deferredEvents.push(event); return; }
+          item.observationFailed = true;
           log.warn("runtime_observation_failed");
         });
       } });
       // 先订阅真正的退出句柄，再做任何可能失败的数据库/观测写入。
-      item.completion = item.child.exited.then(result => exited(item, result)).catch(() => {
-        log.warn("runtime_exit_unconfirmed");
+      item.completion = item.child.exited.then(async result => {
+        const token = Object.freeze({}); exitTokens.set(token, { item, result });
+        try {
+          if (options.storageClient) await options.storageClient.observeOwnedExit(token);
+          else await supervisor.observeMaintenanceExit(token);
+        } finally { exitTokens.delete(token); wakeMaintenance(); }
       });
+      void item.completion.catch(() => { log.warn("runtime_exit_unconfirmed"); });
       if (item.child.processIdentity) await repo.setProcessIdentity(fence, item.child.processIdentity);
       else if (item.child.pid) await repo.patchRunner(fence, { pid: item.child.pid });
       if (item.stopping) item.child.stopAtSafePoint();
@@ -377,6 +425,9 @@ export function createRuntimeSupervisor(options: {
       await record(claimed, "dispatch.scheduled", { attemptId: item.attemptId });
     } catch (error) {
       await item.eventChain;
+      // A claim can precede the fence commit while launch has not begun. Only the
+      // maintenance lifecycle may release that exact never-launched claim now.
+      if (error instanceof StorageMaintenanceError) return;
       // launch 会重检能力与文件边界。只映射固定原因，不能把原始异常正文写入观测。
       const classified = hostReason(error instanceof Error ? error.message : "");
       const reason = classified === "unknown" ? "resource_unavailable" : classified;
@@ -393,6 +444,8 @@ export function createRuntimeSupervisor(options: {
   }
 
   async function cycle(): Promise<void> {
+    if (maintenance) return;
+    await options.storageClient?.assertAdmission();
     const views = await repo.listBindings();
     const wakeable = await repo.listWakeable();
     for (const view of views) {
@@ -461,7 +514,7 @@ export function createRuntimeSupervisor(options: {
         log.warn("runtime_binding_reconcile_failed", { bindingId: item.fence.bindingId });
       }
     }
-    if (closing) return;
+    if (closing || maintenance) return;
     const rank = new Map(wakeable.map(w => [w.bindingId, w.firstMessageAt]));
     const candidates = views.filter(v => v.binding.desiredState === "running" && !active.has(v.binding.id));
     candidates.sort((a, b) => {
@@ -476,18 +529,80 @@ export function createRuntimeSupervisor(options: {
   }
 
   const supervisor: RuntimeSupervisor = {
+    start() {
+      if (timer || closing || maintenance) return;
+      timer = setInterval(() => supervisor.notify(), options.pollMs ?? 1000); timer.unref();
+      supervisor.notify();
+    },
     capability(id) { return capabilities.get(id)?.value ?? null; },
     notify() {
-      if (closing || notificationScheduled) return;
+      if (closing || maintenance || notificationScheduled) return;
       notificationScheduled = true;
       queueMicrotask(() => { notificationScheduled = false; void supervisor.tick().catch(() => log.warn("runtime_tick_failed")); });
     },
     tick() {
+      if (maintenance || closing) return currentTick ?? Promise.resolve();
       if (currentTick) { tickAgain = true; return currentTick; }
       currentTick = (async () => {
-        do { tickAgain = false; await cycle(); } while (tickAgain && !closing);
+        do { tickAgain = false; await cycle(); } while (tickAgain && !closing && !maintenance);
       })().finally(() => { currentTick = null; });
       return currentTick;
+    },
+    beginMaintenanceDrain(epoch) {
+      if (!Number.isSafeInteger(epoch) || epoch < 1 || (maintenance && maintenance.epoch !== epoch))
+        throw new StorageMaintenanceError("active");
+      if (!maintenance) maintenance = { epoch, cancelled: false, result: null };
+      clearInterval(timer); timer = undefined; wakeMaintenance();
+    },
+    drainMaintenance() {
+      const request = maintenance;
+      if (!request) return Promise.reject(new Error("runtime_maintenance_not_requested"));
+      if (request.result) return request.result;
+      request.result = (async () => {
+        await currentTick;
+        await Promise.allSettled([...observationsInFlight]);
+        // Nothing here changes desiredState/intentRevision/requested/reset/applied/SID.
+        const views = await repo.listBindings();
+        const unknown = [...unverifiableOwnedExits,
+          ...views.filter(v => !v.runner.exitConfirmed && v.runner.owner && !active.has(v.binding.id)).map(v => v.binding.id)];
+        for (const item of [...active.values()]) {
+          if (!item.child) {
+            await item.gateway?.close({ strict: true });
+            await repo.markExit(item.fence, { errorCode: null, retryAt: null });
+            active.delete(item.fence.bindingId);
+          } else if (!item.child.processIdentity) unknown.push(item.fence.bindingId);
+        }
+        if (unknown.length) return { ownedExits: [...ownedExits], unknownOwners: unknown };
+        while (active.size) {
+          const wake = new Promise<void>(resolve => { maintenanceWake.add(resolve); });
+          for (const item of active.values()) if (item.safe && !request.cancelled) await requestSafeStop(item);
+          if (request.cancelled && [...active.values()].some(item => !item.stopping)) throw new Error("runtime_maintenance_cancel_pending");
+          if (!active.size) break;
+          const pending = [...active.values()].flatMap(item => item.completion ? [item.completion] : []);
+          // A rejected real completion is an incomplete drain, never a timeout exit.
+          await Promise.race([wake, ...pending]);
+        }
+        await Promise.allSettled([...observationsInFlight]);
+        return { ownedExits: [...ownedExits], unknownOwners: [] };
+      })();
+      const attempt = request.result;
+      void attempt.then(result => { if (result.unknownOwners.length && request.result === attempt) request.result = null; },
+        () => { if (request.result === attempt) request.result = null; });
+      return request.result;
+    },
+    async cancelMaintenanceDrain(epoch) {
+      if (!maintenance || maintenance.epoch !== epoch) throw new StorageMaintenanceError("active");
+      maintenance.cancelled = true; wakeMaintenance();
+      const stopping = [...active.values()].filter(item => item.stopping);
+      await Promise.all(stopping.map(item => item.completion));
+      const pending = active.size;
+      // Admission remains stopped; a new epoch needs a new client/supervisor.
+      return { status: pending ? "withdrawn" : "settled", pending };
+    },
+    async observeMaintenanceExit(input) {
+      const observation = input && typeof input === "object" ? exitTokens.get(input) : undefined;
+      if (!observation) throw new StorageMaintenanceError("active");
+      await exited(observation.item, observation.result);
     },
     close() {
       if (closed) return closed;
@@ -506,7 +621,7 @@ export function createRuntimeSupervisor(options: {
   };
   const unsubscribe = onMessageCommit(options.db, messageId => {
     supervisor.notify();
-    if (!messageId || closing) return;
+    if (!messageId || closing || maintenance) return;
     // 只读取已提交的唤醒决定，不从正文、mentions 或当前路由重新推算。
     const pending = (async () => {
       const rows = await options.db.query(`SELECT b.id AS binding_id, b.runtime_id, b.project_id, b.member_id,
@@ -526,8 +641,6 @@ export function createRuntimeSupervisor(options: {
     void pending.finally(() => observationsInFlight.delete(pending));
     return pending;
   });
-  const timer = options.manual ? undefined : setInterval(() => supervisor.notify(), options.pollMs ?? 1000);
-  timer?.unref();
-  if (!options.manual) supervisor.notify();
+  if (!options.manual) supervisor.start();
   return supervisor;
 }

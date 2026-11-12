@@ -34,6 +34,8 @@ import type { MemoryInjection } from "../../shared/memory.ts";
 import { createMemoryService, type MemoryAccess } from "../memory/service.ts";
 import { invokeMemoryOperation, mapMemoryToolError, MEMORY_OBSERVATIONS, type MemoryOperation } from "../memory/mcp.ts";
 import { getMemoryRuntime, scheduleMemoryReconciliation, cancelMemoryReconciliations } from "../memory/runtime.ts";
+import { runStorageWork, storageWorkMayStart } from "../storage/source-client.ts";
+import { StorageMaintenanceError } from "../storage/admission.ts";
 import { unavailableMemory } from "../memory/injection.ts";
 import { getAdapter, isRegistered, listAdapterIds } from "./adapters/index.ts";
 import { createRuntimeRepository } from "../runtime/repository.ts";
@@ -460,9 +462,9 @@ export interface McpCore {
   /** 某个会话是否已入群（测试用）。 */
   isJoined(sessionId: string): boolean;
   /** 中止本 core 所有挂起等待并以 cancelled 返回；用于优雅关闭。幂等。 */
-  close(): Promise<void>;
+  close(options?: { drain?: boolean }): Promise<void>;
   /** 把本 core 的持久化会话标记为断开（保留历史）。 */
-  disconnect(): Promise<void>;
+  disconnect(options?: { strict?: boolean }): Promise<void>;
 }
 
 const RUNNING_STATES = new Set<RunStatus>(["waiting", "working"]);
@@ -508,6 +510,17 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   /** 每位成员最多一个并发等待。 */
   const waitingMembers = new Set<string>();
   let closed = false;
+  let closePromise: Promise<void> | null = null;
+  const activeCalls = new Set<Promise<unknown>>();
+  const backgroundCalls = new Set<Promise<unknown>>();
+  function trackBackground<T>(pending: Promise<T>): Promise<T> {
+    backgroundCalls.add(pending);
+    void pending.then(() => backgroundCalls.delete(pending), () => backgroundCalls.delete(pending));
+    return pending;
+  }
+  async function waitForCalls(): Promise<void> {
+    while (activeCalls.size || backgroundCalls.size) await Promise.allSettled([...activeCalls, ...backgroundCalls]);
+  }
   let unsubscribeWorkEvents = () => {};
 
   const selfKey = (sessionId: string): string => `${memberKey}:${sessionId}`;
@@ -922,7 +935,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         return false;
       } finally { entry.draining = null; }
     })();
-    entry.draining = pending;
+    entry.draining = trackBackground(pending);
     return await pending;
   }
 
@@ -1130,7 +1143,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
           drainRequests: [],
           abortListener: null,
         };
-        entry.timer = setTimeout(async () => {
+        entry.timer = setTimeout(() => { void trackBackground((async () => {
           // 到期后不再接收新重扫，收束已有有限队列和一次最终检查。
           // 不强行中断 DB 查询，但慢查询也不能被每秒 poll 无限续期。
           entry.deadlineReached = true;
@@ -1143,9 +1156,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
             log.warn("wait_work_event_check_failed", { error, memberId: binding.memberId });
             await settle(entry, { ok: true, status: "cancelled", messages: [], cursor: null, drainedBacklog: false });
           }
-        }, timeoutMs);
+        })()); }, timeoutMs);
         // stdio 与 HTTP 可处于不同进程；持久查询补足进程内通知，仍只在宿主已挂起的 wait 安全点返回。
-        entry.pollTimer = setInterval(() => { void resolveWorkEvents(); }, 1000);
+        entry.pollTimer = setInterval(() => { void trackBackground(resolveWorkEvents()); }, 1000);
         entry.pollTimer.unref();
         if (params.signal) {
           entry.abortListener = () => {
@@ -1470,9 +1483,10 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       await (resolveGroupInternal(groupId, wakeGate));
     },
 
-    async close() {
-      if (closed) return;
+    close(closeOptions) {
+      if (closePromise) return closeOptions?.drain ? closePromise.then(waitForCalls) : closePromise;
       closed = true;
+      closePromise = (async () => {
       cancelMemoryReconciliations(options.db, memoryCoreKey);
       injectedVersions.clear();
       unsubscribeWorkEvents();
@@ -1490,10 +1504,13 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         drained += 1;
       }
       log.info("mcp_core_closed", { pendingWaitsDrained: drained });
+      })();
+      return closeOptions?.drain ? closePromise.then(waitForCalls) : closePromise;
     },
 
-    async disconnect() {
+    async disconnect(closeOptions) {
       const at = now().toISOString();
+      const failures: unknown[] = [];
       for (const binding of bindings.values()) {
         try {
           await withAccess(binding, "disconnect", async () => {
@@ -1502,17 +1519,19 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
           });
         } catch (error) {
           log.warn("mcp_session_disconnect_failed", { error, mcpSessionId: binding.mcpSessionId });
+          failures.push(error);
         }
       }
+      if (closeOptions?.strict && failures.length) throw new AggregateError(failures, "mcp_disconnect_incomplete");
     },
   };
 
   const registration: CoreInternals = { core, resolveGroup: resolveGroupInternal };
   activeRegistrations.add(registration);
-  unsubscribeWorkEvents = onWorkEventCommit(options.db, resolveWorkEvents);
+  unsubscribeWorkEvents = onWorkEventCommit(options.db, events => trackBackground(resolveWorkEvents(events)));
 
   // 短工具整体与 fence 检查处于同一事务；长等待在真正出队时再次检查。
-  return {
+  const publicCore: McpCore = {
     ...core,
     join: async (sid, params) => {
       // gateway 的 join 完成回调先确认通道就绪，再以 consume fence 领取持久工作事件。
@@ -1539,6 +1558,31 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
     attemptInterrupt: (sid, params) => withAccess(bindingFor(sid), "observe", () => core.attemptInterrupt(sid, params)),
     get pendingWaitCount() { return core.pendingWaitCount; },
   };
+  // Track actual tool/background promises, including work after an HTTP transport's
+  // handleRequest has returned. Cleanup never lends its scope to an ordinary call.
+  const wrappers = new Map<PropertyKey, (...args: unknown[]) => Promise<unknown>>();
+  return new Proxy(publicCore, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver) as unknown;
+      if (typeof value !== "function" || ["close", "disconnect", "isJoined"].includes(String(property))) return value;
+      if (!wrappers.has(property)) wrappers.set(property, (...args: unknown[]) => {
+        if (closed) return Promise.reject(new McpToolError("CONFLICT", "服务端正在关闭"));
+        const invoke = () => Reflect.apply(value, target, args) as Promise<unknown>;
+        // A managed wait can only announce a safe point while admission is stopped;
+        // the supervisor returns cancelled without consuming new work.
+        const pending = (options.managed && property === "waitForMessages" && !storageWorkMayStart(options.db)
+          ? Promise.resolve().then(invoke) : runStorageWork(options.db, invoke)).catch(error => {
+          if (error instanceof StorageMaintenanceError)
+            throw new McpToolError("CONFLICT", "存储正在维护，当前入口不接收新工作。", { reason: error.code });
+          throw error;
+        });
+        activeCalls.add(pending);
+        void pending.then(() => activeCalls.delete(pending), () => activeCalls.delete(pending));
+        return pending;
+      });
+      return wrappers.get(property);
+    },
+  });
 
   // -------------------------------------------------------------------------
   // 会话绑定
