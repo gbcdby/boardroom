@@ -1,0 +1,72 @@
+{
+  "schema_version": "fs-identity-qualification/v1",
+  "work_id": "S4-T2-152-fs-identity-qualification-r2",
+  "ticket": "https://github.com/gbcdby/boardroom/issues/152",
+  "assignment": "https://github.com/gbcdby/boardroom/issues/152#issuecomment-6830522804",
+  "design": {
+    "candidate": "S4-T2-Fs-identity-witness-r2@d5e71efc",
+    "product_commit": "d5e71efccb4787ab14b2df609068b3d32ad84f9c",
+    "product_tree": "f39243c6ac170c8c893ba00ea68d879a26382e54",
+    "manifest_sha256": "91c62671f84ed27250bc018b2b70e09d4bf8d92fa466ed175fe06f1beb8b55e2",
+    "design_sha256": "7d8fa7a541c43ad815da1a6442153da8b27955d7f38ae801d7f6ce1bedfee363",
+    "acceptance_sha256": "048bafb078edf4119faf2601726084d46406b128f51d773db4118c3eb8000f1b",
+    "probe_source_sha256": "5f7bd78c218f29368301da63b3bc8dd1314e82d15ac923a883c3d57fdb636ea6",
+    "preparation_sha256": "a8de8c8d5244ef7b16409a067550af0bd973b3bbe4c9bf332aa48cc142d41c16",
+    "registration": "https://github.com/gbcdby/boardroom/issues/152#issuecomment-6829200749",
+    "registration_effect": "仅登记设计双轴结果，不使生产 provider 合同共享激活。"
+  },
+  "status": {
+    "qualification": "NOT_RUN",
+    "B1": "OPEN",
+    "accepted_provider_profiles": [],
+    "historical_product_delete_recreate": "FAIL_UNRESOLVED"
+  },
+  "target": {
+    "profile": "linux-overlay-fid-fsuuid-v1",
+    "runner": "ubuntu-24.04",
+    "backing_filesystem": "ext4",
+    "mount_options": ["rw", "index=off", "metacopy=off", "nfs_export=off", "uuid=on", "redirect_dir=nofollow", "xino=off"],
+    "kernel_and_image": "运行时记录；runner 标签、源文档和历史 vendor kernel 均不等于实测身份。",
+    "scope": "新建的 ext4-backed overlay 有限 fixture，不能外推原 workspace 的 erofs lower/未知 upper backing。",
+    "cold_control": "A 先普通 lookup/open；B 在 lookup-only 阶段保持 cold，到 provider 阶段才首次 open。两组记录各自全部差异，控制组变异不能抵销 provider/source 变异。",
+    "observer": "只读扫描 lower/upper/work 及其共同父目录；O_NOATIME，完整 stat/content hash/xattr、逐阶段 observer-only 复读；trusted.boardroom.fsqual 仅在准备阶段建立以核对 observer 可见性。",
+    "remount": "仅一次 provider 组的普通 overlay umount/mount，同一 lower/upper/work/options/绝对根；不重新格式化、不重挂 backing 设备、不重启 OS。"
+  },
+  "budgets": {
+    "fixture_bytes": 1048576,
+    "objects_per_group": 16,
+    "simultaneous_overlays": 2,
+    "inode_attempts": 32,
+    "inode_seconds": 2,
+    "compile_seconds": 10,
+    "process_seconds": 3,
+    "stage_seconds": 60,
+    "fixture_seconds": 300,
+    "job_minutes": 10,
+    "remounts": 1
+  },
+  "source_files": [
+    ".github/workflows/fs-identity-qualification.yml",
+    "scripts/qualification/fs-identity/probe.c",
+    "scripts/qualification/fs-identity/run.py",
+    "scripts/qualification/fs-identity/profile.json"
+  ],
+  "artifacts": ["environment.json", "candidate.json", "binary.json", "events.jsonl", "fixture/events.jsonl", "fixture/snapshots/", "fixture/diffs/", "fixture/native/", "persisted-observations.json", "persisted-observations.sha256", "summary.json", "cleanup.json", "SHA256SUMS"],
+  "acceptance_mapping": {
+    "privilege_separation": ["QREQ-02"],
+    "same_fd_codec": ["QREQ-03", "FSI-07", "FSI-18", "FSI-19"],
+    "cold_backing_nonmutation": ["QREQ-04", "FSI-19"],
+    "object_matrix": ["QREQ-05", "FSI-16", "FSI-19"],
+    "same_object_mutations": ["QREQ-06", "FSI-02", "FSI-12"],
+    "real_recreation": ["QREQ-06", "FSI-02", "FSI-04", "FSI-12"],
+    "persisted_new_process": ["QREQ-07", "FSI-05", "FSI-17"],
+    "same_source_remount": ["QREQ-08", "FSI-06"],
+    "budgets_cleanup_evidence": ["QREQ-01", "QREQ-09", "QREQ-10", "QREQ-11", "QREQ-12"]
+  },
+  "not_run": ["OS reboot", "backing device remount", "production Node-API", "capture/canonical Fs/parser/service", "old receipts rejection", "restore content closure", "original product failure retest", "PostgreSQL", "full product CI", "Darwin/APFS"],
+  "uapi_sources": [
+    {"url": "https://github.com/torvalds/linux/blob/v6.18/include/uapi/linux/fs.h", "sha256": "bf3363a0a2afe6165311e9827958d89d9ecbe101a79782a3b4bd76699841d263"},
+    {"url": "https://github.com/torvalds/linux/blob/v6.18/include/uapi/linux/fcntl.h", "sha256": "d58b0d209a572c4351757404252bf0bb398cabf1879b52bdd27497a2eeea87ba"},
+    {"url": "https://github.com/torvalds/linux/blob/v6.18/include/uapi/linux/stat.h", "sha256": "c900a05e031d999074db5ac3567f651ce2cf2f9f9e0a686810d6453c9f8b9526"}
+  ]
+}

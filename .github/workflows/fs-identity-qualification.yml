@@ -1,0 +1,47 @@
+name: Fs identity · 有限 Linux 资格证据
+
+on:
+  push:
+    branches: [qualification/152-fs-identity-r2]
+    paths:
+      - .github/workflows/fs-identity-qualification.yml
+      - scripts/qualification/fs-identity/probe.c
+      - scripts/qualification/fs-identity/run.py
+      - scripts/qualification/fs-identity/profile.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fs-identity-qualification-${{ github.ref }}
+  # 在途 fixture 必须完成自己的普通卸载和证据收尾。
+  cancel-in-progress: false
+
+jobs:
+  native-qualification:
+    name: Linux · 有限原生结果见 summary.json
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: 检出固定候选
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: 执行一次有界实验
+        run: >-
+          python3 scripts/qualification/fs-identity/run.py
+          --mode hosted-linux
+          --profile scripts/qualification/fs-identity/profile.json
+          --root "$RUNNER_TEMP/boardroom-fsqual-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          --out "$GITHUB_WORKSPACE/.agent-output/fs-qualification"
+
+      - name: 保存能力结果、原始证据与清理回执
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fs-qualification-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: .agent-output/fs-qualification/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
