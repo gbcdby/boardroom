@@ -42,7 +42,7 @@ npm start
 | WebSocket | `ws://127.0.0.1:4317/ws` |
 | MCP（Streamable HTTP） | `http://127.0.0.1:4317/mcp` |
 
-默认首次启动会创建 `data/agent-studio.db` 并应用数据库迁移；后续启动校验已应用迁移并执行新增迁移。数据目录相对进程工作目录解析，重启要保留同一份数据。当前迁移定义见[迁移列表](src/server/db/migrations/index.ts)。
+合法的首次 v1 启动会创建 `data/agent-studio.db` 并应用数据库迁移；后续启动校验已应用迁移并执行新增迁移。旧相对数据目录仍按原启动工作目录解析，重启要保留同一份数据。发现来源歧义、未完成迁移或配置错误时，服务会拒绝启动并给出恢复动作，避免另开空库。当前迁移定义见[迁移列表](src/server/db/migrations/index.ts)，来源检查见[环境解析](docs/environment-resolution.md)。
 
 ### 从 WebUI 到 agent 入群
 
@@ -65,7 +65,7 @@ npm start
 
 服务注册了 `join`、`wait_for_messages`、`send_message`、`acknowledge_message`、`report_status`、`heartbeat`、`read_history` 七个聊天工具，十五个任务、评审与工作通知工具，以及十个记忆工具，共 **32 个**。完整分组、参数来源和错误格式见 [MCP 工具契约](docs/mcp-tool-contract.md)，当前注册以[工具实现](src/server/mcp/server.ts)为准。每个 MCP 会话绑定一个项目/群组；连接成功不等于已经入群，ACK 不代表任务或自总结已完成。
 
-另有 [stdio 入口](src/server/mcp/stdio.ts)：由宿主运行 `node /绝对路径/src/server/mcp/stdio.ts`。它独立打开数据库，必须与 Web 服务使用同一存储配置（SQLite 使用相同的绝对数据目录）。**共享数据库不会共享进程内唤醒通知**；跨进程新消息需在再次调用 `wait_for_messages` 时读取积压。需要 WebUI 发消息及时结束挂起等待时，使用同一服务上的 Streamable HTTP。
+另有 [stdio 入口](src/server/mcp/stdio.ts)：由宿主运行 `node /绝对路径/src/server/mcp/stdio.ts`。它与 Web 服务共用环境解析规则，但独立打开数据库；从不同工作目录启动时，应使用同一显式配置及绝对数据目录。显式配置无效会非零退出，诊断仅写 stderr，不回落为另一份 SQLite 数据。**共享数据库不会共享进程内唤醒通知**；跨进程新消息需在再次调用 `wait_for_messages` 时读取积压。需要 WebUI 发消息及时结束挂起等待时，使用同一服务上的 Streamable HTTP。
 
 ## 角色库与稳定身份
 
@@ -93,7 +93,9 @@ npm start
 
 ## 配置与存储
 
-优先级为 **默认值 → 配置文件 → 环境变量**。`AGENT_STUDIO_CONFIG` 可指定配置文件；未设置时读取 `<cwd>/config.json`，默认文件不存在则使用默认值。参考 [config.example.json](config.example.json)，实际解析规则见 [config.ts](src/server/config.ts)。
+字段优先级为 **默认值 → 配置文件 → 环境变量**。配置文件依次选择显式 `AGENT_STUDIO_CONFIG`、`<BOARDROOM_HOME>/config.json`、旧 `<cwd>/config.json`；默认文件均不存在时才使用默认值。`BOARDROOM_HOME` 默认是用户目录下的 `~/.boardroom`，覆盖值必须为绝对路径。显式配置缺失、损坏或不可访问会拒绝启动。参考 [config.example.json](config.example.json)，完整选择、恢复和路径规则见[环境解析与旧数据来源预检](docs/environment-resolution.md)。
+
+当前仍使用原 v1 数据库和库内记忆正文，`~/.boardroom` 的 state/skills/memory 等新布局位置只作规划；此阶段不会自动搬迁或激活新存储。运行 `node scripts/inspect-storage.ts` 可取得不打开数据库、不写文件的来源清单；已知旧启动目录可用重复的 `--legacy-cwd /绝对路径` 指定。
 
 在 `/settings` 查看当前进程已经生效的配置与实际 MCP 地址。修改配置文件或启动环境后，正常停止并重新启动服务，再刷新页面核对；页面不保存配置或执行重启。详见[设置与配置生效](docs/settings.md)。
 
@@ -101,6 +103,7 @@ npm start
 | --- | --- | --- |
 | `port` | `AGENT_STUDIO_PORT` | `4317`，只绑定 `127.0.0.1` |
 | `dataDir` | `AGENT_STUDIO_DATA_DIR` | `data`，SQLite 数据目录，相对 cwd 解析 |
+| — | `BOARDROOM_HOME` | 用户目录下的 `.boardroom`；须为绝对路径，不改写 `HOME` 或自动移动旧数据 |
 | `dbDriver` | `AGENT_STUDIO_DB_DRIVER` | `sqlite`；可选 `postgres` |
 | `pgConnectionString` | `AGENT_STUDIO_PG_CONNECTION_STRING` | 无；选择 `postgres` 时必填 |
 | `heartbeat.intervalMs` | `AGENT_STUDIO_HEARTBEAT_INTERVAL_MS` | `10000` ms |

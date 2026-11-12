@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import ConfirmDialog from "../components/ConfirmDialog.vue";
+import CreationDialog from "../components/CreationDialog.vue";
 import PurgeImpact from "../components/PurgeImpact.vue";
 import { useConfirmedAction } from "../composables/useConfirmedAction.ts";
 import { useToast } from "../composables/useToast.ts";
@@ -31,11 +32,17 @@ import {
  */
 
 import { projectPath, useCurrentProject, useProjectDraft } from "../composables/useCurrentProject.ts";
+const props = defineProps<{ mode?: "list" | "overview" | "members" | "settings" | "groups" }>();
 const route = useRoute();
+const viewMode = computed(() => props.mode ?? (!route.params["projectId"] ? "list" : route.meta["projectSection"] === "members" ? "members" : route.meta["projectSection"] === "settings" ? "settings" : route.query["manage"] === "groups" ? "groups" : "overview"));
+const creation = ref<"project" | "group" | null>(null);
+const projectSearch = computed({ get: () => typeof route.query["q"] === "string" ? route.query["q"] : "", set: value => { void router.replace({ path: route.path, query: { ...route.query, q: value || undefined }, hash: route.hash }); } });
+const memberCreateOpen = ref(false);
+const pageTitle = computed(() => ({ list: "所有项目", overview: "项目概览", members: "项目成员", settings: "项目设置", groups: "群组管理" })[viewMode.value]);
 const router = useRouter();
 const context = useCurrentProject();
 const { currentProjectId: activeProjectId, currentProject: activeProject, readonly: projectReadonly } = context;
-const projects = computed(() => context.projects.value.filter((project) => showArchived.value || !project.archivedAt));
+const projects = computed(() => context.projects.value.filter((project) => (showArchived.value || !project.archivedAt) && project.name.toLocaleLowerCase().includes(projectSearch.value.trim().toLocaleLowerCase())));
 let disposed = false;
 let projectRequest = 0;
 const members = ref<MemberDto[]>([]);
@@ -98,20 +105,20 @@ async function loadProjects(): Promise<void> {
 async function toggleShowArchived(): Promise<void> {
   if (busy.value) return;
   clearMessages();
-  showArchived.value = !showArchived.value;
-  await loadProjects();
+  await router.replace({ path: route.path, query: { ...route.query, archived: showArchived.value ? undefined : "1" }, hash: route.hash });
 }
 
 async function loadActiveProject(): Promise<void> {
   const projectId = activeProjectId.value;
-  if (projectId === null) {
+  const version = ++projectRequest;
+  if (projectId === null || viewMode.value === "list") {
     members.value = [];
     groups.value = [];
     participants.value = {};
     statuses.value = {};
+    loadingProject.value = false;
     return;
   }
-  const version = ++projectRequest;
   loadingProject.value = true;
   try {
     const [memberResult, groupResult] = await Promise.all([
@@ -167,9 +174,9 @@ async function createProject(): Promise<void> {
   }
   const result = await run(() => api.createProject(name), `项目「${name}」已创建。`);
   if (!result) return;
-  newProjectName.value = "";
+  newProjectName.value = ""; creation.value = null;
   await context.refreshProjects();
-  await context.selectProject(result.project.id);
+  await router.push(projectPath(result.project.id));
 }
 
 async function addMember(): Promise<void> {
@@ -284,8 +291,9 @@ async function createGroup(): Promise<void> {
   );
   if (!result) return;
   newGroupName.value = "";
-  newGroupSelection.value = [];
+  newGroupSelection.value = []; creation.value = null;
   await loadActiveProject();
+  await context.refreshProjects();
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +362,7 @@ async function archiveGroup(group: GroupDto): Promise<void> {
     execute: async () => { await api.archiveGroup(groupId); },
     reconcile: async () => { await requireProjectScope(projectId); const latest = (await api.listGroups(projectId, { includeArchived: true })).groups.find(item => item.id === groupId);
       if (!latest) throw new Error("原群组已不存在，无法确认归档结果，请刷新项目查看。"); return latest.archivedAt !== null; },
-    afterSuccess: loadActiveProject,
+    afterSuccess: loadProjects,
   });
 }
 
@@ -362,7 +370,7 @@ async function restoreGroup(group: GroupDto): Promise<void> {
   if (busy.value || projectReadonly.value) return;
   const result = await run(() => api.restoreGroup(group.id), `群组「${group.name}」已恢复。`);
   if (!result) return;
-  await loadActiveProject();
+  await loadProjects();
 }
 
 async function requestGroupPurge(group: GroupDto): Promise<void> {
@@ -386,7 +394,7 @@ async function requestGroupPurge(group: GroupDto): Promise<void> {
       if (outcome.state !== "deleted") throw new ApiError(409, "confirmation_changed", "删除范围已变化，请重新预览并再次确认。");
     },
     reconcile: async () => { await requireProjectScope(projectId); return !(await api.listGroups(projectId, { includeArchived: true })).groups.some(item => item.id === groupId); },
-    afterSuccess: loadActiveProject,
+    afterSuccess: loadProjects,
   });
 }
 
@@ -439,7 +447,16 @@ function participantNames(groupId: string): string {
   return (participants.value[groupId] ?? []).map((m) => m.displayName).join("、") || "（暂无参与者）";
 }
 
-watch(() => context.generation.value, () => confirmation.reset());
+function openCreation(kind: "project" | "group"): void { if (!busy.value && !confirmationAction.value) { clearMessages(); creation.value = kind; } }
+function closeCreation(): void {
+  if (busy.value) return;
+  creation.value = null; newProjectName.value = ""; newGroupName.value = ""; newGroupSelection.value = []; clearMessages();
+  if (route.query["create"] === "project") void router.replace({ path: route.path, query: { ...route.query, create: undefined }, hash: route.hash });
+}
+watch(() => route.query["create"], value => { if (value === "project" && viewMode.value === "list") creation.value = "project"; }, { immediate: true });
+watch(viewMode, () => { creation.value = null; void loadActiveProject(); });
+watch(() => route.query["archived"], value => { showArchived.value = value === "1"; void loadActiveProject(); });
+watch(() => context.generation.value, () => { confirmation.reset(); creation.value = null; });
 watch(activeProjectId, () => { projectRequest++; members.value = []; groups.value = []; participants.value = {}; statuses.value = {}; loading.value = false; void loadActiveProject(); }, { immediate: true });
 onBeforeUnmount(() => { disposed = true; projectRequest++; });
 </script>
@@ -455,36 +472,33 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
         <button v-if="confirmationPhase === 'refresh-required'" type="button" data-testid="confirmation-preview" @click="confirmation.retryPreview">重新读取影响范围</button>
       </template>
     </ConfirmDialog>
-    <header class="page-header">
-      <div>
-        <h1>{{ route.meta["projectSection"] === "members" ? "成员" : route.params["projectId"] ? "项目概览" : "项目与群组" }}</h1>
-        <p class="page-description">把成员和对话放在同一个项目中，让协作井然有序。</p>
-      </div>
-    </header>
+    <CreationDialog :open="creation !== null" :title="creation === 'project' ? '新建项目' : '创建群组'" :pending="busy" :dirty="creation === 'project' ? !!newProjectName : !!newGroupName || newGroupSelection.length > 0" :error="error" :confirm-label="creation === 'project' ? '创建项目' : '创建群组'" :confirm-test-id="creation === 'project' ? 'create-project' : 'create-group'" @confirm="creation === 'project' ? createProject() : createGroup()" @close="closeCreation">
+      <template v-if="creation === 'project'"><label class="field" for="new-project-name">项目名称<input id="new-project-name" v-model="newProjectName" :disabled="busy" required placeholder="例如：产品研发" data-testid="new-project-name" /></label><p class="muted small">创建后可添加成员、建立群组，配置项目协作。</p></template>
+      <template v-else><label class="field" for="new-group-name">群组名称<input id="new-group-name" v-model="newGroupName" :disabled="busy || projectReadonly" required placeholder="例如：设计讨论" data-testid="new-group-name" /></label><fieldset class="participants-picker" :disabled="busy || projectReadonly" data-testid="participant-picker"><legend>参与者</legend><p v-if="members.length === 0" class="muted small">暂无可选择的成员，可先建立群组。</p><label v-for="member in members" :key="member.id" class="participant-option"><input type="checkbox" :checked="newGroupSelection.includes(member.id)" @change="toggleGroupSelection(member.id)" />{{ member.displayName }}</label></fieldset><p class="muted small">已选 {{ newGroupSelection.length }} 位参与者。创建群组不会自动启动 Agent。</p></template>
+    </CreationDialog>
+    <header class="page-header"><div><h1>{{ pageTitle }}</h1><p class="page-description">{{ viewMode === 'list' ? '每个项目都有独立的成员、群组和工作记录。' : viewMode === 'settings' ? '管理当前项目的配置与生命周期。' : '把成员和对话放在同一个项目中，让协作井然有序。' }}</p></div><button v-if="viewMode === 'list'" type="button" class="primary" :disabled="busy" data-testid="open-create-project" @click="openCreation('project')">新建项目</button><button v-else-if="viewMode === 'groups'" type="button" class="primary" :disabled="busy || projectReadonly" data-testid="open-create-group" @click="openCreation('group')">创建群组</button></header>
 
-    <p v-if="error" class="error" role="alert" data-testid="error">{{ error }}</p>
+    <p v-if="error && !creation" class="error" role="alert" data-testid="error">{{ error }}</p>
 
-    <section v-if="!route.params['projectId']" class="panel project-picker" aria-labelledby="project-picker-title" :aria-busy="loading">
+    <section v-if="viewMode === 'list'" class="panel project-picker" aria-labelledby="project-picker-title" :aria-busy="loading">
       <div class="section-heading">
         <h2 id="project-picker-title">我的项目 <span class="count">{{ projects.length }}</span></h2>
         <button type="button" class="text-button" :disabled="busy" :aria-pressed="showArchived" data-testid="toggle-archived" @click="toggleShowArchived">
           {{ showArchived ? "隐藏已归档" : "显示已归档" }}
         </button>
       </div>
+      <label class="field project-search">筛选项目<input v-model="projectSearch" type="search" placeholder="按项目名称查找" data-testid="project-search" /></label>
       <div v-if="projects.length > 0" class="project-tabs" role="group" aria-label="浏览项目" data-testid="project-list">
         <button v-for="project in projects" :key="project.id" type="button" class="project-tab" :class="{ active: project.id === activeProjectId }" :aria-pressed="project.id === activeProjectId" :disabled="busy" @click="selectProject(project.id)">
           {{ project.name }}<span v-if="project.archivedAt" class="muted small"> · 已归档</span>
         </button>
       </div>
       <p v-if="loading && projects.length === 0" class="muted small" role="status">正在加载项目…</p>
-      <form class="project-create" @submit.prevent="createProject">
-        <label class="field" for="new-project-name">新项目名称<input id="new-project-name" v-model="newProjectName" :disabled="busy" required placeholder="例如：产品研发" data-testid="new-project-name" /></label>
-        <button type="submit" class="primary" :disabled="busy" data-testid="create-project">创建项目</button>
-      </form>
+
     </section>
 
-    <template v-if="activeProject">
-      <section class="panel project-summary" aria-labelledby="active-project-title" data-testid="project-detail">
+    <template v-if="activeProject && viewMode !== 'list'">
+      <section v-if="viewMode === 'overview' || viewMode === 'settings'" class="panel project-summary" aria-labelledby="active-project-title" data-testid="project-detail">
         <div class="section-heading">
           <div>
             <h2 id="active-project-title">{{ activeProject.name }} <span v-if="activeProject.archivedAt" class="badge" data-testid="project-archived-badge">已归档</span></h2>
@@ -493,7 +507,7 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
           <RouterLink :to="{ path: '/runtimes', query: { projectId: activeProject.id } }">管理托管 Agent <span aria-hidden="true">↗</span></RouterLink>
         </div>
         <p v-if="activeProject.archivedAt" class="muted small">项目已归档。恢复项目后，可以继续添加成员与群组。</p>
-        <details class="project-management" data-testid="project-actions">
+        <details class="project-management" data-testid="project-actions" :open="viewMode === 'settings'">
           <summary>项目管理</summary>
           <p class="muted small project-id">项目 ID：<code>{{ activeProject.id }}</code></p>
           <div class="actions" data-testid="project-lifecycle">
@@ -507,14 +521,17 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
       </section>
 
       <p v-if="loadingProject" class="muted small" role="status">正在更新项目内容…</p>
-      <div class="project-columns" :aria-busy="loadingProject">
-        <section class="panel members-panel" aria-labelledby="members-title">
+      <div v-if="viewMode === 'settings'" class="panel"><h2>协作配置</h2><p class="muted small">当前项目的任务默认评审者在任务页维护，成员与岗位在成员页维护。</p><div class="actions"><RouterLink :to="projectPath(activeProject.id, 'tasks')">任务与默认评审者</RouterLink><RouterLink :to="projectPath(activeProject.id, 'members')">成员与岗位</RouterLink></div></div>
+      <div v-if="viewMode !== 'settings'" class="project-columns" :class="{ 'single-column': viewMode !== 'overview' }" :aria-busy="loadingProject">
+        <section v-if="viewMode === 'members' || viewMode === 'overview'" class="panel members-panel" aria-labelledby="members-title">
           <div class="section-heading"><h2 id="members-title">成员 <span class="count">{{ members.length }}</span></h2></div>
           <p class="muted small section-description">添加人类成员，Agent 可通过 CLI 接入项目。</p>
+          <details class="member-create-context" data-testid="member-create-context" :open="memberCreateOpen" @toggle="memberCreateOpen = ($event.target as HTMLDetailsElement).open"><summary data-testid="open-add-member">添加人类成员</summary>
           <form class="inline-create" @submit.prevent="addMember">
             <label class="field" for="new-member-name">成员显示名<input id="new-member-name" v-model="newMemberName" :disabled="busy || !!activeProject.archivedAt" required placeholder="填写成员名称" data-testid="new-member-name" /></label>
             <button type="submit" class="secondary" :disabled="busy || !!activeProject.archivedAt" data-testid="add-member">添加成员</button>
           </form>
+          </details>
           <div v-if="members.length === 0 && !loadingProject" class="empty-state compact-empty"><p>暂无成员。添加第一位成员，开始协作。</p></div>
           <ul v-else class="member-list" data-testid="member-list">
             <li v-for="member in members" :key="member.id" class="member-item">
@@ -551,21 +568,10 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
           </details>
         </section>
 
-        <section v-if="route.meta['projectSection'] !== 'members'" class="panel groups-panel" aria-labelledby="groups-title">
-          <div class="section-heading"><h2 id="groups-title">群组 <span class="count">{{ groups.length }}</span></h2></div>
+        <section v-if="viewMode === 'groups' || viewMode === 'overview'" class="panel groups-panel" aria-labelledby="groups-title">
+          <div class="section-heading"><h2 id="groups-title">群组 <span class="count">{{ groups.length }}</span></h2><button type="button" class="text-button" :disabled="busy" :aria-pressed="showArchived" data-testid="toggle-archived" @click="toggleShowArchived">{{ showArchived ? "隐藏已归档" : "显示已归档" }}</button></div>
           <p class="muted small section-description">按协作主题建群，为每个群组选择参与者。</p>
-          <details class="create-section" data-testid="group-create" :open="groups.length === 0">
-            <summary>创建群组</summary>
-            <form class="group-create" @submit.prevent="createGroup">
-              <label class="field" for="new-group-name">群组名称<input id="new-group-name" v-model="newGroupName" :disabled="busy || !!activeProject.archivedAt" required placeholder="例如：设计讨论" data-testid="new-group-name" /></label>
-              <fieldset class="participants-picker" :disabled="busy || !!activeProject.archivedAt" data-testid="participant-picker">
-                <legend>参与者</legend>
-                <p v-if="members.length === 0" class="muted small">先添加成员，才能选择参与者。</p>
-                <label v-for="member in members" :key="member.id" class="participant-option"><input type="checkbox" :checked="newGroupSelection.includes(member.id)" @change="toggleGroupSelection(member.id)" />{{ member.displayName }}</label>
-              </fieldset>
-              <div class="actions"><button type="submit" class="secondary" :disabled="busy || !!activeProject.archivedAt" data-testid="create-group">创建群组</button><span class="muted small">已选 {{ newGroupSelection.length }} 位参与者</span></div>
-            </form>
-          </details>
+          <button v-if="viewMode === 'overview'" type="button" class="text-button" :disabled="busy || projectReadonly" data-testid="open-create-group" @click="openCreation('group')">创建群组</button>
           <div v-if="groups.length === 0 && !loadingProject" class="empty-state compact-empty"><p>暂无群组。创建一个群组，把相关讨论放在一起。</p></div>
           <ul v-else class="group-list" data-testid="group-list">
             <li v-for="group in groups" :key="group.id" class="group-item">
@@ -587,7 +593,7 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
         </section>
       </div>
     </template>
-    <div v-else-if="!loading && !error" class="panel empty-state"><h2>开始第一个项目</h2><p>在上方填写项目名称，然后添加成员、创建群组。</p></div>
+    <div v-if="viewMode === 'list' && !loading && !error && !projects.length" class="empty-state"><h2>{{ projectSearch ? '没有匹配的项目' : '从一个项目开始' }}</h2><p>新建项目后，就可以添加成员、建立群组。</p></div>
   </section>
 </template>
 
@@ -598,7 +604,7 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
 .section-heading p { margin: .35rem 0 0; }
 .section-heading > div { min-width: 0; }
 .count { color: var(--muted); font-size: .85rem; font-weight: 400; margin-left: .35rem; }
-.project-tabs { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1rem; }
+.project-tabs { display: grid; gap: 0; margin-top: 1rem; }.project-search { max-width: 25rem; margin-top: 20px; }.project-tab { justify-content: flex-start; border: 0; border-radius: 0; padding: 18px 8px; border-bottom: 1px solid var(--border); min-height: 58px; }.project-columns.single-column { grid-template-columns: minmax(0, 1fr); }.member-create-context { margin-top: 16px; padding: 12px 16px; border: 1px solid var(--border); border-radius: 9px; }.member-create-context summary { color: var(--accent); }
 .project-tab { max-width: 100%; text-align: left; overflow-wrap: anywhere; background: var(--surface-subtle); }
 .project-tab.active { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
 .project-create, .inline-create { display: flex; align-items: end; flex-wrap: wrap; gap: .75rem; margin-top: 1.25rem; }

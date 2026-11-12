@@ -1,4 +1,5 @@
 import { ConfigError, loadConfig } from "./config.ts";
+import { describeDatabase } from "./environment.ts";
 import { createLogger } from "./logger.ts";
 import { ServerStartupError, startServer } from "./server.ts";
 
@@ -13,7 +14,7 @@ async function main(): Promise<void> {
     config = await loadConfig();
   } catch (error) {
     if (error instanceof ConfigError) {
-      logger.error("配置无效", { error });
+      process.stderr.write(`配置无效 [${error.code}]：${error.message}\n恢复方式：${error.recoveryAction}\n`);
       process.exitCode = 1;
       return;
     }
@@ -25,6 +26,8 @@ async function main(): Promise<void> {
     dataDir: config.dataDir,
     heartbeat: config.heartbeat,
     configFile: config.configFile,
+    database: describeDatabase(config.environment!.databaseDescriptor),
+    startupState: config.environment!.startupState,
   });
 
   let server;

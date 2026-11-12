@@ -17,7 +17,7 @@ import re
 import select
 import subprocess
 import sys
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from playwright.sync_api import Error as PlaywrightError, expect, sync_playwright
 
@@ -185,7 +185,7 @@ def exercise(page, fixture: dict, artifacts: Path, report: dict) -> None:
     stopped = api(page, origin, f"/api/runtime-bindings/{binding_id}")["binding"]
     assert stopped["binding"]["desiredState"] == "stopped" and stopped["runner"]["exitConfirmed"] is True
 
-    # 全局 Runtime 可复用到新项目；当前项目只有一个，身份选择不另设项目上下文。
+    # 全局 Runtime 可复用到显式选择的项目，同一身份与其他绑定保持不变。
     created_project = page.request.post(origin + "/api/projects", data={"name": "复用托管身份的项目"})
     assert created_project.status == 201
     other_project_id = created_project.json()["project"]["id"]
@@ -195,6 +195,7 @@ def exercise(page, fixture: dict, artifacts: Path, report: dict) -> None:
     page.goto(f"{origin}/runtimes?projectId={other_project_id}")
     page.get_by_test_id("runtime-reuse-open").click()
     expect(page.get_by_test_id("runtime-existing-select")).to_have_value(runtime_id)
+    expect(page.get_by_test_id("runtime-binding-project")).to_have_value(other_project_id)
     page.set_viewport_size({"width": 390, "height": 844})
     report["layouts"].append(check_layout(page, "mobile-reuse-390"))
     screenshot("06-reuse-existing-mobile.png")
@@ -205,6 +206,33 @@ def exercise(page, fixture: dict, artifacts: Path, report: dict) -> None:
     bindings = api(page, origin, f"/api/runtimes/{runtime_id}")["runtime"]["bindings"]
     assert len(bindings) == 2 and any(item["binding"]["id"] == binding_id for item in bindings)
     passed("R5-cross-project-reuse", "在新项目选择已有全局身份，新增停止的独立绑定并保留原项目绑定。")
+
+    page.goto(origin + "/collaboration/connections?view=all#runtime-scope")
+    expect(page.get_by_test_id("runtime-project-filter")).to_have_value("")
+    expect(page.locator("[data-binding-id]")).to_have_count(2)
+    page.get_by_test_id("runtime-project-filter").select_option(other_project_id)
+    expect(page.locator("[data-binding-id]")).to_have_count(1)
+    expect(page.locator(f'[data-binding-id="{reused["binding"]["id"]}"]')).to_be_visible()
+    page.get_by_test_id("runtime-group-filter").select_option(other_group_id)
+    page.get_by_test_id("runtime-scope-clear").click()
+    expect(page.get_by_test_id("runtime-project-filter")).to_have_value("")
+    expect(page.get_by_test_id("runtime-group-filter")).to_have_value("")
+    expect(page.locator("[data-binding-id]")).to_have_count(2)
+    scope_url = urlsplit(page.url)
+    assert parse_qs(scope_url.query) == {"view": ["all"]} and scope_url.fragment == "runtime-scope"
+    page.get_by_test_id("open-runtime-create").click()
+    expect(page.get_by_test_id("runtime-create-project")).to_have_value("")
+    expect(page.get_by_test_id("runtime-create")).to_be_disabled()
+    page.get_by_test_id("runtime-name").fill("全局范围未保存的配置")
+    page.once("dialog", lambda dialog: dialog.dismiss())
+    page.get_by_test_id("runtime-project-filter").select_option(fixture["projectId"])
+    expect(page.get_by_test_id("runtime-project-filter")).to_have_value("")
+    expect(page.get_by_test_id("runtime-name")).to_have_value("全局范围未保存的配置")
+    page.get_by_test_id("runtime-create-form").get_by_role("button", name="取消", exact=True).click()
+    assert len(api(page, origin, "/api/runtimes")["runtimes"]) == 1
+    screenshot("06-global-runtime-scope.png")
+    passed("S6-visible-runtime-scope", "全局入口显示跨项目绑定，显式筛选可清空并保留query/hash；新建需选择项目，取消切换保留草稿。")
+
     page.set_viewport_size({"width": 1440, "height": 1000})
     page.goto(f"{origin}/runtimes?projectId={fixture['projectId']}")
     expect(card.get_by_test_id("runtime-summary")).to_have_text("已停止")
