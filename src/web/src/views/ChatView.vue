@@ -212,8 +212,9 @@ function fullTimeLabel(iso: string): string {
 function updateScrollPosition(): void {
   const list = messageList.value;
   if (!list) return;
-  // 高度缩短也会产生scroll；没有位置位移时保留跟随意图，不能把布局变化当成主动翻历史。
-  if (list.scrollTop !== lastScrollTop || !atBottom.value) {
+  // 内容重排可自动把位置向底部推进；这和无位移的尺寸事件都不取消跟随。
+  // 主动向上位移仍立即退出跟随，不能被本轮尺寸/消息的 nextTick 抢回。
+  if (list.scrollTop < lastScrollTop || !atBottom.value) {
     atBottom.value = list.scrollHeight - list.scrollTop - list.clientHeight < 64;
   }
   lastScrollTop = list.scrollTop;

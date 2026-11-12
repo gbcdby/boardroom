@@ -122,6 +122,46 @@ for (const order of ["history-first", "layout-first"] as const) {
   });
 }
 
+for (const userScrollsUp of [false, true]) {
+  test(`首次聊天收缩期间自动向下调整${userScrollsUp ? "并主动上翻：保留阅读位置" : "：不得取消最新跟随"}`, async () => {
+    await withViewport(async viewport => {
+      const history = deferred<Response>();
+      let contentHeight = 248;
+      await withPage("ChatView", url => url.endsWith("/messages") ? history.promise : respond(url), async container => {
+        const measured = geometry(container, viewport, { top: 549, after: 262 }, () => contentHeight);
+        contentHeight = 2358;
+        history.resolve(json({ messages: messages.slice(0, 25) })); await settle();
+        assert.equal(measured.list.scrollTop, 1798, "历史先按原560px区域贴底");
+        let applied = measured.list.props.style, adjusted = false;
+        Object.defineProperty(measured.list.props, "style", { configurable: true,
+          get: () => applied,
+          set: value => {
+            const before = measured.height(); applied = value;
+            if (adjusted || measured.height() === before) return;
+            adjusted = true;
+            // 内容重排保持锚点时向下调整100px；此后得到原生失败的2458/1898/189几何。
+            contentHeight += 100;
+            measured.list.scrollTop += 100;
+            measured.list.props.onScroll();
+            if (userScrollsUp) {
+              measured.list.scrollTop = 100; measured.list.props.onScroll();
+            }
+          },
+        });
+        await viewport.resize();
+        assert.ok(adjusted);
+        assert.equal(measured.height(), 189);
+        assert.equal(measured.list.scrollTop, userScrollsUp ? 100 : 2269,
+          `自动位移和主动上翻须区分：top=${measured.list.scrollTop}, height=${measured.height()}, content=${contentHeight}`);
+        contentHeight += 100;
+        viewport.sockets[0].message({ type: "message", message: { ...messages[0], id: "after-layout", seq: 26, text: "调整后到达" } });
+        await settle(); await viewport.flush();
+        assert.equal(measured.list.scrollTop, userScrollsUp ? 100 : 2369, "后续实时消息继续服从阅读意图");
+      }, { path: "/projects/project-1/chat/one" });
+    });
+  });
+}
+
 test("聊天剩余视口：原1440×1000失败几何收窄消息区，composer增高后仍跟随最新", async () => {
   await withViewport(async viewport => {
     await withPage("ChatView", respond, async container => {
