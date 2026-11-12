@@ -82,12 +82,15 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-alpine
+        # 固定 run43322971867 实际使用的官方 16.16 镜像；客户端工具仍单独记录。
+        image: postgres@sha256:f377d590e5474681d4d7838635031a2b50647923b7abfa803ce9b5ff35d5c663
         env:
           POSTGRES_USER: boardroom
           # 仅用于本次 CI 临时容器，不使用仓库或用户凭据。
           POSTGRES_PASSWORD: boardroom-ci-only
           POSTGRES_DB: boardroom_ci
+          # 只隔离此新建测试 cluster 的常规 autovacuum；真实 writer guard 不变。
+          POSTGRES_INITDB_ARGS: --set=autovacuum=off
         ports:
           - 5432:5432
         options: >-
@@ -125,6 +128,11 @@ jobs:
         id: pg_restart_tools
         shell: bash
         run: bash scripts/prepare-ci-pg16-tools.sh
+
+      - name: 核对自有 PostgreSQL 服务版本与静默 fixture 配置
+        env:
+          BOARDROOM_CI_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: node scripts/ci/verify-pg-fixture.mjs
 
       - name: 类型检查
         run: npm run typecheck
