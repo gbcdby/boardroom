@@ -20,7 +20,7 @@ import {
   type MigrationRunResult,
 } from "../migrate.ts";
 import { postgresDialect } from "../dialect.ts";
-import { DriverConnectionError, type DbDriver, type DbRow, type DbTransaction, type DbTransactionContext } from "../driver.ts";
+import { DriverConnectionError, type DbDriver, type DbReadSnapshot, type DbRow, type DbTransaction, type DbTransactionContext } from "../driver.ts";
 import { assertStorageAdmission, readPostgresMaintenanceState, StorageMaintenanceError, type StorageAdmissionIdentity } from "../../storage/admission.ts";
 import { assertPostgresGuardCoverage, extendPostgresStorageGuards } from "../../storage/schema-guards.ts";
 import { storageDrainClientToCheck, assertStorageDrainClient } from "../../storage/drain-boundary.ts";
@@ -170,7 +170,14 @@ export class PostgresDriver implements DbDriver {
     finally { client.release(); }
   }
 
-  private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, client: PoolClient, parent?: OperationQueue): Promise<T> {
+  async readSnapshot<T>(fn: (snapshot: DbReadSnapshot) => Promise<T>): Promise<T> {
+    if (this.currentTransactionContext()) throw new Error("read_snapshot_requires_own_transaction");
+    const client = await this.requirePool().connect();
+    try { return await this.runTransaction(tx => fn({ query: tx.query }), client, undefined, true); }
+    finally { client.release(); }
+  }
+
+  private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, client: PoolClient, parent?: OperationQueue, readOnly = false): Promise<T> {
     const nested = parent !== undefined;
     const identity = this.transactionIdentity.getStore() ?? { values: new Map<symbol, unknown>(), active: true };
     const savedValues = nested ? new Map(identity.values) : undefined;
@@ -192,10 +199,12 @@ export class PostgresDriver implements DbDriver {
     };
     try {
       if (nested) await client.query(`SAVEPOINT ${sp}`);
-      else await client.query(this.dialect.beginTransaction());
+      else await client.query(readOnly ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" : this.dialect.beginTransaction());
       const scope = { client, queue };
       try {
-        if (!nested) await this.checkAdmission(client,true);
+        // READ ONLY is enforced by PG before the first gate query. FOR SHARE is a write
+        // lock and cannot be used in a read-only transaction; normal transactions retain it.
+        if (!nested) await this.checkAdmission(client,!readOnly,!readOnly);
         const result = await this.transactionIdentity.run(identity, () => this.transactionScope.run(scope, () => fn(tx)));
         await queue.drain();
         if (nested) await client.query(`RELEASE SAVEPOINT ${sp}`);
@@ -283,9 +292,9 @@ export class PostgresDriver implements DbDriver {
     return this.pool;
   }
 
-  private async checkAdmission(client: PoolClient, lock: boolean): Promise<void> {
+  private async checkAdmission(client: PoolClient, lock: boolean, allowCleanup = true): Promise<void> {
     const state=await readPostgresMaintenanceState(client,{required:this.admissionIdentity!==undefined,lock});
-    const cleanupClient=storageDrainClientToCheck(this,state,this.admissionIdentity);
+    const cleanupClient=allowCleanup ? storageDrainClientToCheck(this,state,this.admissionIdentity) : null;
     if (cleanupClient) assertStorageDrainClient((await client.query("SELECT * FROM storage_source_clients WHERE client_id=$1 FOR SHARE",[cleanupClient])).rows[0],state!,this.admissionIdentity!);
     else assertStorageAdmission(state,this.admissionIdentity);
     if (state && !this.admissionIdentity) this.admissionIdentity={databaseInstanceId:state.databaseInstanceId,fenceEpoch:state.fenceEpoch};

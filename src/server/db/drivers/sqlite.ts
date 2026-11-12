@@ -19,7 +19,7 @@ import {
   type MigrationRunResult,
 } from "../migrate.ts";
 import { sqliteDialect } from "../dialect.ts";
-import type { DbDriver, DbRow, DbTransaction, DbTransactionContext } from "../driver.ts";
+import type { DbDriver, DbReadSnapshot, DbRow, DbTransaction, DbTransactionContext } from "../driver.ts";
 import { assertSqliteStartupAdmission } from "../../storage/sqlite-startup.ts";
 import { assertStorageAdmission, readSqliteMaintenanceState, StorageMaintenanceError,
   type StorageAdmissionIdentity } from "../../storage/admission.ts";
@@ -45,6 +45,7 @@ export class SqliteDriver implements DbDriver {
   private spCounter = 0;
   private readonly transactionScope = new AsyncLocalStorage<OperationQueue>();
   private readonly transactionIdentity = new AsyncLocalStorage<DbTransactionContext & { active: boolean }>();
+  private readonly readSnapshotHandle = new AsyncLocalStorage<Database.Database>();
   private readonly operations = new OperationQueue();
 
   /** 单连接顶层操作排队；只有同一异步调用链中的操作才属于嵌套事务。 */
@@ -70,7 +71,7 @@ export class SqliteDriver implements DbDriver {
     if (this.opened === null) {
       throw new Error("SqliteDriver 尚未 connect()，不能取用 handle。");
     }
-    return this.opened.db;
+    return this.readSnapshotHandle.getStore() ?? this.opened.db;
   }
 
   /** 数据库文件绝对路径；须先 connect()。 */
@@ -163,6 +164,41 @@ export class SqliteDriver implements DbDriver {
     return this.serialize(() => this.runTransaction(fn, parent));
   }
 
+  async readSnapshot<T>(fn: (snapshot: DbReadSnapshot) => Promise<T>): Promise<T> {
+    if (this.currentTransactionContext()) throw new Error("read_snapshot_requires_own_transaction");
+    return this.serialize(async () => {
+      // This driver only opens named files. Never interpret a native in-memory handle as
+      // another empty database; raw in-memory migration fixtures do not use this API.
+      if (this.handle.memory) throw new Error("read_snapshot_requires_file_database");
+      this.checkAdmission(false);
+      const reader = new Database(this.file, { readonly: true, fileMustExist: true });
+      const scope = new OperationQueue();
+      const identity = { values: new Map<symbol, unknown>(), active: true };
+      try {
+        reader.pragma("query_only=ON");
+        reader.exec("BEGIN");
+        return await this.readSnapshotHandle.run(reader, async () => {
+          // Establish the actual read view and revalidate the real source/epoch after open.
+          this.checkAdmission(false);
+          const snapshot: DbReadSnapshot = { query: <R extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []) =>
+            scope.run(async () => reader.prepare(sql).all(...params) as R[]) };
+          const result = await this.transactionIdentity.run(identity, () => this.transactionScope.run(scope, () => fn(snapshot)));
+          await scope.drain();
+          if (this.sqliteSource?.identity) assertSqliteSourceUnchanged(this.sqliteSource);
+          const current = statSync(this.file, { bigint: true });
+          if (this.fileIdentity && (current.dev !== this.fileIdentity.dev || current.ino !== this.fileIdentity.ino || current.nlink !== 1n))
+            throw new StorageMaintenanceError("metadata_invalid");
+          reader.exec("COMMIT");
+          return result;
+        });
+      } catch (error) {
+        await scope.drain();
+        if (reader.inTransaction) reader.exec("ROLLBACK");
+        throw error;
+      } finally { identity.active = false; scope.close(); reader.close(); }
+    });
+  }
+
   private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, parent?: OperationQueue): Promise<T> {
     const db = this.handle;
     const nested = parent !== undefined;
@@ -224,13 +260,13 @@ export class SqliteDriver implements DbDriver {
     });
   }
 
-  private checkAdmission(): void {
+  private checkAdmission(allowCleanup = true): void {
     if (this.sqliteSource?.identity) assertSqliteSourceUnchanged(this.sqliteSource,true);
     const identity=statSync(this.file,{bigint:true});
     if (this.fileIdentity && (identity.dev!==this.fileIdentity.dev || identity.ino!==this.fileIdentity.ino || identity.nlink!==1n))
       throw new StorageMaintenanceError("metadata_invalid");
     const state=readSqliteMaintenanceState(this.handle,this.admissionIdentity!==undefined);
-    const cleanupClient=storageDrainClientToCheck(this,state,this.admissionIdentity);
+    const cleanupClient=allowCleanup ? storageDrainClientToCheck(this,state,this.admissionIdentity) : null;
     if (cleanupClient) assertStorageDrainClient(this.handle.prepare("SELECT * FROM storage_source_clients WHERE client_id=?").get(cleanupClient) as Record<string,unknown>|undefined,state!,this.admissionIdentity!);
     else assertStorageAdmission(state,this.admissionIdentity);
     if (state && !this.admissionIdentity) this.admissionIdentity={databaseInstanceId:state.databaseInstanceId,fenceEpoch:state.fenceEpoch};
