@@ -11,6 +11,7 @@ export function useChatViewport(
     if (!list || !panel || typeof window === "undefined") return;
     const viewport = window;
     let active = true, frame: number | null = null;
+    let previousSize: { width: number; height: number } | undefined;
     async function measure(): Promise<void> {
       frame = null;
       if (!active) return;
@@ -22,7 +23,10 @@ export function useChatViewport(
       const available = viewportHeight - top - below;
       // 键盘等可把视觉视口压得很矮；最终仍保留可读下限，由页面自然滚动。
       const next = Math.max(128, Math.floor(Math.min(640, viewportHeight * .56, available)));
-      if (next === height.value) return;
+      // nextTick后的预算值可能已更新，真实盒子仍是旧尺寸；后续RO必须能补齐贴底。
+      const resized = listBox.width !== previousSize?.width || listBox.height !== previousSize?.height;
+      previousSize = { width: listBox.width, height: listBox.height };
+      if (next === height.value && !resized) return;
       const follow = atBottom.value;
       height.value = next;
       await nextTick();

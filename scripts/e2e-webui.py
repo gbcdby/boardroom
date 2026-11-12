@@ -742,6 +742,7 @@ def main():
             browser = p.chromium.launch(headless=True)
             report["chromium"] = browser.version
             context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai")
+            context.tracing.start(screenshots=True, snapshots=True, sources=True)
             page = context.new_page()
             page.set_default_timeout(15000)
             try:
@@ -751,6 +752,7 @@ def main():
                 if not page.is_closed(): page.screenshot(path=str(output / "failure.png"), full_page=True)
                 raise
             finally:
+                context.tracing.stop(path=str(output / "trace.zip"))
                 context.close()
                 browser.close()
     except Exception as error:
