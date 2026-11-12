@@ -25,7 +25,7 @@ test("#152 v18 只追加控制元数据；所有现有领域表和 schema_migrat
   try {
     runMigrations(db, migrations.filter(m => m.version < 18));
     const historical = db.prepare("SELECT * FROM schema_migrations ORDER BY version").all();
-    runMigrations(db, migrations);
+    runMigrations(db, migrations.filter(m => m.version <= 18));
     assert.equal((db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as {v:number}).v, 18);
     assert.deepEqual(db.prepare("SELECT * FROM schema_migrations WHERE version<18 ORDER BY version").all(), historical);
     const state = db.prepare("SELECT * FROM storage_maintenance").get() as Record<string, unknown>;
@@ -49,7 +49,7 @@ test("#152 appended migrations extend actual catalog guards atomically; replay n
   try {
     runMigrations(db,migrations);
     const before=assertSqliteGuardCoverage(db);
-    const next=[...migrations,{version:19,name:"fixture_future_table",up:"CREATE TABLE future_domain(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO future_domain VALUES(1,'v');"}];
+    const next=[...migrations,{version:migrations.at(-1)!.version+1,name:"fixture_future_table",up:"CREATE TABLE future_domain(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO future_domain VALUES(1,'v');"}];
     runMigrations(db,next);
     assert.notEqual(assertSqliteGuardCoverage(db),before);
     setAdmission(db,"sealed");

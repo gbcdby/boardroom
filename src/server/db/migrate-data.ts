@@ -23,7 +23,7 @@ import path from "node:path";
 import { DATABASE_FILE_NAME } from "./database.ts";
 import { createDbDriver } from "./driver.ts";
 import type { DbDriver, DbDriverOptions, DbRow, DbTransaction } from "./driver.ts";
-import type { Migration } from "./migrate.ts";
+import { MigrationError, type Migration } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { durableMessageDispatch } from "./migrations/message-dispatch.ts";
 import { managedRuntime } from "./migrations/runtime.ts";
@@ -37,6 +37,7 @@ import { projectWorkspacesMigration } from "./migrations/project-workspaces.ts";
 import { taskIntakeMigration } from "./migrations/task-intake.ts";
 import { policyConfigurationMigration } from "./migrations/policy-configuration.ts";
 import { storageMaintenanceMigration } from "./migrations/storage-maintenance.ts";
+import { mcpConnectionsMigration } from "./migrations/mcp-connections.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -48,6 +49,8 @@ export interface TableSpec {
   readonly name: string;
   /** 作为主键的「键列」，用于跨库一致性校验（复合主键用多列）。 */
   readonly keyColumns: readonly string[];
+  /** 明确声明的整数键列：按有符号 64 位整数无损比较；其他键保留原类型/文本，不推测数值。 */
+  readonly integerKeyColumns?: readonly string[];
   /** v13 事实代际必须数值一致，不能只核对键集合。 */
   readonly valueColumns?: readonly string[];
   /** 覆盖默认 `SELECT *` 的源读取 SQL（如 org_nodes 的层级排序）。 */
@@ -62,6 +65,13 @@ export interface TableSpec {
  * → messages → message_deliveries → member_statuses → mcp_sessions → audit_log。
  */
 export const BUSINESS_TABLES: readonly TableSpec[] = [
+  { name: "mcp_connections", keyColumns: ["id"], valueColumns: ["revision", "discovery_sequence", "created_at", "updated_at"] },
+  { name: "mcp_connection_versions", keyColumns: ["connection_id", "revision"], integerKeyColumns: ["revision"], valueColumns: ["name", "configuration_json", "configuration_digest", "created_at"] },
+  { name: "mcp_catalog_snapshots", keyColumns: ["id"], valueColumns: ["connection_id", "connection_revision", "snapshot_json", "observed_at"] },
+  { name: "mcp_catalog_heads", keyColumns: ["connection_id", "connection_revision"], integerKeyColumns: ["connection_revision"], valueColumns: ["snapshot_id"] },
+  { name: "mcp_connection_mutations", keyColumns: ["request_id"], valueColumns: ["input_digest", "connection_id", "result_json", "created_at"] },
+  { name: "mcp_discovery_attempts", keyColumns: ["id"], valueColumns: ["request_id", "input_digest", "connection_id", "connection_revision",
+    "sequence", "owner_id", "status", "error_code", "snapshot_id", "cleanup", "protocol_version", "page_count", "created_at", "finished_at"] },
   { name: "agents", keyColumns: ["id"] },
   { name: "agent_legacy_aliases", keyColumns: ["display_name", "host_type"], valueColumns: ["agent_id", "retired_at"] },
   { name: "role_templates", keyColumns: ["id"], valueColumns: ["revision"] },
@@ -350,6 +360,7 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   taskIntakeMigration,
   policyConfigurationMigration,
   storageMaintenanceMigration,
+  mcpConnectionsMigration,
 ];
 
 // ---------------------------------------------------------------------------
@@ -412,8 +423,19 @@ export async function copyAllTables(
   return counts;
 }
 
-function keyOf(row: DbRow, cols: readonly string[]): string {
-  return JSON.stringify(cols.map((c) => row[c]));
+function integerKey(value: unknown): string {
+  // PG BIGINT 的默认表示是十进制字符串，SQLite 是 number。绝不能先 Number(string) 丢失低位。
+  let integer: bigint;
+  if (typeof value === "number" && Number.isSafeInteger(value)) integer = BigInt(value);
+  else if (typeof value === "bigint") integer = value;
+  else if (typeof value === "string" && /^(0|-?[1-9][0-9]{0,18})$/.test(value)) integer = BigInt(value);
+  else throw new MigrationError("migration_integer_key_invalid");
+  if (integer < -(1n << 63n) || integer > (1n << 63n) - 1n) throw new MigrationError("migration_integer_key_invalid");
+  return integer.toString();
+}
+
+function keyOf(row: DbRow, spec: TableSpec): string {
+  return JSON.stringify(spec.keyColumns.map(column => spec.integerKeyColumns?.includes(column) ? integerKey(row[column]) : row[column]));
 }
 
 export interface TableValidation {
@@ -442,13 +464,13 @@ export async function compareData(source: DbDriver, target: DbDriver): Promise<V
     const dstRows = await target.query<DbRow>(
       `SELECT ${columns.join(", ")} FROM ${spec.name}`,
     );
-    const srcKeys = new Set(srcRows.map((r) => keyOf(r, spec.keyColumns)));
-    const dstKeys = new Set(dstRows.map((r) => keyOf(r, spec.keyColumns)));
+    const srcKeys = new Set(srcRows.map((r) => keyOf(r, spec)));
+    const dstKeys = new Set(dstRows.map((r) => keyOf(r, spec)));
     const countMatch = srcRows.length === dstRows.length;
     const keysMatch = srcKeys.size === dstKeys.size && [...srcKeys].every((k) => dstKeys.has(k));
     const values = (row: DbRow) => JSON.stringify((spec.valueColumns ?? []).map(column => row[column] === null ? null : String(row[column])));
-    const dstValues = new Map(dstRows.map(row => [keyOf(row, spec.keyColumns), values(row)]));
-    const valuesMatch = !spec.valueColumns || srcRows.every(row => dstValues.get(keyOf(row, spec.keyColumns)) === values(row));
+    const dstValues = new Map(dstRows.map(row => [keyOf(row, spec), values(row)]));
+    const valuesMatch = !spec.valueColumns || srcRows.every(row => dstValues.get(keyOf(row, spec)) === values(row));
     if (!countMatch || !keysMatch || !valuesMatch) ok = false;
     tables.push({
       table: spec.name,

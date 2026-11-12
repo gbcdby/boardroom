@@ -28,10 +28,15 @@ import {
 import { seedSampleData } from "../src/server/db/seed-sample-data.ts";
 import { createRepositories } from "../src/server/db/repositories.ts";
 import { appendAuditEntry } from "../src/server/audit.ts";
+import { createMcpConnections } from "../src/server/mcp/connections/service.ts";
+import { ownerActor } from "../src/server/authz/actors.ts";
+import { discoveryTestServer, discoveryTool } from "./helpers/mcp-discovery-server.ts";
 import type { Task, ReviewRound, ReviewReport } from "../src/shared/tasks.ts";
 
 const PG_URL =
   process.env["AGENT_STUDIO_PG_TEST_URL"] ?? process.env["AGENT_STUDIO_PG_CONNECTION_STRING"];
+// 独立于生产清单的 v19 覆盖合同，不能用 BUSINESS_TABLES 自己证明自己完整。
+const MCP_TABLES = ["mcp_connections", "mcp_connection_versions", "mcp_catalog_snapshots", "mcp_catalog_heads", "mcp_connection_mutations", "mcp_discovery_attempts"];
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-m1-"));
@@ -117,7 +122,13 @@ async function seedSqliteDir(dir: string): Promise<void> {
     for (const [index, kind] of ["authored-messages", "deliveries", "memory-requests", "memory-receipts", "memory-counters", "memory-checkpoints"].entries()) {
       await driver.exec("UPDATE member_fact_revisions SET revision = ? WHERE kind = ?", [101 + index, kind]);
     }
-
+    const service = createMcpConnections({ db: driver }), upstream = await discoveryTestServer({ page: () => ({ tools: [discoveryTool("migrate")] }) });
+    try {
+      const connection = await service.create({ actor: ownerActor() }, { requestId: "migrate-connection", name: "迁移目录", enabled: true,
+        transport: { type: "streamable-http", endpoint: upstream.endpoint } });
+      assert.equal((await service.discover({ actor: ownerActor() }, connection.connectionId, { requestId: "migrate-discovery", expectedRevision: 1 })).status, "succeeded");
+      for (const table of MCP_TABLES) assert.ok((await driver.query(`SELECT * FROM ${table}`)).length > 0, `${table} 需实际非空`);
+    } finally { await service.close(); await upstream.close(); }
   } finally {
     await driver.close();
   }
@@ -154,6 +165,11 @@ async function assertDispatchValues(options: DbDriverOptions): Promise<void> {
 
 // 跨表外键依赖（自引用 org_nodes 由递归读取处理，此处不计入顺序约束）。
 const FK_DEPS: Record<string, string[]> = {
+  mcp_connection_versions: ["mcp_connections"],
+  mcp_catalog_snapshots: ["mcp_connection_versions"],
+  mcp_catalog_heads: ["mcp_catalog_snapshots"],
+  mcp_connection_mutations: ["mcp_connections"],
+  mcp_discovery_attempts: ["mcp_connection_versions", "mcp_catalog_snapshots"],
   policy_documents: ["projects"],
   policy_document_versions: ["policy_documents"],
   project_workspace_versions: ["projects"],
@@ -184,12 +200,13 @@ const FK_DEPS: Record<string, string[]> = {
   memory_trigger_counters: ["projects", "agents", "groups"], memory_scan_checkpoints: ["projects", "agents", "groups"],
 };
 
-test("业务表清单：39 张表、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
+test("业务表清单：45 张表含六张 v19 MCP 表、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
   const names = BUSINESS_TABLES.map((t) => t.name);
-  assert.equal(names.length, 39);
+  assert.equal(names.length, 45);
   assert.equal(names.at(-1), "member_fact_revisions");
   assert.ok(!names.includes("schema_migrations"));
   for (const expected of [
+    ...MCP_TABLES,
     "agents",
     "agent_legacy_aliases", "role_templates", "role_template_versions",
     "projects",
@@ -345,10 +362,15 @@ test("回滚：清空目标业务表，源库不受影响；可重新迁移恢�
     const srcOpts: DbDriverOptions = { dbDriver: "sqlite", dataDir: srcDir };
     await withTempDir(async (dstDir) => {
       const dstOpts: DbDriverOptions = { dbDriver: "sqlite", dataDir: dstDir };
-      await migrateData(srcOpts, dstOpts);
+      const migrated = await migrateData(srcOpts, dstOpts);
+      for (const table of MCP_TABLES) assert.ok(migrated.validation.tables.find(row => row.table === table)!.targetCount > 0, `${table} 需实际复制`);
 
       const rb = await rollbackTarget(dstOpts);
-      assert.equal(rb.clearedTables.length, 39);
+      assert.equal(rb.clearedTables.length, 45);
+      for (const table of MCP_TABLES) assert.ok(rb.clearedTables.includes(table), `${table} 需参与clear`);
+      const emptied = createDbDriver(dstOpts); await emptied.connect();
+      try { for (const table of MCP_TABLES) assert.equal((await emptied.query(`SELECT * FROM ${table}`)).length, 0, `${table} 未清空`); }
+      finally { await emptied.close(); }
 
       // 目标业务表已清空，校验失败。
       const afterRollback = await validateData(srcOpts, dstOpts);

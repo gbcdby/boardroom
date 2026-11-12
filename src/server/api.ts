@@ -21,6 +21,7 @@ import { buildRoster } from "./chat/roster.ts";
 import { resetGroupConsecutiveCount } from "./mcp/core.ts";
 import { createTaskService } from "./tasks/service.ts";
 import { createIdentityApi } from "./identity/api.ts";
+import { createMcpConnectionsApi } from "./mcp/connections/api.ts";
 import { createWorkspaceApi, writeWorkspaceError } from "./workspace/api.ts";
 import { createPolicyApi } from "./policy/api.ts";
 import { WorkspaceError } from "./workspace/errors.ts";
@@ -122,6 +123,8 @@ export interface T1ApiRouter {
    * 返回 true 表示已处理并写完响应；false 表示路径不归本模块管。
    */
   handle(request: IncomingMessage, response: ServerResponse, pathname: string): Promise<boolean>;
+  /** 关闭本路由拥有的外部目录发现连接；必须先于数据库关闭。 */
+  close(): Promise<void>;
 }
 
 /** T3：消息视图（HTTP 响应与 WebSocket 广播共用）。 */
@@ -192,6 +195,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   const compensations = createAuditCompensationService({ repos, now });
   const orgCommands = createOrgHttpCommands({ repos, now });
   const identityApi = createIdentityApi({ ...options, repos });
+  const mcpConnectionsApi = createMcpConnectionsApi(options);
   const workspaceApi = createWorkspaceApi({ ...options, repos });
   const policyApi = createPolicyApi({ ...options, repos });
 
@@ -297,10 +301,12 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   };
 
   return {
+    close: () => mcpConnectionsApi.close(),
     async handle(request, response, pathname) {
       const method = request.method ?? "GET";
       try {
         if (await identityApi.handle(request, response, pathname)) return true;
+        if (await mcpConnectionsApi.handle(request, response, pathname)) return true;
         if (await workspaceApi.handle(request, response, pathname)) return true;
         if (await policyApi.handle(request, response, pathname)) return true;
         return await route(repos, request, response, method, pathname);

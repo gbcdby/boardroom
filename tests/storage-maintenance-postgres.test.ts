@@ -19,7 +19,7 @@ pgTest("#152 PG16 persistent guards, RR stale view, transaction admission, TRUNC
     const controller=await pool.connect(), old=await pool.connect();
     try {
       const initial=await assertPostgresGuardCoverage(controller);
-      await driver.migrate([...migrations,{version:19,name:"fixture_future_domain",up:"CREATE TABLE future_domain(id BIGINT PRIMARY KEY,value TEXT); INSERT INTO future_domain VALUES(1,'v');"}]);
+      await driver.migrate([...migrations,{version:migrations.at(-1)!.version+1,name:"fixture_future_domain",up:"CREATE TABLE future_domain(id BIGINT PRIMARY KEY,value TEXT); INSERT INTO future_domain VALUES(1,'v');"}]);
       assert.notEqual(await assertPostgresGuardCoverage(controller),initial);
       await driver.exec("INSERT INTO projects(id,name,created_at,updated_at) VALUES('p','before','t','t')");
       const seal=`UPDATE storage_maintenance SET admission=$1,fence_epoch=1,active_migration_id='fixture',plan_digest=$2,
