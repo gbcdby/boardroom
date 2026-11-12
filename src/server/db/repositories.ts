@@ -115,6 +115,8 @@ export interface AgentsRepository {
  * 删除后作为实际清除的行数返回。项目记忆计数不包含 Agent 的 global 文档与版本。
  */
 export interface PurgeCounts {
+  readonly policyDocuments: number;
+  readonly policyVersions: number;
   readonly workspaceVersions: number;
   /** v13：保留历史事实的固定版本行，随最后的成员物理清除。 */
   readonly memberFactRevisions: number;
@@ -591,7 +593,10 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
   const managed = await hasRuntimeSchema(ctx);
   const tasks = await hasTasksSchema(ctx);
   const memory = await hasMemorySchema(ctx);
+  const policies = await hasPolicyConfigurationSchema(ctx);
   return {
+    policyDocuments: policies ? await count("SELECT COUNT(*) AS c FROM policy_documents WHERE project_id = ?") : 0,
+    policyVersions: policies ? await count("SELECT COUNT(*) AS c FROM policy_document_versions WHERE document_id IN (SELECT scope_key FROM policy_documents WHERE project_id = ?)") : 0,
     workspaceVersions: await hasWorkspaceSchema(ctx) ? await count("SELECT COUNT(*) AS c FROM project_workspace_versions WHERE project_id = ?") : 0,
     memberFactRevisions: await hasMemberLifecycleSchema(ctx) ? await count('SELECT COUNT(*) AS c FROM member_fact_revisions WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)') : 0,
     memoryDocuments: memory ? await count("SELECT COUNT(*) AS c FROM memory_documents WHERE project_id = ?") : 0,
@@ -886,6 +891,10 @@ export async function hasWorkspaceSchema(ctx: RepoCtx): Promise<boolean> {
   return Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 15"));
 }
 
+async function hasPolicyConfigurationSchema(ctx: RepoCtx): Promise<boolean> {
+  return Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 17"));
+}
+
 type ProjectRow = {
   id: string;
   name: string;
@@ -1009,6 +1018,10 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
           throw new RepositoryError("confirmation_changed", "永久删除的影响范围已变化，请重新获取级联清单并再次确认。");
         }
         const counts = await projectPurgeCounts(ctx, id);
+        if (await hasPolicyConfigurationSchema(ctx)) {
+          await ctx.exec("DELETE FROM policy_document_versions WHERE document_id IN (SELECT scope_key FROM policy_documents WHERE project_id = ?)", [id]);
+          await ctx.exec("DELETE FROM policy_documents WHERE project_id = ?", [id]);
+        }
         if (await hasWorkspaceSchema(ctx)) await ctx.exec("DELETE FROM project_workspace_versions WHERE project_id = ?", [id]);
         if (await hasMemorySchema(ctx)) {
           for (const table of ["memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints"]) {

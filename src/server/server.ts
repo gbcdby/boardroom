@@ -8,6 +8,7 @@ import type { MigrationState } from "./db/migrate.ts";
 import { migrations } from "./db/migrations/index.ts";
 import { buildHealthReport } from "./health.ts";
 import { createRepositories } from "./db/repositories.ts";
+import { initializePolicyConfiguration } from "./policy/configuration.ts";
 import type { Logger } from "./logger.ts";
 import { createStaticHandler, isWebUiBuilt } from "./static.ts";
 import { createWebSocketHub, type ServerEvent, type WebSocketHub } from "./ws.ts";
@@ -149,7 +150,10 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     );
   }
 
+  const repos = createRepositories(driver);
   try {
+    // 环境与迁移已验证，任何监听/后台任务之前显式建立一次默认策略；普通 GET 绝不初始化。
+    await initializePolicyConfiguration(repos);
     registerMemoryRuntime(driver, {
       database: databaseForConnectedReader(environment.databaseDescriptor),
       ...(config.memory ? { config: config.memory } : {}),
@@ -159,8 +163,6 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     await driver.close();
     throw new ServerStartupError((error as Error).message);
   }
-
-  const repos = createRepositories(driver);
 
   // T2 / D6：进程重启后，上一进程遗留的「connected」MCP 会话已失效。
   // 启动时统一标记为断开，并把这些成员的运行状态置为 offline——恢复完全依赖

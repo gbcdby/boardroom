@@ -9,6 +9,8 @@ defineProps<{ confirmation: ProjectPurgeConfirmation | GroupPurgeConfirmation }>
     <ul class="small">
       <li>群组：{{ confirmation.cascade.groups }} 个</li>
       <li>工作区配置及历史版本：{{ confirmation.cascade.workspaceVersions }} 个</li>
+      <li>项目策略配置：{{ confirmation.cascade.policyDocuments }} 份</li>
+      <li>项目策略历史版本：{{ confirmation.cascade.policyVersions }} 个</li>
       <li>任务：{{ confirmation.cascade.tasks }} 项（评论 {{ confirmation.cascade.taskComments }} 条，历史 {{ confirmation.cascade.taskHistory }} 条）</li>
       <li>评审：{{ confirmation.cascade.reviewRounds }} 轮，报告 {{ confirmation.cascade.reviewReports }} 份</li>
       <li>任务关联消息：{{ confirmation.cascade.taskMessageLinks }} 条，工作事件 {{ confirmation.cascade.workEvents }} 条，任务设置 {{ confirmation.cascade.taskSettings }} 条</li>

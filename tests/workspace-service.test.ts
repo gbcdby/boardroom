@@ -137,6 +137,8 @@ for (const engine of identityEngines) {
   test(`sqlite→${engine} S3 非空版本复制与清库：CAS、历史路径、观测和 mutation 摘要逐值保留`, { skip: identitySkip(engine) }, async () => {
     const source = await fixture("sqlite"), target = await fixture(engine);
     try {
+      // 全库复制消费当前完整清单；其余工作区领域用例继续固定 v15。
+      await source.db.migrate(migrations); await target.db.migrate(migrations);
       const p = await source.repos.projects.create({ name: "复制配置" });
       const first = await source.service.save(access, p.id, { rootPath: source.root, mode: "isolated", expectedProjectRevision: 1, mutationId: "first" });
       await source.service.save(access, p.id, { rootPath: null, mode: "serialized", expectedProjectRevision: first.projectRevision, mutationId: "second" });
@@ -154,13 +156,14 @@ for (const engine of identityEngines) {
       const p = await f.repos.projects.create({ name: "旧版本" });
       const before = (await f.db.query("SELECT * FROM projects"))[0];
       const checksums = (await f.db.migrationState()).applied;
-      assert.equal((await f.db.migrate(migrations.filter(m => m.version <= 15))).version, 15);
+      const workspaceMigrations = migrations.filter(migration => migration.version <= 15);
+      assert.equal((await f.db.migrate(workspaceMigrations)).version, 15);
       const after = (await f.db.query("SELECT * FROM projects"))[0]!;
       assert.equal(after.project_revision, 1); assert.equal(after.workspace_revision, 0);
       const { project_revision, workspace_revision, ...old } = after; assert.deepEqual(old, before);
       assert.deepEqual((await f.db.migrationState()).applied.slice(0, 14), checksums);
       assert.equal((await f.repos.projects.get(p.id))?.projectRevision, 1);
-      assert.equal((await f.db.migrate(migrations.filter(m => m.version <= 15))).applied.length, 0);
+      assert.equal((await f.db.migrate(workspaceMigrations)).applied.length, 0);
     } finally { await f.close(); }
   });
 }

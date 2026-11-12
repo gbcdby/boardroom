@@ -9,6 +9,7 @@ import { tasksMigration } from "./tasks.ts";
 import { identityCatalogMigration } from "./identity-catalog.ts";
 import { projectWorkspacesMigration } from "./project-workspaces.ts";
 import { taskIntakeMigration } from "./task-intake.ts";
+import { policyConfigurationMigration } from "./policy-configuration.ts";
 
 /**
  * 生产迁移列表。
@@ -442,4 +443,5 @@ export const migrations: readonly Migration[] = [
   identityCatalogMigration,
   projectWorkspacesMigration,
   taskIntakeMigration,
+  policyConfigurationMigration,
 ];

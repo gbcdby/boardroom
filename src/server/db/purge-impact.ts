@@ -47,6 +47,10 @@ export async function purgeImpactDigest(ctx: RepoCtx, kind: "project" | "group",
   if (project) {
     await capture("projects", "id = ?");
     if (versions.has(15)) await capture("project_workspace_versions", "project_id = ?");
+    if (versions.has(17)) {
+      await capture("policy_documents", "project_id = ?");
+      await capture("policy_document_versions", "document_id IN (SELECT scope_key FROM policy_documents WHERE project_id = ?)");
+    }
     await capture("members", "project_id = ?");
     await capture("org_nodes", "project_id = ?");
     await capture("member_statuses", "project_id = ?");

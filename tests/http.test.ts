@@ -62,7 +62,7 @@ test("健康检查返回进程、数据库与迁移版本", async () => {
       assert.deepEqual(body["database"], { status: "ok", writable: true });
       // F2 起生产迁移列表含领域表迁移；新库启动即全部应用，pending 为 0。
       assert.deepEqual(body["migrations"], {
-        version: migrations.length,
+        version: Math.max(...migrations.map(migration => migration.version)),
         applied: migrations.length,
         pending: 0,
       });
@@ -79,7 +79,7 @@ test("健康检查反映已应用的迁移版本", async () => {
     await driver.connect();
     await driver.migrate(migrations);
     const db = driver.handle;
-    const probeVersion = migrations.length + 1;
+    const probeVersion = Math.max(...migrations.map(migration => migration.version)) + 1;
     runMigrations(db, [
       ...migrations,
       { version: probeVersion, name: "probe", up: "CREATE TABLE probe (id INTEGER PRIMARY KEY);" },
@@ -93,7 +93,7 @@ test("健康检查反映已应用的迁移版本", async () => {
       };
       // 生产迁移 + 探针迁移全部已应用，无 pending。
       assert.equal(body.migrations.version, probeVersion);
-      assert.equal(body.migrations.applied, probeVersion);
+      assert.equal(body.migrations.applied, migrations.length + 1);
       assert.equal(body.migrations.pending, 0);
     } finally {
       await server.close();
@@ -214,8 +214,8 @@ test("启动时执行迁移并记录到数据库", async () => {
         migrations: { version: number };
       };
       // 生产迁移列表（F2 起含领域表）在首次启动时全部应用。
-      assert.equal(body.migrations.version, migrations.length);
-      assert.equal(server.migrationState.version, migrations.length);
+      assert.equal(body.migrations.version, Math.max(...migrations.map(migration => migration.version)));
+      assert.equal(server.migrationState.version, Math.max(...migrations.map(migration => migration.version)));
       assert.equal(server.migrationState.applied.length, migrations.length);
     } finally {
       await server.close();
