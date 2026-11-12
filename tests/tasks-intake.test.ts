@@ -169,7 +169,7 @@ both("非代码任务不会调用 Git 捕获，旧评审在验收变化后失效
   assert.equal((await repos.tasks.getRound(p.project.id, task.id, review.round.id))?.specSnapshot.acceptanceText, "原始验收");
 });
 
-both("非空 v15 升级保留原状态修订与评审，旧正文作为可追溯验收来源", async (repos, db) => {
+both("非空 v15→v16 升级保留原状态修订与评审，旧正文作为可追溯验收来源", async (repos, db) => {
   const p = await people(repos);
   const at = "2026-11-10T00:00:00.000Z";
   const legacy: Task = { id: randomUUID(), projectId: p.project.id, title: "原有任务", body: "旧正文与验收 🧠\n原样保留", labels: ["历史"], state: "blocked",
@@ -187,7 +187,8 @@ both("非空 v15 升级保留原状态修订与评审，旧正文作为可追溯
   const history = await db.query("SELECT * FROM task_history ORDER BY id");
   const rounds = await db.query("SELECT * FROM task_review_rounds ORDER BY id");
   const applied = (await db.migrationState()).applied;
-  assert.deepEqual((await db.migrate(migrations)).applied.map(m => m.version), [16]);
+  const intakeMigrations = migrations.filter(migration => migration.version <= 16);
+  assert.deepEqual((await db.migrate(intakeMigrations)).applied.map(m => m.version), [16]);
   assert.deepEqual((await db.migrationState()).applied.slice(0, applied.length), applied);
   const after = await db.query("SELECT * FROM tasks ORDER BY id");
   assert.deepEqual(after.map(({ delivery_kind: _kind, acceptance_text: _text, acceptance_source: _source, ...original }) => original), before);
@@ -196,7 +197,7 @@ both("非空 v15 升级保留原状态修订与评审，旧正文作为可追溯
   assert.deepEqual(await db.query("SELECT * FROM task_review_rounds ORDER BY id"), rounds);
   assert.equal((await repos.tasks.getRound(p.project.id, done.id, round.id))?.decision?.reason, "原结论");
   assert.equal((await repos.tasks.get(p.project.id, done.id))?.state, "done");
-  assert.equal((await db.migrate(migrations)).applied.length, 0);
+  assert.equal((await db.migrate(intakeMigrations)).applied.length, 0);
   const service = createTaskService({ repos });
   const changedBody = await service.update(p.owner, p.project.id, legacy.id, { expectedRevision: 1, body: "后续改目标" });
   assert.equal(changedBody.acceptanceText, legacy.body, "迁移验收是原正文快照，不能跟着后续目标编辑漂移");
