@@ -70,7 +70,8 @@ for (const engine of ["sqlite", "postgres"] as const) {
       for (const table of tables) snapshots.set(table, await db.query(`SELECT * FROM ${table} ORDER BY 1, 2`));
       const oldAudit = await db.query("SELECT * FROM audit_log ORDER BY id");
       const oldMigrations = (await db.migrationState()).applied;
-      assert.equal((await db.migrate(migrations)).version, 14);
+      // 本条固定验证 v13→v14，后续追加 schema 的独立升级另有测试。
+      assert.equal((await db.migrate(migrations.filter(m => m.version <= 14))).version, 14);
       for (const table of tables) assert.deepEqual(await db.query(`SELECT * FROM ${table} ORDER BY 1, 2`), snapshots.get(table), table);
       const upgradedAudit = await db.query("SELECT * FROM audit_log ORDER BY id");
       assert.deepEqual(upgradedAudit.map(({ scope, ...row }) => { assert.equal(scope, "project"); return row; }), oldAudit);
@@ -90,7 +91,7 @@ for (const engine of ["sqlite", "postgres"] as const) {
         : "SELECT indexname AS name FROM pg_indexes WHERE schemaname = current_schema() AND tablename = 'audit_log'";
       const indexes = (await db.query<{ name: string }>(indexSql)).map(row => row.name);
       for (const name of ["ix_audit_project_created", "ix_audit_project_target", "ix_audit_project_action", "ix_audit_user_created"]) assert.ok(indexes.includes(name), name);
-      assert.equal((await db.migrate(migrations)).applied.length, 0);
+      assert.equal((await db.migrate(migrations.filter(m => m.version <= 14))).applied.length, 0);
     } finally {
       await db.close();
       if (engine === "postgres") {
@@ -125,7 +126,7 @@ for (const engine of ["sqlite", "postgres"] as const) {
       await clearTargetTables(target.db);
       for (const table of tables) assert.deepEqual(await target.db.query(`SELECT * FROM ${table}`), [], table);
       assert.deepEqual(await Promise.all(tables.map(table => source.db.query(`SELECT * FROM ${table} ORDER BY 1, 2`))), before);
-      assert.equal((await target.db.migrationState()).version, 14);
+      assert.equal((await target.db.migrationState()).version, migrations.at(-1)!.version);
     } finally { await source.close(); await target.close(); }
   });
 }

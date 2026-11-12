@@ -24,6 +24,7 @@ export type RepositoryErrorCode =
   | "write_failed"
   | "mutation_scope_changed"
   | "confirmation_changed"
+  | "workspace_changed"
   | "member_removed"
   | "compensation_conflict"
   | "legacy_incomplete_snapshot"

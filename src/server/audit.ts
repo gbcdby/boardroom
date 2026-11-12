@@ -40,6 +40,7 @@ export const AUDIT_ACTIONS = {
   project_archive: "project.archive",
   project_restore: "project.restore",
   project_delete: "project.delete",
+  project_workspace_update: "project.workspace_update",
   group_archive: "group.archive",
   group_restore: "group.restore",
   group_delete: "group.delete",
