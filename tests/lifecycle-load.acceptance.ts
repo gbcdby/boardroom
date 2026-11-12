@@ -84,7 +84,7 @@ async function createLoad(repos: RepositorySet): Promise<ProjectLoad[]> {
     projects.push({ project, members, groups });
   }
   const target = projects[0]!, memberId = target.members[2]!.id, at = new Date().toISOString();
-  await repos.tasks.create({ id: newId(), projectId: target.project.id, title: '固定负载下保留的指派', body: '正文不是补偿输入', labels: [], state: 'in-progress',
+  await repos.tasks.create({ id: newId(), projectId: target.project.id, title: '固定负载下保留的指派', body: '正文不是补偿输入', deliveryKind: "code", acceptanceText: '正文不是补偿输入', acceptanceSource: "explicit", labels: [], state: 'in-progress',
     assigneeMemberId: memberId, reviewerMemberId: memberId, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null, blockedReason: null,
     author: { kind: 'human', actorId: 'human:local', displayName: '人' }, createdAt: at, updatedAt: at });
   await repos.tasks.setSettings(target.project.id, 0, memberId);

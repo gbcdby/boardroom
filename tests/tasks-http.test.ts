@@ -48,7 +48,7 @@ test("HTTP 默认评审配置、完整任务创建、修订冲突和草稿来源
     const p = `/api/projects/${f.project.id}`;
     assert.equal((await f.call("GET", `${p}/task-settings`)).body.settings.revision, 0);
     assert.equal((await f.call("PUT", `${p}/task-settings`, { expectedRevision: 0, defaultReviewerMemberId: f.reviewer.id })).status, 200);
-    const created = await f.call("POST", `${p}/tasks`, { title: "实现接口", body: "明确验收条件", labels: ["API"], assigneeMemberId: f.assignee.id, repoPath: "/repo", fixedPoint: "main" });
+    const created = await f.call("POST", `${p}/tasks`, { title: "实现接口", body: "明确验收条件", deliveryKind: "code" as const, acceptanceText: "明确验收条件", labels: ["API"], assigneeMemberId: f.assignee.id, repoPath: "/repo", fixedPoint: "main" });
     assert.equal(created.status, 201, JSON.stringify(created.body));
     assert.equal(created.body.task.reviewerMemberId, f.reviewer.id);
     assert.equal(created.body.task.author.kind, "human");
@@ -74,7 +74,7 @@ test("HTTP 成员历史与 MCP 共用任务关联可见性，关联不会绕过�
     const messages = `/api/groups/${group.id}/messages`;
     const asWorker = { "x-test-actor": "worker" };
     assert.deepEqual((await f.call("GET", messages, undefined, asWorker)).body.messages, []);
-    const task = (await f.call("POST", `/api/projects/${f.project.id}/tasks`, { title: "引用讨论", body: "内容", assigneeMemberId: f.assignee.id, reviewerMemberId: f.reviewer.id })).body.task;
+    const task = (await f.call("POST", `/api/projects/${f.project.id}/tasks`, { title: "引用讨论", body: "内容", deliveryKind: "code" as const, acceptanceText: "内容", assigneeMemberId: f.assignee.id, reviewerMemberId: f.reviewer.id })).body.task;
     await f.call("POST", `/api/projects/${f.project.id}/tasks/${task.id}/message-links`, { messageId: hidden.id });
     assert.equal((await f.call("GET", messages, undefined, asWorker)).body.messages[0]?.id, hidden.id);
     await f.repos.groups.removeParticipant(group.id, f.assignee.id);
@@ -87,7 +87,7 @@ test("HTTP 同源与严格字段阻止伪造主体，普通成员只能推进自
   const f = await fixture();
   try {
     const p = `/api/projects/${f.project.id}`;
-    const input = { title: "权限边界", body: "不能伪造", assigneeMemberId: f.assignee.id, reviewerMemberId: f.reviewer.id };
+    const input = { title: "权限边界", body: "不能伪造", deliveryKind: "code" as const, acceptanceText: "不能伪造", assigneeMemberId: f.assignee.id, reviewerMemberId: f.reviewer.id };
     assert.equal((await f.call("POST", `${p}/tasks`, input, { origin: "https://other.example" })).status, 403);
     assert.equal((await f.call("POST", `${p}/tasks`, { ...input, actor: { kind: "human" } })).status, 400);
     assert.equal((await f.call("POST", `${p}/tasks`, input, { "x-test-actor": "worker" })).status, 403);

@@ -13,7 +13,7 @@ import { identityFixture, identityEngines, identitySkip } from "./helpers/identi
 
 const access = { actor: ownerActor() };
 async function fixture(engine: typeof identityEngines[number]) {
-  const f = await identityFixture(engine, 15);
+  const f = await identityFixture(engine);
   const sourcePath = await mkdtemp(path.join(tmpdir(), "boardroom-workspace-source-")); const root = await realpath(sourcePath);
   const environment = await resolveBoardroomEnvironment({ cwd: f.dir,
     env: { BOARDROOM_HOME: path.join(f.dir, "home"), AGENT_STUDIO_DATA_DIR: f.dir } });
@@ -154,13 +154,13 @@ for (const engine of identityEngines) {
       const p = await f.repos.projects.create({ name: "旧版本" });
       const before = (await f.db.query("SELECT * FROM projects"))[0];
       const checksums = (await f.db.migrationState()).applied;
-      assert.equal((await f.db.migrate(migrations)).version, 15);
+      assert.equal((await f.db.migrate(migrations.filter(m => m.version <= 15))).version, 15);
       const after = (await f.db.query("SELECT * FROM projects"))[0]!;
       assert.equal(after.project_revision, 1); assert.equal(after.workspace_revision, 0);
       const { project_revision, workspace_revision, ...old } = after; assert.deepEqual(old, before);
       assert.deepEqual((await f.db.migrationState()).applied.slice(0, 14), checksums);
       assert.equal((await f.repos.projects.get(p.id))?.projectRevision, 1);
-      assert.equal((await f.db.migrate(migrations)).applied.length, 0);
+      assert.equal((await f.db.migrate(migrations.filter(m => m.version <= 15))).applied.length, 0);
     } finally { await f.close(); }
   });
 }

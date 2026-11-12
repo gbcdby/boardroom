@@ -79,7 +79,7 @@ for (const outcome of ["empty", "error"] as const) {
       assert.doesNotMatch(textOf(container), /正在加载任务/);
       assert.equal(rowCount(container), 0);
       if (outcome === "error") assert.match(textOf(byTestId(container, "task-error")), /列表暂不可用/);
-      else assert.match(textOf(container), /从一项明确的任务开始/);
+      else assert.match(textOf(container), /先记下一项任务/);
     });
   });
 }

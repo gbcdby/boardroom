@@ -1,10 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { byTestId, deferred, find, input, json, select, settle, submit, textOf, withPage, type UiElement } from "./helpers/web-ui.ts";
+import { useToast } from "../src/web/src/composables/useToast.ts";
 
 const projects = ["a", "b"].map(id => ({ id, name: `项目${id}`, archivedAt: null, manager: null }));
 const author = { kind: "human", actorId: "human:local", displayName: "本地用户" };
-const task = (projectId: string, id = `task-${projectId}`) => ({ id, projectId, title: `任务${id}`, body: "验收条件", labels: [], state: "todo", assigneeMemberId: `${projectId}-worker`, reviewerMemberId: `${projectId}-reviewer`, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null, blockedReason: null, author, createdAt: "2026-11-12T00:00:00Z", updatedAt: "2026-11-12T00:00:00Z" });
+const materialStatus = { scope: "task-materials", executionAdmission: "not-issued", startExecution: { reasonCodes: [], issues: [] }, submitReview: { reasonCodes: [], issues: [] }, complete: { reasonCodes: [], issues: [] } };
+const task = (projectId: string, id = `task-${projectId}`) => ({ id, projectId, title: `任务${id}`, body: "验收条件", deliveryKind: "code", acceptanceText: "验收条件", acceptanceSource: "legacy_task_body", materialStatus, labels: [], state: "todo", assigneeMemberId: `${projectId}-worker`, reviewerMemberId: `${projectId}-reviewer`, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null, blockedReason: null, author, createdAt: "2026-11-12T00:00:00Z", updatedAt: "2026-11-12T00:00:00Z" });
 const taskSettings = (projectId: string) => ({ projectId, defaultReviewerMemberId: `${projectId}-reviewer`, reviewerValid: true, invalidReason: null, revision: 1 });
 const org = (projectId: string) => ({
   nodes: [{ id: `root-${projectId}`, name: `项目${projectId}统筹`, role: "top_manager", parentId: null, memberId: null, memberDisplayName: null }],
@@ -26,6 +28,7 @@ function selectedValue(control: UiElement): unknown { return control.options[con
 
 for (const kind of ["create", "reviewer"] as const) {
   test(`任务板作用域：挂起${kind}切换后新项目可写，旧回包不能释放新请求`, { timeout: 20000 }, async () => {
+    useToast().clear();
     const old = deferred<Response>(), next = deferred<Response>();
     const writes = { a: 0, b: 0 };
     let allowLeave = false, prompts = 0;
@@ -64,12 +67,14 @@ for (const kind of ["create", "reviewer"] as const) {
         assert.equal(byTestId(container, "task-create-open").props.disabled, true, "旧 finally 不能释放新项目写入锁");
         assert.equal(byTestId(container, "task-default-reviewer").props.disabled, true);
         assert.equal(!!find(container, node => node.props["data-testid"] === "task-notice"), false);
+        assert.equal(useToast().items.value.length, 0, "旧作用域回执不能发出成功 Toast");
         assert.doesNotMatch(textOf(byTestId(container, "task-board")), /新任务a/);
         await submit(submitNext); assert.equal(writes.b, 1, "新请求进行中仍需阻止重复提交");
         next.resolve(result("b")); await second; await settle();
         assert.equal(byTestId(container, "task-create-open").props.disabled, false);
         assert.equal(byTestId(container, "task-default-reviewer").props.disabled, false);
-        assert.match(textOf(byTestId(container, "task-notice")), kind === "create" ? /新任务b/ : /默认 reviewer 已保存/);
+        if (kind === "create") assert.match(useToast().items.value.at(-1)?.message ?? "", /新任务b/);
+        else assert.match(textOf(byTestId(container, "task-notice")), /默认 reviewer 已保存/);
       } finally { old.resolve(result("a")); next.resolve(result("b")); await Promise.allSettled([first, second]); }
     }, { path: "/projects/a/tasks", confirmDiscard: () => { prompts++; return allowLeave; } });
   });
@@ -77,6 +82,7 @@ for (const kind of ["create", "reviewer"] as const) {
 
 for (const kind of ["comment", "action"] as const) {
   test(`任务详情作用域：挂起${kind}切任务后可写，迟到回包不能改变当前请求`, { timeout: 20000 }, async () => {
+    useToast().clear();
     const old = deferred<Response>(), next = deferred<Response>();
     let allowLeave = false, writes = 0;
     let first: Promise<void> | undefined, second: Promise<void> | undefined;
@@ -109,17 +115,19 @@ for (const kind of ["comment", "action"] as const) {
         assert.equal(byTestId(container, "task-edit-open").props.disabled, true, "旧 scope finally 不能清新请求 busy");
         assert.equal(byTestId(container, field).value, "新作用域的提交内容", "旧 saved 回调不能清新草稿");
         assert.equal(!!find(container, node => node.props["data-testid"] === "task-notice"), false);
+        assert.equal(useToast().items.value.length, 0, "旧任务回执不能发出成功 Toast");
         await start(); assert.equal(writes, 2);
         next.resolve(json({ task: task("a", "task-2") })); await second; await settle();
         assert.equal(byTestId(container, "task-edit-open").props.disabled, false);
         assert.equal(byTestId(container, field).value, "");
-        assert.match(textOf(byTestId(container, "task-notice")), kind === "comment" ? /评论已保存/ : /任务已进入进行中/);
+        assert.match(useToast().items.value.at(-1)?.message ?? "", kind === "comment" ? /评论已保存/ : /任务已进入进行中/);
       } finally { old.resolve(json({})); next.resolve(json({})); await Promise.allSettled([first, second]); }
     }, { path: "/projects/a/tasks/task-1", confirmDiscard: () => allowLeave });
   });
 }
 
 test("任务详情作用域：旧任务的载入最新结果不能给新任务写入提示", { timeout: 20000 }, async () => {
+  useToast().clear();
   const reload = deferred<Response>(); let reads = 0;
   let pending: Promise<void> | undefined;
   const detail = (id: string) => json({ task: task("a", id), comments: [], history: [], rounds: [], reports: [], messageLinks: [] });

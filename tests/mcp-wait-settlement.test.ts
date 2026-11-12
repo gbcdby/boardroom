@@ -29,7 +29,7 @@ for (const engine of ['sqlite', 'postgres'] as const) for (const revoke of ['epo
       const message = await repos.messages.create({ groupId: group.id, senderMemberId: sender.id, body: `不得泄露的旧payload-${revoke}`,
         mentions: revoke === 'task' ? [] : [joined.memberId] });
       const at = new Date().toISOString();
-      const task = revoke === 'task' ? await repos.tasks.create({ id: newId(), projectId: p.id, title: '动态可读范围', body: '', labels: [], state: 'todo',
+      const task = revoke === 'task' ? await repos.tasks.create({ id: newId(), projectId: p.id, title: '动态可读范围', body: '', deliveryKind: "code", acceptanceText: '', acceptanceSource: "explicit", labels: [], state: 'todo',
         assigneeMemberId: joined.memberId, reviewerMemberId: null, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null,
         blockedReason: null, author: { kind: 'human', actorId: 'human:local', displayName: '人' }, createdAt: at, updatedAt: at }) : null;
       if (task) await repos.tasks.linkMessage(p.id, { taskId: task.id, messageId: message.id, groupId: group.id, createdAt: at });
@@ -154,7 +154,7 @@ for (const engine of ['sqlite', 'postgres'] as const) for (const change of ['dis
               VALUES ${batch.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(',')}`, params);
           }
         }));
-        const task = change === 'task' ? await repos.tasks.create({ id: newId(), projectId: project.id, title: '最后一块的动态权限', body: '', labels: [], state: 'todo',
+        const task = change === 'task' ? await repos.tasks.create({ id: newId(), projectId: project.id, title: '最后一块的动态权限', body: '', deliveryKind: "code", acceptanceText: '', acceptanceSource: "explicit", labels: [], state: 'todo',
           assigneeMemberId: joined.memberId, reviewerMemberId: null, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null,
           blockedReason: null, author: { kind: 'human', actorId: 'human:local', displayName: '人' }, createdAt: at, updatedAt: at }) : null;
         if (task) await repos.tasks.linkMessage(project.id, { taskId: task.id, messageId: ids.at(-1)!, groupId: group.id, createdAt: at });

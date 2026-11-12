@@ -27,7 +27,7 @@ async function withDb(engine: "sqlite" | "postgres", body: (repos: RepositorySet
   }
 }
 function task(projectId: string, memberId: string, state: Task["state"] = "in-progress"): Task {
-  return { id: randomUUID(), projectId, title: "保留任务", body: "任务正文不属于补偿采集", labels: [], state, assigneeMemberId: memberId, reviewerMemberId: memberId,
+  return { id: randomUUID(), projectId, title: "保留任务", body: "任务正文不属于补偿采集", deliveryKind: "code", acceptanceText: "任务正文不属于补偿采集", acceptanceSource: "explicit", labels: [], state, assigneeMemberId: memberId, reviewerMemberId: memberId,
     repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null, blockedReason: null,
     author: { kind: "human", actorId: "human:local", displayName: "人" }, createdAt: at, updatedAt: at };
 }

@@ -34,6 +34,7 @@ import { memoryMigration } from "./migrations/memory.ts";
 import { memberLifecycleMigration } from "./migrations/member-lifecycle.ts";
 import { identityCatalogMigration } from "./migrations/identity-catalog.ts";
 import { projectWorkspacesMigration } from "./migrations/project-workspaces.ts";
+import { taskIntakeMigration } from "./migrations/task-intake.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -92,7 +93,7 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
   },
   { name: "members", keyColumns: ["id"] },
   { name: "project_task_settings", keyColumns: ["project_id"] },
-  { name: "tasks", keyColumns: ["id"] },
+  { name: "tasks", keyColumns: ["id"], valueColumns: ["delivery_kind", "acceptance_text", "acceptance_source"] },
   { name: "task_review_rounds", keyColumns: ["id"] },
   { name: "task_review_reports", keyColumns: ["id"] },
   { name: "task_comments", keyColumns: ["id"] },
@@ -341,6 +342,7 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   memberLifecycleMigration,
   identityCatalogMigration,
   projectWorkspacesMigration,
+  taskIntakeMigration,
 ];
 
 // ---------------------------------------------------------------------------
