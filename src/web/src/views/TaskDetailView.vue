@@ -27,6 +27,7 @@ const error = ref<string | null>(null);
 const notice = ref<string | null>(null);
 const conflict = ref(false);
 let request = 0;
+let scopeVersion = 0;
 let disposed = false;
 const activeRound = computed(() => detail.value?.rounds.find((round) => round.id === task.value?.currentReviewRoundId) ?? null);
 const canOverride = computed(() => activeRound.value && ["reported", "decided"].includes(activeRound.value.state) && ["spec", "standards"].every((axis) => detail.value?.reports.some((report) => report.roundId === activeRound.value?.id && report.axis === axis)));
@@ -36,7 +37,7 @@ const hasDraft = () => (editing.value && JSON.stringify(draft.value) !== savedDr
 useProjectDraft(hasDraft, () => { editing.value = false; comment.value = ""; reason.value = ""; decisionReason.value = ""; draft.value = emptyTaskDraft(); });
 function nameOf(id: string | null): string { return members.value.find((member) => member.id === id)?.displayName ?? (id ? "成员已不可用" : "待重新指派"); }
 function time(iso: string): string { return new Date(iso).toLocaleString("zh-CN"); }
-function isCurrent(projectId: string, id: string, generation: number): boolean { return !disposed && currentProjectId.value === projectId && taskId.value === id && context.generation.value === generation; }
+function isCurrent(projectId: string, id: string, generation: number, scope: number): boolean { return !disposed && currentProjectId.value === projectId && taskId.value === id && context.generation.value === generation && scopeVersion === scope; }
 function reportsOf(round: ReviewRound) { return detail.value?.reports.filter((report) => report.roundId === round.id) ?? []; }
 function roundState(state: ReviewRound["state"]): string { return ({ ready: "等待 reviewer 接手", running: "评审进行中", reported: "两轴报告已提交，等待裁决", decided: "已裁决", failed: "候选准备失败", superseded: "已被后续修改取代" })[state]; }
 function actionLabel(action: string): string {
@@ -46,35 +47,35 @@ function actionLabel(action: string): string {
 async function load(preserveDraft = true): Promise<void> {
   const projectId = currentProjectId.value, id = taskId.value;
   if (!projectId || !id) return;
-  const version = ++request, generation = context.generation.value;
+  const version = ++request, generation = context.generation.value, scope = scopeVersion;
   loading.value = true;
   try {
     const [result, org] = await Promise.all([tasksApi.get(projectId, id), api.getOrg(projectId)]);
-    if (!isCurrent(projectId, id, generation) || version !== request) return;
+    if (!isCurrent(projectId, id, generation, scope) || version !== request) return;
     detail.value = result; members.value = org.members; nodes.value = org.nodes;
     if (!preserveDraft || !editing.value) {
       draft.value = taskDraft(result.task); savedDraft.value = JSON.stringify(draft.value);
     }
-  } catch (err) { if (isCurrent(projectId, id, generation) && version === request) error.value = err instanceof Error ? err.message : "任务读取失败，请重试。"; }
-  finally { if (isCurrent(projectId, id, generation) && version === request) loading.value = false; }
+  } catch (err) { if (isCurrent(projectId, id, generation, scope) && version === request) error.value = err instanceof Error ? err.message : "任务读取失败，请重试。"; }
+  finally { if (isCurrent(projectId, id, generation, scope) && version === request) loading.value = false; }
 }
 
 async function runMutation(kind: string, operation: (projectId: string, id: string) => Promise<unknown>, success: string, saved: () => void = () => {}): Promise<void> {
   const projectId = currentProjectId.value, id = taskId.value;
   if (!projectId || !task.value || !id || busy.value || projectReadonly.value) return;
-  const generation = context.generation.value;
+  const generation = context.generation.value, scope = scopeVersion;
   busy.value = kind; error.value = null; notice.value = null; conflict.value = false;
   try {
     await operation(projectId, id);
-    if (!isCurrent(projectId, id, generation)) return;
+    if (!isCurrent(projectId, id, generation, scope)) return;
     saved(); notice.value = success;
     await load();
   } catch (err) {
-    if (!isCurrent(projectId, id, generation)) return;
+    if (!isCurrent(projectId, id, generation, scope)) return;
     conflict.value = err instanceof ApiError && err.status === 409;
     error.value = conflict.value ? `任务已变更。${err instanceof Error ? err.message : ""} 你的草稿已保留，请载入最新版本并核对。` : err instanceof Error ? err.message : "操作失败，填写内容已保留。";
     if (kind === "review" && err instanceof ApiError && err.status === 400) await load();
-  } finally { if (isCurrent(projectId, id, generation)) busy.value = null; }
+  } finally { if (isCurrent(projectId, id, generation, scope)) busy.value = null; }
 }
 function edit(): void { if (!task.value) return; draft.value = taskDraft(task.value); savedDraft.value = JSON.stringify(draft.value); editing.value = true; }
 function cancelEdit(): void {
@@ -107,10 +108,16 @@ async function decide(): Promise<void> {
   await runMutation("decision", (projectId, id) => tasksApi.decide(projectId, id, roundId, input), "管理者裁决已保存，原报告与历史结论仍保留。", () => { decisionReason.value = ""; });
 }
 async function reloadLatest(): Promise<void> {
+  const projectId = currentProjectId.value, id = taskId.value, generation = context.generation.value, scope = scopeVersion;
+  if (!projectId || !id) return;
   error.value = null; await load();
-  if (!error.value) { conflict.value = false; notice.value = "已载入最新版本；未提交的草稿仍保留，请核对后保存。"; }
+  if (isCurrent(projectId, id, generation, scope) && !error.value) { conflict.value = false; notice.value = "已载入最新版本；未提交的草稿仍保留，请核对后保存。"; }
 }
-watch([currentProjectId, taskId], () => { request++; detail.value = null; error.value = null; notice.value = null; conflict.value = false; editing.value = false; comment.value = ""; reason.value = ""; decisionReason.value = ""; void load(false); }, { immediate: true });
+watch([currentProjectId, taskId], () => {
+  scopeVersion++; request++; busy.value = null; loading.value = false;
+  detail.value = null; error.value = null; notice.value = null; conflict.value = false; editing.value = false;
+  comment.value = ""; reason.value = ""; decisionReason.value = ""; void load(false);
+}, { immediate: true });
 onBeforeUnmount(() => { disposed = true; request++; });
 </script>
 

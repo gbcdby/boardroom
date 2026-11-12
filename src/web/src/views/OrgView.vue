@@ -30,6 +30,7 @@ const context = useCurrentProject();
 const { projects, currentProjectId: activeProjectId, readonly: projectReadonly } = context;
 let disposed = false;
 let request = 0;
+let scopeVersion = 0;
 const snapshot = ref<OrgSnapshot | null>(null);
 
 const loading = ref(true);
@@ -66,6 +67,9 @@ const childRoles = computed(() =>
 function clearMessages(): void {
   error.value = null;
 }
+function isCurrent(projectId: string | null, generation: number, scope: number): boolean {
+  return !disposed && projectId === activeProjectId.value && generation === context.generation.value && scope === scopeVersion;
+}
 
 async function refresh(): Promise<void> {
   const projectId = activeProjectId.value;
@@ -73,10 +77,10 @@ async function refresh(): Promise<void> {
     snapshot.value = null;
     return;
   }
-  const version = ++request;
+  const version = ++request, generation = context.generation.value, scope = scopeVersion;
   const previousNodes = new Map(nodes.value.map((node) => [node.id, node]));
   const result = await api.getOrg(projectId);
-  if (disposed || version !== request || activeProjectId.value !== projectId) return;
+  if (!isCurrent(projectId, generation, scope) || version !== request) return;
   snapshot.value = result;
   const names: Record<string, string> = {};
   const roleValues: Record<string, string> = {};
@@ -110,22 +114,22 @@ async function act<T>(fn: () => Promise<T>, success: string): Promise<boolean> {
   if (busy.value) return false;
   clearMessages();
   mutating.value = true;
-  const projectId = activeProjectId.value, generation = context.generation.value;
+  const projectId = activeProjectId.value, generation = context.generation.value, scope = scopeVersion;
   try {
     await fn();
-    if (disposed || projectId !== activeProjectId.value || generation !== context.generation.value) return false;
+    if (!isCurrent(projectId, generation, scope)) return false;
     toast.success(success);
     try {
       await refresh();
     } catch (err) {
-      error.value = `变更已保存，但刷新失败：${err instanceof Error ? err.message : String(err)}`;
+      if (isCurrent(projectId, generation, scope)) error.value = `变更已保存，但刷新失败：${err instanceof Error ? err.message : String(err)}`;
     }
-    return true;
+    return isCurrent(projectId, generation, scope);
   } catch (err) {
-    error.value = err instanceof ApiError ? err.message : (err as Error).message;
+    if (isCurrent(projectId, generation, scope)) error.value = err instanceof ApiError ? err.message : (err as Error).message;
     return false;
   } finally {
-    mutating.value = false;
+    if (isCurrent(projectId, generation, scope)) mutating.value = false;
   }
 }
 
@@ -137,7 +141,8 @@ watch(() => context.generation.value, () => confirmation.reset());
 onBeforeUnmount(() => { disposed = true; request++; });
 
 async function selectProject(): Promise<void> {
-  request++;
+  const scope = ++scopeVersion, projectId = activeProjectId.value, generation = context.generation.value;
+  request++; mutating.value = false;
   clearMessages();
   editingNodeId.value = null;
   snapshot.value = null;
@@ -145,9 +150,9 @@ async function selectProject(): Promise<void> {
   try {
     await refresh();
   } catch (err) {
-    error.value = err instanceof ApiError ? err.message : (err as Error).message;
+    if (isCurrent(projectId, generation, scope)) error.value = err instanceof ApiError ? err.message : (err as Error).message;
   } finally {
-    loading.value = false;
+    if (isCurrent(projectId, generation, scope)) loading.value = false;
   }
 }
 

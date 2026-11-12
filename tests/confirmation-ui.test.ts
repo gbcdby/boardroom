@@ -24,7 +24,7 @@ test("S6-AC01：移除成员先显示对象与影响，取消不提交变更", a
     await byTestId(container, "confirm-cancel").props.onClick(); await settle();
     assert.equal(removals, 0, "取消不能提交移除");
     assert.equal(find(container, node => node.props["data-testid"] === "confirmation-dialog"), undefined);
-  }, { path: "/projects" });
+  }, { path: "/projects/project-1/overview" });
 });
 
 test("S6-AC01/02：删除岗位展示影响，服务端拒绝保留确认现场", async () => {
@@ -81,7 +81,7 @@ test("S6-AC03：永久删除过期后重新预览，必须再次确认且只使�
     await byTestId(container, "confirm-purge-project").props.onClick(); await settle();
     assert.deepEqual(tokens, ["token-1", "token-2"]);
     assert.equal(find(container, node => node.props["data-testid"] === "confirmation-dialog"), undefined);
-  }, { path: "/projects" });
+  }, { path: "/projects/project-1/overview" });
 });
 
 test("S6-AC02：确认进行中只提交一次；未知结果必须核对，读取失败不能冒充已删除", async () => {
@@ -115,7 +115,7 @@ test("S6-AC02：确认进行中只提交一次；未知结果必须核对，读�
     await byTestId(container, "confirmation-reconcile").props.onClick(); await settle();
     assert.equal(find(container, node => node.props["data-testid"] === "confirmation-dialog"), undefined);
     assert.equal(removals, 1, "核对已完成的移除不能再发送变更");
-  }, { path: "/projects" });
+  }, { path: "/projects/project-1/overview" });
 });
 
 test("S6-AC02：超时进入未知结果，关闭后重开不能绕过核对", async () => {
@@ -140,7 +140,7 @@ test("S6-AC02：超时进入未知结果，关闭后重开不能绕过核对", a
     await byTestId(container, "confirmation-reconcile").props.onClick(); await settle();
     assert.equal(byTestId(container, "confirm-submit").props.disabled, false, "权威读取仍存在后才重新等待确认");
     assert.equal(removals, 1, "核对不能顺带重新提交");
-  }, { path: "/projects" });
+  }, { path: "/projects/project-1/overview" });
 });
 
 test("S6-AC05：切换项目使确认失效，旧请求迟到不影响新项目或产生成功提示", async () => {
@@ -164,7 +164,7 @@ test("S6-AC05：切换项目使确认失效，旧请求迟到不影响新项目�
     assert.deepEqual(targets, ["/api/projects/project-1/members/member-1"]);
     assert.match(textOf(byTestId(container, "member-list")), /新项目成员/);
     assert.equal(toast.items.value.length, 0);
-  }, { path: "/projects" });
+  }, { path: "/projects/project-1/overview" });
   toast.clear();
 });
 
@@ -196,7 +196,7 @@ for (const kind of ["project", "group"] as const) {
       assert.equal(toast.items.value.length, 1);
       assert.match(toast.items.value[0]!.message, /已归档/);
       if (kind === "project") assert.equal(byTestId(container, "new-member-name").props.disabled, true);
-    }, { path: "/projects?archived=1" });
+    }, { path: "/projects/project-1/overview?archived=1" });
     toast.clear();
   });
 }
