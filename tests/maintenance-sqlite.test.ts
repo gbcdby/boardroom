@@ -9,6 +9,7 @@ import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { createSqliteMaintenanceAdapter } from "../src/server/storage/maintenance/sqlite.ts";
 import type { SourceLock, AnchorChange, ArtifactRef } from "../src/server/storage/maintenance/types.ts";
 import { recordDarwinInventoryFailure } from "./fixtures/maintenance-darwin-inventory-diagnostic.ts";
+import { inspectWithLinuxInventoryDiagnostics } from "./fixtures/maintenance-linux-inventory-diagnostic.ts";
 
 const platformTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
 async function fixture() {
@@ -93,7 +94,9 @@ platformTest("#152 unknown source file users stay blockers; renamed source never
     const blockers = await f.adapter.inspectWriters(await f.adapter.observe());
     assert.ok(blockers.some(b => b.code === "source_writer_unknown"));
     external.close();
-    const afterClose = await f.adapter.inspectWriters(await f.adapter.observe());
+    const afterCloseObservation = await f.adapter.observe();
+    const afterClose = await inspectWithLinuxInventoryDiagnostics("after-external-close", f.descriptor,
+      () => f.adapter.inspectWriters(afterCloseObservation));
     await recordDarwinInventoryFailure("after-external-close", f.descriptor, afterClose);
     assert.deepEqual(afterClose, []);
     await rename(f.file, `${f.file}.moved`);
@@ -109,7 +112,9 @@ platformTest("#152 repeated native readers under a held source lock preserve exa
     await f.adapter.withSourceLock("control", async lock => {
       for (let i = 0; i < 4; i++) {
         assert.deepEqual((await f.adapter.observe()).source, f.initial.source);
-        const blockers = await f.adapter.inspectWriters(await lock.observe());
+        const observed = await lock.observe();
+        const blockers = await inspectWithLinuxInventoryDiagnostics("held-source-lock", f.descriptor,
+          () => f.adapter.inspectWriters(observed));
         await recordDarwinInventoryFailure("held-source-lock", f.descriptor, blockers);
         assert.deepEqual(blockers, []);
         await lock.assertHeld();

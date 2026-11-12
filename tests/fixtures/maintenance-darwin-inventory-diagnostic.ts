@@ -15,6 +15,7 @@ export async function recordDarwinInventoryFailure(
   if (process.platform !== "darwin" || blockers.length === 0) return;
   let directory: string | undefined;
   try {
+    const budgetMs = 25_000, deadline = Date.now() + budgetMs;
     const output = path.join(root, ".agent-output", "macos-tests", "native-inventory-diagnostics");
     await mkdir(output, { recursive: true, mode: 0o700 });
     directory = await mkdtemp(path.join(output, `${stage}-`));
@@ -29,23 +30,35 @@ export async function recordDarwinInventoryFailure(
     await save("failure.json", JSON.stringify({ stage, capturedAt: new Date().toISOString(), blockers, source, scopes,
       pid: process.pid, uid: process.getuid?.() ?? null, platform: process.platform, arch: process.arch, node: process.version,
       candidate: process.env.GITHUB_SHA ?? null, runId: process.env.GITHUB_RUN_ID ?? null, runAttempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
+      diagnosticBudgetMs: budgetMs, traceBounds: { extraRangeProbeGroups: 8, queriesPerGroup: 4, eventLimit: 4096 },
       observation: "Inventories below are subsequent calls; the original blockers above remain authoritative." }, null, 2));
     await save("identity.json", JSON.stringify({ binarySha256: await digest(binary), wrapperSha256: await digest(wrapper),
       nativeSourceSha256: await digest(path.join(root, "native", "maintenance-darwin.c")),
+      helperSha256: await digest(path.join(root, "tests", "fixtures", "maintenance-darwin-inventory-diagnostic.ts")),
       testSha256: await digest(path.join(root, "tests", "maintenance-sqlite.test.ts")) }, null, 2));
-    const run = async (name: string, command: string, args: string[]) => {
+    const run = async (name: string, command: string, args: string[], commandBudgetMs = 5_000) => {
       const startedAt = new Date().toISOString();
-      const result = spawnSync(command, args, { encoding: "utf8", timeout: 5_000, maxBuffer: 4 * 1024 * 1024,
-        stdio: ["ignore", "pipe", "pipe"] });
+      const timeoutMs = Math.min(commandBudgetMs, deadline - Date.now());
+      if (timeoutMs <= 0) {
+        await save(`${name}.execution.json`, JSON.stringify({ command, args, startedAt, status: "NOT_RUN", reason: "diagnostic-budget-exhausted" }, null, 2));
+        return false;
+      }
+      const result = spawnSync(command, args, { encoding: "utf8", timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024,
+        killSignal: "SIGKILL", stdio: ["ignore", "pipe", "pipe"] });
       await save(`${name}.stdout.txt`, result.stdout ?? "");
       await save(`${name}.stderr.txt`, result.stderr ?? "");
       await save(`${name}.execution.json`, JSON.stringify({ command, args, startedAt, finishedAt: new Date().toISOString(),
         status: result.status, signal: result.signal, error: result.error?.message ?? null,
-        timeoutMs: 5_000, maxBufferBytes: 4 * 1024 * 1024 }, null, 2));
+        timeoutMs, killSignal: "SIGKILL", maxBufferBytes: 4 * 1024 * 1024 }, null, 2));
       return result.status === 0 && !result.error && !result.signal;
     };
     await run("production-source-users", binary, ["source-users", ...scopes]);
     await run("production-parent-handles", binary, ["parent-handles", ...scopes]);
+    await run("kernel-version", "/usr/bin/uname", ["-srv"], 1_000);
+    await run("os-version", "/usr/bin/sw_vers", [], 1_000);
+    await run("sdk-version", "/usr/bin/xcrun", ["--show-sdk-version"], 1_000);
+    await run("sdk-path", "/usr/bin/xcrun", ["--show-sdk-path"], 1_000);
+    await run("compiler-version", "/usr/bin/cc", ["--version"], 1_000);
     try {
       if (await run("compile-trace", "/usr/bin/cc", ["-std=c11", "-D_DARWIN_C_SOURCE", "-Wall", "-Wextra", "-Werror", "-O2",
         wrapper, "-lproc", "-o", diagnosticBinary])) {

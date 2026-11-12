@@ -67,7 +67,7 @@ async function isolatedCluster(binaryDirectory: string) {
     const client = await connect();
     try {
       const row = (await client.query(`SELECT current_setting('data_directory') AS directory,
-        current_setting('port') AS port,inet_server_addr()::text AS address,
+        current_setting('port') AS port,pg_catalog.host(inet_server_addr()) AS address,
         (pg_control_system()).system_identifier::text AS system_identifier,
         pg_postmaster_start_time()::text AS started,pg_backend_pid() AS backend`)).rows[0];
       assert.equal(await realpath(row.directory), await realpath(data), "never connect to a different cluster");

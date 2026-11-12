@@ -189,8 +189,8 @@ export async function readPostgresCatalog(client: PostgresReader, schema: string
   await assertScopeClosure(client, schema);
   try { await assertPostgresGuardCoverage(client); }
   catch { throw new MaintenanceFailure("schema_guard_incomplete"); }
-  const applied = await rows(client, `SELECT version::text AS version,name,checksum,applied_at::text AS applied_at
-    FROM ${quotePostgresIdentifier(schema)}.schema_migrations ORDER BY version`);
+  const applied = await rows(client, `SELECT m.version::text AS version,m.name,m.checksum,m.applied_at::text AS applied_at
+    FROM ${quotePostgresIdentifier(schema)}.schema_migrations AS m ORDER BY m.version`);
   if (applied.length !== migrations.length || applied.some((row, i) => row.version !== String(migrations[i]!.version)
     || row.name !== migrations[i]!.name || row.checksum !== checksumOf(migrationSql(migrations[i]!, "postgres"))))
     throw new MaintenanceFailure("schema_guard_incomplete");
@@ -210,6 +210,8 @@ export async function readPostgresCatalog(client: PostgresReader, schema: string
     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
     JOIN pg_catalog.pg_roles r ON r.oid=c.relowner LEFT JOIN pg_catalog.pg_am am ON am.oid=c.relam
     WHERE n.nspname=$1 AND c.relkind='r' ORDER BY c.relname`, [schema]);
+  // Column ACLs add to table privileges. NULL/empty means no column grants; aclexplode
+  // accepts NULL but rejects a zero-dimensional '{}' ACL. Preserve every nonempty ACL.
   const allColumns = await rows(client, `SELECT c.relname AS table_name,a.attname AS name,
     (row_number() OVER(PARTITION BY c.oid ORDER BY a.attnum))::text AS position,
     a.atttypid::text AS type_oid,pg_catalog.format_type(a.atttypid,a.atttypmod) AS type,
@@ -217,7 +219,7 @@ export async function readPostgresCatalog(client: PostgresReader, schema: string
     a.attstorage AS storage,a.attcompression AS compression,a.attstattarget AS statistics,
     co.collname AS collation,cn.nspname AS collation_schema,
     pg_catalog.pg_get_expr(d.adbin,d.adrelid,false) AS default_expression,
-    ${acl("COALESCE(a.attacl,'{}'::aclitem[])")} AS acl,
+    ${acl("CASE WHEN pg_catalog.cardinality(a.attacl)>0 THEN a.attacl END")} AS acl,
     pg_catalog.col_description(c.oid,a.attnum) AS comment
     FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid
     JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
