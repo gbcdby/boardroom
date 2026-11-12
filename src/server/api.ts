@@ -20,6 +20,7 @@ import { parseMentions, resolveWakeAndVisibility, type RoutingMember } from "./c
 import { buildRoster } from "./chat/roster.ts";
 import { resetGroupConsecutiveCount } from "./mcp/core.ts";
 import { createTaskService } from "./tasks/service.ts";
+import { createIdentityApi } from "./identity/api.ts";
 import { createOrgMutationService } from "./org/mutations.ts";
 import { createAuditCompensationService } from "./audit-compensation.ts";
 import { createOrgHttpCommands } from "./org/http-commands.ts";
@@ -184,6 +185,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
   const orgMutations = createOrgMutationService({ repos, now });
   const compensations = createAuditCompensationService({ repos, now });
   const orgCommands = createOrgHttpCommands({ repos, now });
+  const identityApi = createIdentityApi({ ...options, repos });
 
   /**
    * 待确认的永久删除（T1 #48）：`project:<id>` / `group:<id>` → 一次性凭据与到期时间。
@@ -290,6 +292,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
     async handle(request, response, pathname) {
       const method = request.method ?? "GET";
       try {
+        if (await identityApi.handle(request, response, pathname)) return true;
         return await route(repos, request, response, method, pathname);
       } catch (error) {
         if (error instanceof RepositoryError) {

@@ -84,6 +84,7 @@ HTTP/传输层错误（Streamable HTTP 自身）由 SDK 返回 JSON-RPC 错误�
 
 - MCP 会话与成员身份分离：一个会话可能在未 `join` 前调用工具（此时返回 `NOT_IN_GROUP`）。
 - `join` 之后该会话绑定一个 `memberId` + `projectId` + `groupId`；后续工具读取该绑定。
+- v14 的旧 `displayName + hostType` 通过永久 alias 解析到稳定 agentId。改名保留旧 alias，旧客户端重连继续复用身份并读取当前显示名；不恢复旧名、不重设已有权限或成员生命周期。已删除身份的 alias 返回 `CONFLICT / agent_identity_retired`，损坏关联返回 `CONFLICT / migration_identity_ambiguous`，不会静默另建身份。详见[稳定身份契约](identity-catalog.md)。
 - 连接层心跳（D4：interval 10s / timeout 30s，可配置）记录在**会话**上，不与成员 `waiting/working` 混同。
 - 绑定保存成员加入代际，操作时重查当前成员、项目/群和运行所有权。移除返回 `FORBIDDEN` / `reason:member_removed`；明确恢复或重新添加后，旧代际返回 `membership_changed`，需要新连接重新 join。普通 join 不隐式恢复已移除成员。
 - 任务编辑/流转、配置和评审分别使用各自 expected revision。记忆保存使用 `expectedVersion` 与 `clientMutationId`；同作者/文档/mutation 的成功重放返回原版本，换正文复用 mutation 拒绝。报告/attempt 的重放按各自合同处理，不对所有写工具笼统承诺幂等。
@@ -101,7 +102,7 @@ HTTP/传输层错误（Streamable HTTP 自身）由 SDK 返回 JSON-RPC 错误�
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `displayName` | string | 是 | 显示名（非空，≤ 64 字符）。 |
+| `displayName` | string | 是 | 旧客户端接入 alias 的名称（非空，≤ 64 字符）；已改名身份仍可用原 alias，返回当前显示名。 |
 | `hostType` | string | 是 | 必须是已注册 adapter ID；当前内置 `claude-code` / `codex-cli` / `dsh` / `other`。注册不等于真实能力验收。 |
 | `projectId` | string | 是 | 已存在的项目 ID。 |
 | `groupId` | string | 是 | 群组 ID。 |
@@ -297,7 +298,7 @@ T2 已把上述**内存 `McpStore` 替换为 F2 的 SQLite 持久化**（`src/se
 - **新增 `heartbeat` 工具**（第 7 个）：刷新本 MCP 会话的连接心跳与 Agent `last_seen_at`；不改成员运行状态。
   入参无；出参 `{ ok, sessionId, state:"connected", lastHeartbeatAt }`。未入群 → `NOT_IN_GROUP`。
 - `wait_for_messages` 返回的 `cursor` 形如 `c_<seq>`（群组内单调 seq，稳定可解析）；`afterCursor` 接受同格式。
-- 持久化落点：`agents`（全局身份，`(display_name, host_type)` 唯一）、`members`、`group_participants`、
+- 持久化落点：`agents`（全局稳定身份 ID，当前名称/宿主仍保留唯一约束；v14 起接入由永久 `agent_legacy_aliases` 解析）、`members`、`group_participants`、
   `mcp_sessions`（连接状态，D1）、`member_statuses`（运行状态，D1）、`messages`、`message_deliveries`。
 - 挂起中的等待仍是运行时对象（不落库）；进程重启后由 agent 重连重新等待（重连积压留 T5）。
 
