@@ -37,7 +37,7 @@ async function fixture(repos: RepositorySet) {
 }
 
 function task(projectId: string): Task {
-  return { id: randomUUID(), projectId, title: "将被删除的任务", body: "完整业务事实", labels: [], state: "todo",
+  return { id: randomUUID(), projectId, title: "将被删除的任务", body: "完整业务事实", deliveryKind: "code", acceptanceText: "完整业务事实", acceptanceSource: "explicit", labels: [], state: "todo",
     assigneeMemberId: null, reviewerMemberId: null, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null,
     blockedReason: null, author, createdAt: at, updatedAt: at };
 }
@@ -398,6 +398,8 @@ for (const engine of ["sqlite", "postgres"] as const) {
     const mutate = [
       () => repos.tasks.create(createdTask),
       () => repos.tasks.updateCas(f.project.id, createdTask.id, 1, { title: "数量相同的任务修订" }, at),
+      () => repos.tasks.updateCas(f.project.id, createdTask.id, 2, { acceptanceText: "数量相同的新验收", deliveryKind: "finding" }, at),
+      () => db.exec("UPDATE tasks SET acceptance_source = 'legacy_task_body' WHERE id = ?", [createdTask.id]),
       () => repos.transaction(async () => { await repos.memory.insertHead(doc); await repos.memory.insertVersion(version(doc)); }),
       () => repos.transaction(async () => {
         const next = { ...doc, version: 2, markdown: "记忆新版本", byteLength: Buffer.byteLength("记忆新版本") };

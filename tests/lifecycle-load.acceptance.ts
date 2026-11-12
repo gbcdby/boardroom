@@ -84,7 +84,7 @@ async function createLoad(repos: RepositorySet): Promise<ProjectLoad[]> {
     projects.push({ project, members, groups });
   }
   const target = projects[0]!, memberId = target.members[2]!.id, at = new Date().toISOString();
-  await repos.tasks.create({ id: newId(), projectId: target.project.id, title: '固定负载下保留的指派', body: '正文不是补偿输入', labels: [], state: 'in-progress',
+  await repos.tasks.create({ id: newId(), projectId: target.project.id, title: '固定负载下保留的指派', body: '正文不是补偿输入', deliveryKind: "code", acceptanceText: '正文不是补偿输入', acceptanceSource: "explicit", labels: [], state: 'in-progress',
     assigneeMemberId: memberId, reviewerMemberId: memberId, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null, blockedReason: null,
     author: { kind: 'human', actorId: 'human:local', displayName: '人' }, createdAt: at, updatedAt: at });
   await repos.tasks.setSettings(target.project.id, 0, memberId);
@@ -202,7 +202,10 @@ for (const engine of ['sqlite', 'postgres'] as const) {
                 const settled = await Promise.allSettled([mutation, heartbeat, traffic] as const);
                 const failure = settled.find(result => result.status === 'rejected');
                 if (failure?.status === 'rejected') {
-                  report.operations.push({ historyMessages, step, operation, status: 'FAIL', mutation: budget.measure(), error: String(failure.reason) });
+                  report.operations.push({ historyMessages, step, operation, status: 'FAIL', mutation: budget.measure(),
+                    sqlTrace: budget.statements,
+                    settled: settled.map((result, index) => ({ branch: ['mutation', 'heartbeat', 'traffic'][index], status: result.status })),
+                    error: String(failure.reason) });
                   throw failure.reason;
                 }
                 const [changed, beat, chat] = settled.map(result => (result as PromiseFulfilledResult<unknown>).value) as [Awaited<typeof mutation>, Awaited<typeof heartbeat>, Awaited<typeof traffic>];

@@ -63,7 +63,7 @@ async function seedSqliteDir(dir: string): Promise<void> {
     const repos = createRepositories(driver);
     const at = "2026-11-10T12:00:00.000Z";
     const author = { kind: "human" as const, actorId: "owner", displayName: "人" };
-    const task: Task = { id: "task-copy", projectId: "pr1", title: "迁移任务", body: "验收正文", labels: ["迁移"], state: "in-progress",
+    const task: Task = { id: "task-copy", projectId: "pr1", title: "迁移任务", body: "验收正文", deliveryKind: "code", acceptanceText: "明确验收与 Unicode 🧪\n独立于目标", acceptanceSource: "explicit", labels: ["迁移"], state: "in-progress",
       assigneeMemberId: "mb1", reviewerMemberId: "mb2", repoPath: "/repo", fixedPoint: "HEAD~1", revision: 1,
       currentReviewRoundId: null, blockedReason: null, author, createdAt: at, updatedAt: at };
     await repos.tasks.setSettings("pr1", 0, "mb2");
@@ -127,6 +127,8 @@ async function assertDispatchValues(options: DbDriverOptions): Promise<void> {
   const driver = createDbDriver(options);
   await driver.connect();
   try {
+    assert.deepEqual(await driver.query("SELECT delivery_kind, acceptance_text, acceptance_source FROM tasks WHERE id = 'task-copy'"),
+      [{ delivery_kind: "code", acceptance_text: "明确验收与 Unicode 🧪\n独立于目标", acceptance_source: "explicit" }]);
     assert.deepEqual(await driver.query("SELECT id, client_message_id FROM messages ORDER BY id"), [
       { id: "msg1", client_message_id: "migration-request" },
       { id: "msg2", client_message_id: null },
@@ -319,6 +321,20 @@ test("SQLite → SQLite：目标键集完整（含复合主键表与 id 保留�
       }
       assert.equal(report.validation.ok, true);
       assert.equal((await validateData(srcOpts, dstOpts)).ok, false, "事实版本数值变化不能仅凭相同主键集通过校验");
+    });
+  });
+});
+
+test("任务资料值参与复制校验，相同主键但验收漂移不能通过", async () => {
+  await withTempDir(async srcDir => {
+    await seedSqliteDir(srcDir);
+    await withTempDir(async dstDir => {
+      const source: DbDriverOptions = { dbDriver: "sqlite", dataDir: srcDir }, target: DbDriverOptions = { dbDriver: "sqlite", dataDir: dstDir };
+      assert.equal((await migrateData(source, target)).validation.ok, true);
+      const driver = createDbDriver(target); await driver.connect();
+      try { await driver.exec("UPDATE tasks SET acceptance_text = ? WHERE id = 'task-copy'", ["被错误替换的验收"]); }
+      finally { await driver.close(); }
+      assert.equal((await validateData(source, target)).ok, false);
     });
   });
 });

@@ -26,7 +26,7 @@ async function room(repos: RepositorySet, db: DbDriver) {
 }
 async function task(repos: RepositorySet, projectId: string, assigneeMemberId: string, reviewerMemberId: string) {
   const at = new Date().toISOString();
-  return repos.tasks.create({ id: newId(), projectId, title: '当前可见关系', body: '不读取任务正文判定消息权限', labels: [], state: 'todo',
+  return repos.tasks.create({ id: newId(), projectId, title: '当前可见关系', body: '不读取任务正文判定消息权限', deliveryKind: "code", acceptanceText: '不读取任务正文判定消息权限', acceptanceSource: "explicit", labels: [], state: 'todo',
     assigneeMemberId, reviewerMemberId, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null, blockedReason: null,
     author: { kind: 'human', actorId: 'human:local', displayName: '人' }, createdAt: at, updatedAt: at });
 }

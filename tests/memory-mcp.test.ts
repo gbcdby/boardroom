@@ -67,7 +67,7 @@ for (const publishNewer of [false, true]) {
       await f.repos.groups.addParticipant(f.group.id, sender.id);
       const message = await f.repos.messages.create({ groupId: f.group.id, senderMemberId: sender.id, body: "通过任务关系可读", mentions: [] });
       const at = new Date().toISOString();
-      const task = await f.repos.tasks.create({ id: newId(), projectId: f.project.id, title: "取材后撤权", body: "", labels: [], state: "todo",
+      const task = await f.repos.tasks.create({ id: newId(), projectId: f.project.id, title: "取材后撤权", body: "", deliveryKind: "code", acceptanceText: "", acceptanceSource: "explicit", labels: [], state: "todo",
         assigneeMemberId: joined.memberId, reviewerMemberId: null, repoPath: null, fixedPoint: null, revision: 1,
         currentReviewRoundId: null, blockedReason: null, author: { kind: "human", actorId: "human:local", displayName: "人" }, createdAt: at, updatedAt: at });
       await f.repos.tasks.linkMessage(f.project.id, { taskId: task.id, messageId: message.id, groupId: f.group.id, createdAt: at });
