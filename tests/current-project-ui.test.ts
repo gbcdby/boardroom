@@ -20,12 +20,12 @@ function navigation(store: any) {
     { path: "/", component },
     { path: "/projects", component },
     { path: "/runtimes", component },
-    ...["overview", "org", "status", "audit", "members", "tasks"].map((section) => ({
+    ...["overview", "org", "status", "audit", "members", "tasks", "memory", "knowledge", "activity", "settings"].map((section) => ({
       path: `/projects/:projectId/${section}`, component, meta: { projectSection: section },
     })),
     { path: "/projects/:projectId/chat/:groupId?", component, meta: { projectSection: "chat" } },
     { path: "/projects/:projectId/tasks/:taskId", component, meta: { projectSection: "tasks" } },
-    ...["chat", "status", "org", "audit", "members", "tasks"].map((section) => ({
+    ...["chat", "status", "org", "audit", "members", "tasks", "memory", "groups"].map((section) => ({
       path: `/${section}`, component, meta: { projectSection: section },
     })),
   ] });
@@ -44,7 +44,8 @@ test("共享项目：显式 URL 优先于记忆，并将旧群聊深链 replace 
   assert.equal(store.currentProjectId.value, "beta");
   assert.equal(storage.get("agent-studio:lastProjectId"), "beta");
   await router.push("/org");
-  assert.equal(router.currentRoute.value.path, "/projects/beta/org");
+  assert.equal(router.currentRoute.value.path, "/projects/beta/members");
+  assert.equal(router.currentRoute.value.query.tab, "organization");
   store.dispose();
 });
 
@@ -76,7 +77,8 @@ test("共享项目：无效 URL 有回退提示，归档显式链接只读，全
   const store = await context();
   const router = navigation(store);
   await router.push("/projects/missing/status");
-  assert.equal(router.currentRoute.value.path, "/projects/alpha/status");
+  assert.equal(router.currentRoute.value.path, "/projects/alpha/members");
+  assert.equal(router.currentRoute.value.query.tab, "status");
   assert.match(store.notice.value, /项目不存在或无权访问，已切换到项目甲/);
   await router.push("/projects/archive/tasks");
   assert.equal(store.readonly.value, true);
@@ -106,4 +108,26 @@ test("共享项目：路由前进后退也受草稿保护，任务详情切项�
   await store.selectProject("beta");
   assert.equal(router.currentRoute.value.path, "/projects/beta/tasks");
   store.dispose();
+});
+
+test("共享项目：浏览器 localStorage 属性读取抛错时仍可进入全局页并切换项目", async () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  let reads = 0;
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, get() { reads++; throw new Error("SecurityError: storage is unavailable"); } });
+  let store: any;
+  try {
+    store = await context();
+    const router = navigation(store);
+    await router.push("/projects");
+    assert.equal(router.currentRoute.value.path, "/projects");
+    assert.equal(store.error.value, null);
+    assert.equal(await store.selectProject("beta"), true);
+    assert.equal(router.currentRoute.value.path, "/projects/beta/overview");
+    assert.equal(store.currentProjectId.value, "beta");
+    assert.ok(reads > 0, "必须实际覆盖会抛错的浏览器属性 getter");
+  } finally {
+    store?.dispose();
+    if (previous) Object.defineProperty(globalThis, "localStorage", previous);
+    else Reflect.deleteProperty(globalThis, "localStorage");
+  }
 });

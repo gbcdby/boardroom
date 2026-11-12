@@ -12,7 +12,7 @@ export const identityEngines = ["sqlite", "postgres"] as const;
 export function identitySkip(engine: typeof identityEngines[number]) {
   return engine === "postgres" && !identityPgUrl ? "未配置真实 PostgreSQL；由数据库 CI 门控执行" : false;
 }
-export async function identityFixture(engine: typeof identityEngines[number] = "sqlite", version = 14) {
+export async function identityFixture(engine: typeof identityEngines[number] = "sqlite", version = migrations.at(-1)!.version) {
   const dir = await mkdtemp(path.join(tmpdir(), "boardroom-identity-"));
   const schema = `identity_${randomUUID().replaceAll("-", "")}`;
   const db = createDbDriver(engine === "sqlite" ? { dbDriver: "sqlite", dataDir: dir }

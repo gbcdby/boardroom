@@ -179,7 +179,7 @@ test("记忆：迟到的成员读取和保存不会覆盖新成员或新项目",
     await input(byTestId(container, "memory-editor"), "成员 B 的在途保存");
     const saving = submit(byTestId(container, "memory-save"));
     assert.equal(await store.selectProject("project-2"), false);
-    assert.equal(router.currentRoute.value.path, "/projects/project-1/memory");
+    assert.equal(router.currentRoute.value.path, "/projects/project-1/knowledge");
     confirmed = true;
     await store.selectProject("project-2"); await settle();
     assert.equal(byTestId(container, "memory-editor").value, "项目乙的独立记忆");
