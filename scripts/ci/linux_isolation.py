@@ -28,6 +28,7 @@ ENTRIES = ('sqlite', 'full-suite')
 CAP_FIELDS = ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')
 PG_URL = 'postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci'
 SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+STAGE_PARENT = Path('/tmp')
 MAX_ARCHIVE = 2 * 1024 * 1024 * 1024
 WORKSPACE = Path('work/workspace')  # Existing plan fixtures create siblings of cwd.
 PROTECTED = ('package.json', 'package-lock.json', 'src/server/storage/maintenance/sqlite.ts',
@@ -102,6 +103,109 @@ def real_directory(path):
     if not path.is_absolute() or path.resolve(strict=True) != path or not path.is_dir():
         raise IsolationError(f'Expected a real absolute directory: {path}')
     return path
+
+
+def stage_directory(run_id, attempt, entry):
+    # RUNNER_TEMP may have runner-private ancestors. Never chmod those ancestors.
+    return STAGE_PARENT / stage_name(run_id, attempt, entry)
+
+
+def validate_stage_parent():
+    parent = real_directory(STAGE_PARENT)
+    info = parent.stat()
+    if info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o1777 or \
+       any(not (item.stat().st_mode & stat.S_IXOTH) for item in parent.parents) or \
+       os.statvfs(parent).f_flag & (os.ST_NOEXEC | os.ST_RDONLY):
+        raise IsolationError('Owned stage requires existing root-owned searchable sticky executable /tmp')
+
+
+def bootstrap_targets(request, stage):
+    environment = child_environment(request, stage)
+    targets = {'launcher': (stage / 'launcher.py', os.R_OK),
+               'context': (stage / 'child.json', os.R_OK),
+               'workspace': (stage / WORKSPACE, os.R_OK | os.W_OK | os.X_OK),
+               'dependencies': (stage / WORKSPACE / 'node_modules', os.R_OK | os.X_OK),
+               'node': (Path(request['node']), os.R_OK | os.X_OK),
+               'python': (Path('/usr/bin/python3'), os.R_OK | os.X_OK)}
+    for name in ('home', 'tmp', 'npm-cache'):
+        targets[name] = (stage / name, os.R_OK | os.W_OK | os.X_OK)
+    for name in ('bash', 'mkdir', 'timeout', 'tee'):
+        program = shutil.which(name, path=environment['PATH'])
+        targets[name] = (Path(program) if program else None, os.R_OK | os.X_OK)
+    if request['entry'] == 'full-suite':
+        targets['npm'] = (Path(request['node_dir']) / 'npm', os.R_OK | os.X_OK)
+        for name in ('pg_dump', 'pg_restore', 'psql'):
+            targets[name] = (Path('/usr/lib/postgresql/16/bin') / name, os.R_OK | os.X_OK)
+    return targets
+
+
+def path_diagnostics(targets):
+    # Observations only: root's access result is never a child authorization proof.
+    result = {'observer_uid': os.geteuid(), 'observer_gid': os.getegid(), 'paths': {}}
+    for label, (path, required) in targets.items():
+        item = {'path': str(path) if path else None, 'required_access': required, 'available': False, 'components': []}
+        result['paths'][label] = item
+        if path is None:
+            item['error'] = 'executable_not_found'
+            continue
+        item['available'] = os.access(path, required)
+        components = [*reversed(path.parents), path]
+        try:
+            resolved = path.resolve(strict=True)
+            item['resolved'] = str(resolved)
+            components += [*reversed(resolved.parents), resolved]
+        except (OSError, RuntimeError) as error:
+            item['resolve_error'] = type(error).__name__
+            item['resolve_errno'] = getattr(error, 'errno', None)
+        for component in dict.fromkeys(components):
+            row = {'path': str(component)}
+            try:
+                info = component.lstat()
+                row.update(uid=info.st_uid, gid=info.st_gid, mode=oct(stat.S_IMODE(info.st_mode)),
+                           device=info.st_dev, inode=info.st_ino, symlink=stat.S_ISLNK(info.st_mode))
+                row['mount_flags'] = os.statvfs(component).f_flag
+            except OSError as error:
+                row['errno'] = error.errno
+            try:
+                acl = os.getxattr(component, 'system.posix_acl_access', follow_symlinks=False)
+                row.update(acl_bytes=len(acl), acl_hex=acl[:4096].hex(), acl_truncated=len(acl) > 4096)
+            except OSError as error:
+                row['acl_errno'] = error.errno
+            item['components'].append(row)
+    return result
+
+
+def verify_child_bootstrap(request, stage):
+    # Called only after the actual nonroot identity/caps/groups/NNP checks.
+    report = path_diagnostics(bootstrap_targets(request, stage))
+    report.update(candidate=request['head'], tree=request['tree'], entry=request['entry'], probes=[])
+    errors = ['inaccessible:' + label for label, item in report['paths'].items() if not item['available']]
+    environment = child_environment(request, stage)
+    node = Path(request['node'])
+    if not errors:
+        selected = shutil.which('node', path=environment['PATH'])
+        if not selected or Path(selected).resolve() != node or digest(node) != request['node_sha256']:
+            errors.append('prepared_node_identity_changed')
+    if not errors:
+        # Exercise loaders and npm's env-node shebang under the real child identity.
+        native = "const D=require('better-sqlite3');const db=new D(':memory:');db.close();console.log('native dependency loaded')"
+        probes = [('node-version', [str(node), '--version']), ('native-dependency', [str(node), '-e', native])]
+        if request['entry'] == 'full-suite':
+            probes += [(name, [report['paths'][name]['path'], '--version']) for name in ('npm', 'pg_dump', 'pg_restore', 'psql')]
+        for label, argv in probes:
+            item = {'label': label, 'argv': argv}
+            try:
+                completed = subprocess.run(argv, cwd=stage / WORKSPACE, env=environment, stdin=subprocess.DEVNULL,
+                                           text=True, capture_output=True, timeout=5)
+                item.update(exit_code=completed.returncode, stdout=completed.stdout[-2048:], stderr=completed.stderr[-2048:])
+                if completed.returncode:
+                    errors.append('probe_failed:' + label)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                item.update(error=type(error).__name__, errno=getattr(error, 'errno', None))
+                errors.append('probe_failed:' + label)
+            report['probes'].append(item)
+    report.update(status='BLOCKED' if errors else 'PASS', errors=errors)
+    return report
 
 
 def output_directory(base, relative=Path('.')):
@@ -413,6 +517,10 @@ def child(stage):
                   node=request['node'], node_sha256=request['node_sha256'],
                   kernel=os.uname().release, architecture=os.uname().machine)
     write_json(workspace / '.agent-output/linux-ci-isolation' / request['entry'] / 'child-identity.json', actual)
+    bootstrap = verify_child_bootstrap(request, stage)
+    write_json(workspace / '.agent-output/linux-ci-isolation' / request['entry'] / 'bootstrap-access.json', bootstrap)
+    if bootstrap['status'] != 'PASS':
+        raise IsolationError('Nonroot bootstrap setup blocked: ' + ', '.join(bootstrap['errors']))
     os.chdir(workspace)
     os.execve('/bin/bash', ['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c',
                           command_for(request['entry'])], child_environment(request, stage))
@@ -425,7 +533,8 @@ def supervise(stage, cleanup_only=False):
     if request['runner_uid'] <= 0 or request['runner_gid'] <= 0 or request['entry'] not in ENTRIES or \
        not re.fullmatch(r'[0-9a-f]{32}', request['token']) or request['name'] != job_name(request['run_id'], request['attempt'], request['entry']):
         raise IsolationError('Invalid job-owned request')
-    if stage != Path(request['runner_temp']) / stage_name(request['run_id'], request['attempt'], request['entry']):
+    validate_stage_parent()
+    if stage != stage_directory(request['run_id'], request['attempt'], request['entry']):
         raise IsolationError('Request is outside the exact job/entry directory')
     if int(os.environ.get('SUDO_UID', '-1')) != request['runner_uid'] or \
        int(os.environ.get('SUDO_GID', '-1')) != request['runner_gid']:
@@ -450,7 +559,7 @@ def supervise(stage, cleanup_only=False):
               'command': command_for(request['entry']), 'command_exit': None, 'errors': [],
               'archives': request['archives'], 'protected_sha256': request['protected_sha256'],
               'source_snapshot': request.get('source_snapshot'),
-              'cleanup_only': cleanup_only}
+              'cleanup_only': cleanup_only, 'setup_complete': False, 'product_entry_status': 'NOT_RUN'}
     if (stage / 'result.json').exists():
         report = read_json(stage / 'result.json')
     try:
@@ -518,6 +627,10 @@ def supervise(stage, cleanup_only=False):
                                             'supervisor_pid': os.getpid()})
             os.chmod(stage / 'child.json', 0o444)
             report['identity'] = {'uid': uid, 'gid': uid, 'name': state['name'], 'private_mode': '0700'}
+            report['bootstrap_paths_root_observation'] = path_diagnostics(bootstrap_targets(request, stage))
+            report['transport_paths_root_observation'] = path_diagnostics({
+                'runner_temp_unused_by_child': (Path(request['runner_temp']), os.X_OK),
+                'source_unused_by_child': (Path(request['source']), os.X_OK)})
             argv = ['/usr/bin/setpriv', '--reuid=' + str(uid), '--regid=' + str(uid), '--clear-groups',
                     '--inh-caps=-all', '--ambient-caps=-all', '--bounding-set=-all', '--no-new-privs',
                     '/usr/bin/python3', '-I', str(stage / 'launcher.py'), '--child', str(stage)]
@@ -526,6 +639,12 @@ def supervise(stage, cleanup_only=False):
             report['command_exit'] = 124 if execution['timed_out'] else execution['returncode']
             if execution['signal'] and report['command_exit'] == 0:
                 report['command_exit'] = 128 + execution['signal']
+            access_receipt = workspace / '.agent-output/linux-ci-isolation' / request['entry'] / 'bootstrap-access.json'
+            if access_receipt.exists() and access_receipt.stat().st_uid == uid:
+                bootstrap = read_json(access_receipt)
+                report['setup_complete'] = bootstrap.get('status') == 'PASS' and bootstrap.get('observer_uid') == uid and \
+                    bootstrap.get('candidate') == request['head'] and bootstrap.get('tree') == request['tree']
+                report['product_entry_status'] = 'exec_attempted' if report['setup_complete'] else 'NOT_RUN'
     except Exception as error:
         report['errors'].append(str(error))
     finally:
@@ -599,10 +718,11 @@ def import_result(stage, source, entry):
 
 def frontend(entry):
     source, temporary, run_id, attempt = hosted_context()
+    validate_stage_parent()
     if entry == 'cleanup':
         errors = []
         for name in ENTRIES:
-            stage = temporary / stage_name(run_id, attempt, name)
+            stage = stage_directory(run_id, attempt, name)
             try:
                 if stage.exists():
                     subprocess.run(['sudo', '-n', '--', '/usr/bin/python3', '-I', str(Path(__file__).resolve()),
@@ -629,7 +749,7 @@ def frontend(entry):
     node = Path(shutil.which('node') or '').resolve(strict=True)
     if not node.is_file() or node.stat().st_mode & (stat.S_ISUID | stat.S_ISGID):
         raise IsolationError('Node must be an ordinary prepared executable')
-    stage = temporary / stage_name(run_id, attempt, entry)
+    stage = stage_directory(run_id, attempt, entry)
     stage.mkdir(mode=0o700)  # Exclusive: an unfinished entry is recovered, never replayed.
     info = stage.stat()
     request = {'entry': entry, 'head': head, 'tree': tree, 'run_id': run_id, 'attempt': attempt,

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -190,6 +191,77 @@ result=module.run_command([sys.executable,'-c',code,str(base/'ready')],base,{'PA
                              env=env, text=True, capture_output=True, timeout=3)
         self.assertNotEqual(run.returncode, 0)
         self.assertIn('GitHub Actions', run.stderr)
+
+    def test_owned_stage_bootstrap_avoids_unsearchable_runner_ancestor(self):
+        # Actual ordinary-UID permission failure/success; no account or privilege fixture.
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            private, shared = base / 'runner-private', base / 'shared'
+            private.mkdir(mode=0o700); shared.mkdir(mode=0o700)
+            old = private / ci.stage_name('43304799101', '1', 'sqlite')
+            with mock.patch.object(ci, 'STAGE_PARENT', shared):
+                new = ci.stage_directory('43304799101', '1', 'sqlite')
+            payload = "import json,os,pathlib,sys; p=pathlib.Path(sys.argv[1]); json.loads((p/'child.json').read_text()); os.chdir(p/'work'); print('loaded context and cwd')"
+            for stage in (old, new):
+                stage.mkdir(mode=0o711); stage.chmod(0o711)
+                (stage / 'work').mkdir(mode=0o700)
+                (stage / 'launcher.py').write_text(payload); (stage / 'launcher.py').chmod(0o444)
+                (stage / 'child.json').write_text('{}'); (stage / 'child.json').chmod(0o444)
+            private.chmod(0o600)
+            try:
+                old_run = subprocess.run([sys.executable, '-I', str(old / 'launcher.py'), str(old)],
+                                         cwd=base, text=True, capture_output=True, timeout=3)
+                self.assertEqual(old_run.returncode, 2)
+                self.assertIn('Permission denied', old_run.stderr)
+                observed = ci.path_diagnostics({'launcher': (old / 'launcher.py', os.R_OK)})
+                self.assertFalse(observed['paths']['launcher']['available'])
+                self.assertTrue(any(row.get('errno') == 13 for row in observed['paths']['launcher']['components']))
+                new_run = subprocess.run([sys.executable, '-I', str(new / 'launcher.py'), str(new)],
+                                         cwd=base, text=True, capture_output=True, timeout=3)
+                self.assertEqual(new_run.returncode, 0, new_run.stderr)
+                self.assertIn('loaded context and cwd', new_run.stdout)
+                self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o600, 'No shared parent chmod to make access succeed')
+            finally:
+                private.chmod(0o700)
+
+    def test_shared_stage_parent_contract_is_strict_and_readonly(self):
+        # Raw metadata predicates only; this is not a real root-owned /tmp qualification.
+        accepted = SimpleNamespace(st_uid=0, st_gid=0, st_mode=stat.S_IFDIR | 0o1777)
+        for change, flags, rejected in [({}, 0, False), ({'st_uid': 1000}, 0, True),
+                                        ({'st_gid': 1000}, 0, True),
+                                        ({'st_mode': stat.S_IFDIR | 0o777}, 0, True),
+                                        ({}, os.ST_NOEXEC, True), ({}, os.ST_RDONLY, True)]:
+            info = SimpleNamespace(**(vars(accepted) | change))
+            with mock.patch.object(ci, 'real_directory', return_value=Path('/tmp')), \
+                 mock.patch.object(Path, 'stat', return_value=info), \
+                 mock.patch.object(os, 'statvfs', return_value=SimpleNamespace(f_flag=flags)), \
+                 mock.patch.object(os, 'chmod') as chmod, mock.patch.object(os, 'chown') as chown:
+                if rejected:
+                    with self.assertRaises(ci.IsolationError): ci.validate_stage_parent()
+                else:
+                    ci.validate_stage_parent()
+                chmod.assert_not_called(); chown.assert_not_called()
+
+    def test_child_bootstrap_records_all_missing_paths_without_launching_products(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = Path(temporary).resolve()
+            request = self.request()
+            request.update(node=str(stage / 'missing-node'), node_sha256='0' * 64)
+            with mock.patch.object(subprocess, 'run') as run:
+                report = ci.verify_child_bootstrap(request, stage)
+            run.assert_not_called()
+            self.assertEqual(report['observer_uid'], os.geteuid())
+            self.assertEqual(report['status'], 'BLOCKED')
+            for name in ('launcher', 'context', 'workspace', 'dependencies', 'node', 'home', 'tmp', 'npm-cache'):
+                self.assertIn('inaccessible:' + name, report['errors'])
+            self.assertNotIn(ci.PG_URL, json.dumps(report))
+            request = self.request('full-suite')
+            request.update(node='/opt/node/bin/node', node_sha256='0' * 64)
+            targets = ci.bootstrap_targets(request, stage)
+            self.assertEqual(str(targets['npm'][0]), '/opt/node/bin/npm')
+            for name in ('pg_dump', 'pg_restore', 'psql'):
+                self.assertEqual(str(targets[name][0]), '/usr/lib/postgresql/16/bin/' + name)
+            self.assertNotIn('AGENT_STUDIO_PG_RESTART_BIN', ci.child_environment(request, stage))
 
     def account_argv(self, program, stage, token, uid=42001, entry='sqlite'):
         # Evaluate only the actual argv expression; never execute account/setpriv commands.
