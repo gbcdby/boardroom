@@ -65,12 +65,12 @@ function respond(url: string) {
   return json({ projects: [project] });
 }
 
-function geometry(container: UiElement, viewport: any, initial = { top: 549, after: 324 }, contentHeight = () => 22000) {
+function geometry(container: UiElement, viewport: any, initial = { top: 549, after: 324 }, contentHeight = () => 22000, renderedHeight?: () => number) {
   const list: any = byTestId(container, "chat-messages");
   const conversation: any = find(container, node => node.props.class === "panel conversation");
   assert.ok(conversation);
   const size = { ...initial };
-  const height = () => Number.parseFloat(list.props.style?.["--chat-message-height"] ?? "") || Math.min(640, viewport.innerHeight * .56);
+  const height = renderedHeight ?? (() => Number.parseFloat(list.props.style?.["--chat-message-height"] ?? "") || Math.min(640, viewport.innerHeight * .56));
   const rect = (top: number, bottom: number) => ({ top, bottom, height: bottom - top, left: 0, right: 1000, width: 1000 });
   list.getBoundingClientRect = () => rect(size.top - viewport.scrollY, size.top - viewport.scrollY + height());
   conversation.getBoundingClientRect = () => rect(size.top - viewport.scrollY - 86, size.top - viewport.scrollY + height() + size.after);
@@ -118,6 +118,98 @@ for (const order of ["history-first", "layout-first"] as const) {
         await settle(); await viewport.flush();
         assert.equal(measured.list.scrollTop, 100, "真实向上位移后不能被新消息抢回底部");
       }, { path: "/projects/project-1/chat/one" });
+    });
+  });
+}
+
+for (const userScrollsUp of [false, true]) {
+  test(`首次聊天收缩期间自动向下调整${userScrollsUp ? "并主动上翻：保留阅读位置" : "：不得取消最新跟随"}`, async () => {
+    await withViewport(async viewport => {
+      const history = deferred<Response>();
+      let contentHeight = 248;
+      await withPage("ChatView", url => url.endsWith("/messages") ? history.promise : respond(url), async container => {
+        const measured = geometry(container, viewport, { top: 549, after: 262 }, () => contentHeight);
+        contentHeight = 2358;
+        history.resolve(json({ messages: messages.slice(0, 25) })); await settle();
+        assert.equal(measured.list.scrollTop, 1798, "历史先按原560px区域贴底");
+        let applied = measured.list.props.style, adjusted = false;
+        Object.defineProperty(measured.list.props, "style", { configurable: true,
+          get: () => applied,
+          set: value => {
+            const before = measured.height(); applied = value;
+            if (adjusted || measured.height() === before) return;
+            adjusted = true;
+            // 内容重排保持锚点时向下调整100px；此后得到原生失败的2458/1898/189几何。
+            contentHeight += 100;
+            measured.list.scrollTop += 100;
+            measured.list.props.onScroll();
+            if (userScrollsUp) {
+              measured.list.scrollTop = 100; measured.list.props.onScroll();
+            }
+          },
+        });
+        await viewport.resize();
+        assert.ok(adjusted);
+        assert.equal(measured.height(), 189);
+        assert.equal(measured.list.scrollTop, userScrollsUp ? 100 : 2269,
+          `自动位移和主动上翻须区分：top=${measured.list.scrollTop}, height=${measured.height()}, content=${contentHeight}`);
+        contentHeight += 100;
+        viewport.sockets[0].message({ type: "message", message: { ...messages[0], id: "after-layout", seq: 26, text: "调整后到达" } });
+        await settle(); await viewport.flush();
+        assert.equal(measured.list.scrollTop, userScrollsUp ? 100 : 2369, "后续实时消息继续服从阅读意图");
+      }, { path: "/projects/project-1/chat/one" });
+    });
+  });
+}
+
+for (const intent of ["follow", "read-history", "leave"] as const) {
+  test(`首次聊天真实尺寸晚于预算提交：${intent}`, async () => {
+    await withViewport(async viewport => {
+      const history = deferred<Response>();
+      let contentHeight = 260, renderedHeight = 260;
+      await withPage("ChatView", url => url.endsWith("/messages") ? history.promise : respond(url), async (container, { router }) => {
+        const measured = geometry(container, viewport, { top: 549, after: 324 }, () => contentHeight, () => renderedHeight);
+        await viewport.resize();
+        assert.equal(measured.list.props.style["--chat-message-height"], "128px");
+        assert.equal(measured.height(), 260, "预算已提交，但真实盒子尚未变化");
+        contentHeight = 2458; renderedHeight = 560; measured.size.after = 262;
+        history.resolve(json({ messages: messages.slice(0, 25) })); await settle();
+        assert.equal(measured.list.scrollTop, 1898, "消息先按真实560px区域贴底");
+        await viewport.resize();
+        assert.equal(measured.list.props.style["--chat-message-height"], "189px");
+        assert.equal(measured.list.scrollTop, 1898, "nextTick后真实盒子仍560px，写入仍夹在旧底部");
+        await viewport.resize();
+        assert.equal(measured.list.scrollTop, 1898);
+
+        // 原生诊断 seq38：RO后来报告189px真实尺寸，但预算仍是同一个189。
+        renderedHeight = 189;
+        for (const observer of viewport.observed) if (!observer.disconnected) observer.callback();
+        const pending = [...viewport.frames.values()] as FrameCallback[];
+        assert.ok(pending.length > 0);
+        if (intent === "leave") {
+          await router.push("/settings"); await settle();
+          for (const callback of pending) callback(0);
+          await settle(); await viewport.flush();
+          assert.equal(find(container, node => node.props["data-testid"] === "chat-messages"), undefined);
+          assert.equal(measured.list.scrollTop, 1898, "卸载后的迟到尺寸帧不得再写旧列表");
+          return;
+        }
+        viewport.frames.clear();
+        for (const callback of pending) callback(0);
+        if (intent === "read-history") {
+          measured.list.scrollTop = 100; measured.list.props.onScroll();
+        }
+        await settle(); await viewport.flush();
+        assert.equal(measured.list.scrollTop, intent === "follow" ? 2269 : 100,
+          `迟到几何后的阅读意图：top=${measured.list.scrollTop}, height=${measured.height()}, content=${contentHeight}`);
+        const settledTop = measured.list.scrollTop;
+        await viewport.resize();
+        assert.equal(measured.list.scrollTop, settledTop, "几何和预算都不变时保持位置");
+        contentHeight += 100;
+        viewport.sockets[0].message({ type: "message", message: { ...messages[0], id: "after-delayed-size", seq: 26, text: "真实尺寸稳定后到达" } });
+        await settle(); await viewport.flush();
+        assert.equal(measured.list.scrollTop, intent === "follow" ? 2369 : 100);
+      }, { path: "/projects/project-1/chat/one", renderRoute: "/projects/:projectId/chat/:groupId?" });
     });
   });
 }

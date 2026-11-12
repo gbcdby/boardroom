@@ -201,25 +201,28 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
         else: route.continue_()
     read_pattern = f"**/api/projects/{project_id}/members"
     page.route(read_pattern, hold_reconcile)
-    with page.expect_request(lambda req: req.method == "GET" and urlsplit(req.url).path == f"/api/projects/{project_id}/members"):
-        recovery.click()
-    expect(recovery).to_have_count(0)
-    check_pending_focus()
-    assert len(reads) == 1, "权威核对应该读取成员一次"
-    # unroute 移除最后一个 handler 会自动放行挂起请求；先显式放行并等待响应。
-    # 核对释放后，后续成功刷新直接通过，不再次挂起。
-    reconcile_released = True
-    with page.expect_response(lambda response: response.request.method == "GET" and urlsplit(response.url).path == f"/api/projects/{project_id}/members"):
-        reads[0].continue_()
-    page.unroute(read_pattern, hold_reconcile)
-    expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
-    expect(page.locator("h1")).to_be_focused()
-    expect(page.get_by_test_id("new-member-name")).to_have_value("删除成员期间保留的草稿")
-    page.get_by_test_id("new-member-name").fill("")
-    assert len(writes(member_path, "DELETE")) == 2, "一次被拒绝、一次明确重试后，不应再次发送移除"
-    assert not request(page, origin, "GET", f"/api/projects/{project_id}/members")["members"]
-    toast(f"成员「{member['displayName']}」已移除。")
-    report["checks"].append("S6-AC01/02/05: 成员取消/Escape与还焦；Tab/Shift+Tab边界循环；提交/核对全禁用时标题焦点；恢复slot加入/移除；pending单飞；注入409拒绝与提交后响应丢失，权威核对完成且保留草稿")
+    try:
+        with page.expect_request(lambda req: req.method == "GET" and urlsplit(req.url).path == f"/api/projects/{project_id}/members"):
+            recovery.click()
+        expect(recovery).to_have_count(0)
+        check_pending_focus()
+        assert len(reads) == 1, "权威核对应该读取成员一次"
+        # unroute 移除最后一个 handler 会自动放行挂起请求；先显式放行并等待响应。
+        # 核对释放后，后续成功刷新直接通过，不再次挂起。
+        reconcile_released = True
+        with page.expect_response(lambda response: response.request.method == "GET" and urlsplit(response.url).path == f"/api/projects/{project_id}/members"):
+            reads[0].continue_()
+        expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
+        expect(page.locator("h1")).to_be_focused()
+        expect(page.get_by_test_id("new-member-name")).to_have_value("删除成员期间保留的草稿")
+        page.get_by_test_id("new-member-name").fill("")
+        assert len(writes(member_path, "DELETE")) == 2, "一次被拒绝、一次明确重试后，不应再次发送移除"
+        assert not request(page, origin, "GET", f"/api/projects/{project_id}/members")["members"]
+        toast(f"成员「{member['displayName']}」已移除。")
+        report["checks"].append("S6-AC01/02/05: 成员取消/Escape与还焦；Tab/Shift+Tab边界循环；提交/核对全禁用时标题焦点；恢复slot加入/移除；pending单飞；注入409拒绝与提交后响应丢失，权威核对完成且保留草稿")
+    finally:
+        # 保持透明 handler 直到成功刷新与原成功断言完成；失败路径也统一清理。
+        page.unroute(read_pattern, hold_reconcile)
 
     group = request(page, origin, "GET", f"/api/projects/{project_id}/groups")["groups"][0]
     group_path = f"/api/groups/{group['id']}"
@@ -742,6 +745,7 @@ def main():
             browser = p.chromium.launch(headless=True)
             report["chromium"] = browser.version
             context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai")
+            context.tracing.start(screenshots=True, snapshots=True, sources=True)
             page = context.new_page()
             page.set_default_timeout(15000)
             try:
@@ -751,6 +755,7 @@ def main():
                 if not page.is_closed(): page.screenshot(path=str(output / "failure.png"), full_page=True)
                 raise
             finally:
+                context.tracing.stop(path=str(output / "trace.zip"))
                 context.close()
                 browser.close()
     except Exception as error:
