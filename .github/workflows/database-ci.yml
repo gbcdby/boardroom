@@ -116,20 +116,7 @@ jobs:
       - name: 私有解包 PostgreSQL 16 重启验证工具（不运行 postinst 或宿主服务）
         id: pg_restart_tools
         shell: bash
-        run: |
-          restart_tools="$RUNNER_TEMP/boardroom-pg16-restart-tools"
-          restart_debs="$RUNNER_TEMP/boardroom-pg16-restart-debs"
-          mkdir -p "$restart_tools" "$restart_debs"
-          cd "$restart_debs"
-          apt-get download postgresql-16
-          for archive in ./*.deb; do dpkg-deb --extract "$archive" "$restart_tools"; done
-          restart_bin="$restart_tools/usr/lib/postgresql/16/bin"
-          test -f "$restart_tools/usr/share/postgresql/16/postgres.bki"
-          test -d "$restart_tools/usr/lib/postgresql/16/lib"
-          "$restart_bin/postgres" --version
-          "$restart_bin/initdb" --version
-          "$restart_bin/pg_ctl" --version
-          echo "bin=$restart_bin" >> "$GITHUB_OUTPUT"
+        run: bash scripts/prepare-ci-pg16-tools.sh
 
       - name: 类型检查
         run: npm run typecheck

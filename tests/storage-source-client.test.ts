@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
+import { realpathSync } from "node:fs";
 import { mkdtemp, rm, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -26,7 +27,9 @@ function drain(db: Database.Database) {
 async function fixture() {
   const dir = await mkdtemp(path.join(tmpdir(), "br-source-client-"));
   const db = new SqliteDriver({ dataDir: dir }); await db.connect(); await db.migrate(migrations);
-  const database = databaseForConnectedReader({ kind: "sqlite", dataDir: dir, sqlitePath: db.file, sourcePath: db.file, identity: null });
+  // Match the resolver contract even when tmpdir() contains a directory alias.
+  const database = databaseForConnectedReader({ kind: "sqlite", dataDir: realpathSync(dir),
+    sqlitePath: realpathSync(db.file), sourcePath: db.file, identity: null });
   const control = new Database(db.file);
   const client = await registerStorageSourceClient({ db, database, entrypoint: "http" });
   return { dir, db, database, control, client, async close() {

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
-import { copyFileSync, existsSync, renameSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, realpathSync, renameSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -15,9 +15,11 @@ import { StorageMaintenanceError } from "../src/server/storage/admission.ts";
 import type { SqliteDatabaseDescriptor } from "../src/server/environment.ts";
 
 function source(dir: string): SqliteDatabaseDescriptor {
-  const sqlitePath = path.join(dir, "agent-studio.db");
+  const sourcePath = path.join(dir, "agent-studio.db");
+  // tmpdir() may contain a directory alias; the descriptor keeps the original entry separately.
+  const sqlitePath = realpathSync(sourcePath);
   const stat = statSync(sqlitePath, { bigint: true });
-  return { kind: "sqlite", dataDir: dir, sqlitePath, sourcePath: sqlitePath,
+  return { kind: "sqlite", dataDir: realpathSync(dir), sqlitePath, sourcePath,
     identity: { device: String(stat.dev), inode: String(stat.ino) } };
 }
 
