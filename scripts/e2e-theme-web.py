@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import select
 import subprocess
+from time import perf_counter
 import traceback
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -57,21 +58,64 @@ def chat_entry_latest(page, name, report):
 
 def chat_entry_held_history(page, origin, path, group_id, name, output, report):
     held = []
+    evidence = {"view": name, "requests": [], "phase": "holding"}
+    report.setdefault("heldHistory", []).append(evidence)
     pattern = f"**/api/groups/{group_id}/messages"
     def hold(route):
-        held.append(route)
+        request = {"url": route.request.url, "method": route.request.method,
+                   "heldAt": perf_counter(), "interceptPhase": evidence["phase"],
+                   "continueCalls": 0, "continued": False}
+        evidence["requests"].append(request)
+        held.append((route, request))
     page.route(pattern, hold)
     try:
         page.goto(origin + path, wait_until="domcontentloaded")
         page.get_by_test_id("chat-messages").wait_for(state="visible")
         expect(page.get_by_role("log", name="群聊消息")).to_have_attribute("aria-busy", "true")
-        page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        evidence["heldBeforeLayoutCount"] = len(held)
         assert held, "必须确实持有首次历史GET，不能以已完成的读取冒充延迟到达"
-    finally:
-        page.unroute(pattern, hold)
-        for route in held:
+        # 等待真实预算已应用且连续两帧几何稳定；此时历史仍未到达，不写入滚动位置。
+        evidence["pendingLayout"] = page.wait_for_function("""() => new Promise(resolve => {
+          const sample = () => {
+            const list=document.querySelector('[data-testid="chat-messages"]');
+            if(!list)return null;
+            const box=list.getBoundingClientRect(), style=getComputedStyle(list);
+            return {at:performance.now(),busy:list.closest('[role="log"]')?.getAttribute('aria-busy'),
+              messages:list.querySelectorAll('.message').length,scrollTop:list.scrollTop,
+              budget:parseFloat(style.getPropertyValue('--chat-message-height')),maxHeight:parseFloat(style.maxHeight),
+              top:box.top,bottom:box.bottom,width:box.width,height:box.height,viewportHeight:innerHeight};
+          };
+          requestAnimationFrame(() => { const first=sample(); requestAnimationFrame(() => {
+            const second=sample(), keys=['budget','maxHeight','top','bottom','width','height'];
+            const pending=s=>s&&s.busy==='true'&&s.messages===0&&s.width>0&&s.height>0
+              &&s.budget>0&&s.maxHeight===s.budget;
+            resolve(pending(first)&&pending(second)&&keys.every(key=>first[key]===second[key])
+              ? {first,second} : false);
+          }); });
+        })""").json_value()
+        evidence["readyAt"] = perf_counter()
+        evidence["phase"] = "releasing"
+        # Playwright 1.62 的 unroute 会自动放行当前拦截器的在途请求。
+        # 必须先逐个 continue，再移除拦截器，否则第二次处理同一 Route 会报错。
+        for route, request in held:
+            assert request["method"] == "GET" and request["continueCalls"] == 0, evidence
+            request["continueCalls"] += 1
+            request["continueAt"] = perf_counter()
             route.continue_()
+            request["continued"] = True
+        evidence["phase"] = "released"
+    except Exception as error:
+        evidence["error"] = str(error)
+        raise
+    finally:
+        evidence["unrouteAt"] = perf_counter()
+        page.unroute(pattern, hold)
     page.wait_for_load_state("networkidle")
+    for route, request in held:
+        response = route.request.response()
+        request["status"] = response.status if response else None
+        request["timing"] = route.request.timing
+        assert request["continueCalls"] == 1 and request["continued"] and request["status"] == 200, evidence
     chat_entry_latest(page, name, report)
     capture(page, output, report, name)
 
