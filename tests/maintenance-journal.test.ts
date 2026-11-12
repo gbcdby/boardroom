@@ -8,7 +8,7 @@ import { buildDatabaseManifests, digestRowMultiset } from "../src/server/storage
 import { assertFrozenSourceUnchanged, captureReference, restorePointDigest, verifyJournalChain, verifySnapshotClosure } from "../src/server/storage/maintenance/journal.ts";
 import type { ArtifactRef, DatabaseManifests, JournalRecord, MigrationPlan, SourceFilesManifest, SourceObservation } from "../src/server/storage/maintenance/types.ts";
 
-const linuxTest = process.platform === "linux" ? test : test.skip;
+const platformTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
 const hash = (letter: string) => letter.repeat(64);
 // These are deliberately structural fixtures. They do not assert that a synthetic V is a real restore.
 // The independent native-adapter tests exercise actual backup output and restoration.
@@ -75,7 +75,7 @@ async function fixture() {
     close: () => rm(dir, { recursive: true, force: true }) };
 }
 
-linuxTest("#152 journal starts at the exact anchor and preserves the capture generation across legal takeover", async () => {
+platformTest("#152 journal starts at the exact anchor and preserves the capture generation across legal takeover", async () => {
   const f = await fixture();
   try {
     const ready = await f.finish();
@@ -93,7 +93,7 @@ linuxTest("#152 journal starts at the exact anchor and preserves the capture gen
   } finally { await f.close(); }
 });
 
-linuxTest("#152 journal rejects skipped phases, request reuse with different input, unknown fields and broken predecessors", async () => {
+platformTest("#152 journal rejects skipped phases, request reuse with different input, unknown fields and broken predecessors", async () => {
   const f = await fixture();
   try {
     for (const change of [
@@ -108,7 +108,7 @@ linuxTest("#152 journal rejects skipped phases, request reuse with different inp
   } finally { await f.close(); }
 });
 
-linuxTest("#152 finite recovery closure rejects missing roles, wrong verifier bundle and changed payload bytes", async () => {
+platformTest("#152 finite recovery closure rejects missing roles, wrong verifier bundle and changed payload bytes", async () => {
   const f = await fixture();
   try {
     const valid = await f.finish();
@@ -120,7 +120,7 @@ linuxTest("#152 finite recovery closure rejects missing roles, wrong verifier bu
   } finally { await f.close(); }
 });
 
-linuxTest("#152 arbitrary capability bodies cannot introduce hidden recovery references", async () => {
+platformTest("#152 arbitrary capability bodies cannot introduce hidden recovery references", async () => {
   const f = await fixture();
   try {
     const capability = await f.store.putJson("capability", { ...await f.store.capability() as object, future: f.planRef });
@@ -129,7 +129,7 @@ linuxTest("#152 arbitrary capability bodies cannot introduce hidden recovery ref
   } finally { await f.close(); }
 });
 
-linuxTest("#152 cancel intent blocks capture/ready and cancelled is a terminal event with one new epoch", async () => {
+platformTest("#152 cancel intent blocks capture/ready and cancelled is a terminal event with one new epoch", async () => {
   const f = await fixture();
   try {
     const intent = { ...f.body, sequence: 2, previous: f.enter, event: "cancel_intent" as const, requestId: "cancel" };
@@ -145,7 +145,7 @@ linuxTest("#152 cancel intent blocks capture/ready and cancelled is a terminal e
   } finally { await f.close(); }
 });
 
-linuxTest("#152 ready reuse allows only journal-proven controller fields, never ignores the control tables", async () => {
+platformTest("#152 ready reuse allows only journal-proven controller fields, never ignores the control tables", async () => {
   const f = await fixture();
   try {
     const ready = await f.finish(), checked = await verifySnapshotClosure(f.store, ready.reference);

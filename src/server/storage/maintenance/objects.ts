@@ -1,11 +1,12 @@
 import { constants, createReadStream } from "node:fs";
-import { lstat, mkdir, open, readFile, realpath, rename, statfs } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, realpath, rename } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import path from "node:path";
 import { canonicalJson, parseCanonical, sha256 } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { maintenanceHostIdentityDigest } from "./host.ts";
+import { assertMaintenancePlatform, maintenanceFilesystem, syncMaintenanceHandle } from "./platform.ts";
 import type { ArtifactRef, ControlRootIdentity, DurabilityCapability, ObjectKind, PathIdentity, SourceRef } from "./types.ts";
 
 type PublishPoint = "temp_written" | "file_synced" | "renamed" | "directory_synced";
@@ -40,14 +41,11 @@ async function ancestors(file: string): Promise<PathIdentity[]> {
 }
 async function syncDirectory(file: string): Promise<void> {
   const handle = await open(file, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-  try { await handle.sync(); } finally { await handle.close(); }
+  try { await syncMaintenanceHandle(handle); } finally { await handle.close(); }
 }
 async function writeNew(file: string, bytes: Uint8Array): Promise<void> {
   const handle = await open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-  try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
-}
-function ensureLinux(): void {
-  if (process.platform !== "linux") throw new MaintenanceFailure("unsupported_durability");
+  try { await handle.writeFile(bytes); await syncMaintenanceHandle(handle); } finally { await handle.close(); }
 }
 function assertRef(ref: ArtifactRef): ObjectKind {
   if (!ref || Object.keys(ref).sort().join() !== "bytes,ref,sha256" || !DIGEST.test(ref.sha256) || !/^(0|[1-9][0-9]*)$/.test(ref.bytes))
@@ -71,7 +69,7 @@ export class ArtifactStore {
     this.root = marker.root.path; this.identity = marker.root; this.marker = marker; this.options = options;
   }
   static async create(root: string, source: SourceRef, options: StoreOptions = {}): Promise<ArtifactStore> {
-    ensureLinux();
+    assertMaintenancePlatform();
     if (!path.isAbsolute(root) || path.resolve(root) !== root || await realpath(path.dirname(root)) !== path.dirname(root))
       throw new MaintenanceFailure("control_root_mismatch");
     try { await lstat(root); return await ArtifactStore.open(root, source, options); }
@@ -125,21 +123,20 @@ export class ArtifactStore {
     }
   }
   async createAttempt(generation: number): Promise<string> {
-    ensureLinux();
+    assertMaintenancePlatform();
     if (!Number.isSafeInteger(generation) || generation < 0) throw new MaintenanceFailure("maintenance_lost");
     const relative = `attempts/${generation}-${randomUUID()}`;
     await this.mkdirPrivate(relative); return path.join(this.root, relative);
   }
   async capability(): Promise<DurabilityCapability> {
-    ensureLinux(); await this.assertCurrent();
-    const stats = await statfs(this.root);
+    assertMaintenancePlatform(); await this.assertCurrent();
+    const filesystem = await maintenanceFilesystem(this.root);
     // Runtime probe on this exact filesystem. It records successful syscalls, not power-loss tests.
-    if (![0x794c7630, 0xef53, 0x58465342].includes(stats.type)) throw new MaintenanceFailure("unsupported_durability");
     const ref = await this.putBytes("source-file-payload", Buffer.from(`durability-probe:${randomUUID()}`));
     await this.confirmDurable(ref);
-    return { formatVersion: 1, kind: "capability", platform: "linux", filesystemType: String(stats.type),
+    return { formatVersion: 1, kind: "capability", ...filesystem,
       node: process.version, rootIdentity: this.identity,
-      guarantee: "observed-file-fsync-rename-directory-fsync", powerLossTested: false, probeDigest: ref.sha256 };
+      powerLossTested: false, probeDigest: ref.sha256 };
   }
   private reference(kind: ObjectKind, bytes: Uint8Array, body?: unknown): ArtifactRef {
     if (!KINDS.has(kind)) throw new MaintenanceFailure("snapshot_invalid");
@@ -161,7 +158,7 @@ export class ArtifactStore {
   }
   /** Import only an already closed regular file inside our unique attempt subtree. */
   async importDatabase(file: string): Promise<ArtifactRef> {
-    ensureLinux(); await this.assertCurrent();
+    assertMaintenancePlatform(); await this.assertCurrent();
     if (!file.startsWith(`${this.root}/attempts/`) || await realpath(file) !== file) throw new MaintenanceFailure("snapshot_invalid");
     const info = await lstat(file, { bigint: true });
     if (!info.isFile() || info.nlink !== 1n || info.size === 0n) throw new MaintenanceFailure("snapshot_invalid");
@@ -171,7 +168,7 @@ export class ArtifactStore {
     const ref = { ref: `snapshots/${sha}/database-snapshot.bin`, sha256: sha, bytes: String(info.size) };
     await this.mkdirPrivate(`snapshots/${sha}`);
     const source = await open(file, constants.O_RDWR | constants.O_NOFOLLOW);
-    try { await source.chmod(0o600); await source.sync(); } finally { await source.close(); }
+    try { await source.chmod(0o600); await syncMaintenanceHandle(source); } finally { await source.close(); }
     await this.assertCurrent();
     try { await lstat(this.pathFor(ref)); await this.confirmDurable(ref); }
     catch (error) {
@@ -183,7 +180,7 @@ export class ArtifactStore {
     await this.verifyFile(ref); return ref;
   }
   private async publish(ref: ArtifactRef, bytes: Uint8Array): Promise<ArtifactRef> {
-    ensureLinux(); await this.assertCurrent();
+    assertMaintenancePlatform(); await this.assertCurrent();
     await this.mkdirPrivate(path.posix.dirname(ref.ref));
     const target = this.pathFor(ref);
     try { await lstat(target); await this.confirmDurable(ref); return ref; }
@@ -192,7 +189,7 @@ export class ArtifactStore {
     const handle = await open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     try {
       await handle.writeFile(bytes); await this.options.after?.("temp_written");
-      await handle.sync(); await this.options.after?.("file_synced");
+      await syncMaintenanceHandle(handle); await this.options.after?.("file_synced");
     } finally { await handle.close(); }
     await this.assertCurrent(); await rename(temp, target); await this.options.after?.("renamed");
     await syncDirectory(path.dirname(target)); await this.options.after?.("directory_synced");
@@ -233,9 +230,9 @@ export class ArtifactStore {
   }
   /** Resync an already published immutable name; this invocation does not perform a rename. */
   async confirmDurable(ref: ArtifactRef): Promise<{ artifact: ArtifactRef; completed: readonly ["file_sync", "immutable_name_verified", "directory_sync"] }> {
-    ensureLinux(); await this.assertCurrent(); await this.verifyFile(ref);
+    assertMaintenancePlatform(); await this.assertCurrent(); await this.verifyFile(ref);
     const handle = await this.verifiedHandle(ref);
-    try { await handle.sync(); } finally { await handle.close(); }
+    try { await syncMaintenanceHandle(handle); } finally { await handle.close(); }
     for (let parent = path.dirname(this.pathFor(ref)); ; parent = path.dirname(parent)) {
       await syncDirectory(parent); if (parent === this.root) break;
     }

@@ -164,6 +164,12 @@ export function verifyStorageDrainReceipt(row: DbRow, expected: {
 
 async function currentProcessIdentity(): Promise<Record<string, unknown>> {
   const local = { version: 1, platform: process.platform, pid: process.pid, instanceId: randomUUID() };
+  if (process.platform === "darwin") {
+    try {
+      const { darwinCurrentProcessIdentity } = await import("./maintenance/darwin.ts");
+      return { ...local, ...darwinCurrentProcessIdentity() };
+    } catch { return { ...local, verification: "process_local_only" }; }
+  }
   if (process.platform !== "linux") return { ...local, verification: "process_local_only" };
   try {
     const [boot, namespace, stat] = await Promise.all([readFile("/proc/sys/kernel/random/boot_id", "utf8"),

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3";
@@ -47,41 +47,41 @@ interface Ctx {
 }
 
 async function withCtx<T>(fn: (ctx: Ctx) => Promise<T> | T): Promise<T> {
-  const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-t59-"));
+  // macOS tmpdir can use /var while the source contract requires the real /private/var path.
+  const dir = await realpath(await mkdtemp(path.join(tmpdir(), "agent-studio-t59-")));
   const driver = new SqliteDriver({ dataDir: dir });
+  let lease: NativeManagementLease | undefined;
+  let readonlyLease: NativeManagementLease | undefined;
+  const cores: McpCore[] = [];
+  try {
     await driver.connect();
     await driver.migrate(migrations);
     const db = driver.handle;
-  runMigrations(db, migrations);
-  const sqlitePath = path.join(dir, "agent-studio.db");
-  const file = await stat(sqlitePath, { bigint: true });
-  const source = { kind: "sqlite" as const, dataDir: dir, sourcePath: sqlitePath, sqlitePath,
-    identity: { device: String(file.dev), inode: String(file.ino) } };
-  const lease = await openNativeManagementSource({ source, mode: "write" });
-  const readonlyLease = await openNativeManagementSource({ source, mode: "readonly-dry-run" });
-  const repos = createRepositories(driver);
-  const project = (await ((await (repos.projects.create({ name: "P" })))));
-  const group = (await ((await (repos.groups.create({ projectId: project.id, name: "G" })))));
-  const cores: McpCore[] = [];
-  const join: Ctx["join"] = async (key, name, hostType) => {
-    const core = createMcpCore({ logger: silentLogger, db: driver, memberKey: key });
-    cores.push(core);
-    const result = await core.join("sess", {
-      displayName: name,
-      hostType,
-      projectId: project.id,
-      groupId: group.id,
-    });
-    return { core, memberId: result.memberId };
-  };
-  try {
+    runMigrations(db, migrations);
+    const sqlitePath = path.join(dir, "agent-studio.db");
+    const file = await stat(sqlitePath, { bigint: true });
+    const source = { kind: "sqlite" as const, dataDir: dir, sourcePath: sqlitePath, sqlitePath,
+      identity: { device: String(file.dev), inode: String(file.ino) } };
+    lease = await openNativeManagementSource({ source, mode: "write" });
+    readonlyLease = await openNativeManagementSource({ source, mode: "readonly-dry-run" });
+    const repos = createRepositories(driver);
+    const project = await repos.projects.create({ name: "P" });
+    const group = await repos.groups.create({ projectId: project.id, name: "G" });
+    const join: Ctx["join"] = async (key, name, hostType) => {
+      const core = createMcpCore({ logger: silentLogger, db: driver, memberKey: key });
+      cores.push(core);
+      const result = await core.join("sess", { displayName: name, hostType, projectId: project.id, groupId: group.id });
+      return { core, memberId: result.memberId };
+    };
     return await fn({ db, lease, readonlyLease, repos, projectId: project.id, groupId: group.id, join });
   } finally {
-    for (const c of cores) await c.close();
-    await readonlyLease.close();
-    await lease.close();
-    await driver.close();
-    await rm(dir, { recursive: true, force: true });
+    // A failed source/lease initialization must still close resources created before it.
+    const errors: unknown[] = [];
+    for (const close of [...cores.map(core => () => core.close()), () => readonlyLease?.close(), () => lease?.close(),
+      () => driver.close(), () => rm(dir, { recursive: true, force: true })]) {
+      try { await close(); } catch (error) { errors.push(error); }
+    }
+    if (errors.length) throw new AggregateError(errors, "host migration fixture cleanup failed");
   }
 }
 

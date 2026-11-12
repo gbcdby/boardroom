@@ -19,17 +19,18 @@ export interface PathIdentity {
   readonly inode: string;
 }
 export interface ControlRootIdentity extends PathIdentity { readonly hostIdentityDigest: string }
-export interface DurabilityCapability {
+interface DurabilityCapabilityBase {
   readonly formatVersion: 1;
   readonly kind: "capability";
-  readonly platform: "linux";
-  readonly filesystemType: string;
   readonly node: string;
   readonly rootIdentity: ControlRootIdentity;
-  readonly guarantee: "observed-file-fsync-rename-directory-fsync";
   readonly powerLossTested: false;
   readonly probeDigest: string;
 }
+export type DurabilityCapability = DurabilityCapabilityBase & (
+  | { readonly platform: "linux"; readonly filesystemType: string; readonly guarantee: "observed-file-fsync-rename-directory-fsync" }
+  | { readonly platform: "darwin"; readonly filesystemType: "apfs"; readonly guarantee: "observed-file-and-directory-fullfsync-rename" }
+);
 export interface PlannedPath {
   readonly path: string;
   readonly existingAncestor: PathIdentity;

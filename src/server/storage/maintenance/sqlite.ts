@@ -10,6 +10,8 @@ import { canonicalJson, digestJson } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { maintenanceHostIdentityDigest } from "./host.ts";
 import { ArtifactStore } from "./objects.ts";
+import { assertDarwinSqliteSource, bindDarwinSqliteSource, darwinSourceHandles, darwinSourceInventory } from "./darwin.ts";
+import { fullSyncDarwinDatabaseHandle, syncMaintenanceHandle } from "./platform.ts";
 import { readSqliteManifests } from "./sqlite-manifests.ts";
 import type { AnchorChange, Blocker, ControlRootIdentity, DatabaseManifests, Json, MaintenanceAdapter, OperationMutex, SourceLock, SourceObservation } from "./types.ts";
 
@@ -35,12 +37,21 @@ function directoryChain(file: string) {
 }
 interface MutexLease extends OperationMutex { readonly root: ControlRootIdentity; readonly db: Database.Database; active: boolean }
 
+function configureDurableSqlite(db: Database.Database): void {
+  db.pragma("synchronous=FULL");
+  if (process.platform !== "darwin") return;
+  db.pragma("fullfsync=ON"); db.pragma("checkpoint_fullfsync=ON");
+  if (db.pragma("synchronous", { simple: true }) !== 2 || db.pragma("fullfsync", { simple: true }) !== 1
+    || db.pragma("checkpoint_fullfsync", { simple: true }) !== 1) throw new MaintenanceFailure("unsupported_durability");
+}
+
 class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   readonly dialect = "sqlite" as const;
   private readonly source: SqliteDatabaseDescriptor;
   private readonly sourceFd: number;
   private readonly sourceDirectories: ReturnType<typeof directoryChain>;
-  private readonly ownFds = new Map<number, string>();
+  private readonly ownFds = new Map<string, string>();
+  private readonly darwinConnections = new Set<Database.Database>();
   private mutex: MutexLease | null = null;
   private currentLock: Database.Database | null = null;
   private closed = false;
@@ -55,7 +66,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       if (String(info.dev) !== source.identity.device || String(info.ino) !== source.identity.inode || info.nlink !== 1n) {
         closeSync(this.sourceFd); throw new MaintenanceFailure("source_changed");
       }
-      this.ownFds.set(this.sourceFd, `${info.dev}:${info.ino}`);
+      this.ownFds.set(`fd:${this.sourceFd}`, `${info.dev}:${info.ino}`);
     } catch { throw new MaintenanceFailure("source_changed"); }
   }
   private assertSource(): void {
@@ -69,16 +80,32 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
         try { fileIdentity(this.source.sqlitePath + suffix); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       }
+      if (process.platform === "darwin") {
+        for (const database of this.darwinConnections) assertDarwinSqliteSource(database);
+        const current = new Set([`${info.dev}:${info.ino}`]);
+        for (const suffix of ["-wal", "-shm"]) {
+          try { const identity = fileIdentity(this.source.sqlitePath + suffix); current.add(`${identity.device}:${identity.inode}`); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        }
+        // A still-open native sidecar must remain the same named file. Renaming it is not "closed".
+        for (const [key, expected] of this.ownFds) if (key.startsWith("fd:")) {
+          try {
+            const native = fstatSync(Number(key.slice(3)), { bigint: true });
+            if (`${native.dev}:${native.ino}` === expected && (native.nlink !== 1n || !current.has(expected))) throw new Error("native source changed");
+          } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EBADF") throw error; }
+        }
+      }
     } catch { throw new MaintenanceFailure("source_changed"); }
   }
-  private relevantFds(): Map<number, string> {
-    const result = new Map<number, string>();
+  private relevantFds(): Map<string, string> {
+    if (process.platform === "darwin") return darwinSourceHandles([this.source.sqlitePath, this.source.sqlitePath + "-wal", this.source.sqlitePath + "-shm"]);
+    const result = new Map<string, string>();
     if (process.platform !== "linux") return result;
     for (const entry of readdirSync("/proc/self/fd")) {
       try {
         const file = `/proc/self/fd/${entry}`, target = readlinkSync(file).replace(/ \(deleted\)$/, "");
         if (![this.source.sqlitePath, this.source.sqlitePath + "-wal", this.source.sqlitePath + "-shm"].includes(target)) continue;
-        const info = statSync(file, { bigint: true }); result.set(Number(entry), `${info.dev}:${info.ino}`);
+        const info = statSync(file, { bigint: true }); result.set(`fd:${entry}`, `${info.dev}:${info.ino}`);
       } catch (error) { if (!["ENOENT", "EBADF"].includes(String((error as NodeJS.ErrnoException).code))) throw error; }
     }
     return result;
@@ -92,13 +119,33 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     const db = new Database(this.source.sqlitePath, { readonly, fileMustExist: true, timeout: 0 });
     try {
       this.assertSource();
-      if (readonly) db.pragma("query_only=ON"); else db.pragma("synchronous=FULL");
+      if (process.platform === "darwin") { bindDarwinSqliteSource(db); this.darwinConnections.add(db); }
+      if (readonly) db.pragma("query_only=ON"); else configureDurableSqlite(db);
       db.pragma("busy_timeout=0");
-      for (const [fd, identity] of this.relevantFds()) if (before.get(fd) !== identity) this.ownFds.set(fd, identity);
+      if (process.platform === "darwin") db.pragma("schema_version"); // Open the real WAL/SHM reader handles before attributing them.
+      const opened = this.relevantFds();
+      for (const [fd, identity] of opened) if (before.get(fd) !== identity) this.ownFds.set(fd, identity);
+      if (!readonly) this.fullSyncSource();
       return db;
-    } catch (error) { db.close(); this.purgeClosedFds(); throw error; }
+    } catch (error) { this.darwinConnections.delete(db); db.close(); this.purgeClosedFds(); throw error; }
   }
-  private closeSource(db: Database.Database): void { db.close(); this.purgeClosedFds(); }
+  private closeSource(db: Database.Database): void { this.darwinConnections.delete(db); db.close(); this.purgeClosedFds(); }
+  private beginSourceWrite(db: Database.Database): void {
+    if (process.platform !== "darwin") { db.exec("BEGIN IMMEDIATE"); return; }
+    const before = this.relevantFds();
+    db.exec("BEGIN IMMEDIATE");
+    // A first write may create WAL/SHM after open. Only this synchronous native operation owns its new handles.
+    for (const [key, identity] of this.relevantFds()) if (before.get(key) !== identity) this.ownFds.set(key, identity);
+    this.assertSource(); this.fullSyncSource();
+  }
+  private fullSyncSource(): void {
+    if (process.platform !== "darwin") return;
+    this.assertSource();
+    const current = this.relevantFds();
+    for (const [key, identity] of this.ownFds) if (key.startsWith("fd:") && current.get(key) === identity)
+      fullSyncDarwinDatabaseHandle(Number(key.slice(3)), identity);
+    this.assertSource();
+  }
   private observation(db: Database.Database): SourceObservation {
     this.assertSource();
     const state = readSqliteMaintenanceState(db, true)!;
@@ -123,7 +170,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     const control = this.openSource(false); const mutexFile = path.join(root.path, "mutex.sqlite");
     let mutexIdentity: Json;
     try {
-      control.exec("BEGIN IMMEDIATE");
+      this.beginSourceWrite(control);
       const state = readSqliteMaintenanceState(control, true)!;
       if (!same(state, expected)) throw new MaintenanceFailure("maintenance_lost");
       if (state.controlRootJson === null && state.mutexIdentityJson === null) {
@@ -134,15 +181,15 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
         fileIdentity(mutexFile);
         const initial = new Database(mutexFile, { fileMustExist: true, timeout: 0 });
         try {
-          initial.pragma("synchronous=FULL");
+          configureDurableSqlite(initial);
           const schema = initial.prepare("SELECT name FROM sqlite_schema").all();
           if (!schema.length) initial.exec("BEGIN IMMEDIATE; CREATE TABLE maintenance_mutex(id INTEGER PRIMARY KEY CHECK(id=1)); INSERT INTO maintenance_mutex VALUES(1); COMMIT");
           this.checkMutexSchema(initial);
         } finally { initial.close(); }
         const handle = await open(mutexFile, constants.O_RDONLY | constants.O_NOFOLLOW);
-        try { await handle.sync(); } finally { await handle.close(); }
+        try { await syncMaintenanceHandle(handle); } finally { await handle.close(); }
         const directory = await open(root.path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-        try { await directory.sync(); } finally { await directory.close(); }
+        try { await syncMaintenanceHandle(directory); } finally { await directory.close(); }
         mutexIdentity = { kind: "sqlite-operation-mutex", ...fileIdentity(mutexFile) };
         control.prepare("UPDATE storage_maintenance SET control_root_json=?,mutex_identity_json=? WHERE singleton=1")
           .run(canonicalJson(root), canonicalJson(mutexIdentity));
@@ -152,11 +199,11 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
         try { if (!same(mutexIdentity, { kind: "sqlite-operation-mutex", ...fileIdentity(mutexFile) })) throw new Error(); }
         catch { throw new MaintenanceFailure("control_root_mismatch"); }
       }
-      this.assertSource(); await store.assertRoot(); control.exec("COMMIT");
+      this.assertSource(); await store.assertRoot(); control.exec("COMMIT"); this.fullSyncSource();
     } catch (error) { if (control.inTransaction) control.exec("ROLLBACK"); failure(error); }
     finally { this.closeSource(control); }
     let db: Database.Database | undefined;
-    try { db = new Database(mutexFile, { fileMustExist: true, timeout: 0 }); db.pragma("synchronous=FULL"); this.checkMutexSchema(db); db.exec("BEGIN IMMEDIATE"); }
+    try { db = new Database(mutexFile, { fileMustExist: true, timeout: 0 }); configureDurableSqlite(db); this.checkMutexSchema(db); db.exec("BEGIN IMMEDIATE"); }
     catch (error) { db?.close(); return failure(error); }
     const lease: MutexLease = { root, identity: mutexIdentity!, db: db!, active: true,
       assertHeld: async () => {
@@ -179,7 +226,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     await mutex.assertHeld();
     const db = this.openSource(false); let active = true;
     try {
-      db.exec("BEGIN IMMEDIATE"); this.currentLock = db;
+      this.beginSourceWrite(db); this.currentLock = db;
       try { assertSqliteGuardCoverage(db); } catch { throw new MaintenanceFailure("schema_guard_incomplete"); }
       if (kind === "snapshot" && readSqliteMaintenanceState(db, true)!.admission !== "sealed") throw new MaintenanceFailure("maintenance_lost");
       const assertHeld = async () => {
@@ -196,7 +243,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
           const result = await this.backup(db, mutex, destination); await assertHeld(); return result;
         },
       };
-      const result = await callback(lock); await assertHeld(); db.exec("COMMIT"); return result;
+      const result = await callback(lock); await assertHeld(); db.exec("COMMIT"); this.fullSyncSource(); return result;
     } catch (error) {
       if (db.inTransaction) db.exec("ROLLBACK");
       if (error instanceof MaintenanceFailure) throw error;
@@ -246,14 +293,14 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       if (progress.remainingPages !== 0 || !same(manifests, readSqliteManifests(reader))) throw new MaintenanceFailure("snapshot_invalid");
       reader.exec("COMMIT");
       const target = new Database(destination, { fileMustExist: true });
-      try { target.pragma("wal_checkpoint(TRUNCATE)"); target.pragma("journal_mode=DELETE"); }
+      try { configureDurableSqlite(target); target.pragma("wal_checkpoint(TRUNCATE)"); target.pragma("journal_mode=DELETE"); }
       finally { target.close(); }
       const info = await stat(destination, { bigint: true });
       const targetFile = await open(destination, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
         const header = Buffer.alloc(16); await targetFile.read(header, 0, 16, 0);
         if (info.size < 512n || header.toString("binary") !== "SQLite format 3\0") throw new MaintenanceFailure("snapshot_invalid");
-        await targetFile.sync();
+        await syncMaintenanceHandle(targetFile);
       } finally { await targetFile.close(); }
       try { if ((await stat(destination + "-wal")).size !== 0) throw new MaintenanceFailure("snapshot_invalid"); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -288,11 +335,19 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   }
   async inspectWriters(_observation: SourceObservation): Promise<readonly Blocker[]> {
     this.assertSource();
-    if (process.platform !== "linux" || process.getuid === undefined) return [{ code: "source_writer_unknown", subjectRef: "os-inventory-unavailable" }];
+    if (!["linux", "darwin"].includes(process.platform) || process.getuid === undefined) return [{ code: "source_writer_unknown", subjectRef: "os-inventory-unavailable" }];
     this.purgeClosedFds(); const blockers: Blocker[] = [];
     const sourcePaths = [this.source.sqlitePath, this.source.sqlitePath + "-wal", this.source.sqlitePath + "-shm"];
     const sessions = path.join(this.source.dataDir, "managed", "sessions");
-    for (const pid of (await readdir("/proc")).filter(entry => /^[1-9][0-9]*$/.test(entry))) {
+    if (process.platform === "darwin") {
+      try {
+        for (const item of darwinSourceInventory({ files: sourcePaths, trees: [sessions] }, false).items) {
+          if (item.kind === "unreadable") blockers.push({ code: "source_writer_unknown", subjectRef: `unreadable-process:${item.pid}` });
+          else if (item.pid !== process.pid || this.ownFds.get(item.key) !== `${item.device}:${item.inode}`)
+            blockers.push({ code: "source_writer_unknown", subjectRef: `os-process:${item.pid}` });
+        }
+      } catch { blockers.push({ code: "source_writer_unknown", subjectRef: "os-inventory-unavailable" }); }
+    } else for (const pid of (await readdir("/proc")).filter(entry => /^[1-9][0-9]*$/.test(entry))) {
       try {
         if ((await stat(`/proc/${pid}`)).uid !== process.getuid()) continue;
         for (const fd of await readdir(`/proc/${pid}/fd`)) {
@@ -300,7 +355,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
             const file = `/proc/${pid}/fd/${fd}`, target = (await readlink(file)).replace(/ \(deleted\)$/, "");
             if (!sourcePaths.includes(target) && target !== sessions && !target.startsWith(`${sessions}/`)) continue;
             const info = await stat(file, { bigint: true });
-            if (Number(pid) === process.pid && this.ownFds.get(Number(fd)) === `${info.dev}:${info.ino}`) continue;
+            if (Number(pid) === process.pid && this.ownFds.get(`fd:${fd}`) === `${info.dev}:${info.ino}`) continue;
             blockers.push({ code: "source_writer_unknown", subjectRef: `os-process:${pid}` });
           } catch (error) { if (!["ENOENT", "ESRCH", "EBADF"].includes(String((error as NodeJS.ErrnoException).code))) blockers.push({ code: "source_writer_unknown", subjectRef: `unreadable-process:${pid}` }); }
         }

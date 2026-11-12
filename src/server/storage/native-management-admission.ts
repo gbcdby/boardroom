@@ -1,5 +1,6 @@
 /** #152 r3 §5.4：原生管理能力与固定迁移操作共同封装，无 raw handle / 任意 SQL 回调。 */
 import Database from "better-sqlite3";
+import { darwinCurrentProcessIdentity } from "./maintenance/darwin.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readFileSync, readlinkSync } from "node:fs";
 import { hostname } from "node:os";
@@ -64,6 +65,10 @@ function digest(value: unknown): string { return createHash("sha256").update(can
 
 function currentProcessIdentity(instanceId: string): Record<string, unknown> {
   const local = { version: 1, platform: process.platform, pid: process.pid, instanceId };
+  if (process.platform === "darwin") {
+    try { return { ...local, ...darwinCurrentProcessIdentity() }; }
+    catch { return { ...local, verification: "process_local_only" }; }
+  }
   if (process.platform === "linux") {
     try {
       const kernelBootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();

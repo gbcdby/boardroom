@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { mkdtemp, readdir, rm, stat, writeFile, mkdir, rename } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
@@ -13,9 +12,9 @@ import { digestJson } from "../src/server/storage/maintenance/canonical.ts";
 import { postgresDescriptorDigest } from "../src/server/storage/maintenance/postgres-tools.ts";
 import type { MaintenanceAdapter } from "../src/server/storage/maintenance/types.ts";
 
-const linuxTest = process.platform === "linux" ? test : test.skip;
+const platformTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
 async function fixture() {
-  const dir = await mkdtemp(path.join(tmpdir(), "br-plan-"));
+  const dir = await mkdtemp(path.join(path.dirname(process.cwd()), "br-plan-"));
   const dataDir = path.join(dir, "data"); await mkdir(dataDir);
   const file = path.join(dataDir, "agent-studio.db"), configFile = path.join(dir, "config.json");
   const writer = new Database(file); writer.exec("CREATE TABLE plan_observation(value TEXT)");
@@ -28,7 +27,7 @@ async function fixture() {
   return { dir, dataDir, file, configFile, writer, adapter, options, async close() { await adapter.close(); writer.close(); await rm(dir, { recursive: true, force: true }); } };
 }
 
-linuxTest("#152 explicit plan is a readonly observation; persist only writes the selected private control root", async () => {
+platformTest("#152 explicit plan is a readonly observation; persist only writes the selected private control root", async () => {
   const f = await fixture();
   try {
     const before = await f.adapter.observe(), names = await readdir(f.dataDir);
@@ -47,7 +46,7 @@ linuxTest("#152 explicit plan is a readonly observation; persist only writes the
   } finally { await f.close(); }
 });
 
-linuxTest("#152 preview data is not an execution fence; schema/config/target drift requires a new immutable plan", async () => {
+platformTest("#152 preview data is not an execution fence; schema/config/target drift requires a new immutable plan", async () => {
   const f = await fixture();
   try {
     const plan = await planMigration(f.options, f.adapter);
@@ -64,7 +63,7 @@ linuxTest("#152 preview data is not an execution fence; schema/config/target dri
   } finally { await f.close(); }
 });
 
-linuxTest("#152 plan rejects missing/replaced source, an unrecognized control root and protected destination overlap", async () => {
+platformTest("#152 plan rejects missing/replaced source, an unrecognized control root and protected destination overlap", async () => {
   const f = await fixture();
   try {
     await assert.rejects(planMigration({ ...f.options, controlRoot: path.join(f.options.environment.runtimeRoot, "control") }, f.adapter), /control_root_mismatch/);
@@ -80,7 +79,7 @@ linuxTest("#152 plan rejects missing/replaced source, an unrecognized control ro
   } finally { await f.close(); }
 });
 
-linuxTest("#152 plan binds a PG observation to the selected descriptor digest (unit boundary, no PG claim)", async () => {
+platformTest("#152 plan binds a PG observation to the selected descriptor digest (unit boundary, no PG claim)", async () => {
   const f = await fixture();
   try {
     const original = await f.adapter.observe();

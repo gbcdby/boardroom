@@ -10,6 +10,7 @@ import { maintenanceHostIdentityDigest } from "./host.ts";
 import { buildDatabaseManifests } from "./manifests.ts";
 import { listPostgresTables, quotePostgresIdentifier as quote, readPostgresCatalog, readPostgresEnvironment, readPostgresManifests,
   readPostgresRoles, type PostgresTable } from "./postgres-manifests.ts";
+import { assertPostgresServerCapability, stablePostgresSourceIdentity, type PostgresDatabaseIdentity } from "./postgres-identity.ts";
 import { parsePostgresConnection, postgresDatabaseArgument, postgresToolVersions, runPostgresTool, waitForPostgresTools,
   type PostgresConnection, type PostgresDescriptor } from "./postgres-tools.ts";
 import type { AnchorChange, Blocker, BlockerCode, ControlRootIdentity, DatabaseManifests, Json,
@@ -24,24 +25,11 @@ interface Session {
   ending: boolean;
   ended: boolean;
 }
-interface DatabaseIdentity {
-  readonly systemIdentifier: string;
-  readonly databaseOid: string;
-  readonly databaseName: string;
-  readonly schemaOid: string | null;
-  readonly schemaName: string;
-  readonly serverAddress: string | null;
-  readonly serverPort: number | null;
-  readonly postmasterStartedAt: string;
-  readonly serverVersion: string;
-  readonly fsync: string;
-  readonly inRecovery: boolean;
-}
 interface HeldMutex {
   readonly session: Session;
   readonly root: ControlRootIdentity;
   readonly identity: Json;
-  readonly sourceIdentity: DatabaseIdentity;
+  readonly sourceIdentity: PostgresDatabaseIdentity;
   readonly marker: string;
   readonly high: number;
   readonly low: number;
@@ -113,6 +101,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   const abort = new AbortController();
   let closed = false, lost = false, mutex: HeldMutex | undefined, lockActive = false;
   let firstSourceIdentity: Json | undefined, mutexTimer: ReturnType<typeof setInterval> | undefined;
+  let firstServerIdentity: PostgresDatabaseIdentity | undefined;
   let assertSnapshotLock: (() => Promise<void>) | undefined;
   const invalidate = () => { lost = true; abort.abort(); };
   function assertOpen(): void {
@@ -143,7 +132,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       throw safeError(error, sourceSession ? "source_missing" : "restore_verification_unavailable");
     }
   }
-  async function readIdentity(session: Session, connection: PostgresConnection, requireSchema: boolean): Promise<DatabaseIdentity> {
+  async function readIdentity(session: Session, connection: PostgresConnection, requireSchema: boolean): Promise<PostgresDatabaseIdentity> {
     const row = (await session.client.query(`SELECT control.system_identifier::text AS system_identifier,
       d.oid::text AS database_oid,d.datname AS database_name,n.oid::text AS schema_oid,
       inet_server_addr()::text AS server_address,inet_server_port() AS server_port,
@@ -153,17 +142,23 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       LEFT JOIN pg_catalog.pg_namespace n ON n.nspname=$1 WHERE d.datname=current_database()`, [connection.schema])).rows[0];
     if (!row || requireSchema && !row.schema_oid || row.database_name !== connection.database)
       throw new MaintenanceFailure("source_missing");
-    if (Math.floor(Number(row.server_version) / 10000) !== 16) throw new MaintenanceFailure("backup_capability_unavailable");
-    return { systemIdentifier: row.system_identifier, databaseOid: row.database_oid, databaseName: row.database_name,
+    const actual: PostgresDatabaseIdentity = { systemIdentifier: row.system_identifier, databaseOid: row.database_oid, databaseName: row.database_name,
       schemaOid: row.schema_oid, schemaName: connection.schema, serverAddress: row.server_address, serverPort: row.server_port,
       postmasterStartedAt: row.postmaster_started_at, serverVersion: row.server_version, fsync: row.fsync, inRecovery: row.in_recovery };
+    // Even a readonly adapter that currently holds no session cannot silently reconnect across a
+    // restart. The caller must build a new adapter and reacquire every physical/session capability.
+    if (session.source) {
+      if (firstServerIdentity && !same(firstServerIdentity, actual)) { invalidate(); throw new MaintenanceFailure("maintenance_lost"); }
+      firstServerIdentity ??= actual;
+    }
+    assertPostgresServerCapability(actual, "observe");
+    return actual;
   }
   async function observation(session: Session): Promise<SourceObservation> {
     const actual = await readIdentity(session, sourceConnection, true);
     const manifests = await readPostgresManifests(session.client, sourceConnection.schema);
     const state = parseStorageMaintenanceState(manifests.controlRows.storage_maintenance.map(row => ({ ...row })));
-    const sourceIdentity: Json = { formatVersion: 1, kind: "postgres", ...actual,
-      descriptorDigest: sourceConnection.descriptorDigest, databaseInstanceId: state.databaseInstanceId };
+    const sourceIdentity = stablePostgresSourceIdentity(actual, sourceConnection.descriptorDigest, state.databaseInstanceId);
     if (firstSourceIdentity !== undefined && !same(firstSourceIdentity, sourceIdentity)) throw new MaintenanceFailure("source_changed");
     firstSourceIdentity ??= sourceIdentity;
     return { source: { kind: "postgres", databaseInstanceId: state.databaseInstanceId, identityDigest: digestJson(sourceIdentity) },
@@ -202,11 +197,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     let acquired = false;
     try {
       const actual = await readIdentity(session, sourceConnection, true);
-      if (actual.fsync !== "on" || actual.inRecovery) throw new MaintenanceFailure("unsupported_durability");
+      assertPostgresServerCapability(actual, "execute");
       const current = await readPostgresMaintenanceState(session.client, { required: true });
       if (!same(current, expected)) throw new MaintenanceFailure("source_changed");
-      if (firstSourceIdentity && !same(firstSourceIdentity, { formatVersion: 1, kind: "postgres", ...actual,
-        descriptorDigest: sourceConnection.descriptorDigest, databaseInstanceId: expected.databaseInstanceId }))
+      if (firstSourceIdentity && !same(firstSourceIdentity, stablePostgresSourceIdentity(actual,
+        sourceConnection.descriptorDigest, expected.databaseInstanceId)))
         throw new MaintenanceFailure("source_changed");
       const keySource = { systemIdentifier: actual.systemIdentifier, databaseOid: actual.databaseOid,
         schemaOid: actual.schemaOid, databaseInstanceId: expected.databaseInstanceId };
@@ -258,8 +253,8 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     const session = await connect(sourceConnection, true);
     try {
       const identity = await readIdentity(session, sourceConnection, true);
-      if (!same(object(current.sourceIdentity).databaseOid, identity.databaseOid)
-        || object(current.sourceIdentity).systemIdentifier !== identity.systemIdentifier) throw new MaintenanceFailure("source_changed");
+      if (!same(current.sourceIdentity, stablePostgresSourceIdentity(identity,
+        sourceConnection.descriptorDigest, current.state.databaseInstanceId))) throw new MaintenanceFailure("source_changed");
       const registered = new Set<string>();
       for (const client of current.clients) {
         if (typeof client.db_sessions_json !== "string") continue;

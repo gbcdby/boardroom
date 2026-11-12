@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { mkdtemp, rm, stat, copyFile, rename } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
@@ -10,9 +9,9 @@ import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { createSqliteMaintenanceAdapter } from "../src/server/storage/maintenance/sqlite.ts";
 import type { SourceLock, AnchorChange, ArtifactRef } from "../src/server/storage/maintenance/types.ts";
 
-const linuxTest = process.platform === "linux" ? test : test.skip;
+const platformTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
 async function fixture() {
-  const dir = await mkdtemp(path.join(tmpdir(), "br-native-maintenance-"));
+  const dir = await mkdtemp(path.join(process.cwd(), "br-native-maintenance-"));
   const file = path.join(dir, "agent-studio.db");
   const db = new Database(file);
   db.exec("CREATE TABLE extra_values(v)"); runMigrations(db, migrations); db.pragma("journal_mode=WAL"); db.close();
@@ -38,7 +37,7 @@ async function enter(lock: SourceLock, store: ArtifactStore, mutexIdentity: Anch
   return journal;
 }
 
-linuxTest("#152 source-bound SQLite operation mutex survives observer close and rejects a missing bound lock file", async () => {
+platformTest("#152 source-bound SQLite operation mutex survives observer close and rejects a missing bound lock file", async () => {
   const f = await fixture(); const other = await createSqliteMaintenanceAdapter(f.descriptor);
   try {
     const mutex = await f.adapter.acquireMutex(f.store.identity, f.initial.state);
@@ -54,7 +53,7 @@ linuxTest("#152 source-bound SQLite operation mutex survives observer close and 
   } finally { await other.close(); await f.close(); }
 });
 
-linuxTest("#152 native lock serializes all control CAS and backup captures committed WAL with exact restored typed values", async () => {
+platformTest("#152 native lock serializes all control CAS and backup captures committed WAL with exact restored typed values", async () => {
   const f = await fixture(); const writer = new Database(f.file); writer.pragma("busy_timeout=1");
   let mutex;
   try {
@@ -86,7 +85,7 @@ linuxTest("#152 native lock serializes all control CAS and backup captures commi
   } finally { await mutex?.release(); writer.close(); await f.close(); }
 });
 
-linuxTest("#152 unknown source file users stay blockers; renamed source never opens a replacement empty DB", async () => {
+platformTest("#152 unknown source file users stay blockers; renamed source never opens a replacement empty DB", async () => {
   const f = await fixture();
   const external = new Database(f.file);
   try {
@@ -98,4 +97,19 @@ linuxTest("#152 unknown source file users stay blockers; renamed source never op
     await assert.rejects(f.adapter.observe(), /source_changed/);
     await assert.rejects(stat(f.file), { code: "ENOENT" });
   } finally { if (external.open) external.close(); await f.close(); }
+});
+
+platformTest("#152 repeated native readers under a held source lock preserve exact ownership when SQLite reuses FDs", async () => {
+  const f = await fixture();
+  try {
+    const mutex = await f.adapter.acquireMutex(f.store.identity, f.initial.state);
+    await f.adapter.withSourceLock("control", async lock => {
+      for (let i = 0; i < 4; i++) {
+        assert.deepEqual((await f.adapter.observe()).source, f.initial.source);
+        assert.deepEqual(await f.adapter.inspectWriters(await lock.observe()), []);
+        await lock.assertHeld();
+      }
+    });
+    await mutex.release();
+  } finally { await f.close(); }
 });

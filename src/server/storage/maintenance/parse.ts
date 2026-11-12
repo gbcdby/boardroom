@@ -13,10 +13,14 @@ const json: z.ZodType<unknown> = z.lazy(() => z.union([z.null(), z.boolean(), z.
 const ref = z.object({ ref: text, sha256: hash, bytes: z.string().regex(/^(0|[1-9][0-9]*)$/) }).strict();
 const source = z.object({ kind: z.enum(["sqlite", "postgres"]), databaseInstanceId: z.string().regex(/^[a-f0-9]{32}$/), identityDigest: hash }).strict();
 const identity = z.object({ path: text, device: z.string().regex(/^\d+$/), inode: z.string().regex(/^\d+$/) }).strict();
-const capability = z.object({ formatVersion: z.literal(1), kind: z.literal("capability"), platform: z.literal("linux"),
-  filesystemType: z.enum(["2035054128", "61267", "1481003842"]), node: text,
-  rootIdentity: identity.extend({ hostIdentityDigest: hash }).strict(), guarantee: z.literal("observed-file-fsync-rename-directory-fsync"),
-  powerLossTested: z.literal(false), probeDigest: hash }).strict();
+const capabilityBase = { formatVersion: z.literal(1), kind: z.literal("capability"), node: text,
+  rootIdentity: identity.extend({ hostIdentityDigest: hash }).strict(), powerLossTested: z.literal(false), probeDigest: hash };
+const capability = z.discriminatedUnion("platform", [
+  z.object({ ...capabilityBase, platform: z.literal("linux"), filesystemType: z.enum(["2035054128", "61267", "1481003842"]),
+    guarantee: z.literal("observed-file-fsync-rename-directory-fsync") }).strict(),
+  z.object({ ...capabilityBase, platform: z.literal("darwin"), filesystemType: z.literal("apfs"),
+    guarantee: z.literal("observed-file-and-directory-fullfsync-rename") }).strict(),
+]);
 const planned = z.object({ path: text, existingAncestor: identity, absentSegments: z.array(text) }).strict();
 const root = z.object({ label: z.enum(["config", "managed-sessions"]), path: text, expected: planned }).strict();
 const capture = z.object({ migrationId: id, source, planDigest: hash, fenceEpoch: counter, journal: ref,

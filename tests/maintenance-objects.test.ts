@@ -1,13 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat, writeFile, rename, symlink } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { canonicalJson, digestJson } from "../src/server/storage/maintenance/canonical.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 
 const source = { kind: "sqlite" as const, databaseInstanceId: "1".repeat(32), identityDigest: "2".repeat(64) };
-const linuxTest = process.platform === "linux" ? test : test.skip;
+const platformTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
 
 test("#152 canonical bodies preserve order-sensitive arrays and refuse lossy/non-JSON values", () => {
   assert.equal(canonicalJson({ z: [2, 1], a: "中" }), '{"a":"中","z":[2,1]}');
@@ -18,8 +17,8 @@ test("#152 canonical bodies preserve order-sensitive arrays and refuse lossy/non
   assert.throws(() => canonicalJson(cycle), /journal_invalid/);
 });
 
-linuxTest("#152 immutable artifact publication reads exact bytes and refuses corruption or root replacement", async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), "br-objects-"));
+platformTest("#152 immutable artifact publication reads exact bytes and refuses corruption or root replacement", async () => {
+  const dir = await mkdtemp(path.join(process.cwd(), "br-objects-"));
   const root = path.join(dir, "control");
   try {
     const store = await ArtifactStore.create(root, source);
@@ -38,8 +37,8 @@ linuxTest("#152 immutable artifact publication reads exact bytes and refuses cor
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-linuxTest("#152 publication fault before directory sync never yields a successful reference; orphan bytes remain untrusted", async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), "br-objects-crash-"));
+platformTest("#152 publication fault before directory sync never yields a successful reference; orphan bytes remain untrusted", async () => {
+  const dir = await mkdtemp(path.join(process.cwd(), "br-objects-crash-"));
   try {
     const store = await ArtifactStore.create(path.join(dir, "control"), source, { after: point => {
       if (point === "renamed") throw new Error("injected publication crash");
@@ -53,7 +52,7 @@ linuxTest("#152 publication fault before directory sync never yields a successfu
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-linuxTest("#152 capability probes the actual control filesystem and reports only observed syscalls", async t => {
+platformTest("#152 capability probes the actual control filesystem and reports only observed syscalls", async t => {
   const dir = await mkdtemp(path.join(process.cwd(), "maintenance-capability-test-"));
   try {
     const operations: string[] = [];

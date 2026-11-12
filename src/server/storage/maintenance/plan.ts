@@ -6,6 +6,7 @@ import { canonicalizePath } from "../../environment.ts";
 import { canonicalJson, digestJson, sha256 } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { ArtifactStore } from "./objects.ts";
+import { assertMaintenancePlatform } from "./platform.ts";
 import { parsePlan } from "./parse.ts";
 import { postgresDescriptorDigest } from "./postgres-tools.ts";
 import type { FileRoot, MaintenanceAdapter, MaintenanceServiceOptions, MigrationPlan, PersistedPlanRef, PlannedPath, SourceObservation, SourceRef } from "./types.ts";
@@ -105,7 +106,8 @@ export async function planMigration(options: MaintenanceServiceOptions, adapter:
   if (locations.controlRoot.absentSegments.length === 0) await ArtifactStore.open(locations.controlRoot.path, observation.source);
   const blockers = [...await adapter.inspectWriters(observation)];
   if (observation.state.admission !== "open") blockers.push({ code: "maintenance_busy", subjectRef: "source-admission" });
-  if (process.platform !== "linux") blockers.push({ code: "unsupported_durability", subjectRef: "host-platform" });
+  try { assertMaintenancePlatform(); }
+  catch { blockers.push({ code: "unsupported_durability", subjectRef: "host-platform" }); }
   return parsePlan({ formatVersion: 1, kind: "plan", migrationId: randomUUID(), source: observation.source, sourceIdentity: observation.sourceIdentity,
     originalCwd: path.resolve(options.originalCwd), originalConfigPath: options.environment.configFile,
     configDigest: await configDigest(options.environment.configFile), effectiveConfigDigest: effectiveConfigDigest(options),
