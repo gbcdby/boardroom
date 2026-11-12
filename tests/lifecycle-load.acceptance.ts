@@ -202,7 +202,10 @@ for (const engine of ['sqlite', 'postgres'] as const) {
                 const settled = await Promise.allSettled([mutation, heartbeat, traffic] as const);
                 const failure = settled.find(result => result.status === 'rejected');
                 if (failure?.status === 'rejected') {
-                  report.operations.push({ historyMessages, step, operation, status: 'FAIL', mutation: budget.measure(), error: String(failure.reason) });
+                  report.operations.push({ historyMessages, step, operation, status: 'FAIL', mutation: budget.measure(),
+                    sqlTrace: budget.statements,
+                    settled: settled.map((result, index) => ({ branch: ['mutation', 'heartbeat', 'traffic'][index], status: result.status })),
+                    error: String(failure.reason) });
                   throw failure.reason;
                 }
                 const [changed, beat, chat] = settled.map(result => (result as PromiseFulfilledResult<unknown>).value) as [Awaited<typeof mutation>, Awaited<typeof heartbeat>, Awaited<typeof traffic>];

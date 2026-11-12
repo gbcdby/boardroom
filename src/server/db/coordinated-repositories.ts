@@ -118,6 +118,8 @@ export function coordinateRepositoryWrites(repos: RepositorySet): RepositorySet 
   repos.deliveries.ensure = coordinate(repos.deliveries.ensure.bind(repos.deliveries), ([id, memberId]) => delivery(id, memberId));
   repos.deliveries.recordAttempt = coordinate(repos.deliveries.recordAttempt.bind(repos.deliveries), ([id, memberId]) => delivery(id, memberId));
   repos.deliveries.markMcpDelivered = coordinate(repos.deliveries.markMcpDelivered.bind(repos.deliveries), ([id, memberId]) => delivery(id, memberId));
+  repos.deliveries.markMcpDeliveredBatch = coordinate(repos.deliveries.markMcpDeliveredBatch.bind(repos.deliveries), ([scope]) =>
+    projectPlan(scope.projectId, async () => ({ memberIds: [scope.memberId], groupIds: [scope.groupId], runtimeIds: [] })));
   repos.deliveries.delete = coordinate(repos.deliveries.delete.bind(repos.deliveries), ([id, memberId]) => delivery(id, memberId));
   repos.statuses.set = coordinate(repos.statuses.set.bind(repos.statuses), ([projectId, memberId]) => projectPlan(projectId, async tx => ({ ...empty(), memberIds: await checkedMembers(tx, projectId, [memberId]) })));
   repos.statuses.delete = coordinate(repos.statuses.delete.bind(repos.statuses), ([projectId, memberId]) => projectPlan(projectId, async tx => ({ ...empty(), memberIds: await checkedMembers(tx, projectId, [memberId]) })));
