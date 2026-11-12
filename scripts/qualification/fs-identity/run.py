@@ -938,7 +938,15 @@ def mount_group(root: Path, group_name: str, ev: Evidence, label: str) -> dict:
             ev.event("mount-guard-rejected", label=label, guard="requested-option-conflict",
                      key=key, requested=value, actual=actual[key])
             raise Stop(f"实际挂载选项冲突: {key}")
+    # Ubuntu linux-azure-7.0 的 bare nouserxattr 回报 userxattr=false；省略不作此推断。
+    # 从原 token 列表检查形状和次数，不能让 dict 折叠掩盖带值或重复回报。
+    negative_xattr = [option for option in entry["super_options"] if option.split("=", 1)[0] == "nouserxattr"]
+    if negative_xattr and negative_xattr != ["nouserxattr"]:
+        ev.event("mount-guard-rejected", label=label, guard="negative-xattr-token", tokens=negative_xattr)
+        raise Stop("实际 nouserxattr 回报含值或重复")
     allowed = set(requested) | {"rw", "relatime", "noatime", "nodiratime", "nosuid", "nodev", "noexec", "seclabel"}
+    if negative_xattr == ["nouserxattr"]:
+        allowed.add("nouserxattr")
     if set(actual) - allowed or "ro" in entry["mount_options"] or "volatile" in actual or "userxattr" in actual:
         ev.event("mount-guard-rejected", label=label, guard="actual-options",
                  unknown_options=sorted(set(actual) - allowed), read_only="ro" in entry["mount_options"],
