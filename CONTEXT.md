@@ -22,7 +22,7 @@
 | 自己参与的消息 | 2026-11-11 核对：普通 Agent 的聊天基线为自己发送 + 被 @；阶段 3 的合法任务关系可扩展当前授权群内的关联消息读取，但不扩大跨项目/跨群或 mention 唤醒范围。 | 决策票 #6；`docs/tasks-and-review.md`、`tests/tasks-service.test.ts` |
 | fixed point | 双轴评审的 diff 基准点（commit SHA、分支、tag 等）；评审记录必须可追溯，未提交候选另记录完整工作树身份。 | `docs/architecture/agent-studio.md` §6.7；`.agents/skills/worker-review/SKILL.md`（2026-11-10 技能迁移） |
 | 三层记忆 | Agent 全局记忆、项目共享记忆、项目+agent 记忆；作用域、读写权限和注入方式不同。 | `docs/architecture/agent-studio.md` §6.8 |
-| 状态看板 vs 跨项目总览 | 状态看板是项目成员明细（规范路由 `/projects/:projectId/status`，旧 `/status` 继续规范化）；`/` 是项目级概览。自 #31 起共用不绑项目的全局 human presence（memberId 级引用计数），不是切项目后只保留当前人的在线。 | 决策票 #31/#40；2026-11-11 核对 `src/web/src/router.ts` |
+| 状态看板 vs 跨项目总览 | 2026-11-11 S6 #138 候选更正旧路由记录：项目成员状态进入 `/projects/:projectId/members?tab=status`，旧 `/status` 与项目 `/status` 继续规范化；`/` 为不绑定当前项目的协作总览。自 #31 起共用全局 human presence（memberId 级引用计数），不因切项目只保留当前人的在线。 | 决策票 #31/#40、PR #149；`src/web/src/router.ts`、`useCurrentProject.ts`；CI43090889252 navigation 实测；候选未合并 |
 | 成员移除 vs 暂停 | 2026-11-11 的 v13 工程候选：暂停保留岗位；移除保留 Member 历史身份并推进 membershipRevision。显式重新添加复用 ID、用新代际且不默认复活旧群关系；撤销不复活旧 MCP/评审/托管/总结执行。 | `docs/t3-member-lifecycle.md`、`src/server/db/migrations/member-lifecycle.ts`、`tests/member-compensation.test.ts`；最终运行状态见 V1 索引 |
 
 ## 宿主差异（Claude Code / Codex CLI）
@@ -62,6 +62,7 @@
 | v13 复制/清库不能简单使用完全相反表序 | 成员和六类事实的真实 trigger 会生成/推进 member_fact_revisions；过早清它会使后续事实删除缺基准 | 复制最后用源值替换事实版本；清空先删事实、再删 Member/事实版本。不要停用 trigger 或伪造 revision | SQLite/PG 非空复制与项目 purge；当前工程实现，最终双引擎结果单列 | 2026-11-11 静态核对 `src/server/db/migrate-data.ts`、`tests/member-facts.test.ts`、`tests/migrate-data.test.ts` |
 | Agent 的 send/wait/ACK 通过，但网页实时列表仍停在旧消息 | 原 WebSocket 广播只装配在 HTTP 发消息回调，MCP 提交通知没有 WebUI 订阅者 | 同一服务进程的 WebUI 订阅 driver 粒度提交后通知，HTTP/MCP 共用消息视图；幂等重试不重播。协议与真实 DOM 分开验收 | 同进程 HTTP/MCP 服务；不扩大为跨进程 stdio 广播保证 | 2026-11-11 CI 42955289947 浏览器负例；`tests/chat-http-ws.test.ts` 真实 MCP/HTTP/WebSocket RED→GREEN，最新 DOM 结果单列 |
 | 群删除若直接用整个成员事实版本，其他群写入/ACK/空扫描也会使确认失效；原 API 删除提交后才写审计 | `member_fact_revisions` 按成员汇总多群事实，且观测推进不等于删除范围增加；分开事务会留下已删业务但无审计 | 捕获实际删除对象/关系的稳定投影；compare、purge 和审计共用原项目锁/事务。删群还需捕获最后绑定消失后才删除的 runtime reservation | #130 项目/群永久删除快照；不改变成员补偿的事实版本语义 | 2026-11-11 `src/server/db/purge-impact.ts`、`tests/purge-confirmation.test.ts` SQLite 同数替换/无关群/观测字段/失败回滚实测；PG/Chromium 由各自 CI 记录单列 |
+| 浏览器报告全 PASS，原生截图仍显示首次聊天未贴底、退出强制配色后白底浅字 | 负载脚本每轮预先滚底，未覆盖首次进入；媒体切换只比较边界 token，未检查实际画布。具体产品根因与修正须另据固定候选证明 | 分别验收正常/延迟历史加载、布局变化与主动翻阅历史；颜色模式进入/退出须检查实际截图和文字背景组合，不能只据 CSS 值或报告状态收口 | S6 #138/#144 的 Chromium 验收；不外推所有浏览器或真实手机键盘 | 2026-11-11 PR #149，CI43090889252 / tree8e86c0b3，artifact13890125303 的原图与 trace；两独立轴保留真实 CI 成功及视觉失败 |
 
 ## 待验证
 

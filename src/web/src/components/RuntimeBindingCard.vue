@@ -123,8 +123,8 @@ h3 { margin: 0; font-size: 1rem; } h4 { margin: 1.2rem 0 .65rem; font-size: .95r
 .running { color: var(--ok); } .summary.error { color: var(--bad); margin: 0; } .queued, .stopping { color: var(--warn); }
 .reason { font-size: .85rem; overflow-wrap: anywhere; margin-bottom: .65rem; }
 .reason code { font-size: .7rem; }
-.capability-notice, .pending-notice { padding: .65rem .8rem; background: rgba(175, 122, 25, .09); border-left: 3px solid #b78730; border-radius: 4px; font-size: .82rem; }
-.pending-notice { background: rgba(37, 99, 235, .07); border-color: var(--accent); }
+.capability-notice, .pending-notice { padding: .65rem .8rem; background: color-mix(in srgb, var(--warn) 9%, var(--card-bg)); border-left: 3px solid var(--warn); border-radius: 4px; font-size: .82rem; }
+.pending-notice { background: var(--accent-soft); border-color: var(--accent); }
 .runtime-state-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; margin: 1.3rem 0 .7rem; }
 .delivery-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 1rem; }
 .permission-line { margin-bottom: 1.2rem; }

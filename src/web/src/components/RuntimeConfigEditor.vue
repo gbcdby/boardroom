@@ -81,7 +81,7 @@ function toggle(field: keyof RuntimeConfigDto, event: Event): void {
 .full { grid-column: 1 / -1; }
 .field-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .45rem; align-items: center; font-size: .9rem; }
 .inherit-toggle { display: inline-flex; align-items: center; gap: .3rem; color: var(--muted); font-size: .8rem; }
-input:not([type=checkbox]), select, textarea { width: 100%; padding: .6rem .7rem; border: 1px solid var(--border); border-radius: 6px; color: var(--fg); background: var(--card-bg); font: inherit; font-size: .9rem; }
+input:not([type=checkbox]), select, textarea { width: 100%; padding: .6rem .7rem; border: 1px solid var(--control-border); border-radius: 6px; color: var(--fg); background: var(--card-bg); font: inherit; font-size: .9rem; }
 input:disabled, select:disabled, textarea:disabled { opacity: .65; background: var(--bg); }
 textarea { resize: vertical; }
 @media (max-width: 620px) { .runtime-config-grid { grid-template-columns: 1fr; } }
