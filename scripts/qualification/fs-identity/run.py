@@ -917,21 +917,33 @@ def mount_group(root: Path, group_name: str, ev: Evidence, label: str) -> dict:
     if rc != 0:
         raise Stop(f"mount 不能接受固定参数: {group_name}")
     entry = containing(group / "merged")
+    # 同一次回读先保存完整原始 entry；记录本身不表示任何身份/选项门槛通过。
+    ev.file(f"mounts/{label}.json", {"requested_options": options, "actual_mountinfo": entry,
+                                   "recorded_before_guards": True,
+                                   "omitted_defaults_basis": "本次 mount 成功接受的显式固定请求；不按 runner 标签推断"})
     if entry["point"] != str(group / "merged") or entry["type"] != "overlay":
+        ev.event("mount-guard-rejected", label=label, guard="overlay-identity",
+                 expected_point=str(group / "merged"), actual_point=entry["point"], actual_type=entry["type"])
         raise Stop("实际 overlay mount 身份不符")
     requested = dict(option.split("=", 1) if "=" in option else (option, None) for option in options)
     actual = dict(option.split("=", 1) if "=" in option else (option, None) for option in entry["super_options"])
     if any(actual.get(key) != requested[key] for key in ("lowerdir", "upperdir", "workdir")):
+        ev.event("mount-guard-rejected", label=label, guard="backing-directories",
+                 mismatches={key: {"requested": requested[key], "actual": actual.get(key)}
+                             for key in ("lowerdir", "upperdir", "workdir") if actual.get(key) != requested[key]})
         raise Stop("mountinfo 未确认同一 lower/upper/work")
     # Linux 可省略默认的 off 项；仅以本次内核已成功接受的显式请求补充，保存原始文本。
     for key, value in requested.items():
         if key in actual and actual[key] != value:
+            ev.event("mount-guard-rejected", label=label, guard="requested-option-conflict",
+                     key=key, requested=value, actual=actual[key])
             raise Stop(f"实际挂载选项冲突: {key}")
     allowed = set(requested) | {"rw", "relatime", "noatime", "nodiratime", "nosuid", "nodev", "noexec", "seclabel"}
     if set(actual) - allowed or "ro" in entry["mount_options"] or "volatile" in actual or "userxattr" in actual:
+        ev.event("mount-guard-rejected", label=label, guard="actual-options",
+                 unknown_options=sorted(set(actual) - allowed), read_only="ro" in entry["mount_options"],
+                 volatile="volatile" in actual, userxattr="userxattr" in actual)
         raise Stop("出现未核对/冲突的实际 overlay 选项")
-    ev.file(f"mounts/{label}.json", {"requested_options": options, "actual_mountinfo": entry,
-                                   "omitted_defaults_basis": "本次 mount 成功接受的显式固定请求；不按 runner 标签推断"})
     return entry
 
 
