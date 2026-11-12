@@ -89,11 +89,11 @@ onBeforeUnmount(() => { void nextTick(restoreFocus); });
 </template>
 
 <style scoped>
-.confirm-dialog { width: min(560px, calc(100vw - 32px)); max-width: calc(100vw - 32px); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid var(--border); border-radius: 14px; color: var(--fg); background: var(--card-bg); box-shadow: 0 16px 60px rgb(0 0 0 / 18%); }
+.confirm-dialog { width: min(560px, calc(100vw - 32px)); max-width: calc(100vw - 32px); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid var(--control-border); border-radius: 14px; color: var(--fg); background: var(--surface-raised); box-shadow: var(--shadow-popup); }
 .confirm-dialog[open] { display: flex; flex-direction: column; }
-.confirm-dialog::backdrop { background: rgb(15 23 42 / 36%); }
+.confirm-dialog::backdrop { background: var(--backdrop); }
 .confirm-dialog-heading { flex: none; padding: 24px 24px 0; overflow-wrap: anywhere; }.confirm-dialog-heading h2 { margin: 0; line-height: 1.5; }
 .confirm-dialog-body { padding: 12px 24px 24px; overflow: auto; overscroll-behavior: contain; min-height: 0; overflow-wrap: anywhere; }.confirm-dialog-description { margin-top: 0; }
-.confirm-dialog-actions { flex: none; display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding: 16px 24px; border-top: 1px solid var(--border); background: var(--card-bg); }.confirm-dialog-actions .danger { border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); }
+.confirm-dialog-actions { flex: none; display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding: 16px 24px; border-top: 1px solid var(--border); background: var(--surface-raised); }.confirm-dialog-actions .danger { border-color: var(--bad); }
 @media (max-width: 500px) { .confirm-dialog-heading { padding: 20px 20px 0; }.confirm-dialog-body { padding: 12px 20px 20px; }.confirm-dialog-actions { padding: 14px 20px; } }
 </style>

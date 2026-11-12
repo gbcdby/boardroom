@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import select
 import subprocess
+import time
 import traceback
 from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright, expect
@@ -87,6 +88,48 @@ def check_confirmation_layout(page, kind, label, width, height, report, require_
         expect(button).to_be_enabled()
         button.click(trial=True)  # 检查真实命中与可操作性，不执行取消或删除。
 
+def observe_reconcile_requests(page, report):
+    """只记录 API 请求阶段；不等待网络、不读取响应正文，也不改变拦截行为。"""
+    started = time.monotonic()
+    trace = {"stage": "observer-installed", "events": [], "requests": [], "active": True}
+    report["memberReconcileNetwork"] = trace
+    records = {}
+    def record(event, request=None, **details):
+        if not trace["active"]:
+            return
+        at = round((time.monotonic() - started) * 1000, 3)
+        entry = {"event": event, "atMs": at, "stage": trace["stage"], **details}
+        if request is not None:
+            parsed = urlsplit(request.url)
+            if not parsed.path.startswith("/api/"):
+                return
+            if request not in records:
+                item = {"id": len(records) + 1, "method": request.method,
+                    "path": parsed.path + ("?" + parsed.query if parsed.query else "")}
+                records[request] = item
+                trace["requests"].append(item)
+            item = records[request]
+            item.update({"lastEvent": event, "lastAtMs": at, **details})
+            item["networkStage" if event in ("request", "response-headers", "request-finished", "request-failed") else "routeStage"] = event
+            entry["requestId"] = item["id"]
+        else:
+            trace["stage"] = event
+            entry["stage"] = event
+        trace["events"].append(entry)
+    handlers = {
+        "request": lambda request: record("request", request),
+        "response": lambda response: record("response-headers", response.request, status=response.status),
+        "requestfinished": lambda request: record("request-finished", request, timing=request.timing),
+        "requestfailed": lambda request: record("request-failed", request, failure=request.failure),
+    }
+    for event, handler in handlers.items():
+        page.on(event, handler)
+    def stop():
+        trace["active"] = False
+        for event, handler in handlers.items():
+            page.remove_listener(event, handler)
+    return record, stop
+
 def confirmation_flows(page, origin, project_id, org_project_id, output, report):
     """真实操作与数据结果；仅对拒绝/响应丢失场景注入传输故障。"""
     observed = []
@@ -147,6 +190,7 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     member_row = page.get_by_test_id("member-list").locator("li").filter(has_text=member["displayName"])
     member_row.locator("summary").click()
     remove = member_row.get_by_role("button", name="移除", exact=True)
+    page.get_by_test_id("open-add-member").click()
     page.get_by_test_id("new-member-name").fill("删除成员期间保留的草稿")
     remove.click()
     expect(page.get_by_test_id("confirmation-dialog")).to_contain_text(member["displayName"])
@@ -195,30 +239,56 @@ def confirmation_flows(page, origin, project_id, org_project_id, output, report)
     expect(page.get_by_test_id("confirm-cancel")).to_be_focused()
     reads = []
     reconcile_released = False
+    record_reconcile, stop_reconcile_observer = observe_reconcile_requests(page, report)
     def hold_reconcile(route):
-        if route.request.method == "GET" and not reconcile_released: reads.append(route)
-        else: route.continue_()
+        record_reconcile("route-enter", route.request, released=reconcile_released)
+        if route.request.method == "GET" and not reconcile_released:
+            reads.append(route)
+            record_reconcile("route-held", route.request)
+        else:
+            try:
+                route.continue_()
+                record_reconcile("route-continued", route.request)
+            except Exception as error:
+                record_reconcile("route-error", route.request, error=str(error))
+                raise
     read_pattern = f"**/api/projects/{project_id}/members"
     page.route(read_pattern, hold_reconcile)
-    with page.expect_request(lambda req: req.method == "GET" and urlsplit(req.url).path == f"/api/projects/{project_id}/members"):
-        recovery.click()
-    expect(recovery).to_have_count(0)
-    check_pending_focus()
-    assert len(reads) == 1, "权威核对应该读取成员一次"
-    # unroute 移除最后一个 handler 会自动放行挂起请求；先显式放行并等待响应。
-    # 核对释放后，后续成功刷新直接通过，不再次挂起。
-    reconcile_released = True
-    with page.expect_response(lambda response: response.request.method == "GET" and urlsplit(response.url).path == f"/api/projects/{project_id}/members"):
-        reads[0].continue_()
-    page.unroute(read_pattern, hold_reconcile)
-    expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
-    expect(page.locator("h1")).to_be_focused()
-    expect(page.get_by_test_id("new-member-name")).to_have_value("删除成员期间保留的草稿")
-    page.get_by_test_id("new-member-name").fill("")
-    assert len(writes(member_path, "DELETE")) == 2, "一次被拒绝、一次明确重试后，不应再次发送移除"
-    assert not request(page, origin, "GET", f"/api/projects/{project_id}/members")["members"]
-    toast(f"成员「{member['displayName']}」已移除。")
-    report["checks"].append("S6-AC01/02/05: 成员取消/Escape与还焦；Tab/Shift+Tab边界循环；提交/核对全禁用时标题焦点；恢复slot加入/移除；pending单飞；注入409拒绝与提交后响应丢失，权威核对完成且保留草稿")
+    try:
+        record_reconcile("reconcile-click")
+        with page.expect_request(lambda req: req.method == "GET" and urlsplit(req.url).path == f"/api/projects/{project_id}/members"):
+            recovery.click()
+        expect(recovery).to_have_count(0)
+        check_pending_focus()
+        assert len(reads) == 1, "权威核对应该读取成员一次"
+        # unroute 移除最后一个 handler 会自动放行挂起请求；先显式放行并等待响应。
+        # 核对释放后，后续成功刷新直接通过，不再次挂起。
+        reconcile_released = True
+        record_reconcile("held-read-release")
+        with page.expect_response(lambda response: response.request.method == "GET" and urlsplit(response.url).path == f"/api/projects/{project_id}/members"):
+            reads[0].continue_()
+            record_reconcile("held-read-continue-returned", reads[0].request)
+        expect(page.get_by_test_id("confirmation-dialog")).not_to_be_visible()
+        record_reconcile("dialog-closed")
+        expect(page.locator("h1")).to_be_focused()
+        expect(page.get_by_test_id("new-member-name")).to_have_value("删除成员期间保留的草稿")
+        page.get_by_test_id("new-member-name").fill("")
+        assert len(writes(member_path, "DELETE")) == 2, "一次被拒绝、一次明确重试后，不应再次发送移除"
+        assert not request(page, origin, "GET", f"/api/projects/{project_id}/members")["members"]
+        toast(f"成员「{member['displayName']}」已移除。")
+        report["checks"].append("S6-AC01/02/05: 成员取消/Escape与还焦；Tab/Shift+Tab边界循环；提交/核对全禁用时标题焦点；恢复slot加入/移除；pending单飞；注入409拒绝与提交后响应丢失，权威核对完成且保留草稿")
+    except Exception as error:
+        network = report["memberReconcileNetwork"]
+        network["failure"] = {"stage": network["stage"], "error": str(error)[:5000]}
+        raise
+    finally:
+        # 保持透明 handler 直到成功刷新与原成功断言完成；失败路径也统一清理。
+        try:
+            record_reconcile("unroute-start")
+            page.unroute(read_pattern, hold_reconcile)
+            record_reconcile("unroute-returned")
+        finally:
+            stop_reconcile_observer()
 
     group = request(page, origin, "GET", f"/api/projects/{project_id}/groups")["groups"][0]
     group_path = f"/api/groups/{group['id']}"
@@ -564,7 +634,8 @@ def exercise(page, origin, records, output, report, capture_only, workdir):
     expect(toggle).to_be_focused()
     expect(page.get_by_role("navigation", name="主导航")).not_to_be_visible()
     toggle.click()
-    page.get_by_role("navigation", name="主导航").get_by_role("link", name="状态看板", exact=True).click()
+    page.get_by_role("navigation", name="主导航").get_by_role("link", name="所有项目", exact=True).click()
+    expect(page).to_have_url(origin + "/projects")
     expect(page.locator("h1")).to_be_focused()
     expect(page.get_by_role("navigation", name="主导航")).not_to_be_visible()
     report["checks"].append("UI-03: 窄窗菜单键盘展开/Escape还焦、导航后标题焦点")
@@ -578,9 +649,9 @@ def exercise(page, origin, records, output, report, capture_only, workdir):
     page.keyboard.press("End")
     page.keyboard.press("Enter")
     selected_id = target.input_value()
-    expect(page).to_have_url(origin + f"/projects/{selected_id}/status")
+    expect(page).to_have_url(origin + f"/projects/{selected_id}/members?tab=status")
     target.select_option(target_id)
-    expect(page).to_have_url(origin + f"/projects/{target_id}/status")
+    expect(page).to_have_url(origin + f"/projects/{target_id}/members?tab=status")
     expect(target).to_have_value(target_id)
     report["checks"].append("UI-03/#39: 顶栏项目原生选择器可键盘操作，URL和页面同步")
 
@@ -668,6 +739,7 @@ def exercise(page, origin, records, output, report, capture_only, workdir):
     report["checks"].append("UI-04: 旧群发送回包不会污染切换后的群组")
 
     page.goto(origin + "/projects")
+    page.get_by_test_id("open-create-project").click()
     name = page.get_by_test_id("new-project-name")
     expect(name).to_be_visible()
     assert name.evaluate("el => !!(el.labels?.length || el.getAttribute('aria-label'))"), "项目名称缺少标签"
@@ -676,11 +748,13 @@ def exercise(page, origin, records, output, report, capture_only, workdir):
     expect(page.get_by_test_id("project-detail")).to_contain_text("浏览器操作创建的项目")
     expect(page.get_by_test_id("toast-message").filter(has_text="项目「浏览器操作创建的项目」已创建。")).to_have_count(1)
     created_project_id = page.get_by_test_id("current-project").input_value()
+    page.get_by_test_id("open-add-member").click()
     member = page.get_by_test_id("new-member-name")
     member.fill("可访问性验证成员")
     page.get_by_test_id("add-member").click()
     expect(page.get_by_test_id("member-list")).to_contain_text("可访问性验证成员")
     expect(page.get_by_test_id("toast-message").filter(has_text="成员「可访问性验证成员」已添加。")).to_have_count(1)
+    page.get_by_test_id("open-create-group").click()
     page.get_by_test_id("new-group-name").fill("浏览器创建群组")
     page.get_by_test_id("participant-picker").get_by_role("checkbox").first.check()
     page.get_by_test_id("create-group").click()
@@ -737,15 +811,22 @@ def main():
             browser = p.chromium.launch(headless=True)
             report["chromium"] = browser.version
             context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai")
+            context.tracing.start(screenshots=True, snapshots=True, sources=True)
             page = context.new_page()
             page.set_default_timeout(15000)
             try:
                 records = seed(page, origin)
                 exercise(page, origin, records, output, report, args.capture_only, fixture_info["workdir"])
-            except Exception:
+            except Exception as error:
+                network = report.get("memberReconcileNetwork")
+                if network and network["active"]:
+                    # 冻结失败时的请求状态，避免 context.close 的取消事件覆盖现场。
+                    network["failure"] = {"stage": network["stage"], "error": str(error)[:5000]}
+                    network["active"] = False
                 if not page.is_closed(): page.screenshot(path=str(output / "failure.png"), full_page=True)
                 raise
             finally:
+                context.tracing.stop(path=str(output / "trace.zip"))
                 context.close()
                 browser.close()
     except Exception as error:

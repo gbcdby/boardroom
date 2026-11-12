@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import { ApiError, api, type MemberDto, type OrgNodeDto } from "../api/client.ts";
 import { draftInput, emptyTaskDraft, NO_REVIEWER, taskFieldErrors, taskStates, taskStateLabel, tasksApi, type Task, type TaskSettings, type TaskFieldErrors } from "../api/tasks.ts";
 import TaskFields from "../components/TaskFields.vue";
 import CreationDialog from "../components/CreationDialog.vue";
 import { projectPath, useCurrentProject, useProjectDraft } from "../composables/useCurrentProject.ts";
+import { beginTaskListRender, useTaskListViewState } from "../composables/useTaskListViewState.ts";
 import { useToast } from "../composables/useToast.ts";
 
 const context = useCurrentProject();
@@ -18,17 +19,18 @@ const settings = ref<TaskSettings | null>(null);
 const defaultReviewer = ref("");
 const draft = ref(emptyTaskDraft());
 const createOpen = ref(false);
+const { layout, filter } = useTaskListViewState(context);
 const createError = ref<string | null>(null);
 const createUnknown = ref(false);
 const createFields = ref<TaskFieldErrors>({});
-const layout = ref<"board" | "list">("board");
-const filter = ref("");
 const loading = ref(false);
 const busy = ref(false);
 const error = ref<string | null>(null);
 const notice = ref<string | null>(null);
 const conflict = ref(false);
 let request = 0;
+let scopeVersion = 0;
+let pendingRender: ReturnType<typeof beginTaskListRender> | null = null;
 let disposed = false;
 const activeAgents = computed(() => members.value.filter((member) => member.kind === "agent" && member.status === "active"));
 const defaultReviewerName = computed(() => settings.value?.reviewerValid ? members.value.find((member) => member.id === settings.value?.defaultReviewerMemberId)?.displayName ?? null : null);
@@ -44,68 +46,80 @@ const hasDraft = () => Object.values(draft.value).some(Boolean) || (settings.val
 useProjectDraft(hasDraft, () => { draft.value = emptyTaskDraft(); defaultReviewer.value = settings.value?.defaultReviewerMemberId ?? ""; createOpen.value = false; createError.value = null; createUnknown.value = false; createFields.value = {}; });
 function nameOf(id: string | null): string { return members.value.find((member) => member.id === id)?.displayName ?? (id ? "成员已不可用" : "待分派"); }
 function positionOf(id: string): string { return nodes.value.find((node) => node.memberId === id)?.name ?? "未分配岗位"; }
-function current(projectId: string, generation: number): boolean { return !disposed && currentProjectId.value === projectId && context.generation.value === generation; }
+function current(projectId: string, generation: number, scope: number): boolean { return !disposed && currentProjectId.value === projectId && context.generation.value === generation && scopeVersion === scope; }
 
 async function load(): Promise<void> {
   const projectId = currentProjectId.value;
   if (!projectId) return;
   const version = ++request;
-  const generation = context.generation.value;
+  const generation = context.generation.value, scope = scopeVersion;
+  const render = beginTaskListRender(context, projectId);
+  pendingRender = render;
   loading.value = true; error.value = null;
   try {
     const [result, settingResult, org] = await Promise.all([tasksApi.list(projectId), tasksApi.settings(projectId), api.getOrg(projectId)]);
-    if (!current(projectId, generation) || version !== request) return;
+    if (!current(projectId, generation, scope) || version !== request) return;
     tasks.value = result.tasks; members.value = org.members; nodes.value = org.nodes;
     const keepSelection = settings.value && defaultReviewer.value !== (settings.value.defaultReviewerMemberId ?? "");
     settings.value = settingResult.settings;
     if (!keepSelection) defaultReviewer.value = settingResult.settings.defaultReviewerMemberId ?? "";
-  } catch (err) { if (current(projectId, generation) && version === request) error.value = err instanceof Error ? err.message : "任务读取失败，请重试。"; }
-  finally { if (current(projectId, generation) && version === request) loading.value = false; }
+  } catch (err) { if (current(projectId, generation, scope) && version === request) error.value = err instanceof Error ? err.message : "任务读取失败，请重试。"; }
+  finally {
+    if (current(projectId, generation, scope) && version === request) {
+      loading.value = false;
+      await nextTick();
+      if (current(projectId, generation, scope) && version === request) render.complete();
+    }
+  }
 }
 
 async function createTask(): Promise<void> {
   const projectId = currentProjectId.value;
   if (!projectId || !canCreate.value) return;
-  const generation = context.generation.value;
-  busy.value = true; createError.value = null; createFields.value = {};
+  const generation = context.generation.value, scope = scopeVersion;
+  busy.value = true; error.value = null; notice.value = null; createError.value = null; createFields.value = {};
   try {
     const result = await tasksApi.create(projectId, draftInput(draft.value));
-    if (!current(projectId, generation)) return;
+    if (!current(projectId, generation, scope)) return;
     tasks.value = [result.task, ...tasks.value];
     draft.value = emptyTaskDraft(); createOpen.value = false;
     toast.success(`已保存「${result.task.title}」${result.task.assigneeMemberId ? "，已记录分派通知。" : "，可稍后补齐资料与分派。"}`, `task-created:${result.task.id}`);
   } catch (err) {
-    if (!current(projectId, generation)) return;
+    if (!current(projectId, generation, scope)) return;
     createUnknown.value = !(err instanceof ApiError) || err.status >= 500 || err.status === 408;
     createFields.value = taskFieldErrors(err);
     createError.value = createUnknown.value ? "保存结果尚未确认。请求可能已经生效，请先读取当前任务核对，不要重复保存。" : err instanceof Error ? err.message : "创建失败，填写内容已保留。";
   }
-  finally { if (current(projectId, generation)) busy.value = false; }
+  finally { if (current(projectId, generation, scope)) busy.value = false; }
 }
 
 async function saveSettings(): Promise<void> {
   const projectId = currentProjectId.value;
   if (!projectId || !settings.value || busy.value || projectReadonly.value) return;
-  const generation = context.generation.value;
+  const generation = context.generation.value, scope = scopeVersion;
   busy.value = true; error.value = null; notice.value = null; conflict.value = false;
   try {
     const result = await tasksApi.setSettings(projectId, settings.value.revision, defaultReviewer.value || null);
-    if (!current(projectId, generation)) return;
+    if (!current(projectId, generation, scope)) return;
     settings.value = result.settings; notice.value = "默认 reviewer 已保存。新建任务可直接使用此设置。";
   } catch (err) {
-    if (!current(projectId, generation)) return;
+    if (!current(projectId, generation, scope)) return;
     conflict.value = err instanceof ApiError && err.status === 409;
     error.value = conflict.value ? "项目设置已变更。你的选择已保留，请载入最新设置并核对后再保存。" : err instanceof Error ? err.message : "保存失败，请重试。";
-  } finally { if (current(projectId, generation)) busy.value = false; }
+  } finally { if (current(projectId, generation, scope)) busy.value = false; }
 }
 
 function cancelCreate(): void {
   if (!createUnknown.value) { draft.value = emptyTaskDraft(); createError.value = null; createFields.value = {}; }
   createOpen.value = false;
 }
-watch(currentProjectId, () => { request++; busy.value = false; tasks.value = []; settings.value = null; members.value = []; nodes.value = []; void load(); }, { immediate: true });
-onMounted(() => { if (typeof matchMedia !== "undefined" && matchMedia("(max-width: 760px)").matches) layout.value = "list"; });
-onBeforeUnmount(() => { disposed = true; request++; });
+watch(currentProjectId, () => {
+  pendingRender?.cancel(); pendingRender = null;
+  scopeVersion++; request++;
+  busy.value = false; loading.value = false; error.value = null; notice.value = null; conflict.value = false;
+  tasks.value = []; settings.value = null; members.value = []; nodes.value = []; void load();
+}, { immediate: true });
+onBeforeUnmount(() => { disposed = true; request++; pendingRender?.cancel(); });
 </script>
 
 <template>
@@ -123,7 +137,7 @@ onBeforeUnmount(() => { disposed = true; request++; });
     </CreationDialog>
     <div class="task-toolbar">
       <label class="field">筛选状态<select v-model="filter" data-testid="task-state-filter"><option value="">全部状态</option><option v-for="state in taskStates" :key="state.value" :value="state.value">{{ state.label }}</option></select></label>
-      <div class="actions" aria-label="任务显示方式"><button type="button" :aria-pressed="layout === 'board'" @click="layout = 'board'">看板</button><button type="button" :aria-pressed="layout === 'list'" @click="layout = 'list'" data-testid="task-list-mode">列表</button></div>
+      <div class="actions" aria-label="任务显示方式"><button type="button" class="selection-button" :aria-pressed="layout === 'board'" data-testid="task-board-mode" @click="layout = 'board'"><span class="selection-mark" aria-hidden="true">✓</span>看板</button><button type="button" class="selection-button" :aria-pressed="layout === 'list'" @click="layout = 'list'" data-testid="task-list-mode"><span class="selection-mark" aria-hidden="true">✓</span>列表</button></div>
     </div>
     <p v-if="loading" role="status" class="muted">正在加载任务…</p>
     <div v-if="!currentProjectId" class="panel empty-state"><h2>选择一个项目</h2><p>选择项目后查看任务，或先创建项目。</p><RouterLink to="/projects">前往项目</RouterLink></div>

@@ -50,7 +50,7 @@ const hasDraft = () => (editing.value && JSON.stringify(draft.value) !== savedDr
 useProjectDraft(hasDraft, () => { editing.value = false; comment.value = ""; reason.value = ""; decisionReason.value = ""; draft.value = emptyTaskDraft(); });
 function nameOf(id: string | null): string { return members.value.find((member) => member.id === id)?.displayName ?? (id ? "成员已不可用" : "待分派"); }
 function time(iso: string): string { return new Date(iso).toLocaleString("zh-CN"); }
-function isCurrent(projectId: string, id: string, generation: number, scope: number): boolean { return !disposed && scopeVersion === scope && currentProjectId.value === projectId && taskId.value === id && context.generation.value === generation; }
+function isCurrent(projectId: string, id: string, generation: number, scope: number): boolean { return !disposed && currentProjectId.value === projectId && taskId.value === id && context.generation.value === generation && scopeVersion === scope; }
 function reportsOf(round: ReviewRound) { return detail.value?.reports.filter((report) => report.roundId === round.id) ?? []; }
 function roundState(state: ReviewRound["state"]): string { return ({ ready: "等待 reviewer 接手", running: "评审进行中", reported: "两轴报告已提交，等待裁决", decided: "已裁决", failed: "候选准备失败", superseded: "已被后续修改取代" })[state]; }
 function actionLabel(action: string): string {
@@ -127,7 +127,7 @@ async function decide(): Promise<void> {
 }
 async function reloadLatest(): Promise<void> {
   const projectId = currentProjectId.value, id = taskId.value, generation = context.generation.value, scope = scopeVersion;
-  if (!projectId) return;
+  if (!projectId || !id) return;
   latestReadSucceeded.value = false;
   error.value = null; await load();
   if (!isCurrent(projectId, id, generation, scope)) return;
@@ -141,7 +141,12 @@ function rebaseDraft(): void {
   draft.value = { ...latest, ...mine }; saveUnknown.value = false; conflict.value = false; error.value = null; editFields.value = {};
   notice.value = `已采用版本 ${baseRevision.value}，保留你修改过的字段。请检查合并后的草稿再保存。`;
 }
-watch([currentProjectId, taskId], () => { scopeVersion++; request++; busy.value = null; detail.value = null; error.value = null; notice.value = null; conflict.value = false; editing.value = false; baseRevision.value = null; saveUnknown.value = false; latestReadSucceeded.value = false; comment.value = ""; reason.value = ""; decisionReason.value = ""; void load(false); }, { immediate: true });
+watch([currentProjectId, taskId], () => {
+  scopeVersion++; request++; busy.value = null; loading.value = false;
+  detail.value = null; error.value = null; notice.value = null; conflict.value = false; editing.value = false;
+  baseRevision.value = null; saveUnknown.value = false; latestReadSucceeded.value = false;
+  comment.value = ""; reason.value = ""; decisionReason.value = ""; void load(false);
+}, { immediate: true });
 onBeforeUnmount(() => { disposed = true; request++; });
 </script>
 
