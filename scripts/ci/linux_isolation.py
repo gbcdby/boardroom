@@ -481,8 +481,10 @@ def supervise(stage, cleanup_only=False):
             state.update(uid=uid, gid=uid)
             write_json(state_path, state)
             tool(['/usr/sbin/groupadd', '--gid', str(uid), state['name']])
-            tool(['/usr/sbin/useradd', '--uid', str(uid), '--gid', str(uid), '--no-user-group',
-                  '--no-create-home', '--no-log-init', '-K', 'CREATE_MAIL_SPOOL=no',
+            # Shadow skips mail creation for --system. CREATE_MAIL_SPOOL is not
+            # a login.defs -K key; the explicit, newly allocated UID stays nonroot.
+            tool(['/usr/sbin/useradd', '--system', '--uid', str(uid), '--gid', str(uid), '--no-user-group',
+                  '--no-create-home', '--no-log-init',
                   '--home-dir', str(stage / 'home'), '--shell', '/usr/sbin/nologin',
                   '--comment', 'boardroom-ci:' + request['token'], state['name']])
             for name in ('work', 'home', 'tmp', 'npm-cache'):

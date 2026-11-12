@@ -53,6 +53,14 @@ jobs:
 
       - name: 全量测试（macOS / SQLite，不启用 PostgreSQL 门控用例）
         shell: bash
+        env:
+          # 只增加观察；绝对路径允许既有测试从不同 cwd 启动普通 Node 子进程。
+          NODE_OPTIONS: >-
+            --test-reporter=spec
+            --test-reporter-destination=stdout
+            --test-reporter=${{ github.workspace }}/scripts/ci/test-execution-reporter.mjs
+            --test-reporter-destination=stdout
+            --import=${{ github.workspace }}/scripts/ci/test-process-observer.mjs
         run: npm test 2>&1 | tee .agent-output/macos-tests/full-suite.log
 
       - name: 保存环境与完整测试日志
