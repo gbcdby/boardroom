@@ -1,19 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, type BigIntStats } from "node:fs";
+import { constants } from "node:fs";
 import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { canonicalJson } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { auditPublicArchiveToc, type PublicRestoreCatalogBinding } from "./postgres-public-toc.ts";
 import { postgresPublicToolVersions, runPostgresTool } from "./postgres-tools.ts";
+import { publicDirectoryFiles, type PublicDirectoryFiles, type PublicFileStat } from "./postgres-public-directory.ts";
 import type { Json } from "./types.ts";
 
 interface FileIdentity {
   readonly device: string; readonly inode: string; readonly bytes: string; readonly mode: string;
   readonly uid: string; readonly links: string; readonly mtime: string; readonly ctime: string;
 }
-interface BoundFile { readonly path: string; readonly name: string; readonly identity: FileIdentity; readonly sha256: string }
-function identity(info: BigIntStats): FileIdentity {
+interface BoundFile { readonly name: string; readonly identity: FileIdentity; readonly sha256: string }
+function identity(info: PublicFileStat): FileIdentity {
   if (!info.isFile() || info.nlink !== 1n || (info.mode & 0o777n) !== 0o600n || info.size > BigInt(Number.MAX_SAFE_INTEGER)
     || process.getuid && info.uid !== BigInt(process.getuid())) throw new MaintenanceFailure("snapshot_invalid");
   return { device: String(info.dev), inode: String(info.ino), bytes: String(info.size), mode: String(info.mode),
@@ -51,7 +52,7 @@ export async function restorePostgresPublic(input: {
     || resolve(input.restoreDirectory) !== input.restoreDirectory || await realpath(input.restoreDirectory) !== input.restoreDirectory) throw failure();
   const directory = await open(input.restoreDirectory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   const directoryIdentity = await directory.stat({ bigint: true });
-  const boundDirectory = `/dev/fd/${directory.fd}`;
+  let directoryFiles: PublicDirectoryFiles;
   const directoryCheck = async () => {
     check(); const current = await lstat(input.restoreDirectory, { bigint: true });
     if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== directoryIdentity.dev || current.ino !== directoryIdentity.ino
@@ -63,23 +64,23 @@ export async function restorePostgresPublic(input: {
   const close = async (handle: FileHandle) => { await handle.close(); handles.delete(handle); };
   const create = async (suffix: string) => {
     await directoryCheck();
-    const path = join(boundDirectory, `.public-${randomUUID()}-${suffix}`);
-    const handle = track(await open(path, constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_RDWR, 0o600));
-    identity(await handle.stat({ bigint: true })); await directoryCheck(); return { path, handle };
+    const name = `.public-${randomUUID()}-${suffix}`;
+    const handle = track(await directoryFiles.create(name));
+    identity(await handle.stat({ bigint: true })); await directoryCheck(); return { name, handle };
   };
-  const seal = async (file: { path: string; handle: FileHandle }): Promise<BoundFile> => {
+  const seal = async (file: { name: string; handle: FileHandle }): Promise<BoundFile> => {
     await file.handle.sync();
     const info = identity(await file.handle.stat({ bigint: true }));
     const sha256 = await postgresFileDigest(file.handle, check);
-    if (!same(info, identity(await lstat(file.path, { bigint: true })))) throw new MaintenanceFailure("snapshot_invalid");
+    if (!same(info, identity(await directoryFiles.stat(file.name)))) throw new MaintenanceFailure("snapshot_invalid");
     await close(file.handle); await directoryCheck();
-    return { path: file.path, name: basename(file.path), identity: info, sha256 };
+    return { name: file.name, identity: info, sha256 };
   };
   const read = async (file: BoundFile): Promise<FileHandle> => {
     await directoryCheck();
-    const handle = track(await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW));
+    const handle = track(await directoryFiles.read(file.name));
     if (!same(file.identity, identity(await handle.stat({ bigint: true })))
-      || !same(file.identity, identity(await lstat(file.path, { bigint: true })))
+      || !same(file.identity, identity(await directoryFiles.stat(file.name)))
       || await postgresFileDigest(handle, check) !== file.sha256) throw new MaintenanceFailure("snapshot_invalid");
     // postgresFileDigest uses explicit positions; this newly opened description still starts at 0.
     return handle;
@@ -87,12 +88,13 @@ export async function restorePostgresPublic(input: {
   const recheck = async (file: BoundFile, handle: FileHandle) => {
     await directoryCheck();
     if (!same(file.identity, identity(await handle.stat({ bigint: true })))
-      || !same(file.identity, identity(await lstat(file.path, { bigint: true })))
+      || !same(file.identity, identity(await directoryFiles.stat(file.name)))
       || await postgresFileDigest(handle, check) !== file.sha256) throw new MaintenanceFailure("snapshot_invalid");
   };
   const write = async (suffix: string, bytes: string) => { const file = await create(suffix); await file.handle.writeFile(bytes); return seal(file); };
   try {
     await directoryCheck(); await checkCurrent();
+    directoryFiles = publicDirectoryFiles(directory, directoryIdentity, check);
     const versions = await postgresPublicToolVersions(input.environment, input.signal, deadline, input.binding.pgDump);
     const source = track(await open(input.archivePath, constants.O_RDONLY | constants.O_NOFOLLOW));
     const sourceIdentity = identity(await source.stat({ bigint: true }));

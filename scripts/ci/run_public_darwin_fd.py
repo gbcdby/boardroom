@@ -23,6 +23,28 @@ VERSION = "16.15"
 SOURCE = "https://ftp.postgresql.org/pub/source/v16.15/postgresql-16.15.tar.bz2"
 PROGRAMS = ("postgres", "initdb", "pg_ctl", "pg_isready", "pg_dump", "pg_restore", "psql")
 TEST = "tests/maintenance-postgres-public-darwin.acceptance.ts"
+DIRECTORY_TESTS = (
+    "tests/maintenance-postgres-public-directory.test.ts",
+    "tests/maintenance-postgres-public-directory.acceptance.ts",
+)
+DIRECTORY_HEADERS = "native/node-api/v24.22.1"
+DIRECTORY_SOURCES = (
+    "native/README.md", "native/postgres-public-directory.c", "scripts/build-maintenance-platform.mjs",
+    "src/server/storage/maintenance/postgres-public-directory.ts",
+    "src/server/storage/maintenance/postgres-public-restore.ts", *DIRECTORY_TESTS,
+    "tests/fixtures/postgres-public-directory-controls.ts",
+    *(f"{DIRECTORY_HEADERS}/{name}" for name in ("node_api.h", "node_api_types.h", "js_native_api.h",
+        "js_native_api_types.h", "LICENSE", "SOURCES.json")),
+)
+REQUIRED_SOURCES = (
+    TEST, *DIRECTORY_TESTS, "tests/fixtures/postgres-public-directory-controls.ts",
+    "scripts/ci/run_public_darwin_fd.py", "scripts/build-maintenance-platform.mjs",
+    ".github/workflows/public-darwin-fd-acceptance.yml", "package.json", "package-lock.json",
+    "src/server/storage/maintenance/postgres.ts", "src/server/storage/maintenance/postgres-public-restore.ts",
+    "src/server/storage/maintenance/postgres-public-directory.ts", "native/postgres-public-directory.c", "native/README.md",
+    *(f"{DIRECTORY_HEADERS}/{name}" for name in ("node_api.h", "node_api_types.h", "js_native_api.h",
+        "js_native_api_types.h", "LICENSE", "SOURCES.json")),
+)
 ACTIVITY_SECONDS = 600
 CLEANUP_SECONDS = 40
 
@@ -39,6 +61,112 @@ def utc():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def source_inventory(repo, tree):
+    """Bind the runtime/build/test closure and bundled headers to this exact Git tree."""
+    inventory = {}
+    for entry in tree.split("\0"):
+        if not entry:
+            continue
+        metadata, relative = entry.split("\t", 1)
+        mode, kind, blob = metadata.split(" ")
+        if relative not in REQUIRED_SOURCES and not relative.startswith(("src/server/", "native/", "tests/fixtures/")):
+            continue
+        path = repo / relative
+        if kind != "blob" or mode not in ("100644", "100755") or path.resolve() != path or not stat.S_ISREG(path.lstat().st_mode):
+            raise RuntimeError(f"qualification source must be a tracked regular file: {relative}")
+        contents = path.read_bytes()
+        actual_blob = hashlib.sha1(f"blob {len(contents)}\0".encode() + contents).hexdigest()
+        if actual_blob != blob:
+            raise RuntimeError(f"qualification source differs from candidate tree: {relative}")
+        inventory[relative] = {"git_blob": blob, "git_mode": mode, "bytes": len(contents),
+                               "sha256": hashlib.sha256(contents).hexdigest()}
+    missing = sorted(set(REQUIRED_SOURCES) - inventory.keys())
+    if missing:
+        raise RuntimeError(f"qualification source inventory is incomplete: {missing}")
+    return dict(sorted(inventory.items()))
+
+
+def bridge_binary_identity(path):
+    info = path.lstat()
+    if (path.resolve() != path or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o700):
+        raise RuntimeError("production directory bridge binary identity/mode is unavailable")
+    return {"path": str(path), "device": str(info.st_dev), "inode": str(info.st_ino), "uid": info.st_uid,
+            "mode": oct(stat.S_IMODE(info.st_mode)), "nlink": info.st_nlink, "bytes": info.st_size, "sha256": sha(path)}
+
+
+def header_source_receipt(repo, inventory):
+    receipt = json.loads((repo / DIRECTORY_HEADERS / "SOURCES.json").read_text())
+    expected = {"node_api.h", "node_api_types.h", "js_native_api.h", "js_native_api_types.h", "LICENSE"}
+    files = receipt.get("files", [])
+    if (receipt.get("upstreamVersion") != "v24.22.1" or receipt.get("napiVersion") != 8
+            or receipt.get("origin") != "https://github.com/nodejs/node" or len(files) != len(expected)
+            or {item.get("name") for item in files} != expected):
+        raise RuntimeError("bundled Node-API header provenance is incomplete")
+    for item in files:
+        actual = inventory[f"{DIRECTORY_HEADERS}/{item['name']}"]
+        if item.get("sha256") != actual["sha256"] or item.get("bytes") != actual["bytes"]:
+            raise RuntimeError("bundled Node-API header/license bytes differ from official-source receipt")
+    return receipt
+
+
+def directory_control_gate(receipts, inventory, runtime, binary, uid, exit_code, tap):
+    """Require each fixed production control and each independent cleanup receipt."""
+    issues = []
+    observed_failure = False
+    observed_blocked = False
+    summary = {}
+    expected_runtime = {"platform": "darwin", "arch": "arm64", "node": runtime["node"],
+                        "uid": uid, "napi": runtime["napi"]}
+    expected_sources = {path: inventory[path]["sha256"] for path in DIRECTORY_SOURCES}
+    for suite, ids in (("core", [f"DIRFD-{i:02}" for i in range(1, 11)]), ("socket", ["DIRFD-11"])):
+        receipt = receipts.get(suite)
+        if not isinstance(receipt, dict):
+            issues.append(f"{suite}: missing receipt object")
+            continue
+        status = receipt.get("status")
+        observed_failure |= status == "FAIL"
+        observed_blocked |= status == "BLOCKED"
+        controls = receipt.get("controls")
+        valid_controls = isinstance(controls, list) and all(isinstance(control, dict) for control in controls)
+        actual_ids = [control.get("id") for control in controls] if valid_controls else []
+        if len(actual_ids) != len(ids) or set(filter(lambda value: isinstance(value, str), actual_ids)) != set(ids):
+            issues.append(f"{suite}: missing, extra or repeated control ID")
+        if valid_controls:
+            observed_failure |= any(control.get("status") == "FAIL" for control in controls)
+            observed_blocked |= any(control.get("status") == "BLOCKED" for control in controls)
+        if not valid_controls or any(control.get("status") != "PASS" for control in controls):
+            issues.append(f"{suite}: every required control must independently PASS")
+        if receipt.get("suite") != suite or status != "PASS":
+            issues.append(f"{suite}: receipt suite/status did not PASS")
+        if receipt.get("runtime") != expected_runtime:
+            issues.append(f"{suite}: actual Darwin/runtime/UID/NAPI binding mismatch")
+        if receipt.get("headers") != {"upstreamVersion": "v24.22.1", "napiVersion": 8}:
+            issues.append(f"{suite}: header source/API binding mismatch")
+        loaded = receipt.get("binary")
+        required_binary = {"path": binary["path"], "sha256": binary["sha256"], "mode": 0o700,
+                           "uid": uid, "nlink": 1, "device": binary["device"], "inode": binary["inode"],
+                           "productionDarwinArtifact": True}
+        if (not isinstance(loaded, dict) or any(loaded.get(key) != value for key, value in required_binary.items())
+                or loaded.get("productionDarwinArtifact") is not True or type(loaded.get("nlink")) is not int):
+            issues.append(f"{suite}: actual loaded production binary binding mismatch")
+        if receipt.get("sourceSha256") != expected_sources:
+            issues.append(f"{suite}: complete fixed production source binding mismatch")
+        if receipt.get("nativeAttempted") is not True:
+            issues.append(f"{suite}: real production native execution was not reached")
+        if receipt.get("remainingOwnedDescriptors") != [] or receipt.get("ownedFixtureRemoved") is not True:
+            issues.append(f"{suite}: owned descriptor/fixture cleanup not proven")
+        if suite == "socket" and (receipt.get("fixtureCreated") is not True or receipt.get("fixtureStatus") != "CREATED"):
+            issues.append("socket: actual Unix socket fixture was not created")
+        summary[suite] = {"receipt_status": status, "controls": controls, "nativeAttempted": receipt.get("nativeAttempted"),
+                          "ownedFixtureRemoved": receipt.get("ownedFixtureRemoved")}
+    tap_summary = dict(re.findall(r"^# (tests|pass|fail|cancelled|skipped) (\d+)$", tap, re.M))
+    if exit_code != 0 or tap_summary != {"tests": "13", "pass": "13", "fail": "0", "cancelled": "0", "skipped": "0"}:
+        issues.append("core/socket Node process and all 13 parent/control TAP results must pass without skips")
+    status = "PASS" if not issues else "FAIL" if observed_failure else "BLOCKED" if observed_blocked else "INCONCLUSIVE"
+    return {"status": status, "issues": issues, "suites": summary, "exit_code": exit_code, "tap_summary": tap_summary}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expected-commit", required=True)
@@ -51,12 +179,14 @@ def main():
     os.chmod(output, 0o700)
     evidence = output / "cases"
     evidence.mkdir(mode=0o700)
+    directory_evidence = output / "public-directory"
+    directory_evidence.mkdir(mode=0o700)
     started = time.monotonic()
     deadline = started + ACTIVITY_SECONDS
     proof = {"work_id": "BR-COLLAB-S4-T2/PUB-R05-Darwin", "started_at": utc(),
              "expected_commit": args.expected_commit, "maximum_attempts": 1,
              "activity_budget_seconds": ACTIVITY_SECONDS, "cleanup_budget_seconds": CLEANUP_SECONDS,
-             "product_status": "NOT_RUN", "outcome": "BLOCKED", "commands": [],
+             "product_status": "NOT_RUN", "public_case_status": "NOT_RUN", "outcome": "BLOCKED", "commands": [],
              "platform": platform.system(), "architecture": platform.machine(), "kernel": platform.release(),
              "image_os": os.environ.get("ImageOS", "unknown"), "image_version": os.environ.get("ImageVersion", "unknown"),
              "production_modified": False, "shared_service_modified": False, "global_tools_modified": False}
@@ -178,13 +308,34 @@ def main():
         if head.strip() != args.expected_commit or status.strip():
             raise RuntimeError("run candidate changed or is dirty")
         proof.update(candidate=head.strip(), tree=tree.strip(), node=call("node-version", ["node", "--version"], 3)[1].strip())
+        _, runtime_text = call("node-runtime", ["node", "-e",
+            "process.stdout.write(JSON.stringify({node:process.version,napi:process.versions.napi,modules:process.versions.modules,platform:process.platform,arch:process.arch}))"], 3)
+        runtime = json.loads(runtime_text)
+        if runtime.get("platform") != "darwin" or runtime.get("arch") != "arm64" or int(runtime.get("napi", "0")) < 8:
+            raise RuntimeError("actual Node runtime cannot load the fixed Node-API 8 bridge")
+        proof["node_runtime"] = runtime
         call("macos-version", ["sw_vers"], 3)
         call("compiler-version", ["xcrun", "clang", "--version"], 3)
-        proof["source_sha256"] = {p: sha(repo / p) for p in [TEST, "src/server/storage/maintenance/postgres.ts",
-            "src/server/storage/maintenance/postgres-public-restore.ts", "src/server/storage/maintenance/postgres-public-toc.ts",
-            "src/server/storage/maintenance/postgres-tools.ts", "src/server/storage/maintenance/postgres-manifests.ts"]}
-        # Native host identity is required by the existing adapter. This builds only the repo's existing helper.
+        call("build-compiler-version", ["/usr/bin/cc", "--version"], 3)
+        proof["darwin_sdk"] = {"version": call("sdk-version", ["xcrun", "--show-sdk-version"], 3)[1].strip(),
+                               "path": call("sdk-path", ["xcrun", "--show-sdk-path"], 3)[1].strip()}
+        _, tree_files = call("source-tree-inventory", ["git", "ls-tree", "-rz", "--full-tree", "HEAD"], 3)
+        inventory = source_inventory(repo, tree_files)
+        (output / "source-inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
+        proof["source_sha256"] = {p: record["sha256"] for p, record in inventory.items()}
+        proof["directory_headers"] = {"source_version": "v24.22.1", "compiled_node_api_version": 8,
+            "actual_runtime_version": runtime["node"], "actual_runtime_napi": runtime["napi"],
+            "same_version_headers_claimed": False,
+            "source_receipt": header_source_receipt(repo, inventory)}
+        # The fixed production build includes host identity, SQLite and the public-directory bridge.
         call("maintenance-native-build", ["node", "scripts/build-maintenance-platform.mjs", "--required"], 30)
+        bridge_path = repo / "build/maintenance-platform/postgres-public-directory-arm64.node"
+        proof["directory_bridge_binary"] = bridge_binary_identity(bridge_path)
+        bridge_copy = output / bridge_path.name
+        shutil.copyfile(bridge_path, bridge_copy)
+        os.chmod(bridge_copy, 0o600)
+        if sha(bridge_copy) != proof["directory_bridge_binary"]["sha256"]:
+            raise RuntimeError("saved bridge binary differs from production build")
         owned = pathlib.Path(tempfile.mkdtemp(prefix="boardroom-r05-")).resolve()
         os.chmod(owned, 0o700)
         identity = (owned.stat().st_dev, owned.stat().st_ino)
@@ -193,6 +344,36 @@ def main():
         runtime_tmp = owned / "fixtures"
         runtime_tmp.mkdir(mode=0o700)
         environment["TMPDIR"] = str(runtime_tmp)
+        environment["BOARDROOM_PUBLIC_DIRECTORY_EVIDENCE"] = str(directory_evidence)
+        proof["product_status"] = "RUNNING"
+        proof["directory_controls"] = {"status": "RUNNING", "receipts": str(directory_evidence.relative_to(output))}
+        code, tap = call("production-directory-controls", ["node", "--test", "--test-reporter=tap",
+            "--test-timeout=30000", "--test-concurrency=1", *DIRECTORY_TESTS], 45, allow_failure=True)
+        receipts = {}
+        receipt_errors = []
+        for suite in ("core", "socket"):
+            path = directory_evidence / f"public-directory-{suite}.json"
+            try:
+                info = path.lstat()
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+                        or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 1024 * 1024):
+                    raise RuntimeError("receipt file identity/size is invalid")
+                receipts[suite] = json.loads(path.read_text())
+            except (OSError, ValueError, RuntimeError) as error:
+                receipt_errors.append(f"{suite}: {type(error).__name__}: {str(error)[:256]}")
+        gate = directory_control_gate(receipts, inventory, runtime, proof["directory_bridge_binary"], os.getuid(), code, tap)
+        gate["issues"].extend(receipt_errors)
+        if bridge_binary_identity(bridge_path) != proof["directory_bridge_binary"]:
+            gate["issues"].append("production bridge binary changed during core/socket controls")
+        if source_inventory(repo, tree_files) != inventory:
+            gate["issues"].append("qualification source inventory changed during core/socket controls")
+        if gate["issues"] and gate["status"] == "PASS":
+            gate["status"] = "INCONCLUSIVE"
+        proof["directory_controls"] = gate
+        if gate["status"] != "PASS":
+            proof["product_status"] = "NOT_RUN" if gate["status"] == "BLOCKED" else gate["status"]
+            raise RuntimeError("production directory core/socket qualification did not pass; see independent receipts")
+        proof["product_status"] = "NOT_RUN"
         binary = None
         candidates = [pathlib.Path("/opt/homebrew/opt/postgresql@16/bin")]
         installed = shutil.which("postgres")
@@ -276,10 +457,12 @@ def main():
         environment.update(AGENT_STUDIO_PG_TEST_URL=f"postgres://{user}@127.0.0.1:{port}/postgres",
             BOARDROOM_PUB_R05_PG_BIN=str(binary), BOARDROOM_PUB_R05_EVIDENCE=str(evidence), BOARDROOM_PUB_R05_OWNED_DATA=str(data))
         proof["product_status"] = "RUNNING"
+        proof["public_case_status"] = "RUNNING"
         code, tap = call("darwin-native-acceptance", ["node", "--test", "--test-reporter=tap", "--test-timeout=120000",
             "--test-concurrency=1", TEST], 130, env=environment, allow_failure=True)
         if code != 0:
             proof["product_status"] = "FAIL"
+            proof["public_case_status"] = "FAIL"
         result = json.loads((evidence / "acceptance.json").read_text()) if (evidence / "acceptance.json").exists() else None
         accepted = (code == 0 and result is not None and result.get("actualDarwinExecution") is True
                     and len(result.get("cases", [])) == 5 and all(c.get("status") == c.get("cleanup") == "PASS" for c in result["cases"]))
@@ -288,6 +471,12 @@ def main():
         if proof["tap_summary"].get("skipped") != "0":
             accepted = False
             proof["product_status"] = "FAIL"
+        proof["public_case_status"] = proof["product_status"]
+        proof["directory_bridge_binary_after"] = bridge_binary_identity(bridge_path)
+        if proof["directory_bridge_binary_after"] != proof["directory_bridge_binary"]:
+            raise RuntimeError("production directory bridge changed during qualification")
+        if source_inventory(repo, tree_files) != inventory:
+            raise RuntimeError("qualification source inventory changed during execution")
         _, after = call("git-status-after", ["git", "status", "--porcelain=v1"], 3)
         if after.strip():
             raise RuntimeError("candidate changed during acceptance")
@@ -296,6 +485,8 @@ def main():
         proof["error"] = {"type": type(error).__name__, "message": str(error)[:1000]}
         if proof["product_status"] == "RUNNING":
             proof["product_status"] = "INCONCLUSIVE"
+        if proof["public_case_status"] == "RUNNING":
+            proof["public_case_status"] = "INCONCLUSIVE"
         proof["outcome"] = "FAIL" if proof["product_status"] == "FAIL" else "INCONCLUSIVE" if proof["product_status"] != "NOT_RUN" else "BLOCKED"
         accepted = False
     finally:
