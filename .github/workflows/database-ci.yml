@@ -136,9 +136,16 @@ jobs:
       - name: 有界 SQLite 源使用者 TAP 诊断
         if: ${{ !cancelled() && steps.maintenance_pg_diagnostic.outcome != 'skipped' }}
         shell: bash
-        run: |
-          mkdir -p .agent-output/maintenance-native-diagnostics
-          timeout --signal=TERM --kill-after=10s 30s node --test --test-reporter=tap --test-name-pattern='unknown source file users' tests/maintenance-sqlite.test.ts 2>&1 | tee .agent-output/maintenance-native-diagnostics/sqlite-source-users.tap
+        run: python3 scripts/ci/linux_isolation.py sqlite
+
+      - name: 全量测试（启用 PostgreSQL 门控用例）
+        env:
+          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: python3 scripts/ci/linux_isolation.py full-suite
+
+      - name: 核对 Linux 专属测试身份、进程与工件收尾
+        if: always()
+        run: python3 scripts/ci/linux_isolation.py cleanup
 
       - name: 保存原生维护即时诊断证据
         if: always()
@@ -150,10 +157,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: 全量测试（启用 PostgreSQL 门控用例）
-        env:
-          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
-        run: npm test
+      - name: 保存 Linux 测试身份与资源收尾证据
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-ci-isolation-${{ github.run_attempt }}
+          path: .agent-output/linux-ci-isolation/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: 独立私有 cluster 真实重启与旧句柄失效验证
         shell: bash
