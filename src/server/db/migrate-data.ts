@@ -36,6 +36,7 @@ import { identityCatalogMigration } from "./migrations/identity-catalog.ts";
 import { projectWorkspacesMigration } from "./migrations/project-workspaces.ts";
 import { taskIntakeMigration } from "./migrations/task-intake.ts";
 import { policyConfigurationMigration } from "./migrations/policy-configuration.ts";
+import { storageMaintenanceMigration } from "./migrations/storage-maintenance.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -348,6 +349,7 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   projectWorkspacesMigration,
   taskIntakeMigration,
   policyConfigurationMigration,
+  storageMaintenanceMigration,
 ];
 
 // ---------------------------------------------------------------------------
@@ -398,13 +400,15 @@ export async function copyAllTables(
   target: DbDriver,
 ): Promise<Record<string, number>> {
   const counts: Record<string, number> = {};
-  await target.transaction(async (tx) => {
+  // Source admission remains locked for the whole business copy; maintenance cannot start
+  // between source preflight and target mutation. Metadata/clients are never business rows.
+  await source.transaction(async () => target.transaction(async (tx) => {
     for (const spec of BUSINESS_TABLES) {
       // 前面的 member/事实 INSERT 已产生临时代际；最后精确覆盖源值，之后不再写监控表。
       if (spec.name === "member_fact_revisions") await tx.exec("DELETE FROM member_fact_revisions");
       counts[spec.name] = await copyTable(source, tx, spec);
     }
-  });
+  }));
   return counts;
 }
 
@@ -502,30 +506,24 @@ export async function migrateData(
   opts: MigrateOptions = {},
 ): Promise<MigrateReport> {
   let snapshot: string | undefined;
-  if (opts.snapshotSource === true && sourceOpts.dbDriver !== "postgres" && sourceOpts.dataDir !== undefined) {
-    snapshot = await snapshotSqliteSource(sourceOpts.dataDir);
-  }
-
   const source = await openDriver(sourceOpts);
-  const target = await openDriver(targetOpts);
+  let target: DbDriver | undefined;
   try {
-    await ensureTargetSchema(target);
-    if (opts.clear !== false) {
-      await clearTargetTables(target);
-    }
-    const perTableCounts = await copyAllTables(source, target);
-    const validation = await compareData(source, target);
-    const totalRows = Object.values(perTableCounts).reduce((a, b) => a + b, 0);
-    return {
-      direction: `${source.kind}->${target.kind}`,
-      perTableCounts,
-      totalRows,
-      validation,
-      snapshot,
-    };
+    target = await openDriver(targetOpts);
+    const destination=target;
+    return await source.transaction(async()=>{
+      if (opts.snapshotSource === true && sourceOpts.dbDriver !== "postgres" && sourceOpts.dataDir !== undefined)
+        snapshot = await snapshotSqliteSource(sourceOpts.dataDir);
+      await ensureTargetSchema(destination);
+      if (opts.clear !== false) await clearTargetTables(destination);
+      const perTableCounts = await copyAllTables(source,destination);
+      const validation = await compareData(source,destination);
+      const totalRows = Object.values(perTableCounts).reduce((a,b)=>a+b,0);
+      return {direction:`${source.kind}->${destination.kind}`,perTableCounts,totalRows,validation,snapshot};
+    });
   } finally {
     await source.close();
-    await target.close();
+    await target?.close();
   }
 }
 

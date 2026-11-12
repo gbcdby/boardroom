@@ -21,6 +21,9 @@ import {
 } from "../migrate.ts";
 import { postgresDialect } from "../dialect.ts";
 import { DriverConnectionError, type DbDriver, type DbRow, type DbTransaction, type DbTransactionContext } from "../driver.ts";
+import { assertStorageAdmission, readPostgresMaintenanceState, StorageMaintenanceError, type StorageAdmissionIdentity } from "../../storage/admission.ts";
+import { assertPostgresGuardCoverage, extendPostgresStorageGuards } from "../../storage/schema-guards.ts";
+import { storageDrainClientToCheck, assertStorageDrainClient } from "../../storage/drain-boundary.ts";
 
 export interface PostgresDriverOptions {
   readonly connectionString: string;
@@ -38,6 +41,7 @@ export class PostgresDriver implements DbDriver {
   private readonly connectionString: string;
   private readonly schema: string | undefined;
   private pool: Pool | null = null;
+  private admissionIdentity: StorageAdmissionIdentity | undefined;
   /** 按异步调用链绑定连接；不相关请求不能共享另一个事务的客户端。 */
   private readonly transactionScope = new AsyncLocalStorage<{ client: PoolClient; queue: OperationQueue }>();
   private readonly transactionIdentity = new AsyncLocalStorage<DbTransactionContext & { active: boolean }>();
@@ -75,6 +79,8 @@ export class PostgresDriver implements DbDriver {
     this.pool = pool;
     try {
       await pool.query("SELECT 1");
+      const probe=await pool.connect();
+      try {await this.checkAdmission(probe,false);} finally {probe.release();}
       if (this.schema !== undefined) {
         // search_path 指向的 schema 必须先存在，否则后续 DDL 全部失败。
         await pool.query(`CREATE SCHEMA IF NOT EXISTS ${this.quotedSchema()}`);
@@ -82,6 +88,7 @@ export class PostgresDriver implements DbDriver {
     } catch (error) {
       await pool.end().catch(() => {});
       this.pool = null;
+      if (error instanceof StorageMaintenanceError) throw error;
       throw new DriverConnectionError(
         `无法连接 PostgreSQL（${this.sanitizedConnectionString()}）：${this.sanitize(errorText(error))}。` +
           `请确认数据库服务已启动、AGENT_STUDIO_PG_CONNECTION_STRING 与权限配置正确；` +
@@ -97,7 +104,10 @@ export class PostgresDriver implements DbDriver {
   async migrate(migrations: readonly Migration[]): Promise<MigrationRunResult> {
     const ordered = validateAndSort(migrations);
     const pool = this.requirePool();
-    await pool.query(this.dialect.migrationTableDdl());
+    await this.transaction(async tx => {await tx.exec(this.dialect.migrationTableDdl());});
+    const probe=await pool.connect();
+    try {if (await readPostgresMaintenanceState(probe)) await assertPostgresGuardCoverage(probe);}
+    finally {probe.release();}
 
     const applied = new Map<number, AppliedMigration>();
     for (const row of await this.readAppliedMigrations()) {
@@ -123,6 +133,8 @@ export class PostgresDriver implements DbDriver {
       newlyApplied.push(migration);
     }
     const state = await this.migrationState();
+    const current=await pool.connect();
+    try {await this.checkAdmission(current,false);} finally {current.release();}
     return { applied: newlyApplied, version: state.version };
   }
 
@@ -134,6 +146,7 @@ export class PostgresDriver implements DbDriver {
 
   async query<T extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []): Promise<T[]> {
     const scope = this.transactionScope.getStore();
+    if (!scope) return this.transaction(async tx => tx.query<T>(sql,params));
     const execute = () => (scope?.client ?? this.requirePool()).query(this.dialect.renderParameters(sql), [...params]);
     const result = await (scope ? scope.queue.run(execute) : execute());
     return result.rows as T[];
@@ -141,6 +154,7 @@ export class PostgresDriver implements DbDriver {
 
   async exec(sql: string, params: readonly unknown[] = []): Promise<number> {
     const scope = this.transactionScope.getStore();
+    if (!scope) return this.transaction(async tx => tx.exec(sql,params));
     const execute = () => (scope?.client ?? this.requirePool()).query(this.dialect.renderParameters(sql), [...params]);
     const result = await (scope ? scope.queue.run(execute) : execute());
     return result.rowCount ?? 0;
@@ -181,6 +195,7 @@ export class PostgresDriver implements DbDriver {
       else await client.query(this.dialect.beginTransaction());
       const scope = { client, queue };
       try {
+        if (!nested) await this.checkAdmission(client,true);
         const result = await this.transactionIdentity.run(identity, () => this.transactionScope.run(scope, () => fn(tx)));
         await queue.drain();
         if (nested) await client.query(`RELEASE SAVEPOINT ${sp}`);
@@ -211,6 +226,7 @@ export class PostgresDriver implements DbDriver {
   async close(): Promise<void> {
     const pool = this.pool;
     this.pool = null;
+    this.admissionIdentity = undefined;
     if (pool !== null) {
       await pool.end().catch(() => {});
     }
@@ -221,7 +237,10 @@ export class PostgresDriver implements DbDriver {
     const upSql = migrationSql(migration, "postgres");
     try {
       await client.query(this.dialect.beginTransaction());
+      await this.checkAdmission(client,true);
+      if (await readPostgresMaintenanceState(client)) await assertPostgresGuardCoverage(client);
       await client.query(upSql); // 迁移脚本为无参多语句，走简单查询协议
+      await extendPostgresStorageGuards(client);
       await client.query(
         this.dialect.renderParameters(
           `INSERT INTO ${MIGRATION_TABLE} (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)`,
@@ -262,6 +281,14 @@ export class PostgresDriver implements DbDriver {
       throw new DriverConnectionError("PostgreSQL 驱动尚未 connect()，无法执行查询。");
     }
     return this.pool;
+  }
+
+  private async checkAdmission(client: PoolClient, lock: boolean): Promise<void> {
+    const state=await readPostgresMaintenanceState(client,{required:this.admissionIdentity!==undefined,lock});
+    const cleanupClient=storageDrainClientToCheck(this,state,this.admissionIdentity);
+    if (cleanupClient) assertStorageDrainClient((await client.query("SELECT * FROM storage_source_clients WHERE client_id=$1 FOR SHARE",[cleanupClient])).rows[0],state!,this.admissionIdentity!);
+    else assertStorageAdmission(state,this.admissionIdentity);
+    if (state && !this.admissionIdentity) this.admissionIdentity={databaseInstanceId:state.databaseInstanceId,fenceEpoch:state.fenceEpoch};
   }
 
   private quotedSchema(): string {
