@@ -1,0 +1,38 @@
+name: Fs native ext4 R04 evidence
+
+on:
+  push:
+    branches: [qualification/152-native-ext4-r04-d1]
+    paths:
+      - '.github/workflows/fs-native-ext4-r04-evidence.yml'
+      - 'scripts/qualification/fs-native-ext4-r04/**'
+      - 'tests/fs-native-ext4-r04-evidence.test.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fs-native-ext4-r04-evidence
+  cancel-in-progress: false
+
+jobs:
+  bounded-r04-evidence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Offline evidence consumer controls
+        run: python3 tests/fs-native-ext4-r04-evidence.test.py
+      - name: One bounded owned-fixture observation
+        run: python3 scripts/qualification/fs-native-ext4-r04/run.py --mode hosted-linux --out "$GITHUB_WORKSPACE/.agent-output/fs-native-ext4-r04-evidence"
+      - name: Preserve complete originals even for FAIL or INCONCLUSIVE
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fs-native-ext4-r04-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: .agent-output/fs-native-ext4-r04-evidence
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

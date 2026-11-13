@@ -1,0 +1,70 @@
+{
+  "B1": "OPEN",
+  "R05": "NOT_IMPLEMENTED_NOT_RUN",
+  "S4_outputs_released": [],
+  "accepted_provider_profiles": [],
+  "authoritative_r3": "https://github.com/gbcdby/boardroom/issues/152#issuecomment-6852650119",
+  "budgets": {
+    "bundle_bytes": 67108864,
+    "cold_rounds": 3,
+    "compile_seconds": 10,
+    "default_variants": 1,
+    "fixture_seconds": 300,
+    "image_bytes": 67108864,
+    "images": 2,
+    "job_minutes": 10,
+    "objects_per_class": 8,
+    "payload_bytes": 1048576,
+    "probe_seconds": 3,
+    "stage_seconds": 60
+  },
+  "cold_open_rule": null,
+  "effective_reference": null,
+  "feature_reference": null,
+  "limits": {
+    "kernel_notes_bytes": 1048576,
+    "mountinfo_bytes": 1048576,
+    "mountinfo_line_bytes": 16384,
+    "mountinfo_lines": 4096,
+    "overflow_retries": 0,
+    "proc_option_line_bytes": 1024,
+    "proc_options_bytes": 16384,
+    "proc_options_lines": 256,
+    "statmount_buffer_bytes": 16384,
+    "sysfs_scalar_bytes": 4096
+  },
+  "mount_options": [
+    "rw",
+    "relatime",
+    "errors=remount-ro",
+    "data=ordered",
+    "acl"
+  ],
+  "null_means": "UNSUPPORTED, never wildcard",
+  "production_enable": false,
+  "profile": "linux-native-ext4-fid-fsuuid-v1",
+  "qualified_kernel_builds": [],
+  "revision": "S4-T2-Fs-native-ext4-r3-R04-d1-20261113",
+  "schema": "fs-ext4-r04-diagnostic-profile/v1",
+  "shared_plan": "https://github.com/gbcdby/boardroom/issues/152#issuecomment-6857609667",
+  "source_files": [
+    ".github/workflows/fs-native-ext4-r04-evidence.yml",
+    "tests/fs-native-ext4-r04-evidence.test.py",
+    "scripts/qualification/fs-native-ext4-r04/README.md",
+    "scripts/qualification/fs-native-ext4-r04/checks.py",
+    "scripts/qualification/fs-native-ext4-r04/profile.json",
+    "scripts/qualification/fs-native-ext4-r04/probe.c",
+    "scripts/qualification/fs-native-ext4-r04/run.py",
+    "scripts/qualification/fs-native-ext4-r04/observer.py",
+    "scripts/qualification/fs-native-ext4-r04/support.py",
+    "scripts/qualification/fs-native-ext4-r04/uapi.h"
+  ],
+  "target": {
+    "machine": "x86_64",
+    "release": "7.0.0-1017-azure",
+    "sysname": "Linux",
+    "version": "#17~24.04.1-Ubuntu SMP PREEMPT Thu Sep 24 18:46:57 UTC 2026"
+  },
+  "ticket153": "BLOCKED",
+  "topology_reference": null
+}
