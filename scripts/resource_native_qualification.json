@@ -1,0 +1,103 @@
+{
+  "schema": 1,
+  "purpose": "QUALIFICATION_ONLY",
+  "branch": "qualification/resource-173-native-run43385503319",
+  "product": {
+    "head": "1887723324f33154fc99bb7a25fa33aff57152f8",
+    "actual": "fd69b31aeb1fef6a067cd2a272c18c7c528b5af4",
+    "tree": "e30a4634ea74a145de8e3b75d1a1cba111445582",
+    "run": 43385503319
+  },
+  "dependencies": {
+    "artifactId": 14018724199,
+    "zipSha256": "0e1af761ed5a13e4df1d2d8a5742867eab7b6448299e51b87a668fc092fa99dc",
+    "environmentSha256": "e3497e62ace7a882d8b9017b8a2c532f52c9f481733c5e0400dc01f2a842ed18",
+    "tarSha256": "ba8f59aad460950690bd02ec1bdd643947003854ff3bebf0bce96912c502fd0c",
+    "environment": {
+      "candidate": "fd69b31aeb1fef6a067cd2a272c18c7c528b5af4",
+      "node": "v24.22.2",
+      "abi": "137",
+      "platform": "linux",
+      "arch": "x64",
+      "libc": "2.39",
+      "lockSha256": "08587e32f7caf0f33023b78ebab0b0b1fbea7b7fbbed69415ac8f6aec5601a03"
+    }
+  },
+  "browser": {
+    "image": "mcr.microsoft.com/playwright/python:v1.62.0-noble@sha256:aa81288e738725378becba5b3e06cb0f3a7f012a610e87e8d767a090ea3f740d",
+    "version": "151.0.7922.34",
+    "executable": "/ms-playwright/chromium-1234/chrome-linux64/chrome",
+    "referenceArguments": [
+      "/ms-playwright/chromium-1234/chrome-linux64/chrome",
+      "--disable-field-trial-config",
+      "--disable-background-networking",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-back-forward-cache",
+      "--disable-breakpad",
+      "--disable-client-side-phishing-detection",
+      "--disable-component-extensions-with-background-pages",
+      "--disable-component-update",
+      "--no-default-browser-check",
+      "--disable-default-apps",
+      "--disable-dev-shm-usage",
+      "--disable-edgeupdater",
+      "--disable-extensions",
+      "--disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,BoundaryEventDispatchTracksNodeRemoval,DestroyProfileOnBrowserClose,DialMediaRouteProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,BlockOriginHeaderModificationOnRedirect,Translate,AutoDeElevate,OptimizationHints,msForceBrowserSignIn,msEdgeUpdateLaunchServicesPreferredVersion",
+      "--enable-features=CDPScreenshotNewSurface",
+      "--allow-pre-commit-input",
+      "--disable-hang-monitor",
+      "--disable-ipc-flooding-protection",
+      "--disable-popup-blocking",
+      "--disable-prompt-on-repost",
+      "--disable-renderer-backgrounding",
+      "--disable-updater-scheduler",
+      "--force-color-profile=srgb",
+      "--metrics-recording-only",
+      "--no-first-run",
+      "--password-store=basic",
+      "--use-mock-keychain",
+      "--no-service-autorun",
+      "--export-tagged-pdf",
+      "--disable-search-engine-choice-screen",
+      "--unsafely-disable-devtools-self-xss-warnings",
+      "--edge-skip-compat-layer-relaunch",
+      "--disable-infobars",
+      "--disable-search-engine-choice-screen",
+      "--disable-sync",
+      "--enable-unsafe-swiftshader",
+      "--no-sandbox",
+      "--enable-automation",
+      "--ozone-platform=x11",
+      "--user-data-dir=/tmp/playwright_chromiumdev_profile-PaYRq8",
+      "--remote-debugging-pipe",
+      "--no-startup-window",
+      "--flag-switches-begin",
+      "--flag-switches-end",
+      "--enable-unsafe-swiftshader"
+    ],
+    "referenceReportSha256": "cc79fc2cee932689e09fc7e692b84efde7ed83394428e2cbe7dd81e53420ab1f",
+    "coreBundleSha256": "3258d1cf334c6afc95f22aa9c292436cb976b391e0437f1359c83b84f0cb9d66",
+    "packages": {
+      "playwright": "1.62.0",
+      "pyee": "13.0.1",
+      "greenlet": "3.5.6",
+      "typing-extensions": "4.16.0"
+    },
+    "desktopPackages": {
+      "openbox": "3.6.1-12build5",
+      "x11-utils": "7.7+6build2",
+      "xauth": "1:1.1.2-1build1",
+      "xvfb": "2:21.1.12-1ubuntu1.6"
+    }
+  },
+  "newPaths": [
+    ".github/workflows/resource-173-native-qualification.yml",
+    "scripts/qualify_resource_native.py",
+    "scripts/resource_native_qualification.json",
+    "scripts/resource_owned_chromium.py",
+    "tests/resource-native-qualification.test.py"
+  ],
+  "preservedEntrySha256": "35c489b9b57b9246b73ddfe8262fe8100b1629476e1305883540a6518b6cf6e4",
+  "visibleControlAstSha256": "e6b4182e6a22fb079f328feb82edf39d2155939e3e8c8d77d4f3ce4069dccf40"
+}
