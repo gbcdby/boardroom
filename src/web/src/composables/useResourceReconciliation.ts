@@ -64,7 +64,8 @@ export function createResourceReconciliation<T, Scope extends ResourceScope = Re
   function readerFor(staged: Map<string, CachedResponse>, signal: AbortSignal): ResourceReader {
     return { async get<R>(path: string): Promise<R> {
       const previous = staged.get(path);
-      const response = await request(path, { method: "GET", signal, headers: { accept: "application/json", ...(previous?.etag ? { "if-none-match": previous.etag } : {}) } });
+      // 本层持有 URL/ETag 快照；不让在途读占用浏览器 HTTP 缓存项、阻塞同 URL 的写入。
+      const response = await request(path, { method: "GET", signal, cache: "no-store", headers: { accept: "application/json", ...(previous?.etag ? { "if-none-match": previous.etag } : {}) } });
       if (response.status === 304) {
         if (!previous) throw new Error("服务器返回未修改，但当前页面没有对应快照。请重新读取。");
         return previous.value as R;

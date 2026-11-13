@@ -17,9 +17,9 @@ function browserFixture() {
 }
 
 test("共用对账：同一刷新合并，条件 GET/304 保留快照；错误保留上次值与时间", async () => {
-  const first = deferred<Response>(); let requests = 0; const headers: Headers[] = [];
+  const first = deferred<Response>(); let requests = 0; const headers: Headers[] = [], cacheModes: Array<RequestInit["cache"]> = [];
   const state = createResourceReconciliation<{ revision: number }>({ browser: null,
-    fetch: async (_url, init) => { headers.push(new Headers(init?.headers)); requests++; if (requests === 1) return first.promise; if (requests === 2) return new Response(null, { status: 304 }); throw new Error("断线"); },
+    fetch: async (_url, init) => { headers.push(new Headers(init?.headers)); cacheModes.push(init?.cache); requests++; if (requests === 1) return first.promise; if (requests === 2) return new Response(null, { status: 304 }); throw new Error("断线"); },
     read: (scope, reader) => reader.get(`/api/${scope.projectId}`),
   });
   try {
@@ -32,6 +32,7 @@ test("共用对账：同一刷新合并，条件 GET/304 保留快照；错误�
     await state.refresh(); assert.equal(state.value.value, snapshot); assert.equal(headers[1]!.get("if-none-match"), '"one"');
     const readAt = state.lastSuccessAt.value; await state.refresh();
     assert.equal(state.value.value, snapshot); assert.equal(state.lastSuccessAt.value, readAt); assert.match(state.error.value!, /断线/);
+    assert.deepEqual(cacheModes, ["no-store", "no-store", "no-store"], "首次和条件读取均由应用缓存负责，不持有浏览器 HTTP 缓存项");
   } finally { state.dispose(); }
 });
 

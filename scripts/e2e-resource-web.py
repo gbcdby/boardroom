@@ -7,11 +7,15 @@ import hashlib
 import json
 from pathlib import Path
 from queue import Queue, Empty
+import signal
 import subprocess
+import sys
 from threading import Thread
 from time import monotonic
 import traceback
 from playwright.sync_api import sync_playwright, expect, Error as PlaywrightError
+sys.dont_write_bytecode = True  # 不把本入口的辅助模块缓存写进候选工作树。
+from resource_native_desktop import NativeDesktop
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -136,6 +140,18 @@ def hints(snapshot, task_id):
             and event["frame"].get("id") == task_id]
 
 
+def native_snapshot(page, cdp, window, width, phase, report):
+    """有界旁录；自身失败不得取代原断言/异常，也不能伪造 visibility。"""
+    item = {"width": width, "phase": phase, "at": datetime.now(timezone.utc).isoformat(), "windowId": window}
+    try:
+        item["bounds"] = cdp.send("Browser.getWindowBounds", {"windowId": window}) if window is not None else None
+        item["page"] = page.evaluate("""() => ({visibility:document.visibilityState, focus:document.hasFocus(),
+          visibilityEvents:window.resourceVisibilityEvidence, windowEvents:window.resourceWindowEvidence})""")
+    except Exception as error:
+        item["observationError"] = str(error)[:512]
+    report.setdefault("nativeWindowEvidence", []).append(item)
+
+
 def native_hidden_recovery(page, context, fixture, data, task, path, width, report):
     """控制 Chromium 窗口；仅读取原生 visibility/isTrusted，绝不改写页面可见性。"""
     cdp = context.new_cdp_session(page)
@@ -147,19 +163,28 @@ def native_hidden_recovery(page, context, fixture, data, task, path, width, repo
           state: document.visibilityState, trusted: event.isTrusted, at: Date.now()
         });
       });
+      window.resourceWindowEvidence = [];
+      for (const type of ['focus', 'blur']) window.addEventListener(type, event => {
+        if (window.resourceWindowEvidence.length < 128) window.resourceWindowEvidence.push({
+          type, visibility:document.visibilityState, trusted:event.isTrusted, at:Date.now()
+        });
+      });
     }""")
     try:
         # Playwright 默认模拟 focused/active；关闭该模拟后检查真正的窗口可见性。
         try:
             cdp.send("Emulation.setFocusEmulationEnabled", {"enabled": False})
             window = cdp.send("Browser.getWindowForTarget")["windowId"]
+            native_snapshot(page, cdp, window, width, "before-minimize", report)
             cdp.send("Browser.setWindowBounds", {"windowId": window, "bounds": {"windowState": "minimized"}})
             page.wait_for_function("document.visibilityState === 'hidden'", polling=100, timeout=5000)
         except PlaywrightError as error:
+            native_snapshot(page, cdp, window, width, "hidden-wait-failed", report)
             report["unverified"].append({"width": width, "id": "S5-AC07-native-hidden",
                                          "status": "INCONCLUSIVE", "reason": str(error),
                                          "observed": page.evaluate("document.visibilityState")})
             return task
+        native_snapshot(page, cdp, window, width, "hidden-confirmed", report)
         page.wait_for_timeout(200)  # 完成隐藏之前已经发出的请求。
         before = fixture.snapshot()
         read_count = len(resource_gets(before, path))
@@ -180,15 +205,18 @@ def native_hidden_recovery(page, context, fixture, data, task, path, width, repo
         visibility = page.evaluate("window.resourceVisibilityEvidence")
         assert any(item["state"] == "hidden" and item["trusted"] for item in visibility), visibility
         assert any(item["state"] == "visible" and item["trusted"] for item in visibility), visibility
+        native_snapshot(page, cdp, window, width, "visible-confirmed", report)
         check(report, width, "S5-AC07-native-hidden",
               "Chromium 原生隐藏超过15秒不读取，恢复可见后立即对账",
               hiddenDurationMs=16000, requestCountBefore=read_count,
               requestCountHidden=len(resource_gets(hidden, path)), recoveryMs=elapsed, visibility=visibility)
         return task
     finally:
+        native_snapshot(page, cdp, window, width, "before-restore-cleanup", report)
         if window is not None:
             cdp.send("Browser.setWindowBounds", {"windowId": window, "bounds": {"windowState": "normal"}})
         page.bring_to_front()
+        native_snapshot(page, cdp, window, width, "after-restore-cleanup", report)
         cdp.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
         cdp.detach()
 
@@ -381,13 +409,32 @@ def exercise(page, context, fixture, data, width, output, report):
     page.get_by_test_id("task-title").fill(f"本地提交较新版本 {width}")
     fixture.command("network", holdPath=path)
     api(page, writer, "POST", path + "/comments", {"body": f"触发一次真实旧读取 {width}"}, 201)
-    wait_fixture(page, fixture, lambda snapshot: path in snapshot["heldPaths"])
+    held_snapshot = wait_fixture(page, fixture, lambda snapshot: path in snapshot["heldPaths"])
+    held_request = [event for event in held_snapshot["events"] if event["kind"] == "http.held" and event["path"] == path][-1]
+    save_started = monotonic()
     page.get_by_test_id("task-save").click()
     expect(page.locator("h1")).to_have_text(f"本地提交较新版本 {width}")
+    save_elapsed = round((monotonic() - save_started) * 1000)
+    held_response = [event for event in held_snapshot["events"] if event["kind"] == "http.response"
+                     and event["requestId"] == held_request["requestId"]]
+    assert len(held_response) == 1 and held_response[0]["status"] == 200, held_response
+    assert held_request["ifNoneMatch"], "旧详情仍须由原 URL 的应用 ETag 条件读取取得"
+    saved_snapshot = fixture.snapshot()
+    saved_requests = [event for event in saved_snapshot["events"] if event["kind"] == "http.request"
+                      and event["method"] == "PATCH" and event["path"] == path
+                      and event["requestId"] > held_request["requestId"]]
+    assert len(saved_requests) == 1 and path in saved_snapshot["heldPaths"], saved_snapshot
+    saved_response = [event for event in saved_snapshot["events"] if event["kind"] == "http.response"
+                      and event["requestId"] == saved_requests[0]["requestId"]]
+    assert len(saved_response) == 1 and saved_response[0]["status"] == 200, saved_response
     assert fixture.command("release") == [path]
     page.wait_for_timeout(300)
     expect(page.locator("h1")).to_have_text(f"本地提交较新版本 {width}")
-    check(report, width, "S5-AC07-late-detail", "提交取消旧读取；释放迟到的真实详情响应后较新值不回退")
+    released = [event for event in fixture.snapshot()["events"] if event["kind"] == "http.released" and event["path"] == path][-1]
+    check(report, width, "S5-AC07-late-detail", "同 URL 的旧 GET 扣留时真实 PATCH 成功；原释放点之后新值保持",
+          heldRequest=held_request, heldResponse=held_response[0], patchRequest=saved_requests[0], patchResponse=saved_response[0],
+          saveMs=save_elapsed, release=released,
+          oldResponseOutcome="cancelled-before-release" if released["browserCancelled"] else "release-attempted-delivery-not-proven")
 
     # 同一 TasksView 切换项目后，释放旧项目响应不能污染新项目。
     page.goto(origin + f"/projects/{pid}/tasks")
@@ -416,23 +463,38 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", type=Path, default=ROOT / ".agent-output/resource-web-e2e")
     parser.add_argument("--chromium")
+    parser.add_argument("--native-desktop", action="store_true", help="创建自有 Xvfb/Openbox 并运行 headed Chromium；缺依赖或隐藏能力不成立即失败")
     args = parser.parse_args()
     output = args.artifacts.resolve(); output.mkdir(parents=True, exist_ok=True)
     report = {"status": "NOT_RUN", "at": datetime.now(timezone.utc).isoformat(),
               "candidate": candidate(), "scope": "real Chromium / HTTP / MCP HTTP + independent stdio / temporary SQLite",
               "checks": [], "screenshots": [], "unverified": [], "pageErrors": [], "requests": []}
     fixture = None
+    desktop = NativeDesktop(output / "native-desktop") if args.native_desktop else None
     try:
+        browser_env = desktop.start() if desktop else None
         fixture = Fixture(output); data = fixture.start()
         report["fixture"] = data
         with sync_playwright() as p:
-            # 显式使用完整 Chromium；headless shell 不提供原生窗口最小化能力。
+            # 完整 Chromium + 原生 X11 窗口；没有桌面时不冒充 hidden 能力。
             executable = args.chromium or p.chromium.executable_path
             report["chromiumExecutable"] = executable
-            browser = p.chromium.launch(headless=True, executable_path=executable)
+            browser = p.chromium.launch(headless=not args.native_desktop, executable_path=executable,
+                                       env=browser_env, args=["--ozone-platform=x11"] if desktop else [])
             report["status"] = "FAIL"; report["chromium"] = browser.version
             try:
+                report["headed"] = args.native_desktop
+                if desktop:
+                    browser_cdp = browser.new_browser_cdp_session()
+                    try:
+                        report["browserArguments"] = browser_cdp.send("Browser.getBrowserCommandLine")["arguments"]
+                        report["browserProcesses"] = [entry for entry in browser_cdp.send("SystemInfo.getProcessInfo")["processInfo"] if entry["type"] == "browser"]
+                        assert not any(argument.startswith("--headless") for argument in report["browserArguments"])
+                        assert "--ozone-platform=x11" in report["browserArguments"]
+                    finally:
+                        browser_cdp.detach()
                 for width, height in [(1440, 1000), (390, 844)]:
+                    if desktop: desktop.check_alive()
                     context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai",
                                                   reduced_motion="reduce", viewport={"width": width, "height": height})
                     context.tracing.start(screenshots=True, snapshots=True, sources=True)
@@ -443,6 +505,7 @@ def main():
                         **({"body": request.post_data} if request.method in ("POST", "PATCH", "PUT") else {})}))
                     try:
                         exercise(page, context, fixture, data, width, output, report)
+                        if desktop: desktop.check_alive()
                         assert not report["pageErrors"], report["pageErrors"]
                     except Exception:
                         if not page.is_closed(): screenshot(page, output, report, f"failure-{width}.png")
@@ -452,6 +515,10 @@ def main():
                         context.close()
             finally: browser.close()
         report["status"] = "INCONCLUSIVE" if report["unverified"] else "PASS"
+    except (KeyboardInterrupt, SystemExit):
+        report["status"] = "FAIL"
+        report["interrupted"] = True
+        raise
     except Exception as error:
         report["error"] = str(error)[:10000]
         report["traceback"] = traceback.format_exc()
@@ -465,6 +532,10 @@ def main():
             try: report["cleanup"] = fixture.close()
             except Exception as error:
                 report["cleanupError"] = str(error); report["status"] = "FAIL"
+        if desktop:
+            try: report["nativeDesktop"] = desktop.close()
+            except Exception as error:
+                report["desktopCleanupError"] = str(error); report["status"] = "FAIL"
         report["candidateAfter"] = candidate()
         if report["candidateAfter"] != report["candidate"]:
             report["status"] = "INCONCLUSIVE"; report["candidateChanged"] = True
@@ -474,4 +545,7 @@ def main():
 
 
 if __name__ == "__main__":
+    def terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, terminate)
     raise SystemExit(main())
