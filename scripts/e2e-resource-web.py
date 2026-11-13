@@ -479,8 +479,9 @@ def main():
             # 完整 Chromium + 原生 X11 窗口；没有桌面时不冒充 hidden 能力。
             executable = args.chromium or p.chromium.executable_path
             report["chromiumExecutable"] = executable
+            # Browser.getBrowserCommandLine 要求此开关；Playwright 1.62 不再默认加入。
             browser = p.chromium.launch(headless=not args.native_desktop, executable_path=executable,
-                                       env=browser_env, args=["--ozone-platform=x11"] if desktop else [])
+                                       env=browser_env, args=["--enable-automation", "--ozone-platform=x11"] if desktop else [])
             report["status"] = "FAIL"; report["chromium"] = browser.version
             try:
                 report["headed"] = args.native_desktop
