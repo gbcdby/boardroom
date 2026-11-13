@@ -14,8 +14,9 @@ type SafeDatabase = { kind: "sqlite"; sqlitePath: string; sourcePath?: string; i
 type Binding = { nonce?: unknown; memberId?: unknown; projectId?: unknown; bindingGeneration?: unknown; membershipRevision?: unknown };
 export interface ReaderPhase extends Binding {
   phase: string; owner: number; atMs: number; reader?: string; childPid?: number;
+  seq?: number; atUtc?: string; parentPid?: number; clockOriginMs?: number;
   budgetMs?: number; timerId?: number; database?: SafeDatabase; code?: string; signal?: string | null;
-  state?: string; errors?: { scope: string; code: string }[]; entryCount?: number;
+  state?: string; errors?: { scope: string; code: string }[]; entryCount?: number; maxBytes?: number;
 }
 export type ExpectedMemoryEntry = Pick<MemoryInjectionEntry, "scope" | "documentId" | "version" | "markdown">;
 
@@ -34,9 +35,11 @@ function binding(message: Record<string, unknown>): Binding {
 
 /** 只由测试创建的 --import 脚本安装；不改变业务参数、计时预算或 IPC 回复。日志不含正文/连接串。 */
 export function installMemoryReaderObserver(log: string): void {
-  let childNumber = 0, timerNumber = 0; let reader: string | undefined;
+  let childNumber = 0, timerNumber = 0, sequence = 0; let reader: string | undefined;
   const note = (phase: string, fields: Partial<ReaderPhase> = {}) => appendFileSync(log,
-    JSON.stringify({ phase, owner: process.pid, atMs: performance.now(), ...(reader ? { reader } : {}), ...fields }) + "\n");
+    JSON.stringify({ phase, owner: process.pid, parentPid: process.ppid, seq: ++sequence,
+      atUtc: new Date().toISOString(), atMs: performance.now(), clockOriginMs: performance.timeOrigin,
+      ...(reader ? { reader } : {}), ...fields }) + "\n");
   note("observer");
   process.once("exit", code => note("owner-exit", { code: String(code) }));
   const originalFork = childProcess.fork;
@@ -54,10 +57,10 @@ export function installMemoryReaderObserver(log: string): void {
       if (message["type"] === "read") record("read", binding(message));
       const callback = rest.at(-1);
       if (typeof callback === "function") rest[rest.length - 1] = (error: Error | null) => {
-        if (error) record("ipc-error"); callback(error);
+        if (error) record("ipc-error", { code: safeObservationError(error).code }); callback(error);
       };
       try { return Reflect.apply(send, child, [message, ...rest]) as boolean; }
-      catch (error) { record("ipc-error"); throw error; }
+      catch (error) { record("ipc-error", { code: safeObservationError(error).code }); throw error; }
     }) as typeof child.send;
     const kill = child.kill;
     child.kill = ((signal?: NodeJS.Signals | number) => {
@@ -67,7 +70,7 @@ export function installMemoryReaderObserver(log: string): void {
       if (!raw || typeof raw !== "object") return;
       const message = raw as Record<string, unknown>;
       if (message["type"] === "ready") record("ready");
-      if (message["type"] === "error") record("query-error");
+      if (message["type"] === "error") record("query-error", safeReason(message["code"]));
       if (message["type"] === "result") {
         const result = message["result"] as MemoryInjection | undefined;
         if (!result || !Array.isArray(result.errors) || !Array.isArray(result.entries)
@@ -75,10 +78,10 @@ export function installMemoryReaderObserver(log: string): void {
           record("protocol-error"); return;
         }
         record("result", { ...binding(message), state: result.state,
-          errors: result.errors.map(({ scope, code }) => ({ scope, code })), entryCount: result.entries.length });
+          errors: result.errors.map(({ scope, code }) => ({ scope, code })), entryCount: result.entries.length, maxBytes: result.maxBytes });
       }
     });
-    child.on("error", () => record("process-error"));
+    child.on("error", error => record("process-error", { code: safeObservationError(error).code }));
     child.on("exit", (code, signal) => record("exit", { code: String(code), signal }));
     return child;
   }) as typeof childProcess.fork;
@@ -94,6 +97,107 @@ export function installMemoryReaderObserver(log: string): void {
     note("timer-started", { budgetMs: delay, timerId });
     return timer;
   }, schedule) as typeof setTimeout;
+}
+
+const REASON_CODES = new Set(["memory_reader_timeout", "memory_reader_hard_timeout", "memory_reader_circuit_open",
+  "memory_reader_query_failed", "memory_reader_ipc_failed", "memory_reader_protocol_failed", "memory_reader_process_failed",
+  "memory_reader_exited", "memory_reader_closed", "memory_reader_busy", "memory_reader_unavailable", "memory_reader_unconfigured",
+  "memory_binding_unavailable", "memory_binding_changed", "storage_maintenance"]);
+const PHASES = new Set(["observer", "owner-exit", "fork", "init", "read", "ready", "result", "timer-started", "timer-fired",
+  "ipc-error", "query-error", "protocol-error", "process-error", "kill", "exit"]);
+const SIGNALS = new Set(["SIGTERM", "SIGKILL", "SIGINT", "SIGABRT", "SIGBUS", "SIGSEGV", "SIGPIPE", "SIGHUP", "SIGQUIT", "SIGILL", "SIGFPE", "SIGTRAP", "SIGSYS"]);
+const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value) ?? "undefined").digest("hex");
+const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+const number = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+const integer = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : null;
+function safeReason(value: unknown): { code: string; codeSha256?: string } {
+  return typeof value === "string" && REASON_CODES.has(value) ? { code: value }
+    : { code: "UNRECOGNIZED", ...(typeof value === "string" ? { codeSha256: hash(value) } : {}) };
+}
+
+/** 白名单只用于日志投影，不接受未知结果、不改变测试断言。 */
+export function safeObservationError(value: unknown): { name: string; code: string } {
+  const error = object(value), names = new Set(["Error", "AssertionError", "TypeError", "SyntaxError", "RangeError", "AggregateError"]);
+  const codes = new Set(["ENOENT", "EACCES", "EPERM", "EBADF", "EPIPE", "ERR_ASSERTION", "ERR_STREAM_DESTROYED", "ERR_IPC_CHANNEL_CLOSED"]);
+  return { name: names.has(String(error["name"])) ? String(error["name"]) : "UNRECOGNIZED",
+    code: codes.has(String(error["code"])) ? String(error["code"]) : "UNRECOGNIZED" };
+}
+
+export function safeMemoryObservation(value: unknown) {
+  const memory = object(value);
+  return { state: ["available", "partial", "unavailable"].includes(String(memory["state"])) ? String(memory["state"]) : "NOT_OBSERVED",
+    entryCount: Array.isArray(memory["entries"]) ? memory["entries"].length : null, maxBytes: integer(memory["maxBytes"]),
+    errors: Array.isArray(memory["errors"]) ? memory["errors"].map(value => {
+      const error = object(value), scope = error["scope"];
+      return { scope: scope === "global" || scope === "project-agent" ? scope : "UNRECOGNIZED", ...safeReason(error["code"]) };
+    }) : null };
+}
+
+/** 只解析既有结构化 warn；原 stderr、自由文本、payload 和凭据不进入快照。 */
+export function safeMemoryStderr(text: string) {
+  const lines = text.split("\n"), partialLine = lines.pop() !== "";
+  const readerWarnings: { code: string; codeSha256?: string }[] = []; let parseFailed = 0, ignored = 0;
+  for (const line of lines) {
+    if (!line) continue;
+    try {
+      const event = object(JSON.parse(line));
+      if (event["msg"] === "memory_reader_unavailable" && event["level"] === "warn") readerWarnings.push(safeReason(event["code"]));
+      else ignored++;
+    } catch { parseFailed++; }
+  }
+  return { bytes: Buffer.byteLength(text), readerWarnings, parseFailed, ignored, partialLine, truncated: false };
+}
+
+/** 独占日志的只读投影；owner 必须来自本 fixture 实际 spawn 的 PID，不能拼接别的测试事件。 */
+export function safeReaderSnapshot(text: string, ownerPid: number | undefined) {
+  const events: Record<string, unknown>[] = []; let parseFailed = 0, foreignOwnerEvents = 0, unknownPhaseEvents = 0, dropped = 0;
+  const lines = text.split("\n"), partialLine = lines.pop() !== "";
+  for (const line of lines) {
+    if (!line) continue;
+    let event: Record<string, unknown>;
+    try { event = object(JSON.parse(line)); } catch { parseFailed++; continue; }
+    if (ownerPid === undefined || event["owner"] !== ownerPid) { foreignOwnerEvents++; continue; }
+    if (!PHASES.has(String(event["phase"]))) { unknownPhaseEvents++; continue; }
+    if (events.length >= 256) { dropped++; continue; }
+    const phase = String(event["phase"]), reader = typeof event["reader"] === "string" && new RegExp(`^${ownerPid}/[1-9][0-9]*$`).test(event["reader"]) ? event["reader"] : null;
+    const safe: Record<string, unknown> = { phase, owner: ownerPid, parentPid: integer(event["parentPid"]),
+      seq: integer(event["seq"]), atMs: number(event["atMs"]), clockOriginMs: number(event["clockOriginMs"]),
+      atUtc: typeof event["atUtc"] === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(event["atUtc"]) ? event["atUtc"] : null,
+      reader, childPid: integer(event["childPid"]) };
+    if (phase === "init") {
+      const database = object(event["database"]);
+      safe["database"] = database["kind"] === "sqlite" ? { kind: "sqlite", identitySha256: hash([database["sqlitePath"], database["sourcePath"], database["identity"]]) }
+        : database["kind"] === "postgres" ? { kind: "postgres", configurationSha256: typeof database["configurationSha256"] === "string" && /^[a-f0-9]{64}$/.test(database["configurationSha256"]) ? database["configurationSha256"] : null }
+          : { kind: "NOT_OBSERVED" };
+    }
+    if (phase === "read" || phase === "result") {
+      const parts = [event["nonce"], event["memberId"], event["projectId"], event["bindingGeneration"], event["membershipRevision"]];
+      safe["bindingSha256"] = parts.slice(0, 4).every(value => typeof value === "string") && integer(parts[4]) !== null ? hash(parts) : null;
+      safe["membershipRevision"] = integer(event["membershipRevision"]);
+    }
+    if (phase === "result") {
+      const memory = safeMemoryObservation(event);
+      safe["memory"] = { ...memory, entryCount: integer(event["entryCount"]) };
+    }
+    if (phase === "timer-started" || phase === "timer-fired") { safe["timerId"] = integer(event["timerId"]); safe["budgetMs"] = number(event["budgetMs"]); }
+    if (phase === "exit" || phase === "owner-exit") {
+      safe["code"] = event["code"] === null || event["code"] === "null" ? null
+        : /^\d+$/.test(String(event["code"])) ? integer(Number(event["code"])) : "NOT_OBSERVED";
+    }
+    if (phase === "exit" || phase === "kill") safe["signal"] = event["signal"] === null ? null : SIGNALS.has(String(event["signal"])) ? event["signal"] : "UNRECOGNIZED";
+    if (["ipc-error", "query-error", "process-error"].includes(phase)) safe["error"] = phase === "query-error" ? safeReason(event["code"]) : safeObservationError({ code: event["code"] });
+    events.push(safe);
+  }
+  const readers = [...new Set(events.map(event => event["reader"]).filter((value): value is string => typeof value === "string"))].map(reader => {
+    const own = events.filter(event => event["reader"] === reader), exited = own.find(event => event["phase"] === "exit");
+    const childPids = [...new Set(own.map(event => event["childPid"]).filter((value): value is number => typeof value === "number"))];
+    return { reader, childPid: childPids.length === 1 ? childPids[0]! : null, childPidConflict: childPids.length > 1,
+      ready: own.some(event => event["phase"] === "ready") ? "OBSERVED" : "NOT_OBSERVED",
+      exit: exited ? { code: exited["code"], signal: exited["signal"] } : "NOT_OBSERVED" };
+  });
+  return { ownerPid: ownerPid ?? null, clockRule: "atMs/seq compare only within the same owner; no reader-process clock is installed",
+    events, readers, ownerExit: events.find(event => event["phase"] === "owner-exit") ?? "NOT_OBSERVED",
+    parseFailed, foreignOwnerEvents, unknownPhaseEvents, partialLine, capped: dropped > 0, dropped };
 }
 
 function safeInjection(memory: MemoryInjection | undefined): object {
@@ -196,6 +300,7 @@ export async function createMemoryReaderObservation(dir: string, name: string) {
   const confirmedTimeouts = new Set<string>(); let afterEvent = 0;
   const readEvents = async () => (await readFile(log, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line) as ReaderPhase);
   return { preload,
+    async snapshot(ownerPid: number | undefined) { return safeReaderSnapshot(await readFile(log, "utf8"), ownerPid); },
     async assertInjection(memory: MemoryInjection | undefined, expected: ExpectedMemoryEntry[], database: MemoryDatabaseDescriptor) {
       const events = await readEvents();
       const state = assertInjectionContract(memory, expected, events, safeReaderDatabase(database), confirmedTimeouts, afterEvent);
