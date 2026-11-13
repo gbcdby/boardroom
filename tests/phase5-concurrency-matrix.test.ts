@@ -14,7 +14,7 @@ import { createMcpCore } from "../src/server/mcp/core.ts";
 import { createRuntimeRepository } from "../src/server/runtime/repository.ts";
 import { createLogger } from "../src/server/logger.ts";
 import { memoryFixture, memoryPeople, pgUnavailable } from "./helpers/memory-fixture.ts";
-import { assertProjectBeforeLowerLocks, barrier, interleaveProjectWriters, observeLocks, startActualApi, withIndependentPgDrivers, type Outcome } from "./helpers/phase5-concurrency-fixture.ts";
+import { assertProjectBeforeLowerLocks, barrier, interleaveProjectWriters, observeLocks, RemovePairDiagnostics, startActualApi, withIndependentPgDrivers, type Outcome } from "./helpers/phase5-concurrency-fixture.ts";
 import { seedCompleteMemberRelations, snapshotRelationsDatabase } from "./helpers/phase5-relations-fixture.ts";
 
 const access = { actor: ownerActor() }, logger = createLogger({ level: "error", write() {} });
@@ -169,11 +169,11 @@ for (const entry of entries) {
 
 function failureText(outcome: Outcome<unknown>) { return outcome.ok ? "" : String(outcome.error); }
 function failureCode(outcome: Outcome<unknown>) { assert.equal(outcome.ok, false); return (outcome as { error: { code: string } }).error.code; }
-async function withPairDrivers(engine: "sqlite" | "postgres", body: (a: RepositorySet, aDb: DbDriver, b: RepositorySet, bDb: DbDriver, probe?: Client) => Promise<void>) {
-  if (engine === "postgres") return withIndependentPgDrivers(body);
+async function withPairDrivers(engine: "sqlite" | "postgres", body: (a: RepositorySet, aDb: DbDriver, b: RepositorySet, bDb: DbDriver, probe?: Client) => Promise<void>, onCleanupError?: (stage: string, error: unknown) => void) {
+  if (engine === "postgres") return withIndependentPgDrivers(body, onCleanupError);
   return memoryFixture((repos, db) => body(repos, db, repos, db));
 }
-async function runPair(input: { firstDb: DbDriver; secondDb: DbDriver; probe: Client | undefined; projectId: string; first: () => Promise<unknown>; second: () => Promise<unknown> }) {
+async function runPair(input: { firstDb: DbDriver; secondDb: DbDriver; probe: Client | undefined; projectId: string; first: () => Promise<unknown>; second: () => Promise<unknown>; diagnostic?: RemovePairDiagnostics }) {
   if (input.probe) return interleaveProjectWriters({ ...input, probe: input.probe });
   // SQLite validates only the serial outcome oracle, never the PostgreSQL lock/concurrency claim.
   const outcome = (operation: () => Promise<unknown>): Promise<Outcome<unknown>> => operation().then(value => ({ ok: true, value }), error => ({ ok: false, error }));
@@ -215,52 +215,74 @@ for (const engine of ["sqlite", "postgres"] as const) for (const first of ["remo
 }
 
 for (const engine of ["sqlite", "postgres"] as const) for (const pair of ["remove/remove", "undo/undo", "改派/remove", "remove/改派", "改派/undo", "undo/改派"] as const) {
-  test(`${engine} S5-AUDIT-11/13 ${engine === "postgres" ? "真实双连接交错" : "仅串行语义"} 完整关系 ${pair}，成功事务完整且迟到写稳定冲突`, { skip: engine === "postgres" ? pgUnavailable : false, timeout: 15000 }, async () => withPairDrivers(engine, async (a, aDb, b, bDb, probe) => {
-    const f = await seedCompleteMemberRelations(a, aDb);
-    const replacement = await a.members.create({ projectId: f.project.id, kind: "human", displayName: "并发新负责人" });
-    const orgA = createOrgMutationService({ repos: a }), orgB = createOrgMutationService({ repos: b });
-    const undoA = createAuditCompensationService({ repos: a }), undoB = createAuditCompensationService({ repos: b });
-    const original = pair.includes("undo") ? await orgA.removeMember(access, f.project.id, f.member.id) : null;
-    const baseline = await snapshotRelationsDatabase(aDb);
-    const task = (await a.tasks.get(f.project.id, f.tasks[0]!.id))!;
-    const operations = (repos: RepositorySet, name: string): (() => Promise<unknown>) => {
-      if (name === "remove") return () => (repos === a ? orgA : orgB).removeMember(access, f.project.id, f.member.id);
-      if (name === "undo") return () => (repos === a ? undoA : undoB).revoke(access, f.project.id, original!.auditId);
-      return () => createTaskService({ repos }).update(access, f.project.id, task.id, { expectedRevision: task.revision, assigneeMemberId: replacement.id });
-    };
-    const [firstName, secondName] = pair.split("/");
-    const outcome = await runPair({ firstDb: aDb, secondDb: bDb, probe, projectId: f.project.id,
-      first: operations(a, firstName!), second: operations(b, secondName!) });
-    assert.equal(outcome.first.ok, true, failureText(outcome.first));
-    if (pair === "改派/remove") assert.equal(outcome.second.ok, true, failureText(outcome.second));
-    else {
-      const code = failureCode(outcome.second);
-      assert.equal(code, pair === "remove/remove" ? "member_removed" : pair === "remove/改派" || pair === "undo/改派" ? "conflict" : "compensation_conflict");
+  test(`${engine} S5-AUDIT-11/13 ${engine === "postgres" ? "真实双连接交错" : "仅串行语义"} 完整关系 ${pair}，成功事务完整且迟到写稳定冲突`, { skip: engine === "postgres" ? pgUnavailable : false, timeout: 15000 }, async t => {
+    const collect = engine === "postgres" && pair === "remove/remove";
+    let diagnostic: RemovePairDiagnostics | undefined;
+    try {
+      await withPairDrivers(engine, async (a, aDb, b, bDb, probe) => {
+        const f = await seedCompleteMemberRelations(a, aDb);
+        const replacement = await a.members.create({ projectId: f.project.id, kind: "human", displayName: "并发新负责人" });
+        const orgA = createOrgMutationService({ repos: a }), orgB = createOrgMutationService({ repos: b });
+        const undoA = createAuditCompensationService({ repos: a }), undoB = createAuditCompensationService({ repos: b });
+        const original = pair.includes("undo") ? await orgA.removeMember(access, f.project.id, f.member.id) : null;
+        const baseline = await snapshotRelationsDatabase(aDb);
+        const task = (await a.tasks.get(f.project.id, f.tasks[0]!.id))!;
+        const operations = (repos: RepositorySet, name: string): (() => Promise<unknown>) => {
+          if (name === "remove") return () => (repos === a ? orgA : orgB).removeMember(access, f.project.id, f.member.id);
+          if (name === "undo") return () => (repos === a ? undoA : undoB).revoke(access, f.project.id, original!.auditId);
+          return () => createTaskService({ repos }).update(access, f.project.id, task.id, { expectedRevision: task.revision, assigneeMemberId: replacement.id });
+        };
+        const [firstName, secondName] = pair.split("/");
+        if (collect) diagnostic = new RemovePairDiagnostics(f.project.id, t.name);
+        const verifyOutcomes = async () => {
+          const outcome = await runPair({ firstDb: aDb, secondDb: bDb, probe, projectId: f.project.id,
+            first: operations(a, firstName!), second: operations(b, secondName!), ...(diagnostic ? { diagnostic } : {}) });
+          assert.equal(outcome.first.ok, true, failureText(outcome.first));
+          if (pair === "改派/remove") assert.equal(outcome.second.ok, true, failureText(outcome.second));
+          else {
+            const code = failureCode(outcome.second);
+            assert.equal(code, pair === "remove/remove" ? "member_removed" : pair === "remove/改派" || pair === "undo/改派" ? "conflict" : "compensation_conflict");
+          }
+        };
+        if (diagnostic) await diagnostic.check("outcome_assertions", verifyOutcomes); else await verifyOutcomes();
+        const verifyRelations = async () => {
+          const after = await snapshotRelationsDatabase(aDb);
+          diagnostic?.relations(baseline, after);
+          for (const table of ["messages", "message_deliveries", "memory_documents", "memory_versions", "group_participants", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints"]) {
+            assert.deepEqual(after[table], baseline[table], `${pair}: 竞争不能损害 ${table} 历史事实`);
+          }
+          const actualTask = (await a.tasks.get(f.project.id, task.id))!;
+          if (firstName === "改派") { assert.equal(actualTask.assigneeMemberId, replacement.id); assert.equal(actualTask.revision, task.revision + 1); }
+          if (pair === "remove/改派") { assert.equal(actualTask.assigneeMemberId, null); assert.equal(actualTask.state, "blocked"); }
+          if (pair === "undo/改派") { assert.equal(actualTask.assigneeMemberId, f.member.id); assert.equal(actualTask.state, "in-progress"); }
+          const present = firstName === "undo";
+          assert.equal(Boolean(await a.members.get(f.member.id)), present);
+          if (original) {
+            assert.equal((await a.audit.get(f.project.id, original.auditId))!.reversedAt !== null, firstName === "undo");
+            assert.equal((await a.audit.list(f.project.id, { action: "member.revoke" })).length, firstName === "undo" ? 1 : 0);
+            assert.deepEqual(after.memory_summary_requests, baseline.memory_summary_requests, "撤销/改派不能复活旧总结请求");
+            assert.deepEqual(after.member_fact_revisions, baseline.member_fact_revisions);
+          }
+          assert.equal((await a.audit.list(f.project.id, { action: "member.remove" })).length, 1);
+          assert.equal((await a.tasks.getSettings(f.project.id)).defaultReviewerMemberId, present ? f.member.id : null);
+          for (const table of ["agent_runtime_bindings", "agent_runner_states", "agent_runtime_members", "member_statuses"]) assert.deepEqual(after[table], []);
+          for (const request of f.requests.filter(r => r.state === "pending" || r.state === "running")) {
+            assert.equal((await a.memory.getRequest(request.id))!.state, "cancelled");
+            assert.equal((await a.memory.getRequest(request.id))!.revision, 2);
+          }
+        };
+        if (diagnostic) {
+          // An outcome mismatch still fails, but cannot prevent the original relation readback and connection evidence.
+          await diagnostic.check("relation_assertions", verifyRelations);
+          await diagnostic.inspectConnections(aDb, bDb, probe!);
+        } else await verifyRelations();
+      }, collect ? (stage, error) => { if (diagnostic) diagnostic.failure(stage, error); else throw error; } : undefined);
+    } catch (error) { if (!diagnostic) throw error; diagnostic.failure("fixture", error); }
+    if (diagnostic) {
+      try { t.diagnostic(JSON.stringify(diagnostic.report())); } catch (error) { diagnostic.failure("diagnostic_output", error); }
+      diagnostic.throwIfFailed();
     }
-    const after = await snapshotRelationsDatabase(aDb);
-    for (const table of ["messages", "message_deliveries", "memory_documents", "memory_versions", "group_participants", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints"]) {
-      assert.deepEqual(after[table], baseline[table], `${pair}: 竞争不能损害 ${table} 历史事实`);
-    }
-    const actualTask = (await a.tasks.get(f.project.id, task.id))!;
-    if (firstName === "改派") { assert.equal(actualTask.assigneeMemberId, replacement.id); assert.equal(actualTask.revision, task.revision + 1); }
-    if (pair === "remove/改派") { assert.equal(actualTask.assigneeMemberId, null); assert.equal(actualTask.state, "blocked"); }
-    if (pair === "undo/改派") { assert.equal(actualTask.assigneeMemberId, f.member.id); assert.equal(actualTask.state, "in-progress"); }
-    const present = firstName === "undo";
-    assert.equal(Boolean(await a.members.get(f.member.id)), present);
-    if (original) {
-      assert.equal((await a.audit.get(f.project.id, original.auditId))!.reversedAt !== null, firstName === "undo");
-      assert.equal((await a.audit.list(f.project.id, { action: "member.revoke" })).length, firstName === "undo" ? 1 : 0);
-      assert.deepEqual(after.memory_summary_requests, baseline.memory_summary_requests, "撤销/改派不能复活旧总结请求");
-      assert.deepEqual(after.member_fact_revisions, baseline.member_fact_revisions);
-    }
-    assert.equal((await a.audit.list(f.project.id, { action: "member.remove" })).length, 1);
-    assert.equal((await a.tasks.getSettings(f.project.id)).defaultReviewerMemberId, present ? f.member.id : null);
-    for (const table of ["agent_runtime_bindings", "agent_runner_states", "agent_runtime_members", "member_statuses"]) assert.deepEqual(after[table], []);
-    for (const request of f.requests.filter(r => r.state === "pending" || r.state === "running")) {
-      assert.equal((await a.memory.getRequest(request.id))!.state, "cancelled");
-      assert.equal((await a.memory.getRequest(request.id))!.revision, 2);
-    }
-  }));
+  });
 }
 
 for (const engine of ["sqlite", "postgres"] as const) for (const first of ["claim", "remove"] as const) {
