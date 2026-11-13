@@ -40,8 +40,27 @@ jobs:
       - name: 按锁文件安装依赖
         run: npm ci
 
+      - name: 严格构建 macOS 存储维护原生能力
+        run: node scripts/build-maintenance-platform.mjs --required
+
+      - name: macOS APFS 强制落盘、原生写者库存与真实子进程故障恢复
+        shell: bash
+        run: node --test --test-reporter=tap --test-timeout=60000 --test-concurrency=1 tests/maintenance-darwin.acceptance.ts 2>&1 | tee .agent-output/macos-tests/maintenance-native.log
+
+      - name: macOS 原生管理与维护恢复定向回归（保留即时失败详情）
+        shell: bash
+        run: node --test --test-reporter=tap --test-timeout=60000 --test-concurrency=1 tests/db-host-migration.test.ts tests/native-management-admission.test.ts tests/storage-source-client.test.ts tests/maintenance-platform.test.ts tests/maintenance-sqlite.test.ts tests/maintenance-objects.test.ts tests/maintenance-plan.test.ts 2>&1 | tee .agent-output/macos-tests/maintenance-regression.log
+
       - name: 全量测试（macOS / SQLite，不启用 PostgreSQL 门控用例）
         shell: bash
+        env:
+          # 只增加观察；绝对路径允许既有测试从不同 cwd 启动普通 Node 子进程。
+          NODE_OPTIONS: >-
+            --test-reporter=spec
+            --test-reporter-destination=stdout
+            --test-reporter=${{ github.workspace }}/scripts/ci/test-execution-reporter.mjs
+            --test-reporter-destination=stdout
+            --import=${{ github.workspace }}/scripts/ci/test-process-observer.mjs
         run: npm test 2>&1 | tee .agent-output/macos-tests/full-suite.log
 
       - name: 保存环境与完整测试日志
@@ -63,12 +82,15 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-alpine
+        # 固定 run43322971867 实际使用的官方 16.16 镜像；客户端工具仍单独记录。
+        image: postgres@sha256:f377d590e5474681d4d7838635031a2b50647923b7abfa803ce9b5ff35d5c663
         env:
           POSTGRES_USER: boardroom
           # 仅用于本次 CI 临时容器，不使用仓库或用户凭据。
           POSTGRES_PASSWORD: boardroom-ci-only
           POSTGRES_DB: boardroom_ci
+          # 只隔离此新建测试 cluster 的常规 autovacuum；真实 writer guard 不变。
+          POSTGRES_INITDB_ARGS: --set=autovacuum=off
         ports:
           - 5432:5432
         options: >-
@@ -93,16 +115,92 @@ jobs:
       - name: 按锁文件安装依赖
         run: npm ci
 
+      - name: 准备 PostgreSQL 16 原生备份与恢复工具
+        run: |
+          sudo apt-get update
+          apt-cache policy postgresql-client-16
+          sudo apt-get install --yes --no-install-recommends postgresql-client-16
+          echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/16/bin/pg_dump --version
+          /usr/lib/postgresql/16/bin/pg_restore --version
+
+      - name: 私有解包 PostgreSQL 16 重启验证工具（不运行 postinst 或宿主服务）
+        id: pg_restart_tools
+        shell: bash
+        run: bash scripts/prepare-ci-pg16-tools.sh
+
+      - name: 核对自有 PostgreSQL 服务版本与静默 fixture 配置
+        env:
+          BOARDROOM_CI_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: node scripts/ci/verify-pg-fixture.mjs
+
       - name: 类型检查
         run: npm run typecheck
 
       - name: 构建 WebUI
         run: npm run build
 
+      - name: 有界 PostgreSQL 维护适配器 TAP 诊断
+        id: maintenance_pg_diagnostic
+        shell: bash
+        env:
+          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: |
+          mkdir -p .agent-output/maintenance-native-diagnostics
+          timeout --signal=TERM --kill-after=10s 180s node --test --test-reporter=tap --test-concurrency=1 tests/maintenance-postgres.test.ts 2>&1 | tee .agent-output/maintenance-native-diagnostics/postgres.tap
+
+      - name: 有界 SQLite 源使用者 TAP 诊断
+        if: ${{ !cancelled() && steps.maintenance_pg_diagnostic.outcome != 'skipped' }}
+        shell: bash
+        run: python3 scripts/ci/linux_isolation.py sqlite
+
       - name: 全量测试（启用 PostgreSQL 门控用例）
         env:
           AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
-        run: npm test
+        run: python3 scripts/ci/linux_isolation.py full-suite
+
+      - name: 核对 Linux 专属测试身份、进程与工件收尾
+        if: always()
+        run: python3 scripts/ci/linux_isolation.py cleanup
+
+      - name: 保存原生维护即时诊断证据
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: maintenance-native-diagnostics-${{ github.run_attempt }}
+          path: .agent-output/maintenance-native-diagnostics/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 保存 Linux 测试身份与资源收尾证据
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-ci-isolation-${{ github.run_attempt }}
+          path: .agent-output/linux-ci-isolation/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 独立私有 cluster 真实重启与旧句柄失效验证
+        shell: bash
+        env:
+          AGENT_STUDIO_PG_RESTART_BIN: ${{ steps.pg_restart_tools.outputs.bin }}
+        run: |
+          test -n "$AGENT_STUDIO_PG_RESTART_BIN"
+          mkdir -p .agent-output/maintenance-pg-restart
+          node --test tests/maintenance-postgres-restart.test.ts 2>&1 | tee .agent-output/maintenance-pg-restart/native-restart.log
+
+      - name: 保存独立 PostgreSQL 重启验证证据
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: maintenance-pg-restart-${{ github.run_attempt }}
+          path: .agent-output/maintenance-pg-restart/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: 固定 V1 与万条历史负载逐次计时（SQLite / PostgreSQL）
         env:

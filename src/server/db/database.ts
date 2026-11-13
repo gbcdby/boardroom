@@ -1,6 +1,8 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { assertSqliteStartupAdmission } from "../storage/sqlite-startup.ts";
+import { assertStorageAdmission, readSqliteMaintenanceState, StorageMaintenanceError } from "../storage/admission.ts";
 
 /** 数据库文件名；位于配置的 dataDir 下。 */
 export const DATABASE_FILE_NAME = "agent-studio.db";
@@ -25,6 +27,11 @@ export interface OpenDatabaseResult {
 export function openDatabase(dataDir: string, fileName = DATABASE_FILE_NAME): OpenDatabaseResult {
   const resolvedDir = path.resolve(dataDir);
   const file = path.join(resolvedDir, fileName);
+  try {assertSqliteStartupAdmission(file);}
+  catch (error) {
+    if (error instanceof StorageMaintenanceError) throw error;
+    throw new DatabaseSetupError(`数据库 ${file} 预检失败：${describeCode(error)}。请检查实际数据目录与权限。`);
+  }
 
   try {
     mkdirSync(resolvedDir, { recursive: true });
@@ -46,6 +53,7 @@ export function openDatabase(dataDir: string, fileName = DATABASE_FILE_NAME): Op
   }
 
   try {
+    assertStorageAdmission(readSqliteMaintenanceState(db));
     db.pragma("journal_mode = WAL");
     db.pragma("synchronous = NORMAL");
     db.pragma("foreign_keys = ON");
@@ -53,6 +61,7 @@ export function openDatabase(dataDir: string, fileName = DATABASE_FILE_NAME): Op
     probeReadWrite(db);
   } catch (error) {
     db.close();
+    if (error instanceof StorageMaintenanceError) throw error;
     throw new DatabaseSetupError(
       `数据库 ${file} 初始化失败：${describeCode(error)}。` +
         `请确认数据目录 ${resolvedDir} 可读写（WAL 模式需要在该目录创建 -wal/-shm 文件），` +
@@ -71,6 +80,7 @@ export function openDatabase(dataDir: string, fileName = DATABASE_FILE_NAME): Op
 export function probeReadWrite(db: Database.Database): void {
   db.exec("BEGIN IMMEDIATE");
   try {
+    assertStorageAdmission(readSqliteMaintenanceState(db));
     db.exec("CREATE TEMP TABLE IF NOT EXISTS _rw_probe (id INTEGER)");
     db.exec("DROP TABLE IF EXISTS _rw_probe");
     db.exec("ROLLBACK");

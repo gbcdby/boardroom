@@ -9,6 +9,7 @@
     "node": ">=24.0.0"
   },
   "scripts": {
+    "postinstall": "node scripts/build-maintenance-platform.mjs",
     "prestart": "npm run build:web",
     "start": "node src/server/index.ts",
     "dev:server": "node --watch src/server/index.ts",

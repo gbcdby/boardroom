@@ -12,8 +12,9 @@
  *   node src/server/mcp/stdio.ts
  */
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { randomUUID } from "node:crypto";
 import { ConfigError, loadConfig } from "../config.ts";
-import { databaseDriverOptions, databaseForConnectedReader } from "../environment.ts";
+import { databaseForConnectedReader } from "../environment.ts";
 import { createDbDriver } from "../db/driver.ts";
 import { migrations } from "../db/migrations/index.ts";
 import { createRepositories } from "../db/repositories.ts";
@@ -21,7 +22,9 @@ import { initializePolicyConfiguration } from "../policy/configuration.ts";
 import { createLogger } from "../logger.ts";
 import { createMcpCore } from "./core.ts";
 import { createMcpServer } from "./server.ts";
-import { registerMemoryRuntime, closeMemoryRuntime } from "../memory/runtime.ts";
+import { registerMemoryRuntime, closeMemoryRuntime, pauseMemoryRuntime } from "../memory/runtime.ts";
+import { registerStorageSourceClient, storageClientDriverOptions } from "../storage/source-client.ts";
+import { StorageMaintenanceError } from "../storage/admission.ts";
 
 async function main(): Promise<void> {
   // 日志写 stderr：stdout 属于 MCP 线协议，不能混入日志。
@@ -35,17 +38,37 @@ async function main(): Promise<void> {
 
   // 打开持久化驱动并执行迁移（幂等）；stdio 与 HTTP 服务共享同一数据目录。
   const environment = config.environment!;
-  const driver = createDbDriver(databaseDriverOptions(environment));
+  const clientId = randomUUID();
+  const driver = createDbDriver(storageClientDriverOptions(environment, clientId));
   await driver.connect();
+  try { await driver.migrate(migrations); } catch (error) { await driver.close(); throw error; }
+  const storageClient = await registerStorageSourceClient({ db: driver, clientId, entrypoint: "stdio",
+    database: databaseForConnectedReader(environment.databaseDescriptor) });
+  let ownedCore: ReturnType<typeof createMcpCore> | undefined;
+  let ownedServer: ReturnType<typeof createMcpServer> | undefined;
+  let maintenanceClosing = false;
+  await storageClient.bind({
+    stopNewWork() { maintenanceClosing = true; pauseMemoryRuntime(driver); },
+    async disconnectSessions() {
+      await ownedCore?.close({ drain: true }); await ownedCore?.disconnect({ strict: true }); await ownedServer?.close();
+    },
+    async stopOwnedRuntime() { return { ownedExits: [], unknownOwners: [] }; },
+    async observeOwnedExit() { throw new StorageMaintenanceError("active"); },
+    closeMemory: () => closeMemoryRuntime(driver),
+  });
+  storageClient.startWatching();
   try {
-    await driver.migrate(migrations);
+    await storageClient.run(async () => {
     await initializePolicyConfiguration(createRepositories(driver));
+    await storageClient.assertAdmission();
     registerMemoryRuntime(driver, {
       database: databaseForConnectedReader(environment.databaseDescriptor),
       ...(config.memory ? { config: config.memory } : {}),
       onDiagnostic: code => logger.warn("memory_reader_unavailable", { code }),
     });
-  } catch (error) { await driver.close(); throw error; }
+    });
+  } catch (error) { await storageClient.close(); throw error; }
+  await storageClient.assertAdmission();
 
   const core = createMcpCore({
     logger,
@@ -54,24 +77,35 @@ async function main(): Promise<void> {
     ...(heartbeat === undefined ? {} : { heartbeat }),
     ...(config.antiLoop ? { antiLoop: { config: config.antiLoop } } : {}),
   });
+  ownedCore = core;
   const server = createMcpServer({ core, logger });
+  ownedServer = server;
   const transport = new StdioServerTransport();
-  let shuttingDown = false;
-  const shutdown = async (signal: string): Promise<void> => {
-    if (shuttingDown) return;
-    shuttingDown = true;
+  let shuttingDown: Promise<void> | null = null;
+  const shutdown = (signal: string): Promise<void> => {
+    if (shuttingDown) return shuttingDown;
+    shuttingDown = (async () => {
     logger.info("收到退出信号，正在关闭 stdio", { signal });
-    // 连接断开：把本会话标记为 disconnected、成员状态 offline（状态可恢复）。
-    for (const close of [() => core.disconnect(), () => core.close(), () => server.close(),
-      () => closeMemoryRuntime(driver), () => driver.close()]) {
-      try { await close(); }
-      catch { logger.error("关闭 stdio 资源失败"); }
+    await storageClient.refresh().catch(() => {});
+    if (maintenanceClosing) {
+      try { await storageClient.waitForDrain(); await storageClient.close(); }
+      catch { logger.error("stdio_maintenance_drain_incomplete"); process.exitCode = 1; }
+      return;
     }
+    // 连接断开：把本会话标记为 disconnected、成员状态 offline（状态可恢复）。
+    pauseMemoryRuntime(driver);
+    for (const close of [() => core.close({ drain: true }), () => core.disconnect({ strict: true }), () => server.close(),
+      () => closeMemoryRuntime(driver), () => storageClient.close()]) {
+      try { await close(); }
+      catch { logger.error("关闭 stdio 资源失败"); process.exitCode = 1; }
+    }
+    })();
+    return shuttingDown;
   };
   // 宿主正常关闭 stdin 也是资源关闭，不是一次 Agent 声明的逻辑 session-end。
   process.stdin.once("end", () => void shutdown("stdin_end"));
   process.stdin.once("close", () => void shutdown("stdin_close"));
-  server.server.onclose = () => { void shutdown("transport_close"); };
+  server.server.onclose = () => { if (!maintenanceClosing) void shutdown("transport_close"); };
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.once(signal, () => void shutdown(signal));
   }

@@ -11,10 +11,10 @@
  * 数据目录优先级：--data-dir > 环境变量 > 统一 resolver 所选配置；只操作既有 SQLite。
  * 建议先 `--dry-run` 预览受影响行数，确认无误后再实跑。
  */
-import Database from "better-sqlite3";
 import { ConfigError } from "../src/server/config-error.ts";
-import { resolveBoardroomEnvironment, assertEnvironmentSelected, assertEnvironmentWritable, assertSqliteSourceUnchanged } from "../src/server/environment.ts";
+import { resolveBoardroomEnvironment, assertEnvironmentSelected, assertEnvironmentWritable } from "../src/server/environment.ts";
 import { migrateOtherToDsh, HostTypeMigrationCollisionError } from "../src/server/db/migrate-host-type.ts";
+import { openNativeManagementSource } from "../src/server/storage/native-management-admission.ts";
 
 async function main(): Promise<void> {
   const env = { ...process.env };
@@ -32,15 +32,11 @@ async function main(): Promise<void> {
   if (database.kind !== "sqlite") throw new ConfigError("此历史 host-type 管理命令仅支持既有 SQLite；PostgreSQL 配置不会回落本地库。");
   if (!database.identity) throw new ConfigError("未找到既有 SQLite 数据库；此管理命令不会建库或执行 schema 迁移。", "legacy_migration_required");
   if (!dryRun) await assertEnvironmentWritable(environment);
-  assertSqliteSourceUnchanged(database);
-  const db = new Database(database.sqlitePath, { readonly: dryRun, fileMustExist: true });
+  const lease = await openNativeManagementSource({ source: database, mode: dryRun ? "readonly-dry-run" : "write" });
   try {
-    assertSqliteSourceUnchanged(database);
-    if (dryRun) db.pragma("query_only = ON");
-    else db.pragma("foreign_keys = ON");
     console.log(`数据库：${database.sqlitePath}`);
     console.log(`模式：${dryRun ? "DRY-RUN（不执行改写）" : "执行"}`);
-    const report = migrateOtherToDsh(db, { dryRun });
+    const report = migrateOtherToDsh(lease);
     console.log("迁移报告：");
     console.log(`  agents 改写（other→dsh）：${report.changedAgents}`);
     console.log(`  mcp_sessions 改写      ：${report.changedSessions}`);
@@ -50,10 +46,10 @@ async function main(): Promise<void> {
     if (report.collisions.length > 0) {
       console.log(`  冲突 display_name：${report.collisions.join(", ")}`);
     }
-    console.log(report.dryRun ? "DRY-RUN 完成（未改动任何数据）。" : "迁移完成。");
   } finally {
-    if (db.open) db.close();
+    await lease.close();
   }
+  console.log(dryRun ? "DRY-RUN 完成（未改动任何数据）。" : "迁移完成。");
 }
 
 await main().catch((error: unknown) => {

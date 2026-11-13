@@ -60,8 +60,7 @@ export function createLegacyConfigInspector({ db, repos = createRepositories(db)
   async function preflight(): Promise<LegacyConfigInspection> {
     // PG 的多表视图必须来自自己的 repeatable-read 只读事务，不能借用未知隔离级别的写事务。
     if (db.currentTransactionContext()) throw new InvalidArgumentError("legacy_inspection_requires_own_snapshot");
-    return db.transaction(async tx => {
-      if (db.kind === "postgres") await tx.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    return db.readSnapshot(async tx => {
       const captured: Record<string, DbRow[]> = {};
       for (const [table, order] of [["agents", "id"], ["agent_runtimes", "id"], ["agent_runtime_bindings", "id"],
         ["agent_runner_states", "binding_id"], ["agent_runtime_members", "member_id"], ["members", "id"], ["projects", "id"],

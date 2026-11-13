@@ -35,6 +35,9 @@ export interface DbTransaction {
   exec(sql: string, params?: readonly unknown[]): Promise<number>;
 }
 
+/** A real consistent read transaction; this view deliberately has no exec or write capability. */
+export type DbReadSnapshot = Pick<DbTransaction, "query">;
+
 /** 持久化驱动公共接口：connect → migrate → query/transaction → close。 */
 export interface DbDriver {
   readonly kind: DbDriverKind;
@@ -57,6 +60,12 @@ export interface DbDriver {
   exec(sql: string, params?: readonly unknown[]): Promise<number>;
   /** 单个写事务：fn  reject 即整体回滚并向上抛出。支持 SAVEPOINT 嵌套（#61）。 */
   transaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T>;
+  /**
+   * 独立只读一致视图；不继承已有事务。PG 在 BEGIN 固定 REPEATABLE READ READ ONLY，
+   * SQLite 使用既有文件的独立 readonly/query_only 连接。快照只验证开始时的源准入；
+   * 结果不授权后续写入或维护推进，后续写仍须重新经过普通事务门禁。
+   */
+  readSnapshot<T>(fn: (snapshot: DbReadSnapshot) => Promise<T>): Promise<T>;
   /** 关闭连接/连接池。未连接或已关闭时静默返回（幂等）。 */
   close(): Promise<void>;
 }

@@ -4,7 +4,7 @@
  * 让既有 repository/HTTP/MCP 调用点在 M1 迁移前保持不变。
  */
 import Database from "better-sqlite3";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { OperationQueue } from "../operation-queue.ts";
@@ -19,7 +19,11 @@ import {
   type MigrationRunResult,
 } from "../migrate.ts";
 import { sqliteDialect } from "../dialect.ts";
-import type { DbDriver, DbRow, DbTransaction, DbTransactionContext } from "../driver.ts";
+import type { DbDriver, DbReadSnapshot, DbRow, DbTransaction, DbTransactionContext } from "../driver.ts";
+import { assertSqliteStartupAdmission } from "../../storage/sqlite-startup.ts";
+import { assertStorageAdmission, readSqliteMaintenanceState, StorageMaintenanceError,
+  type StorageAdmissionIdentity } from "../../storage/admission.ts";
+import { storageDrainClientToCheck, assertStorageDrainClient } from "../../storage/drain-boundary.ts";
 
 export interface SqliteDriverOptions {
   readonly dataDir: string;
@@ -35,10 +39,13 @@ export class SqliteDriver implements DbDriver {
   private readonly sqlitePath: string | undefined;
   private readonly sqliteSource: SqliteDatabaseDescriptor | undefined;
   private opened: { db: Database.Database; file: string } | null = null;
+  private admissionIdentity: StorageAdmissionIdentity | undefined;
+  private fileIdentity: {dev:bigint;ino:bigint} | undefined;
   /** SAVEPOINT 计数器：用于嵌套事务（事务内再开事务，#61）。 */
   private spCounter = 0;
   private readonly transactionScope = new AsyncLocalStorage<OperationQueue>();
   private readonly transactionIdentity = new AsyncLocalStorage<DbTransactionContext & { active: boolean }>();
+  private readonly readSnapshotHandle = new AsyncLocalStorage<Database.Database>();
   private readonly operations = new OperationQueue();
 
   /** 单连接顶层操作排队；只有同一异步调用链中的操作才属于嵌套事务。 */
@@ -64,7 +71,7 @@ export class SqliteDriver implements DbDriver {
     if (this.opened === null) {
       throw new Error("SqliteDriver 尚未 connect()，不能取用 handle。");
     }
-    return this.opened.db;
+    return this.readSnapshotHandle.getStore() ?? this.opened.db;
   }
 
   /** 数据库文件绝对路径；须先 connect()。 */
@@ -80,20 +87,29 @@ export class SqliteDriver implements DbDriver {
     // openDatabase 抛 DatabaseSetupError（含恢复路径），原样向上传播。
     if (this.sqliteSource) assertSqliteSourceUnchanged(this.sqliteSource, true);
     else assertSqliteSingleLink(this.sqlitePath ?? path.resolve(this.dataDir, DATABASE_FILE_NAME));
-    if (this.sqlitePath === undefined) { this.opened = openDatabase(this.dataDir); return; }
+    if (this.sqlitePath === undefined) {
+      this.opened = openDatabase(this.dataDir);
+      this.fileIdentity = statSync(this.opened.file,{bigint:true});
+      this.checkAdmission();
+      return;
+    }
     let db: Database.Database | undefined;
     try {
+      assertSqliteStartupAdmission(this.sqlitePath);
       if (!this.sqliteSource?.identity) mkdirSync(path.dirname(this.sqlitePath), { recursive: true });
       // 已存在源不得触发 CREATE；先核实 inode，再允许任何 pragma/迁移写入。
       db = new Database(this.sqlitePath, { fileMustExist: this.sqliteSource?.identity != null });
       if (this.sqliteSource?.identity) assertSqliteSourceUnchanged(this.sqliteSource, true);
       else assertSqliteSingleLink(this.sqlitePath);
+      assertStorageAdmission(readSqliteMaintenanceState(db));
       db.pragma("journal_mode = WAL");
       db.pragma("synchronous = NORMAL");
       db.pragma("foreign_keys = ON");
       db.pragma("busy_timeout = 5000");
       probeReadWrite(db);
       this.opened = { db, file: this.sqlitePath };
+      this.fileIdentity = statSync(this.sqlitePath,{bigint:true});
+      this.checkAdmission();
     } catch (error) {
       db?.close();
       if (error instanceof ConfigError) throw error;
@@ -102,7 +118,12 @@ export class SqliteDriver implements DbDriver {
   }
 
   async migrate(migrations: readonly Migration[]): Promise<MigrationRunResult> {
-    return runMigrations(this.handle, migrations);
+    return this.serialize(async () => {
+      this.checkAdmission();
+      const result=runMigrations(this.handle, migrations);
+      this.checkAdmission();
+      return result;
+    });
   }
 
   async migrationState(): Promise<{ version: number; applied: AppliedMigration[] }> {
@@ -111,18 +132,71 @@ export class SqliteDriver implements DbDriver {
   }
 
   async query<T extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []): Promise<T[]> {
-    return this.serialize(async () => this.handle.prepare(sql).all(...params) as T[]);
+    return this.serialize(async () => {
+      const statement=this.handle.prepare(sql);
+      // SQLite checkpoint cannot run inside a transaction. This exact connection-control
+      // operation moves already committed WAL pages only; it never admits business SQL.
+      // It is serialized with this client's work, checked before execution, and real
+      // checkpoint locks remain visible to the maintenance physical-lock check.
+      if (/^\s*PRAGMA\s+wal_checkpoint\s*\(\s*(?:PASSIVE|FULL|RESTART|TRUNCATE)\s*\)\s*;?\s*$/i.test(sql)) {
+        this.checkAdmission();
+        return statement.all(...params) as T[];
+      }
+      // Native metadata, not SQL-prefix guessing. RETURNING/CTE writes require real transaction admission.
+      if (statement.readonly || this.currentTransactionContext()) return statement.all(...params) as T[];
+      return this.runTransaction(async tx => tx.query<T>(sql,params));
+    });
   }
 
   async exec(sql: string, params: readonly unknown[] = []): Promise<number> {
     // DbDriver.exec 是单语句接口：无参数的 DML 也必须返回真实顶层 changes。
     // prepare 同时在执行前拒绝多语句；迁移仍由 runMigrations 使用原生 exec。
-    return this.serialize(async () => this.handle.prepare(sql).run(...params).changes);
+    return this.serialize(async () => {
+      const statement=this.handle.prepare(sql);
+      if (this.currentTransactionContext()) return statement.run(...params).changes;
+      if (statement.readonly) {this.checkAdmission();return statement.run(...params).changes;}
+      return this.runTransaction(async tx => tx.exec(sql,params));
+    });
   }
 
   async transaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T> {
     const parent = this.transactionScope.getStore();
     return this.serialize(() => this.runTransaction(fn, parent));
+  }
+
+  async readSnapshot<T>(fn: (snapshot: DbReadSnapshot) => Promise<T>): Promise<T> {
+    if (this.currentTransactionContext()) throw new Error("read_snapshot_requires_own_transaction");
+    return this.serialize(async () => {
+      // This driver only opens named files. Never interpret a native in-memory handle as
+      // another empty database; raw in-memory migration fixtures do not use this API.
+      if (this.handle.memory) throw new Error("read_snapshot_requires_file_database");
+      this.checkAdmission(false);
+      const reader = new Database(this.file, { readonly: true, fileMustExist: true });
+      const scope = new OperationQueue();
+      const identity = { values: new Map<symbol, unknown>(), active: true };
+      try {
+        reader.pragma("query_only=ON");
+        reader.exec("BEGIN");
+        return await this.readSnapshotHandle.run(reader, async () => {
+          // Establish the actual read view and revalidate the real source/epoch after open.
+          this.checkAdmission(false);
+          const snapshot: DbReadSnapshot = { query: <R extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []) =>
+            scope.run(async () => reader.prepare(sql).all(...params) as R[]) };
+          const result = await this.transactionIdentity.run(identity, () => this.transactionScope.run(scope, () => fn(snapshot)));
+          await scope.drain();
+          if (this.sqliteSource?.identity) assertSqliteSourceUnchanged(this.sqliteSource);
+          const current = statSync(this.file, { bigint: true });
+          if (this.fileIdentity && (current.dev !== this.fileIdentity.dev || current.ino !== this.fileIdentity.ino || current.nlink !== 1n))
+            throw new StorageMaintenanceError("metadata_invalid");
+          reader.exec("COMMIT");
+          return result;
+        });
+      } catch (error) {
+        await scope.drain();
+        if (reader.inTransaction) reader.exec("ROLLBACK");
+        throw error;
+      } finally { identity.active = false; scope.close(); reader.close(); }
+    });
   }
 
   private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, parent?: OperationQueue): Promise<T> {
@@ -148,6 +222,7 @@ export class SqliteDriver implements DbDriver {
     if (nested) db.exec(`SAVEPOINT ${sp}`);
     else db.exec(this.dialect.beginTransaction());
     try {
+      if (!nested) this.checkAdmission();
       const result = await this.transactionIdentity.run(identity, () => this.transactionScope.run(scope, () => fn(tx)));
       await scope.drain();
       if (nested) db.exec(`RELEASE SAVEPOINT ${sp}`);
@@ -180,7 +255,21 @@ export class SqliteDriver implements DbDriver {
     await this.serialize(async () => {
       if (this.opened !== null && this.opened.db.open) this.opened.db.close();
       this.opened = null;
+      this.admissionIdentity = undefined;
+      this.fileIdentity = undefined;
     });
+  }
+
+  private checkAdmission(allowCleanup = true): void {
+    if (this.sqliteSource?.identity) assertSqliteSourceUnchanged(this.sqliteSource,true);
+    const identity=statSync(this.file,{bigint:true});
+    if (this.fileIdentity && (identity.dev!==this.fileIdentity.dev || identity.ino!==this.fileIdentity.ino || identity.nlink!==1n))
+      throw new StorageMaintenanceError("metadata_invalid");
+    const state=readSqliteMaintenanceState(this.handle,this.admissionIdentity!==undefined);
+    const cleanupClient=allowCleanup ? storageDrainClientToCheck(this,state,this.admissionIdentity) : null;
+    if (cleanupClient) assertStorageDrainClient(this.handle.prepare("SELECT * FROM storage_source_clients WHERE client_id=?").get(cleanupClient) as Record<string,unknown>|undefined,state!,this.admissionIdentity!);
+    else assertStorageAdmission(state,this.admissionIdentity);
+    if (state && !this.admissionIdentity) this.admissionIdentity={databaseInstanceId:state.databaseInstanceId,fenceEpoch:state.fenceEpoch};
   }
 }
 
