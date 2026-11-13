@@ -14,6 +14,7 @@ const stages: readonly string[] = ["scenario-start", "backup-start", "backup-ret
   "assertions-complete", "adapter-close-start", "adapter-close-returned", "fixture-close-start", "fixture-close-returned", "fixture-start", "fixture-returned"];
 interface Observation {
   readonly directory: string | undefined;
+  callIdentity(): ObjectValue | null;
   mark(stage: Stage): void;
   failure(stage: "setup" | "case" | "cleanup", error: unknown): void;
   registerAlias(digest: string): void;
@@ -29,7 +30,7 @@ let summaryDirectory: string | undefined, processClosed = false;
 const processIncomplete = (reason: string) => { if (processReasons.size < 12) processReasons.add(reason); };
 const absentObservation = "NOT_OBSERVED; never infer an empty inventory";
 const timing = "subscriber and synchronous bounded recording perturb timing";
-const noop: Observation = Object.freeze({ directory: undefined, mark() {}, failure() {}, registerAlias() {}, close() {} });
+const noop: Observation = Object.freeze({ directory: undefined, callIdentity: () => null, mark() {}, failure() {}, registerAlias() {}, close() {} });
 
 /** One bounded receipt for this test-file process, including scopes denied by the
  * shared cap. Denied scopes cannot each create another receipt or stderr line. */
@@ -191,6 +192,13 @@ export function observePostgresWriters(input: { sourceDescriptorDigest: string; 
   catch { incomplete("subscribe_failed"); }
   const observation: Observation = {
     directory,
+    // Read only the identities already supplied by the existing diagnostic channel; no new DB read/getter.
+    callIdentity() {
+      const adapter = adapters.size === 1 ? [...adapters.values()][0] : undefined;
+      return { scopeId, caseId, scenario, sourceDescriptorDigest: digest,
+        adapterObservationId: adapter?.adapterObservationId ?? null, adapterOrdinal: adapter?.ordinal ?? null,
+        adapterBinding: adapters.size === 1 ? "OBSERVED_SINGLE" : adapters.size === 0 ? "NOT_OBSERVED" : "AMBIGUOUS" };
+    },
     mark(stage: Stage) { if (stages.includes(stage)) record({ kind: "test-stage", stage }); else incomplete("unknown_test_stage"); },
     registerAlias(alias: string) {
       if (closed) return;
@@ -250,4 +258,96 @@ export function observePostgresWriters(input: { sourceDescriptorDigest: string; 
   };
   active.add(observation);
   return observation;
+}
+
+const callStages = ["observe", "acquire-mutex", "seal-draining", "seal-sealed", "snapshot-lock", "snapshot-callback",
+  "backup", "dump-start-marker", "fault-connect", "fault-sequence", "fault-find-exporter", "fault-stop-exporter", "fault-close",
+  "backup-settle", "expected-rejection", "check-connect", "check-query", "check-close", "mutex-release", "adapter-close", "fixture-close"] as const;
+export type PostgresCallStage = typeof callStages[number];
+export type PostgresCall = <T>(stage: PostgresCallStage, operation: () => Promise<T>) => Promise<T>;
+const callLimits = { calls: 64, eventBytes: 1024, totalBytes: 32_768, receiptBytes: 4096 } as const;
+const callCodes = new Set(["source_changed", "source_missing", "plan_stale", "target_conflict", "control_root_mismatch",
+  "source_writer_unknown", "source_writer_active", "drain_incomplete", "maintenance_busy", "maintenance_lost", "schema_guard_incomplete",
+  "journal_invalid", "snapshot_invalid", "restore_verification_unavailable", "unsupported_durability", "backup_capability_unavailable",
+  "request_conflict", "phase_conflict", "ERR_ASSERTION", "ENOENT", "EACCES", "EPERM", "EIO", "ECONNRESET", "ETIMEDOUT",
+  "08000", "08001", "08003", "08004", "08006", "08007", "08P01", "57014", "57P01", "57P02", "57P03", "55P03",
+  "40P01", "40001", "53300", "53400", "53100", "53200", "55000", "23505", "42501", "42P01", "42703", "25006", "25P02", "XX000"]);
+function callError(error: unknown): { code: string | null; name: string | null } {
+  try {
+    const value = error as { code?: unknown; name?: unknown } | null;
+    return { code: typeof value?.code === "string" && callCodes.has(value.code) ? value.code : "UNRECOGNIZED",
+      name: ["Error", "error", "MaintenanceFailure", "AssertionError", "TypeError", "RangeError", "AbortError"].includes(value?.name as string) ? value!.name as string : "UNRECOGNIZED" };
+  } catch { return { code: "UNREADABLE", name: "UNREADABLE" }; }
+}
+
+/** Separate bounded file in the existing scope directory: fixture.close closes the
+ * old observer before it returns, so its actual settle must not use that closed log.
+ * This recorder never changes an operation's result/error, nor the old receipt. */
+export function observePostgresCalls(observation: Pick<Observation, "directory" | "callIdentity">) {
+  let descriptor: number | undefined, closed = false, stopped = false, calls = 0, pending = 0, written = 0, dropped = 0, bytes = 0;
+  const reasons = new Set<string>();
+  const incomplete = (reason: string) => { if (reasons.size < 8) reasons.add(reason); };
+  const identity = (): ObjectValue => {
+    try {
+      const raw = observation.callIdentity() ?? {}, positive = (value: unknown) => Number.isSafeInteger(value) && (value as number) > 0 ? value : null;
+      return { scopeId: positive(raw.scopeId), caseId: raw.caseId === "pg-exporter-drift" ? raw.caseId : "NOT_OBSERVED",
+        scenario: raw.scenario === "exporter" ? raw.scenario : "NOT_OBSERVED",
+        sourceDescriptorDigest: typeof raw.sourceDescriptorDigest === "string" && /^[a-f0-9]{64}$/.test(raw.sourceDescriptorDigest) ? raw.sourceDescriptorDigest : null,
+        adapterObservationId: positive(raw.adapterObservationId), adapterOrdinal: positive(raw.adapterOrdinal),
+        adapterBinding: ["OBSERVED_SINGLE", "NOT_OBSERVED", "AMBIGUOUS"].includes(raw.adapterBinding as string) ? raw.adapterBinding : "NOT_OBSERVED" };
+    } catch { incomplete("identity_unavailable"); return { scopeId: null, adapterObservationId: null, adapterBinding: "NOT_OBSERVED" }; }
+  };
+  try {
+    if (!observation.directory) throw new Error("no diagnostic scope");
+    descriptor = openSync(join(observation.directory, "calls.jsonl"), constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_WRONLY, 0o600);
+  } catch { incomplete("setup_failed"); }
+  const record = (callId: number, stage: PostgresCallStage, boundary: "begin" | "end", outcome: "pending" | "fulfilled" | "rejected", error?: unknown) => {
+    try {
+      if (closed || stopped || descriptor === undefined) { dropped++; incomplete("event_not_written"); return; }
+      if (callId > callLimits.calls) { dropped++; incomplete("call_limit"); return; }
+      if (!callStages.includes(stage)) { dropped++; incomplete("unknown_stage"); return; }
+      const line = JSON.stringify({ version: 1, kind: "test-call", ...identity(), ownerPid: process.pid, ownerParentPid: process.ppid,
+        sequence: written + 1, callId, stage, boundary, outcome, atMilliseconds: performance.now(), atUtc: new Date().toISOString(),
+        ...(outcome === "rejected" ? { error: callError(error) } : {}) }) + "\n";
+      const buffer = Buffer.from(line);
+      if (buffer.length > callLimits.eventBytes || bytes + buffer.length > callLimits.totalBytes) { dropped++; stopped = true; incomplete("byte_limit"); return; }
+      let offset = 0;
+      while (offset < buffer.length) {
+        const count = writeSync(descriptor, buffer, offset, buffer.length - offset);
+        if (count <= 0) throw new Error("partial diagnostic write");
+        offset += count; bytes += count;
+      }
+      written++;
+    } catch { dropped++; stopped = true; incomplete("event_write_failed"); }
+  };
+  const run: PostgresCall = async (stage, operation) => {
+    const callId = ++calls; pending++; record(callId, stage, "begin", "pending");
+    try { const value = await operation(); record(callId, stage, "end", "fulfilled"); return value; }
+    catch (error) { record(callId, stage, "end", "rejected", error); throw error; }
+    finally { pending--; }
+  };
+  return { run,
+    close() {
+      if (closed) return; closed = true;
+      let logClosed = descriptor === undefined;
+      try { if (descriptor !== undefined) { const owned = descriptor; descriptor = undefined; closeSync(owned); logClosed = true; } }
+      catch { incomplete("log_close_failed"); }
+      if (pending) incomplete("unsettled_calls");
+      const receipt = { version: 1, kind: "test-call-receipt", ...identity(), ownerPid: process.pid, ownerParentPid: process.ppid,
+        atUtc: new Date().toISOString(), atMilliseconds: performance.now(),
+        observationStatus: reasons.size ? "INCOMPLETE" : calls === 0 ? "NOT_OBSERVED" : "COMPLETE",
+        incompleteReasons: [...reasons], callsStarted: calls, pendingCalls: pending, eventsWritten: written, droppedEvents: dropped,
+        bytesWritten: bytes, logClosed, limits: callLimits, businessOutcome: "NOT_INFERRED",
+        absentObservation: "Missing begin/end/file is NOT_OBSERVED, never proof an operation did not start or cleanup succeeded.",
+        timing: "Owner-local monotonic times; bounded synchronous recording perturbs timing." };
+      try {
+        const json = JSON.stringify(receipt, null, 2) + "\n";
+        if (!observation.directory || Buffer.byteLength(json) > callLimits.receiptBytes) throw new Error("missing/bounded call receipt");
+        writeFileSync(join(observation.directory, "calls-receipt.json"), json, { flag: "wx", mode: 0o600 });
+      } catch {
+        try { writeSync(process.stderr.fd, JSON.stringify({ postgresCallObservation: "INCOMPLETE", ownerPid: process.pid, reason: "receipt_write_failed" }) + "\n"); }
+        catch { /* Never replace the original operation outcome. */ }
+      }
+    },
+  };
 }

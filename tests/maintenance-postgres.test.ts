@@ -19,7 +19,7 @@ import { auditPublicArchiveToc, readPublicRestoreCatalogBinding } from "../src/s
 import type { PostgresDatabaseIdentity } from "../src/server/storage/maintenance/postgres-identity.ts";
 import type { PostgresDescriptor } from "../src/server/storage/maintenance/postgres-tools.ts";
 import type { ControlRootIdentity, Json, MaintenanceAdapter, OperationMutex } from "../src/server/storage/maintenance/types.ts";
-import { closePostgresWriterObservations, observePostgresWriters } from "./fixtures/maintenance-postgres-writer-observation.ts";
+import { closePostgresWriterObservations, observePostgresCalls, observePostgresWriters, type PostgresCall } from "./fixtures/maintenance-postgres-writer-observation.ts";
 
 after(closePostgresWriterObservations);
 
@@ -186,12 +186,15 @@ async function fixture(t: TestContext, caseId: string, seed = true, schema = "ap
   } catch (error) { observation.failure("setup", error); await cleanup(); throw error; }
   } catch (error) { observation.failure("setup", error); observation.close(); throw error; }
 }
-async function acquire(adapter: MaintenanceAdapter, f: Fixture): Promise<OperationMutex> {
-  return adapter.acquireMutex(f.root, (await adapter.observe()).state);
+async function acquire(adapter: MaintenanceAdapter, f: Fixture, call?: PostgresCall): Promise<OperationMutex> {
+  if (!call) return adapter.acquireMutex(f.root, (await adapter.observe()).state);
+  const observed = await call("observe", () => adapter.observe());
+  return call("acquire-mutex", () => adapter.acquireMutex(f.root, observed.state));
 }
-async function seal(adapter: MaintenanceAdapter, f: Fixture, mutex: OperationMutex): Promise<void> {
+async function seal(adapter: MaintenanceAdapter, f: Fixture, mutex: OperationMutex, call?: PostgresCall): Promise<void> {
   // Fixture-only anchors test the native CAS primitive; D owns real durable journal publication.
-  for (const admission of ["draining", "sealed"] as const) await adapter.withSourceLock("control", async lock => {
+  for (const admission of ["draining", "sealed"] as const) {
+    const operation = () => adapter.withSourceLock("control", async lock => {
     const before = await lock.observe();
     await lock.anchor({ expected: before.state, admission,
       fenceEpoch: before.state.fenceEpoch + (admission === "draining" ? 1 : 0),
@@ -199,7 +202,10 @@ async function seal(adapter: MaintenanceAdapter, f: Fixture, mutex: OperationMut
       activeMigrationId: "fixture-migration", planDigest: "c".repeat(64), controlRootIdentity: { ...f.root },
       mutexIdentity: mutex.identity, journalSequence: admission === "draining" ? 1 : before.state.journalSequence + 1,
       journal: { ref: `fixture-${admission}`, sha256: (admission === "draining" ? "d" : "e").repeat(64), bytes: "1" } });
-  });
+    });
+    if (call) await call(admission === "draining" ? "seal-draining" : "seal-sealed", operation);
+    else await operation();
+  }
 }
 
 pgTest("#152 PG column ACL preserves grants and grant options while accepting NULL and empty privilege sets", async t => {
@@ -786,34 +792,40 @@ pgTest("#152 PG exporter loss cancels its dump and sequence drift invalidates an
       if (beforeReal === undefined) delete process.env.BOARDROOM_TEST_REAL_DUMP; else process.env.BOARDROOM_TEST_REAL_DUMP = beforeReal;
       if (beforeStarted === undefined) delete process.env.BOARDROOM_TEST_DUMP_STARTED; else process.env.BOARDROOM_TEST_DUMP_STARTED = beforeStarted;
     }
+    const calls = scenario === "exporter" ? observePostgresCalls(f.observation) : undefined;
+    if (calls) { try { t.after(() => calls.close()); } catch { calls.close(); } }
+    const call: PostgresCall = calls?.run ?? ((_stage, operation) => operation());
     try {
-      const mutex = await acquire(adapter, f); await seal(adapter, f, mutex);
-      await assert.rejects(adapter.withSourceLock("snapshot", async lock => {
-        const backup = lock.backup(join(f.directory, "interrupted.dump")).then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
+      const mutex = await acquire(adapter, f, calls?.run); await seal(adapter, f, mutex, calls?.run);
+      await call("expected-rejection", () => assert.rejects(call("snapshot-lock", () => adapter.withSourceLock("snapshot", lock => call("snapshot-callback", async () => {
+        // Observe the underlying promise before the existing outcome wrapper.
+        const backup = call("backup", () => lock.backup(join(f.directory, "interrupted.dump"))).then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
         // The private tool-start marker is after capture/export, making fault injection deterministic.
-        let observedStart = false;
-        for (let attempt = 0; attempt < 200; attempt++) {
-          try { await access(started); observedStart = true; break; } catch { await new Promise(resolve => setTimeout(resolve, 25)); }
-        }
-        assert.equal(observedStart, true, "native dump must reach its process boundary before injecting a fault");
-        const mutator = await f.connectSource();
+        await call("dump-start-marker", async () => {
+          let observedStart = false;
+          for (let attempt = 0; attempt < 200; attempt++) {
+            try { await access(started); observedStart = true; break; } catch { await new Promise(resolve => setTimeout(resolve, 25)); }
+          }
+          assert.equal(observedStart, true, "native dump must reach its process boundary before injecting a fault");
+        });
+        const mutator = await call("fault-connect", () => f.connectSource());
         try {
           if (scenario === "sequence") await mutator.query("SELECT nextval(pg_get_serial_sequence('schema_migrations','version'))");
           else {
-            const exporter = (await mutator.query(`SELECT a.pid FROM pg_stat_activity a
+            const exporter = (await call("fault-find-exporter", () => mutator.query(`SELECT a.pid FROM pg_stat_activity a
               WHERE datid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND a.pid<>pg_backend_pid()
-              AND EXISTS(SELECT 1 FROM pg_locks l WHERE l.pid=a.pid AND l.mode='ShareLock' AND l.relation='projects'::regclass AND l.granted)`)).rows;
+              AND EXISTS(SELECT 1 FROM pg_locks l WHERE l.pid=a.pid AND l.mode='ShareLock' AND l.relation='projects'::regclass AND l.granted)`))).rows;
             assert.equal(exporter.length, 1);
-            assert.equal((await mutator.query("SELECT pg_terminate_backend($1,5000) AS stopped", [exporter[0].pid])).rows[0].stopped, true);
+            assert.equal((await call("fault-stop-exporter", () => mutator.query("SELECT pg_terminate_backend($1,5000) AS stopped", [exporter[0].pid]))).rows[0].stopped, true);
           }
-        } finally { await mutator.end(); }
-        const outcome = await backup;
+        } finally { await call("fault-close", () => mutator.end()); }
+        const outcome = await call("backup-settle", () => backup);
         if (outcome.error) throw outcome.error;
-      }), scenario === "sequence" ? /source_changed/ : /maintenance_lost/);
-      const check = await f.connectSource();
-      try { assert.equal((await check.query("SELECT admission FROM storage_maintenance")).rows[0].admission, "sealed"); }
-      finally { await check.end(); }
+      }))), scenario === "sequence" ? /source_changed/ : /maintenance_lost/));
+      const check = await call("check-connect", () => f.connectSource());
+      try { assert.equal((await call("check-query", () => check.query("SELECT admission FROM storage_maintenance"))).rows[0].admission, "sealed"); }
+      finally { await call("check-close", () => check.end()); }
       if (scenario === "sequence") await mutex.release();
-    } finally { await adapter.close(); await f.close(); }
+    } finally { await call("adapter-close", () => adapter.close()); await call("fixture-close", () => f.close()); }
   }
 });
