@@ -3,7 +3,7 @@ import { canonicalJson, digestJson } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { buildDatabaseManifests } from "./manifests.ts";
 import { ArtifactStore } from "./objects.ts";
-import { parseBundle, parseCapability, parseJournal, parseManifests, parsePlan, parsePublication, parseReceipt, parseSourceFiles, parseVerification } from "./parse.ts";
+import { parseBundle, parseCapability, parseJournal, parseManifests, parsePlan, parsePublication, parseReceipt, parseVerification, readSourceFiles } from "./parse.ts";
 import type { ArtifactRef, DatabaseManifests, JournalRecord, MaintenanceCaptureRef, MigrationPlan, SnapshotReceipt, SourceFilesManifest, SourceObservation } from "./types.ts";
 
 const equal = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
@@ -56,7 +56,7 @@ export async function verifyJournalChain(store: ArtifactStore, current: Artifact
     const evidence = new Set(record.evidence.map(item => item.ref)); requireValue(evidence.size === record.evidence.length);
     for (const artifact of record.evidence) await verifyCapability(store, artifact);
     if (record.frozen) {
-      const files = parseSourceFiles(await store.readJson(record.frozen.sourceFilesManifest, "source-files"));
+      const files = await readSourceFiles(store, record.frozen.sourceFilesManifest);
       requireValue(equal(files.source, record.source) && equal(files.roots, plan.fileRoots)
         && record.frozen.schemaManifestDigest === plan.schemaManifestDigest && record.frozen.guardManifestDigest === plan.guardManifestDigest);
       await verifySourceFilesClosure(store, files);
@@ -93,7 +93,7 @@ export function captureReference(node: JournalNode): MaintenanceCaptureRef {
     fenceEpoch: node.record.fenceEpoch, journal: node.reference, journalSequence: node.record.sequence, ownerGeneration: node.record.ownerGeneration };
 }
 
-/** Verifies the finite byte/reference closure. Actual restore execution is the adapter's separate obligation. */
+/** Verifies the finite byte/reference closure, not runtime qualification, source provenance or actual restore execution. */
 export async function verifySnapshotClosure(store: ArtifactStore, current: ArtifactRef): Promise<{
   chain: VerifiedJournalChain; receipt: SnapshotReceipt; receiptRef: ArtifactRef; files: SourceFilesManifest; manifests: DatabaseManifests;
 }> {
@@ -117,7 +117,7 @@ export async function verifySnapshotClosure(store: ArtifactStore, current: Artif
     && equal(publication.bundle, receipt.bundle) && equal(publication.capability, receipt.capability)
     && equal(verification.bundle, receipt.bundle) && equal(verification.publication, receipt.publication)
     && bundle.restorePointDigest === receipt.restorePointDigest && receipt.restorePointDigest === restorePointDigest(receipt));
-  const files = parseSourceFiles(await store.readJson(receipt.sourceFilesManifest, "source-files")); await verifySourceFilesClosure(store, files);
+  const files = await readSourceFiles(store, receipt.sourceFilesManifest); await verifySourceFilesClosure(store, files);
   requireValue(equal(files.source, receipt.capture.source));
   await verifyCapability(store, receipt.capability);
   const manifests = parseManifests(await store.readJson(receipt.manifests, "database-manifests"));

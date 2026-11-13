@@ -105,20 +105,39 @@ export interface JournalRecord {
   /** Only ready records point to a prior receipt. The receipt never points back to ready. */
   readonly snapshot: ArtifactRef | null;
 }
+export type SourceFileIncarnation =
+  | { readonly type: 248; readonly byteCount: 32; readonly hex: string }
+  | { readonly type: 1; readonly byteCount: 8; readonly hex: string };
+interface SourceRootBindingBase {
+  readonly sourceRoot: FileRoot["label"];
+  readonly hostIdentityDigest: string;
+  readonly filesystemUuidHex: string;
+  readonly anchorPath: string;
+  readonly anchorKind: "file" | "directory";
+}
+/** A recognized persisted codec is not an admitted runtime provider. */
+export type SourceRootBinding = SourceRootBindingBase & (
+  | { readonly profile: "linux-overlay-fid-fsuuid-v1"; readonly filesystemType: "overlay";
+      readonly anchorHandle: Extract<SourceFileIncarnation, { type: 248 }> }
+  | { readonly profile: "linux-native-ext4-fid-fsuuid-v1"; readonly filesystemType: "ext4";
+      readonly anchorHandle: Extract<SourceFileIncarnation, { type: 1 }> }
+);
+interface SourceFileEntryBase { readonly sourceRoot: string; readonly sourceRelativePath: string }
+export type SourceFileEntry = SourceFileEntryBase & (
+  | { readonly kind: "file"; readonly identity: PathIdentity; readonly mode: string; readonly size: string; readonly payload: ArtifactRef;
+      readonly sourceWitness: { readonly kind: "file"; readonly incarnation: SourceFileIncarnation;
+        readonly change: { readonly mtimeNs: string; readonly ctimeNs: string; readonly observedBirthtimeNs: string | null } } }
+  | { readonly kind: "directory"; readonly identity: PathIdentity; readonly mode: string; readonly size: string | null; readonly payload: null;
+      readonly sourceWitness: { readonly kind: "directory"; readonly incarnation: SourceFileIncarnation } }
+  | { readonly kind: "absent"; readonly identity: null; readonly mode: null; readonly size: null; readonly payload: null; readonly sourceWitness: null }
+);
 export interface SourceFilesManifest {
-  readonly formatVersion: 1;
+  readonly formatVersion: 2;
   readonly kind: "source-files";
   readonly source: SourceRef;
   readonly roots: readonly FileRoot[];
-  readonly entries: readonly {
-    readonly sourceRoot: string;
-    readonly sourceRelativePath: string;
-    readonly kind: "file" | "directory" | "absent";
-    readonly identity: PathIdentity | null;
-    readonly mode: string | null;
-    readonly size: string | null;
-    readonly payload: ArtifactRef | null;
-  }[];
+  readonly rootBindings: readonly SourceRootBinding[];
+  readonly entries: readonly SourceFileEntry[];
   readonly sourceMembershipExclusions: readonly ["database-files", "entire-maintenance-control-root", "all-maintenance-artifacts"];
 }
 export type RestorePayloadRole = "plan" | "journal-prefix" | "capture-journal" | "source-files-manifest"
