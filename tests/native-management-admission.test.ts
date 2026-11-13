@@ -23,7 +23,9 @@ function source(dir: string): SqliteDatabaseDescriptor {
     identity: { device: String(stat.dev), inode: String(stat.ino) } };
 }
 
-async function fixture(body: (db: Database.Database, dir: string) => Promise<void>, version = 18): Promise<void> {
+const currentMigrationVersion = Math.max(...migrations.map(migration => migration.version));
+
+async function fixture(body: (db: Database.Database, dir: string) => Promise<void>, version = currentMigrationVersion): Promise<void> {
   const dir = await mkdtemp(path.join(tmpdir(), "boardroom-native-management-"));
   const db = new Database(path.join(dir, "agent-studio.db"));
   try {
@@ -152,8 +154,17 @@ test("#152 native factory：缺 v18/未知 schema/checksum/guard 明确拒绝且
     assert.deepEqual(logicalSnapshot(db), before);
     assert.equal(db.prepare("SELECT name FROM sqlite_schema WHERE name='storage_maintenance'").get(), undefined);
   }, 17);
+  await fixture(async (db, dir) => {
+    const before = logicalSnapshot(db);
+    assert.equal(db.prepare("SELECT version FROM schema_migrations WHERE version=?").get(currentMigrationVersion), undefined);
+    for (const mode of ["write", "readonly-dry-run"] as const)
+      await assert.rejects(openNativeManagementSource({ source: source(dir), mode }),
+        (error: unknown) => error instanceof StorageMaintenanceError && error.reason === "metadata_invalid");
+    assert.deepEqual(logicalSnapshot(db), before);
+    assert.deepEqual(db.prepare("SELECT * FROM storage_source_clients").all(), []);
+  }, currentMigrationVersion - 1);
   for (const alter of [
-    "INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES(19,'unknown','invalid','t')",
+    `INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES(${currentMigrationVersion + 1},'unknown','invalid','t')`,
     "UPDATE schema_migrations SET checksum='changed' WHERE version=18",
     "DROP TABLE storage_source_clients",
   ]) await fixture(async (db, dir) => {
