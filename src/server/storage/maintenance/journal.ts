@@ -47,7 +47,11 @@ export async function verifyJournalChain(store: ArtifactStore, current: Artifact
     }
     requireValue((record.event === "capture") === (record.frozen !== null));
     requireValue((record.event === "ready") === (record.snapshot !== null));
-    if (record.event === "cancel_intent") cancelPending = true;
+    if (record.event === "cancel_intent") {
+      // The verified prefix must already contain capture/Jq; planned/no-Jq cancellation is forbidden.
+      requireValue(record.phase !== "planned");
+      cancelPending = true;
+    }
     if (record.event === "cancelled") requireValue(cancelPending);
     const evidence = new Set(record.evidence.map(item => item.ref)); requireValue(evidence.size === record.evidence.length);
     for (const artifact of record.evidence) await verifyCapability(store, artifact);

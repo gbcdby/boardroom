@@ -215,7 +215,11 @@ export class PostgresDriver implements DbDriver {
         await queue.drain();
         if (nested) await client.query(`RELEASE SAVEPOINT ${sp}`);
         else {
-          await client.query(this.dialect.commit());
+          const committed = await client.query(this.dialect.commit());
+          // body 捕获语句错误后 PG 仍可能以 ROLLBACK tag 正常响应 COMMIT。
+          if (committed.command !== "COMMIT") {
+            throw new Error(`PostgreSQL 事务未确认提交（可能已 aborted）：COMMIT 返回 ${committed.command}。`);
+          }
           if (!readOnly) callbacks.push(...commitCallbacks(identity));
         }
         return result;

@@ -90,19 +90,26 @@ export async function waitForPostgresTools(signal: AbortSignal): Promise<void> {
   await Promise.allSettled([...(activeTools.get(signal) ?? [])]);
 }
 
-export async function runPostgresTool(program: "pg_dump" | "pg_restore", args: readonly string[],
+export async function runPostgresTool(program: "pg_dump" | "pg_restore" | "psql", args: readonly string[],
   environment: NodeJS.ProcessEnv, options: {
     readonly failure: BlockerCode;
     readonly signal?: AbortSignal;
     readonly inputFd?: number;
     readonly outputFd?: number;
+    /** Independently opened, verified read-only handles; child numbers start at 3. */
+    readonly readFds?: readonly number[];
+    /** Absolute performance.now() deadline shared by the whole public restore pipeline. */
+    readonly deadline?: number;
   }): Promise<{ readonly stdout: string; readonly stderrPresent: boolean }> {
   if (options.signal?.aborted) throw new MaintenanceFailure("maintenance_lost");
+  const remaining = options.deadline === undefined ? 300_000 : options.deadline - performance.now();
+  if (!Number.isFinite(remaining) || remaining <= 0
+    || options.readFds?.some(fd => !Number.isSafeInteger(fd) || fd < 0)) throw new MaintenanceFailure(options.failure);
   const operation = new Promise<{ readonly stdout: string; readonly stderrPresent: boolean }>((resolve, reject) => {
     let settled = false, stdout = "", stderrPresent = false, failure: BlockerCode | undefined;
     let escalation: ReturnType<typeof setTimeout> | undefined;
     const child = spawn(program, [...args], { shell: false, env: environment,
-      stdio: [options.inputFd ?? "ignore", options.outputFd ?? "pipe", "pipe"],
+      stdio: [options.inputFd ?? "ignore", options.outputFd ?? "pipe", "pipe", ...options.readFds ?? []],
       ...(options.signal ? { signal: options.signal } : {}), killSignal: "SIGTERM" });
     const stop = (code = options.failure) => {
       failure = code;
@@ -112,7 +119,7 @@ export async function runPostgresTool(program: "pg_dump" | "pg_restore", args: r
         escalation.unref();
       }
     };
-    const timer = setTimeout(() => stop(), 300_000);
+    const timer = setTimeout(() => stop(), Math.min(300_000, Math.ceil(remaining)));
     timer.unref();
     // stderr can contain source SQL, identifiers and authentication details. Do not retain it.
     child.stderr?.on("data", () => { stderrPresent = true; });
@@ -136,6 +143,22 @@ export async function runPostgresTool(program: "pg_dump" | "pg_restore", args: r
     void operation.then(() => pending.delete(operation), () => pending.delete(operation));
   }
   return operation;
+}
+
+/** This profile is validated against PG16.15's TOC and native restrict/unrestrict commands. */
+export async function postgresPublicToolVersions(environment: NodeJS.ProcessEnv, signal: AbortSignal,
+  deadline: number, pgDump: string): Promise<{ readonly pgRestore: string; readonly psql: string }> {
+  const versions: string[] = [];
+  for (const program of ["pg_restore", "psql"] as const) {
+    const result = await runPostgresTool(program, ["--version"], environment,
+      { signal, failure: "restore_verification_unavailable", deadline });
+    const match = new RegExp(`^${program} \\(PostgreSQL\\) (\\d+\\.\\d+)(?:[^\\r\\n]*)[\\r\\n]*$`).exec(result.stdout);
+    if (!match || result.stderrPresent) throw new MaintenanceFailure("restore_verification_unavailable");
+    versions.push(match[1]!);
+  }
+  if (versions[0] !== "16.15" || versions[1] !== versions[0] || pgDump !== versions[0])
+    throw new MaintenanceFailure("restore_verification_unavailable");
+  return { pgRestore: versions[0]!, psql: versions[1]! };
 }
 
 export async function postgresToolVersions(environment: NodeJS.ProcessEnv, signal: AbortSignal,

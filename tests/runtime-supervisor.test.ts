@@ -15,7 +15,7 @@ import { createRuntimeObservability } from "../src/server/runtime/observability.
 import { createRuntimeSupervisor } from "../src/server/runtime/supervisor.ts";
 import { createRuntimeGateway, type RuntimeGateway } from "../src/server/runtime/gateway.ts";
 import { createLogger } from "../src/server/logger.ts";
-import { databaseForConnectedReader } from "../src/server/environment.ts";
+import { canonicalizePath, databaseForConnectedReader } from "../src/server/environment.ts";
 import { registerStorageSourceClient } from "../src/server/storage/source-client.ts";
 import { createHostOutputParser } from "../src/server/runtime/hosts/parser.ts";
 import type { HostEvent, HostLauncher, HostLaunchSnapshot, HostPreflight, OwnedHostProcess, OwnedProcessIdentity, OwnedProcessInspection, VerifiedUsageSchema } from "../src/server/runtime/hosts/types.ts";
@@ -61,7 +61,7 @@ async function fixture(options: { announceMode?: boolean; preflight?: HostPrefli
   const dir = await mkdtemp(path.join(tmpdir(), "runtime-supervisor-"));
   const db = new SqliteDriver({ dataDir: dir }); await db.connect(); await db.migrate(migrations);
   const sourceClient = options.storage ? await registerStorageSourceClient({ db, entrypoint: "http",
-    database: databaseForConnectedReader({ kind: "sqlite", dataDir: dir, sqlitePath: db.file, sourcePath: db.file, identity: null }) }) : undefined;
+    database: databaseForConnectedReader({ kind: "sqlite", dataDir: dir, sqlitePath: canonicalizePath(db.file), sourcePath: db.file, identity: null }) }) : undefined;
   const repos = createRepositories(db);
   let clock = Date.now();
   const runtime = createRuntimeRepository(db, { now: () => new Date(clock) });

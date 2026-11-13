@@ -2,6 +2,8 @@
 
 此目录仅服务于 #152 的维护前缀。`maintenance-darwin.c` 提供固定、只读观察或精确 FD 同步操作；不运行 shell、不发送进程信号、不接受任意命令，也不承担迁移阶段状态。
 
+`postgres-public-directory.c` 是 public 验证恢复独用的 Node-API 接缝。在 Node 进程内对已绑定目录 FD 执行 `openat` / `fstatat`，只接受内部生成的六类私有 `.public-*` 叶名称。它不提供源文件系统快照、任意路径访问或迁移协调能力。Darwin 的 `/dev/fd/N` 可用于末端文件 FD，不能作为目录 FD 子路径创建的替代。
+
 ## 构建与安装
 
 需要 macOS 的 Xcode Command Line Tools（`/usr/bin/cc`、系统 SDK 和 libproc）。`npm ci` 的 `postinstall` 只在 Darwin 尝试编译；缺少工具时保留普通应用功能，维护操作明确返回能力不可用。Linux 的安装行为不变。
@@ -14,6 +16,16 @@ node --test --test-concurrency=1 tests/maintenance-darwin.acceptance.ts
 ```
 
 生成物位于已忽略的 `build/maintenance-platform/`，不随源码提交。运行时仅执行本包固定位置、当前用户拥有的单链接可执行文件。没有原生组件时，普通入口仍能登记 `process_local_only`，该身份不能作为独立维护停写证据。
+
+public 目录接缝产物为 `postgres-public-directory-<arch>.node`，权限 0700，运行时核对固定路径、owner、普通文件和单链接。它使用 `native/node-api/v24.22.1/` 的四个上游公开 C headers（附 LICENSE 与 `SOURCES.json` 原文 SHA），以公开 Node-API 8 编译，不使用 V8/Node 私有接口，不在安装时下载 headers。实际 Node 必须支持 Node-API 8；构建和资格记录分别保留 headers 版本、runtime Node/NAPI、compiler 和产物摘要。该组件构建失败只使 public 恢复不可用，不删除已构建的库存工具或 SQLite 扩展；`--required` 仍失败。
+
+目录借用 FD 在 async queue 前复制并保持到真实完成；文件 raw FD 在交给 TS 后由 try/finally 覆盖元数据、abort 与 adoption 的所有失败。读取使用 O_NONBLOCK|O_NOFOLLOW，返回后严格拒绝非普通文件，再由 public helper 保留完整 sealed 身份/摘要和目录复验。O_NONBLOCK 消除 FIFO 等待对端的路径，不意味着任意内核 I/O 可强制取消。取消或期限到达仍须等待已经发起的操作完成并关闭其 FD，不能提前声明结束。
+
+真实 Darwin 资格还须执行以下生产桥控制，然后运行原 public PG 五场景；Linux 的便携 C 控制不能代替 Darwin 的末端 descriptor adoption、offset 或原生 PG 消费证据：
+
+```sh
+node --test --test-concurrency=1 tests/maintenance-postgres-public-directory.test.ts tests/maintenance-postgres-public-directory.acceptance.ts
+```
 
 ## 能力与边界
 

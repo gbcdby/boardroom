@@ -94,6 +94,41 @@ test("sqlite 隐式 exec 和 query RETURNING 提交后释放串行队列，回�
   } finally { await f.close(); }
 });
 
+test("postgres 捕获语句错误后的外层回滚仍拒绝事务并丢弃提交回调", { skip: identitySkip("postgres"), timeout: 15_000 }, async () => {
+  const f = await identityFixture("postgres");
+  try {
+    const seen: string[] = [];
+    let bodyCompleted = false;
+    await f.db.exec("CREATE TABLE callback_probe (id TEXT PRIMARY KEY)");
+    const outcome = await f.db.transaction(async tx => {
+      await tx.exec("INSERT INTO callback_probe VALUES ('aborted')");
+      await afterCommit(f.db, () => { seen.push("aborted_outer"); });
+      await f.db.transaction(async () => {
+        await afterCommit(f.db, () => { seen.push("aborted_nested"); });
+      });
+      // 捕获真实 23505 后正常返回；PG 将最终 COMMIT 执行为 ROLLBACK。
+      await assert.rejects(tx.exec("INSERT INTO callback_probe VALUES ('aborted')"), { code: "23505" });
+      bodyCompleted = true;
+      return "caught_body_result";
+    }).then(value => ({ status: "fulfilled", value }), error => ({ status: "rejected", error }));
+    assert.equal(f.db.currentTransactionContext(), undefined);
+    const rows = await f.db.query("SELECT id FROM callback_probe");
+    assert.deepEqual({ bodyCompleted, status: outcome.status, callbacks: [...seen], rows },
+      { bodyCompleted: true, status: "rejected", callbacks: [], rows: [] });
+
+    // 同一驱动仍可开启新事务；失败事务的回调不能泄漏到后续真实提交。
+    const result = await f.db.transaction(async tx => {
+      await tx.exec("INSERT INTO callback_probe VALUES ('committed')");
+      await afterCommit(f.db, () => { seen.push("committed"); });
+      return "committed_body_result";
+    });
+    assert.equal(result, "committed_body_result");
+    assert.equal(f.db.currentTransactionContext(), undefined);
+    assert.deepEqual(seen, ["committed"]);
+    assert.deepEqual(await f.db.query("SELECT id FROM callback_probe"), [{ id: "committed" }]);
+  } finally { await f.close(); }
+});
+
 test("postgres 五个并发提交回调重新借用连接池，不保留原物理连接", { skip: identitySkip("postgres"), timeout: 15_000 }, async () => {
   const f = await identityFixture("postgres");
   try {

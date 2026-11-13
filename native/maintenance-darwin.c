@@ -6,6 +6,8 @@
 #include <sys/sysctl.h>
 #include <sys/acl.h>
 #include <libproc.h>
+#include <mach/vm_inherit.h>
+#include <mach/vm_statistics.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -147,6 +149,18 @@ static bool scan_fds(pid_t pid, const struct proc_bsdinfo *process) {
   }
   unreadable(pid, "fd-churn"); return false;
 }
+static bool empty_guard_boundary(const struct proc_regionwithpathinfo *region, uint64_t address) {
+  if (region->prp_prinfo.pri_size != 0 || region->prp_prinfo.pri_address <= address) return false;
+  /* Only the exact empty, inaccessible guard metadata observed on XNU 12377.161.15.
+     This is an unresolved boundary, never an EOF or permission to skip a mapping. */
+  struct proc_regionwithpathinfo empty;
+  memset(&empty, 0, sizeof(empty));
+  empty.prp_prinfo.pri_address = region->prp_prinfo.pri_address;
+  empty.prp_prinfo.pri_inheritance = VM_INHERIT_NONE;
+  empty.prp_prinfo.pri_user_tag = VM_MEMORY_GUARD;
+  empty.prp_prinfo.pri_share_mode = SM_EMPTY;
+  return memcmp(region, &empty, sizeof(empty)) == 0;
+}
 static void scan_mappings(pid_t pid, const struct proc_bsdinfo *process) {
   uint64_t address = 0;
   for (int i = 0; i < MAX_REGIONS; i++) {
@@ -159,6 +173,16 @@ static void scan_mappings(pid_t pid, const struct proc_bsdinfo *process) {
       return;
     }
     uint64_t begin = region.prp_prinfo.pri_address, size = region.prp_prinfo.pri_size;
+    if (size == 0) {
+      if (!empty_guard_boundary(&region, address)) { unreadable(pid, "mapped-file-range"); return; }
+      const uint64_t boundary = begin;
+      memset(&region, 0, sizeof(region)); errno = 0;
+      /* Exactly one confirmation at the boundary, without advancing past it. Even EINVAL here is unresolved. */
+      bytes = proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, boundary, &region, sizeof(region));
+      if (bytes != (int)sizeof(region)) { unreadable(pid, "mapped-file-info"); return; }
+      begin = region.prp_prinfo.pri_address; size = region.prp_prinfo.pri_size;
+      if (begin != boundary) { unreadable(pid, "mapped-file-range"); return; }
+    }
     if (size == 0 || begin > UINT64_MAX - size || begin + size <= address) { unreadable(pid, "mapped-file-range"); return; }
     address = begin + size;
     region.prp_vip.vip_path[MAXPATHLEN - 1] = '\0';

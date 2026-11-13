@@ -129,19 +129,45 @@ platformTest("#152 arbitrary capability bodies cannot introduce hidden recovery 
   } finally { await f.close(); }
 });
 
-platformTest("#152 cancel intent blocks capture/ready and cancelled is a terminal event with one new epoch", async () => {
+platformTest("#152 journal rejects planned/no-Jq cancellation even when an unlinked capture exists", async () => {
   const f = await fixture();
   try {
+    assert.equal((await verifyJournalChain(f.store, f.enter)).nodes.length, 1);
     const intent = { ...f.body, sequence: 2, previous: f.enter, event: "cancel_intent" as const, requestId: "cancel" };
     const intentRef = await f.store.putJson("journal", intent);
     const cancelled = { ...intent, sequence: 3, previous: intentRef, event: "cancelled" as const, fenceEpoch: 2 };
     const head = await f.store.putJson("journal", cancelled);
-    assert.equal((await verifyJournalChain(f.store, head)).nodes.at(-1)!.record.phase, "planned");
-    for (const record of [
-      { ...f.captured, sequence: 3, previous: intentRef },
-      { ...cancelled, fenceEpoch: 1 },
-      { ...cancelled, sequence: 4, previous: head, event: "observation" },
-    ]) await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", record)), /journal_invalid/);
+    // fixture() has persisted a capture, but this exact predecessor chain never includes it.
+    await assert.rejects(verifyJournalChain(f.store, intentRef), /journal_invalid/);
+    await assert.rejects(verifyJournalChain(f.store, head), /journal_invalid/);
+  } finally { await f.close(); }
+});
+
+platformTest("#152 captured cancellation blocks capture/ready and is terminal with exactly one new epoch", async () => {
+  const f = await fixture();
+  try {
+    const ready = await f.finish();
+    for (const anchor of [{ reference: f.captureRef, record: f.captured }, ready]) {
+      const intent: JournalRecord = { ...anchor.record, sequence: anchor.record.sequence + 1, previous: anchor.reference,
+        event: "cancel_intent", requestId: "cancel", frozen: null, snapshot: null };
+      const intentRef = await f.store.putJson("journal", intent);
+      assert.equal((await verifyJournalChain(f.store, intentRef)).nodes.at(-1)!.record.phase, anchor.record.phase);
+      const cancelled: JournalRecord = { ...intent, sequence: intent.sequence + 1, previous: intentRef,
+        event: "cancelled", fenceEpoch: intent.fenceEpoch + 1 };
+      const head = await f.store.putJson("journal", cancelled);
+      const terminal = (await verifyJournalChain(f.store, head)).nodes.at(-1)!.record;
+      assert.equal(terminal.phase, anchor.record.phase);
+      assert.equal(terminal.fenceEpoch, anchor.record.fenceEpoch + 1);
+      for (const record of [
+        { ...intent, fenceEpoch: intent.fenceEpoch + 1 },
+        { ...f.captured, sequence: intent.sequence + 1, previous: intentRef },
+        { ...ready.record, sequence: intent.sequence + 1, previous: intentRef },
+        { ...cancelled, sequence: intent.sequence, previous: anchor.reference },
+        { ...cancelled, fenceEpoch: intent.fenceEpoch },
+        { ...cancelled, fenceEpoch: intent.fenceEpoch + 2 },
+        { ...cancelled, sequence: cancelled.sequence + 1, previous: head, event: "observation" },
+      ]) await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", record)), /journal_invalid/);
+    }
   } finally { await f.close(); }
 });
 

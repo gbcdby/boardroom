@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { constants, closeSync, fstatSync, lstatSync, openSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, open, readdir, readlink, stat } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open, stat } from "node:fs/promises";
 import path from "node:path";
 import { assertSqliteSourceUnchanged, type SqliteDatabaseDescriptor } from "../../environment.ts";
 import { inspectOwnedProcess } from "../../runtime/hosts/process-identity.ts";
@@ -11,6 +11,7 @@ import { MaintenanceFailure } from "./error.ts";
 import { maintenanceHostIdentityDigest } from "./host.ts";
 import { ArtifactStore } from "./objects.ts";
 import { assertDarwinSqliteSource, bindDarwinSqliteSource, darwinSourceHandles, darwinSourceInventory } from "./darwin.ts";
+import { inspectLinuxSourceProcesses, linuxMappedSourceHandles, linuxSourceMappingIdentities } from "./linux-mappings.ts";
 import { fullSyncDarwinDatabaseHandle, syncMaintenanceHandle } from "./platform.ts";
 import { readSqliteManifests } from "./sqlite-manifests.ts";
 import type { AnchorChange, Blocker, ControlRootIdentity, DatabaseManifests, Json, MaintenanceAdapter, OperationMutex, SourceLock, SourceObservation } from "./types.ts";
@@ -108,6 +109,10 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
         const info = statSync(file, { bigint: true }); result.set(`fd:${entry}`, `${info.dev}:${info.ino}`);
       } catch (error) { if (!["ENOENT", "EBADF"].includes(String((error as NodeJS.ErrnoException).code))) throw error; }
     }
+    const sources = linuxSourceMappingIdentities([this.source.sqlitePath, this.source.sqlitePath + "-wal", this.source.sqlitePath + "-shm"]);
+    const mapped = linuxMappedSourceHandles("/proc/self", sources);
+    if (mapped.empty) throw new MaintenanceFailure("source_writer_unknown");
+    for (const [key, identity] of mapped.handles) result.set(key, identity);
     return result;
   }
   private purgeClosedFds(): void {
@@ -122,7 +127,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       if (process.platform === "darwin") { bindDarwinSqliteSource(db); this.darwinConnections.add(db); }
       if (readonly) db.pragma("query_only=ON"); else configureDurableSqlite(db);
       db.pragma("busy_timeout=0");
-      if (process.platform === "darwin") db.pragma("schema_version"); // Open the real WAL/SHM reader handles before attributing them.
+      if (["linux", "darwin"].includes(process.platform)) db.pragma("schema_version"); // Open the real WAL/SHM reader handles before attributing them.
       const opened = this.relevantFds();
       for (const [fd, identity] of opened) if (before.get(fd) !== identity) this.ownFds.set(fd, identity);
       if (!readonly) this.fullSyncSource();
@@ -131,7 +136,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   }
   private closeSource(db: Database.Database): void { this.darwinConnections.delete(db); db.close(); this.purgeClosedFds(); }
   private beginSourceWrite(db: Database.Database): void {
-    if (process.platform !== "darwin") { db.exec("BEGIN IMMEDIATE"); return; }
+    if (!["linux", "darwin"].includes(process.platform)) { db.exec("BEGIN IMMEDIATE"); return; }
     const before = this.relevantFds();
     db.exec("BEGIN IMMEDIATE");
     // A first write may create WAL/SHM after open. Only this synchronous native operation owns its new handles.
@@ -347,20 +352,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
             blockers.push({ code: "source_writer_unknown", subjectRef: `os-process:${item.pid}` });
         }
       } catch { blockers.push({ code: "source_writer_unknown", subjectRef: "os-inventory-unavailable" }); }
-    } else for (const pid of (await readdir("/proc")).filter(entry => /^[1-9][0-9]*$/.test(entry))) {
-      try {
-        if ((await stat(`/proc/${pid}`)).uid !== process.getuid()) continue;
-        for (const fd of await readdir(`/proc/${pid}/fd`)) {
-          try {
-            const file = `/proc/${pid}/fd/${fd}`, target = (await readlink(file)).replace(/ \(deleted\)$/, "");
-            if (!sourcePaths.includes(target) && target !== sessions && !target.startsWith(`${sessions}/`)) continue;
-            const info = await stat(file, { bigint: true });
-            if (Number(pid) === process.pid && this.ownFds.get(`fd:${fd}`) === `${info.dev}:${info.ino}`) continue;
-            blockers.push({ code: "source_writer_unknown", subjectRef: `os-process:${pid}` });
-          } catch (error) { if (!["ENOENT", "ESRCH", "EBADF"].includes(String((error as NodeJS.ErrnoException).code))) blockers.push({ code: "source_writer_unknown", subjectRef: `unreadable-process:${pid}` }); }
-        }
-      } catch (error) { if (!["ENOENT", "ESRCH"].includes(String((error as NodeJS.ErrnoException).code))) blockers.push({ code: "source_writer_unknown", subjectRef: `unreadable-process:${pid}` }); }
-    }
+    } else blockers.push(...await inspectLinuxSourceProcesses(sourcePaths, sessions, this.ownFds));
     const db = this.openSource(true);
     try {
       for (const row of db.prepare("SELECT binding_id,process_identity_json FROM agent_runner_states WHERE exit_confirmed=0").all() as { binding_id: string; process_identity_json: string | null }[]) {

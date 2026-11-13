@@ -136,6 +136,55 @@ test("#152 macOS source inventory finds a different process's mapped writer afte
   }
 });
 
+test("#152 Darwin range refinement keeps the target vnode after an empty guard and rejects unresolved ranges", async t => {
+  const dir = await temporary();
+  try {
+    const file = path.join(dir, "source"), executable = path.join(dir, "region-scan");
+    await writeFile(file, Buffer.alloc(65536), { mode: 0o600 });
+    const compiled = spawnSync("/usr/bin/cc", ["-std=c11", "-D_DARWIN_C_SOURCE", "-Wall", "-Wextra", "-Werror", "-O2",
+      fixture("maintenance-darwin-region-scan.c"), "-lproc", "-o", executable], { encoding: "utf8", timeout: 60_000 });
+    assert.equal(compiled.status, 0, compiled.stderr || "native range fixture compiler unavailable");
+    const cases: { name: string; calls: number; reason: string | null }[] = [
+      { name: "normal-target", calls: 2, reason: null },
+      { name: "guard-target", calls: 3, reason: null },
+      { name: "guard-anonymous-target", calls: 4, reason: null },
+      ...["guard-vnode", "guard-other-tag", "guard-writable", "guard-max-write", "guard-submap", "guard-nonempty",
+        "guard-counter", "guard-offset", "guard-nonprogress"].map(name => ({ name, calls: 1, reason: "mapped-file-range" })),
+      ...["guard-backward", "normal-nonprogress", "confirm-zero", "confirm-forward-zero", "confirm-forward", "confirm-backward",
+        "confirm-overflow"].map(name => ({ name, calls: 2, reason: "mapped-file-range" })),
+      ...["confirm-short", "confirm-einval", "confirm-esrch", "confirm-denied"].map(name => ({ name, calls: 2, reason: "mapped-file-info" })),
+      { name: "normal-overflow", calls: 1, reason: "mapped-file-range" },
+      { name: "normal-denied", calls: 1, reason: "mapped-file-info" },
+      { name: "budget", calls: 262144, reason: "mapped-file-limit" },
+      { name: "guard-budget", calls: 524288, reason: "mapped-file-limit" },
+    ];
+    for (const scenario of cases) await t.test(scenario.name, () => {
+      const child = spawnSync(executable, [scenario.name, file], { encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024 });
+      assert.equal(child.status, 0, child.stderr || "native range fixture failed");
+      const observed = JSON.parse(child.stdout) as { items: ReturnType<typeof darwinSourceInventory>["items"]; queryCount: number;
+        queries: string[]; mappedBegin: string; mappedSize: string; device: string; inode: string; targetFdClosed: boolean };
+      assert.equal(observed.targetFdClosed, true); assert.equal(observed.queryCount, scenario.calls);
+      assert.equal(observed.items.length, 1);
+      const item = observed.items[0]!;
+      if (scenario.reason === null) {
+        assert.equal(item.kind, "handle");
+        if (item.kind !== "handle") throw new Error("mapped target was lost");
+        assert.equal(item.device, observed.device); assert.equal(item.inode, observed.inode); assert.equal(item.fd, -1);
+        assert.equal(item.key, `map:${observed.mappedBegin}:${observed.mappedSize}`);
+        if (scenario.name === "guard-target") assert.equal(observed.queries[1], observed.mappedBegin);
+        if (scenario.name === "guard-anonymous-target") {
+          assert.equal(observed.queries[1], String(BigInt(observed.mappedBegin) - 16384n));
+          assert.equal(observed.queries[2], observed.mappedBegin);
+        }
+      } else {
+        assert.equal(item.kind, "unreadable");
+        if (item.kind !== "unreadable") throw new Error("unresolved range was accepted");
+        assert.equal(item.reason, scenario.reason);
+      }
+    });
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 for (const point of ["temp_written", "file_synced", "renamed", "directory_synced"] as const) {
   test(`#152 macOS actual child crash at ${point} leaves only an unanchored object and permits verified republish`, async () => {
     const dir = await temporary();

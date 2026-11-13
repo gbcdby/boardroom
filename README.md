@@ -153,6 +153,10 @@ HTTP、MCP 与业务仓储已通过统一 `DbDriver` 接入两种数据库，选
 
 真实 PostgreSQL 测试需显式设置 `AGENT_STUDIO_PG_TEST_URL` 后运行 `npm test`；使用专用测试库。缺少 PG 配置时，相关用例会跳过或不注册，默认测试通过不证明 PG 运行路径已验收。三个 SDK e2e 命令默认用 SQLite，可通过 `AGENT_STUDIO_DB_DRIVER=postgres` 和 `AGENT_STUDIO_PG_CONNECTION_STRING` 切换。真实 Chromium 安装/运行及干净启动复验步骤见[接入指南](docs/getting-started-mcp.md#8-验收与可重复验证)。
 
+PostgreSQL 维护快照的 `public` 隔离恢复使用 `pg16-public-native-segments-v1` 能力：当前要求原生 `pg_dump`、`pg_restore`、`psql` 均为 **16.15**，通过完整 TOC 审计后，由 `psql` 在一个事务内执行未改写的原生 SQL；工具缺失、版本不匹配或无法核实输入文件身份时阻断。自定义 schema 继续使用原 `pg_restore --single-transaction` 路径。
+
+public 的单次 **300 秒整体期限**从首次 native 阶段起算，贯穿 backend 退出核对、完整 manifest、最终只读 COMMIT、监控与资源收尾，直到成功回执。超时、取消、源/目标失效或最终 monitor 失败均拒绝成功；失败清理仍等待本次 child 实际 close 与自有 backend 退出。native 隔离恢复事务若已经提交，后续验证失败不会把该事实记作回滚。普通 PG 回归覆盖真实恢复、权限与失败退出；`tests/maintenance-postgres-public-terminal.test.ts` 用真实 PG 和受控单调时钟注入检查成功尾部，实际 300 秒 native 超时另用 `node --test tests/maintenance-postgres-public-deadline.acceptance.ts` 在专用 PG 环境执行，不缩短生产预算。平台上的受控 FD 能力、CI 和整票验收仍分别记录。
+
 **SDK 检查不会启动真实模型或 harness**，也不覆盖浏览器中的完整人工操作。2026-11-11 的独立真实宿主回传见 [#112](https://github.com/gbcdby/boardroom/issues/112#issuecomment-6790053498)及 [V1 验收索引](docs/v1-acceptance.md)：Claude Code 2.1.233、Codex CLI 0.167.0，macOS 26.5.2 arm64 / SQLite / Streamable HTTP。它与 Linux 双数据库 CI 分开取证；没有将代理模型线路视为托管官方 OAuth profile，也没有宣称 macOS PostgreSQL 或修复后 Codex reviewer 已重新实测。更早的宿主结果见 [2026-11-03 验收报告](docs/t8-acceptance-report.md)与 [DSH 证据索引](evidence/real-host-retest/README.md)，适用范围如下：
 
 | 宿主 / 历史版本 | 已有历史记录 | 当前保守边界 |
