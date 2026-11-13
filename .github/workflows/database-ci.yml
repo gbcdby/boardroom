@@ -448,6 +448,10 @@ jobs:
         if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-tasks-web.py
 
+      - name: 提交后资源刷新、断线对账与草稿真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
+        run: .agent-output/browser-venv/bin/python scripts/e2e-resource-web.py
+
       - name: 记忆编辑、冲突与历史真实浏览器验证
         if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-memory-web.py
@@ -484,6 +488,7 @@ jobs:
             .agent-output/webui-e2e/
             .agent-output/webui-before/
             .agent-output/tasks-web-e2e/
+            .agent-output/resource-web-e2e/
             .agent-output/memory-web-e2e/
             .agent-output/settings-web-e2e/
             .agent-output/navigation-web-e2e/

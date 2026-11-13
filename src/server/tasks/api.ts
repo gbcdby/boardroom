@@ -10,6 +10,8 @@ import { ForbiddenError } from "../authz/authorize.ts";
 import { ownerActor } from "../authz/actors.ts";
 import { createTaskService, type TaskAccess } from "./service.ts";
 import { notifyWorkEventCommit } from "./events.ts";
+import { notifyResourceChange } from "../resource-changes.ts";
+import { conditionalJson } from "../conditional-json.ts";
 import {
   parseTaskInput, createTaskSchema, updateTaskSchema, transitionTaskSchema, commentTaskSchema,
   linkTaskMessageSchema, startTaskReviewSchema, beginTaskReviewSchema, submitReviewReportSchema,
@@ -46,7 +48,8 @@ export function createTaskApi(options: { db: DbDriver; logger: Logger;
 }): { handle(request: IncomingMessage, response: ServerResponse, pathname: string): Promise<boolean> } {
   const log = options.logger.child({ component: "tasks-api" });
   const service = createTaskService({ repos: createRepositories(options.db),
-    onWorkEvents: events => notifyWorkEventCommit(options.db, events) });
+    onWorkEvents: events => notifyWorkEventCommit(options.db, events),
+    onResourceChanged: change => notifyResourceChange(options.db, change) });
   return { async handle(request, response, pathname) {
     if (!/^\/api\/projects\/[^/]+\/(tasks|task-settings)(\/|$)/.test(pathname)) return false;
     try {
@@ -60,7 +63,7 @@ export function createTaskApi(options: { db: DbDriver; logger: Logger;
       const access: TaskAccess = { actor };
       const method = request.method ?? "GET";
       if (parts[3] === "task-settings" && parts.length === 4) {
-        if (method === "GET") json(response, 200, { settings: await service.getSettings(access, projectId) });
+        if (method === "GET") conditionalJson(request, response, { settings: await service.getSettings(access, projectId) });
         else if (method === "PUT") json(response, 200, { settings: await service.setSettings(access, projectId, parseTaskInput(taskSettingsSchema, await body(request))) });
         else json(response, 405, { error: { code: "method_not_allowed", message: "此接口支持 GET / PUT。" } });
         return true;
@@ -69,14 +72,14 @@ export function createTaskApi(options: { db: DbDriver; logger: Logger;
       if (parts[3] === "tasks" && parts.length === 4) {
         if (method === "GET") {
           const query = Object.fromEntries(new URL(request.url ?? pathname, "http://127.0.0.1").searchParams);
-          json(response, 200, { tasks: await service.list(access, projectId, parseTaskInput(listTasksSchema, query)) });
+          conditionalJson(request, response, { tasks: await service.list(access, projectId, parseTaskInput(listTasksSchema, query)) });
         } else if (method === "POST") json(response, 201, { task: await service.create(access, projectId, parseTaskInput(createTaskSchema, await body(request))) });
         else json(response, 405, { error: { code: "method_not_allowed", message: "此接口支持 GET / POST。" } });
         return true;
       }
       const taskId = parts[4]!;
       if (parts.length === 5) {
-        if (method === "GET") json(response, 200, await service.get(access, projectId, taskId));
+        if (method === "GET") conditionalJson(request, response, await service.get(access, projectId, taskId));
         else if (method === "PATCH") json(response, 200, { task: await service.update(access, projectId, taskId, parseTaskInput(updateTaskSchema, await body(request))) });
         else json(response, 405, { error: { code: "method_not_allowed", message: "此接口支持 GET / PATCH。" } });
         return true;

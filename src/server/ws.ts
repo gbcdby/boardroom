@@ -7,10 +7,13 @@ import type { Logger } from "./logger.ts";
 import type { MessageView } from "./api.ts";
 import { authorize, type Actor, type DenyCode } from "./authz/authorize.ts";
 import { ownerActor } from "./authz/actors.ts";
+import type { ResourceChange, ResourceChangedEvent } from "../shared/resource-changes.ts";
 
 /** 客户端 → 服务端。 */
 export type ClientEvent =
   | { type: "ping"; sentAt?: string }
+  /** 资源读取订阅与人的在线 presence 分开；null 显式释放旧项目。 */
+  | { type: "resource.subscribe"; projectId: string | null }
   /**
    * 客户端声明自己「人在哪个项目里在线」（T4 人的在线/离线）。
    * 仅用于人的在线展示；人不执行 agent 轮次，绝不产生 waiting/working。
@@ -26,6 +29,8 @@ export type ServerEvent =
       heartbeat: HeartbeatConfig;
     }
   | { type: "pong"; sentAt?: string; serverTime: string }
+  | { type: "resource.subscribed"; projectId: string | null }
+  | ResourceChangedEvent
   | { type: "notice"; level: "info" | "warn"; message: string }
   | { type: "message"; message: MessageView }
   /**
@@ -76,6 +81,7 @@ export interface WebSocketHub {
   readonly clientCount: number;
   /** 广播事件给所有已连接客户端。 */
   broadcast(event: ServerEvent): void;
+  broadcastResourceChange(change: ResourceChange): Promise<void>;
   /**
    * 广播某项目的状态看板快照（T4）。只发给「对该项目可见」的客户端：
    * 声明了其它项目的 presence 的客户端不会收到，避免跨项目泄漏。
@@ -111,6 +117,7 @@ export function createWebSocketHub(options: WebSocketHubOptions): WebSocketHub {
   const lastSeen = new Map<WebSocket, number>();
   /** 客户端声明的在线项目（T4 人的在线）；客户端断开时清除。 */
   const presence = new Map<WebSocket, { projectId: string; memberId: string | null }>();
+  const resources = new Map<WebSocket, { projectId: string; authorized: boolean }>();
 
   server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     if (new URL(request.url ?? "/", "http://127.0.0.1").pathname !== wsPath) {
@@ -144,6 +151,30 @@ export function createWebSocketHub(options: WebSocketHubOptions): WebSocketHub {
       if (event?.type === "ping") {
         const pong: ServerEvent = { type: "pong", serverTime: now().toISOString() };
         send(client, event.sentAt === undefined ? pong : { ...pong, sentAt: event.sentAt });
+        return;
+      }
+      if (event?.type === "resource.subscribe") {
+        // 先释放旧选择；异步主体解析迟到不能恢复已切走的订阅。
+        resources.delete(client);
+        if (event.projectId === null) { send(client, { type: "resource.subscribed", projectId: null }); return; }
+        if (typeof event.projectId !== "string" || !event.projectId.trim()) {
+          send(client, { type: "error", code: "invalid_message", message: "资源订阅需要项目标识。" }); return;
+        }
+        const selection = { projectId: event.projectId, authorized: false };
+        resources.set(client, selection);
+        try {
+          const actor = await resolveActor({ projectId: selection.projectId, memberId: null });
+          if (resources.get(client) !== selection) return;
+          if (!actor || !authorize(actor, "task:view", { projectId: selection.projectId }).allowed) {
+            resources.delete(client); send(client, { type: "error", code: "forbidden", message: "无权订阅该项目的资源。" }); return;
+          }
+          selection.authorized = true;
+          send(client, { type: "resource.subscribed", projectId: selection.projectId });
+        } catch {
+          if (resources.get(client) === selection) {
+            resources.delete(client); send(client, { type: "error", code: "forbidden", message: "无法确定资源订阅主体。" });
+          }
+        }
         return;
       }
       if (event?.type === "presence") {
@@ -188,6 +219,7 @@ export function createWebSocketHub(options: WebSocketHubOptions): WebSocketHub {
     client.on("close", (code) => {
       lastSeen.delete(client);
       presence.delete(client);
+      resources.delete(client);
       log.info("客户端断开", { clientId, code, clientCount: wss.clients.size });
     });
 
@@ -226,13 +258,28 @@ export function createWebSocketHub(options: WebSocketHubOptions): WebSocketHub {
     }
   }
 
+  async function broadcastResourceChange(change: ResourceChange): Promise<void> {
+    // 新实体必须提供自己的读取权限；不能把未知模块自动视作 Task 可见。
+    if (change.entity !== "task" && change.entity !== "task-settings") return;
+    const event: ResourceChangedEvent = { type: "resource.changed", projectId: change.projectId, entity: change.entity, id: change.id, revision: change.revision };
+    await Promise.allSettled([...wss.clients].map(async client => {
+      const selection = resources.get(client);
+      if (!selection?.authorized || selection.projectId !== change.projectId) return;
+      const actor = await resolveActor({ projectId: change.projectId, memberId: null });
+      if (resources.get(client) !== selection || !actor || !authorize(actor, "task:view", { projectId: change.projectId }).allowed) return;
+      send(client, event);
+    }));
+  }
+
   return {
     get clientCount() {
       return wss.clients.size;
     },
     broadcast(event) {
+      if (event.type === "resource.changed") { void broadcastResourceChange(event); return; }
       for (const client of wss.clients) send(client, event);
     },
+    broadcastResourceChange,
     broadcastProjectStatus(projectId, statuses) {
       const event: ServerEvent = {
         type: "status_update",

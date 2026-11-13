@@ -15,6 +15,7 @@ import { captureReviewCandidate } from "./candidate.ts";
 import { TaskError } from "./errors.ts";
 import { assessTaskMaterials } from "./materials.ts";
 import type { MutationDiscover } from "../db/mutation-scope.ts";
+import type { ResourceChange } from "../../shared/resource-changes.ts";
 import { discoverDomainMutation, type DomainAccess, type DomainMutationTargets } from "../mutation-access.ts";
 
 export interface TaskAccess extends DomainAccess {
@@ -45,8 +46,9 @@ export interface TaskServiceOptions {
   readonly captureCandidate?: (input: { repoPath: string; fixedPoint: string }) => Promise<ReviewCandidate>;
   readonly onWorkEvents?: (events: readonly WorkEvent[]) => void | Promise<void>;
   readonly onTaskChanged?: (projectId: string, taskId: string, revision: number) => void | Promise<void>;
+  readonly onResourceChanged?: (change: ResourceChange) => void | Promise<void>;
 }
-type Context = { actor: Actor; author: TaskAuthor; at: string; events: WorkEvent[]; changed: Map<string, number> };
+type Context = { actor: Actor; author: TaskAuthor; at: string; events: WorkEvent[]; changed: Map<string, number>; resources: ResourceChange[] };
 class GuardRollback extends RepositoryError {
   readonly denial: ForbiddenError;
   constructor(denial: ForbiddenError) { super("invalid_argument", denial.message); this.denial = denial; }
@@ -127,12 +129,12 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
     if (task.revision !== revision) throw new TaskError("task_revision_conflict", "任务已被更新，请刷新后重试。", "conflict");
   }
   async function mutate<T>(access: TaskAccess, projectId: string, body: (ctx: Context) => Promise<T>, operation: "write" | "consume" = "write", targets: DomainMutationTargets = {}): Promise<T> {
-    const events: WorkEvent[] = []; const changed = new Map<string, number>();
+    const events: WorkEvent[] = []; const changed = new Map<string, number>(); const resources: ResourceChange[] = [];
     const discover = discoverDomainMutation(access, projectId, targets);
     const work = () => repos.mutations.run({ projectIds: [projectId], discover }, () => repos.transaction(async () => {
       try {
         const actor = await actorFor(access, projectId, true);
-        return await body({ actor, author: await authorFor(actor), at: now(), events, changed });
+        return await body({ actor, author: await authorFor(actor), at: now(), events, changed, resources });
       } catch (error) {
         if (error instanceof ForbiddenError) throw new GuardRollback(error);
         throw error;
@@ -145,8 +147,13 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
     try { if (events.length) await options.onWorkEvents?.(events); }
     catch { console.warn("task_work_event_notification_failed", { projectId }); }
     for (const [taskId, revision] of changed) {
+      resources.push({ projectId, entity: "task", id: taskId, revision });
       try { await options.onTaskChanged?.(projectId, taskId, revision); }
       catch { console.warn("task_change_notification_failed", { projectId, taskId }); }
+    }
+    for (const resource of resources) {
+      try { await options.onResourceChanged?.(resource); }
+      catch { console.warn("resource_change_notification_failed", { projectId, entity: resource.entity, id: resource.id }); }
     }
     return result;
   }
@@ -258,6 +265,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         if (value.defaultReviewerMemberId !== null) await validMember(projectId, value.defaultReviewerMemberId, true);
         const settings = await repos.tasks.setSettings(projectId, value.expectedRevision, value.defaultReviewerMemberId);
         await appendAuditEntry(repos.audit, { projectId, actor: auditActorFrom(ctx.actor), action: "task.settings_updated", targetKind: "project", targetId: projectId, targetName: "任务设置", after: settings });
+        ctx.resources.push({ projectId, entity: "task-settings", id: projectId, revision: settings.revision });
         return settings;
       }, "write", { memberIds: [value.defaultReviewerMemberId], taskDefaults: true });
     },
