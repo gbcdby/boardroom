@@ -396,41 +396,128 @@ def process_rows(uid):
             continue
         try:
             fields = dict(line.split(':', 1) for line in (path / 'status').read_text().splitlines() if ':' in line)
-            if uid not in list(map(int, fields['Uid'].split())):
+            uids = list(map(int, fields['Uid'].split()))
+            if uid not in uids:
                 continue
             tail = (path / 'stat').read_text().rsplit(') ', 1)[1].split()
-            rows.append({'pid': int(path.name), 'start_ticks': tail[19], 'state': fields['State'].strip()})
+            rows.append({'pid': int(path.name), 'start_ticks': tail[19], 'state': fields['State'].strip(),
+                         'stat_state': tail[0], 'ppid': int(tail[1]), 'uids': uids})
         except (FileNotFoundError, ProcessLookupError):
             pass
     return rows
 
 
+def zombie(row):
+    # Do not treat a changing /proc observation as proof of a terminated child.
+    return row['state'].split()[0] == 'Z' and row['stat_state'] == 'Z'
+
+
+def owned_pidfd(uid, expected):
+    fd = os.pidfd_open(expected['pid'])
+    try:
+        current = next((row for row in process_rows(uid) if row['pid'] == expected['pid']), None)
+        if current is None or current['start_ticks'] != expected['start_ticks'] or \
+           current['uids'] != [uid] * 4 or expected['uids'] != [uid] * 4:
+            raise IsolationError('Owned process identity changed; do not signal or wait')
+        return fd, current
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def reap_owned_fd(uid, fd, current):
+    """Peek before consuming: a Z label or successful signal is not a reap."""
+    def fields(value):
+        return {name: getattr(value, name) for name in ('si_pid', 'si_uid', 'si_signo', 'si_code', 'si_status')}
+
+    try:
+        peek = os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if peek is None or peek.si_pid != current['pid'] or peek.si_uid != uid or \
+           peek.si_signo != signal.SIGCHLD or peek.si_code not in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED):
+            raise IsolationError('Owned child wait identity or terminal status is unproven')
+        consumed = os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
+        if consumed is None or fields(consumed) != fields(peek):
+            raise IsolationError('Owned child wait consumption did not match its terminal peek')
+        return {'process': current, 'peek': fields(peek), 'consumed': fields(consumed)}
+    except ChildProcessError as error:
+        raise IsolationError('Owned child has no waitable status; reap is unproven') from error
+
+
+def reap_owned_process(uid, expected):
+    fd, current = owned_pidfd(uid, expected)
+    try:
+        return reap_owned_fd(uid, fd, current)
+    finally:
+        os.close(fd)
+
+
 def stop_owned_processes(uid):
-    """UID is newly allocated and account identity was checked by the caller."""
-    initial = process_rows(uid)
+    """Stop the verified new UID; certify only actual, already-terminal reaps."""
+    receipt = {'initial': process_rows(uid), 'reaped': [], 'signals': [],
+               'remaining': [], 'errors': [], 'reap_only': False}
+    reported, attempted = set(), set()
+
+    def failure(row, error):
+        message = f"PID {row['pid']} / start {row['start_ticks']}: {error}"
+        if message not in reported:
+            reported.add(message)
+            receipt['errors'].append(message)
+
+    def reap_zombies(rows):
+        for row in rows:
+            identity = (row['pid'], row['start_ticks'])
+            if zombie(row) and identity not in attempted:
+                attempted.add(identity)
+                try:
+                    receipt['reaped'].append(reap_owned_process(uid, row))
+                except (OSError, IsolationError) as error:
+                    failure(row, error)
+
+    def finish(rows):
+        receipt['remaining'] = rows
+        proven = {(item['process']['pid'], item['process']['start_ticks']) for item in receipt['reaped']}
+        receipt['reap_only'] = not rows and not receipt['errors'] and not receipt['signals'] and \
+            all(zombie(row) and (row['pid'], row['start_ticks']) in proven for row in receipt['initial'])
+        return receipt
+
+    # The subreaper owns this work: perform and record wait before considering signals.
+    reap_zombies(receipt['initial'])
+    rows = process_rows(uid)
+    if not rows or all(zombie(row) and (row['pid'], row['start_ticks']) in attempted for row in rows):
+        return finish(rows)  # Unreapable terminal records remain a failure, without futile signals.
     for sig, seconds in ((signal.SIGTERM, 3), (signal.SIGKILL, 3)):
         for row in process_rows(uid):
+            if zombie(row):
+                reap_zombies([row])
+                continue
             try:
-                fd = os.pidfd_open(row['pid'])
+                fd, current = owned_pidfd(uid, row)
                 try:
-                    current = next((r for r in process_rows(uid) if r['pid'] == row['pid']), None)
-                    if current and current['start_ticks'] == row['start_ticks']:
+                    if zombie(current):
+                        attempted.add((current['pid'], current['start_ticks']))
+                        receipt['reaped'].append(reap_owned_fd(uid, fd, current))
+                    else:
+                        attempt = {'process': current, 'signal': int(sig), 'result': 'requested'}
+                        receipt['signals'].append(attempt)
                         signal.pidfd_send_signal(fd, sig)
+                        attempt['result'] = 'sent'  # Receipt of exit still requires a separate wait.
                 finally:
                     os.close(fd)
-            except ProcessLookupError:
-                pass
+            except (OSError, IsolationError) as error:
+                failure(row, error)
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            try:
-                while os.waitpid(-1, os.WNOHANG)[0]:
-                    pass
-            except ChildProcessError:
-                pass
-            if not process_rows(uid):
-                return initial
+            reap_zombies(process_rows(uid))
+            rows = process_rows(uid)
+            if not rows or all(zombie(row) and (row['pid'], row['start_ticks']) in attempted for row in rows):
+                return finish(rows)
+            if any(zombie(row) and (row['pid'], row['start_ticks']) not in attempted for row in rows):
+                continue  # A later snapshot first saw this exit: reap it without adding a wait.
             time.sleep(0.05)
-    raise IsolationError('Owned UID still has processes; preserve account and workspace')
+    # A terminal child first seen at the final boundary still gets one nonblocking
+    # attempt. Already unproven identities are never retried to manufacture proof.
+    reap_zombies(process_rows(uid))
+    return finish(process_rows(uid))
 
 
 def account_record(name):
@@ -465,7 +552,10 @@ def cleanup_owned(stage, request, state):
         if account.pw_uid != state.get('uid') or account.pw_gid != state.get('gid') or \
            account.pw_dir != str(stage / 'home') or account.pw_gecos != 'boardroom-ci-' + request['token']:
             raise IsolationError('New account ownership no longer matches this job')
-        result['terminated_processes'] = stop_owned_processes(account.pw_uid)
+        result['process_cleanup'] = stop_owned_processes(account.pw_uid)
+        result['remaining_processes'] = result['process_cleanup']['remaining']
+        if result['remaining_processes'] or result['process_cleanup']['errors']:
+            raise IsolationError('Owned process cleanup is unproven; preserve account and workspace')
     elif state.get('uid') and process_rows(state['uid']):
         raise IsolationError('Account missing but UID has processes; preserve unknown ownership')
     for line in Path('/proc/self/mountinfo').read_text().splitlines():
@@ -652,10 +742,10 @@ def supervise(stage, cleanup_only=False):
         try:
             account = account_record(state['name'])
             if account and account.pw_uid == state.get('uid') and account.pw_gecos == 'boardroom-ci-' + request['token']:
-                lingering = stop_owned_processes(account.pw_uid)
-                if lingering:
-                    report['terminated_after_command'] = lingering
-                    report['errors'].append('Command left owned processes; terminated before collecting artifacts')
+                process_cleanup = stop_owned_processes(account.pw_uid)
+                report.setdefault('process_cleanup_observations', []).append(process_cleanup)
+                if not process_cleanup['reap_only']:
+                    report['errors'].append('Command left active or unproven owned processes; see cleanup observations')
         except Exception as error:
             report['errors'].append('process cleanup: ' + str(error))
         try:

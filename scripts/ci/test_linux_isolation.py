@@ -1,11 +1,13 @@
 """Launcher contracts using owned local fixtures; account/UID changes are hosted-only."""
 import ast
 import copy
+import ctypes
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import select
 import signal
 import stat
 import subprocess
@@ -343,7 +345,371 @@ result=module.run_command([sys.executable,'-c',code,str(base/'ready')],base,{'PA
                 with self.assertRaises(ProcessBoundaryReached):
                     ci.cleanup_owned(stage, request, state)
                 stop.assert_called_once_with(42001)
+            for incomplete in ({'remaining': [{'pid': 123}], 'errors': []},
+                               {'remaining': [], 'errors': ['identity is unknown']}):
+                with mock.patch.object(ci, 'account_record', return_value=SimpleNamespace(**account)), \
+                     mock.patch.object(ci, 'group_record', return_value=None), \
+                     mock.patch.object(ci, 'stop_owned_processes', return_value=incomplete), \
+                     mock.patch.object(ci, 'tool') as tool:
+                    with self.assertRaisesRegex(ci.IsolationError, 'cleanup is unproven'):
+                        ci.cleanup_owned(stage, request, state)
+                    tool.assert_not_called()
             self.assertEqual(sentinel.read_text(), 'unchanged')
+
+
+class OwnedReapControls(unittest.TestCase):
+    """Real child processes, with only inventory scoped to this test's children.
+
+    Never invoke UID-wide termination for the shared local test user. The
+    production /proc view is unchanged; pidfd/wait/signal calls remain native.
+    """
+
+    def setUp(self):
+        self.children = {}
+        self.evidence = {'inventory': 'test-owned exact PID scope; native process operations',
+                         'uid': os.getuid(), 'supervisor_pid': os.getpid()}
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(self.libc.prctl(37, ctypes.byref(previous), 0, 0, 0), 0)
+        self.previous_subreaper = previous.value
+        self.assertEqual(self.libc.prctl(36, 1, 0, 0, 0), 0)
+        actual = ctypes.c_int()
+        self.assertEqual(self.libc.prctl(37, ctypes.byref(actual), 0, 0, 0), 0)
+        self.assertEqual(actual.value, 1)
+        self.evidence['actual_subreaper'] = actual.value
+        self.native_inventory = ci.process_rows
+        self.inventory_patch = mock.patch.object(ci, 'process_rows', self.inventory)
+        self.inventory_patch.start()
+
+    def row(self, pid):
+        base = Path('/proc') / str(pid)
+        fields = dict(line.split(':', 1) for line in (base / 'status').read_text().splitlines() if ':' in line)
+        tail = (base / 'stat').read_text().rsplit(') ', 1)[1].split()
+        return {'pid': pid, 'start_ticks': tail[19], 'state': fields['State'].strip(),
+                'stat_state': tail[0], 'ppid': int(tail[1]), 'uids': list(map(int, fields['Uid'].split()))}
+
+    def inventory(self, uid):
+        rows = []
+        for pid in self.children:
+            try:
+                row = self.row(pid)
+                if uid in row['uids']:
+                    rows.append(row)
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+        return rows
+
+    def remember(self, pid):
+        self.children[pid] = os.pidfd_open(pid)
+        return pid
+
+    def poll_exit(self, pid):
+        poller = select.poll()
+        poller.register(self.children[pid], select.POLLIN)
+        self.assertTrue(poller.poll(2000), 'owned child did not reach its intended exit')
+
+    def orphan_zombie(self, status=23):
+        pid_read, pid_write = os.pipe()
+        release_read, release_write = os.pipe()
+        parent = os.fork()
+        if parent == 0:
+            os.close(pid_read)
+            os.close(release_write)
+            child = os.fork()
+            if child == 0:
+                os.close(pid_write)
+                os.read(release_read, 1)
+                os._exit(status)
+            os.write(pid_write, str(child).encode())
+            os._exit(0)
+        os.close(pid_write)
+        os.close(release_read)
+        try:
+            self.assertTrue(select.select([pid_read], [], [], 2)[0])
+            child = self.remember(int(os.read(pid_read, 32)))
+            waited_parent = os.waitpid(parent, 0)
+            self.assertEqual(waited_parent[1], 0)
+            self.assertEqual(self.row(child)['ppid'], os.getpid())
+            self.evidence['orphan_adoption'] = {'original_parent_pid': parent, 'parent_wait': list(waited_parent),
+                                               'child_pid': child, 'adopted_ppid': self.row(child)['ppid']}
+            os.write(release_write, b'exit')
+            self.poll_exit(child)
+            self.assertEqual(self.row(child)['stat_state'], 'Z')
+            return child
+        finally:
+            os.close(pid_read)
+            os.close(release_write)
+
+    def live_child(self, ignore_term=False):
+        ready_read, ready_write = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(ready_read)
+            if ignore_term:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            os.write(ready_write, b'ready')
+            while True:
+                signal.pause()
+        self.remember(child)
+        os.close(ready_write)
+        try:
+            self.assertTrue(select.select([ready_read], [], [], 2)[0])
+            self.assertEqual(os.read(ready_read, 5), b'ready')
+        finally:
+            os.close(ready_read)
+        return child
+
+    @staticmethod
+    def command_cleanup_exit(receipt):
+        # Preserve the original caller's rule for the baseline RED comparison.
+        if isinstance(receipt, list):
+            return ci.result_code(0, ['owned leftovers'] if receipt else [])
+        return ci.result_code(0, [] if receipt['reap_only'] else ['owned leftovers'])
+
+    def test_orphan_already_zombie_is_actually_reaped_without_failure(self):
+        child = self.orphan_zombie()
+        before = self.row(child)
+        receipt = ci.stop_owned_processes(os.getuid())
+        self.evidence.update(initial=before, receipt=receipt)
+        self.assertEqual(self.command_cleanup_exit(receipt), 0,
+                         'already-terminated owned children must pass only after actual reap')
+        self.assertEqual(receipt['initial'], [before])
+        self.assertEqual(receipt['signals'], [])
+        self.assertEqual(receipt['remaining'], [])
+        self.assertEqual(receipt['errors'], [])
+        self.assertEqual(len(receipt['reaped']), 1)
+        reaped = receipt['reaped'][0]
+        self.assertEqual(reaped['process'], before)
+        self.assertEqual(reaped['peek'], reaped['consumed'])
+        self.assertEqual(reaped['consumed'], {'si_pid': child, 'si_uid': os.getuid(),
+                         'si_signo': signal.SIGCHLD, 'si_code': os.CLD_EXITED, 'si_status': 23})
+        self.assertFalse(Path('/proc', str(child)).exists())
+
+    def test_live_residual_remains_failure_after_real_term_and_reap(self):
+        child = self.live_child()
+        receipt = ci.stop_owned_processes(os.getuid())
+        self.evidence['receipt'] = receipt
+        self.assertEqual(self.command_cleanup_exit(receipt), 1)
+        self.assertEqual(receipt['remaining'], [])
+        self.assertEqual(receipt['errors'], [])
+        self.assertTrue(receipt['signals'])
+        self.assertEqual(receipt['reaped'][0]['consumed']['si_pid'], child)
+        self.assertEqual(receipt['reaped'][0]['consumed']['si_code'], os.CLD_KILLED)
+        self.assertEqual(receipt['reaped'][0]['consumed']['si_status'], signal.SIGTERM)
+
+    def test_live_snapshot_followed_by_new_zombie_is_reaped_before_collection(self):
+        ready_read, ready_write = os.pipe()
+        exit_read, exit_write = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(ready_read)
+            os.close(exit_write)
+            def term(number, frame):
+                os.write(ready_write, b't')
+                os.read(exit_read, 1)
+                os._exit(47)
+            signal.signal(signal.SIGTERM, term)
+            os.write(ready_write, b'r')
+            while True:
+                signal.pause()
+        self.remember(child)
+        os.close(ready_write)
+        os.close(exit_read)
+        native_signal, native_wait = signal.pidfd_send_signal, os.waitid
+        sent, transitioned = False, False
+        trace, waits = [], []
+
+        def ready(expected):
+            self.assertTrue(select.select([ready_read], [], [], 2)[0])
+            self.assertEqual(os.read(ready_read, 1), expected)
+
+        def actual():
+            return [row for row in self.native_inventory(os.getuid()) if row['pid'] == child]
+
+        def inventory(uid):
+            nonlocal transitioned
+            self.assertEqual(uid, os.getuid())
+            if sent and not transitioned:
+                ready(b't')
+                snapshot = actual()
+                self.assertEqual(len(snapshot), 1)
+                self.assertFalse(ci.zombie(snapshot[0]))
+                os.write(exit_write, b'x')
+                self.poll_exit(child)
+                after = actual()
+                self.assertEqual(len(after), 1)
+                self.assertTrue(ci.zombie(after[0]))
+                transitioned = True
+                trace.append({'returned_real_snapshot': snapshot, 'actual_after_release': after})
+                return snapshot
+            snapshot = actual()
+            trace.append({'returned_real_snapshot': snapshot})
+            return snapshot
+
+        def send(*args):
+            nonlocal sent
+            result = native_signal(*args)
+            sent = True
+            return result
+
+        def wait(*args):
+            result = native_wait(*args)
+            waits.append({'args': list(args), 'result': list(result) if result else None})
+            return result
+
+        try:
+            ready(b'r')
+            with mock.patch.object(ci, 'process_rows', side_effect=inventory), \
+                 mock.patch.object(signal, 'pidfd_send_signal', side_effect=send), \
+                 mock.patch.object(os, 'waitid', side_effect=wait):
+                receipt = ci.stop_owned_processes(os.getuid())
+            self.evidence.update(trace=trace, candidate_wait_calls=waits, receipt=receipt,
+                                 inventory_before_harness_cleanup=actual(),
+                                 artifact_collection_guard_would_reject=bool(actual()))
+            self.assertTrue(transitioned)
+            self.assertFalse(receipt['reap_only'])
+            self.assertEqual(self.command_cleanup_exit(receipt), 1)
+            self.assertEqual(receipt['remaining'], [])
+            self.assertEqual(receipt['errors'], [])
+            self.assertEqual(len(waits), 2)
+            self.assertEqual(len(receipt['reaped']), 1)
+            self.assertEqual(receipt['reaped'][0]['peek'], receipt['reaped'][0]['consumed'])
+            self.assertEqual(receipt['reaped'][0]['consumed']['si_status'], 47)
+            self.assertEqual(receipt['reaped'][0]['consumed']['si_code'], os.CLD_EXITED)
+            self.assertEqual(receipt['signals'][0]['signal'], signal.SIGTERM)
+            self.assertFalse(actual())
+        finally:
+            os.close(ready_read)
+            os.close(exit_write)
+
+    def test_ignore_term_residual_keeps_budget_and_failure_after_kill(self):
+        child = self.live_child(ignore_term=True)
+        started = time.monotonic()
+        receipt = ci.stop_owned_processes(os.getuid())
+        self.evidence.update(receipt=receipt, elapsed_seconds=time.monotonic() - started)
+        self.assertEqual(self.command_cleanup_exit(receipt), 1)
+        self.assertEqual(receipt['remaining'], [])
+        self.assertEqual([item['signal'] for item in receipt['signals']], [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(receipt['reaped'][0]['consumed']['si_pid'], child)
+        self.assertEqual(receipt['reaped'][0]['consumed']['si_status'], signal.SIGKILL)
+        self.assertGreaterEqual(self.evidence['elapsed_seconds'], 3)
+        self.assertLess(self.evidence['elapsed_seconds'], 7)
+
+    def test_changed_start_or_uid_does_not_wait_or_signal(self):
+        child = self.live_child()
+        actual = self.row(child)
+        for uid, expected in [(os.getuid(), dict(actual, start_ticks=str(int(actual['start_ticks']) + 1))),
+                              (os.getuid() + 1, actual)]:
+            with self.subTest(expected_uid=uid), mock.patch.object(os, 'waitid', wraps=os.waitid) as wait, \
+                 mock.patch.object(signal, 'pidfd_send_signal', wraps=signal.pidfd_send_signal) as send:
+                with self.assertRaisesRegex(ci.IsolationError, 'identity'):
+                    ci.reap_owned_process(uid, expected)
+                wait.assert_not_called()
+                send.assert_not_called()
+        self.assertIsNone(os.waitid(os.P_PIDFD, self.children[child], os.WEXITED | os.WNOHANG | os.WNOWAIT))
+        self.evidence.update(initial=actual, refused_start_and_uid=True, still_alive=True)
+
+    def test_no_wait_result_cannot_certify_a_real_zombie(self):
+        child = self.orphan_zombie()
+        expected = self.row(child)
+        with mock.patch.object(os, 'waitid', return_value=None) as wait:
+            receipt = ci.stop_owned_processes(os.getuid())
+            self.assertFalse(receipt['reap_only'])
+            self.assertEqual(receipt['reaped'], [])
+            self.assertEqual(receipt['remaining'], [expected])
+            self.assertEqual(len(receipt['errors']), 1)
+            self.assertEqual(wait.call_count, 1)
+        self.assertEqual(self.row(child)['stat_state'], 'Z')
+        self.evidence.update(initial=expected, injected_boundary='waitid returned None',
+                             receipt=receipt, attempted_wait_count=1,
+                             still_unreaped=True, not_hosted_account_evidence=True)
+
+    def test_real_nonchild_zombie_is_not_certified_by_its_state(self):
+        pid_read, pid_write = os.pipe()
+        release_read, release_write = os.pipe()
+        parent = os.fork()
+        if parent == 0:
+            os.close(pid_read)
+            os.close(release_write)
+            child = os.fork()
+            if child == 0:
+                os._exit(29)
+            os.write(pid_write, str(child).encode())
+            os.read(release_read, 1)
+            waited = os.waitpid(child, 0)
+            os.write(pid_write, ('\n' + str(waited[1])).encode())
+            os._exit(0)
+        self.remember(parent)
+        os.close(pid_write)
+        os.close(release_read)
+        try:
+            self.assertTrue(select.select([pid_read], [], [], 2)[0])
+            child = self.remember(int(os.read(pid_read, 32)))
+            self.poll_exit(child)
+            expected = self.row(child)
+            self.assertEqual(expected['ppid'], parent)
+            self.assertEqual(expected['stat_state'], 'Z')
+            with self.assertRaisesRegex(ci.IsolationError, 'no waitable status'):
+                ci.reap_owned_process(os.getuid(), expected)
+            self.assertEqual(self.row(child)['stat_state'], 'Z')
+            os.write(release_write, b'reap')
+            self.assertTrue(select.select([pid_read], [], [], 2)[0])
+            actual_parent_wait_status = int(os.read(pid_read, 32))
+            self.assertEqual(os.waitstatus_to_exitcode(actual_parent_wait_status), 29)
+            self.poll_exit(parent)
+            self.assertEqual(os.waitid(os.P_PIDFD, self.children[parent], os.WEXITED).si_status, 0)
+            self.assertFalse(Path('/proc', str(child)).exists())
+            self.evidence.update(initial=expected, native_nonchild_wait='ECHILD; rejected',
+                                 actual_parent_wait_status=actual_parent_wait_status)
+        finally:
+            os.close(pid_read)
+            os.close(release_write)
+
+    def test_consumption_mismatch_never_becomes_a_reap_receipt(self):
+        child = self.orphan_zombie()
+        expected = self.row(child)
+        native_wait = os.waitid
+        calls = []
+        def changed_return(*args):
+            value = native_wait(*args)
+            calls.append(value)
+            if not (args[2] & os.WNOWAIT):
+                return SimpleNamespace(si_pid=value.si_pid, si_uid=value.si_uid, si_signo=value.si_signo,
+                                       si_code=value.si_code, si_status=value.si_status + 1)
+            return value
+        with mock.patch.object(os, 'waitid', side_effect=changed_return):
+            with self.assertRaisesRegex(ci.IsolationError, 'wait'):
+                ci.reap_owned_process(os.getuid(), expected)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        self.evidence.update(initial=expected, injected_boundary='consumption return status changed',
+                             real_kernel_returns=[list(item) for item in calls], falsely_certified=False)
+
+    def tearDown(self):
+        cleanup = []
+        try:
+            for pid, fd in self.children.items():
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    result = os.waitid(os.P_PIDFD, fd, os.WEXITED)
+                    cleanup.append({'pid': pid, 'wait': list(result) if result else None})
+                except ChildProcessError:
+                    cleanup.append({'pid': pid, 'already_reaped': True})
+                finally:
+                    os.close(fd)
+                self.assertFalse(Path('/proc', str(pid)).exists(), 'test-owned child survived cleanup')
+        finally:
+            self.inventory_patch.stop()
+            self.libc.prctl(36, self.previous_subreaper, 0, 0, 0)
+            self.evidence['test_cleanup'] = cleanup
+            evidence_root = os.environ.get('ISOLATION_REAP_EVIDENCE_DIR')
+            if evidence_root:
+                output = Path(evidence_root)
+                output.mkdir(parents=True, exist_ok=True)
+                (output / (self._testMethodName + '.json')).write_text(json.dumps(self.evidence, indent=2) + '\n')
 
 
 if __name__ == '__main__':
