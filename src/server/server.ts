@@ -27,6 +27,7 @@ import { createRuntimeSupervisor, type RuntimeSupervisor } from "./runtime/super
 import { createHostLauncher } from "./runtime/hosts/launcher.ts";
 import type { HostLauncher } from "./runtime/hosts/types.ts";
 import { notifyMessageCommit, onMessageCommit } from "./runtime/dispatch-events.ts";
+import { onResourceChange } from "./resource-changes.ts";
 import { createTaskApi } from "./tasks/api.ts";
 import { createMemoryApi } from "./memory/api.ts";
 import { registerMemoryRuntime, closeMemoryRuntime, pauseMemoryRuntime } from "./memory/runtime.ts";
@@ -169,8 +170,9 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   let ownedApi: ReturnType<typeof createT1ApiRouter> | undefined;
   let stopStatus = () => {};
   let stopMessages = () => {};
+  let stopResources = () => {};
   await storageClient.bind({
-    stopNewWork(epoch) { stopStatus(); stopMessages(); pauseMemoryRuntime(driver); ownedSupervisor?.beginMaintenanceDrain(epoch); },
+    stopNewWork(epoch) { stopStatus(); stopMessages(); stopResources(); pauseMemoryRuntime(driver); ownedSupervisor?.beginMaintenanceDrain(epoch); },
     async disconnectSessions() { await ownedApi?.close(); await ownedMcp?.close({ strict: true }); await ownedHub?.close(); },
     stopOwnedRuntime: () => ownedSupervisor?.drainMaintenance() ?? Promise.resolve({ ownedExits: [], unknownOwners: [] }),
     observeOwnedExit: input => ownedSupervisor?.observeMaintenanceExit(input) ?? Promise.reject(new StorageMaintenanceError("active")),
@@ -367,6 +369,8 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     } } : {}),
   });
   ownedHub = hub;
+  const unsubscribeResources = onResourceChange(driver, change => hub.broadcastResourceChange(change));
+  stopResources = unsubscribeResources;
 
   // WebUI 是人的视角，实时读取所有来源的已提交消息。MCP core 与 HTTP 都发送
   // 同一提交通知，因此 Agent 的消息也可见，HTTP 消息不会重复广播。
@@ -450,6 +454,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     await mcpHandler.close();
     clearInterval(statusTimer);
     unsubscribeMessages();
+    unsubscribeResources();
     await hub.close();
     await closeMemoryRuntime(driver);
     await storageClient.close();
@@ -535,6 +540,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
       await closeResource(() => runtimeSupervisor.close());
       await closeResource(() => mcpHandler.close());
       unsubscribeMessages();
+      unsubscribeResources();
       await closeResource(() => hub.close());
       // 先在途的连接一并断开：Streamable HTTP 的 SSE 响应会持续保持连接，
       // 仅 close() 不会中断它们；closeAllConnections 让进行中的等待随连接结束。

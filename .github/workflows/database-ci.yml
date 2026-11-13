@@ -295,6 +295,8 @@ jobs:
         run: |
           mkdir -p .agent-output/browser-dependencies
           node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
           import { createHash } from 'node:crypto';
           import { readFileSync, writeFileSync } from 'node:fs';
           const manifest = {
@@ -307,10 +309,19 @@ jobs:
             lockSha256: createHash('sha256').update(readFileSync('package-lock.json')).digest('hex'),
           };
           writeFileSync('.agent-output/browser-dependencies/environment.json', JSON.stringify(manifest, null, 2));
+          assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim(), manifest.candidate);
+          const producer = {schema:1, runId:Number(process.env.GITHUB_RUN_ID),
+            attempt:Number(process.env.GITHUB_RUN_ATTEMPT), candidate:manifest.candidate,
+            tree:execFileSync('git', ['rev-parse', 'HEAD^{tree}'], {encoding:'utf8'}).trim()};
+          assert.match(producer.candidate, /^[0-9a-f]{40}$/);
+          assert.match(producer.tree, /^[0-9a-f]{40}$/);
+          assert.ok(Number.isSafeInteger(producer.runId) && producer.runId > 0);
+          assert.ok(Number.isSafeInteger(producer.attempt) && producer.attempt > 0);
+          writeFileSync('.agent-output/browser-dependencies/producer.json', JSON.stringify(producer, null, 2));
           JS
           # tar 保留原生模块、可执行位和 .bin 符号链接；来源为本 job 已完成的 npm ci。
           tar -czf .agent-output/browser-dependencies/node_modules.tar.gz node_modules
-          (cd .agent-output/browser-dependencies && sha256sum node_modules.tar.gz > SHA256SUMS)
+          (cd .agent-output/browser-dependencies && sha256sum node_modules.tar.gz environment.json producer.json > SHA256SUMS)
 
       - name: 交接同候选原生依赖
         id: browser_dependencies
@@ -327,7 +338,7 @@ jobs:
     needs: database-tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # 与下方 Python 包版本一致；镜像已安装浏览器及完整系统依赖，避免 apt 镜像 DNS 故障。
+    # 与下方 Python 包版本一致；资源隐藏验收另在本 job 安装固定 Openbox。
     container:
       image: mcr.microsoft.com/playwright/python:v1.62.0-noble@sha256:aa81288e738725378becba5b3e06cb0f3a7f012a610e87e8d767a090ea3f740d
       options: --init --shm-size=1g
@@ -377,6 +388,8 @@ jobs:
           digest-mismatch: error
 
       - name: 核对依赖身份并构建真实 WebUI
+        env:
+          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.database-tests.outputs.browser_dependencies_id }}
         run: |
           (cd .agent-output/browser-dependencies && sha256sum --check SHA256SUMS)
           node --input-type=module <<'JS'
@@ -397,6 +410,8 @@ jobs:
           assert.deepEqual(manifest, current, '依赖必须来自本候选、同一锁文件和相同 Node/Linux ABI');
           console.log(JSON.stringify(current));
           JS
+          # 元数据来自实际 producer；browser-only retry 仍使用成功 producer 的真实 artifact ID。
+          python3 scripts/resource_browser_binding.py --artifact-dir .agent-output/browser-dependencies --output .agent-output/resource-web-e2e/runtime-binding.json
           tar --extract --gzip --no-same-owner --file .agent-output/browser-dependencies/node_modules.tar.gz
           node --input-type=module <<'JS'
           import assert from 'node:assert/strict';
@@ -411,7 +426,7 @@ jobs:
         id: browser_ready
         run: |
           python3 -m virtualenv .agent-output/browser-venv
-          .agent-output/browser-venv/bin/python -m pip install playwright==1.62.0
+          .agent-output/browser-venv/bin/python -m pip install playwright==1.62.0 pyee==13.0.1 greenlet==3.5.6 typing-extensions==4.16.0
           .agent-output/browser-venv/bin/python - <<'PY'
           from importlib.metadata import version
           from pathlib import Path
@@ -447,6 +462,20 @@ jobs:
       - name: 任务与项目切换真实浏览器验证
         if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-tasks-web.py
+
+      - name: 提交后资源刷新、断线对账与草稿真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
+        env:
+          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.database-tests.outputs.browser_dependencies_id }}
+        run: |
+          mkdir -p .agent-output/resource-web-e2e/native-desktop
+          # 仅本次 browser 容器；不改其他脚本、job、时限或现有桌面。
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get -o Acquire::Retries=0 update
+          apt-get -o Acquire::Retries=0 install -y --no-install-recommends openbox=3.6.1-12build5 x11-utils=7.7+6build2
+          command -v Xvfb openbox xprop xauth
+          dpkg-query -W -f='${Package}\t${Version}\n' xvfb openbox x11-utils xauth > .agent-output/resource-web-e2e/native-desktop/packages.tsv
+          .agent-output/browser-venv/bin/python scripts/e2e-resource-web.py --native-desktop
 
       - name: 记忆编辑、冲突与历史真实浏览器验证
         if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
@@ -484,6 +513,7 @@ jobs:
             .agent-output/webui-e2e/
             .agent-output/webui-before/
             .agent-output/tasks-web-e2e/
+            .agent-output/resource-web-e2e/
             .agent-output/memory-web-e2e/
             .agent-output/settings-web-e2e/
             .agent-output/navigation-web-e2e/

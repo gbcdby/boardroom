@@ -349,8 +349,22 @@ def exercise(page, fixture, output, report):
     expect(page.locator("h1")).to_have_text("浏览器完整创建的任务")
     page.get_by_test_id("task-edit-open").click()
     page.get_by_test_id("task-title").fill("409后保留的任务标题")
+    # 保存请求已捕获旧基准后再让另一真实写入先提交。资源自动刷新可能在点击前
+    # 禁用旧草稿的保存按钮，所以不能再依赖“外部先改、用户后点”的时序制造409。
+    conflicting_url = origin + f"/api/projects/{pid}/tasks/{created['id']}"
+    held_save = []
+    def hold_save(route):
+        if route.request.method == "PATCH": held_save.append(route)
+        else: route.continue_()
+    page.route(conflicting_url, hold_save)
+    with page.expect_request(lambda req: req.method == "PATCH" and req.url == conflicting_url):
+        page.get_by_test_id("task-save").click()
+    assert len(held_save) == 1
+    assert held_save[0].request.post_data_json["expectedRevision"] == created["revision"]
     request(page, origin, "PATCH", f"/api/projects/{pid}/tasks/{created['id']}", {"expectedRevision": created["revision"], "title": "其他操作更新的标题", "body": "远端补充的目标，不应被旧草稿覆盖"})
-    page.get_by_test_id("task-save").click()
+    with page.expect_response(lambda response: response.request.method == "PATCH" and response.url == conflicting_url and response.status == 409):
+        held_save[0].continue_()
+    page.unroute(conflicting_url, hold_save)
     expect(page.get_by_test_id("task-conflict")).to_contain_text("保留")
     expect(page.get_by_test_id("task-title")).to_have_value("409后保留的任务标题")
     page.get_by_test_id("task-reload").click()
@@ -396,6 +410,47 @@ def exercise(page, fixture, output, report):
     assert len(decided["reports"]) == 2
     assert "已逐项核对两轴报告" in json.dumps(decided["history"], ensure_ascii=False)
     report["checks"].append("AC-REVIEW-03: 两轴分别呈现，管理者必填原因覆盖与再次覆盖，原报告/裁决历史保留（合成UI报告）")
+
+    # R-173-REQ-002：沿用真实服务中仍可覆盖的 decided 轮次，外部合法修改令它 superseded。
+    # reported -> superseded 的原始反例及新轮次未就绪/归档分支由真实 SFC 回归另验。
+    decision_base = decided["task"]
+    old_round = next(round for round in decided["rounds"] if round["id"] == decision_base["currentReviewRoundId"])
+    page.get_by_test_id("task-decision-reason").fill("远端失效后仍要处理的裁决理由")
+    page.get_by_test_id("task-comment-body").fill("独立评论草稿不应一起丢弃")
+    page.get_by_test_id("task-decision-reason").focus()
+    reason_control = page.get_by_test_id("task-decision-reason").element_handle()
+    prior_decisions = len([item for item in report["taskRequests"] if item["path"].endswith("/decision")])
+    request(page, origin, "PATCH", f"/api/projects/{pid}/tasks/{review_id}", {
+        "expectedRevision": decision_base["revision"], "title": "远端修改使旧评审失效",
+    })
+    expect(page.get_by_test_id("task-decision-unavailable")).to_contain_text("当前没有可提交裁决的评审轮次")
+    assert page.evaluate("original => document.querySelector('[data-testid=task-decision-reason]') === original", reason_control)
+    expect(page.get_by_test_id("task-decision-reason")).to_have_value("远端失效后仍要处理的裁决理由")
+    expect(page.get_by_test_id("task-decision-reason")).to_be_focused()
+    expect(page.get_by_test_id("task-decision-base")).to_contain_text(f"任务版本 {decision_base['revision']}")
+    expect(page.get_by_test_id("task-decision-base")).to_contain_text(f"{old_round['id']} / 版本 {old_round['revision']}")
+    expect(page.get_by_test_id("task-decision-rebase")).to_be_disabled()
+    expect(page.get_by_test_id("task-decide")).to_be_disabled()
+    for width, height in [(1440, 1000), (390, 844)]:
+        page.set_viewport_size({"width": width, "height": height})
+        expect(page.get_by_test_id("task-decision-reason")).to_be_focused()
+        dimensions = page.evaluate("({viewport:innerWidth,document:document.documentElement.scrollWidth})")
+        assert dimensions["document"] <= width + 1, dimensions
+        key = f"decision-draft-superseded-{width}"
+        page.screenshot(path=str(output / f"{key}.png"), full_page=True, animations="disabled")
+        report["screenshots"].append(f"{key}.png")
+        report["layouts"].append({"view": key, **dimensions})
+    reason_control.dispose()
+    page.get_by_test_id("task-decision-discard").click()
+    expect(page.get_by_test_id("task-decision-reason")).to_have_count(0)
+    expect(page.get_by_test_id("task-comment-body")).to_have_value("独立评论草稿不应一起丢弃")
+    assert len([item for item in report["taskRequests"] if item["path"].endswith("/decision")]) == prior_decisions
+    superseded = request(page, origin, "GET", f"/api/projects/{pid}/tasks/{review_id}")
+    assert superseded["task"]["currentReviewRoundId"] is None
+    assert next(round for round in superseded["rounds"] if round["id"] == old_round["id"])["state"] == "superseded"
+    page.get_by_test_id("task-comment-body").fill("")
+    page.set_viewport_size({"width": 1440, "height": 1000})
+    report["checks"].append("R-173-REQ-002: 真实远端修改令旧轮次失效，1440/390保留同一裁决理由控件/焦点/旧基准，仅丢弃理由不提交且保留评论")
 
     page.goto(origin + f"/projects/{pid}/tasks/{created['id']}")
     page.get_by_test_id("task-edit-open").click()

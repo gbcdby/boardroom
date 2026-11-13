@@ -40,6 +40,7 @@ import { unavailableMemory } from "../memory/injection.ts";
 import { getAdapter, isRegistered, listAdapterIds } from "./adapters/index.ts";
 import { createRuntimeRepository } from "../runtime/repository.ts";
 import { notifyMessageCommit } from "../runtime/dispatch-events.ts";
+import { notifyResourceChange } from "../resource-changes.ts";
 import {
   createAntiLoop,
   DEFAULT_ANTI_LOOP_CONFIG,
@@ -480,7 +481,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
   const repos: RepositorySet = options.repos ?? createRepositories(options.db);
   const tasks = createTaskService({ repos, now,
-    onWorkEvents: events => notifyWorkEventCommit(options.db, events) });
+    onWorkEvents: events => notifyWorkEventCommit(options.db, events),
+    onResourceChanged: change => notifyResourceChange(options.db, change) });
   const memoryRuntime = getMemoryRuntime(options.db);
   const memory = createMemoryService({ repos, now, config: memoryRuntime.config, injectionReader: memoryRuntime.reader,
     onWorkEvents: events => notifyWorkEventCommit(options.db, events),

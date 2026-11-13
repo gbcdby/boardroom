@@ -7,6 +7,7 @@ import { compileScript, parse } from "@vue/compiler-sfc";
 import ts from "typescript";
 import { createRenderer, nextTick } from "vue";
 import { createMemoryHistory, createRouter, RouterView } from "vue-router";
+import { resourceBrowserKey, type ResourceBrowser } from "../../src/web/src/composables/useResourceReconciliation.ts";
 
 // 编译真正的 SFC，再由 Vue renderer 触发控件事件。此证据不替代 Chromium 布局/焦点验收。
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -74,7 +75,7 @@ export async function withPage(
   name: string,
   respond: (url: string, init: RequestInit | undefined) => Promise<Response> | Response,
   check: (container: UiElement, context: { store: any; router: ReturnType<typeof createRouter> }) => Promise<void>,
-  options: { path?: string; confirmDiscard?: () => boolean; renderRoute?: string } = {},
+  options: { path?: string; confirmDiscard?: () => boolean; renderRoute?: string; resourceBrowser?: ResourceBrowser } = {},
 ): Promise<void> {
   const directory = await mkdtemp(path.join(tmpdir(), "boardroom-ui-"));
   const previousFetch = globalThis.fetch;
@@ -114,7 +115,9 @@ export async function withPage(
     store.installRouter(router);
     await router.push(options.path ?? "/projects/project-1/tasks");
     const container = element("root");
-    app = renderer.createApp(options.renderRoute ? RouterView : component); app.use(router); app.provide(context.currentProjectKey, store); app.mount(container);
+    app = renderer.createApp(options.renderRoute ? RouterView : component); app.use(router); app.provide(context.currentProjectKey, store);
+    if (options.resourceBrowser) app.provide(resourceBrowserKey, options.resourceBrowser);
+    app.mount(container);
     await settle(); await check(container, { store, router });
   } finally {
     app?.unmount(); store?.dispose(); globalThis.fetch = previousFetch;

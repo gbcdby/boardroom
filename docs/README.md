@@ -19,6 +19,7 @@
 | [t3-member-lifecycle.md](t3-member-lifecycle.md) | 当前成员生命周期、移除、审计补偿与删除范围 |
 | [getting-started-mcp.md](getting-started-mcp.md) | 安装、双数据库、三宿主 MCP 配置与限制 |
 | [tasks-and-review.md](tasks-and-review.md) | 任务、固定 Git 候选与独立双轴评审 |
+| [resource-reconciliation.md](resource-reconciliation.md) | 提交后资源提示、条件读取、重连与跨进程对账、编辑草稿基准 |
 | [memory.md](memory.md) | 三层记忆、版本/冲突与目标 Agent 自总结 |
 | [settings.md](settings.md) | 只读有效配置、来源、刷新与重启生效 |
 | [environment-resolution.md](environment-resolution.md) | HTTP/stdio 共用环境解析、旧源只读预检、严格失败与存储恢复边界 |
