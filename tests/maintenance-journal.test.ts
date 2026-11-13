@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
-import { digestJson } from "../src/server/storage/maintenance/canonical.ts";
+import { canonicalJson, digestJson, sha256 } from "../src/server/storage/maintenance/canonical.ts";
+import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
+import { readSourceFiles } from "../src/server/storage/maintenance/parse.ts";
 import { buildDatabaseManifests, digestRowMultiset } from "../src/server/storage/maintenance/manifests.ts";
 import { assertFrozenSourceUnchanged, captureReference, restorePointDigest, verifyJournalChain, verifySnapshotClosure } from "../src/server/storage/maintenance/journal.ts";
 import type { ArtifactRef, DatabaseManifests, JournalRecord, MigrationPlan, SourceFilesManifest, SourceObservation } from "../src/server/storage/maintenance/types.ts";
@@ -12,7 +14,7 @@ const platformTest = ["linux", "darwin"].includes(process.platform) ? test : tes
 const hash = (letter: string) => letter.repeat(64);
 // These are deliberately structural fixtures. They do not assert that a synthetic V is a real restore.
 // The independent native-adapter tests exercise actual backup output and restoration.
-async function fixture() {
+async function fixture(options: { sourceFiles?: (value: SourceFilesManifest) => unknown } = {}) {
   // /tmp can be tmpfs: use the current worktree filesystem for the actual durability probe.
   const dir = await mkdtemp(path.join(process.cwd(), "maintenance-journal-test-"));
   const sourceIdentity = { kind: "sqlite", fixture: "structure-only" };
@@ -21,7 +23,8 @@ async function fixture() {
   const info = await stat(dir, { bigint: true });
   const planned = (file: string) => ({ path: file, existingAncestor: { path: dir, device: String(info.dev), inode: String(info.ino) }, absentSegments: [path.basename(file)] });
   const config = path.join(dir, "config.json"), schema = { format: "structural-test-catalog" };
-  const roots = [{ label: "config" as const, path: config, expected: planned(config) }];
+  const configIdentity = { path: config, device: "1", inode: "7" };
+  const roots = [{ label: "config" as const, path: config, expected: { path: config, existingAncestor: configIdentity, absentSegments: [] } }];
   const plan: MigrationPlan = { formatVersion: 1, kind: "plan", migrationId: "graph-test", source, sourceIdentity,
     originalCwd: dir, originalConfigPath: config, configDigest: hash("a"), effectiveConfigDigest: hash("b"),
     schemaManifestDigest: digestJson(schema), guardManifestDigest: hash("c"), controlRoot: planned(store.root), targetRoot: planned(path.join(dir, "target")),
@@ -33,10 +36,16 @@ async function fixture() {
     fenceEpoch: 1, ownerGeneration: 1, evidence: [capability], frozen: null, snapshot: null };
   const enter = await store.putJson("journal", body);
   const payload = await store.putBytes("source-file-payload", Buffer.from("private config bytes"));
-  const files: SourceFilesManifest = { formatVersion: 1, kind: "source-files", source, roots,
-    entries: [{ sourceRoot: "config", sourceRelativePath: "", kind: "file", identity: { path: config, device: "1", inode: "7" }, mode: "600", size: payload.bytes, payload }],
+  // Fixed synthetic ext4-shaped bytes; no source is opened and no native/provider claim is made.
+  const handle = { type: 1 as const, byteCount: 8 as const, hex: "0123456789abcdef" };
+  const files: SourceFilesManifest = { formatVersion: 2, kind: "source-files", source, roots,
+    rootBindings: [{ sourceRoot: "config", profile: "linux-native-ext4-fid-fsuuid-v1", filesystemType: "ext4",
+      filesystemUuidHex: "4".repeat(32), hostIdentityDigest: store.identity.hostIdentityDigest,
+      anchorPath: config, anchorKind: "file", anchorHandle: handle }],
+    entries: [{ sourceRoot: "config", sourceRelativePath: "", kind: "file", identity: configIdentity, mode: "600", size: payload.bytes, payload,
+      sourceWitness: { kind: "file", incarnation: handle, change: { mtimeNs: "1", ctimeNs: "2", observedBirthtimeNs: null } } }],
     sourceMembershipExclusions: ["database-files", "entire-maintenance-control-root", "all-maintenance-artifacts"] };
-  const filesRef = await store.putJson("source-files", files);
+  const filesRef = await store.putJson("source-files", options.sourceFiles ? options.sourceFiles(files) : files);
   const table = (name: string, rows: readonly unknown[]) => ({ name, columns: ["fixture"], ...digestRowMultiset(rows as never) });
   const domainTable = table("ordinary", [["text", "same"], ["text", "same"]]);
   const frozen = buildDatabaseManifests("sqlite", schema, [domainTable], { storage_maintenance: [], storage_source_clients: [] });
@@ -71,9 +80,55 @@ async function fixture() {
     const ready: JournalRecord = { ...body, sequence: 3, previous: captureRef, phase: "snapshot_ready", event: "ready", requestId: "ready", snapshot: receipt };
     return { reference: await store.putJson("journal", ready), record: ready };
   }
-  return { dir, store, source, plan, planRef, body, enter, captured, captureRef, capability, payload, manifests, control, finish,
+  return { dir, store, source, plan, planRef, body, enter, captured, captureRef, capability, files, filesRef, payload, manifests, control, finish,
     close: () => rm(dir, { recursive: true, force: true }) };
 }
+
+platformTest("#152 FSI-08: exact anchored v1 chains are rejected at capture and ready without rewriting bytes", async () => {
+  const f = await fixture({ sourceFiles: value => {
+    const { rootBindings: _bindings, ...legacy } = value;
+    return { ...legacy, formatVersion: 1, entries: value.entries.map(({ sourceWitness: _witness, ...entry }) => entry) };
+  } });
+  try {
+    const ready = await f.finish(), original = await f.store.readBytes(f.filesRef);
+    const invalid = (error: unknown) => error instanceof MaintenanceFailure && error.code === "snapshot_invalid";
+    await assert.rejects(verifyJournalChain(f.store, f.captureRef), invalid);
+    await assert.rejects(verifySnapshotClosure(f.store, ready.reference), invalid);
+    assert.deepEqual(await f.store.readBytes(f.filesRef), original);
+  } finally { await f.close(); }
+});
+
+platformTest("#152 FSI-08: Fs-specific noncanonical and invalid bytes are snapshot_invalid in the existing closure reader", async () => {
+  const f = await fixture();
+  try {
+    const canonical = Buffer.from(canonicalJson(f.files));
+    for (const bytes of [Buffer.concat([canonical, Buffer.from("\n")]), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), canonical]),
+      Buffer.from(JSON.stringify(f.files)), Buffer.from("{"), Buffer.from([0xff])]) {
+      // Deliberately corrupt fixtures with a correct content address; never rewrite an immutable artifact.
+      const hash = sha256(bytes), ref = { ref: `snapshots/${hash}/source-files.json`, sha256: hash, bytes: String(bytes.length) };
+      await mkdir(path.dirname(f.store.pathFor(ref)), { mode: 0o700 });
+      await writeFile(f.store.pathFor(ref), bytes, { mode: 0o600, flag: "wx" });
+      const anchor = await f.store.putJson("journal", { ...f.captured, frozen: { ...f.captured.frozen!, sourceFilesManifest: ref } });
+      await assert.rejects(verifyJournalChain(f.store, anchor), error => error instanceof MaintenanceFailure && error.code === "snapshot_invalid");
+    }
+  } finally { await f.close(); }
+});
+
+platformTest("#152 Fs reader retains actual control-root and missing-file errors while checking artifact kind/hash", async () => {
+  const f = await fixture();
+  try {
+    assert.deepEqual(await readSourceFiles(f.store, f.filesRef), f.files);
+    await assert.rejects(readSourceFiles(f.store, f.planRef), error => error instanceof MaintenanceFailure && error.code === "snapshot_invalid");
+    await assert.rejects(readSourceFiles(f.store, { ...f.filesRef, sha256: hash("f") }),
+      error => error instanceof MaintenanceFailure && error.code === "snapshot_invalid");
+    await chmod(f.store.root, 0o750);
+    try {
+      await assert.rejects(readSourceFiles(f.store, f.filesRef), error => error instanceof MaintenanceFailure && error.code === "control_root_mismatch");
+    } finally { await chmod(f.store.root, 0o700); }
+    await rm(f.store.pathFor(f.filesRef));
+    await assert.rejects(readSourceFiles(f.store, f.filesRef), error => (error as NodeJS.ErrnoException).code === "ENOENT");
+  } finally { await f.close(); }
+});
 
 platformTest("#152 journal starts at the exact anchor and preserves the capture generation across legal takeover", async () => {
   const f = await fixture();
