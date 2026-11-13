@@ -1,0 +1,51 @@
+name: Fs native ext4 · 一次有限资格
+
+on:
+  push:
+    branches: [qualification/152-native-ext4-r3]
+    paths:
+      - .github/workflows/fs-native-ext4-qualification.yml
+      - scripts/qualification/fs-native-ext4/**
+      - tests/fs-native-ext4-qualification.test.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fs-native-ext4-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-ext4-qualification:
+    name: Linux x86_64 · 原件与 Q01–Q12 见 summary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: 检出固定候选
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: 资格消费者控制
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 tests/fs-native-ext4-qualification.test.py
+
+      - name: 执行一次自有 ext4 fixture
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: >-
+          python3 scripts/qualification/fs-native-ext4/run.py
+          --mode hosted-linux
+          --root "$RUNNER_TEMP/boardroom-ext4qual-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          --out "$GITHUB_WORKSPACE/.agent-output/fs-native-ext4-qualification"
+
+      - name: 保存原件与独立清理回执
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fs-native-ext4-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: .agent-output/fs-native-ext4-qualification/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

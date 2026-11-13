@@ -1,0 +1,81 @@
+{
+  "schema_version": "fs-native-ext4-qualification/v1",
+  "profile": "linux-native-ext4-fid-fsuuid-v1",
+  "contract": "https://github.com/gbcdby/boardroom/issues/152#issuecomment-6852650119",
+  "contract_public_body_sha256": "b2dbb3180e428add9b8eaa20c603a5f5b4ddfeb348305fcd36b66bbd00e8bb75",
+  "design_manifest_sha256": "9d5311c922854ad805c27df37187b09fdebb30b1958b223c4a26f255e2c7a02d",
+  "accepted_provider_profiles": [],
+  "qualified_kernel_builds": [],
+  "B1": "OPEN",
+  "historical_product_delete_recreate": "FAIL_UNRESOLVED",
+  "overlay": "historical FAIL/BLOCKED unchanged",
+  "S4_outputs_released": [],
+  "ticket153": "BLOCKED",
+  "production_runtime_matcher": "NOT_IMPLEMENTED_UNSUPPORTED; R04 current-FD evidence required; no omitted-default or fixture-feature inference",
+  "R05": "NOT_RUN",
+  "architecture": "Linux x86_64",
+  "runner_label": "ubuntu-24.04; actual kernel/image recorded independently",
+  "mount_options": [
+    "rw",
+    "data=ordered",
+    "relatime",
+    "errors=remount-ro"
+  ],
+  "native": {
+    "uuid_bytes": 16,
+    "uuid_zero_allowed": false,
+    "handle_type": 1,
+    "handle_bytes": 8,
+    "read_buffer_cap": 128,
+    "attempts_per_observation": 1,
+    "resize_retry": false,
+    "unique_mount_output_bits": 64,
+    "statx_legacy_request_mask": "0x17ff",
+    "statx_unique_request_mask": "0x4fff",
+    "non_dax_evidence": "same-FD valid STATX_ATTR_DAX attribute mask, attribute unset",
+    "mount_ids_persist_as_identity": false
+  },
+  "budgets": {
+    "image_bytes": 67108864,
+    "payload_bytes": 1048576,
+    "objects_per_group": 16,
+    "compile_seconds": 10,
+    "native_child_seconds": 3,
+    "stage_seconds": 60,
+    "fixture_seconds": 300,
+    "job_minutes": 10,
+    "inode_attempts": 32,
+    "inode_seconds": 2,
+    "fs_cycles": 1
+  },
+  "source_files": [
+    ".github/workflows/fs-native-ext4-qualification.yml",
+    "tests/fs-native-ext4-qualification.test.py",
+    "scripts/qualification/fs-native-ext4/probe.c",
+    "scripts/qualification/fs-native-ext4/run.py",
+    "scripts/qualification/fs-native-ext4/checks.py",
+    "scripts/qualification/fs-native-ext4/support.py",
+    "scripts/qualification/fs-native-ext4/profile.json",
+    "scripts/qualification/fs-native-ext4/README.md"
+  ],
+  "uapi_sources": [
+    {
+      "url": "https://github.com/torvalds/linux/blob/v6.18/include/uapi/linux/fs.h",
+      "sha256": "bf3363a0a2afe6165311e9827958d89d9ecbe101a79782a3b4bd76699841d263"
+    },
+    {
+      "url": "https://github.com/torvalds/linux/blob/v6.18/include/uapi/linux/fcntl.h",
+      "sha256": "d58b0d209a572c4351757404252bf0bb398cabf1879b52bdd27497a2eeea87ba"
+    },
+    {
+      "url": "https://github.com/torvalds/linux/blob/v6.18/include/uapi/linux/stat.h",
+      "sha256": "c900a05e031d999074db5ac3567f651ce2cf2f9f9e0a686810d6453c9f8b9526"
+    }
+  ],
+  "limits": [
+    "32-bit random ext4 generation risk retained; no claim of zero collisions",
+    "OS reboot NOT_RUN",
+    "Node-API/canonical Fs/parser/service/product validation NOT_RUN",
+    "finite Q evidence never registers a production profile"
+  ]
+}
