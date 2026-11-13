@@ -13,9 +13,12 @@ import sys
 from threading import Thread
 from time import monotonic
 import traceback
-from playwright.sync_api import sync_playwright, expect, Error as PlaywrightError
+from playwright.sync_api import expect, Error as PlaywrightError
 sys.dont_write_bytecode = True  # 不把本入口的辅助模块缓存写进候选工作树。
 from resource_native_desktop import NativeDesktop
+from resource_browser_binding import load_profile, load_runtime_binding
+from resource_browser_session import (bounded_playwright, native_page, runtime_identity,
+                                      sdk_cleanup, validate_native_observations)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -463,64 +466,68 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", type=Path, default=ROOT / ".agent-output/resource-web-e2e")
     parser.add_argument("--chromium")
-    parser.add_argument("--native-desktop", action="store_true", help="创建自有 Xvfb/Openbox 并运行 headed Chromium；缺依赖或隐藏能力不成立即失败")
+    parser.add_argument("--native-desktop", action="store_true", help="创建自有 Xvfb/Openbox 并运行已资格化的原生 Chromium")
+    parser.add_argument("--runtime-binding", type=Path, default=ROOT / ".agent-output/resource-web-e2e/runtime-binding.json",
+                        help="本轮 CI consumer 已核实的 source/producer 绑定；不回退旧资格产物")
     args = parser.parse_args()
     output = args.artifacts.resolve(); output.mkdir(parents=True, exist_ok=True)
     report = {"status": "NOT_RUN", "at": datetime.now(timezone.utc).isoformat(),
               "candidate": candidate(), "scope": "real Chromium / HTTP / MCP HTTP + independent stdio / temporary SQLite",
-              "checks": [], "screenshots": [], "unverified": [], "pageErrors": [], "requests": []}
+              "checks": [], "screenshots": [], "unverified": [], "pageErrors": [], "requests": [],
+              "nativeCases": [], "cleanupErrors": []}
     fixture = None
     desktop = NativeDesktop(output / "native-desktop") if args.native_desktop else None
     try:
-        browser_env = desktop.start() if desktop else None
+        report["status"] = "FAIL"
+        assert desktop is not None, "完整资源原生验收要求 --native-desktop；不能以 headless 冒充资格"
+        binding = load_runtime_binding(args.runtime_binding)
+        profile = load_profile()["browser"]
+        if args.chromium:
+            assert Path(args.chromium).resolve() == Path(profile["executable"]).resolve(), "Chromium executable 与已资格 profile 不符"
+        report["runtimeBinding"] = binding
+        report["runtime"] = runtime_identity(binding)
+        report["chromiumExecutable"] = profile["executable"]
+        browser_env = desktop.start()
         fixture = Fixture(output); data = fixture.start()
         report["fixture"] = data
-        with sync_playwright() as p:
-            # 完整 Chromium + 原生 X11 窗口；没有桌面时不冒充 hidden 能力。
-            executable = args.chromium or p.chromium.executable_path
-            report["chromiumExecutable"] = executable
-            # Browser.getBrowserCommandLine 要求此开关；Playwright 1.62 不再默认加入。
-            browser = p.chromium.launch(headless=not args.native_desktop, executable_path=executable,
-                                       env=browser_env, args=["--enable-automation", "--ozone-platform=x11"] if desktop else [])
-            report["status"] = "FAIL"; report["chromium"] = browser.version
-            try:
-                report["headed"] = args.native_desktop
-                if desktop:
-                    browser_cdp = browser.new_browser_cdp_session()
-                    try:
-                        report["browserArguments"] = browser_cdp.send("Browser.getBrowserCommandLine")["arguments"]
-                        report["browserProcesses"] = [entry for entry in browser_cdp.send("SystemInfo.getProcessInfo")["processInfo"] if entry["type"] == "browser"]
-                        assert not any(argument.startswith("--headless") for argument in report["browserArguments"])
-                        assert "--ozone-platform=x11" in report["browserArguments"]
-                    finally:
-                        browser_cdp.detach()
-                for width, height in [(1440, 1000), (390, 844)]:
-                    if desktop: desktop.check_alive()
-                    context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai",
-                                                  reduced_motion="reduce", viewport={"width": width, "height": height})
-                    context.tracing.start(screenshots=True, snapshots=True, sources=True)
-                    page = context.new_page(); page.set_default_timeout(10000)
+        with bounded_playwright(report) as p:
+            for width, height in [(1440, 1000), (390, 844)]:
+                desktop.check_alive()
+                case_report = {"width": width, "height": height, "status": "NOT_RUN", "cleanupErrors": []}
+                report["nativeCases"].append(case_report)
+                with native_page(p, browser_env, width, height, output / f"native-{width}",
+                                 output / f"trace-{width}.zip", case_report, binding) as (page, context):
+                    report["headed"] = True
+                    report["chromium"] = case_report["browserVersion"]["product"].split("/", 1)[1]
+                    if "browserArguments" not in report:
+                        # 兼容原报告的首个实际 browser 记录；两宽的完整身份都在 nativeCases。
+                        report["browserArguments"] = case_report["argumentComparison"]["actual"]
+                        report["browserProcesses"] = case_report["browserProcesses"]
+                        report["browserIdentityScope"] = "first width; all actual identities in nativeCases"
                     page.on("pageerror", lambda error: report["pageErrors"].append(str(error)))
                     page.on("request", lambda request: report["requests"].append({
                         "at": datetime.now(timezone.utc).isoformat(), "method": request.method, "url": request.url,
                         **({"body": request.post_data} if request.method in ("POST", "PATCH", "PUT") else {})}))
                     try:
                         exercise(page, context, fixture, data, width, output, report)
-                        if desktop: desktop.check_alive()
+                        desktop.check_alive()
                         assert not report["pageErrors"], report["pageErrors"]
+                        case_report["status"] = validate_native_observations(report, width)
                     except Exception:
-                        if not page.is_closed(): screenshot(page, output, report, f"failure-{width}.png")
+                        case_report["status"] = "FAIL"
+                        sdk_cleanup(case_report, "failure screenshot",
+                                    lambda: screenshot(page, output, report, f"failure-{width}.png") if not page.is_closed() else None)
                         raise
-                    finally:
-                        context.tracing.stop(path=str(output / f"trace-{width}.zip"))
-                        context.close()
-            finally: browser.close()
+                if case_report["chromeCleanup"]["status"] != "PASS" or case_report["cleanupErrors"]:
+                    raise RuntimeError("Chrome/SDK 清理未合格；不得开始下一宽或覆盖原失败")
+        assert not report["cleanupErrors"], report["cleanupErrors"]
         report["status"] = "INCONCLUSIVE" if report["unverified"] else "PASS"
     except (KeyboardInterrupt, SystemExit):
         report["status"] = "FAIL"
         report["interrupted"] = True
         raise
     except Exception as error:
+        report["status"] = "FAIL"
         report["error"] = str(error)[:10000]
         report["traceback"] = traceback.format_exc()
     finally:
@@ -539,7 +546,10 @@ def main():
                 report["desktopCleanupError"] = str(error); report["status"] = "FAIL"
         report["candidateAfter"] = candidate()
         if report["candidateAfter"] != report["candidate"]:
-            report["status"] = "INCONCLUSIVE"; report["candidateChanged"] = True
+            report["candidateChanged"] = True
+            if report["status"] != "FAIL": report["status"] = "INCONCLUSIVE"
+        if report["cleanupErrors"] or any(case["status"] == "FAIL" for case in report["nativeCases"]):
+            report["status"] = "FAIL"
         (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
         print(json.dumps({key: value for key, value in report.items() if key not in ("requests", "traceback")}, ensure_ascii=False, indent=2))
     return 0 if report["status"] == "PASS" else 1
