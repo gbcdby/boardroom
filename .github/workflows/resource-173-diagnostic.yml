@@ -1,0 +1,145 @@
+name: 临时诊断 · S5 resource run154
+
+# 仅由唯一发布者在独立审查后推送本次专用分支；无 PR/main/定时触发。
+on:
+  push:
+    branches: [diagnostic/resource-173-run43357835373]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: resource-173-run43357835373-diagnostic
+  cancel-in-progress: false
+
+jobs:
+  observe-resource:
+    name: 观察性 Chromium · 不代替三 job 验收
+    if: github.repository == 'gbcdby/boardroom'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.62.0-noble@sha256:aa81288e738725378becba5b3e06cb0f3a7f012a610e87e8d767a090ea3f740d
+      options: --init --shm-size=1g
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: 核对原 product tree 与限定 observer delta
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p .agent-output/resource-173-diagnostic-identity
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          git = lambda *args: subprocess.check_output(['git', *args], text=True).strip()
+          product = '59f4a889924f9a80bedd501d74ecfea4c1ff4f15'
+          allowed = {
+              'scripts/e2e-resource-web.py', 'scripts/resource-web-fixture.mjs',
+              'scripts/resource_browser_diagnostics.py', 'tests/resource-web-fixture.test.ts',
+              'tests/resource-browser-diagnostics.test.py', '.github/workflows/resource-173-diagnostic.yml',
+          }
+          assert os.environ['GITHUB_REF'] == 'refs/heads/diagnostic/resource-173-run43357835373'
+          assert git('rev-parse', 'HEAD') == os.environ['GITHUB_SHA']
+          assert not git('status', '--porcelain')
+          changed = set(git('diff', '--name-only', product, 'HEAD').splitlines())
+          assert changed == allowed, sorted(changed)
+          lock = hashlib.sha256(Path('package-lock.json').read_bytes()).hexdigest()
+          assert lock == '08587e32f7caf0f33023b78ebab0b0b1fbea7b7fbbed69415ac8f6aec5601a03'
+          record = {'observerSha': git('rev-parse', 'HEAD'), 'observerTree': git('rev-parse', 'HEAD^{tree}'),
+                    'productTree': product, 'productRun': 43357835373,
+                    'productCheckout': 'e719a2f455317e7b4899e1459ac0f35c9d85a4b0',
+                    'changedPaths': sorted(changed), 'allOtherProductPathsUnchanged': True,
+                    'purpose': 'OBSERVATION_ONLY'}
+          Path('.agent-output/resource-173-diagnostic-identity/source-binding.json').write_text(json.dumps(record, indent=2) + '\n')
+          PY
+      - name: 核对本次借用 artifact 的固定身份与未过期状态
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          from pathlib import Path
+          request = urllib.request.Request('https://api.github.com/repos/gbcdby/boardroom/actions/artifacts/14007291884',
+              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json',
+                       'X-GitHub-Api-Version': '2022-11-28'})
+          with urllib.request.urlopen(request, timeout=30) as response: artifact = json.load(response)
+          assert artifact['id'] == 14007291884 and artifact['name'] == 'browser-dependencies-1'
+          assert not artifact['expired'], '原依赖过期：本诊断 BLOCKED，不自动重建或改用另一候选'
+          assert artifact['digest'] == 'sha256:9f0fb1354c9e3386c74bdcf5fa00a421733fc2a927ac0fddd856692a10611914'
+          assert artifact['workflow_run']['id'] == 43357835373
+          assert artifact['workflow_run']['head_sha'] == '4a3767b58b7f1130f48652dc8a9db800194d8826'
+          record = {key: artifact[key] for key in ['id', 'name', 'digest', 'expired', 'created_at', 'expires_at', 'workflow_run']}
+          Path('.agent-output/resource-173-diagnostic-identity/dependency-artifact.json').write_text(json.dumps(record, indent=2) + '\n')
+          PY
+      - name: 取得 run154 原依赖（不触发 producer）
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          repository: gbcdby/boardroom
+          run-id: 43357835373
+          artifact-ids: 14007291884
+          github-token: ${{ github.token }}
+          path: .agent-output/browser-dependencies
+          digest-mismatch: error
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.22.2'
+      - name: 核对 ABI、锁文件和依赖 bytes 并构建同一产品
+        run: |
+          (cd .agent-output/browser-dependencies && sha256sum --check SHA256SUMS)
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const hash = file => createHash('sha256').update(readFileSync(file)).digest('hex');
+          const root = '.agent-output/browser-dependencies/';
+          assert.equal(hash(root + 'environment.json'), '81e5c68f7057eb47111ae1cbecb54aedec73024a6d9af77068e18179fdf1c578');
+          assert.equal(hash(root + 'node_modules.tar.gz'), '093c8c98c2dcce55870a7fae0d2f4f4cc46ef6513817eacc2bf9d33fd06f4856');
+          const manifest = JSON.parse(readFileSync(root + 'environment.json', 'utf8'));
+          const actual = { candidate: 'e719a2f455317e7b4899e1459ac0f35c9d85a4b0', node: process.version,
+            abi: process.versions.modules, platform: process.platform, arch: process.arch,
+            libc: process.report.getReport().header.glibcVersionRuntime, lockSha256: hash('package-lock.json') };
+          assert.deepEqual(actual, manifest);
+          writeFileSync('.agent-output/resource-173-diagnostic-identity/runtime.json', JSON.stringify(actual, null, 2) + '\n');
+          JS
+          tar --extract --gzip --no-same-owner --file .agent-output/browser-dependencies/node_modules.tar.gz
+          node --input-type=module -e "import Database from 'better-sqlite3'; const db = new Database(':memory:'); if (db.prepare('SELECT 1 AS value').get().value !== 1) throw Error('sqlite smoke'); db.close();"
+          npm run build
+      - name: 固定 run154 Python 浏览器依赖并记录实际二进制
+        run: |
+          python3 -m virtualenv .agent-output/browser-venv
+          .agent-output/browser-venv/bin/python -m pip install playwright==1.62.0 pyee==13.0.1 greenlet==3.5.6 typing-extensions==4.16.0
+          .agent-output/browser-venv/bin/python - <<'PY'
+          import importlib.metadata, json, platform
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+          expected = {'playwright': '1.62.0', 'pyee': '13.0.1', 'greenlet': '3.5.6', 'typing-extensions': '4.16.0'}
+          actual = {name: importlib.metadata.version(name) for name in expected}
+          assert actual == expected
+          with sync_playwright() as p: executable = p.chromium.executable_path
+          assert executable == '/ms-playwright/chromium-1234/chrome-linux64/chrome' and Path(executable).is_file()
+          Path('.agent-output/resource-173-diagnostic-identity/python-browser.json').write_text(json.dumps(
+              {'python': platform.python_version(), 'packages': actual, 'chromiumExecutable': executable}, indent=2) + '\n')
+          PY
+      - name: 一次原 resource 场景与有界旁录（仍保留原 FAIL/INCONCLUSIVE）
+        run: >-
+          .agent-output/browser-venv/bin/python scripts/e2e-resource-web.py
+          --chromium /ms-playwright/chromium-1234/chrome-linux64/chrome
+          --artifacts .agent-output/resource-173-diagnostic --diagnostics
+      - name: 保存原场景和独立诊断证据
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: resource-173-diagnostic-${{ github.run_attempt }}
+          path: |
+            .agent-output/resource-173-diagnostic-identity/
+            .agent-output/resource-173-diagnostic/
+            !.agent-output/resource-173-diagnostic/chromium-netlog.json.inprogress/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

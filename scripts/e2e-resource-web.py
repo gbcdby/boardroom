@@ -8,10 +8,14 @@ import json
 from pathlib import Path
 from queue import Queue, Empty
 import subprocess
+import sys
 from threading import Thread
 from time import monotonic
 import traceback
 from playwright.sync_api import sync_playwright, expect, Error as PlaywrightError
+
+sys.dont_write_bytecode = True  # 诊断导入不得在固定源码树生成 __pycache__。
+from resource_browser_diagnostics import BrowserDiagnostics
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -34,12 +38,12 @@ def candidate():
 
 class Fixture:
     """串行 stdin 控制；保存原始 stdout/stderr，不能伪造业务响应。"""
-    def __init__(self, output):
+    def __init__(self, output, diagnostics=False):
         self.output, self.messages, self.serial = output, Queue(), 0
         self.stderr = (output / "fixture-stderr.log").open("w")
         self.stdout = (output / "fixture-stdout.jsonl").open("w")
         self.process = subprocess.Popen(
-            ["node", "scripts/resource-web-fixture.mjs"], cwd=ROOT,
+            ["node", "scripts/resource-web-fixture.mjs", *(["--diagnostics"] if diagnostics else [])], cwd=ROOT,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
             text=True, bufsize=1)
         self.reader = Thread(target=self._read, daemon=True)
@@ -136,10 +140,14 @@ def hints(snapshot, task_id):
             and event["frame"].get("id") == task_id]
 
 
-def native_hidden_recovery(page, context, fixture, data, task, path, width, report):
+def native_hidden_recovery(page, context, fixture, data, task, path, width, report, diagnostics=None):
     """控制 Chromium 窗口；仅读取原生 visibility/isTrusted，绝不改写页面可见性。"""
     cdp = context.new_cdp_session(page)
     window = None
+    send = cdp.send if diagnostics is None else lambda name, params=None: diagnostics.control(cdp, name, params, width)
+    if diagnostics:
+        diagnostics.native_start(page)
+        diagnostics.native_snapshot(cdp, page, window, width, "before-focus-control")
     page.evaluate("""() => {
       window.resourceVisibilityEvidence = [];
       document.addEventListener('visibilitychange', event => {
@@ -151,15 +159,19 @@ def native_hidden_recovery(page, context, fixture, data, task, path, width, repo
     try:
         # Playwright 默认模拟 focused/active；关闭该模拟后检查真正的窗口可见性。
         try:
-            cdp.send("Emulation.setFocusEmulationEnabled", {"enabled": False})
-            window = cdp.send("Browser.getWindowForTarget")["windowId"]
-            cdp.send("Browser.setWindowBounds", {"windowId": window, "bounds": {"windowState": "minimized"}})
+            send("Emulation.setFocusEmulationEnabled", {"enabled": False})
+            window = send("Browser.getWindowForTarget")["windowId"]
+            if diagnostics: diagnostics.native_snapshot(cdp, page, window, width, "before-minimize")
+            send("Browser.setWindowBounds", {"windowId": window, "bounds": {"windowState": "minimized"}})
+            if diagnostics: diagnostics.native_snapshot(cdp, page, window, width, "after-minimize")
             page.wait_for_function("document.visibilityState === 'hidden'", polling=100, timeout=5000)
         except PlaywrightError as error:
+            if diagnostics: diagnostics.native_snapshot(cdp, page, window, width, "hidden-wait-failed")
             report["unverified"].append({"width": width, "id": "S5-AC07-native-hidden",
                                          "status": "INCONCLUSIVE", "reason": str(error),
                                          "observed": page.evaluate("document.visibilityState")})
             return task
+        if diagnostics: diagnostics.native_snapshot(cdp, page, window, width, "hidden-confirmed")
         page.wait_for_timeout(200)  # 完成隐藏之前已经发出的请求。
         before = fixture.snapshot()
         read_count = len(resource_gets(before, path))
@@ -172,11 +184,12 @@ def native_hidden_recovery(page, context, fixture, data, task, path, width, repo
         assert len(resource_gets(hidden, path)) == read_count, "原生隐藏期间仍产生周期读取"
         assert page.locator("h1").text_content() == previous["title"], "隐藏期间不应自动对账"
         restored_at = monotonic()
-        cdp.send("Browser.setWindowBounds", {"windowId": window, "bounds": {"windowState": "normal"}})
+        send("Browser.setWindowBounds", {"windowId": window, "bounds": {"windowState": "normal"}})
         page.bring_to_front()
         page.wait_for_function("document.visibilityState === 'visible'", polling=100, timeout=5000)
         expect(page.locator("h1")).to_have_text(task["title"], timeout=5000)
         elapsed = round((monotonic() - restored_at) * 1000)
+        if diagnostics: diagnostics.native_snapshot(cdp, page, window, width, "visible-confirmed")
         visibility = page.evaluate("window.resourceVisibilityEvidence")
         assert any(item["state"] == "hidden" and item["trusted"] for item in visibility), visibility
         assert any(item["state"] == "visible" and item["trusted"] for item in visibility), visibility
@@ -186,14 +199,18 @@ def native_hidden_recovery(page, context, fixture, data, task, path, width, repo
               requestCountHidden=len(resource_gets(hidden, path)), recoveryMs=elapsed, visibility=visibility)
         return task
     finally:
+        if diagnostics: diagnostics.native_snapshot(cdp, page, window, width, "before-restore-cleanup")
         if window is not None:
-            cdp.send("Browser.setWindowBounds", {"windowId": window, "bounds": {"windowState": "normal"}})
+            send("Browser.setWindowBounds", {"windowId": window, "bounds": {"windowState": "normal"}})
         page.bring_to_front()
-        cdp.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
+        send("Emulation.setFocusEmulationEnabled", {"enabled": True})
+        if diagnostics:
+            diagnostics.native_snapshot(cdp, page, window, width, "after-restore-cleanup")
+            diagnostics.native_stop(page)
         cdp.detach()
 
 
-def exercise(page, context, fixture, data, width, output, report):
+def exercise(page, context, fixture, data, width, output, report, diagnostics=None):
     origin, writer = data["url"], data["writeUrl"]
     first, second = data["records"]
     pid, other_pid = first["project"]["id"], second["project"]["id"]
@@ -374,7 +391,7 @@ def exercise(page, context, fixture, data, width, output, report):
     assert page.get_by_test_id("resource-sync-status").locator("time").get_attribute("datetime") != last_read
     check(report, width, "S5-AC07-reconnect", "断线保留上次值与读取时间，真实 WS 重连后立即对账",
           retainedReadAt=last_read, recoveryMs=round((monotonic() - started) * 1000))
-    task = native_hidden_recovery(page, context, fixture, data, task, path, width, report)
+    task = native_hidden_recovery(page, context, fixture, data, task, path, width, report, diagnostics)
 
     # 延迟的真实旧详情不得覆盖之后的 mutation；比较的字节来自真实上游。
     page.get_by_test_id("task-edit-open").click()
@@ -416,20 +433,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", type=Path, default=ROOT / ".agent-output/resource-web-e2e")
     parser.add_argument("--chromium")
+    parser.add_argument("--diagnostics", action="store_true", help="仅增有界 NetLog/CDP/原生窗口旁录；不改变验收场景或结论")
     args = parser.parse_args()
     output = args.artifacts.resolve(); output.mkdir(parents=True, exist_ok=True)
     report = {"status": "NOT_RUN", "at": datetime.now(timezone.utc).isoformat(),
               "candidate": candidate(), "scope": "real Chromium / HTTP / MCP HTTP + independent stdio / temporary SQLite",
               "checks": [], "screenshots": [], "unverified": [], "pageErrors": [], "requests": []}
     fixture = None
+    diagnostics = BrowserDiagnostics(output) if args.diagnostics else None
     try:
-        fixture = Fixture(output); data = fixture.start()
+        fixture = Fixture(output, args.diagnostics); data = fixture.start()
         report["fixture"] = data
         with sync_playwright() as p:
             # 显式使用完整 Chromium；headless shell 不提供原生窗口最小化能力。
             executable = args.chromium or p.chromium.executable_path
             report["chromiumExecutable"] = executable
-            browser = p.chromium.launch(headless=True, executable_path=executable)
+            browser = p.chromium.launch(headless=True, executable_path=executable,
+                                        **({"args": diagnostics.launch_args()} if diagnostics else {}))
             report["status"] = "FAIL"; report["chromium"] = browser.version
             try:
                 for width, height in [(1440, 1000), (390, 844)]:
@@ -441,16 +461,24 @@ def main():
                     page.on("request", lambda request: report["requests"].append({
                         "at": datetime.now(timezone.utc).isoformat(), "method": request.method, "url": request.url,
                         **({"body": request.post_data} if request.method in ("POST", "PATCH", "PUT") else {})}))
+                    observation_session = diagnostics.attach(context, page, width, [data["url"], data["writeUrl"]]) if diagnostics else None
                     try:
-                        exercise(page, context, fixture, data, width, output, report)
+                        exercise(page, context, fixture, data, width, output, report, diagnostics)
                         assert not report["pageErrors"], report["pageErrors"]
                     except Exception:
+                        if diagnostics:
+                            diagnostics.event("exercise.failed", {"width": width})
+                            diagnostics.checkpoint_netlog()
                         if not page.is_closed(): screenshot(page, output, report, f"failure-{width}.png")
                         raise
                     finally:
+                        if diagnostics: diagnostics.mark_cleanup(observation_session)
                         context.tracing.stop(path=str(output / f"trace-{width}.zip"))
                         context.close()
-            finally: browser.close()
+                        if diagnostics: diagnostics.close_session(observation_session)
+            finally:
+                if diagnostics: diagnostics.event("browser.cleanup.before")
+                browser.close()
         report["status"] = "INCONCLUSIVE" if report["unverified"] else "PASS"
     except Exception as error:
         report["error"] = str(error)[:10000]
@@ -461,10 +489,16 @@ def main():
                 if fixture.process.poll() is None and hasattr(fixture, "ready"):
                     snapshot = fixture.snapshot()
                     (output / "fixture-events.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2))
+                    if diagnostics:
+                        try:
+                            observation = fixture.command("diagnostics")
+                            (output / "fixture-observer-before-cleanup.json").write_text(json.dumps(observation, ensure_ascii=False))
+                        except Exception as error: diagnostics.problem("fixture.snapshot", error)
             except Exception as error: report["snapshotError"] = str(error)
             try: report["cleanup"] = fixture.close()
             except Exception as error:
                 report["cleanupError"] = str(error); report["status"] = "FAIL"
+        if diagnostics: report["diagnostics"] = diagnostics.finish()
         report["candidateAfter"] = candidate()
         if report["candidateAfter"] != report["candidate"]:
             report["status"] = "INCONCLUSIVE"; report["candidateChanged"] = True

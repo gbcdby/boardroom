@@ -1,13 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
 
-test("浏览器故障夹具：真实 HTTP/MCP/独立stdio、字节保留延迟、WS丢包和临时资源回收", { timeout: 45000 }, async () => {
-  const child = spawn(process.execPath, ["scripts/resource-web-fixture.mjs"], {
+test("浏览器故障夹具：真实 HTTP/MCP/独立stdio、字节保留延迟、WS丢包和临时资源回收", { timeout: 45000 }, async t => {
+  const child = spawn(process.execPath, ["scripts/resource-web-fixture.mjs", "--diagnostics"], {
     cwd: path.resolve(import.meta.dirname, ".."), stdio: ["pipe", "pipe", "pipe"],
   });
   let stderr = "", serial = 0, closed: any;
@@ -72,7 +73,28 @@ test("浏览器故障夹具：真实 HTTP/MCP/独立stdio、字节保留延迟�
     assert.deepEqual(await command("release"), [detail]);
     const released = await heldResponse;
     assert.equal(released.status, 200); assert.equal(released.headers.get("etag"), etag);
+    const deliveredBytes = Buffer.from(await released.clone().arrayBuffer());
     assert.equal((await released.json() as any).task.title, task.title);
+
+    // 真实交付与客户端取消分别留证；旁录不得改变已扣住的响应或替它合成成功。
+    const delivered = await command("diagnostics");
+    const delivery = delivered.events.find((event: any) => event.kind === "delivery.queued" && event.path === detail);
+    assert.ok(delivery); assert.equal(delivery.status, 200);
+    assert.ok(delivered.events.some((event: any) => event.kind === "downstream.finish" && event.requestId === delivery.requestId));
+    const ingress = delivered.events.find((event: any) => event.kind === "proxy.ingress" && event.requestId === delivery.requestId);
+    assert.ok(Number.isInteger(ingress.socket.remotePort) && ingress.socket.remotePort > 0);
+    assert.ok(delivered.events.some((event: any) => event.kind === "upstream.complete" && event.requestId === delivery.requestId && event.etag === etag
+      && event.bodySha256 === createHash("sha256").update(deliveredBytes).digest("hex")));
+    await command("network", { holdPath: detail });
+    const abort = new AbortController();
+    const cancelled = fetch(data.url + detail, { signal: abort.signal }).then(() => "unexpected_response", error => error.name);
+    await until(async () => (await command("snapshot")).heldPaths.includes(detail));
+    abort.abort(); assert.equal(await cancelled, "AbortError");
+    await until(async () => (await command("diagnostics")).events.some((event: any) => event.kind === "downstream.close" && !event.writableFinished && event.path === detail));
+    assert.deepEqual(await command("release"), [detail]);
+    const afterAbort = await command("diagnostics");
+    assert.ok(afterAbort.events.some((event: any) => event.kind === "delivery.skipped_destroyed" && event.path === detail));
+    assert.equal(afterAbort.status, "COMPLETE");
 
     await command("network", { dropResources: true });
     task = (await json(data.writeUrl, detail, "PATCH", { expectedRevision: task.revision, title: "真实HTTP提交" })).task;
@@ -104,6 +126,11 @@ test("浏览器故障夹具：真实 HTTP/MCP/独立stdio、字节保留延迟�
     assert.equal(code, 0, stderr);
     assert.ok(closed); assert.deepEqual(closed.failures, []);
     if (data) assert.equal(existsSync(data.root), false);
+    t.diagnostic(JSON.stringify({ fixturePid: data?.fixturePid, stdioPid: data?.stdioPid,
+      childExitCode: code, temporaryRoot: data?.root, temporaryRootRemoved: data ? !existsSync(data.root) : null,
+      cleanupFailures: closed.failures, observerStatus: closed.diagnostics?.status,
+      observerEvents: closed.diagnostics?.events.length, observerBytes: closed.diagnostics?.bytes,
+      observedKinds: [...new Set(closed.diagnostics?.events.map((entry: any) => entry.kind))] }));
     lines.close();
   }
 });

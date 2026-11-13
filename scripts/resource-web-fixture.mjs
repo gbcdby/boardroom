@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 /** #173 专属临时服务。代理只转发真实 HTTP/WS，并按测试指令丢包/断开；不生成成功业务响应。 */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { errorMonitor } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
@@ -24,6 +26,32 @@ let stdioStderr = "";
 let nextRequestId = 0;
 const event = (kind, fields = {}) => events.push({ kind, at: Date.now(), ...fields });
 const send = value => process.stdout.write(`${JSON.stringify(value)}\n`);
+// 可选旁录独立于原验收 events；不改请求头/URL、响应字节或错误传播。
+const diagnostic = { enabled: process.argv.includes("--diagnostics"), status: "COMPLETE", events: [],
+  bytes: 0, dropped: 0, maxEvents: 4096, maxBytes: 1024 * 1024 };
+const observe = (kind, fields = {}) => {
+  if (!diagnostic.enabled) return;
+  try {
+    const item = { kind, at: Date.now(), monotonicNs: process.hrtime.bigint().toString(), ...fields };
+    const size = Buffer.byteLength(JSON.stringify(item)) + 1;
+    if (diagnostic.events.length >= diagnostic.maxEvents || diagnostic.bytes + size > diagnostic.maxBytes) {
+      diagnostic.status = "INCOMPLETE"; diagnostic.dropped++; return;
+    }
+    diagnostic.events.push(item); diagnostic.bytes += size;
+  } catch { diagnostic.status = "INCOMPLETE"; diagnostic.dropped++; }
+};
+const socketIdentity = socket => ({ localAddress: socket.localAddress ?? null, localPort: socket.localPort ?? null,
+  remoteAddress: socket.remoteAddress ?? null, remotePort: socket.remotePort ?? null });
+function observeRequest(request, response, entry) {
+  if (!diagnostic.enabled) return;
+  observe("proxy.ingress", { ...entry, socket: socketIdentity(request.socket) });
+  for (const kind of ["aborted", "close", "end", "error"]) request.on(kind === "error" ? errorMonitor : kind, error => observe(`request.${kind}`,
+    { ...entry, complete: request.complete, destroyed: request.destroyed, errorCode: error?.code ?? null }));
+  for (const kind of ["finish", "close", "error"]) response.on(kind === "error" ? errorMonitor : kind, error => observe(`downstream.${kind}`,
+    { ...entry, headersSent: response.headersSent, writableEnded: response.writableEnded,
+      writableFinished: response.writableFinished, destroyed: response.destroyed, errorCode: error?.code ?? null }));
+}
+
 
 async function call(client, name, args) {
   const result = await client.callTool({ name, arguments: args });
@@ -37,7 +65,9 @@ async function close() {
     const failures = [];
     async function attempt(operation) { try { await operation(); } catch (error) { failures.push(String(error)); } }
     for (const socket of sockets) socket.terminate();
-    for (const response of held) response.response.destroy();
+    for (const response of held) {
+      observe("cleanup.destroy_held", response.entry); response.response.destroy();
+    }
     await attempt(async () => { if (proxy?.listening) { const done = new Promise(resolve => proxy.close(resolve)); proxy.closeAllConnections(); await done; } });
     await attempt(() => websocketServer ? new Promise(resolve => websocketServer.close(resolve)) : undefined);
     await attempt(() => httpTransport?.terminateSession());
@@ -46,7 +76,7 @@ async function close() {
     await attempt(() => stdioTransport?.close());
     await attempt(() => server?.close());
     await attempt(() => rm(root, { recursive: true, force: true }));
-    send({ event: "closed", root, failures, stdioStderr });
+    send({ event: "closed", root, failures, stdioStderr, ...(diagnostic.enabled ? { diagnostics: diagnostic } : {}) });
     if (failures.length) process.exitCode = 1;
   })();
   return closing;
@@ -81,20 +111,40 @@ try {
   proxy = createServer((request, response) => {
     const entry = { requestId: ++nextRequestId, method: request.method, path: request.url, ifNoneMatch: request.headers["if-none-match"] ?? null };
     event("http.request", entry);
+    observeRequest(request, response, entry);
     if (network.blocked) { event("http.offline", entry); response.writeHead(503); response.end("test network disconnected"); return; }
     // 捕获上游真实字节；延迟场景只延后交付，不改状态、ETag 或正文。
     const upstream = httpRequest(new URL(request.url, server.url), { method: request.method, headers: request.headers }, result => {
+      observe("upstream.headers", { ...entry, status: result.statusCode, etag: result.headers.etag ?? null });
+      if (diagnostic.enabled) for (const kind of ["aborted", "close", "error"]) result.on(kind === "error" ? errorMonitor : kind, error =>
+        observe(`upstream.response.${kind}`, { ...entry, complete: result.complete, destroyed: result.destroyed, errorCode: error?.code ?? null }));
       const chunks = [];
       result.on("data", chunk => chunks.push(chunk));
       result.on("end", () => {
         const body = Buffer.concat(chunks), headers = result.headers, status = result.statusCode;
         event("http.response", { ...entry, status, etag: headers.etag ?? null });
-        const deliver = () => { if (!response.destroyed) { response.writeHead(status, headers); response.end(body); } };
+        observe("upstream.complete", { ...entry, status, etag: headers.etag ?? null, bytes: body.length,
+          ...(diagnostic.enabled ? { bodySha256: createHash("sha256").update(body).digest("hex") } : {}) });
+        const deliver = () => {
+          observe("delivery.attempt", { ...entry, status, destroyed: response.destroyed });
+          if (!response.destroyed) {
+            response.writeHead(status, headers); response.end(body);
+            observe("delivery.queued", { ...entry, status, bytes: body.length });
+          } else observe("delivery.skipped_destroyed", entry);
+        };
         if (network.holdPath === request.url && request.method === "GET") {
-          network.holdPath = null; held.push({ response, deliver, path: request.url }); event("http.held", entry);
+          network.holdPath = null; held.push({ response, deliver, path: request.url, entry }); event("http.held", entry);
         } else deliver();
       });
     });
+    if (diagnostic.enabled) {
+      upstream.on("socket", socket => {
+        observe("upstream.socket", { ...entry, socket: socketIdentity(socket) });
+        if (socket.connecting) socket.once("connect", () => observe("upstream.connect", { ...entry, socket: socketIdentity(socket) }));
+      });
+      for (const kind of ["finish", "close", "error"]) upstream.on(kind === "error" ? errorMonitor : kind, error =>
+        observe(`upstream.request.${kind}`, { ...entry, destroyed: upstream.destroyed, errorCode: error?.code ?? null }));
+    }
     upstream.on("error", error => { event("http.error", { ...entry, message: error.message }); if (!response.destroyed) { response.writeHead(502); response.end(); } });
     request.pipe(upstream);
   });
@@ -140,12 +190,15 @@ try {
         if (network.blocked) for (const socket of sockets) socket.terminate();
         event("network.control", { ...network }); result = { ...network };
       } else if (command.op === "release") {
-        result = held.splice(0).map(item => { const browserCancelled = item.response.destroyed; item.deliver(); event("http.released", { path: item.path, browserCancelled }); return item.path; });
+        result = held.splice(0).map(item => { const browserCancelled = item.response.destroyed;
+          observe("release.requested", { ...item.entry, browserCancelled }); item.deliver(); event("http.released", { path: item.path, browserCancelled }); return item.path; });
       } else if (command.op === "mcp") {
         assert.ok(["update_task", "comment_task"].includes(command.name));
         assert.ok(["stdio", "http"].includes(command.transport));
         result = await call(command.transport === "stdio" ? stdioClient : httpClient, command.name, command.args);
         event("mcp.committed", { transport: command.transport, name: command.name, taskId: command.args.taskId, revision: result.task?.revision });
+      } else if (command.op === "diagnostics" && diagnostic.enabled) {
+        result = diagnostic;
       } else if (command.op === "snapshot") {
         result = { events, network: { ...network }, stdioPid: stdioTransport.pid, heldPaths: held.map(item => item.path),
           workEvents: await repos.context.query("SELECT task_id, acked_at FROM work_events ORDER BY id") };
