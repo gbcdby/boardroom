@@ -166,11 +166,12 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   let ownedSupervisor: RuntimeSupervisor | undefined;
   let ownedMcp: McpSessionsHandler | undefined;
   let ownedHub: WebSocketHub | undefined;
+  let ownedApi: ReturnType<typeof createT1ApiRouter> | undefined;
   let stopStatus = () => {};
   let stopMessages = () => {};
   await storageClient.bind({
     stopNewWork(epoch) { stopStatus(); stopMessages(); pauseMemoryRuntime(driver); ownedSupervisor?.beginMaintenanceDrain(epoch); },
-    async disconnectSessions() { await ownedMcp?.close({ strict: true }); await ownedHub?.close(); },
+    async disconnectSessions() { await ownedApi?.close(); await ownedMcp?.close({ strict: true }); await ownedHub?.close(); },
     stopOwnedRuntime: () => ownedSupervisor?.drainMaintenance() ?? Promise.resolve({ ownedExits: [], unknownOwners: [] }),
     observeOwnedExit: input => ownedSupervisor?.observeMaintenanceExit(input) ?? Promise.reject(new StorageMaintenanceError("active")),
     closeMemory: () => closeMemoryRuntime(driver),
@@ -261,6 +262,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}),
     ...(options.orgChangeRecorder ? { orgChangeRecorder: options.orgChangeRecorder } : {}),
   });
+  ownedApi = t1Api;
   const runtimeObservations = createRuntimeObservability({ db: driver, logger });
   const runtimeStateRoot = environment.runtimeRoot;
   const runtimeSupervisor = createRuntimeSupervisor({ db: driver, repos, logger, observations: runtimeObservations,
@@ -443,6 +445,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
       httpServer.listen(config.port, HOST);
     });
   } catch (error) {
+    await t1Api.close();
     await runtimeSupervisor.close();
     await mcpHandler.close();
     clearInterval(statusTimer);
@@ -525,6 +528,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
       const closeResource = async (operation: () => Promise<unknown>) => {
         try { await operation(); } catch (error) { failures.push(error); }
       };
+      await closeResource(() => t1Api.close());
       await closeResource(() => storageClient.refresh());
       if (storageClient.diagnostic.status === "draining" || storageClient.diagnostic.status === "blocked")
         await closeResource(() => storageClient.waitForDrain());

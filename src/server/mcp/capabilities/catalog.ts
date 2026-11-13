@@ -29,6 +29,12 @@ const connectionDeclarationSchema = z.object({
     }).strict(),
   ]),
 }).strict();
+export type McpConnectionDeclaration = Readonly<z.infer<typeof connectionDeclarationSchema>>;
+
+/** 仅供可信配置持久化/协议边界消费；普通目录仍使用脱敏 ConnectionProjection。 */
+export function readMcpConnectionDeclaration(input: unknown): McpConnectionDeclaration {
+  return freezeData(parseData(connectionDeclarationSchema, input, "invalid_connection"));
+}
 
 export const connectionProjectionSchema = z.object({
   connectionId: opaqueIdSchema, revision: revisionSchema, enabled: z.boolean(),
@@ -45,7 +51,7 @@ export function parseData<S extends z.ZodTypeAny>(schema: S, input: unknown, cod
 
 /** 只检查声明并返回不含端点/argv/凭据引用的投影，不建立连接或执行命令。 */
 export function inspectMcpConnection(input: unknown): ConnectionProjection {
-  const connection = parseData(connectionDeclarationSchema, input, "invalid_connection");
+  const connection = readMcpConnectionDeclaration(input);
   return freezeData({
     connectionId: connection.connectionId, revision: connection.revision, enabled: connection.enabled,
     transport: connection.transport.type, configurationDigest: digestJson(connection),

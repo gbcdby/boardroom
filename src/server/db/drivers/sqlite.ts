@@ -8,6 +8,7 @@ import { mkdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { OperationQueue } from "../operation-queue.ts";
+import { commitCallbacks, runCommitCallbacks, type CommitCallback } from "../after-commit.ts";
 import { openDatabase, DatabaseSetupError, probeReadWrite, DATABASE_FILE_NAME } from "../database.ts";
 import { assertSqliteSingleLink, assertSqliteSourceUnchanged, type SqliteDatabaseDescriptor } from "../../environment.ts";
 import { ConfigError } from "../../config-error.ts";
@@ -132,7 +133,8 @@ export class SqliteDriver implements DbDriver {
   }
 
   async query<T extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []): Promise<T[]> {
-    return this.serialize(async () => {
+    const callbacks: CommitCallback[] = [];
+    const result = await this.serialize(async () => {
       const statement=this.handle.prepare(sql);
       // SQLite checkpoint cannot run inside a transaction. This exact connection-control
       // operation moves already committed WAL pages only; it never admits business SQL.
@@ -144,24 +146,32 @@ export class SqliteDriver implements DbDriver {
       }
       // Native metadata, not SQL-prefix guessing. RETURNING/CTE writes require real transaction admission.
       if (statement.readonly || this.currentTransactionContext()) return statement.all(...params) as T[];
-      return this.runTransaction(async tx => tx.query<T>(sql,params));
+      return this.runTransaction(async tx => tx.query<T>(sql,params), undefined, callbacks);
     });
+    await runCommitCallbacks(callbacks);
+    return result;
   }
 
   async exec(sql: string, params: readonly unknown[] = []): Promise<number> {
     // DbDriver.exec 是单语句接口：无参数的 DML 也必须返回真实顶层 changes。
     // prepare 同时在执行前拒绝多语句；迁移仍由 runMigrations 使用原生 exec。
-    return this.serialize(async () => {
+    const callbacks: CommitCallback[] = [];
+    const result = await this.serialize(async () => {
       const statement=this.handle.prepare(sql);
       if (this.currentTransactionContext()) return statement.run(...params).changes;
       if (statement.readonly) {this.checkAdmission();return statement.run(...params).changes;}
-      return this.runTransaction(async tx => tx.exec(sql,params));
+      return this.runTransaction(async tx => tx.exec(sql,params), undefined, callbacks);
     });
+    await runCommitCallbacks(callbacks);
+    return result;
   }
 
   async transaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T> {
     const parent = this.transactionScope.getStore();
-    return this.serialize(() => this.runTransaction(fn, parent));
+    const callbacks: CommitCallback[] = [];
+    const result = await this.serialize(() => this.runTransaction(fn, parent, callbacks));
+    await runCommitCallbacks(callbacks);
+    return result;
   }
 
   async readSnapshot<T>(fn: (snapshot: DbReadSnapshot) => Promise<T>): Promise<T> {
@@ -199,7 +209,7 @@ export class SqliteDriver implements DbDriver {
     });
   }
 
-  private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, parent?: OperationQueue): Promise<T> {
+  private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, parent?: OperationQueue, callbacks: CommitCallback[] = []): Promise<T> {
     const db = this.handle;
     const nested = parent !== undefined;
     const identity = this.transactionIdentity.getStore() ?? { values: new Map<symbol, unknown>(), active: true };
@@ -226,7 +236,10 @@ export class SqliteDriver implements DbDriver {
       const result = await this.transactionIdentity.run(identity, () => this.transactionScope.run(scope, () => fn(tx)));
       await scope.drain();
       if (nested) db.exec(`RELEASE SAVEPOINT ${sp}`);
-      else db.exec(this.dialect.commit());
+      else {
+        db.exec(this.dialect.commit());
+        callbacks.push(...commitCallbacks(identity));
+      }
       return result;
     } catch (error) {
       await scope.drain();

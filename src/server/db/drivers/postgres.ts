@@ -9,6 +9,7 @@
 import { Pool, type PoolClient, type QueryResult } from "pg";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { OperationQueue } from "../operation-queue.ts";
+import { commitCallbacks, runCommitCallbacks, type CommitCallback } from "../after-commit.ts";
 import {
   MIGRATION_TABLE,
   MigrationError,
@@ -166,8 +167,12 @@ export class PostgresDriver implements DbDriver {
     const parent = this.transactionScope.getStore();
     if (parent) return parent.queue.run(() => this.runTransaction(fn, parent.client, parent.queue));
     const client = await this.requirePool().connect();
-    try { return await this.runTransaction(fn, client); }
+    const callbacks: CommitCallback[] = [];
+    let result: T;
+    try { result = await this.runTransaction(fn, client, undefined, false, callbacks); }
     finally { client.release(); }
+    await runCommitCallbacks(callbacks);
+    return result;
   }
 
   async readSnapshot<T>(fn: (snapshot: DbReadSnapshot) => Promise<T>): Promise<T> {
@@ -177,7 +182,8 @@ export class PostgresDriver implements DbDriver {
     finally { client.release(); }
   }
 
-  private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, client: PoolClient, parent?: OperationQueue, readOnly = false): Promise<T> {
+  private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, client: PoolClient, parent?: OperationQueue, readOnly = false,
+    callbacks: CommitCallback[] = []): Promise<T> {
     const nested = parent !== undefined;
     const identity = this.transactionIdentity.getStore() ?? { values: new Map<symbol, unknown>(), active: true };
     const savedValues = nested ? new Map(identity.values) : undefined;
@@ -208,7 +214,14 @@ export class PostgresDriver implements DbDriver {
         const result = await this.transactionIdentity.run(identity, () => this.transactionScope.run(scope, () => fn(tx)));
         await queue.drain();
         if (nested) await client.query(`RELEASE SAVEPOINT ${sp}`);
-        else await client.query(this.dialect.commit());
+        else {
+          const committed = await client.query(this.dialect.commit());
+          // body 捕获语句错误后 PG 仍可能以 ROLLBACK tag 正常响应 COMMIT。
+          if (committed.command !== "COMMIT") {
+            throw new Error(`PostgreSQL 事务未确认提交（可能已 aborted）：COMMIT 返回 ${committed.command}。`);
+          }
+          if (!readOnly) callbacks.push(...commitCallbacks(identity));
+        }
         return result;
       } catch (error) {
         await queue.drain();

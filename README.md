@@ -73,6 +73,10 @@ npm start
 
 旧 runtime 仍是当前可写配置来源。Profile/Binding 检查接口只读，分别展示有效、请求及已应用快照、原目录和运行观察，供后续迁移核对；读取不会应用配置。角色库目前提供本地管理 API，完整请求、二次确认、审计和 v14 兼容边界见[角色与身份契约](docs/identity-catalog.md)。
 
+## 外部 MCP 连接与工具目录
+
+本地用户可通过 `/api/mcp/connections` 保存全局连接配置及不可变版本，显式发起检查/刷新后读取完整工具目录。当前发现支持无凭据 Streamable HTTP 的 `initialize`、`tools/list` 和分页；需要凭据或外部 stdio 启动条件时明确返回 `blocked`。发现结果、配置登记和模型实际装载分开记录，完整接口与支持边界见[外部 MCP 目录](docs/mcp-connections.md)。
+
 ## 可选托管 Agent 运行时
 
 项目创建与工作区管理 API 可保存已有目录或 `rootPath: null`，返回独立配置版本、规范路径与只读 Git 观察；详情见[项目工作区配置](docs/project-workspaces.md)。保存和改绑不会修改已有托管实例的 cwd，也不创建工作副本或写入目录内的 Skills。

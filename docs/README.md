@@ -14,6 +14,7 @@
 | [f2-authorize-guard.md](f2-authorize-guard.md) | 统一权限矩阵、拒绝语义、接入点位 |
 | [policy-kernel.md](policy-kernel.md) | 纯策略求值、默认规则、解释预览与实际执行的边界 |
 | [mcp-tool-contract.md](mcp-tool-contract.md) | 当前工具目录、绑定/CAS 与聊天契约 |
+| [mcp-connections.md](mcp-connections.md) | 外部 MCP 连接版本、显式工具发现、完整目录、取消与当前支持边界 |
 | [t1-project-group-api.md](t1-project-group-api.md) | 项目/群组/成员 HTTP 与早期 WebUI 契约 |
 | [t3-member-lifecycle.md](t3-member-lifecycle.md) | 当前成员生命周期、移除、审计补偿与删除范围 |
 | [getting-started-mcp.md](getting-started-mcp.md) | 安装、双数据库、三宿主 MCP 配置与限制 |

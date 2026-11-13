@@ -354,7 +354,8 @@ for (const engine of ["sqlite", "postgres"] as const) {
           const preview = await call("DELETE", target);
           const write = () => call("POST", `/api/groups/${f.group.id}/messages`, { senderMemberId: f.member.id, text: "并发HTTP事实" });
           const remove = () => call("DELETE", target, { confirm: preview.body.confirmation.token });
-          const original = repos.context.exec; let paused = false;
+          const original = repos.context.exec, originalDbExec = db.exec;
+          const lockAttempted = deferred(); let paused = false;
           repos.context.exec = async (sql, params) => {
             const matching = writerFirst ? /^INSERT INTO messages\b/.test(sql.trimStart()) : /^DELETE FROM /.test(sql);
             if (!paused && matching) {
@@ -369,12 +370,26 @@ for (const engine of ["sqlite", "postgres"] as const) {
           let second: ReturnType<typeof call> | undefined;
           try {
             await Promise.race([entered.promise, first.then(() => { throw new Error("首请求未进入受控事务屏障"); })]);
+            if (engine === "postgres" && !writerFirst) db.exec = (sql, params) => {
+              const pending = originalDbExec.call(db, sql, params);
+              if (sql === "UPDATE projects SET updated_at = updated_at WHERE id = ?" && params?.length === 1 && params[0] === f.project.id) lockAttempted.resolve();
+              return pending;
+            };
             waitingFor = writerFirst ? "DELETE" : "POST";
             let settled = false;
             second = (writerFirst ? remove() : write()).then(result => { settled = true; return result; });
-            await accepted.promise; await setImmediate();
+            await accepted.promise;
+            // PG 迟到写入须实际发起本项目锁操作；SQLite 同 driver 队列在此前阻塞，只验证接收/排队。
+            if (engine === "postgres" && !writerFirst) await Promise.race([
+              lockAttempted.promise,
+              second.then(() => { throw new Error("迟到HTTP写入未发起本项目锁操作便已完成"); }),
+            ]);
+            await setImmediate();
             assert.equal(settled, false, "服务已接收第二请求，但它不能越过首请求的数据库事务");
-          } finally { release.resolve(); repos.context.exec = original; }
+          } finally {
+            release.resolve(); repos.context.exec = original; db.exec = originalDbExec;
+            await Promise.allSettled(second ? [first, second] : [first]);
+          }
           const [firstResult, secondResult] = await Promise.all([first, second!]);
           if (writerFirst) {
             assert.equal(firstResult.status, 201); assert.equal(secondResult.status, 409);
