@@ -148,6 +148,45 @@ platformTest("#152 journal starts at the exact anchor and preserves the capture 
   } finally { await f.close(); }
 });
 
+platformTest("#152 recapture preserves every existing frozen field across takeover", async (t) => {
+  const f = await fixture();
+  try {
+    const takeover: JournalRecord = { ...f.captured, sequence: 3, previous: f.captureRef, event: "takeover",
+      requestId: "takeover", ownerGeneration: 2, frozen: null };
+    const takeoverRef = await f.store.putJson("journal", takeover);
+    const recaptured: JournalRecord = { ...f.captured, sequence: 4, previous: takeoverRef,
+      requestId: "recapture", ownerGeneration: 2 };
+    await t.test("unchanged frozen values remain valid in the new generation", async () => {
+      const chain = await verifyJournalChain(f.store, await f.store.putJson("journal", recaptured));
+      const captures = chain.nodes.filter(node => node.record.event === "capture");
+      assert.equal(chain.nodes.length, 4);
+      assert.deepEqual(captures.map(node => node.record.ownerGeneration), [1, 2]);
+      assert.deepEqual(captures.map(node => node.record.frozen), [f.captured.frozen, f.captured.frozen]);
+    });
+    // A distinct, fully readable synthetic closure must not become a new frozen baseline.
+    const payload = await f.store.putBytes("source-file-payload", Buffer.from("changed private config bytes"));
+    const files: SourceFilesManifest = { ...f.files, entries: f.files.entries.map(entry => entry.kind === "file"
+      ? { ...entry, size: payload.bytes, payload } : entry) };
+    const filesRef = await f.store.putJson("source-files", files);
+    const frozen = f.captured.frozen!;
+    for (const change of [
+      { field: "sourceFilesManifest", frozen: { ...frozen, sourceFilesManifest: filesRef }, validFirstCapture: true },
+      { field: "schemaManifestDigest", frozen: { ...frozen, schemaManifestDigest: hash("f") }, validFirstCapture: false },
+      { field: "frozenBusinessManifestDigest", frozen: { ...frozen, frozenBusinessManifestDigest: hash("f") }, validFirstCapture: true },
+      { field: "guardManifestDigest", frozen: { ...frozen, guardManifestDigest: hash("f") }, validFirstCapture: false },
+    ]) await t.test(`${change.field} drift is rejected`, async () => {
+      if (change.validFirstCapture) {
+        // These values are valid on their own; rejection must come from the earlier capture.
+        const standalone = await f.store.putJson("journal", { ...f.captured, frozen: change.frozen });
+        assert.equal((await verifyJournalChain(f.store, standalone)).nodes.length, 2);
+      }
+      const head = await f.store.putJson("journal", { ...recaptured, frozen: change.frozen });
+      await assert.rejects(verifyJournalChain(f.store, head),
+        error => error instanceof MaintenanceFailure && error.code === "journal_invalid");
+    });
+  } finally { await f.close(); }
+});
+
 platformTest("#152 journal rejects skipped phases, request reuse with different input, unknown fields and broken predecessors", async () => {
   const f = await fixture();
   try {
