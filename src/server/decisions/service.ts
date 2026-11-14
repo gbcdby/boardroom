@@ -221,6 +221,14 @@ export function createDecisionService(db: DbDriver, options: { now?: () => Date;
       await writer.updatePending(String(record.id), Number(record.revision), { status: 'pending', requiredAuthority: fields.required,
         assigneeMemberId: fields.assignee, blockedReason: fields.blocked, policyEvaluation: next.policy_evaluation_json, at: ctx.at });
       await changed(ctx, writer, next, 'refreshed');
+      if ((fields.required === 'auto' || fields.required === 'owner') && fields.assignee && fields.blocked === null) {
+        const event = await repos.tasks.enqueueWorkEvent({ id: randomUUID(), projectId: ctx.command.projectId, taskId: ctx.command.taskId,
+          recipientMemberId: fields.assignee, kind: 'decision.requested',
+          eventKey: `decision:${record.id}:${next.revision}:${fields.assignee}:requested`,
+          payload: { taskId: ctx.command.taskId, decisionId: record.id, decisionRevision: next.revision }, deliveryState: 'pending', attempts: 0,
+          createdAt: ctx.at, firstDeliveredAt: null, lastDeliveredAt: null, ackedAt: null });
+        await notifyWorkEventCommit(db, [event]);
+      }
       return saveReceipt(ctx, writer, next, currentHead, 'refreshed', inputRef);
     });
   }
