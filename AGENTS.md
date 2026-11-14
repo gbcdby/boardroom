@@ -6,7 +6,7 @@ Agent Studio 是本地跨 Agent 协作平台；当前范围为单用户、localh
 
 - 当前用法与能力见 `README.md`；产品基线与架构见 `docs/architecture/agent-studio.md`。
 - 宏观架构、范围和架构决策保留在 `docs/`，归档规则见 `docs/README.md`；详细 spec、ticket、决策地图、依赖和状态以 GitHub Issues 为准，不在仓库复制。
-- 开发约定写入本文件或 issue；可调整的 Agent 工作流程见 `docs/agent-workflow.md`。过程材料、日志、草稿和生成产物放 `.agent-output/`。
+- 开发约定写入本文件或 issue；可调整的 Agent 工作流程见 `docs/agent-workflow.md`。过程材料、日志、草稿和生成中间产物仅存本地 `.agent-output/`，由 Git 忽略，不得用 `git add -f` 强制提交。需要长期引用的设计基准、原型、文档和素材整理到 `docs/`，归属见 `docs/README.md`。
 - 正式文档、Issue/PR 和用户交流使用中文；标识符、命令、路径及 API 名称保留原文。
 
 ## 工作流与生效技能
