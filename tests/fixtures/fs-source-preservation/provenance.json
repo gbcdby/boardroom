@@ -1,0 +1,46 @@
+{
+  "schema": "fs-source-preservation-historical-fixture/v1",
+  "source_commit": "76f24e9e77546372582a5192039ccfade580ff6c",
+  "source_tree": "e96abeb9e0414ad19b2b59e50bf344681144fd51",
+  "run": "43472449599",
+  "attempt": 1,
+  "job": "132047558944",
+  "artifact": "14060533424",
+  "zip_sha256": "31e7ecaafef9915fa722f8f2d327f9c6bf479d2e8913b77fb4a7745a92d2a132",
+  "status": "HISTORICAL",
+  "legacy_M05": "FAIL / PROVIDER_PERSISTENT_SB_SAMPLE",
+  "profile_qualification": "NOT_RUN",
+  "source": "https://github.com/gbcdby/boardroom/issues/152#issuecomment-6877030479",
+  "files": {
+    "regular-journal-before.bin.gz": {
+      "raw_file": "regular-journal-before.bin",
+      "raw_bytes": 4194304,
+      "raw_sha256": "5e80927f814f79fd542420cd8453ed0be4600cf8a212e97c519548fd31db6cfd",
+      "stored_sha256": "c345b5c9a7bfec31ca5df56805323da88d63dfdbe7d15d8bd4c18183aa41a03f"
+    },
+    "regular-journal-after.bin.gz": {
+      "raw_file": "regular-journal-after.bin",
+      "raw_bytes": 4194304,
+      "raw_sha256": "e350205ee018aefeb80eb37f3b4e1514acd6a37fd811ae3588a46cd19b9a8198",
+      "stored_sha256": "ea69a283244ab98ff9352dce49ae2f65a291eea4152d986b4bb64b9aceec461a"
+    },
+    "regular-pre.sb": {
+      "raw_file": "regular-pre.sb",
+      "raw_bytes": 1024,
+      "raw_sha256": "0bf0660fc8f5067ec8a1b25cc489c6eb7a5d92c28bf23cc85428377d1f7e7016",
+      "stored_sha256": "0bf0660fc8f5067ec8a1b25cc489c6eb7a5d92c28bf23cc85428377d1f7e7016"
+    },
+    "regular-post.sb": {
+      "raw_file": "regular-post.sb",
+      "raw_bytes": 1024,
+      "raw_sha256": "3c0eaabece0e45ce501f3c33dc75d2648c5f6e9779c5b0318d46cab70ee8afbd",
+      "stored_sha256": "3c0eaabece0e45ce501f3c33dc75d2648c5f6e9779c5b0318d46cab70ee8afbd"
+    },
+    "provider-regular.jsonl.gz": {
+      "raw_file": "provider-regular.jsonl",
+      "raw_bytes": 46565,
+      "raw_sha256": "82a49a366c77484091dfe0aed42e7077b34d5b7df7c2290a4034c004238df5eb",
+      "stored_sha256": "12f74641804cb55519d171d9956c00aa61ff7f66eabbebc08462f20c1173e244"
+    }
+  }
+}
