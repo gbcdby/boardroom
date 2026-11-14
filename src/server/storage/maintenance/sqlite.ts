@@ -15,6 +15,8 @@ import { inspectLinuxSourceProcesses, linuxMappedSourceHandles, linuxSourceMappi
 import { fullSyncDarwinDatabaseHandle, syncMaintenanceHandle } from "./platform.ts";
 import { readSqliteManifests } from "./sqlite-manifests.ts";
 import { readSqliteSourceClients } from "./sqlite-source-clients.ts";
+import { withSourceClientFacts } from "./source-writers.ts";
+import { decodeSqliteSourceRows } from "./source-facts.ts";
 import type { AnchorChange, Blocker, ControlRootIdentity, DatabaseManifests, Json, MaintenanceAdapter, OperationMutex, SourceClientsObservation, SourceLock, SourceObservation } from "./types.ts";
 
 function same(a: unknown, b: unknown): boolean { return canonicalJson(a) === canonicalJson(b); }
@@ -136,6 +138,10 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     } catch (error) { this.darwinConnections.delete(db); db.close(); this.purgeClosedFds(); throw error; }
   }
   private closeSource(db: Database.Database): void { this.darwinConnections.delete(db); db.close(); this.purgeClosedFds(); }
+  private closeFactsSource(db: Database.Database): void {
+    try { this.closeSource(db); }
+    catch { throw new MaintenanceFailure("maintenance_lost", "source-client-facts"); }
+  }
   private beginSourceWrite(db: Database.Database): void {
     if (!["linux", "darwin"].includes(process.platform)) { db.exec("BEGIN IMMEDIATE"); return; }
     const before = this.relevantFds();
@@ -260,7 +266,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     const mutex = this.mutex;
     if (!mutex || this.currentLock) throw new MaintenanceFailure(this.currentLock ? "maintenance_busy" : "maintenance_lost");
     await mutex.assertHeld();
-    const db = this.openSource(false); let active = true;
+    const db = this.openSource(false); let active = true, factsInvalidated = false, factsUsed = false;
     try {
       this.beginSourceWrite(db); this.currentLock = db;
       try { assertSqliteGuardCoverage(db); } catch { throw new MaintenanceFailure("schema_guard_incomplete"); }
@@ -281,7 +287,19 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
             throw new MaintenanceFailure("snapshot_invalid", "source-clients");
           }
         },
-        anchor: async change => { await assertHeld(); this.anchor(db, change, mutex); },
+        withSourceClientFacts: (plan, consume) => { factsUsed = true; return withSourceClientFacts({ root: mutex.root, mutexIdentity: mutex.identity,
+          assertUnchangedLock: async () => { await assertHeld(); if (factsInvalidated) throw new MaintenanceFailure("maintenance_lost"); },
+          observe: () => lock.observeSourceClients(),
+          decodedRows: async observation => decodeSqliteSourceRows(observation),
+          validateSource: (value, observation) => { if (!same(value, observation.sourceIdentity)) throw new MaintenanceFailure("source_changed"); },
+          inspectWriters: async () => this.inspectCurrentWriters(true),
+          runtimeRows: async () => ({
+            runners: db.prepare(`SELECT b.id AS binding_id,b.member_id,r.generation,r.lease_owner,r.exit_confirmed,
+              r.process_identity_json,r.state FROM agent_runtime_bindings b LEFT JOIN agent_runner_states r ON r.binding_id=b.id`).all() as Record<string, unknown>[],
+            owners: db.prepare("SELECT member_id,binding_id,generation,lease_owner,lease_expires_at FROM agent_runtime_members").all() as Record<string, unknown>[],
+          }),
+        }, plan, consume); },
+        anchor: async change => { await assertHeld(); factsInvalidated = true; this.anchor(db, change, mutex); },
         backup: async destination => {
           await assertHeld();
           if (kind !== "snapshot") throw new MaintenanceFailure("maintenance_lost");
@@ -294,7 +312,10 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       if (error instanceof MaintenanceFailure) throw error;
       if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(String((error as { code?: string }).code))) throw new MaintenanceFailure("maintenance_busy");
       throw error;
-    } finally { active = false; this.currentLock = null; this.closeSource(db); }
+    } finally {
+      active = false; this.currentLock = null;
+      if (factsUsed) this.closeFactsSource(db); else this.closeSource(db);
+    }
   }
   private anchor(db: Database.Database, change: AnchorChange, mutex: MutexLease): void {
     this.assertSource();
@@ -379,6 +400,9 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     finally { if (db.inTransaction) db.exec("ROLLBACK"); db.close(); }
   }
   async inspectWriters(_observation: SourceObservation): Promise<readonly Blocker[]> {
+    return this.inspectCurrentWriters();
+  }
+  private async inspectCurrentWriters(strictClose = false): Promise<readonly Blocker[]> {
     this.assertSource();
     if (!["linux", "darwin"].includes(process.platform) || process.getuid === undefined) return [{ code: "source_writer_unknown", subjectRef: "os-inventory-unavailable" }];
     this.purgeClosedFds(); const blockers: Blocker[] = [];
@@ -400,7 +424,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
         try { exited = row.process_identity_json !== null && (await inspectOwnedProcess(JSON.parse(row.process_identity_json))).status === "wrapper_exited"; } catch { /* unknown remains blocking */ }
         if (!exited) blockers.push({ code: "source_writer_active", subjectRef: `runtime-binding:${row.binding_id}` });
       }
-    } finally { this.closeSource(db); }
+    } finally { if (strictClose) this.closeFactsSource(db); else this.closeSource(db); }
     return [...new Map(blockers.map(blocker => [canonicalJson(blocker), blocker])).values()];
   }
   async close(): Promise<void> {

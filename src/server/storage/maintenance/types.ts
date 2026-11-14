@@ -276,6 +276,38 @@ export interface SourceClientsObservation {
   readonly textEncoding: SourceClientsRosterV1["textEncoding"];
   readonly rows: readonly SourceClientRawRow[];
 }
+export interface SourceClientProcessFact {
+  readonly status: "present" | "exited";
+  readonly reason: "identity_matches" | "process_absent" | "identity_replaced" | "boot_changed";
+}
+export interface SourceClientFact {
+  readonly clientId: string;
+  readonly classification: "current-client" | "historical-client";
+  readonly receipt: import("../source-client.ts").StorageDrainReceipt | null;
+  readonly process: SourceClientProcessFact;
+}
+export interface SourceRuntimeFact {
+  readonly bindingId: string;
+  readonly memberId: string;
+  readonly generation: number;
+  readonly status: "not-owned" | "exited";
+}
+/** A scoped observation, never a quiescence/Fs/publication permit. */
+export interface SourceClientFactsWindow {
+  readonly observation: SourceClientsObservation;
+  readonly origin: {
+    readonly kind: "current-generation" | "captured-generation";
+    readonly head: ArtifactRef;
+    readonly capture: ArtifactRef | null;
+    readonly receiptGeneration: number;
+    readonly chain: import("./journal.ts").VerifiedJournalChain;
+  };
+  readonly clients: readonly SourceClientFact[];
+  readonly runtime: readonly SourceRuntimeFact[];
+  readonly scope: readonly string[];
+  /** Repeats native observations; invalid after callback/lock end or a control write. */
+  assertCurrent(): Promise<void>;
+}
 export interface AnchorChange {
   readonly expected: StorageMaintenanceState;
   readonly admission: "open" | "draining" | "sealed";
@@ -292,6 +324,7 @@ export interface AnchorChange {
 export interface SourceLock {
   observe(): Promise<SourceObservation>;
   observeSourceClients(): Promise<SourceClientsObservation>;
+  withSourceClientFacts<T>(plan: PersistedPlanRef, consume: (window: SourceClientFactsWindow) => Promise<T>): Promise<T>;
   anchor(change: AnchorChange): Promise<void>;
   /** Uses an independent snapshot reader; the lock remains held throughout the callback. */
   backup(destination: string): Promise<{ readonly manifests: DatabaseManifests; readonly toolchain: Json }>;

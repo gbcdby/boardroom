@@ -1,4 +1,4 @@
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
+import { accessSync, closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 import { readdir, readlink, stat } from "node:fs/promises";
 import { release } from "node:os";
 import type { Blocker } from "./types.ts";
@@ -7,6 +7,7 @@ const MAP_LIMIT = 8 * 1024 * 1024;
 const METADATA_LIMIT = 2 * 1024 * 1024;
 const READ_LIMIT = 4096;
 const UINT64 = (1n << 64n) - 1n;
+const O_PATH = 0x200000; // Linux UAPI; Node does not expose this flag.
 function unavailable(): never { throw new Error("linux_mapping_inventory_unavailable"); }
 function absent(error: unknown): boolean { return ["ENOENT", "ESRCH"].includes(String((error as NodeJS.ErrnoException).code)); }
 
@@ -70,9 +71,15 @@ export function linuxSourceMappingIdentities(files: readonly string[]): readonly
   const mounts = procText("/proc/self/mountinfo", METADATA_LIMIT), result: LinuxSourceMappingIdentity[] = [];
   for (const [index, file] of files.entries()) {
     let fd: number;
-    try { fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW); }
+    // Closing an ordinary descriptor releases this process's POSIX locks on
+    // the inode, including SQLite WAL/SHM locks held through another handle.
+    // O_PATH supplies only metadata and its close preserves those native locks.
+    try { fd = openSync(file, O_PATH | constants.O_NOFOLLOW); }
     catch (error) { if (index !== 0 && (error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
     try {
+      // O_PATH itself bypasses read permission. Preserve the prior refusal on
+      // unreadable sources, checking the pinned object rather than a new open.
+      accessSync(`/proc/self/fd/${fd}`, constants.R_OK);
       const native = fstatSync(fd, { bigint: true });
       if (!native.isFile() || native.nlink !== 1n) unavailable();
       const mappedIdentity = linuxMappingIdentity(procText(`/proc/self/fdinfo/${fd}`, 64 * 1024), mounts);

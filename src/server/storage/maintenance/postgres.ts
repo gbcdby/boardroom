@@ -16,7 +16,8 @@ import { parsePostgresConnection, postgresDatabaseArgument, postgresToolVersions
   type PostgresConnection, type PostgresDescriptor } from "./postgres-tools.ts";
 import { postgresFileDigest, restorePostgresPublic } from "./postgres-public-restore.ts";
 import { readPublicRestoreCatalogBinding, type PublicRestoreCatalogBinding } from "./postgres-public-toc.ts";
-import { readPostgresSourceClients } from "./postgres-source-clients.ts";
+import { decodePostgresSourceRows, readPostgresSourceClients } from "./postgres-source-clients.ts";
+import { withSourceClientFacts } from "./source-writers.ts";
 import type { AnchorChange, Blocker, BlockerCode, ControlRootIdentity, DatabaseManifests, Json,
   MaintenanceAdapter, OperationMutex, SourceClientsObservation, SourceLock, SourceObservation } from "./types.ts";
 
@@ -147,6 +148,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     session.ended = true; sessions.delete(session);
     if (writerObservation.hasSubscribers) note({ kind: "session-end-complete", outcome, session: sessionMetadata(session) });
     return outcome === "fulfilled";
+  }
+  async function endFactsSession(session: Session): Promise<void> {
+    let confirmed = false;
+    try { confirmed = await endSession(session); } catch { /* Synchronous native close is also uncertain. */ }
+    if (!confirmed) { invalidate(); throw new MaintenanceFailure("maintenance_lost", "source-client-facts"); }
   }
   async function connect(connection: PostgresConnection, sourceSession: boolean, critical = false): Promise<Session> {
     assertOpen();
@@ -325,7 +331,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       await endSession(session); throw safeError(error, "maintenance_lost");
     }
   }
-  async function inspectWriters(current: SourceObservation, phase: WriterPhase = "external"): Promise<readonly Blocker[]> {
+  async function inspectWriters(current: Pick<SourceObservation, "sourceIdentity" | "state" | "clients">, phase: WriterPhase = "external", sourceFacts = false): Promise<readonly Blocker[]> {
     const session = await connect(sourceConnection, true);
     const observing = writerObservation.hasSubscribers, inspectionId = observing ? ++inspectionSequence : 0;
     let stage = "source-identity";
@@ -333,16 +339,30 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       const identity = await readIdentity(session, sourceConnection, true);
       if (!same(current.sourceIdentity, stablePostgresSourceIdentity(identity,
         sourceConnection.descriptorDigest, current.state.databaseInstanceId))) throw new MaintenanceFailure("source_changed");
-      const registered = new Set<string>();
+      const registered = new Set<string>(), registrationPids: number[] = [], registrationStarts: string[] = [];
       for (const client of current.clients) {
         if (typeof client.db_sessions_json !== "string") continue;
         try {
           const envelope = JSON.parse(client.db_sessions_json) as { sessions?: { observedBackends?: { pid?: unknown; backend_start?: unknown }[] }[] };
           for (const entry of envelope.sessions ?? []) for (const backend of entry.observedBackends ?? []) {
-            if (Number.isSafeInteger(backend.pid) && typeof backend.backend_start === "string")
+            if (Number.isSafeInteger(backend.pid) && typeof backend.backend_start === "string") {
               registered.add(`${backend.pid}:${backend.backend_start}`);
+              registrationPids.push(backend.pid as number); registrationStarts.push(backend.backend_start);
+            }
           }
         } catch { /* An invalid registration cannot exempt any real backend. */ }
+      }
+      if (sourceFacts && registrationPids.length) {
+        // Native timestamps can be recorded under a different session TimeZone.
+        // Compare the actual instants without losing PostgreSQL microseconds to JS Date.
+        const normalized = (await session.client.query(`SELECT pid,started::timestamptz::text AS backend_start
+          FROM unnest($1::integer[],$2::text[]) AS registrations(pid,started)`, [registrationPids, registrationStarts])).rows;
+        if (normalized.length !== registrationPids.length) throw new MaintenanceFailure("source_writer_unknown");
+        registered.clear();
+        for (const backend of normalized) {
+          if (!Number.isSafeInteger(backend.pid) || typeof backend.backend_start !== "string") throw new MaintenanceFailure("source_writer_unknown");
+          registered.add(`${backend.pid}:${backend.backend_start}`);
+        }
       }
       stage = "activity-query";
       const actual = (await session.client.query(`SELECT pid,backend_start::text,backend_type,state,
@@ -398,7 +418,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       }
       throw safeError(error, "source_writer_unknown");
     }
-    finally { await endSession(session); }
+    finally { if (sourceFacts) await endFactsSession(session); else await endSession(session); }
   }
   async function withPassfile<T>(connection: PostgresConnection, directory: string,
     callback: (environment: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
@@ -413,7 +433,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     await assertMutex();
     if (lockActive) throw new MaintenanceFailure("maintenance_busy");
     lockActive = true;
-    let session: Session | undefined, active = false, transactionId = "", changed = false, backupUsed = false;
+    let session: Session | undefined, active = false, transactionId = "", changed = false, backupUsed = false, factsInvalidated = false, factsUsed = false;
     let tables: readonly PostgresTable[] = [], lockedSchemaDigest: string | undefined;
     let frozenCapture: DatabaseManifests | undefined;
     try {
@@ -454,8 +474,32 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
             await assertHeld(); return result;
           } catch (error) { throw safeError(error, "snapshot_invalid", "source-clients"); }
         },
+        withSourceClientFacts: (plan, consume) => { factsUsed = true; return withSourceClientFacts({ root: mutex!.root, mutexIdentity: mutex!.identity,
+          assertUnchangedLock: async () => { await assertHeld(); if (factsInvalidated) throw new MaintenanceFailure("maintenance_lost"); },
+          observe: () => lock.observeSourceClients(),
+          decodedRows: observation => decodePostgresSourceRows(locked.client, observation),
+          validateSource(value, observation) {
+            const actual = object(observation.sourceIdentity);
+            const expected = { kind: "postgres", database_oid: actual.databaseOid, schema_oid: actual.schemaOid,
+              database_name: actual.databaseName, schema_name: actual.schemaName, configurationDigest: sha256(source.connectionString) };
+            if (!same(value, expected)) throw new MaintenanceFailure("source_changed");
+          },
+          inspectWriters: async (observation, rows) => inspectWriters({ ...observation, clients: rows as readonly Readonly<Record<string, Json>>[] }, "external", true),
+          runtimeRows: async () => {
+            try {
+              return {
+                runners: (await locked.client.query(`SELECT b.id AS binding_id,b.member_id,r.generation,r.lease_owner,r.exit_confirmed,
+                  r.process_identity_json,r.state FROM agent_runtime_bindings b LEFT JOIN agent_runner_states r ON r.binding_id=b.id`)).rows,
+                owners: (await locked.client.query("SELECT member_id,binding_id,generation,lease_owner,lease_expires_at FROM agent_runtime_members")).rows,
+              };
+            } catch (error) {
+              if (lost || locked.ended) throw new MaintenanceFailure("maintenance_lost", "source-client-facts");
+              throw safeError(error, "source_writer_unknown", "source-client-facts");
+            }
+          },
+        }, plan, consume); },
         async anchor(change) {
-          await assertHeld(); assertAnchor(change, mutex!);
+          await assertHeld(); factsInvalidated = true; assertAnchor(change, mutex!);
           const current = await readPostgresMaintenanceState(locked.client, { required: true });
           if (!same(current, change.expected)) throw new MaintenanceFailure("source_changed");
           const expectedCas = cas(change.expected, 12);
@@ -538,14 +582,17 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           const catalog = await readPostgresCatalog(fresh.client, sourceConnection.schema);
           if (digestJson(catalog.schema) !== lockedSchemaDigest) throw new MaintenanceFailure("source_changed");
           await fresh.client.query("COMMIT");
-        } finally { await endSession(fresh); }
+        } finally { if (factsUsed) await endFactsSession(fresh); else await endSession(fresh); }
       }
       if ((await session.client.query("COMMIT")).command !== "COMMIT") throw new MaintenanceFailure("maintenance_lost");
       active = false; return result;
     } catch (error) {
       if (session) await session.client.query("ROLLBACK").catch(() => {});
       throw safeError(error, "snapshot_invalid");
-    } finally { active = false; lockActive = false; assertSnapshotLock = undefined; publicBackup = undefined; if (session) await endSession(session); }
+    } finally {
+      active = false; lockActive = false; assertSnapshotLock = undefined; publicBackup = undefined;
+      if (session) { if (factsUsed) await endFactsSession(session); else await endSession(session); }
+    }
   }
   function verifyDatabase(databaseFile: string, expected: DatabaseManifests, restoreDirectory: string): Promise<Json> {
     const operation = verifyDatabaseOperation(databaseFile, expected, restoreDirectory);

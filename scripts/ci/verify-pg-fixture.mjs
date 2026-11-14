@@ -8,6 +8,7 @@ export const fixtureImageDigest = "sha256:f377d590e5474681d4d7838635031a2b506479
 export const fixtureImageReference = `postgres@${fixtureImageDigest}`;
 const dockerTimeoutMs = 10_000;
 const maximumReceiptBytes = 16_384;
+const fixtureMaxPreparedTransactions = 8;
 
 // This SELECT runs inside the one job.services.postgres.id container. It never
 // takes a caller-supplied database URL or changes a PostgreSQL setting.
@@ -27,6 +28,11 @@ export const fixtureReadbackSql = `SELECT json_build_object(
   'autovacuumSourceLine', (SELECT sourceline FROM pg_settings WHERE name='autovacuum'),
   'autovacuumPendingRestart', (SELECT pending_restart FROM pg_settings WHERE name='autovacuum'),
   'autovacuumWorkers', (SELECT count(*)::int FROM pg_stat_activity WHERE backend_type='autovacuum worker'),
+  'maxPreparedTransactions', current_setting('max_prepared_transactions')::int,
+  'maxPreparedTransactionsSource', (SELECT source FROM pg_settings WHERE name='max_prepared_transactions'),
+  'maxPreparedTransactionsSourceFile', (SELECT sourcefile FROM pg_settings WHERE name='max_prepared_transactions'),
+  'maxPreparedTransactionsSourceLine', (SELECT sourceline FROM pg_settings WHERE name='max_prepared_transactions'),
+  'maxPreparedTransactionsPendingRestart', (SELECT pending_restart FROM pg_settings WHERE name='max_prepared_transactions'),
   'fsync', current_setting('fsync'),
   'inRecovery', pg_is_in_recovery(),
   'readOnly', current_setting('transaction_read_only')
@@ -56,14 +62,16 @@ function boolean(value) {
 export function projectReadback(input) {
   const value = object(input), result = {};
   for (const key of ["serverVersion", "serverBuild", "database", "user", "systemIdentifier", "postmasterStartedAt",
-    "dataDirectory", "configFile", "autovacuum", "autovacuumSource", "fsync", "readOnly"])
+    "dataDirectory", "configFile", "autovacuum", "autovacuumSource", "maxPreparedTransactionsSource", "fsync", "readOnly"])
     result[key] = text(value[key]);
-  for (const key of ["serverVersionNum", "autovacuumWorkers"]) result[key] = integer(value[key]);
+  for (const key of ["serverVersionNum", "autovacuumWorkers", "maxPreparedTransactions"]) result[key] = integer(value[key]);
   // A default or inaccessible setting can legitimately have no source file.
   // Preserve that failure evidence instead of mistaking NULL for a parser error.
   result.autovacuumSourceFile = value.autovacuumSourceFile === null ? null : text(value.autovacuumSourceFile);
   result.autovacuumSourceLine = value.autovacuumSourceLine === null ? null : integer(value.autovacuumSourceLine);
-  for (const key of ["autovacuumPendingRestart", "inRecovery"]) result[key] = boolean(value[key]);
+  result.maxPreparedTransactionsSourceFile = value.maxPreparedTransactionsSourceFile === null ? null : text(value.maxPreparedTransactionsSourceFile);
+  result.maxPreparedTransactionsSourceLine = value.maxPreparedTransactionsSourceLine === null ? null : integer(value.maxPreparedTransactionsSourceLine);
+  for (const key of ["autovacuumPendingRestart", "maxPreparedTransactionsPendingRestart", "inRecovery"]) result[key] = boolean(value[key]);
   return result;
 }
 export function assertQuietFixtureConfiguration(value) {
@@ -73,6 +81,10 @@ export function assertQuietFixtureConfiguration(value) {
   requireEvidence(value.dataDirectory.startsWith("/") && value.configFile === posix.join(value.dataDirectory, "postgresql.conf")
     && value.autovacuumSourceFile === value.configFile && value.autovacuumSource === "configuration file"
     && value.autovacuumSourceLine > 0 && value.autovacuumPendingRestart === false, "fixture_configuration_source_mismatch");
+  requireEvidence(value.maxPreparedTransactions === fixtureMaxPreparedTransactions, "fixture_prepared_transactions_unavailable");
+  requireEvidence(value.maxPreparedTransactionsSourceFile === value.configFile
+    && value.maxPreparedTransactionsSource === "configuration file" && value.maxPreparedTransactionsSourceLine > 0
+    && value.maxPreparedTransactionsPendingRestart === false, "fixture_prepared_configuration_source_mismatch");
   requireEvidence(value.readOnly === "on" && value.fsync === "on" && value.inRecovery === false, "fixture_readback_state_mismatch");
   // Off does not suppress anti-wraparound workers. A current worker is still a
   // failure, and the original production inventory remains authoritative later.
@@ -92,10 +104,10 @@ const officialReferences = new Set([fixtureImageReference, `library/${fixtureIma
 
 export function runFixtureReadback() {
   const receipt = { version: 1, role: "read-only-owned-ci-service-preflight", status: "FAIL", stage: "service-input",
-    expectedImage: fixtureImageReference, expectedServerVersionNum: 160016,
+    expectedImage: fixtureImageReference, expectedServerVersionNum: 160016, expectedMaxPreparedTransactions: fixtureMaxPreparedTransactions,
     readbackQuerySha256: createHash("sha256").update(fixtureReadbackSql).digest("hex"),
     limits: { dockerCalls: 4, dockerTimeoutMs, statementTimeoutMs: 5000, receiptBytes: maximumReceiptBytes },
-    boundary: "regular autovacuum disabled for this new CI cluster; anti-wraparound workers still fail closed",
+    boundary: "only this new CI cluster enables prepared transactions and disables regular autovacuum; anti-wraparound workers still fail closed",
     productionClients: "separate host/private tool versions remain in the existing preparation logs" };
   try {
     const id = process.env.BOARDROOM_CI_POSTGRES_CONTAINER_ID;
