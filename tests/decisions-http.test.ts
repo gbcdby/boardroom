@@ -12,6 +12,7 @@ import { onWorkEventCommit } from '../src/server/tasks/events.ts';
 import { onResourceChange } from '../src/server/resource-changes.ts';
 import type { DecisionCommandResult,LiveDecisionView } from '../src/shared/decisions.ts';
 import { DECISION_TABLE_NAMES } from '../src/server/decisions/tables.ts';
+import { createDecisionService } from '../src/server/decisions/service.ts';
 
 const cases = [...identityEngines.map(engine => ({engine,int8Control:false})),{engine:'sqlite' as const,int8Control:true}];
 for(const {engine,int8Control} of cases)test(`${engine}: Decision real local HTTP source, rollback, current GET and same-key durable receipt${int8Control?' (PG int8 representation control)':''}`,{skip:identitySkip(engine)},async()=>{
@@ -116,4 +117,35 @@ for(const {engine,int8Control} of cases)test(`${engine}: Decision real local HTT
     const all=await fetch(`${base}/api/decisions`);assert.equal(all.status,200);
     if(int8Control)assert.ok(sourceReads>0,'representation control reached the source reread');
   }finally{f.db.query=query;f.db.exec=exec;f.db.transaction=transaction;await closeHttp?.();await f.close();}
+});
+
+for(const engine of identityEngines)test(`${engine}: S1-T5-R10 real HTTP refresh preserves DTO, durable notification and replay`,{skip:identitySkip(engine)},async()=>{
+  const f=await identityFixture(engine);let closeHttp:(()=>Promise<void>)|undefined;
+  try{
+    await initializePolicyConfiguration(f.repos);const p=await decisionDomainFixture(f.repos),api=createTaskApi({db:f.db,logger:createLogger({write:()=>{}})});
+    const server=createServer((req,res)=>{void api.handle(req,res,new URL(req.url??'/','http://127.0.0.1').pathname).then(handled=>{if(!handled){res.statusCode=404;res.end();}});});
+    await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',()=>{server.off('error',reject);resolve();});});
+    closeHttp=()=>new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
+    const address=server.address();assert.ok(address&&typeof address==='object');const base=`http://127.0.0.1:${address.port}`;
+    const listed=await fetch(`${base}/api/projects/${p.project.id}/decisions?taskId=${p.task.id}`);assert.equal(listed.status,200);
+    const first=(await listed.json() as {decisions:LiveDecisionView[]}).decisions[0]!,url=`${base}/api/projects/${p.project.id}/decisions/${first.ref.decisionId}/refresh`;
+    const input={decisionRef:first.ref,idempotencyKey:'http-refresh'};
+    const post=(body:unknown,origin?:string)=>fetch(url,{method:'POST',headers:{'content-type':'application/json',...(origin?{origin}:{})},body:JSON.stringify(body)});
+    const old=await f.db.query('SELECT * FROM work_events ORDER BY id');
+    assert.equal((await post({...input,recipientMemberId:p.worker.id})).status,400);
+    assert.equal((await post(input,'https://foreign.example')).status,403);
+    assert.deepEqual(await f.db.query('SELECT * FROM work_events ORDER BY id'),old);
+    const response=await post(input),result=await response.json() as DecisionCommandResult;
+    assert.equal(response.status,409);assert.equal(result.receipt.httpStatus,409);assert.equal(result.state,'refreshed');assert.equal(result.current.status,'pending');
+    assert.equal(result.decisionRef.revision,first.ref.revision+1);
+    const notices=await f.repos.tasks.listUnackedWorkEvents(p.project.id,p.manager.id);
+    const fresh=notices.filter(event=>event.kind==='decision.requested'&&event.payload.decisionId===first.ref.decisionId&&event.payload.decisionRevision===result.decisionRef.revision);
+    assert.equal(fresh.length,1);assert.equal(fresh[0]!.recipientMemberId,p.manager.id);
+    const replayResponse=await post(input),replay=await replayResponse.json() as DecisionCommandResult;
+    assert.equal(replayResponse.status,409);assert.equal(replay.replay,'same-key');assert.deepEqual(replay.receipt,result.receipt);
+    const reconstructed=await createDecisionService(f.db).get(p.owner,p.project.id,first.ref.decisionId);assert.equal(reconstructed.recordKind,'live-review-decision');
+    assert.ok(reconstructed.recordKind==='live-review-decision');assert.deepEqual(reconstructed.ref,result.decisionRef);
+    assert.deepEqual(await f.repos.tasks.listUnackedWorkEvents(p.project.id,p.manager.id),notices);
+    for(const table of ['decision_user_events','decision_local_initiations','decision_resolutions','decision_executions'])assert.equal((await f.db.query(`SELECT * FROM ${table}`)).length,0);
+  }finally{await closeHttp?.();await f.close();}
 });
