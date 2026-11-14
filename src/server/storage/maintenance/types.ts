@@ -13,6 +13,39 @@ export interface SourceRef {
   readonly databaseInstanceId: string;
   readonly identityDigest: string;
 }
+export type SourceClientTextCell = readonly ["text", string];
+export type SourceClientIntegerCell = readonly ["integer", string];
+export type SourceClientNullCell = readonly ["null"];
+export interface SourceClientRawRow {
+  readonly client_id: SourceClientTextCell;
+  readonly database_instance_id: SourceClientTextCell;
+  readonly entrypoint: SourceClientTextCell;
+  readonly build_id: SourceClientTextCell;
+  readonly host_identity_json: SourceClientTextCell;
+  readonly process_identity_json: SourceClientTextCell;
+  readonly db_sessions_json: SourceClientTextCell;
+  readonly registered_at: SourceClientTextCell;
+  readonly last_observed_at: SourceClientTextCell;
+  readonly drain_state: SourceClientTextCell;
+  readonly drain_receipt_digest: SourceClientTextCell | SourceClientNullCell;
+  readonly ended_at: SourceClientTextCell | SourceClientNullCell;
+  readonly protocol_version: readonly ["integer", "1"];
+  readonly registered_epoch: SourceClientIntegerCell;
+  readonly observed_epoch: SourceClientIntegerCell;
+  readonly drain_epoch: SourceClientIntegerCell | SourceClientNullCell;
+}
+/** Complete typed original bytes. This value does not grant source provenance or quiescence. */
+export interface SourceClientsRosterV1 {
+  readonly formatVersion: 1;
+  readonly kind: "source-clients-roster";
+  readonly source: SourceRef;
+  readonly migrationId: string;
+  readonly plan: ArtifactRef;
+  readonly fenceEpoch: string;
+  readonly receiptGeneration: string;
+  readonly textEncoding: { readonly backend: SourceRef["kind"]; readonly name: string };
+  readonly rows: readonly SourceClientRawRow[];
+}
 export interface PathIdentity {
   readonly path: string;
   readonly device: string;
@@ -84,8 +117,7 @@ export interface MaintenanceCaptureRef {
   readonly ownerGeneration: number;
 }
 export interface MaintenanceRef extends MaintenanceCaptureRef {}
-export interface JournalRecord {
-  readonly formatVersion: 1;
+interface JournalRecordBase {
   readonly kind: "journal";
   readonly migrationId: string;
   readonly sequence: number;
@@ -99,12 +131,28 @@ export interface JournalRecord {
   readonly fenceEpoch: number;
   readonly ownerGeneration: number;
   readonly evidence: readonly ArtifactRef[];
-  /** Only a capture record contains this pre-snapshot frozen domain; never the full control hash. */
-  readonly frozen: { readonly sourceFilesManifest: ArtifactRef; readonly schemaManifestDigest: string;
-    readonly frozenBusinessManifestDigest: string; readonly guardManifestDigest: string } | null;
   /** Only ready records point to a prior receipt. The receipt never points back to ready. */
   readonly snapshot: ArtifactRef | null;
 }
+export interface JournalFrozenV1 {
+  readonly sourceFilesManifest: ArtifactRef;
+  readonly schemaManifestDigest: string;
+  readonly frozenBusinessManifestDigest: string;
+  readonly guardManifestDigest: string;
+}
+/** Legacy bytes remain explicit; current chains accept only the valid planned/no-Jq prefix. */
+export interface JournalRecordV1 extends JournalRecordBase {
+  readonly formatVersion: 1;
+  readonly frozen: JournalFrozenV1 | null;
+}
+export interface JournalFrozenV2 extends JournalFrozenV1 { readonly sourceClientsDigest: string }
+export interface JournalRecordV2 extends JournalRecordBase {
+  readonly formatVersion: 2;
+  /** Only capture embeds the complete original roster and its five frozen facts. */
+  readonly sourceClients: SourceClientsRosterV1 | null;
+  readonly frozen: JournalFrozenV2 | null;
+}
+export type JournalRecord = JournalRecordV1 | JournalRecordV2;
 export type SourceFileIncarnation =
   | { readonly type: 248; readonly byteCount: 32; readonly hex: string }
   | { readonly type: 1; readonly byteCount: 8; readonly hex: string };
