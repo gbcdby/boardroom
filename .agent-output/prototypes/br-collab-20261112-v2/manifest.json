@@ -1,0 +1,97 @@
+{
+  "prototype_ref": "BR-COLLAB-PROTOTYPE-20261112-v2",
+  "date": "2026-11-12",
+  "scope": "静态原型，示例数据；非实现、交互或运行验收证据",
+  "files": [
+    {
+      "id": "P01",
+      "theme": "light",
+      "path": "light/01-collaboration-overview.png",
+      "bytes": 1408485,
+      "width": 1586,
+      "height": 992,
+      "sha256": "10d8de9602e61707be81bfb8e924602cccb839de316a50bef4eeb44220f12b0d"
+    },
+    {
+      "id": "P02",
+      "theme": "light",
+      "path": "light/02-member-conversation.png",
+      "bytes": 1740187,
+      "width": 1586,
+      "height": 992,
+      "sha256": "c331f2e69aa0736ced8b5f574aba7c6eed73d4077a546a7b412735aef9be094d"
+    },
+    {
+      "id": "P03",
+      "theme": "light",
+      "path": "light/03-task-flow.png",
+      "bytes": 1454171,
+      "width": 1585,
+      "height": 992,
+      "sha256": "28513bfbbaffe5b568474d74a629a0c259c715a67fc1a96f728671b442e2224e"
+    },
+    {
+      "id": "P04",
+      "theme": "light",
+      "path": "light/04-group-chat.png",
+      "bytes": 1389843,
+      "width": 1586,
+      "height": 992,
+      "sha256": "11e6bdc7705a1f2068afc2b5aa03d982a101cf617ef4616407359f234634f246"
+    },
+    {
+      "id": "P05",
+      "theme": "light",
+      "path": "light/05-role-mcp-capabilities.png",
+      "bytes": 1417972,
+      "width": 1586,
+      "height": 992,
+      "sha256": "71f8d1494ea4b3d9ff75a1229db999be5718b4e9152b1160491b2ebed4adb1d4"
+    },
+    {
+      "id": "P01",
+      "theme": "dark",
+      "path": "dark/01-collaboration-overview.png",
+      "bytes": 1479231,
+      "width": 1586,
+      "height": 992,
+      "sha256": "b29aac16b4662643789ecf4becc03846ab09eeed86bc1d9976985a9ff639cd17"
+    },
+    {
+      "id": "P02",
+      "theme": "dark",
+      "path": "dark/02-member-conversation.png",
+      "bytes": 1725976,
+      "width": 1585,
+      "height": 992,
+      "sha256": "e4483056db01b7a285e766f086c8e6bb2555b14c4d7f96a3bfb4643cd36a74c0"
+    },
+    {
+      "id": "P03",
+      "theme": "dark",
+      "path": "dark/03-task-flow.png",
+      "bytes": 1530982,
+      "width": 1586,
+      "height": 992,
+      "sha256": "15ff08cc64ec2d21c904efee3feb7bf40d2c53654cc30e50c0f335ce99ee55c8"
+    },
+    {
+      "id": "P04",
+      "theme": "dark",
+      "path": "dark/04-group-chat.png",
+      "bytes": 1744803,
+      "width": 1585,
+      "height": 992,
+      "sha256": "bfec8fda8497761134f5a1562be135f2b26b1d41a1f0f03c996d7aafe988cb47"
+    },
+    {
+      "id": "P05",
+      "theme": "dark",
+      "path": "dark/05-role-mcp-capabilities.png",
+      "bytes": 1484416,
+      "width": 1585,
+      "height": 992,
+      "sha256": "a7338c41feefe1dd190d25159c1d353a9483fbedffff4b347dea9e201eaf51c7"
+    }
+  ]
+}
