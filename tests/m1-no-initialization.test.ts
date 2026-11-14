@@ -1,7 +1,7 @@
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import fs, { existsSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { spawnSync } from "node:child_process";
@@ -125,7 +125,8 @@ test("M1 SQLite readonly预检后原文件移走，第二次NO_CREATE打开失�
 
 test("M1 SQLite inspect后出现同名新文件，独占创建失败且竞争者原文件不接管", async () => {
   const source = await m1Sqlite();
-  const targetDir = path.join(source.directory!, "target"), targetFile = path.join(targetDir, DATABASE_FILE_NAME);
+  const targetDir = path.join(source.directory!, "target");
+  const targetFile = path.join(await realpath(source.directory!), "target", DATABASE_FILE_NAME);
   const original = fs.openSync;
   let competed = false;
   const hook = mock.method(fs, "openSync", function (...args: Parameters<typeof fs.openSync>) {
@@ -144,7 +145,7 @@ test("M1 SQLite inspect后出现同名新文件，独占创建失败且竞争者
   } finally { hook.mock.restore(); syncBuiltinESMExports(); await source.close(); }
 });
 
-test("M1 SQLite实际同源别名在初始化/clear前拒绝，原57表保持", async () => {
+test("M1 SQLite实际同源别名在初始化/clear前拒绝，原58表保持", async () => {
   const source = await m1Sqlite(true);
   await withM1Cleanup(async () => {
     const before = await m1Capture(source.db);
@@ -196,7 +197,7 @@ test("M1 sourcePermit不能由配置布尔值伪造，owner结束后也不能重
 test("M1 copy原错保留，target/source close故障分别收集且其余连接仍关闭", async () => {
   const source = await m1Sqlite(true), target = await m1Sqlite();
   await target.db.exec("CREATE TRIGGER m1_copy_fail BEFORE INSERT ON decision_changes BEGIN SELECT RAISE(ABORT,'original-copy-failure'); END");
-  const sourceFile = path.join(source.directory!, DATABASE_FILE_NAME), targetFile = path.join(target.directory!, DATABASE_FILE_NAME);
+  const sourceFile = await realpath(path.join(source.directory!, DATABASE_FILE_NAME)), targetFile = await realpath(path.join(target.directory!, DATABASE_FILE_NAME));
   const sourceClose = new Error("source-close-failed"), targetClose = new Error("target-close-failed");
   const closed: string[] = [];
   const originalClose = SqliteDriver.prototype.close;
@@ -219,7 +220,7 @@ test("M1 copy原错保留，target/source close故障分别收集且其余连接
 
 test("M1 目标已真实提交后source最终完成失败：保留失败，目标数据如实保持已提交", async () => {
   const source = await m1Sqlite(true), target = await m1Sqlite();
-  const sourceFile = path.join(source.directory!, DATABASE_FILE_NAME);
+  const sourceFile = await realpath(path.join(source.directory!, DATABASE_FILE_NAME));
   const original = SqliteDriver.prototype.transaction;
   const failure = new Error("source-final-completion-failed");
   const hook = mock.method(SqliteDriver.prototype, "transaction", async function <T>(this: SqliteDriver,

@@ -189,3 +189,44 @@ for (const revoke of ["member", "group"] as const) {
     }
   });
 }
+
+for (const revoke of ["group", "member", "group-archive"] as const) {
+  test(`#157 join 真实reader返回前${revoke}变化：按当前context兑现或拒绝，不泄漏旧正文`, async () => {
+    const f = await fixture();
+    const runtime = getMemoryRuntime(f.db), read = runtime.reader.readOwn.bind(runtime.reader);
+    let entered!: () => void, release!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const identity = { displayName: "入群最终观察", hostType: "other", projectId: f.project.id, groupId: f.group.id };
+      const joined = await f.core.join("observer", identity);
+      const canary = "join-private-memory-must-not-leak";
+      await f.core.memoryOperation("observer", "write", { scope: "global", expectedVersion: 0, clientMutationId: "join-canary", markdown: canary });
+      await new Promise<void>(resolve => scheduleMemoryReconciliation(f.db, "test:before-join-revocation", async () => { resolve(); }));
+      runtime.reader.readOwn = async binding => { const result = await read(binding); entered(); await gate; return result; };
+      const pending = f.core.join("observer", identity).then(value => ({ value, error: undefined }), (error: unknown) => ({ value: undefined, error }));
+      watchdog = setTimeout(release, 3000);
+      await ready;
+      if (revoke === "group") await f.repos.groups.removeParticipant(f.group.id, joined.memberId);
+      else if (revoke === "member") await f.repos.members.setStatus(joined.memberId, "disabled");
+      else await f.repos.groups.archive(f.group.id);
+      release();
+      const result = await pending;
+      if (revoke === "group") {
+        assert.equal(result.error, undefined);
+        assert.equal(result.value!.context.visibility.scope, "none");
+        assert.deepEqual(result.value!.context.participants, []);
+        assert.deepEqual(result.value!.context.memory?.entries, []);
+        assert.ok(!JSON.stringify(result.value).includes(canary));
+        runtime.reader.readOwn = read;
+        await f.repos.groups.addParticipant(f.group.id, joined.memberId);
+        const restored = await f.core.waitForMessages("observer", { timeoutMs: 10 });
+        assert.equal(restored.memory?.entries[0]?.markdown, canary, "未兑现版本不能被旧join的指纹吞掉");
+      } else {
+        assert.equal((result.error as { code?: string })?.code, "FORBIDDEN");
+        assert.equal(result.value, undefined);
+      }
+    } finally { if (watchdog) clearTimeout(watchdog); release(); runtime.reader.readOwn = read; await f.close(); }
+  });
+}

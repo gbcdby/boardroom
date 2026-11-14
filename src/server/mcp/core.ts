@@ -741,14 +741,14 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    */
   async function guard(binding: SessionBinding, capability: Capability, scope: GuardScope, denyMessage?: string): Promise<void> {
     const member = await currentBindingMember(binding);
+    const groupMemberIds = scope.groupMemberIds ?? (scope.groupId === undefined ? undefined : await repos.groups.participants(scope.groupId));
     const decision = authorize(
       (await options.authz?.actorFor?.(binding)) ?? (await orgActorForMember(repos, binding.memberId)) ?? actorForMember(member),
       capability,
       {
         ...scope,
-        ...(scope.groupId !== undefined && scope.groupMemberIds === undefined
-          ? { groupMemberIds: await (repos.groups.participants(scope.groupId)) }
-          : {}),
+        ...(groupMemberIds === undefined ? {} : { groupMemberIds,
+          groupMemberNodeIds: scope.groupMemberNodeIds ?? await Promise.all(groupMemberIds.map(async id => (await repos.members.get(id))?.nodeId ?? null)) }),
         conn: { projectId: binding.projectId, groupIds: [binding.groupId] },
       },
     );
@@ -1571,21 +1571,28 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       // The isolated memory reader may yield after event delivery committed.
       // Publish only after the real current binding and event eligibility pass
       // again under the same project/member/fence boundary as the response.
-      return withAccess(binding, "consume", async () => {
+      const responseAccess = workEvents.length ? "consume" : "observe";
+      return withAccess(binding, responseAccess, async () => {
         if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError('FORBIDDEN', '入群会话在响应前已失效。');
-        await guard(binding, 'group:view', { projectId: binding.projectId, groupId: binding.groupId });
         const project = await repos.projects.get(binding.projectId), group = await repos.groups.get(binding.groupId);
         if (!project || !group || project.archivedAt !== null || group.archivedAt !== null)
           throw new McpToolError('FORBIDDEN', '项目或群组已归档，不能兑现旧入群响应。');
+        // A join may legitimately observe read_only/none, including before a
+        // managed host has confirmed its permission mode. Rebuild that context
+        // under the final fence; only actual work-event delivery is consumption.
+        const context = await buildSessionContext(binding);
         if (workEvents.length) {
           const current = new Set((await tasks.listWorkEvents(await taskAccess(binding), binding.projectId)).map(event => event.id));
           if (workEvents.some(event => !current.has(event.id))) throw new McpToolError('FORBIDDEN', '工作事件在入群响应前已失效。');
         }
-        return withAccess(binding, "consume", async () => {
+        return withAccess(binding, responseAccess, async () => {
           if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError('FORBIDDEN', '入群会话在响应前已失效。');
-          injectedVersions.set(binding.sessionId, preparedMemory.fingerprint);
-          reconcileMemorySoon(binding);
-          return { ...result, context: { ...result.context, memory: preparedMemory.injection },
+          if (context.visibility.scope !== "none") {
+            injectedVersions.set(binding.sessionId, preparedMemory.fingerprint);
+            reconcileMemorySoon(binding);
+          }
+          return { ...result, context: { ...context, memory: context.visibility.scope === "none"
+            ? unavailableMemory(memoryRuntime.config, "memory_binding_unavailable") : preparedMemory.injection },
             ...(workEvents.length ? { workEvents } : {}) };
         });
       });
@@ -1645,7 +1652,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   async function buildSessionContext(binding: SessionBinding): Promise<McpSessionContext> {
     const project = await (repos.projects.get(binding.projectId));
     const group = await (repos.groups.get(binding.groupId));
-    const actor = (await (options.authz?.actorFor?.(binding))) ?? actorForSession(binding);
+    const member = await currentBindingMember(binding);
+    const actor = (await options.authz?.actorFor?.(binding)) ?? (await orgActorForMember(repos, binding.memberId)) ?? actorForMember(member);
     const participantIds = await (repos.groups.participants(binding.groupId));
     const scope: GuardScope = {
       projectId: binding.projectId,
@@ -1676,7 +1684,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       group: { id: group!.id, name: group!.name },
       identity: {
         memberId: binding.memberId,
-        displayName: binding.displayName,
+        displayName: member.displayName,
         role: actor.role,
         reach: actor.reach ?? ROLE_REACH[actor.role],
       },
