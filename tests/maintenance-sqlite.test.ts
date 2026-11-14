@@ -28,6 +28,8 @@ async function fixture() {
 async function enter(lock: SourceLock, store: ArtifactStore, mutexIdentity: AnchorChange["mutexIdentity"], sequence: number, previous: ArtifactRef | null) {
   const observed = await lock.observe();
   const phase = sequence === 1 ? "planned" : "quiesced";
+  // Deliberately incomplete legacy-shaped bytes exercise only native anchor CAS, not the journal
+  // reader or a source proof. Valid current v2 capture/closure fixtures live in maintenance-journal.
   const journal = await store.putJson("journal", { formatVersion: 1, kind: "journal", migrationId: "fixture", sequence, previous,
     phase, event: sequence === 1 ? "enter" : "capture", requestId: `request-${sequence}`, requestDigest: "d".repeat(64),
     source: observed.source, plan: { ref: `plans/${"a".repeat(64)}.json`, sha256: "a".repeat(64), bytes: "1" },

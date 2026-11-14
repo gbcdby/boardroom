@@ -1,14 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { canonicalJson, digestJson, sha256 } from "../src/server/storage/maintenance/canonical.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import { readSourceFiles } from "../src/server/storage/maintenance/parse.ts";
+import { buildSourceClientsRoster, sourceClientsDigest } from "../src/server/storage/maintenance/source-clients.ts";
 import { buildDatabaseManifests, digestRowMultiset } from "../src/server/storage/maintenance/manifests.ts";
 import { assertFrozenSourceUnchanged, captureReference, restorePointDigest, verifyJournalChain, verifySnapshotClosure } from "../src/server/storage/maintenance/journal.ts";
-import type { ArtifactRef, DatabaseManifests, JournalRecord, MigrationPlan, SourceFilesManifest, SourceObservation } from "../src/server/storage/maintenance/types.ts";
+import type { ArtifactRef, DatabaseManifests, JournalRecordV2 as JournalRecord, MigrationPlan, SourceFilesManifest, SourceObservation, SourceClientsRosterV1 } from "../src/server/storage/maintenance/types.ts";
 
 const platformTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
 const hash = (letter: string) => letter.repeat(64);
@@ -31,9 +33,9 @@ async function fixture(options: { sourceFiles?: (value: SourceFilesManifest) => 
     fileRoots: roots, preview: { observedAt: "2026-11-12T00:00:00.000Z", dataDigest: hash("d"), tableCounts: {}, clientInventory: [] }, requiredCapabilities: [], blockers: [] };
   const planRef = await store.putJson("plan", plan);
   const capability = await store.putJson("capability", await store.capability());
-  const body: JournalRecord = { formatVersion: 1, kind: "journal", migrationId: plan.migrationId, sequence: 1, previous: null,
+  const body: JournalRecord = { formatVersion: 2, kind: "journal", migrationId: plan.migrationId, sequence: 1, previous: null,
     phase: "planned", event: "enter", requestId: "enter", requestDigest: hash("e"), source, plan: planRef,
-    fenceEpoch: 1, ownerGeneration: 1, evidence: [capability], frozen: null, snapshot: null };
+    fenceEpoch: 1, ownerGeneration: 1, evidence: [capability], frozen: null, snapshot: null, sourceClients: null };
   const enter = await store.putJson("journal", body);
   const payload = await store.putBytes("source-file-payload", Buffer.from("private config bytes"));
   // Fixed synthetic ext4-shaped bytes; no source is opened and no native/provider claim is made.
@@ -49,9 +51,13 @@ async function fixture(options: { sourceFiles?: (value: SourceFilesManifest) => 
   const table = (name: string, rows: readonly unknown[]) => ({ name, columns: ["fixture"], ...digestRowMultiset(rows as never) });
   const domainTable = table("ordinary", [["text", "same"], ["text", "same"]]);
   const frozen = buildDatabaseManifests("sqlite", schema, [domainTable], { storage_maintenance: [], storage_source_clients: [] });
+  const sourceClients = buildSourceClientsRoster({ formatVersion: 1, kind: "source-clients-roster", source, migrationId: plan.migrationId,
+    plan: planRef, fenceEpoch: "1", receiptGeneration: "1", textEncoding: { backend: "sqlite", name: "UTF-8" }, rows: [] });
   const captured: JournalRecord = { ...body, sequence: 2, previous: enter, phase: "quiesced", event: "capture", requestId: "capture",
+    sourceClients,
     frozen: { sourceFilesManifest: filesRef, schemaManifestDigest: frozen.schemaManifestDigest,
-      frozenBusinessManifestDigest: frozen.frozenBusinessManifestDigest, guardManifestDigest: plan.guardManifestDigest } };
+      frozenBusinessManifestDigest: frozen.frozenBusinessManifestDigest, guardManifestDigest: plan.guardManifestDigest,
+      sourceClientsDigest: sourceClientsDigest(sourceClients) } };
   const captureRef = await store.putJson("journal", captured);
   const capture = captureReference({ record: captured, reference: captureRef });
   const control = { database_instance_id: source.databaseInstanceId, admission: "sealed", fence_epoch: "1", owner_generation: "1",
@@ -84,7 +90,7 @@ async function fixture(options: { sourceFiles?: (value: SourceFilesManifest) => 
     close: () => rm(dir, { recursive: true, force: true }) };
 }
 
-platformTest("#152 FSI-08: exact anchored v1 chains are rejected at capture and ready without rewriting bytes", async () => {
+platformTest("#152 FSI-08: exact anchored Fs v1 is rejected by v2 capture and ready without rewriting bytes", async () => {
   const f = await fixture({ sourceFiles: value => {
     const { rootBindings: _bindings, ...legacy } = value;
     return { ...legacy, formatVersion: 1, entries: value.entries.map(({ sourceWitness: _witness, ...entry }) => entry) };
@@ -148,11 +154,11 @@ platformTest("#152 journal starts at the exact anchor and preserves the capture 
   } finally { await f.close(); }
 });
 
-platformTest("#152 recapture preserves every existing frozen field across takeover", async (t) => {
+platformTest("#152 SC-A07: v2 recapture preserves all five frozen fields and original roster across takeover", async (t) => {
   const f = await fixture();
   try {
     const takeover: JournalRecord = { ...f.captured, sequence: 3, previous: f.captureRef, event: "takeover",
-      requestId: "takeover", ownerGeneration: 2, frozen: null };
+      requestId: "takeover", ownerGeneration: 2, frozen: null, sourceClients: null };
     const takeoverRef = await f.store.putJson("journal", takeover);
     const recaptured: JournalRecord = { ...f.captured, sequence: 4, previous: takeoverRef,
       requestId: "recapture", ownerGeneration: 2 };
@@ -162,6 +168,8 @@ platformTest("#152 recapture preserves every existing frozen field across takeov
       assert.equal(chain.nodes.length, 4);
       assert.deepEqual(captures.map(node => node.record.ownerGeneration), [1, 2]);
       assert.deepEqual(captures.map(node => node.record.frozen), [f.captured.frozen, f.captured.frozen]);
+      assert.ok(captures.every(node => node.record.formatVersion === 2));
+      assert.deepEqual(captures.map(node => node.record.formatVersion === 2 ? node.record.sourceClients?.receiptGeneration : null), ["1", "1"]);
     });
     // A distinct, fully readable synthetic closure must not become a new frozen baseline.
     const payload = await f.store.putBytes("source-file-payload", Buffer.from("changed private config bytes"));
@@ -179,11 +187,181 @@ platformTest("#152 recapture preserves every existing frozen field across takeov
         // These values are valid on their own; rejection must come from the earlier capture.
         const standalone = await f.store.putJson("journal", { ...f.captured, frozen: change.frozen });
         assert.equal((await verifyJournalChain(f.store, standalone)).nodes.length, 2);
+      } else {
+        // These two values are bound to the same plan before the frozen equality guard.
+        await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", { ...f.captured, frozen: change.frozen })), /journal_invalid/);
       }
       const head = await f.store.putJson("journal", { ...recaptured, frozen: change.frozen });
       await assert.rejects(verifyJournalChain(f.store, head),
         error => error instanceof MaintenanceFailure && error.code === "journal_invalid");
     });
+    await t.test("complete roster and self-consistent fifth digest cannot replace the first capture", async () => {
+      const vectors = JSON.parse(readFileSync(new URL("./fixtures/maintenance-source-clients-v1.json", import.meta.url), "utf8"));
+      const sample = JSON.parse(vectors.rawByteVectors[0].canonicalEnvelope) as SourceClientsRosterV1;
+      const sourceClients = buildSourceClientsRoster({ ...f.captured.sourceClients!, rows: sample.rows });
+      const frozen = { ...f.captured.frozen!, sourceClientsDigest: sourceClientsDigest(sourceClients) };
+      const firstRef = await f.store.putJson("journal", { ...f.captured, sourceClients, frozen });
+      assert.equal((await verifyJournalChain(f.store, firstRef)).nodes.length, 2);
+      await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", { ...recaptured, sourceClients, frozen })), /journal_invalid/);
+      const takeoverRef = await f.store.putJson("journal", { ...takeover, previous: firstRef });
+      for (const changed of [
+        { ...sourceClients, rows: sourceClients.rows.map(row => ({ ...row, host_identity_json: ["text", row.host_identity_json[1] + "0a"] as const })) },
+        { ...sourceClients, textEncoding: { backend: "sqlite", name: "UTF-16le" } },
+      ]) {
+        const frozen = { ...f.captured.frozen!, sourceClientsDigest: digestJson(changed) };
+        // Each self-consistent raw-byte/encoding variant is a valid standalone first capture.
+        assert.equal((await verifyJournalChain(f.store, await f.store.putJson("journal", { ...f.captured, sourceClients: changed, frozen }))).nodes.length, 2);
+        await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", {
+          ...recaptured, previous: takeoverRef, sourceClients: changed, frozen,
+        })), /journal_invalid/);
+      }
+    });
+  } finally { await f.close(); }
+});
+
+platformTest("#152 SC-A06: self-consistent roster digests cannot cross source, plan, epoch or first generation", async t => {
+  const f = await fixture();
+  try {
+    assert.equal((await verifyJournalChain(f.store, f.captureRef)).nodes.length, 2);
+    const roster = f.captured.sourceClients!;
+    const variants = [
+      { name: "source backend", roster: { ...roster, source: { ...roster.source, kind: "postgres" }, textEncoding: { backend: "postgres", name: "UTF8" } } },
+      { name: "database instance", roster: { ...roster, source: { ...roster.source, databaseInstanceId: "9".repeat(32) } } },
+      { name: "source identity", roster: { ...roster, source: { ...roster.source, identityDigest: hash("f") } } },
+      { name: "plan path", roster: { ...roster, plan: { ...roster.plan, ref: `plans/${hash("f")}.json` } } },
+      { name: "plan digest", roster: { ...roster, plan: { ...roster.plan, sha256: hash("f") } } },
+      { name: "plan byte count", roster: { ...roster, plan: { ...roster.plan, bytes: "1" } } },
+      { name: "migration", roster: { ...roster, migrationId: "another-plan" } },
+      { name: "fence epoch", roster: { ...roster, fenceEpoch: "2" } },
+      { name: "first receipt generation", roster: { ...roster, receiptGeneration: "2" } },
+      { name: "cross-backend encoding", roster: { ...roster, textEncoding: { backend: "postgres", name: "UTF8" } } },
+      { name: "wrong encoding name", roster: { ...roster, textEncoding: { backend: "sqlite", name: "UTF8" } } },
+    ];
+    for (const variant of variants) await t.test(variant.name, async () => {
+      const frozen = { ...f.captured.frozen!, sourceClientsDigest: digestJson(variant.roster) };
+      const reference = await f.store.putJson("journal", { ...f.captured, sourceClients: variant.roster, frozen });
+      await assert.rejects(verifyJournalChain(f.store, reference), error => error instanceof MaintenanceFailure && error.code === "journal_invalid");
+    });
+    await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", {
+      ...f.captured, frozen: { ...f.captured.frozen!, sourceClientsDigest: hash("f") },
+    })), /journal_invalid/);
+    await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", { ...f.body, sourceClients: roster })), /journal_invalid/);
+    const takeover = { ...f.captured, sequence: 3, previous: f.captureRef, event: "takeover", ownerGeneration: 2, frozen: null, sourceClients: null };
+    const previous = await f.store.putJson("journal", takeover);
+    const changedGeneration = { ...roster, receiptGeneration: "2" };
+    await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", { ...f.captured, sequence: 4, previous,
+      ownerGeneration: 2, sourceClients: changedGeneration, frozen: { ...f.captured.frozen!, sourceClientsDigest: digestJson(changedGeneration) } })), /journal_invalid/);
+  } finally { await f.close(); }
+});
+
+platformTest("#152 SC-A08: only a valid v1 planned prefix can transition directly to the first v2 capture", async () => {
+  const f = await fixture();
+  try {
+    const { sourceClients: _roster, ...body } = f.body;
+    const legacyEnter = { ...body, formatVersion: 1 };
+    const enter = await f.store.putJson("journal", legacyEnter);
+    const takeover = { ...legacyEnter, sequence: 2, previous: enter, event: "takeover", ownerGeneration: 2, requestId: "legacy-takeover" };
+    const takeoverRef = await f.store.putJson("journal", takeover);
+    const observation = { ...takeover, sequence: 3, previous: takeoverRef, event: "observation", requestId: "legacy-observation" };
+    const planned = await f.store.putJson("journal", observation);
+    const oldBytes = await f.store.readBytes(planned);
+    const prefix = await verifyJournalChain(f.store, planned);
+    assert.equal(prefix.nodes.length, 3);
+    assert.ok(prefix.nodes.every(node => node.record.formatVersion === 1 && node.record.phase === "planned" && node.record.frozen === null));
+    const sourceClients = { ...f.captured.sourceClients!, receiptGeneration: "2" };
+    const captured = { ...f.captured, sequence: 4, previous: planned, ownerGeneration: 2, sourceClients,
+      frozen: { ...f.captured.frozen!, sourceClientsDigest: digestJson(sourceClients) } };
+    const captureRef = await f.store.putJson("journal", captured);
+    assert.deepEqual((await verifyJournalChain(f.store, captureRef)).nodes.map(node => node.record.formatVersion), [1, 1, 1, 2]);
+    const v2Takeover = { ...captured, sequence: 5, previous: captureRef, event: "takeover", ownerGeneration: 3, frozen: null, sourceClients: null };
+    const v2TakeoverRef = await f.store.putJson("journal", v2Takeover);
+    assert.equal((await verifyJournalChain(f.store, await f.store.putJson("journal", {
+      ...captured, sequence: 6, previous: v2TakeoverRef, ownerGeneration: 3,
+    }))).nodes.length, 6);
+    for (const event of ["takeover", "observation"]) {
+      const bad = { ...f.body, sequence: 4, previous: planned, event, ownerGeneration: event === "takeover" ? 3 : 2 };
+      await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", bad)), /journal_invalid/);
+    }
+    await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", { ...captured, ownerGeneration: 3 })), /journal_invalid/);
+    const backwards = { ...observation, sequence: 2, previous: f.enter, ownerGeneration: 1 };
+    await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", backwards)), /journal_invalid/);
+    await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", {
+      ...observation, sequence: 5, previous: captureRef, phase: "quiesced",
+    })), /journal_invalid/);
+    for (const event of ["cancel_intent", "cancelled"]) await assert.rejects(verifyJournalChain(f.store,
+      await f.store.putJson("journal", { ...observation, sequence: 4, previous: planned, event })), /journal_invalid/);
+    assert.deepEqual(await f.store.readBytes(planned), oldBytes);
+  } finally { await f.close(); }
+});
+
+platformTest("#152 SC-A08: legacy capture/ready cannot be accepted or laundered by a v2 recapture", async () => {
+  const f = await fixture();
+  try {
+    const { sourceClients: _empty, ...body } = f.body;
+    const enter = await f.store.putJson("journal", { ...body, formatVersion: 1 });
+    const { sourceClients: _roster, ...captured } = f.captured;
+    const { sourceClientsDigest: _digest, ...frozen } = f.captured.frozen!;
+    const legacyCapture = { ...captured, formatVersion: 1, previous: enter, frozen };
+    const reference = await f.store.putJson("journal", legacyCapture), original = await f.store.readBytes(reference);
+    await assert.rejects(verifyJournalChain(f.store, reference), /journal_invalid/);
+    const ready = await f.finish();
+    const { sourceClients: _readyRoster, ...readyRecord } = ready.record;
+    const legacyReady = await f.store.putJson("journal", { ...readyRecord, formatVersion: 1, previous: reference });
+    await assert.rejects(verifyJournalChain(f.store, legacyReady), /journal_invalid/);
+    await assert.rejects(verifySnapshotClosure(f.store, legacyReady), /journal_invalid/);
+    const takeover = await f.store.putJson("journal", { ...legacyCapture, sequence: 3, previous: reference,
+      event: "takeover", ownerGeneration: 2, frozen: null });
+    await assert.rejects(verifyJournalChain(f.store, await f.store.putJson("journal", { ...f.captured,
+      sequence: 4, previous: takeover, ownerGeneration: 2 })), /journal_invalid/);
+    assert.deepEqual(await f.store.readBytes(reference), original);
+  } finally { await f.close(); }
+});
+
+platformTest("#152 SC-A14: private v2 originals survive readback and failed publication without selecting an orphan", async () => {
+  const f = await fixture();
+  try {
+    const reopened = await ArtifactStore.open(f.store.root, f.source);
+    const original = await reopened.readBytes(f.captureRef), identity = await stat(reopened.pathFor(f.captureRef), { bigint: true });
+    assert.equal(original.toString("utf8"), canonicalJson(f.captured));
+    assert.deepEqual(await reopened.putJson("journal", f.captured), f.captureRef);
+    assert.equal((await stat(reopened.pathFor(f.captureRef), { bigint: true })).ino, identity.ino);
+    assert.equal(identity.mode & 0o777n, 0o600n);
+    const orphan = { ...f.body, sequence: 3, previous: f.captureRef, phase: "quiesced", event: "observation", requestId: "orphan" };
+    let faultReached = false;
+    const failedStore = await ArtifactStore.open(f.store.root, f.source, { after(point) {
+      if (point === "directory_synced") { faultReached = true; throw new MaintenanceFailure("journal_invalid"); }
+    } });
+    await assert.rejects(failedStore.putJson("journal", orphan), /journal_invalid/);
+    assert.equal(faultReached, true);
+    const bytes = Buffer.from(canonicalJson(orphan)), hash = sha256(bytes);
+    const orphanRef = { ref: `journals/${f.body.migrationId}/3-${hash}.json`, sha256: hash, bytes: String(bytes.length) };
+    assert.deepEqual(await reopened.readBytes(orphanRef), bytes);
+    const checked = await verifyJournalChain(reopened, f.captureRef);
+    assert.deepEqual(Object.keys(checked).sort(), ["nodes", "plan"]);
+    assert.equal(checked.nodes.length, 2);
+    assert.deepEqual(checked.nodes.at(-1)!.reference, f.captureRef);
+    assert.deepEqual(await reopened.readBytes(f.captureRef), original);
+  } finally { await f.close(); }
+});
+
+platformTest("#152 SC-A14: corrupt or noncanonical v2 bytes fail safely and preserve root/I/O errors", async () => {
+  const f = await fixture();
+  try {
+    const original = await f.store.readBytes(f.captureRef);
+    for (const bytes of [Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), original]), Buffer.concat([original, Buffer.from("\n")]),
+      Buffer.from(JSON.stringify(f.captured)), Buffer.from("{"), Buffer.from([0xff])]) {
+      const hash = sha256(bytes), reference = { ref: `journals/${f.body.migrationId}/2-${hash}.json`, sha256: hash, bytes: String(bytes.length) };
+      await writeFile(f.store.pathFor(reference), bytes, { mode: 0o600, flag: "wx" });
+      await assert.rejects(verifyJournalChain(f.store, reference), error => error instanceof MaintenanceFailure && error.code === "journal_invalid"
+        && error.message === "storage_maintenance: journal_invalid (source)");
+    }
+    await chmod(f.store.root, 0o750);
+    try { await assert.rejects(verifyJournalChain(f.store, f.captureRef), /control_root_mismatch/); }
+    finally { await chmod(f.store.root, 0o700); }
+    await writeFile(f.store.pathFor(f.captureRef), Buffer.alloc(original.length, 0x20));
+    await assert.rejects(verifyJournalChain(f.store, f.captureRef), /snapshot_invalid/);
+    await rm(f.store.pathFor(f.captureRef));
+    await assert.rejects(verifyJournalChain(f.store, f.captureRef), /ENOENT/);
   } finally { await f.close(); }
 });
 
@@ -243,7 +421,7 @@ platformTest("#152 captured cancellation blocks capture/ready and is terminal wi
     const ready = await f.finish();
     for (const anchor of [{ reference: f.captureRef, record: f.captured }, ready]) {
       const intent: JournalRecord = { ...anchor.record, sequence: anchor.record.sequence + 1, previous: anchor.reference,
-        event: "cancel_intent", requestId: "cancel", frozen: null, snapshot: null };
+        event: "cancel_intent", requestId: "cancel", frozen: null, snapshot: null, sourceClients: null };
       const intentRef = await f.store.putJson("journal", intent);
       assert.equal((await verifyJournalChain(f.store, intentRef)).nodes.at(-1)!.record.phase, anchor.record.phase);
       const cancelled: JournalRecord = { ...intent, sequence: intent.sequence + 1, previous: intentRef,

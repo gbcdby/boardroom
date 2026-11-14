@@ -1,0 +1,1402 @@
+{
+  "provenance": "Fixed author vectors prepared before the codec exists. Explicit expected row order is [a,b]; canonical ASCII envelope is independently encoded with Python json sort_keys/separators and hashlib SHA256. Tests consume these pinned bytes/digests, never derive expected from the codec. Synthetic typed bytes do not assert a real database or writer proof. Additional fixed canonical strings and digests use independent Python json/hashlib; typed bytes only, not an actual source adapter/proof.",
+  "originalHostJsonUtf8": "{ \"host\": \"例子\", \"escaped\": \"\\u0041\" }\n",
+  "vectors": [
+    {
+      "name": "empty-sqlite",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": []
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "0d9c20e5da203585e154ab49e33694f87b645534640e1cd2e7f746d272bb25ee"
+    },
+    {
+      "name": "two-rows-unsorted-sqlite",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "62"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9223372036854775807"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          },
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]},{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"62\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9223372036854775807\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "1afeb4cec4651f7d917bb24928d885a389290d078f93c9e2a8882398ce1e1b22"
+    },
+    {
+      "name": "empty-postgres",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "postgres",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "postgres",
+          "name": "UTF8"
+        },
+        "rows": []
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"postgres\"},\"textEncoding\":{\"backend\":\"postgres\",\"name\":\"UTF8\"}}",
+      "sha256": "dc9803df1b4ed238af50f939cebf8bf24c0288cc0a5fcc840a74575bc89cd61a"
+    }
+  ],
+  "rawByteVectors": [
+    {
+      "name": "one-row-original",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "2db778e37918aacb290ab2c3fd04963ff93b5983ac6e34d073471435184f0c74"
+    },
+    {
+      "name": "json-whitespace",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "7b22686f7374223a22e4be8be5ad90222c2265736361706564223a225c7530303431227d"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"7b22686f7374223a22e4be8be5ad90222c2265736361706564223a225c7530303431227d\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "f632ab21ef47f27147a6368075067858e1058ac92e035b0e9a5e76278633802b"
+    },
+    {
+      "name": "json-escaped",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "7b2276223a225c7530303431227d"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"7b2276223a225c7530303431227d\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "b607469518cbc3f1b061842185afb1d53a41e8cf3d4e3a9a1e43cba30f00fcb3"
+    },
+    {
+      "name": "json-literal",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "7b2276223a2241227d"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"7b2276223a2241227d\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "556c00f9af76ce40e68a8b6b45b97ac790184aa00e7875cf163d4df20ecc84dc"
+    },
+    {
+      "name": "raw-nul",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "610062"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"610062\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "734616c68c27fc87652c456f370c6ab5c2684409891c49b03c0ee4728206215d"
+    },
+    {
+      "name": "unicode-nfc",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "c3a9"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"c3a9\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "a67eeb8f2d4f3ce901b68f99055ceb90557050d22ee186b4f450c5e340015835"
+    },
+    {
+      "name": "unicode-nfd",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "65cc81"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"65cc81\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "54cc9d774975b2e3b539514c36b55447d8e2411c063aec28d99f2b7db85dfac9"
+    },
+    {
+      "name": "invalid-utf8",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "ff"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"ff\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "7fb256f5c2df3f2a03629daa8d9e5156ecc023cf4241611d89b70592bd92cdf1"
+    },
+    {
+      "name": "empty-receipt-text",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "text",
+              ""
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"text\",\"\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "b37d9a74ee2eb26f36a19a7cf0ab2205c12742ece5fdf05714830551c504f0b3"
+    },
+    {
+      "name": "empty-ended-text",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "text",
+              ""
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"text\",\"\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "6f8394761a8a9ca85bc141bf0f66bf97871b43ca9fdd143580354b37a0bbad12"
+    },
+    {
+      "name": "zero-drain-integer",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-8"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "integer",
+              "0"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"integer\",\"0\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-8\"}}",
+      "sha256": "d17be39a399fcfa7a22eaa936c1863cf0121122937c7c3035bc70a694925b064"
+    },
+    {
+      "name": "encoding-UTF-16le",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-16le"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-16le\"}}",
+      "sha256": "90d45fff02f41f9712c63eb3d50614379473620e04a78ed32b48071e7bd3c5b2"
+    },
+    {
+      "name": "encoding-UTF-16be",
+      "input": {
+        "formatVersion": 1,
+        "kind": "source-clients-roster",
+        "source": {
+          "kind": "sqlite",
+          "databaseInstanceId": "11111111111111111111111111111111",
+          "identityDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "migrationId": "codec-fixture",
+        "plan": {
+          "ref": "plans/codec-fixture.json",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": "123"
+        },
+        "fenceEpoch": "7",
+        "receiptGeneration": "3",
+        "textEncoding": {
+          "backend": "sqlite",
+          "name": "UTF-16be"
+        },
+        "rows": [
+          {
+            "client_id": [
+              "text",
+              "61"
+            ],
+            "database_instance_id": [
+              "text",
+              "3131313131313131313131313131313131313131313131313131313131313131"
+            ],
+            "entrypoint": [
+              "text",
+              "617069"
+            ],
+            "build_id": [
+              "text",
+              "636f6465632d66697874757265"
+            ],
+            "host_identity_json": [
+              "text",
+              "7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a"
+            ],
+            "process_identity_json": [
+              "text",
+              "7b22706964223a312c20227374617274223a2278227d"
+            ],
+            "db_sessions_json": [
+              "text",
+              "5b7b22706964223a2239323233333732303336383534373735383037227d5d"
+            ],
+            "registered_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30302e3030305a"
+            ],
+            "last_observed_at": [
+              "text",
+              "323032362d31312d31345430303a30303a30312e3030305a"
+            ],
+            "drain_state": [
+              "text",
+              "72656769737465726564"
+            ],
+            "drain_receipt_digest": [
+              "null"
+            ],
+            "ended_at": [
+              "null"
+            ],
+            "protocol_version": [
+              "integer",
+              "1"
+            ],
+            "registered_epoch": [
+              "integer",
+              "0"
+            ],
+            "observed_epoch": [
+              "integer",
+              "9007199254740993"
+            ],
+            "drain_epoch": [
+              "null"
+            ]
+          }
+        ]
+      },
+      "canonicalEnvelope": "{\"fenceEpoch\":\"7\",\"formatVersion\":1,\"kind\":\"source-clients-roster\",\"migrationId\":\"codec-fixture\",\"plan\":{\"bytes\":\"123\",\"ref\":\"plans/codec-fixture.json\",\"sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"},\"receiptGeneration\":\"3\",\"rows\":[{\"build_id\":[\"text\",\"636f6465632d66697874757265\"],\"client_id\":[\"text\",\"61\"],\"database_instance_id\":[\"text\",\"3131313131313131313131313131313131313131313131313131313131313131\"],\"db_sessions_json\":[\"text\",\"5b7b22706964223a2239323233333732303336383534373735383037227d5d\"],\"drain_epoch\":[\"null\"],\"drain_receipt_digest\":[\"null\"],\"drain_state\":[\"text\",\"72656769737465726564\"],\"ended_at\":[\"null\"],\"entrypoint\":[\"text\",\"617069\"],\"host_identity_json\":[\"text\",\"7b2022686f7374223a2022e4be8be5ad90222c202265736361706564223a20225c753030343122207d0a\"],\"last_observed_at\":[\"text\",\"323032362d31312d31345430303a30303a30312e3030305a\"],\"observed_epoch\":[\"integer\",\"9007199254740993\"],\"process_identity_json\":[\"text\",\"7b22706964223a312c20227374617274223a2278227d\"],\"protocol_version\":[\"integer\",\"1\"],\"registered_at\":[\"text\",\"323032362d31312d31345430303a30303a30302e3030305a\"],\"registered_epoch\":[\"integer\",\"0\"]}],\"source\":{\"databaseInstanceId\":\"11111111111111111111111111111111\",\"identityDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"sqlite\"},\"textEncoding\":{\"backend\":\"sqlite\",\"name\":\"UTF-16be\"}}",
+      "sha256": "c50104f34e5a71060cd9ffacfd386ee2dd50c8be90fbe93732e320333cdd26da"
+    }
+  ]
+}

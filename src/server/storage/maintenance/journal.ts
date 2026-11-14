@@ -1,10 +1,10 @@
 import path from "node:path";
-import { canonicalJson, digestJson } from "./canonical.ts";
+import { canonicalJson, digestJson, parseCanonical } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { buildDatabaseManifests } from "./manifests.ts";
 import { ArtifactStore } from "./objects.ts";
 import { parseBundle, parseCapability, parseJournal, parseManifests, parsePlan, parsePublication, parseReceipt, parseVerification, readSourceFiles } from "./parse.ts";
-import type { ArtifactRef, DatabaseManifests, JournalRecord, MaintenanceCaptureRef, MigrationPlan, SnapshotReceipt, SourceFilesManifest, SourceObservation } from "./types.ts";
+import type { ArtifactRef, DatabaseManifests, JournalFrozenV2, JournalRecord, MaintenanceCaptureRef, MigrationPlan, SnapshotReceipt, SourceClientsRosterV1, SourceFilesManifest, SourceObservation } from "./types.ts";
 
 const equal = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
 function requireValue(condition: unknown): asserts condition { if (!condition) throw new MaintenanceFailure("journal_invalid"); }
@@ -20,7 +20,11 @@ export async function verifyJournalChain(store: ArtifactStore, current: Artifact
   const reversed: JournalNode[] = [], seen = new Set<string>(); let reference: ArtifactRef | null = current;
   while (reference) {
     requireValue(!seen.has(reference.ref) && reversed.length < 4096); seen.add(reference.ref);
-    const record = parseJournal(await store.readJson(reference, "journal"));
+    requireValue(store.kindFor(reference) === "journal");
+    const bytes = await store.readBytes(reference), value = parseCanonical(bytes);
+    // Check original bytes too: TextDecoder may otherwise discard a UTF-8 BOM.
+    requireValue(Buffer.from(canonicalJson(value), "utf8").equals(bytes));
+    const record = parseJournal(value);
     requireValue(reference.ref === `journals/${record.migrationId}/${record.sequence}-${reference.sha256}.json`);
     reversed.push({ reference, record }); reference = record.previous;
   }
@@ -30,12 +34,21 @@ export async function verifyJournalChain(store: ArtifactStore, current: Artifact
     && first.migrationId === plan.migrationId && equal(first.source, plan.source)
     && digestJson(plan.sourceIdentity) === plan.source.identityDigest && plan.controlRoot.path === store.root);
   let cancelPending = false;
-  let firstFrozen: JournalRecord["frozen"] = null;
+  let firstFrozen: JournalFrozenV2 | null = null;
+  let firstSourceClients: SourceClientsRosterV1 | null = null;
   const requests = new Map<string, string>();
   for (let index = 0; index < nodes.length; index++) {
     const record = nodes[index]!.record, previous = nodes[index - 1]?.record;
     requireValue(record.sequence === index + 1 && record.migrationId === first.migrationId
       && equal(record.source, first.source) && equal(record.plan, first.plan));
+    if (record.formatVersion === 1) {
+      // Only a still-planned legacy prefix is usable. Never fill or re-sign an old capture.
+      requireValue((!previous || previous.formatVersion === 1) && record.phase === "planned"
+        && ["enter", "takeover", "observation"].includes(record.event) && record.frozen === null && record.snapshot === null);
+    } else if (previous?.formatVersion === 1) {
+      // This is the sole version edge; ordinary generation checks below still apply.
+      requireValue(record.event === "capture" && firstFrozen === null);
+    }
     const digest = requests.get(record.requestId);
     requireValue(digest === undefined || digest === record.requestDigest); requests.set(record.requestId, record.requestDigest);
     if (previous) {
@@ -57,6 +70,12 @@ export async function verifyJournalChain(store: ArtifactStore, current: Artifact
     const evidence = new Set(record.evidence.map(item => item.ref)); requireValue(evidence.size === record.evidence.length);
     for (const artifact of record.evidence) await verifyCapability(store, artifact);
     if (record.frozen) {
+      requireValue(record.formatVersion === 2 && record.sourceClients !== null);
+      const roster = record.sourceClients;
+      requireValue(equal(roster.source, record.source) && equal(roster.plan, record.plan)
+        && roster.migrationId === record.migrationId && roster.fenceEpoch === String(record.fenceEpoch)
+        && roster.textEncoding.backend === record.source.kind && digestJson(roster) === record.frozen.sourceClientsDigest);
+      requireValue(firstSourceClients === null ? roster.receiptGeneration === String(record.ownerGeneration) : equal(firstSourceClients, roster));
       const files = await readSourceFiles(store, record.frozen.sourceFilesManifest);
       requireValue(equal(files.source, record.source) && equal(files.roots, plan.fileRoots)
         && record.frozen.schemaManifestDigest === plan.schemaManifestDigest && record.frozen.guardManifestDigest === plan.guardManifestDigest);
@@ -64,6 +83,7 @@ export async function verifyJournalChain(store: ArtifactStore, current: Artifact
       // Takeover may advance the owner, but cannot replace the first capture's frozen facts.
       requireValue(firstFrozen === null || equal(firstFrozen, record.frozen));
       firstFrozen ??= record.frozen;
+      firstSourceClients ??= roster;
     }
   }
   return { plan, nodes };

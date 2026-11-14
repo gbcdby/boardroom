@@ -2,19 +2,15 @@ import path from "node:path";
 import { z } from "zod";
 import { canonicalJson, parseCanonical } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
+import { counter, hash, id, ref, source, text } from "./parse-primitives.ts";
+import { sourceClientsRosterSchema } from "./source-clients.ts";
 import type { ArtifactStore } from "./objects.ts";
 import type { ActualRestoreVerification, ArtifactRef, DatabaseManifests, DurabilityCapability, JournalRecord, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceFilesManifest } from "./types.ts";
 
-const hash = z.string().regex(/^[a-f0-9]{64}$/);
-const text = z.string().min(1).max(4096);
-const counter = z.number().int().nonnegative().safe();
-const id = z.string().regex(/^[A-Za-z0-9_-]{1,100}$/);
 const blockerCode = z.enum(["source_changed", "source_missing", "plan_stale", "target_conflict", "control_root_mismatch",
   "source_writer_unknown", "source_writer_active", "drain_incomplete", "maintenance_busy", "maintenance_lost", "schema_guard_incomplete",
   "journal_invalid", "snapshot_invalid", "restore_verification_unavailable", "unsupported_durability", "backup_capability_unavailable", "request_conflict", "phase_conflict"]);
 const json: z.ZodType<unknown> = z.lazy(() => z.union([z.null(), z.boolean(), z.number().finite(), z.string(), z.array(json), z.record(json)]));
-const ref = z.object({ ref: text, sha256: hash, bytes: z.string().regex(/^(0|[1-9][0-9]*)$/) }).strict();
-const source = z.object({ kind: z.enum(["sqlite", "postgres"]), databaseInstanceId: z.string().regex(/^[a-f0-9]{32}$/), identityDigest: hash }).strict();
 const identity = z.object({ path: text, device: z.string().regex(/^\d+$/), inode: z.string().regex(/^\d+$/) }).strict();
 const capabilityBase = { formatVersion: z.literal(1), kind: z.literal("capability"), node: text,
   rootIdentity: identity.extend({ hostIdentityDigest: hash }).strict(), powerLossTested: z.literal(false), probeDigest: hash };
@@ -33,12 +29,17 @@ const plan = z.object({ formatVersion: z.literal(1), kind: z.literal("plan"), mi
   schemaManifestDigest: hash, guardManifestDigest: hash, controlRoot: planned, targetRoot: planned, fileRoots: z.array(root),
   preview: z.object({ observedAt: text, dataDigest: hash, tableCounts: z.record(z.string().regex(/^\d+$/)), clientInventory: z.array(json) }).strict(),
   requiredCapabilities: z.array(text), blockers: z.array(z.object({ code: blockerCode, subjectRef: text }).strict()) }).strict();
-const journal = z.object({ formatVersion: z.literal(1), kind: z.literal("journal"), migrationId: id, sequence: counter.positive(),
+const journalBase = { kind: z.literal("journal"), migrationId: id, sequence: counter.positive(),
   previous: ref.nullable(), phase: z.enum(["planned", "quiesced", "snapshot_ready"]),
   event: z.enum(["enter", "capture", "ready", "takeover", "observation", "cancel_intent", "cancelled"]),
   requestId: id, requestDigest: hash, source, plan: ref, fenceEpoch: counter.positive(), ownerGeneration: counter.positive(), evidence: z.array(ref),
-  frozen: z.object({ sourceFilesManifest: ref, schemaManifestDigest: hash, frozenBusinessManifestDigest: hash, guardManifestDigest: hash }).strict().nullable(),
-  snapshot: ref.nullable() }).strict();
+  snapshot: ref.nullable() };
+const legacyFrozen = z.object({ sourceFilesManifest: ref, schemaManifestDigest: hash, frozenBusinessManifestDigest: hash, guardManifestDigest: hash }).strict();
+const journal = z.discriminatedUnion("formatVersion", [
+  z.object({ ...journalBase, formatVersion: z.literal(1), frozen: legacyFrozen.nullable() }).strict(),
+  z.object({ ...journalBase, formatVersion: z.literal(2), sourceClients: sourceClientsRosterSchema.nullable(),
+    frozen: legacyFrozen.extend({ sourceClientsDigest: hash }).strict().nullable() }).strict(),
+]).refine(value => value.formatVersion === 1 || (value.event === "capture") === (value.sourceClients !== null));
 const overlayHandle = z.object({ type: z.literal(248), byteCount: z.literal(32), hex: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 const ext4Handle = z.object({ type: z.literal(1), byteCount: z.literal(8), hex: z.string().regex(/^[a-f0-9]{16}$/) }).strict();
 const incarnation = z.discriminatedUnion("type", [overlayHandle, ext4Handle]);
@@ -83,6 +84,7 @@ function parse<T>(schema: z.ZodTypeAny, value: unknown): T {
 }
 export const parsePlan = (value: unknown): MigrationPlan => parse(plan, value);
 export const parseCapability = (value: unknown): DurabilityCapability => parse(capability, value);
+/** Strict structural decoding; legacy capture acceptance is forbidden by the current chain reader. */
 export const parseJournal = (value: unknown): JournalRecord => parse(journal, value);
 function requireSourceFiles(condition: unknown): asserts condition {
   if (!condition) throw new MaintenanceFailure("snapshot_invalid");
