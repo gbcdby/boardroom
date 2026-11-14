@@ -252,8 +252,8 @@ export async function interleaveProjectWriters<T, U>(input: {
     }
   }, input.diagnostic ? { collector: input.diagnostic, writer: "first" } : undefined);
   // A caller-owned real transaction keeps the completed mutation uncommitted.
-  // Starting the second writer here avoids charging the first's entire 500ms
-  // work allowance to the second's unchanged 200ms project-lock statement.
+  // Starting the second writer here avoids charging the first's remaining work
+  // to the second's unchanged 200ms project-lock statement.
   const first = settled(() => input.secondAfterFirstWork ? input.firstDb.transaction(async () => {
     const result = await input.first();
     assert.ok(input.firstDb.currentTransactionContext(), "首操作工作完成后仍须保留真实物理事务");

@@ -158,6 +158,7 @@ for (const entry of entries) {
     const f = await entryFixture(entry, worker, workerDb);
     try {
       const outcomes = await interleaveProjectWriters({ firstDb: ownerDb, secondDb: workerDb, probe, projectId: f.project.id,
+        secondAfterFirstWork: entry === "HTTP remove" || entry === "HTTP undo",
         first: () => createTaskService({ repos: owner }).comment(access, f.project.id, f.task.id, "独立连接提交的真实评论"), second: f.run });
       assert.equal(outcomes.first.ok, true, failureText(outcomes.first));
       assert.equal(outcomes.second.ok, true, failureText(outcomes.second));
@@ -189,6 +190,7 @@ for (const engine of ["sqlite", "postgres"] as const) for (const first of ["remo
     const restored = await compensationA.revoke(access, f.project.id, removed.auditId);
     const baseline = await snapshotRelationsDatabase(aDb);
     const result = await runPair({ firstDb: aDb, secondDb: bDb, probe, projectId: f.project.id,
+      secondAfterFirstWork: true,
       first: () => first === "remove" ? orgA.removeMember(access, f.project.id, f.member.id) : compensationA.revoke(access, f.project.id, restored.id),
       second: () => first === "remove" ? compensationB.revoke(access, f.project.id, restored.id) : orgB.removeMember(access, f.project.id, f.member.id) });
     assert.equal(result.first.ok, true, failureText(result.first));
@@ -236,7 +238,7 @@ for (const engine of ["sqlite", "postgres"] as const) for (const pair of ["remov
         if (collect) diagnostic = new RemovePairDiagnostics(f.project.id, t.name);
         const verifyOutcomes = async () => {
           const outcome = await runPair({ firstDb: aDb, secondDb: bDb, probe, projectId: f.project.id,
-            secondAfterFirstWork: pair === "undo/undo",
+            secondAfterFirstWork: secondName === "remove" || secondName === "undo",
             first: operations(a, firstName!), second: operations(b, secondName!), ...(diagnostic ? { diagnostic } : {}) });
           assert.equal(outcome.first.ok, true, failureText(outcome.first));
           if (pair === "改派/remove") assert.equal(outcome.second.ok, true, failureText(outcome.second));
@@ -296,6 +298,7 @@ for (const engine of ["sqlite", "postgres"] as const) for (const first of ["clai
     const orgA = createOrgMutationService({ repos: a }), orgB = createOrgMutationService({ repos: b });
     if (first === "claim") await runtimeA.intent(binding.id, "start");
     const outcomes = await runPair({ firstDb: aDb, secondDb: bDb, probe, projectId: project.id,
+      secondAfterFirstWork: first === "claim",
       first: () => first === "claim" ? runtimeA.claim(binding.id, "winner") : orgA.removeMember(access, project.id, binding.memberId),
       second: () => first === "claim" ? orgB.removeMember(access, project.id, binding.memberId) : runtimeB.claim(binding.id, "stale-claim") });
     assert.equal(outcomes.first.ok, true, failureText(outcomes.first));
