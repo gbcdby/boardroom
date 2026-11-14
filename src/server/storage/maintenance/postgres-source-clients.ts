@@ -2,7 +2,41 @@ import { digestJson } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { quotePostgresIdentifier as quote, readPostgresCatalog, type PostgresReader } from "./postgres-manifests.ts";
 import { invalidSourceClients, sourceClientColumns, sourceClientsEncoding, sourceClientsHex, sourceClientsRows } from "./source-clients-read.ts";
-import type { Json } from "./types.ts";
+import { decodedSourceRows, sourceTextHexes, unknownWriter } from "./source-facts.ts";
+import type { Json, SourceClientsObservation } from "./types.ts";
+
+/** Native codec conversion, followed by a byte-exact inverse, on the original lock session. */
+export async function decodePostgresSourceRows(client: PostgresReader, observation: SourceClientsObservation): Promise<Record<string, unknown>[]> {
+  const hexes = sourceTextHexes(observation), text = new Map<string, string>();
+  if (observation.textEncoding.backend !== "postgres") return unknownWriter();
+  if (hexes.length === 0) return decodedSourceRows(observation, text);
+  // SQL_ASCII does not assign a character meaning to high bytes. Refuse them
+  // before asking the server to convert, which would abort the held transaction.
+  // A10 retains every raw byte; ASCII identities still use the native round trip.
+  if (observation.textEncoding.name === "SQL_ASCII" && hexes.some(hex => Buffer.from(hex, "hex").some(byte => byte > 0x7f)))
+    return unknownWriter();
+  try {
+    const converted = (await client.query(`SELECT position::text AS position,
+      encode(convert_to(convert_from(decode(value,'hex'),$2),'UTF8'),'hex') AS value
+      FROM unnest($1::text[]) WITH ORDINALITY AS cells(value,position) ORDER BY cells.position`, [hexes, observation.textEncoding.name])).rows;
+    if (converted.length !== hexes.length) return unknownWriter();
+    const utf8 = converted.map((row, i) => {
+      if (row.position !== String(i + 1) || typeof row.value !== "string" || !/^(?:[a-f0-9]{2})*$/.test(row.value)) return unknownWriter();
+      const bytes = Buffer.from(row.value, "hex");
+      const value = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+      if (!Buffer.from(value, "utf8").equals(bytes)) return unknownWriter();
+      text.set(hexes[i]!, value); return row.value as string;
+    });
+    const inverse = (await client.query(`SELECT position::text AS position,
+      encode(convert_to(convert_from(decode(value,'hex'),'UTF8'),$2),'hex') AS value
+      FROM unnest($1::text[]) WITH ORDINALITY AS cells(value,position) ORDER BY cells.position`, [utf8, observation.textEncoding.name])).rows;
+    if (inverse.length !== hexes.length || inverse.some((row, i) => row.position !== String(i + 1) || row.value !== hexes[i])) return unknownWriter();
+  } catch (error) {
+    if (["55P03", "40001", "40P01"].includes(String((error as { code?: string })?.code))) throw error;
+    return unknownWriter();
+  }
+  return decodedSourceRows(observation, text);
+}
 
 function object(value: Json | undefined): Readonly<Record<string, Json>> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new MaintenanceFailure("schema_guard_incomplete", "source-clients");
