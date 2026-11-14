@@ -108,6 +108,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: 确认未提交本地 Agent 过程产物
+        shell: bash
+        run: |
+          tracked_outputs="$(git ls-files -- .agent-output)"
+          if [ -n "$tracked_outputs" ]; then
+            printf '%s\n' "$tracked_outputs"
+            echo "::error::.agent-output 仅存本地过程材料；需要归档的资料请整理到 docs/ 后提交。"
+            exit 1
+          fi
+
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
