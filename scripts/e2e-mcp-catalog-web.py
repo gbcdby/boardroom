@@ -21,6 +21,8 @@ from resource_browser_session import bounded_playwright, native_page, runtime_id
 
 ROOT = Path(__file__).resolve().parent.parent
 COLLECTION = "/api/mcp/connections"
+SHARED_TOOL = "shared_tool"
+LONG_TOOL = "long_" + "name_" * 35
 
 
 class Fixture:
@@ -65,6 +67,20 @@ def api(page, origin, method, path, body=None, status=200):
     assert response.status == status, (method, path, response.status, response.text()[:500])
     assert response.headers.get("cache-control") == "no-store"
     return response.json()
+
+
+def catalog_tool(snapshot, connection, name):
+    assert snapshot["connection"]["connectionId"] == connection
+    matches = [tool for tool in snapshot["tools"] if tool["ref"]["name"] == name]
+    assert len(matches) == 1, ("unique catalog tool", connection, name)
+    tool = matches[0]
+    assert tool["ref"]["connectionId"] == connection
+    assert tool["ref"]["connectionRevision"] == snapshot["connection"]["revision"]
+    return tool
+
+
+def tool_row(page, tool):
+    return page.locator(f'[data-tool-key="{tool["toolKey"]}"]')
 
 
 def refresh(page, origin):
@@ -162,26 +178,35 @@ def exercise(page, context, fixture, output, report, native):
 
     attempt = discover(page, origin, connection)
     assert attempt["status"] == "succeeded" and attempt["pages"] == 2
-    expect(page.get_by_test_id("mcp-tool-1")).to_be_visible()
     first = api(page, origin, "GET", COLLECTION + "/" + connection)["currentSnapshot"]
-    first_digest, first_key = first["snapshotDigest"], first["tools"][0]["toolKey"]
-    assert first["tools"][0]["ref"]["name"] == "shared_tool"
+    assert len(first["tools"]) == 2
+    first_shared = catalog_tool(first, connection, SHARED_TOOL)
+    first_long = catalog_tool(first, connection, LONG_TOOL)
+    first_digest, first_key = first["snapshotDigest"], first_shared["toolKey"]
+    expect(tool_row(page, first_shared)).to_be_visible()
+    expect(tool_row(page, first_long)).to_be_visible()
     assert fixture.command("stats")["methods"].count("tools/list") == 2
     fixture.command("mode", mode="fail")
     failed = discover(page, origin, connection)
     assert failed["status"] == "discovery_failed"
     assert api(page, origin, "GET", COLLECTION + "/" + connection)["currentSnapshot"]["snapshotDigest"] == first_digest
-    expect(page.get_by_test_id("mcp-tool-1")).to_be_visible()
+    expect(tool_row(page, first_shared)).to_be_visible()
+    expect(tool_row(page, first_long)).to_be_visible()
     fixture.command("mode", mode="schema2"); discover(page, origin, connection)
     changed = api(page, origin, "GET", COLLECTION + "/" + connection)["currentSnapshot"]
-    assert changed["tools"][0]["ref"]["schemaDigest"] != first["tools"][0]["ref"]["schemaDigest"]
+    changed_shared = catalog_tool(changed, connection, SHARED_TOOL)
+    assert changed_shared["ref"]["schemaDigest"] != first_shared["ref"]["schemaDigest"]
+    assert changed_shared["toolKey"] != first_key
     fixture.command("mode", mode="empty"); discover(page, origin, connection)
     expect(page.get_by_test_id("mcp-empty-catalog")).to_be_visible()
     page.locator(".catalog-history summary").click()
     page.get_by_test_id("mcp-history-digest").fill(first_digest)
     page.get_by_test_id("mcp-load-history").click()
     expect(page.get_by_role("heading", name="已知历史目录", exact=True)).to_be_visible()
-    expect(page.get_by_test_id("mcp-tool-0")).to_have_attribute("data-tool-key", first_key)
+    expect(tool_row(page, first_shared)).to_have_attribute("data-tool-key", first_key)
+    expect(tool_row(page, first_long)).to_be_visible()
+    report["catalogIdentities"] = {"firstDigest": first_digest, "firstShared": first_shared["ref"],
+        "firstSharedKey": first_key, "changedShared": changed_shared["ref"], "longToolKey": first_long["toolKey"]}
     report["checks"].append("A03/A04: 真实 initialize/分页/完整空目录/部分失败保留旧完整快照；schema变化和精确历史摘要")
 
     for width, height in [(1440, 1000), (390, 844)]:
@@ -189,9 +214,11 @@ def exercise(page, context, fixture, output, report, native):
         for theme in ("light", "dark"):
             page.emulate_media(color_scheme=theme)
             expect(page.locator("html")).to_have_attribute("data-theme", theme)
-            page.get_by_test_id("mcp-tool-0").focus(); page.keyboard.press("Enter")
+            long_row = tool_row(page, first_long)
+            long_row.focus(); page.keyboard.press("Enter")
             details = page.get_by_test_id("mcp-tool-drawer") if width == 390 else page.locator(".tool-inspector")
             expect(details).to_contain_text(connection)
+            expect(details).to_contain_text(LONG_TOOL)
             expect(details).to_contain_text("<img src=x onerror=globalThis.mcpXss=1>")
             assert page.evaluate("typeof globalThis.mcpXss") == "undefined"
             capture(page, output, report, f"mcp-catalog-{width}-{theme}")
@@ -201,7 +228,7 @@ def exercise(page, context, fixture, output, report, native):
                     assert page.evaluate("document.querySelector('[data-testid=mcp-tool-drawer]').contains(document.activeElement)")
                 page.keyboard.press("Escape")
                 expect(page.get_by_test_id("mcp-tool-drawer")).to_have_count(0)
-                expect(page.get_by_test_id("mcp-tool-0")).to_be_focused()
+                expect(long_row).to_be_focused()
     report["checks"].append("A08: 390/1440 light/dark截图、长不可信文本、工具精确来源、键盘抽屉焦点循环及关闭恢复")
     page.set_viewport_size({"width": 1440, "height": 1000})
     page.get_by_role("button", name="返回当前目录", exact=True).click()
@@ -247,8 +274,12 @@ def exercise(page, context, fixture, output, report, native):
     other = page.get_by_test_id("mcp-connection").input_value()
     fixture.command("mode", mode="pages"); discover(page, origin, other)
     other_snapshot = api(page, origin, "GET", COLLECTION + "/" + other)["currentSnapshot"]
-    assert other_snapshot["tools"][0]["ref"]["name"] == first["tools"][0]["ref"]["name"]
-    assert other_snapshot["tools"][0]["toolKey"] != first_key
+    other_shared = catalog_tool(other_snapshot, other, SHARED_TOOL)
+    assert other != connection and other_shared["ref"]["name"] == first_shared["ref"]["name"]
+    assert other_shared["ref"]["schemaDigest"] == first_shared["ref"]["schemaDigest"]
+    assert other_shared["toolKey"] != first_key
+    report["catalogIdentities"]["otherShared"] = other_shared["ref"]
+    report["catalogIdentities"]["otherSharedKey"] = other_shared["toolKey"]
     report["checks"].append("A04/A05: 保存真实提交后丢回执保持unknown，同key恢复无重复连接；同名工具不同来源身份不同")
 
     # Drop a real discovery receipt, then commit a different request from a second HTTP client.

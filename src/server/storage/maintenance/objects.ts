@@ -219,6 +219,24 @@ export class ArtifactStore {
     if (this.kindFor(ref) !== expectedKind || RAW.has(expectedKind)) throw new MaintenanceFailure("journal_invalid");
     return parseCanonical(await this.readBytes(ref));
   }
+  /** Size comes from this exact existing DB-selected object, never a directory search. */
+  async readAnchoredJournal(pointer: { readonly ref: string; readonly sha256: string }): Promise<ArtifactRef> {
+    const candidate = { ...pointer, bytes: "0" };
+    if (this.kindFor(candidate) !== "journal") throw new MaintenanceFailure("journal_invalid");
+    await this.assertRoot();
+    const file = this.pathFor(candidate);
+    let current = path.dirname(file);
+    while (current !== this.root) { await directoryIdentity(current, true); current = path.dirname(current); }
+    const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let reference: ArtifactRef;
+    try {
+      const info = await handle.stat({ bigint: true });
+      if (!info.isFile() || info.nlink !== 1n || (info.mode & 0o777n) !== 0o600n) throw new MaintenanceFailure("journal_invalid");
+      reference = { ...pointer, bytes: String(info.size) };
+    } finally { await handle.close(); }
+    await this.readBytes(reference);
+    return reference;
+  }
   async verifyFile(ref: ArtifactRef): Promise<void> {
     const handle = await this.verifiedHandle(ref);
     try {
