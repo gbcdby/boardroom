@@ -49,6 +49,10 @@ const bindingBase = { sourceRoot: root.shape.label, hostIdentityDigest: hash,
 const rootBinding = z.discriminatedUnion("profile", [
   z.object({ ...bindingBase, profile: z.literal("linux-overlay-fid-fsuuid-v1"), filesystemType: z.literal("overlay"), anchorHandle: overlayHandle }).strict(),
   z.object({ ...bindingBase, profile: z.literal("linux-native-ext4-fid-fsuuid-v1"), filesystemType: z.literal("ext4"), anchorHandle: ext4Handle }).strict(),
+  z.object({ ...bindingBase, profile: z.literal("linux-native-ext4-fid-fsuuid-source-state-v1"), filesystemType: z.literal("ext4"), anchorHandle: ext4Handle,
+    readEvidence: z.object({ policy: z.literal("application-source-preservation-v1"), kernelDiagnosticPolicy: z.literal("ext4-last-mounted-v1"),
+      profileEntryDigest: hash, qualificationDigest: hash, runtimeEnvironmentDigest: hash, sourceStateDigest: hash,
+      blockEffectsObservation: z.literal("not-observed-at-runtime") }).strict() }).strict(),
 ]);
 const nanoseconds = z.string().regex(/^(0|-?[1-9][0-9]*)$/);
 const fileWitness = z.object({ kind: z.literal("file"), incarnation,
