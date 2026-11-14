@@ -30,6 +30,7 @@ export async function verifyJournalChain(store: ArtifactStore, current: Artifact
     && first.migrationId === plan.migrationId && equal(first.source, plan.source)
     && digestJson(plan.sourceIdentity) === plan.source.identityDigest && plan.controlRoot.path === store.root);
   let cancelPending = false;
+  let firstFrozen: JournalRecord["frozen"] = null;
   const requests = new Map<string, string>();
   for (let index = 0; index < nodes.length; index++) {
     const record = nodes[index]!.record, previous = nodes[index - 1]?.record;
@@ -60,6 +61,9 @@ export async function verifyJournalChain(store: ArtifactStore, current: Artifact
       requireValue(equal(files.source, record.source) && equal(files.roots, plan.fileRoots)
         && record.frozen.schemaManifestDigest === plan.schemaManifestDigest && record.frozen.guardManifestDigest === plan.guardManifestDigest);
       await verifySourceFilesClosure(store, files);
+      // Takeover may advance the owner, but cannot replace the first capture's frozen facts.
+      requireValue(firstFrozen === null || equal(firstFrozen, record.frozen));
+      firstFrozen ??= record.frozen;
     }
   }
   return { plan, nodes };
