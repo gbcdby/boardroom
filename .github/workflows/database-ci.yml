@@ -76,7 +76,10 @@ jobs:
   database-tests:
     name: Node 24 · SQLite / PostgreSQL
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # CI171 used 287s preparing and 626s in a still-progressing full suite before
+    # the old job limit. Keep the existing 900s child allowance, plus bounded
+    # preparation and post-suite SDK/restart/cleanup time; no product limit changes.
+    timeout-minutes: 25
     outputs:
       browser_dependencies_id: ${{ steps.browser_dependencies.outputs.artifact-id }}
 
@@ -148,7 +151,7 @@ jobs:
           mkdir -p .agent-output/maintenance-native-diagnostics
           # run169 的 spec 末尾摘要被 job 取消截断；先保全已失败入口的真实
           # 断言详情。完整 npm test 仍在原隔离身份下运行，所有门槛保持。
-          timeout --signal=TERM --kill-after=10s 90s node --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='local HTTP source|successors require current head|reader namespace|target既有namespace|已绑定会话再次 join|join memory reconciliation starts only' tests/decisions-http.test.ts tests/decisions-service.test.ts tests/m1-postgres-coordination.test.ts tests/agent-alias-integrity.test.ts tests/memory-mcp.test.ts 2>&1 | tee .agent-output/maintenance-native-diagnostics/decision-mcp-regression.tap
+          timeout --signal=TERM --kill-after=10s 90s node --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='local HTTP source|successors require current head|reader namespace|target既有namespace|已绑定会话再次 join|join memory reconciliation starts only|完整关系 undo/undo' tests/decisions-http.test.ts tests/decisions-service.test.ts tests/m1-postgres-coordination.test.ts tests/agent-alias-integrity.test.ts tests/memory-mcp.test.ts tests/phase5-concurrency-matrix.test.ts 2>&1 | tee .agent-output/maintenance-native-diagnostics/decision-mcp-regression.tap
 
       - name: 有界 PostgreSQL 维护适配器 TAP 诊断
         id: maintenance_pg_diagnostic
