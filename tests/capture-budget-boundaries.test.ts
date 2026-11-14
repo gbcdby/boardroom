@@ -8,7 +8,7 @@ import { captureMemberRelations, readLifecycleMember } from "../src/server/org/m
 import { createOrgMutationService, reversalRoot } from "../src/server/org/mutations.ts";
 import { createAuditCompensationService } from "../src/server/audit-compensation.ts";
 import { appendAuditEntry, type AuditEntry } from "../src/server/audit.ts";
-import { ownerActor } from "../src/server/authz/actors.ts";
+import { actorForMember, ownerActor } from "../src/server/authz/actors.ts";
 import type { RepositorySet } from "../src/server/db/repositories.ts";
 import type { DbDriver } from "../src/server/db/driver.ts";
 import type { Task } from "../src/shared/tasks.ts";
@@ -207,6 +207,51 @@ for (const engine of ["sqlite", "postgres"] as const) {
     assert.deepEqual(await repos.members.getIncludingRemoved(member.id), before); assert.deepEqual(await repos.members.retainedFacts(member.id), facts);
     assert.equal((await db.query("SELECT group_id FROM group_participants WHERE member_id = ?", [member.id])).length, 129);
     assert.equal((await repos.audit.list(project.id)).length, 0);
+  }, engine));
+
+  test(`${engine} S5-AUDIT-11/14：重复撤销稳定冲突，不采集恢复后新增的超限关系`, gate, async () => memoryFixture(async (repos, db) => {
+    const { project, member } = await person(repos);
+    const org = createOrgMutationService({ repos }), compensation = createAuditCompensationService({ repos });
+    const removed = await org.removeMember(access, project.id, member.id);
+    await compensation.revoke(access, project.id, removed.auditId);
+    // These are current relations added after the completed undo, not fields of its historic snapshot.
+    await db.transaction(async tx => {
+      for (let i = 0; i < 129; i++) {
+        const groupId = `after-undo-${String(i).padStart(4, "0")}`;
+        await tx.exec("INSERT INTO groups (id, project_id, name, created_at, updated_at) VALUES (?, ?, '恢复后新增群', ?, ?)", [groupId, project.id, at, at]);
+        await tx.exec("INSERT INTO group_participants (group_id, member_id, joined_at) VALUES (?, ?, ?)", [groupId, member.id, at]);
+      }
+    });
+    const state = async () => ({ member: await repos.members.getIncludingRemoved(member.id),
+      audits: await repos.audit.list(project.id), facts: await repos.members.retainedFacts(member.id),
+      participants: await db.query("SELECT * FROM group_participants WHERE member_id = ? ORDER BY group_id", [member.id]) });
+    const before = await state(), budget = new ObservedBudget();
+    await assert.rejects(budget.run(() => compensation.revoke(access, project.id, removed.auditId)), { code: "compensation_conflict" });
+    assert.equal(budget.affectedRows, 0); assert.deepEqual(await state(), before);
+    // The same real relations still exceed the unchanged limit when an operation actually needs to capture them.
+    await assert.rejects(org.removeMember(access, project.id, member.id), exceeded);
+    assert.deepEqual(await state(), before);
+  }, engine));
+
+  test(`${engine} S5-AUDIT-11：重复撤销仍先拒绝越权主体、取消与归档项目`, gate, async () => memoryFixture(async (repos, db) => {
+    const { project, member } = await person(repos), foreign = await repos.projects.create({ name: "其他项目" });
+    const compensation = createAuditCompensationService({ repos });
+    const removed = await createOrgMutationService({ repos }).removeMember(access, project.id, member.id);
+    await compensation.revoke(access, project.id, removed.auditId);
+    const before = { member: await repos.members.getIncludingRemoved(member.id), audits: await repos.audit.list(project.id) };
+    for (const actor of [ownerActor(foreign.id), actorForMember(member)]) {
+      const budget = new ObservedBudget();
+      await assert.rejects(budget.run(() => compensation.revoke({ actor }, project.id, removed.auditId)), { code: "invalid_argument" });
+      assert.equal(budget.completedSql, 0, "无权主体不能读取撤销状态");
+    }
+    const cancelled = new ObservedBudget(MEMBER_CAPTURE_BUDGET, AbortSignal.abort());
+    await assert.rejects(cancelled.run(() => compensation.revoke(access, project.id, removed.auditId)), exceeded);
+    assert.equal(cancelled.completedSql, 0, "已取消操作不能读取撤销状态");
+    await db.exec("UPDATE projects SET archived_at = ? WHERE id = ?", [at, project.id]);
+    const budget = new ObservedBudget();
+    await assert.rejects(budget.run(() => compensation.revoke(access, project.id, removed.auditId)), { code: "archived" });
+    assert.equal(budget.affectedRows, 0);
+    assert.deepEqual({ member: await repos.members.getIncludingRemoved(member.id), audits: await repos.audit.list(project.id) }, before);
   }, engine));
 
   test(`${engine} S5-AUDIT-14：512工作事件完整采集，513哨兵拒绝，公开移除不删通知`, gate, async () => memoryFixture(async (repos, db) => {
