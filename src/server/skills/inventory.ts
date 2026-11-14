@@ -50,7 +50,7 @@ function issue(error: unknown, source: string): SkillInspectionIssue {
     detail: error instanceof InspectionError ? error.message : `本地来源不可读（${(error as NodeJS.ErrnoException).code ?? "unknown"}）` };
 }
 /** 限量 fd 读取，检查普通文件、链接数和读前/后身份，避免 FIFO 阻塞及无限增长。 */
-async function readRegular(file: string, root: string, maxBytes: number): Promise<Buffer> {
+export async function readRegular(file: string, root: string, maxBytes: number): Promise<Buffer> {
   const actual = await realpath(file);
   if (!inside(root, actual)) fail("path_escape", "文件解析到包根之外");
   const before = await lstat(actual);
