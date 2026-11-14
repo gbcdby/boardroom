@@ -4,7 +4,7 @@ import { chmod, copyFile, lstat, mkdir, open, stat } from "node:fs/promises";
 import path from "node:path";
 import { assertSqliteSourceUnchanged, type SqliteDatabaseDescriptor } from "../../environment.ts";
 import { inspectOwnedProcess } from "../../runtime/hosts/process-identity.ts";
-import { readSqliteMaintenanceState, type StorageMaintenanceState } from "../admission.ts";
+import { parseStorageMaintenanceState, readSqliteMaintenanceState, type StorageMaintenanceState } from "../admission.ts";
 import { assertSqliteGuardCoverage } from "../schema-guards.ts";
 import { canonicalJson, digestJson } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
@@ -14,7 +14,8 @@ import { assertDarwinSqliteSource, bindDarwinSqliteSource, darwinSourceHandles, 
 import { inspectLinuxSourceProcesses, linuxMappedSourceHandles, linuxSourceMappingIdentities } from "./linux-mappings.ts";
 import { fullSyncDarwinDatabaseHandle, syncMaintenanceHandle } from "./platform.ts";
 import { readSqliteManifests } from "./sqlite-manifests.ts";
-import type { AnchorChange, Blocker, ControlRootIdentity, DatabaseManifests, Json, MaintenanceAdapter, OperationMutex, SourceLock, SourceObservation } from "./types.ts";
+import { readSqliteSourceClients } from "./sqlite-source-clients.ts";
+import type { AnchorChange, Blocker, ControlRootIdentity, DatabaseManifests, Json, MaintenanceAdapter, OperationMutex, SourceClientsObservation, SourceLock, SourceObservation } from "./types.ts";
 
 function same(a: unknown, b: unknown): boolean { return canonicalJson(a) === canonicalJson(b); }
 function failure(error: unknown, fallback: "snapshot_invalid" | "maintenance_busy" = "snapshot_invalid"): never {
@@ -167,6 +168,36 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     try { db.exec("BEGIN"); const result = this.observation(db); db.exec("COMMIT"); return result; }
     finally { if (db.inTransaction) db.exec("ROLLBACK"); this.closeSource(db); }
   }
+  private sourceClientsObservation(db: Database.Database): SourceClientsObservation {
+    this.assertSource();
+    let rows: Record<string, unknown>[];
+    try { rows = db.prepare("SELECT * FROM storage_maintenance").all() as Record<string, unknown>[]; }
+    catch (error) {
+      // The fixed query's missing/invalid schema is distinct from native BUSY/LOCKED or I/O failure.
+      if ((error as { code?: string }).code === "SQLITE_ERROR") throw new MaintenanceFailure("schema_guard_incomplete", "source-clients");
+      throw error;
+    }
+    let state: StorageMaintenanceState;
+    try { state = parseStorageMaintenanceState(rows); }
+    catch { throw new MaintenanceFailure("schema_guard_incomplete", "source-clients"); }
+    const sourceIdentity = { kind: "sqlite", sourcePath: this.source.sourcePath, sqlitePath: this.source.sqlitePath,
+      device: this.source.identity!.device, inode: this.source.identity!.inode };
+    const raw = readSqliteSourceClients(db);
+    this.assertSource();
+    return { source: { kind: "sqlite", databaseInstanceId: state.databaseInstanceId, identityDigest: digestJson(sourceIdentity) },
+      sourceIdentity, state, ...raw };
+  }
+  async observeSourceClients(): Promise<SourceClientsObservation> {
+    try {
+      const db = this.openSource(true);
+      try { db.exec("BEGIN"); const result = this.sourceClientsObservation(db); db.exec("COMMIT"); return result; }
+      finally { try { if (db.inTransaction) db.exec("ROLLBACK"); } finally { this.closeSource(db); } }
+    } catch (error) {
+      if (error instanceof MaintenanceFailure) throw error;
+      if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(String((error as { code?: string })?.code))) throw new MaintenanceFailure("maintenance_busy");
+      throw new MaintenanceFailure("snapshot_invalid", "source-clients");
+    }
+  }
   async acquireMutex(root: ControlRootIdentity, expected: StorageMaintenanceState): Promise<OperationMutex> {
     if (this.mutex?.active) throw new MaintenanceFailure("maintenance_busy");
     if (root.hostIdentityDigest !== await maintenanceHostIdentityDigest()) throw new MaintenanceFailure("control_root_mismatch");
@@ -241,6 +272,15 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       const lock: SourceLock = {
         assertHeld,
         observe: async () => { await assertHeld(); return this.observation(db); },
+        observeSourceClients: async () => {
+          await assertHeld();
+          try { const result = this.sourceClientsObservation(db); await assertHeld(); return result; }
+          catch (error) {
+            if (error instanceof MaintenanceFailure) throw error;
+            if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(String((error as { code?: string })?.code))) throw new MaintenanceFailure("maintenance_busy");
+            throw new MaintenanceFailure("snapshot_invalid", "source-clients");
+          }
+        },
         anchor: async change => { await assertHeld(); this.anchor(db, change, mutex); },
         backup: async destination => {
           await assertHeld();

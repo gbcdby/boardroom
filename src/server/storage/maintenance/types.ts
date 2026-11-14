@@ -267,6 +267,15 @@ export interface SourceObservation {
   readonly manifests: DatabaseManifests;
   readonly clients: readonly Readonly<Record<string, Json>>[];
 }
+/** One complete read view; neither this value nor its standalone reader authorizes capture. */
+export interface SourceClientsObservation {
+  readonly source: SourceRef;
+  readonly sourceIdentity: Json;
+  readonly state: StorageMaintenanceState;
+  readonly schemaManifestDigest: string;
+  readonly textEncoding: SourceClientsRosterV1["textEncoding"];
+  readonly rows: readonly SourceClientRawRow[];
+}
 export interface AnchorChange {
   readonly expected: StorageMaintenanceState;
   readonly admission: "open" | "draining" | "sealed";
@@ -282,6 +291,7 @@ export interface AnchorChange {
 /** A real native lock. No raw handle, generic SQL, unseal or business callback is exposed. */
 export interface SourceLock {
   observe(): Promise<SourceObservation>;
+  observeSourceClients(): Promise<SourceClientsObservation>;
   anchor(change: AnchorChange): Promise<void>;
   /** Uses an independent snapshot reader; the lock remains held throughout the callback. */
   backup(destination: string): Promise<{ readonly manifests: DatabaseManifests; readonly toolchain: Json }>;
@@ -296,6 +306,7 @@ export interface OperationMutex {
 export interface MaintenanceAdapter {
   readonly dialect: "sqlite" | "postgres";
   observe(): Promise<SourceObservation>;
+  observeSourceClients(): Promise<SourceClientsObservation>;
   acquireMutex(controlRootIdentity: ControlRootIdentity, expected: StorageMaintenanceState): Promise<OperationMutex>;
   withSourceLock<T>(kind: "control" | "snapshot", callback: (lock: SourceLock) => Promise<T>): Promise<T>;
   inspectWriters(observation: SourceObservation): Promise<readonly Blocker[]>;

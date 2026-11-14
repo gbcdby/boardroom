@@ -9,6 +9,7 @@ import { createMcpCore } from '../src/server/mcp/core.ts';
 import { createMcpServer } from '../src/server/mcp/server.ts';
 import { createLogger } from '../src/server/logger.ts';
 import type { LiveDecisionView } from '../src/shared/decisions.ts';
+import { createDecisionService } from '../src/server/decisions/service.ts';
 
 for(const engine of identityEngines)test(`${engine}: Decision registered MCP uses current binding and forbids transplanted human source`,{skip:identitySkip(engine)},async()=>{
   const f=await identityFixture(engine);let close:(()=>Promise<void>)|undefined;
@@ -40,7 +41,20 @@ for(const engine of identityEngines)test(`${engine}: Decision registered MCP use
     const listed=await call('list_decisions',{taskId:p.task.id});assert.equal(listed.ok,true,JSON.stringify(listed));
     assert.equal(listed.decisions.length,1,'MCP task filter cannot be dropped when separating request routing fields');
     const decision=(listed.decisions as LiveDecisionView[]).find(d=>d.recordKind==='live-review-decision')!;assert.ok(decision);
-    const input={decisionId:decision.ref.decisionId,decisionRef:decision.ref,choiceId:'approve',reason:'MCP 管理者当前权限',idempotencyKey:'mcp-actual'};
+    const refreshInput={decisionId:decision.ref.decisionId,decisionRef:decision.ref,idempotencyKey:'mcp-refresh'};
+    const response=await call('refresh_decision',refreshInput);assert.equal(response.ok,false);assert.equal(response.error.code,'CONFLICT');
+    const refreshed=response.error.details.result;assert.equal(refreshed.state,'refreshed');assert.equal(refreshed.receipt.httpStatus,409);
+    assert.equal(refreshed.decisionRef.revision,decision.ref.revision+1);
+    const notices=await f.repos.tasks.listUnackedWorkEvents(p.project.id,p.manager.id);
+    const newNotice=notices.find(event=>event.kind==='decision.requested'&&event.payload.decisionId===decision.ref.decisionId&&event.payload.decisionRevision===refreshed.decisionRef.revision);
+    assert.ok(newNotice);assert.equal(newNotice.recipientMemberId,p.manager.id);
+    const repeated=await call('refresh_decision',refreshInput);assert.equal(repeated.ok,false);assert.equal(repeated.error.code,'CONFLICT');
+    assert.equal(repeated.error.details.result.replay,'same-key');assert.deepEqual(repeated.error.details.result.receipt,refreshed.receipt);
+    const reconstructed=await createDecisionService(f.db).get(p.owner,p.project.id,decision.ref.decisionId);assert.ok(reconstructed.recordKind==='live-review-decision');assert.equal(reconstructed.ref.revision,refreshed.decisionRef.revision);
+    assert.deepEqual(await f.repos.tasks.listUnackedWorkEvents(p.project.id,p.manager.id),notices);
+    assert.equal((await f.db.query('SELECT * FROM decision_user_events')).length,0);
+    assert.equal((await f.db.query('SELECT * FROM decision_executions')).length,0);
+    const input={decisionId:decision.ref.decisionId,decisionRef:refreshed.decisionRef,choiceId:'approve',reason:'MCP 管理者当前权限',idempotencyKey:'mcp-actual'};
     const forged=await call('resolve_decision',{...input,userInitiationRef:'human-source',actor:{kind:'human',id:'human:local'}});assert.equal(forged.ok,false);
     const foreign=await call('read_decision',{decisionId:decision.ref.decisionId,projectId:'other-project'});assert.equal(foreign.ok,false);assert.equal(foreign.error.code,'FORBIDDEN');
     const applied=await call('resolve_decision',input);assert.equal(applied.ok,true);assert.equal(applied.state,'applied');assert.equal(applied.current.resolution.authority,'owner');

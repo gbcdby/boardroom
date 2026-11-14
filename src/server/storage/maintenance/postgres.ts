@@ -16,8 +16,9 @@ import { parsePostgresConnection, postgresDatabaseArgument, postgresToolVersions
   type PostgresConnection, type PostgresDescriptor } from "./postgres-tools.ts";
 import { postgresFileDigest, restorePostgresPublic } from "./postgres-public-restore.ts";
 import { readPublicRestoreCatalogBinding, type PublicRestoreCatalogBinding } from "./postgres-public-toc.ts";
+import { readPostgresSourceClients } from "./postgres-source-clients.ts";
 import type { AnchorChange, Blocker, BlockerCode, ControlRootIdentity, DatabaseManifests, Json,
-  MaintenanceAdapter, OperationMutex, SourceLock, SourceObservation } from "./types.ts";
+  MaintenanceAdapter, OperationMutex, SourceClientsObservation, SourceLock, SourceObservation } from "./types.ts";
 
 interface Session {
   readonly client: Client;
@@ -54,10 +55,10 @@ function object(value: Json): Readonly<Record<string, Json>> {
   return value as Readonly<Record<string, Json>>;
 }
 function same(a: unknown, b: unknown): boolean { return canonicalJson(a) === canonicalJson(b); }
-function safeError(error: unknown, fallback: BlockerCode): MaintenanceFailure {
+function safeError(error: unknown, fallback: BlockerCode, subjectRef = "source"): MaintenanceFailure {
   if (error instanceof MaintenanceFailure) return error;
   const code = String((error as { code?: unknown } | null)?.code ?? "");
-  return new MaintenanceFailure(code === "55P03" ? "maintenance_busy" : ["40001", "40P01"].includes(code) ? "source_changed" : fallback);
+  return new MaintenanceFailure(code === "55P03" ? "maintenance_busy" : ["40001", "40P01"].includes(code) ? "source_changed" : fallback, subjectRef);
 }
 function checkedCounter(value: number): boolean { return Number.isSafeInteger(value) && value >= 0; }
 /** Internal readers use promise queries. Bound every actual query dispatch and its
@@ -138,13 +139,14 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   function assertOpen(): void {
     if (closed || lost) throw new MaintenanceFailure("maintenance_lost");
   }
-  async function endSession(session: Session): Promise<void> {
+  async function endSession(session: Session): Promise<boolean> {
     session.ending = true;
     if (writerObservation.hasSubscribers) note({ kind: "session-end-start", session: sessionMetadata(session) });
     let outcome = "fulfilled";
     await session.client.end().catch(() => { outcome = "rejected"; });
     session.ended = true; sessions.delete(session);
     if (writerObservation.hasSubscribers) note({ kind: "session-end-complete", outcome, session: sessionMetadata(session) });
+    return outcome === "fulfilled";
   }
   async function connect(connection: PostgresConnection, sourceSession: boolean, critical = false): Promise<Session> {
     assertOpen();
@@ -207,6 +209,41 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       await session.client.query("COMMIT"); return result;
     } catch (error) { throw safeError(error, "schema_guard_incomplete"); }
     finally { await endSession(session); }
+  }
+  async function sourceClientsObservation(session: Session): Promise<SourceClientsObservation> {
+    assertOpen();
+    const actual = await readIdentity(session, sourceConnection, true);
+    let state: StorageMaintenanceState;
+    try { state = (await readPostgresMaintenanceState(session.client, { required: true }))!; }
+    catch (error) {
+      if (["40001", "40P01", "55P03"].includes(String((error as { code?: string })?.code))) throw error;
+      throw new MaintenanceFailure("schema_guard_incomplete", "source-clients");
+    }
+    const raw = await readPostgresSourceClients(session.client, sourceConnection.schema);
+    const sourceIdentity = stablePostgresSourceIdentity(actual, sourceConnection.descriptorDigest, state.databaseInstanceId);
+    if (firstSourceIdentity !== undefined && !same(firstSourceIdentity, sourceIdentity)) throw new MaintenanceFailure("source_changed");
+    firstSourceIdentity ??= sourceIdentity;
+    assertOpen(); if (session.ended) throw new MaintenanceFailure("maintenance_lost");
+    return { source: { kind: "postgres", databaseInstanceId: state.databaseInstanceId, identityDigest: digestJson(sourceIdentity) },
+      sourceIdentity, state, ...raw };
+  }
+  async function observeSourceClients(): Promise<SourceClientsObservation> {
+    let session: Session | undefined;
+    try {
+      session = await connect(sourceConnection, true);
+      await session.client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      const result = await sourceClientsObservation(session);
+      if ((await session.client.query("COMMIT")).command !== "COMMIT") throw new MaintenanceFailure("maintenance_lost");
+      return result;
+    } catch (error) { throw safeError(error, "snapshot_invalid", "source-clients"); }
+    finally {
+      if (session) {
+        let closedSuccessfully = false;
+        try { closedSuccessfully = await endSession(session); } catch { /* A synchronous driver failure is also unconfirmed closure. */ }
+        if (!closedSuccessfully) { invalidate(); throw new MaintenanceFailure("maintenance_lost", "source-clients"); }
+      }
+      assertOpen();
+    }
   }
   async function assertMutex(held = mutex, check?: () => void): Promise<void> {
     check?.(); assertOpen();
@@ -407,6 +444,15 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           lockedSchemaDigest ??= result.manifests.schemaManifestDigest;
           if (lockedSchemaDigest !== result.manifests.schemaManifestDigest) throw new MaintenanceFailure("source_changed");
           return result;
+        },
+        async observeSourceClients() {
+          await assertHeld();
+          try {
+            const result = await sourceClientsObservation(locked);
+            lockedSchemaDigest ??= result.schemaManifestDigest;
+            if (lockedSchemaDigest !== result.schemaManifestDigest) throw new MaintenanceFailure("source_changed");
+            await assertHeld(); return result;
+          } catch (error) { throw safeError(error, "snapshot_invalid", "source-clients"); }
         },
         async anchor(change) {
           await assertHeld(); assertAnchor(change, mutex!);
@@ -716,7 +762,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       }
     } finally { if (cleanup) await cleanup.end().catch(() => {}); }
   }
-  return { dialect: "postgres", observe, acquireMutex, withSourceLock, inspectWriters, verifyDatabase,
+  return { dialect: "postgres", observe, observeSourceClients, acquireMutex, withSourceLock, inspectWriters, verifyDatabase,
     async close() {
       if (closed) return; closed = true; clearInterval(mutexTimer); abort.abort();
       await waitForPostgresTools(abort.signal);
