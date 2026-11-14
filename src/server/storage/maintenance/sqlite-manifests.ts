@@ -19,8 +19,8 @@ function objectRows(db: Database.Database, sql: string): Readonly<Record<string,
     Object.fromEntries(Object.entries(row).map(([key, value]) => [key, jsonCell(value)])));
 }
 
-/** Call inside one real source read view; no SQL writes, migration or guard repair occur. */
-export function readSqliteManifests(db: Database.Database): DatabaseManifests {
+/** The existing schema representation, without reading any application/control row values. */
+export function readSqliteCatalog(db: Database.Database) {
   try { assertSqliteGuardCoverage(db); }
   catch { throw new MaintenanceFailure("schema_guard_incomplete"); }
   const applied = objectRows(db, "SELECT version,name,checksum,applied_at FROM schema_migrations ORDER BY version");
@@ -29,10 +29,19 @@ export function readSqliteManifests(db: Database.Database): DatabaseManifests {
     throw new MaintenanceFailure("schema_guard_incomplete");
   const catalog = objectRows(db, "SELECT type,name,tbl_name,sql FROM main.sqlite_schema ORDER BY type,name,tbl_name");
   const names = catalog.filter(row => row.type === "table").map(row => String(row.name)).sort();
-  const tables: DatabaseManifests["tables"][number][] = [];
-  for (const name of names) {
+  const tables = names.map(name => {
     const columns = objectRows(db, `PRAGMA main.table_xinfo(${quoteSqliteIdentifier(name)})`);
     if (!columns.length) throw new MaintenanceFailure("schema_guard_incomplete");
+    return { name, columns };
+  });
+  return { schema: { catalog, migrations: applied }, tables };
+}
+
+/** Call inside one real source read view; no SQL writes, migration or guard repair occur. */
+export function readSqliteManifests(db: Database.Database): DatabaseManifests {
+  const catalog = readSqliteCatalog(db);
+  const tables: DatabaseManifests["tables"][number][] = [];
+  for (const { name, columns } of catalog.tables) {
     const expressions = columns.flatMap(column => {
       const quoted = quoteSqliteIdentifier(String(column.name));
       // Text bytes are read as hex too, preserving even a SQLite TEXT value containing invalid UTF-8.
@@ -51,7 +60,7 @@ export function readSqliteManifests(db: Database.Database): DatabaseManifests {
     }));
     tables.push({ name, columns, ...digestRowMultiset(encoded) });
   }
-  return buildDatabaseManifests("sqlite", { catalog, migrations: applied }, tables, {
+  return buildDatabaseManifests("sqlite", catalog.schema, tables, {
     storage_maintenance: objectRows(db, "SELECT * FROM storage_maintenance ORDER BY singleton"),
     storage_source_clients: objectRows(db, "SELECT * FROM storage_source_clients ORDER BY client_id"),
   });
