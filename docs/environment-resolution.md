@@ -108,9 +108,27 @@ node scripts/storage-maintenance.ts plan \
 
 stdout 只包含一个安全 JSON 预览：`formatVersion`、`command: "plan"`、`result: "preview"`、`observationMode: "logical_read_only"`、`persisted: false`、`executionAuthorized: false`，以及公开来源 ID/数据库类型、`observedAt`、字符串精度的 `tableCounts`、`requiredCapabilities` 和 `blockers`。不输出完整计划、配置/连接串、文件正文、内部来源身份或维护/快照回执。动态内部 blocker 引用只输出诊断指纹。退出码 0 仅表示预览完成，可能仍有阻塞项；空 blockers 也不证明已经取得执行能力。输入或读取失败使用受控 stderr 错误和退出码 1。
 
-该命令保持逻辑只读：不登记 client、不改变业务或维护控制行，不调用普通 driver.connect/migrate，不持久化计划，也不创建控制根、目标库、journal 或备份。它只提供 `plan`，不提供 persist/execute/resume/cancel/inspectMigration。SQLite 可正确读取已提交 WAL，正常 WAL/SHM 协调仍可能发生，**不承诺物理文件系统零持久变化**。PG 只连接明确配置的既有 PG16 源做只读观察；无需 verification DB 或 pg_dump/pg_restore/psql，缺权限/连接失败不提权或回落其他源。返回前等待本次 adapter 关闭。
+`plan` 保持逻辑只读：不登记 client、不改变业务或维护控制行，不调用普通 driver.connect/migrate，不持久化计划，也不创建控制根、目标库、journal 或备份。它不会隐式保存或执行维护。SQLite 可正确读取已提交 WAL，正常 WAL/SHM 协调仍可能发生，**不承诺物理文件系统零持久变化**。PG 只连接明确配置的既有 PG16 源做只读观察；无需 verification DB 或 pg_dump/pg_restore/psql，缺权限/连接失败不提权或回落其他源。返回前等待本次 adapter 关闭。
 
 计划预览没有捕获 Fs，没有取得 provider 资格、停写或一致快照，也不会开放维护执行。其普通读取不能作为冷打开资格的预热或通过依据；Fs 准入、恢复和取消仍遵守各自已有门槛。
+
+### 显式保存计划并回读
+
+需要保留本次计划时，使用同一组参数显式调用 `persist-plan`：
+
+```sh
+node scripts/storage-maintenance.ts persist-plan \
+  --data-dir /absolute/existing/data \
+  --expected-source-id '<selectedSourceId>' \
+  --control-root /absolute/existing/data/maintenance-control \
+  --target-root /absolute/future-target
+```
+
+这会生成新的计划，复核来源、配置、schema 和路径绑定后，只在选定的私有控制根保存不可变计划，再按摘要和来源回读核对。它不接收先前预览的 JSON；保存可能仍包含写者等阻塞项。控制根与 `plans` 目录权限为 `0700`，标记和计划文件为 `0600`。源业务、guard/client/admission、目标库与 journal 不被推进，也不授予维护执行或 Fs provider 资格。
+
+成功时只输出 `formatVersion: 1`、`command: "persist-plan"`、`result: "persisted"`、`persisted: true`、`executionAuthorized: false`、公开 `source` ID/数据库类型、`migrationId`、`planDigest` 和 `planRef`。`planRef` 仅含相对 `ref`、`sha256` 与字符串字节数 `bytes`，不输出绝对控制路径、连接输入或完整计划。回读和 adapter 关闭都完成后才输出成功；退出码 0 不代表执行、停写或快照已经获准。
+
+保存或回读失败返回退出码 1，stdout 不输出成功结果。控制根中可能已保留计划产物，命令不会声称已经回滚；应保留现场并核对来源、控制根与计划摘要。当前 CLI 不提供 execute/resume/cancel/inspectMigration。
 
 [`scripts/migrate-data.ts`](../scripts/migrate-data.ts) 的显式 source/target 语义保持独立；统一启动配置不替代迁移工具已指定的来源与目标。
 
