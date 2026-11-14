@@ -21,12 +21,22 @@ import {
   type MigrationRunResult,
 } from "../migrate.ts";
 import { postgresDialect } from "../dialect.ts";
-import { DriverConnectionError, type DbDriver, type DbReadSnapshot, type DbRow, type DbTransaction, type DbTransactionContext } from "../driver.ts";
+import { DriverConnectionError, type DbDriver, type DbDriverOptions, type DbReadSnapshot, type DbRow, type DbTransaction, type DbTransactionContext } from "../driver.ts";
 import { assertStorageAdmission, readPostgresMaintenanceState, StorageMaintenanceError, type StorageAdmissionIdentity } from "../../storage/admission.ts";
 import { assertPostgresGuardCoverage, extendPostgresStorageGuards } from "../../storage/schema-guards.ts";
 import { storageDrainClientToCheck, assertStorageDrainClient } from "../../storage/drain-boundary.ts";
+import { withM1Cleanup } from "../m1-resources.ts";
+
+interface M1PinnedConnection {
+  readonly client: PoolClient;
+  readonly queue: OperationQueue;
+  active: boolean;
+  failed?: unknown;
+  check?: (read: DbReadSnapshot) => Promise<void>;
+}
 
 export interface PostgresDriverOptions {
+  readonly initializationOnConnect?: "normal" | "none";
   readonly connectionString: string;
   /** 连接后创建并锁定到的 schema（经启动参数 options 设 search_path）。 */
   readonly schema?: string;
@@ -38,6 +48,7 @@ const SCHEMA_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 export class PostgresDriver implements DbDriver {
   readonly kind = "postgres" as const;
   readonly dialect = postgresDialect;
+  readonly initializationOnConnect: "normal" | "none";
 
   private readonly connectionString: string;
   private readonly schema: string | undefined;
@@ -48,8 +59,11 @@ export class PostgresDriver implements DbDriver {
   private readonly transactionIdentity = new AsyncLocalStorage<DbTransactionContext & { active: boolean }>();
   /** SAVEPOINT 计数器。 */
   private spCounter = 0;
+  private readonly m1Pin = new AsyncLocalStorage<M1PinnedConnection>();
+  private m1PinActive = false;
 
   constructor(options: PostgresDriverOptions) {
+    this.initializationOnConnect = options.initializationOnConnect ?? "normal";
     this.connectionString = options.connectionString;
     this.schema = options.schema;
     if (this.schema !== undefined && !SCHEMA_IDENTIFIER.test(this.schema)) {
@@ -62,6 +76,80 @@ export class PostgresDriver implements DbDriver {
   currentTransactionContext(): DbTransactionContext | undefined {
     const context = this.transactionIdentity.getStore();
     return context?.active ? context : undefined;
+  }
+
+  /** Internal M1 descriptor, not identity evidence. The M1 factory still verifies every fact. */
+  m1ExistingSourceOptions(): DbDriverOptions {
+    return { dbDriver: "postgres", pgConnectionString: this.connectionString, initializationOnConnect: "none",
+      ...(this.schema === undefined ? {} : { pgSchema: this.schema }) };
+  }
+
+  /** M1 target only: inspect, explicit CREATE, existing migration code and copy keep one client. */
+  async withM1PinnedConnection<T>(use: () => Promise<T>): Promise<T> {
+    if (this.initializationOnConnect !== "none" || this.m1PinActive || this.currentTransactionContext())
+      throw new Error("m1_target_requires_uninitialized_own_connection");
+    const client = await this.requirePool().connect();
+    const pin: M1PinnedConnection = { client, queue: new OperationQueue(), active: true };
+    const onError = (error: Error): void => { pin.failed ??= error; };
+    client.on("error", onError);
+    this.m1PinActive = true;
+    return withM1Cleanup(() => this.m1Pin.run(pin, async () => {
+      const result = await use();
+      this.assertM1Pin(pin);
+      return result;
+    }), [async () => {
+      await pin.queue.drain();
+      pin.active = false;
+      pin.queue.close();
+      this.m1PinActive = false;
+      try { client.release(pin.failed !== undefined); } finally { client.off("error", onError); }
+    }]);
+  }
+
+  /** Called after inspect/CREATE in that same physical transaction; cannot be rebound. */
+  bindM1Target(check: (read: DbReadSnapshot) => Promise<void>): void {
+    const pin = this.m1Pin.getStore();
+    if (!pin || pin.check || !this.currentTransactionContext()) throw new Error("m1_target_binding_invalid");
+    this.assertM1Pin(pin);
+    pin.check = check;
+  }
+
+  private assertM1Pin(pin: M1PinnedConnection): void {
+    if (!pin.active) throw new Error("m1_target_lease_ended");
+    if (pin.failed !== undefined) throw pin.failed;
+  }
+
+  private async checkM1Pin(client: PoolClient): Promise<void> {
+    const pin = this.m1Pin.getStore();
+    if (!pin) {
+      if (this.m1PinActive) throw new Error("m1_target_lease_owned_elsewhere");
+      return;
+    }
+    this.assertM1Pin(pin);
+    if (pin.client !== client) throw new Error("m1_target_client_changed");
+    if (pin.check) await pin.check({ query: async <R extends DbRow = DbRow>(sql: string, params: readonly unknown[] = []) =>
+      (await client.query(this.dialect.renderParameters(sql), [...params])).rows as R[] });
+  }
+
+  private async withClient<T>(use: (client: PoolClient) => Promise<T>): Promise<T> {
+    const current = this.transactionScope.getStore();
+    if (current) return use(current.client);
+    const pin = this.m1Pin.getStore();
+    if (pin) return pin.queue.run(async () => { this.assertM1Pin(pin); return use(pin.client); });
+    if (this.m1PinActive) throw new Error("m1_target_lease_owned_elsewhere");
+    const client = await this.requirePool().connect();
+    // Pool's error listener only covers idle clients. A leased source can die while the
+    // target is working, between queries; retain that error without an uncaught event.
+    let connectionFailure: Error | undefined;
+    const onError = (error: Error): void => { connectionFailure ??= error; };
+    client.on("error", onError);
+    try {
+      const result = await use(client);
+      if (connectionFailure) throw connectionFailure;
+      return result;
+    } finally {
+      try { client.release(connectionFailure); } finally { client.off("error", onError); }
+    }
   }
 
   async connect(): Promise<void> {
@@ -80,21 +168,22 @@ export class PostgresDriver implements DbDriver {
     this.pool = pool;
     try {
       await pool.query("SELECT 1");
-      const probe=await pool.connect();
-      try {await this.checkAdmission(probe,false);} finally {probe.release();}
-      if (this.schema !== undefined) {
+      await this.withClient(probe => this.checkAdmission(probe,false));
+      if (this.schema !== undefined && this.initializationOnConnect === "normal") {
         // search_path 指向的 schema 必须先存在，否则后续 DDL 全部失败。
         await pool.query(`CREATE SCHEMA IF NOT EXISTS ${this.quotedSchema()}`);
       }
     } catch (error) {
-      await pool.end().catch(() => {});
       this.pool = null;
-      if (error instanceof StorageMaintenanceError) throw error;
-      throw new DriverConnectionError(
+      const failure = error instanceof StorageMaintenanceError ? error : new DriverConnectionError(
         `无法连接 PostgreSQL（${this.sanitizedConnectionString()}）：${this.sanitize(errorText(error))}。` +
           `请确认数据库服务已启动、AGENT_STUDIO_PG_CONNECTION_STRING 与权限配置正确；` +
           `回滚方式：保持/改回 AGENT_STUDIO_DB_DRIVER=sqlite 即恢复阶段 1 行为。`,
       );
+      if (this.initializationOnConnect === "none")
+        return withM1Cleanup(async () => { throw failure; }, [() => pool.end()]);
+      await pool.end().catch(() => {});
+      throw failure;
     }
   }
 
@@ -104,11 +193,9 @@ export class PostgresDriver implements DbDriver {
    */
   async migrate(migrations: readonly Migration[]): Promise<MigrationRunResult> {
     const ordered = validateAndSort(migrations);
-    const pool = this.requirePool();
+    this.requirePool();
     await this.transaction(async tx => {await tx.exec(this.dialect.migrationTableDdl());});
-    const probe=await pool.connect();
-    try {if (await readPostgresMaintenanceState(probe)) await assertPostgresGuardCoverage(probe);}
-    finally {probe.release();}
+    await this.withClient(async probe => {if (await readPostgresMaintenanceState(probe)) await assertPostgresGuardCoverage(probe);});
 
     const applied = new Map<number, AppliedMigration>();
     for (const row of await this.readAppliedMigrations()) {
@@ -134,8 +221,7 @@ export class PostgresDriver implements DbDriver {
       newlyApplied.push(migration);
     }
     const state = await this.migrationState();
-    const current=await pool.connect();
-    try {await this.checkAdmission(current,false);} finally {current.release();}
+    await this.withClient(current => this.checkAdmission(current,false));
     return { applied: newlyApplied, version: state.version };
   }
 
@@ -166,20 +252,16 @@ export class PostgresDriver implements DbDriver {
     // 并行兄弟子事务在父队列中串行，不能让一方回滚覆盖另一方的 SAVEPOINT。
     const parent = this.transactionScope.getStore();
     if (parent) return parent.queue.run(() => this.runTransaction(fn, parent.client, parent.queue));
-    const client = await this.requirePool().connect();
     const callbacks: CommitCallback[] = [];
-    let result: T;
-    try { result = await this.runTransaction(fn, client, undefined, false, callbacks); }
-    finally { client.release(); }
+    const result = await this.withClient(client => this.runTransaction(fn, client, undefined, false, callbacks));
     await runCommitCallbacks(callbacks);
     return result;
   }
 
   async readSnapshot<T>(fn: (snapshot: DbReadSnapshot) => Promise<T>): Promise<T> {
     if (this.currentTransactionContext()) throw new Error("read_snapshot_requires_own_transaction");
-    const client = await this.requirePool().connect();
-    try { return await this.runTransaction(tx => fn({ query: tx.query }), client, undefined, true); }
-    finally { client.release(); }
+    if (this.m1PinActive) throw new Error("m1_target_lease_cannot_open_another_snapshot");
+    return this.withClient(client => this.runTransaction(tx => fn({ query: tx.query }), client, undefined, true));
   }
 
   private async runTransaction<T>(fn: (tx: DbTransaction) => Promise<T>, client: PoolClient, parent?: OperationQueue, readOnly = false,
@@ -210,11 +292,12 @@ export class PostgresDriver implements DbDriver {
       try {
         // READ ONLY is enforced by PG before the first gate query. FOR SHARE is a write
         // lock and cannot be used in a read-only transaction; normal transactions retain it.
-        if (!nested) await this.checkAdmission(client,!readOnly,!readOnly);
+        if (!nested) { await this.checkM1Pin(client); await this.checkAdmission(client,!readOnly,!readOnly); }
         const result = await this.transactionIdentity.run(identity, () => this.transactionScope.run(scope, () => fn(tx)));
         await queue.drain();
         if (nested) await client.query(`RELEASE SAVEPOINT ${sp}`);
         else {
+          await this.checkM1Pin(client);
           const committed = await client.query(this.dialect.commit());
           // body 捕获语句错误后 PG 仍可能以 ROLLBACK tag 正常响应 COMMIT。
           if (committed.command !== "COMMIT") {
@@ -246,49 +329,53 @@ export class PostgresDriver implements DbDriver {
   }
 
   async close(): Promise<void> {
+    if (this.m1PinActive) throw new Error("m1_target_lease_still_active");
     const pool = this.pool;
     this.pool = null;
     this.admissionIdentity = undefined;
     if (pool !== null) {
-      await pool.end().catch(() => {});
+      if (this.initializationOnConnect === "none") await pool.end();
+      else await pool.end().catch(() => {});
     }
   }
 
   private async applyOne(migration: Migration): Promise<void> {
-    const client = await this.requirePool().connect();
     const upSql = migrationSql(migration, "postgres");
-    try {
-      await client.query(this.dialect.beginTransaction());
-      await this.checkAdmission(client,true);
-      if (await readPostgresMaintenanceState(client)) await assertPostgresGuardCoverage(client);
-      await client.query(upSql); // 迁移脚本为无参多语句，走简单查询协议
-      await extendPostgresStorageGuards(client);
-      await client.query(
-        this.dialect.renderParameters(
-          `INSERT INTO ${MIGRATION_TABLE} (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)`,
-        ),
-        [migration.version, migration.name, checksumOf(upSql), new Date().toISOString()],
-      );
-      await client.query(this.dialect.commit());
-    } catch (error) {
+    return this.withClient(async client => {
       try {
-        await client.query(this.dialect.rollback());
-      } catch {
-        // 事务可能已因错误终止；保留原始错误。
+        await client.query(this.dialect.beginTransaction());
+        await this.checkM1Pin(client);
+        await this.checkAdmission(client,true);
+        if (await readPostgresMaintenanceState(client)) await assertPostgresGuardCoverage(client);
+        await client.query(upSql); // 迁移脚本为无参多语句，走简单查询协议
+        await extendPostgresStorageGuards(client);
+        await client.query(
+          this.dialect.renderParameters(
+            `INSERT INTO ${MIGRATION_TABLE} (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)`,
+          ),
+          [migration.version, migration.name, checksumOf(upSql), new Date().toISOString()],
+        );
+        await this.checkM1Pin(client);
+        const committed = await client.query(this.dialect.commit());
+        if (committed.command !== "COMMIT") throw new Error(`PostgreSQL 迁移未确认提交：COMMIT 返回 ${committed.command}。`);
+      } catch (error) {
+        try {
+          await client.query(this.dialect.rollback());
+        } catch {
+          // 事务可能已因错误终止；保留原始错误。
+        }
+        throw new MigrationError(
+          `迁移 ${migration.version} "${migration.name}" 执行失败：${errorText(error)}。` +
+            `该迁移已整体回滚，数据库版本仍为上一个成功版本。`,
+        );
       }
-      throw new MigrationError(
-        `迁移 ${migration.version} "${migration.name}" 执行失败：${errorText(error)}。` +
-          `该迁移已整体回滚，数据库版本仍为上一个成功版本。`,
-      );
-    } finally {
-      client.release();
-    }
+    });
   }
 
   private async readAppliedMigrations(): Promise<AppliedMigration[]> {
-    const result: QueryResult = await this.requirePool().query(
+    const result: QueryResult = await this.withClient(client => client.query(
       `SELECT version, name, checksum, applied_at FROM ${MIGRATION_TABLE} ORDER BY version`,
-    );
+    ));
     return result.rows.map((row: Record<string, unknown>) => ({
       version: Number(row["version"]),
       name: String(row["name"]),

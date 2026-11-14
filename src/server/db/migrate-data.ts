@@ -22,7 +22,7 @@ import path from "node:path";
 
 import { DATABASE_FILE_NAME } from "./database.ts";
 import { createDbDriver } from "./driver.ts";
-import type { DbDriver, DbDriverOptions, DbRow, DbTransaction } from "./driver.ts";
+import type { DbDriver, DbDriverOptions, DbReadSnapshot, DbRow, DbTransaction } from "./driver.ts";
 import { MigrationError, type Migration } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { durableMessageDispatch } from "./migrations/message-dispatch.ts";
@@ -38,6 +38,15 @@ import { taskIntakeMigration } from "./migrations/task-intake.ts";
 import { policyConfigurationMigration } from "./migrations/policy-configuration.ts";
 import { storageMaintenanceMigration } from "./migrations/storage-maintenance.ts";
 import { mcpConnectionsMigration } from "./migrations/mcp-connections.ts";
+import { decisionsMigration } from "./migrations/decisions.ts";
+import { workEventDeliveryInvalidationsMigration } from "./migrations/work-event-delivery-invalidations.ts";
+import { DECISION_TABLES } from "../decisions/tables.ts";
+import { validateDecisionStorageGraph } from "../decisions/storage-validation.ts";
+import { WORK_EVENT_INVALIDATION_COLUMNS, validateWorkEventInvalidations } from "../tasks/work-event-storage.ts";
+import { openM1SourceExisting, withM1BorrowedSource, m1PermitFacts, type M1SourcePermit } from "./m1-source.ts";
+import { assertM1DifferentTarget, withM1TargetLease } from "./m1-target.ts";
+import { withM1Cleanup } from "./m1-resources.ts";
+import type { M1ReadPlan, M1Rows } from "./m1-inspection.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -126,6 +135,8 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
   { name: "member_statuses", keyColumns: ["project_id", "member_id"] },
   { name: "mcp_sessions", keyColumns: ["id"] },
   { name: "audit_log", keyColumns: ["id"] },
+  { name: "work_event_delivery_invalidations", keyColumns: ["work_event_id"],
+    valueColumns: WORK_EVENT_INVALIDATION_COLUMNS.filter(column => column !== "work_event_id") },
   { name: "agent_runtimes", keyColumns: ["id"] },
   { name: "agent_runtime_bindings", keyColumns: ["id"] },
   { name: "agent_runner_states", keyColumns: ["binding_id"] },
@@ -133,6 +144,9 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
   { name: "agent_runtime_events", keyColumns: ["id"] },
   { name: "agent_runtime_observation_meta", keyColumns: ["id"] },
   { name: "agent_runtime_usage_snapshots", keyColumns: ["id"] },
+  ...DECISION_TABLES.map(table => ({ name: table.name, keyColumns: table.keyColumns,
+    integerKeyColumns: table.columns.filter(column => column.integer && table.keyColumns.includes(column.name)).map(column => column.name),
+    valueColumns: table.columns.filter(column => !table.keyColumns.includes(column.name)).map(column => column.name) })),
   { name: "member_fact_revisions", keyColumns: ["member_id", "kind"], valueColumns: ["revision"] },
 ];
 
@@ -361,7 +375,14 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   policyConfigurationMigration,
   storageMaintenanceMigration,
   mcpConnectionsMigration,
+  decisionsMigration,
+  workEventDeliveryInvalidationsMigration,
 ];
+
+/** Both complete, already-existing PG catalogs remain legal sources. No mixed checksum catalog. */
+export const M1_READ_PLAN: M1ReadPlan = Object.freeze({ tables: BUSINESS_TABLES,
+  catalogs: { sqlite: [migrations], postgres: [migrations, PG_BUSINESS_SCHEMA_MIGRATIONS] },
+  validate(rows: Parameters<NonNullable<M1ReadPlan['validate']>>[0]) { validateDecisionStorageGraph(rows); validateWorkEventInvalidations(rows); } });
 
 // ---------------------------------------------------------------------------
 // 驱动打开 / 目标建表 / 清空
@@ -370,8 +391,8 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
 /** 按配置打开并连接一个驱动（源或目标）。 */
 export async function openDriver(options: DbDriverOptions): Promise<DbDriver> {
   const driver = createDbDriver(options);
-  await driver.connect();
-  return driver;
+  try { await driver.connect(); return driver; }
+  catch (error) { return withM1Cleanup(async () => { throw error; }, [() => driver.close()]); }
 }
 
 /** 在目标库创建业务表（PG 用镜像 DDL，SQLite 用生产 DDL）。幂等。 */
@@ -393,13 +414,12 @@ export async function clearTargetTables(driver: DbDriver): Promise<void> {
 // 拷贝 / 校验
 // ---------------------------------------------------------------------------
 
-async function copyTable(source: DbDriver, tx: DbTransaction, spec: TableSpec): Promise<number> {
-  const rows = await source.query<DbRow>(spec.readSql ?? `SELECT * FROM ${spec.name}`);
+async function copyTable(rows: readonly Readonly<DbRow>[], tx: DbTransaction, spec: TableSpec): Promise<number> {
   for (const row of rows) {
     const cols = Object.keys(row);
     if (cols.length === 0) continue;
     const placeholders = cols.map(() => "?").join(", ");
-    const sql = `INSERT INTO ${spec.name} (${cols.join(", ")}) VALUES (${placeholders})`;
+    const sql = `INSERT INTO ${spec.name} (${cols.map(column => `"${column.replaceAll('"', '""')}"`).join(", ")}) VALUES (${placeholders})`;
     await tx.exec(sql, Object.values(row));
   }
   return rows.length;
@@ -410,17 +430,28 @@ export async function copyAllTables(
   source: DbDriver,
   target: DbDriver,
 ): Promise<Record<string, number>> {
-  const counts: Record<string, number> = {};
-  // Source admission remains locked for the whole business copy; maintenance cannot start
-  // between source preflight and target mutation. Metadata/clients are never business rows.
-  await source.transaction(async () => target.transaction(async (tx) => {
+  // A concrete existing-only reader descriptor is required for borrowed PG sources.
+  // This helper does not own/close either driver and does not commit a caller's outer SAVEPOINT.
+  return withM1BorrowedSource(source, M1_READ_PLAN, async permit => (await copyM1Batch(permit, target)).counts);
+}
+
+async function copyM1Batch(permit: M1SourcePermit, target: DbDriver):
+  Promise<{ counts: Record<string, number>; validation: ValidationReport }> {
+  const facts = m1PermitFacts(permit);
+  return target.transaction(async tx => {
+    await facts.assertAlive();
+    await assertM1DifferentTarget(target, tx, permit);
+    const counts: Record<string, number> = {};
     for (const spec of BUSINESS_TABLES) {
       // 前面的 member/事实 INSERT 已产生临时代际；最后精确覆盖源值，之后不再写监控表。
       if (spec.name === "member_fact_revisions") await tx.exec("DELETE FROM member_fact_revisions");
-      counts[spec.name] = await copyTable(source, tx, spec);
+      counts[spec.name] = await copyTable(facts.rows[spec.name]!, tx, spec);
     }
-  }));
-  return counts;
+    const validation = await compareM1Batch(facts.rows, tx);
+    if (!validation.ok) throw new MigrationError("m1_copy_validation_failed");
+    await facts.assertAlive();
+    return { counts, validation };
+  });
 }
 
 function integerKey(value: unknown): string {
@@ -453,14 +484,19 @@ export interface ValidationReport {
 }
 
 /** 逐表校验行数相等 + 主键集合一致（跨库一致性）。 */
-export async function compareData(source: DbDriver, target: DbDriver): Promise<ValidationReport> {
+export async function compareData(source: DbReadSnapshot, target: DbReadSnapshot): Promise<ValidationReport> {
+  const rows: Record<string, readonly DbRow[]> = {};
+  for (const spec of BUSINESS_TABLES) rows[spec.name] = await source.query<DbRow>(
+    `SELECT ${[...spec.keyColumns, ...(spec.valueColumns ?? [])].join(", ")} FROM ${spec.name}`);
+  return compareM1Batch(rows, target);
+}
+
+async function compareM1Batch(source: M1Rows, target: DbReadSnapshot): Promise<ValidationReport> {
   const tables: TableValidation[] = [];
   let ok = true;
   for (const spec of BUSINESS_TABLES) {
     const columns = [...spec.keyColumns, ...(spec.valueColumns ?? [])];
-    const srcRows = await source.query<DbRow>(
-      `SELECT ${columns.join(", ")} FROM ${spec.name}`,
-    );
+    const srcRows = source[spec.name]!;
     const dstRows = await target.query<DbRow>(
       `SELECT ${columns.join(", ")} FROM ${spec.name}`,
     );
@@ -489,14 +525,11 @@ export async function validateData(
   sourceOpts: DbDriverOptions,
   targetOpts: DbDriverOptions,
 ): Promise<ValidationReport> {
-  const source = await openDriver(sourceOpts);
-  const target = await openDriver(targetOpts);
-  try {
-    return await compareData(source, target);
-  } finally {
-    await source.close();
-    await target.close();
-  }
+  const source = await openM1SourceExisting(sourceOpts, M1_READ_PLAN);
+  return withM1Cleanup(() => source.withBatch(async permit => {
+    const target = await openM1SourceExisting(targetOpts, M1_READ_PLAN);
+    return withM1Cleanup(() => target.readSnapshot(read => compareM1Batch(m1PermitFacts(permit).rows, read)), [() => target.close()]);
+  }), [() => source.close()]);
 }
 
 // ---------------------------------------------------------------------------
@@ -519,8 +552,9 @@ export interface MigrateReport {
 }
 
 /**
- * 数据迁移主流程：打开源/目标 → 目标建表 → （可选清空目标）→ 拷贝 → 自检。
- * 源库全程只读。
+ * M1 D2：既有源无初始化准入 → 单次原行快照/typed图 → 获准目标检查/初始化
+ * → 独立clear → 同一目标事务copy与同批比较 → 真实提交 → 释放源owner。
+ * 源不创建或升级；SQLite IMMEDIATE/PG门禁锁保持到真实目标提交后。
  */
 export async function migrateData(
   sourceOpts: DbDriverOptions,
@@ -528,25 +562,19 @@ export async function migrateData(
   opts: MigrateOptions = {},
 ): Promise<MigrateReport> {
   let snapshot: string | undefined;
-  const source = await openDriver(sourceOpts);
-  let target: DbDriver | undefined;
-  try {
-    target = await openDriver(targetOpts);
-    const destination=target;
-    return await source.transaction(async()=>{
-      if (opts.snapshotSource === true && sourceOpts.dbDriver !== "postgres" && sourceOpts.dataDir !== undefined)
-        snapshot = await snapshotSqliteSource(sourceOpts.dataDir);
-      await ensureTargetSchema(destination);
+  const source = await openM1SourceExisting(sourceOpts, M1_READ_PLAN);
+  return withM1Cleanup(() => source.withBatch(async permit => {
+    const facts = m1PermitFacts(permit);
+    if (opts.snapshotSource === true && facts.binding.sqlite)
+      snapshot = await snapshotSqliteFile(facts.binding.sqlite.sqlitePath);
+    return withM1TargetLease(targetOpts, permit, M1_READ_PLAN, async destination => {
+      // Clear retains its independent committed boundary. Copy failure does not undo it.
       if (opts.clear !== false) await clearTargetTables(destination);
-      const perTableCounts = await copyAllTables(source,destination);
-      const validation = await compareData(source,destination);
+      const { counts: perTableCounts, validation } = await copyM1Batch(permit, destination);
       const totalRows = Object.values(perTableCounts).reduce((a,b)=>a+b,0);
-      return {direction:`${source.kind}->${destination.kind}`,perTableCounts,totalRows,validation,snapshot};
+      return { direction: `${source.kind}->${destination.kind}`, perTableCounts, totalRows, validation, snapshot };
     });
-  } finally {
-    await source.close();
-    await target?.close();
-  }
+  }), [() => source.close()]);
 }
 
 export interface RollbackReport {
@@ -586,6 +614,10 @@ export async function rollbackTarget(
  */
 export async function snapshotSqliteSource(dataDir: string): Promise<string> {
   const base = path.join(dataDir, DATABASE_FILE_NAME);
+  return snapshotSqliteFile(base);
+}
+
+async function snapshotSqliteFile(base: string): Promise<string> {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const dest = `${base}.pre-migration.${stamp}.snapshot`;
   await copyFile(base, dest);

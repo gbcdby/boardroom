@@ -81,7 +81,7 @@ export function coordinateRepositoryWrites(repos: RepositorySet): RepositorySet 
   });
 
   repos.projects.rename = coordinate(repos.projects.rename.bind(repos.projects), ([id]) => projectPlan(id));
-  repos.projects.archive = coordinate(repos.projects.archive.bind(repos.projects), ([id]) => projectPlan(id));
+  repos.projects.archive = coordinate(repos.projects.archive.bind(repos.projects), ([id]) => projectPlan(id, async tx => ({ memberIds: ids((await tx.query<IdRow>('SELECT id FROM members WHERE project_id=? ORDER BY id LIMIT 2049', [id])).map(row => row.id)), groupIds: [], runtimeIds: [] })));
   repos.projects.restore = coordinate(repos.projects.restore.bind(repos.projects), ([id]) => projectPlan(id));
   repos.projects.previewPurge = coordinate(repos.projects.previewPurge.bind(repos.projects), ([id]) => projectPlan(id, purgeDiscovery(id)));
   repos.projects.capturePurge = coordinate(repos.projects.capturePurge.bind(repos.projects), ([id]) => projectPlan(id, purgeDiscovery(id)));

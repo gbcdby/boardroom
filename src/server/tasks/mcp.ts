@@ -3,6 +3,7 @@ import type { TaskAccess, TaskService } from "./service.ts";
 import { ForbiddenError } from "../authz/authorize.ts";
 import { RepositoryError } from "../db/errors.ts";
 import { McpToolError } from "../mcp/errors.ts";
+import { decisionToolError, decisionToolResult } from "../decisions/protocol.ts";
 import {
   taskIdSchema, parseTaskInput, createTaskSchema, updateTaskSchema, transitionTaskSchema,
   commentTaskSchema, linkTaskMessageSchema, startTaskReviewSchema, beginTaskReviewSchema,
@@ -34,6 +35,7 @@ export const TASK_OBSERVATIONS: ReadonlySet<TaskOperation> = new Set(["get_setti
 
 export function mapTaskToolError(error: unknown): McpToolError {
   if (error instanceof McpToolError) return error;
+  const decisionError=decisionToolError(error);if(decisionError)return decisionError;
   if (error instanceof ForbiddenError) return new McpToolError("FORBIDDEN", error.message, { reason: error.code });
   if (error instanceof RepositoryError) {
     const reason = "reason" in error && typeof error.reason === "string" ? error.reason : error.code;
@@ -83,7 +85,7 @@ export async function invokeTaskOperation(service: TaskService, access: TaskAcce
     }
     case "begin_review": return { ok: true, round: await service.beginReview(access, projectId, taskId, roundId, parseTaskInput(beginTaskReviewSchema, body)) };
     case "submit_report": return { ok: true, report: await service.submitReport(access, projectId, taskId, roundId, parseTaskInput(submitReviewReportSchema, body)) };
-    case "decide_review": return { ok: true, task: await service.decideReview(access, projectId, taskId, roundId, parseTaskInput(decideTaskReviewSchema, body)) };
+    case "decide_review": return decisionToolResult(await service.decideReview(access, projectId, taskId, roundId, parseTaskInput(decideTaskReviewSchema, body)));
     case "list_work_events": return { ok: true, workEvents: await service.listWorkEvents(access, projectId) };
     case "ack_work_event": return { ok: true, ...await service.acknowledgeWorkEvent(access, projectId, body["eventId"] as string) };
   }

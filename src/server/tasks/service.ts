@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
-import type { RepositorySet } from "../db/repositories.ts";
+import { repositoryDriver, type RepositorySet } from "../db/repositories.ts";
+import { createDecisionService } from "../decisions/service.ts";
+import { materializeReview } from "../decisions/materializer.ts";
+import { invalidateTaskDecisions } from "../decisions/lifecycle.ts";
+import type { DecisionCommandResult } from "../../shared/decisions.ts";
+import type { TrustedLocalDecisionRequest } from "../decisions/trusted-local.ts";
 import type { Member } from "../db/types.ts";
 import { ArchivedError, NotFoundError, RepositoryError } from "../db/errors.ts";
 import { newId } from "../db/ids.ts";
@@ -35,7 +40,7 @@ export interface TaskService {
   startReview(access: TaskAccess, projectId: string, taskId: string, input: { expectedRevision: number }): Promise<StartReviewResult>;
   beginReview(access: TaskAccess, projectId: string, taskId: string, roundId: string, input: { expectedTaskRevision: number; expectedRoundRevision: number }): Promise<ReviewRound>;
   submitReport(access: TaskAccess, projectId: string, taskId: string, roundId: string, input: SubmitReviewReportInput): Promise<ReviewReport>;
-  decideReview(access: TaskAccess, projectId: string, taskId: string, roundId: string, input: DecideReviewInput): Promise<TaskView>;
+  decideReview(access: TaskAccess, projectId: string, taskId: string, roundId: string, input: DecideReviewInput, proof?: TrustedLocalDecisionRequest): Promise<DecisionCommandResult>;
   listWorkEvents(access: TaskAccess, projectId: string): Promise<WorkEvent[]>;
   deliverWorkEvents(access: TaskAccess, projectId: string, limit?: number): Promise<WorkEvent[]>;
   acknowledgeWorkEvent(access: TaskAccess, projectId: string, eventId: string): Promise<{ event: WorkEvent; alreadyAcknowledged: boolean }>;
@@ -48,7 +53,7 @@ export interface TaskServiceOptions {
   readonly onTaskChanged?: (projectId: string, taskId: string, revision: number) => void | Promise<void>;
   readonly onResourceChanged?: (change: ResourceChange) => void | Promise<void>;
 }
-type Context = { actor: Actor; author: TaskAuthor; at: string; events: WorkEvent[]; changed: Map<string, number>; resources: ResourceChange[] };
+type Context = { access: TaskAccess; actor: Actor; author: TaskAuthor; at: string; events: WorkEvent[]; changed: Map<string, number>; resources: ResourceChange[] };
 class GuardRollback extends RepositoryError {
   readonly denial: ForbiddenError;
   constructor(denial: ForbiddenError) { super("invalid_argument", denial.message); this.denial = denial; }
@@ -60,6 +65,7 @@ function deny(capability: Capability, reason: string, code: DenyCode = "forbidde
 /** HTTP/MCP 只负责传输与可信身份；权限、业务状态、CAS 与同事务审计均在此处。 */
 export function createTaskService(options: TaskServiceOptions): TaskService {
   const { repos } = options;
+  const db = repositoryDriver(repos), decisions = createDecisionService(db, options.now ? { now: options.now } : {});
   const now = () => (options.now?.() ?? new Date()).toISOString();
   const capture = options.captureCandidate ?? captureReviewCandidate;
   async function actorFor(access: TaskAccess, projectId: string, write = false): Promise<Actor> {
@@ -130,11 +136,11 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
   }
   async function mutate<T>(access: TaskAccess, projectId: string, body: (ctx: Context) => Promise<T>, operation: "write" | "consume" = "write", targets: DomainMutationTargets = {}): Promise<T> {
     const events: WorkEvent[] = []; const changed = new Map<string, number>(); const resources: ResourceChange[] = [];
-    const discover = discoverDomainMutation(access, projectId, targets);
+    const discover = discoverDomainMutation(access, projectId, { ...targets, ...(targets.taskId ? { escalation: true } : {}) });
     const work = () => repos.mutations.run({ projectIds: [projectId], discover }, () => repos.transaction(async () => {
       try {
         const actor = await actorFor(access, projectId, true);
-        return await body({ actor, author: await authorFor(actor), at: now(), events, changed, resources });
+        return await body({ access, actor, author: await authorFor(actor), at: now(), events, changed, resources });
       } catch (error) {
         if (error instanceof ForbiddenError) throw new GuardRollback(error);
         throw error;
@@ -170,6 +176,7 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
     ctx.events.push(record);
   }
   async function supersede(ctx: Context, task: Task): Promise<void> {
+    await invalidateTaskDecisions(db, ctx.access, task.projectId, task.id, ctx.at);
     if (!task.currentReviewRoundId) return;
     const round = await repos.tasks.getRound(task.projectId, task.id, task.currentReviewRoundId);
     if (round && round.state !== "superseded") await repos.tasks.updateRoundCas(task.projectId, round.id, round.revision, { state: "superseded" }, ctx.at);
@@ -444,32 +451,13 @@ export function createTaskService(options: TaskServiceOptions): TaskService {
         const report = await repos.tasks.addReport({ id: newId(), projectId, taskId, roundId, axis: value.axis, verdict: value.verdict,
           body: value.body, sources: value.sources, evidence: value.evidence, contentSha256, author: ctx.author, createdAt: ctx.at });
         await repos.tasks.addComment({ id: newId(), projectId, taskId, kind: "review_report", author: ctx.author, body: value.body, createdAt: ctx.at, reviewReportId: report.id });
-        await history(ctx, task, "task.review_reported", { roundId, reportId: report.id, axis: report.axis, verdict: report.verdict }); return report;
+        await history(ctx, task, "task.review_reported", { roundId, reportId: report.id, axis: report.axis, verdict: report.verdict });
+        if (other) await materializeReview(db, access, { projectId, taskId, roundId }, ctx.at);
+        return report;
       }, "write", { taskId, roundId });
     },
-    async decideReview(access, projectId, taskId, roundId, input) {
-      const value = parseTaskInput(decideTaskReviewSchema, input);
-      return mutate(access, projectId, async ctx => {
-        const task = await required(projectId, taskId); const round = await requiredRound(projectId, taskId, roundId);
-        if (value.override) await manage(ctx.actor, task, "task:override"); else await requireReviewer(ctx.actor, task, round);
-        currentRound(task, round, value.expectedTaskRevision, value.expectedRoundRevision, value.override ? ["reported", "decided"] : ["reported"]);
-        await requireMaterials(task, value.verdict === "pass" ? "complete" : "startExecution");
-        const reports = await repos.tasks.listReports(projectId, taskId, roundId);
-        if (!round.candidate || reports.length !== 2 || !reports.some(report => report.axis === "spec") || !reports.some(report => report.axis === "standards")) {
-          throw new TaskError("review_reports_required", "完整有效候选与两轴报告齐备后才能裁决。", "conflict");
-        }
-        if (!value.override && value.verdict === "pass" && reports.some(report => report.verdict !== "pass")) throw new TaskError("review_axis_rejected", "仍有评审轴要求修改，不能作普通通过裁决。", "conflict");
-        const updated = await repos.tasks.updateCas(projectId, taskId, task.revision, { state: value.verdict === "pass" ? "done" : "in-progress", blockedReason: null }, ctx.at);
-        const decision: NonNullable<ReviewRound["decision"]> = { verdict: value.verdict, actor: ctx.author, reason: value.reason, override: value.override ?? false, taskRevision: updated.revision };
-        await history(ctx, updated, "task.review_decided", { roundId, previousDecision: round.decision, decision });
-        await repos.tasks.updateRoundCas(projectId, roundId, round.revision, { state: "decided", decision }, ctx.at);
-        const assignee = updated.assigneeMemberId ? await repos.members.get(updated.assigneeMemberId) : null;
-        await event(ctx, updated, updated.assigneeMemberId, "task.review_decided", `review:${roundId}:revision:${round.revision + 1}:decided`, {
-          roundId, decision, enteredDone: task.state !== "done" && updated.state === "done",
-          completionRevision: updated.revision, assigneeAgentId: assignee?.kind === "agent" ? assignee.agentId : null,
-        });
-        return present(updated);
-      }, "write", { taskId, roundId });
+    async decideReview(access, projectId, taskId, roundId, input, proof) {
+      return decisions.requestAndMaybeResolveReview(access, { projectId, taskId, roundId }, input, proof);
     },
     async listWorkEvents(access, projectId) {
       const actor = await actorFor(access, projectId);

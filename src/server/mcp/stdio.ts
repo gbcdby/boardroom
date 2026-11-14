@@ -23,6 +23,7 @@ import { createLogger } from "../logger.ts";
 import { createMcpCore } from "./core.ts";
 import { createMcpServer } from "./server.ts";
 import { registerMemoryRuntime, closeMemoryRuntime, pauseMemoryRuntime } from "../memory/runtime.ts";
+import { initializeDecisions } from "../decisions/startup.ts";
 import { registerStorageSourceClient, storageClientDriverOptions } from "../storage/source-client.ts";
 import { StorageMaintenanceError } from "../storage/admission.ts";
 
@@ -60,6 +61,7 @@ async function main(): Promise<void> {
   try {
     await storageClient.run(async () => {
     await initializePolicyConfiguration(createRepositories(driver));
+    await initializeDecisions(driver);
     await storageClient.assertAdmission();
     registerMemoryRuntime(driver, {
       database: databaseForConnectedReader(environment.databaseDescriptor),

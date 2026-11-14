@@ -1,3 +1,4 @@
+import { DECISION_TABLE_NAMES } from "../decisions/tables.ts";
 import { createHash } from "node:crypto";
 import type { DbRow } from "./driver.ts";
 import type { RepoCtx } from "./repositories.ts";
@@ -45,6 +46,7 @@ export async function purgeImpactDigest(ctx: RepoCtx, kind: "project" | "group",
   const scope = project ? "project_id = ?" : "group_id = ?";
 
   if (project) {
+    if (versions.has(20)) for (const table of DECISION_TABLE_NAMES) await capture(table, "project_id = ?");
     await capture("projects", "id = ?");
     if (versions.has(15)) await capture("project_workspace_versions", "project_id = ?");
     if (versions.has(17)) {
@@ -70,6 +72,7 @@ export async function purgeImpactDigest(ctx: RepoCtx, kind: "project" | "group",
       digest.update(JSON.stringify(["agent_runtime_members", rows.map(row => canonicalRow("agent_runtime_members", row)).sort()]));
     }
   }
+  if (versions.has(21)) await capture("work_event_delivery_invalidations", project ? "project_id = ?" : "work_event_id IN (SELECT id FROM work_events WHERE context_group_id = ?)");
   if (versions.has(11)) {
     if (project) {
       for (const table of ["project_task_settings", "tasks", "task_comments", "task_history", "task_review_rounds", "task_review_reports", "work_events"]) {

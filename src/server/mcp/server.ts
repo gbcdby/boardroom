@@ -5,6 +5,7 @@ import type { McpCore } from "./core.ts";
 import { McpToolError } from "./errors.ts";
 import { isRegistered, listAdapterIds } from "./adapters/index.ts";
 import { TASK_COMMANDS, type TaskOperation } from "../tasks/mcp.ts";
+import { DECISION_COMMANDS, type DecisionOperation } from "../decisions/mcp.ts";
 import { MEMORY_COMMANDS, type MemoryOperation } from "../memory/mcp.ts";
 
 /**
@@ -80,6 +81,11 @@ export function createMcpServer(options: CreateMcpServerOptions): McpServer {
       description: `${definition.title}。项目由当前 join 绑定确定；写入需要修订，外部执行证据按声明记录。`,
       inputSchema: definition.schema,
     }, (args: Record<string, unknown>, extra: ToolExtra) => runTool(log, definition.name, () => core.taskOperation(sessionOf(extra), operation, args) as Promise<ToolPayload>));
+  }
+  for(const operation of Object.keys(DECISION_COMMANDS) as DecisionOperation[]) {
+    const definition=DECISION_COMMANDS[operation];
+    server.registerTool(definition.name,{title:definition.title,description:`${definition.title}。身份与项目来自当前绑定；pending 不是已执行，人工来源不能经 MCP 提交。`,inputSchema:definition.schema},
+      (args:Record<string,unknown>,extra:ToolExtra)=>runTool(log,definition.name,()=>core.decisionOperation(sessionOf(extra),operation,args) as Promise<ToolPayload>));
   }
   for (const operation of Object.keys(MEMORY_COMMANDS) as MemoryOperation[]) {
     const definition = MEMORY_COMMANDS[operation];

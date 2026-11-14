@@ -9,10 +9,11 @@ import { join, resolve } from "node:path";
 import { Client } from "pg";
 import { PostgresDriver } from "../src/server/db/drivers/postgres.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
+import { migrationSql } from "../src/server/db/migrate.ts";
 import { extendPostgresStorageGuards } from "../src/server/storage/schema-guards.ts";
 import { maintenanceHostIdentityDigest } from "../src/server/storage/maintenance/host.ts";
 import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";
-import { encodePostgresCell } from "../src/server/storage/maintenance/postgres-manifests.ts";
+import { encodePostgresCell, readPostgresMigrationFunctionBodies } from "../src/server/storage/maintenance/postgres-manifests.ts";
 import { buildDatabaseManifests, digestRowMultiset } from "../src/server/storage/maintenance/manifests.ts";
 import { parsePostgresConnection, postgresDatabaseArgument, runPostgresTool, waitForPostgresTools } from "../src/server/storage/maintenance/postgres-tools.ts";
 import { auditPublicArchiveToc, readPublicRestoreCatalogBinding } from "../src/server/storage/maintenance/postgres-public-toc.ts";
@@ -22,6 +23,22 @@ import type { ControlRootIdentity, Json, MaintenanceAdapter, OperationMutex } fr
 import { closePostgresWriterObservations, observePostgresCalls, observePostgresWriters, type PostgresCall } from "./fixtures/maintenance-postgres-writer-observation.ts";
 
 after(closePostgresWriterObservations);
+
+test("#157 PG migration function bodies bind exact dollar tags and preserve the frozen v20/v21 guards", () => {
+  const plain = "\nBEGIN\n  RETURN NEW;\nEND;\n";
+  const tagged = "\nBEGIN\n  RAISE NOTICE '$guard$ is different from the outer tag';\n  RETURN NEW;\nEND;\n";
+  const sql = `CREATE FUNCTION plain_guard() RETURNS trigger LANGUAGE plpgsql AS $$${plain}$$;\n`
+    + `create function tagged_guard() returns trigger language plpgsql as $Guard$${tagged}$Guard$;`;
+  assert.deepEqual([...readPostgresMigrationFunctionBodies(sql)], [["plain_guard", plain], ["tagged_guard", tagged]]);
+  assert.throws(() => readPostgresMigrationFunctionBodies("CREATE FUNCTION bad() RETURNS trigger LANGUAGE plpgsql AS $Tag$ BEGIN RETURN NEW; END; $tag$;"), /schema_guard_incomplete/);
+  assert.throws(() => readPostgresMigrationFunctionBodies("CREATE FUNCTION bad() RETURNS trigger LANGUAGE plpgsql AS $one$ BEGIN RETURN NEW; END; $two$;"), /schema_guard_incomplete/);
+  assert.throws(() => readPostgresMigrationFunctionBodies("CREATE FUNCTION bad() RETURNS trigger LANGUAGE plpgsql AS $1bad$ BEGIN RETURN NEW; END; $1bad$;"), /schema_guard_incomplete/);
+  const decision = readPostgresMigrationFunctionBodies(migrationSql(migrations.find(m => m.version === 20)!, "postgres"));
+  const delivery = readPostgresMigrationFunctionBodies(migrationSql(migrations.find(m => m.version === 21)!, "postgres"));
+  assert.equal(decision.size, 11);assert.equal(delivery.size, 1);
+  assert.equal(decision.get("decision_legacy_records_update_guard_fn"), "\nBEGIN\n  IF 1 = 1 THEN RAISE EXCEPTION 'decision_legacy_records_update_guard' USING ERRCODE = '23514'; END IF;\n  RETURN NEW;\nEND;\n");
+  assert.equal(delivery.get("work_event_invalidation_update_guard_fn"), "\nBEGIN RAISE EXCEPTION 'work_event_invalidation_immutable' USING ERRCODE = '23514'; END;\n");
+});
 
 test("#152 PG typed cells preserve int8/numeric precision, NULL, binary and duplicate rows", () => {
   const integer = encodePostgresCell("20", "9223372036854775807");
@@ -207,6 +224,29 @@ async function seal(adapter: MaintenanceAdapter, f: Fixture, mutex: OperationMut
     else await operation();
   }
 }
+
+pgTest("#157 PG v20/v21 function catalog accepts exact bodies and rejects tampered or extra guards", async t => {
+  const f = await fixture(t, "pg-decision-function-catalog", false);
+  const adapter = await createPostgresMaintenanceAdapter(f.source, f.target);
+  const client = await f.connectSource();
+  try {
+    await assert.doesNotReject(adapter.observe());
+    for (const name of ["decision_legacy_records_update_guard_fn", "work_event_invalidation_update_guard_fn"]) {
+      const original = (await client.query("SELECT pg_get_functiondef($1::regprocedure) AS definition", [`${name}()`])).rows[0]?.definition;
+      assert.equal(typeof original, "string");
+      try {
+        await client.query(`CREATE OR REPLACE FUNCTION ${quoted(name)}() RETURNS trigger LANGUAGE plpgsql AS $tampered$ BEGIN RETURN NEW; END; $tampered$`);
+        await assert.rejects(adapter.observe(), /schema_guard_incomplete/, `${name} must retain its immutable body`);
+      } finally { await client.query(original); }
+      await assert.doesNotReject(adapter.observe());
+    }
+    try {
+      await client.query("CREATE FUNCTION extra_guard_fn() RETURNS trigger LANGUAGE plpgsql AS $extra$ BEGIN RETURN NEW; END; $extra$");
+      await assert.rejects(adapter.observe(), /schema_guard_incomplete/, "extra functions must not be silently omitted");
+    } finally { await client.query("DROP FUNCTION IF EXISTS extra_guard_fn()"); }
+    await assert.doesNotReject(adapter.observe());
+  } finally { await client.end(); await adapter.close(); await f.close(); }
+});
 
 pgTest("#152 PG column ACL preserves grants and grant options while accepting NULL and empty privilege sets", async t => {
   const f = await fixture(t, "pg-column-acl", false), adapter = await createPostgresMaintenanceAdapter(f.source, f.target);

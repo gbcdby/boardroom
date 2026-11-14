@@ -1,10 +1,10 @@
 # MCP 工具契约
 
 状态：已确认（当前工具目录与兼容聊天契约）
-日期：2026-10-22 初版；2026-11-11 更新任务、记忆与成员代际
-来源：[主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)、阶段 3/4/5 共享合同及当前注册代码。
+日期：2026-10-22 初版；2026-11-14 更新 Decision 工具目录
+来源：[主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)、阶段 3/4/5 共享合同、[Decision 评审合同 #157](https://github.com/gbcdby/boardroom/issues/157)及当前注册代码。
 
-当前注册 **32 个工具：7 个聊天/连接、15 个任务/评审/工作事件、10 个记忆工具**。工具名字、实际 schema 与调用装配以 [MCP 注册层](../src/server/mcp/server.ts)、[任务入口](../src/server/tasks/mcp.ts)、[记忆入口](../src/server/memory/mcp.ts)为准。以下目录列全现有工具；§7 起保留早期阶段增量的来源背景，不能单独据旧段落判断当前支持范围。
+当前注册 **37 个工具：7 个聊天/连接、15 个任务/评审/工作事件、5 个 Decision、10 个记忆工具**。工具名字、实际 schema 与调用装配以 [MCP 注册层](../src/server/mcp/server.ts)、[任务入口](../src/server/tasks/mcp.ts)、[Decision 入口](../src/server/decisions/mcp.ts)、[记忆入口](../src/server/memory/mcp.ts)为准。以下目录列全现有工具；§7 起保留早期阶段增量的来源背景，不能单独据旧段落判断当前支持范围。
 
 | 分组 | 工具名 | 参数与行为说明 |
 | --- | --- | --- |
@@ -13,10 +13,11 @@
 | 任务修改（5） | `create_task`、`update_task`、`transition_task`、`comment_task`、`link_task_message` | 创建/分配受管理范围限制，评论受项目成员权限，状态受负责人/管理权限 |
 | 评审（4） | `start_task_review`、`begin_task_review`、`submit_task_review_report`、`decide_task_review` | 固定 Git 候选，独立轴报告，指定 reviewer / 有理由管理覆盖 |
 | 工作事件（2） | `list_work_events`、`acknowledge_work_event` | 当前绑定成员自己的持久通知；ACK 不改变任务或总结状态 |
+| Decision（5） | `list_decisions`、`read_decision`、`request_review_decision`、`resolve_decision`、`refresh_decision` | 当前绑定项目的查询、明确提案/后继、选择与策略刷新；参数见 `src/server/decisions/schemas.ts`，身份和权限由当前绑定决定，不能经 MCP 提交人工来源 |
 | 文档/历史（3） | `read_memory`、`write_memory`、`list_memory_versions` | [记忆范围与版本](memory.md)、`src/server/memory/schemas.ts` |
 | 总结（7） | `list_memory_summary_requests`、`read_memory_summary`、`begin_memory_summary`、`submit_memory_summary`、`fail_memory_summary`、`retry_memory_summary`、`report_memory_session_end` | 材料/begin/submit/fail/session-end 由目标 Agent 本体有效绑定执行；重试另按管理权限与状态核验 |
 
-任务、记忆输入严格拒绝未知字段。身份、绑定代际和项目权限由服务端取当前连接/数据库事实；客户端不能通过传 actor、projectId 或 targetAgentId 获得额外权限。真实模型证据门槛见 [V1 验收索引](v1-acceptance.md)，工具返回成功与模型真实运行分开记录。
+任务、Decision、记忆输入严格拒绝未知字段。身份、绑定代际和项目权限由服务端取当前连接/数据库事实；客户端不能通过传 actor、projectId 或 targetAgentId 获得额外权限。Decision 命令区分 `pending`、`refreshed`、`applied`、`not_required`；提案待裁决不表示 Task 已执行，选择必须携带返回的当前 Decision 引用。真实模型证据门槛见 [V1 验收索引](v1-acceptance.md)，工具返回成功与模型真实运行分开记录。
 
 ## 1. 传输选择
 

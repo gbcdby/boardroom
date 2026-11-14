@@ -66,6 +66,28 @@ try {
   const reviewer = await connect(`评审者-${projectId}`, groupId);
   const manager = await connect(`统筹-${projectId}`, groupId, "manager");
   const prefix = `/api/projects/${projectId}`;
+  async function approveReview(input) {
+    const pending = await reviewer.call("decide_task_review", input);
+    assert.equal(pending.ok, true, JSON.stringify(pending)); assert.equal(pending.state, "pending");
+    assert.equal(pending.receipt.httpStatus, 202); assert.equal(pending.task.state, "review");
+    const listed = await manager.call("list_decisions", { taskId: input.taskId });
+    const decision = listed.decisions.find(item => item.recordKind === "live-review-decision" && item.isCurrent);
+    assert.ok(decision); assert.equal(decision.requiredAuthority, "owner");
+    const choice = { decisionId: decision.ref.decisionId, decisionRef: decision.ref, choiceId: "approve",
+      reason: "真实当前管理者完成批准，协议夹具不代表模型评审", idempotencyKey: `sdk-approve:${input.taskId}` };
+    const applied = await manager.call("resolve_decision", choice);
+    assert.equal(applied.ok, true, JSON.stringify(applied)); assert.equal(applied.state, "applied");
+    assert.equal(applied.current.resolution.authority, "owner"); assert.equal(applied.task.state, "done");
+    const replay = await manager.call("resolve_decision", choice);
+    assert.equal(replay.replay, "same-key"); assert.deepEqual(replay.receipt, applied.receipt);
+    const oldPending = await reviewer.call("decide_task_review", input);
+    assert.equal(oldPending.state, "pending"); assert.equal(oldPending.current.status, "resolved");
+    assert.deepEqual(oldPending.receipt, pending.receipt);
+    const notices = await manager.call("wait_for_messages", { timeoutMs: 100 });
+    assert.ok(notices.workEvents?.some(event => event.kind === "decision.requested" && event.payload.decisionId === decision.ref.decisionId));
+    for (const event of notices.workEvents ?? []) assert.equal((await manager.call("acknowledge_work_event", { eventId: event.id })).ok, true);
+    return applied;
+  }
   const quick = await manager.call("create_task", { title: "先记下待整理的需求", reviewerMemberId: null });
   checked("MCP 标题录入持久 todo，缺分派不误发执行或评审通知", () => {
     assert.equal(quick.ok, true, JSON.stringify(quick)); assert.equal(quick.task.state, "todo");
@@ -169,9 +191,9 @@ try {
     assert.deepEqual(detail.reports.map(item => item.axis).sort(), ["spec", "standards"]);
     assert.equal(detail.comments.filter(item => item.kind === "review_report").length, 2);
   });
-  task = (await reviewer.call("decide_task_review", { taskId: task.id, roundId: round.id,
+  task = (await approveReview({ taskId: task.id, roundId: round.id,
     expectedTaskRevision: task.revision, expectedRoundRevision: round.revision, verdict: "pass", reason: "协议夹具两轴已提交" })).task;
-  checked("指定 reviewer 裁决进入 done", () => assert.equal(task.state, "done"));
+  checked("默认owner策略保留reviewer待决回执，真实manager批准一次进入done且同key可重放", () => assert.equal(task.state, "done"));
   detail = await http("GET", `${prefix}/tasks/${task.id}`);
   round = detail.rounds.find(item => item.id === round.id);
   task = (await http("POST", `${prefix}/tasks/${task.id}/reviews/${round.id}/decision`, {
@@ -199,7 +221,7 @@ try {
       assert.equal(submitted.ok, true, JSON.stringify(submitted));
       currentRound = (await http("GET", `${prefix}/tasks/${current.id}`)).rounds.find(item => item.id === currentRound.id);
     }
-    const decided = await reviewer.call("decide_task_review", { taskId: current.id, roundId: currentRound.id,
+    const decided = await approveReview({ taskId: current.id, roundId: currentRound.id,
       expectedTaskRevision: current.revision, expectedRoundRevision: currentRound.revision, verdict: "pass", reason: "恢复路径的两轴协议 fixture 已完成" });
     assert.equal(decided.ok, true, JSON.stringify(decided)); assert.equal(decided.task.state, "done");
     return decided.task;

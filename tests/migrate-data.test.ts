@@ -200,9 +200,10 @@ const FK_DEPS: Record<string, string[]> = {
   memory_trigger_counters: ["projects", "agents", "groups"], memory_scan_checkpoints: ["projects", "agents", "groups"],
 };
 
-test("业务表清单：45 张表含六张 v19 MCP 表、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
+test("业务表清单：58 张表含 v19 MCP、v20 Decision 与 v21 WorkEvent 失效边车、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
   const names = BUSINESS_TABLES.map((t) => t.name);
-  assert.equal(names.length, 45);
+  assert.equal(names.length, 58);
+  assert.ok(names.includes("work_event_delivery_invalidations"));
   assert.equal(names.at(-1), "member_fact_revisions");
   assert.ok(!names.includes("schema_migrations"));
   for (const expected of [
@@ -366,7 +367,7 @@ test("回滚：清空目标业务表，源库不受影响；可重新迁移恢�
       for (const table of MCP_TABLES) assert.ok(migrated.validation.tables.find(row => row.table === table)!.targetCount > 0, `${table} 需实际复制`);
 
       const rb = await rollbackTarget(dstOpts);
-      assert.equal(rb.clearedTables.length, 45);
+      assert.equal(rb.clearedTables.length, 58);
       for (const table of MCP_TABLES) assert.ok(rb.clearedTables.includes(table), `${table} 需参与clear`);
       const emptied = createDbDriver(dstOpts); await emptied.connect();
       try { for (const table of MCP_TABLES) assert.equal((await emptied.query(`SELECT * FROM ${table}`)).length, 0, `${table} 未清空`); }

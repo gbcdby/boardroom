@@ -55,7 +55,7 @@
 
 `C-DB` 的两个 PG 变量用途不同：`AGENT_STUDIO_PG_TEST_URL` 门控测试文件，`AGENT_STUDIO_PG_CONNECTION_STRING` 供实际服务和 SDK e2e 连接；仅设置前者不会把 e2e 切到 PG。更换数据库驱动不搬迁数据。浏览器脚本的安装与运行命令见[接入指南 §8](getting-started-mcp.md#8-验收与可重复验证)。
 
-`C-INSTALL` 的生产 smoke 自动化入口为 `node scripts/e2e-install.mjs`，使用实际 `npm start/prestart`、独立临时配置/data、可选 PG 新 schema，检查 HTTP、32 个 MCP 工具、实际消息/ACK、正常关闭与同数据重启。数据库选择沿用 `AGENT_STUDIO_DB_DRIVER` + `AGENT_STUDIO_PG_CONNECTION_STRING`，原始报告为 `.agent-output/install-e2e/{sqlite,postgres}.json`，本轮结果为 `E-INSTALL`。干净检出的 `npm ci` 由安装环境/CI 单独记录，不由脚本伪造。
+`C-INSTALL` 的生产 smoke 自动化入口为 `node scripts/e2e-install.mjs`，使用实际 `npm start/prestart`、独立临时配置/data、可选 PG 新 schema，检查 HTTP、完整 MCP 工具名单、实际消息/ACK、正常关闭与同数据重启。工具名单与独立手写契约 `tests/helpers/mcp-contract.ts` 逐项相等；当前为37项，包含 #157 的5个 Decision 工具，历史 `E-INSTALL` 的32项结果仍按当时来源保留。数据库选择沿用 `AGENT_STUDIO_DB_DRIVER` + `AGENT_STUDIO_PG_CONNECTION_STRING`，原始报告为 `.agent-output/install-e2e/{sqlite,postgres}.json`，原 V1 基线结果见下方 `E-INSTALL`。干净检出的 `npm ci` 由安装环境/CI 单独记录，不由脚本伪造。
 
 ### 2.1 已固定工程证据组
 

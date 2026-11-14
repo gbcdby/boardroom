@@ -1,3 +1,5 @@
+import { assertReviewTransaction } from "../decisions/locked-transaction.ts";
+import type { ReviewLockedTransaction } from "../decisions/types.ts";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { RepositorySet } from "../db/repositories.ts";
@@ -108,6 +110,25 @@ export async function initializePolicyConfiguration(repos: RepositorySet, now: (
   });
 }
 
+export async function assertPolicyConfigurationInitialized(repos:RepositorySet):Promise<void> { await requiredGlobal(repos); }
+async function readEffectivePolicy(repos:RepositorySet,projectId:string|null):Promise<EffectivePolicyConfiguration> {
+    // 一个查询的快照包含两份 head，避免全局/项目同时更新时拼成不可存在的组合。
+    const rows = await repos.context.query<PolicyVersionRow>(`SELECT d.scope, d.project_id, v.* FROM policy_documents d
+      LEFT JOIN policy_document_versions v ON v.document_id = d.scope_key AND v.revision = d.revision
+      WHERE d.scope_key IN ('user', ?)`, [keyOf(projectId)]);
+    const saved = rows.map(fromRow), global = saved.find(version => version.document.scope === "user") as PersistedPolicyDocument<GlobalPolicyDocument> | undefined;
+    if (!global) throw new PolicyConfigurationError("policy_not_initialized", 409);
+    const project = (saved.find(version => version.document.scope === "project") ?? null) as PersistedPolicyDocument<ProjectPolicyDocument> | null;
+    return { ...compose(global.document, project?.document), global, project, defaultRevision: global.defaultRevision,
+      policyRevision: createHash("sha256").update(JSON.stringify([global.ref.contentDigest, project?.ref.contentDigest ?? null, global.defaultRevision])).digest("hex"),
+      mode: "observation", executionAdmission: "not-issued" };
+}
+export async function readLockedReviewPolicy(guard:ReviewLockedTransaction):Promise<EffectivePolicyConfiguration> {
+  const state=assertReviewTransaction(guard);
+  const value=await readEffectivePolicy(state.repos,state.slot.projectId);
+  assertReviewTransaction(guard); return value;
+}
+
 export function createPolicyConfiguration({ repos, now = () => new Date() }: { repos: RepositorySet; now?: () => Date }) {
   async function requireProject(projectId: string) {
     if (typeof projectId !== "string" || !projectId || projectId.trim() !== projectId || projectId.length > 200 || /[\r\n\0]/.test(projectId)) {
@@ -150,16 +171,7 @@ export function createPolicyConfiguration({ repos, now = () => new Date() }: { r
   }
   async function getEffective(access: PolicyConfigurationAccess, projectId: string | null = null): Promise<EffectivePolicyConfiguration> {
     requirePolicyUser(access, projectId); if (projectId !== null) await requireProject(projectId);
-    // 一个查询的快照包含两份 head，避免全局/项目同时更新时拼成不可存在的组合。
-    const rows = await repos.context.query<PolicyVersionRow>(`SELECT d.scope, d.project_id, v.* FROM policy_documents d
-      LEFT JOIN policy_document_versions v ON v.document_id = d.scope_key AND v.revision = d.revision
-      WHERE d.scope_key IN ('user', ?)`, [keyOf(projectId)]);
-    const saved = rows.map(fromRow), global = saved.find(version => version.document.scope === "user") as PersistedPolicyDocument<GlobalPolicyDocument> | undefined;
-    if (!global) throw new PolicyConfigurationError("policy_not_initialized", 409);
-    const project = (saved.find(version => version.document.scope === "project") ?? null) as PersistedPolicyDocument<ProjectPolicyDocument> | null;
-    return { ...compose(global.document, project?.document), global, project, defaultRevision: global.defaultRevision,
-      policyRevision: createHash("sha256").update(JSON.stringify([global.ref.contentDigest, project?.ref.contentDigest ?? null, global.defaultRevision])).digest("hex"),
-      mode: "observation", executionAdmission: "not-issued" };
+    return readEffectivePolicy(repos,projectId);
   }
   async function audit(access: PolicyConfigurationAccess, projectId: string | null, before: PersistedPolicyDocument | null, after: PersistedPolicyDocument) {
     // 审计只保存不可变版本引用，完整规则在版本表，不受既有审计正文截断影响。

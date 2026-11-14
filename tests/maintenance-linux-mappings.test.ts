@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import promises from "node:fs/promises";
@@ -75,10 +75,39 @@ async function startUser(file: string, mode: string) {
   } catch (error) { child.kill("SIGKILL"); await exited.catch(() => undefined); throw error; }
 }
 
+// Setup/release need a current complete inventory; an unrelated same-UID process can change between scans.
+// This bounded test-only observation never reclassifies blockers or retries the live-user/fault assertions.
+async function assertCompleteInventory(t: TestContext, f: Awaited<ReturnType<typeof fixture>>,
+  phase: "PREPARE" | "RELEASE", ownPid?: number) {
+  const started = performance.now();
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const attemptStarted = performance.now();
+    assert.ok(attemptStarted - started < 2000, `${phase}: complete inventory window exhausted`);
+    let operation = "observe", blockers: Awaited<ReturnType<typeof f.adapter.inspectWriters>> | undefined;
+    try {
+      const observation = await f.adapter.observe(); operation = "inspectWriters";
+      blockers = await f.adapter.inspectWriters(observation); operation = "complete";
+    } finally {
+      t.diagnostic(JSON.stringify({ phase, attempt, operation, ownPid: ownPid ?? null, testPid: process.pid,
+        elapsedMs: performance.now() - started, attemptElapsedMs: performance.now() - attemptStarted, blockers: blockers ?? null }));
+    }
+    // Await the complete scan, but never accept even a clear result that arrived outside the fixed window.
+    assert.ok(performance.now() - started <= 2000, `${phase}: complete inventory exceeded 2 seconds`);
+    if (blockers.length === 0) { assert.deepEqual(blockers, []); return; }
+    const mayObserveAgain = blockers.every(blocker => {
+      const pid = /^unreadable-process:([1-9][0-9]*)$/.exec(blocker.subjectRef ?? "")?.[1];
+      return blocker.code === "source_writer_unknown" && pid !== undefined && pid !== String(process.pid)
+        && (phase !== "RELEASE" || pid !== String(ownPid));
+    });
+    if (!mayObserveAgain || attempt === 4) assert.deepEqual(blockers, []);
+    await new Promise<void>(resolve => setTimeout(resolve, 50));
+  }
+}
+
 for (const mode of ["shared-writer", "private-reader", "fd-reader"]) linuxTest(`#152 real Linux ${mode} remains a blocker until the same-UID process releases its source`, async t => {
   const f = await fixture(); let user: Awaited<ReturnType<typeof startUser>> | undefined;
   try {
-    assert.deepEqual(await f.adapter.inspectWriters(await f.adapter.observe()), []);
+    await assertCompleteInventory(t, f, "PREPARE");
     user = await startUser(f.file, mode);
     assert.equal(user.ready.uid, process.getuid!());
     const sourceFds = [];
@@ -98,8 +127,9 @@ for (const mode of ["shared-writer", "private-reader", "fd-reader"]) linuxTest(`
     }
     const blockers = await f.adapter.inspectWriters(await f.adapter.observe());
     assert.ok(blockers.some(blocker => blocker.code === "source_writer_unknown" && blocker.subjectRef === `os-process:${user!.child.pid}`));
+    const ownPid = user.child.pid!;
     assert.deepEqual(await user.stop(), { code: 0, signal: null }); user = undefined;
-    assert.deepEqual(await f.adapter.inspectWriters(await f.adapter.observe()), []);
+    await assertCompleteInventory(t, f, "RELEASE", ownPid);
   } finally { await user?.stop(); await f.close(); }
 });
 

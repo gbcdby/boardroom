@@ -12,6 +12,8 @@ import { createTaskService, type TaskAccess } from "./service.ts";
 import { notifyWorkEventCommit } from "./events.ts";
 import { notifyResourceChange } from "../resource-changes.ts";
 import { conditionalJson } from "../conditional-json.ts";
+import { createDecisionApi, writeDecisionError } from "../decisions/api.ts";
+import { trustedLocalDecisionRequest } from "../decisions/trusted-local.ts";
 import {
   parseTaskInput, createTaskSchema, updateTaskSchema, transitionTaskSchema, commentTaskSchema,
   linkTaskMessageSchema, startTaskReviewSchema, beginTaskReviewSchema, submitReviewReportSchema,
@@ -47,10 +49,12 @@ export function createTaskApi(options: { db: DbDriver; logger: Logger;
   resolveActor?: (resolution: ActorResolution) => Promise<Actor | null>;
 }): { handle(request: IncomingMessage, response: ServerResponse, pathname: string): Promise<boolean> } {
   const log = options.logger.child({ component: "tasks-api" });
+  const decisions = createDecisionApi(options);
   const service = createTaskService({ repos: createRepositories(options.db),
     onWorkEvents: events => notifyWorkEventCommit(options.db, events),
     onResourceChanged: change => notifyResourceChange(options.db, change) });
   return { async handle(request, response, pathname) {
+    if (await decisions.handle(request,response,pathname)) return true;
     if (!/^\/api\/projects\/[^/]+\/(tasks|task-settings)(\/|$)/.test(pathname)) return false;
     try {
       if (!sameOrigin(request)) { json(response, 403, { error: { code: "forbidden", message: "仅接受本地同源任务请求。" } }); return true; }
@@ -102,11 +106,16 @@ export function createTaskApi(options: { db: DbDriver; logger: Logger;
         switch (parts[7]) {
           case "begin": json(response, 200, { round: await service.beginReview(access, projectId, taskId, roundId, parseTaskInput(beginTaskReviewSchema, input)) }); return true;
           case "reports": json(response, 201, { report: await service.submitReport(access, projectId, taskId, roundId, parseTaskInput(submitReviewReportSchema, input)) }); return true;
-          case "decision": json(response, 200, { task: await service.decideReview(access, projectId, taskId, roundId, parseTaskInput(decideTaskReviewSchema, input)) }); return true;
+          case "decision": {
+            const result=await service.decideReview(access,projectId,taskId,roundId,parseTaskInput(decideTaskReviewSchema,input),
+              actor.kind==='human'?trustedLocalDecisionRequest(request,actor):undefined);
+            json(response,result.receipt.httpStatus,result);return true;
+          }
         }
       }
       json(response, 404, { error: { code: "not_found", message: "任务接口不存在。" } });
     } catch (error) {
+      if (writeDecisionError(response,error)) return true;
       if (error instanceof ForbiddenError) json(response, 403, { error: { code: error.code, message: error.message } });
       else if (error instanceof RepositoryError) {
         const reason = "reason" in error && typeof error.reason === "string" ? error.reason : undefined;

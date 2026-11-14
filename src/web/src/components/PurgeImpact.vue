@@ -13,7 +13,7 @@ defineProps<{ confirmation: ProjectPurgeConfirmation | GroupPurgeConfirmation }>
       <li>项目策略历史版本：{{ confirmation.cascade.policyVersions }} 个</li>
       <li>任务：{{ confirmation.cascade.tasks }} 项（评论 {{ confirmation.cascade.taskComments }} 条，历史 {{ confirmation.cascade.taskHistory }} 条）</li>
       <li>评审：{{ confirmation.cascade.reviewRounds }} 轮，报告 {{ confirmation.cascade.reviewReports }} 份</li>
-      <li>任务关联消息：{{ confirmation.cascade.taskMessageLinks }} 条，工作事件 {{ confirmation.cascade.workEvents }} 条，任务设置 {{ confirmation.cascade.taskSettings }} 条</li>
+      <li>任务关联消息：{{ confirmation.cascade.taskMessageLinks }} 条，工作事件 {{ confirmation.cascade.workEvents }} 条、投递失效记录 {{ confirmation.cascade.workEventInvalidations }} 条，任务设置 {{ confirmation.cascade.taskSettings }} 条</li>
       <li>记忆文档：{{ confirmation.cascade.memoryDocuments }} 份（历史版本 {{ confirmation.cascade.memoryVersions }} 个）</li>
       <li>自总结请求：{{ confirmation.cascade.memorySummaryRequests }} 条</li>
       <li>记忆投递收据：{{ confirmation.cascade.memoryMessageReceipts }} 条，触发计数 {{ confirmation.cascade.memoryTriggerCounters }} 条，扫描检查点 {{ confirmation.cascade.memoryScanCheckpoints }} 条</li>
@@ -38,7 +38,7 @@ defineProps<{ confirmation: ProjectPurgeConfirmation | GroupPurgeConfirmation }>
       <li>群聊消息：{{ confirmation.cascade.messages }} 条（投递记录 {{ confirmation.cascade.deliveries }} 条）</li>
       <li>参与者关系：{{ confirmation.cascade.participants }} 条</li>
       <li>任务关联消息：{{ confirmation.cascade.taskMessageLinks }} 条（任务与评审保留）</li>
-      <li>该群工作事件：{{ confirmation.cascade.workEvents }} 条（其它工作事件保留）</li>
+      <li>该群工作事件：{{ confirmation.cascade.workEvents }} 条、投递失效记录 {{ confirmation.cascade.workEventInvalidations }} 条（其它工作事件保留）</li>
       <li>自总结请求：{{ confirmation.cascade.memorySummaryRequests }} 条</li>
       <li>记忆投递收据：{{ confirmation.cascade.memoryMessageReceipts }} 条，触发计数 {{ confirmation.cascade.memoryTriggerCounters }} 条，扫描检查点 {{ confirmation.cascade.memoryScanCheckpoints }} 条</li>
       <li>MCP 会话记录：{{ confirmation.cascade.mcpSessions }} 条</li>

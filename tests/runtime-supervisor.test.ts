@@ -10,6 +10,8 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories } from "../src/server/db/repositories.ts";
+import { ownerActor } from "../src/server/authz/actors.ts";
+import { createTaskService } from "../src/server/tasks/service.ts";
 import { createRuntimeRepository } from "../src/server/runtime/repository.ts";
 import { createRuntimeObservability } from "../src/server/runtime/observability.ts";
 import { createRuntimeSupervisor } from "../src/server/runtime/supervisor.ts";
@@ -571,11 +573,21 @@ test("R6 mode未知/回落阻止新业务，单次操作拒绝不伪报整轮终
   try {
     const host = (await unknown.start())!;
     assert.equal((await host.call("send_message", { text: "模式未证实不能开始" })).error?.code, "FORBIDDEN");
+    const task = await createTaskService({ repos: unknown.repos }).create({ actor: ownerActor() }, unknown.project.id,
+      { title: "权限模式确认后才能投递", assigneeMemberId: unknown.binding.memberId });
+    const event = (await unknown.repos.tasks.listUnackedWorkEvents(unknown.project.id, unknown.binding.memberId)).find(item => item.taskId === task.id)!;
+    assert.ok(event, "真实Task创建产生待领取工作事件");
+    const repeatedJoin = await host.call("join", { displayName: host.snapshot.identity!.displayName, hostType: host.snapshot.backend,
+      projectId: unknown.project.id, groupId: unknown.group.id });
+    assert.equal(repeatedJoin.error?.code, "FORBIDDEN", "空join不是业务消费，但有工作事件的join仍须真实权限模式");
+    assert.deepEqual((await unknown.repos.tasks.listUnackedWorkEvents(unknown.project.id, unknown.binding.memberId)).find(item => item.id === event.id), event,
+      "拒绝不能增加投递次数或伪造ACK");
     const queued = await unknown.enqueue(unknown.binding.id, "allowed");
     host.event({ type: "ready", permissionMode: "auto" });
     await until(async () => (await unknown.runtime.getBinding(unknown.binding.id))!.runner.state === "running", "Auto观察后应就绪");
     const first = await host.call("wait_for_messages", { timeoutMs: 100 });
     assert.ok(first.messages?.some((item) => item.id === queued.id));
+    assert.ok((first.workEvents as { id: string }[] | undefined)?.some(item => item.id === event.id), "真实模式确认后才可兑现工作事件");
     host.event({ type: "permission_denied", reason: "permission_required" }); await nextTurn();
     assert.equal(host.stops, 0); assert.equal(host.forced, 0);
     assert.equal((await unknown.repos.deliveries.get(queued.id, unknown.binding.memberId))?.status, "delivered");

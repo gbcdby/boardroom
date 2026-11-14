@@ -9,6 +9,7 @@ import type { MigrationState } from "./db/migrate.ts";
 import { migrations } from "./db/migrations/index.ts";
 import { buildHealthReport } from "./health.ts";
 import { createRepositories } from "./db/repositories.ts";
+import { initializeDecisions } from "./decisions/startup.ts";
 import { initializePolicyConfiguration } from "./policy/configuration.ts";
 import type { Logger } from "./logger.ts";
 import { createStaticHandler, isWebUiBuilt } from "./static.ts";
@@ -185,6 +186,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     await storageClient.run(async () => {
     // 环境与迁移已验证，任何监听/后台任务之前显式建立一次默认策略；普通 GET 绝不初始化。
     await initializePolicyConfiguration(repos);
+    await initializeDecisions(driver);
     await storageClient.assertAdmission();
     registerMemoryRuntime(driver, {
       database: databaseForConnectedReader(environment.databaseDescriptor),

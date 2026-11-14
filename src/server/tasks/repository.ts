@@ -2,6 +2,8 @@ import type { Task, TaskSettings, TaskState, TaskComment, TaskHistory, TaskMessa
 import type { RepoCtx } from "../db/repositories.ts";
 import { ArchivedError, ConflictError, InvalidArgumentError, InvalidReferenceError, NotFoundError } from "../db/errors.ts";
 import { isDeepStrictEqual } from "node:util";
+import { eligibleWorkEventSql, isWorkEventEligible } from "./work-event-storage.ts";
+import { TaskError } from "./errors.ts";
 
 export interface TasksRepository {
   getSettings(projectId: string): Promise<TaskSettings>;
@@ -400,7 +402,7 @@ export function createTasksRepository(ctx: RepoCtx): TasksRepository {
     async listUnackedWorkEvents(projectId, memberId, limit = 100, options = {}) {
       if (!Number.isSafeInteger(limit) || limit < 1) throw new InvalidArgumentError("事件数量必须为正整数。");
       const group = await eventGroupFilter(options);
-      return (await ctx.query<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND delivery_state <> 'acked'${group.sql} ORDER BY created_at, id LIMIT ?`,
+      return (await ctx.query<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND delivery_state <> 'acked'${group.sql}${await eligibleWorkEventSql(ctx)} ORDER BY created_at, id LIMIT ?`,
         [projectId, memberId, ...group.params, limit])).map(toEvent);
     },
     async markWorkEventsDelivered(projectId, memberId, ids, at, options = {}) {
@@ -413,10 +415,10 @@ export function createTasksRepository(ctx: RepoCtx): TasksRepository {
           const params = [projectId, memberId, id, ...group.params];
           const row = await ctx.one<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql}`, params);
           if (!row) throw new NotFoundError("工作事件不存在或不属于当前接收人和群组范围。");
-          if (row.delivery_state === "acked") continue;
-          await ctx.exec(`UPDATE work_events SET delivery_state = 'delivered', attempts = attempts + 1, first_delivered_at = COALESCE(first_delivered_at, ?), last_delivered_at = ? WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql} AND delivery_state <> 'acked'`, [at, at, ...params]);
+          if (row.delivery_state === "acked" || !await isWorkEventEligible(ctx, projectId, id)) continue;
+          await ctx.exec(`UPDATE work_events SET delivery_state = 'delivered', attempts = attempts + 1, first_delivered_at = COALESCE(first_delivered_at, ?), last_delivered_at = ? WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql} AND delivery_state <> 'acked'${await eligibleWorkEventSql(ctx)}`, [at, at, ...params]);
           const saved = (await ctx.one<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql}`, params))!;
-          if (saved.delivery_state !== "acked") result.push(toEvent(saved));
+          if (saved.delivery_state !== "acked" && await isWorkEventEligible(ctx, projectId, id)) result.push(toEvent(saved));
         }
         return result;
       });
@@ -429,8 +431,9 @@ export function createTasksRepository(ctx: RepoCtx): TasksRepository {
         const params = [projectId, memberId, id, ...group.params];
         const row = await ctx.one<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql}`, params);
         if (!row) throw new NotFoundError("工作事件不存在或不属于当前接收人和群组范围。");
+        if (!await isWorkEventEligible(ctx, projectId, id)) throw new TaskError("work_event_delivery_invalidated", "工作事件已因成员生命周期变化失效。", "conflict");
         if (row.delivery_state === "acked") return { event: toEvent(row), alreadyAcknowledged: true };
-        const changed = await ctx.exec(`UPDATE work_events SET delivery_state = 'acked', acked_at = ? WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql} AND delivery_state <> 'acked'`, [at, ...params]);
+        const changed = await ctx.exec(`UPDATE work_events SET delivery_state = 'acked', acked_at = ? WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql} AND delivery_state <> 'acked'${await eligibleWorkEventSql(ctx)}`, [at, ...params]);
         const saved = (await ctx.one<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql}`, params))!;
         return { event: toEvent(saved), alreadyAcknowledged: changed === 0 };
       });

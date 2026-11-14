@@ -12,6 +12,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Client as PgClient } from "pg";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { EXPECTED_MCP_TOOL_NAMES } from "../tests/helpers/mcp-contract.ts";
 
 const exec = promisify(execFile), root = path.resolve(import.meta.dirname, "..");
 const engine = process.env.AGENT_STUDIO_DB_DRIVER === "postgres" ? "postgres" : "sqlite";
@@ -125,7 +126,7 @@ try {
   client = new Client({ name: "installation-protocol-check", version: "1" });
   await client.connect(new StreamableHTTPClientTransport(new URL(origin + "/mcp")));
   const tools = await client.listTools(); report.toolNames = tools.tools.map(tool => tool.name).sort();
-  assert.equal(report.toolNames.length, 32);
+  assert.deepEqual(report.toolNames, EXPECTED_MCP_TOOL_NAMES, "production MCP tools must exactly match the independent public contract");
   for (const tool of ["join", "wait_for_messages", "create_task", "read_memory"]) assert.ok(report.toolNames.includes(tool));
   const call = async (name, args) => {
     const result = await client.callTool({ name, arguments: args });
@@ -138,7 +139,7 @@ try {
   const message = (await json("POST", `/api/groups/${group.id}/messages`, { senderMemberId: member.id, text, mentions: [joined.memberId] }, 201)).message;
   const delivered = await waiting; assert.ok(delivered.messages.some(entry => entry.id === message.id));
   await call("acknowledge_message", { messageId: message.id });
-  report.checks.push("32 actual MCP tools, join, live HTTP message -> SDK wait -> durable ACK");
+  report.checks.push(`${report.toolNames.length} actual MCP tools match the independent contract, join, live HTTP message -> SDK wait -> durable ACK`);
   await client.close(); client = undefined; await stop();
   await start();
   const history = (await json("GET", `/api/groups/${group.id}/messages`)).messages;

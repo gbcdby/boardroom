@@ -8,6 +8,7 @@ import {
   RepositoryError,
 } from "../db/errors.ts";
 import { createRepositories, type RepositorySet } from "../db/repositories.ts";
+import { afterCommit } from "../db/after-commit.ts";
 import type { MutationDiscover } from "../db/mutation-scope.ts";
 import { newId } from "../db/ids.ts";
 import { findLegacyAgentId } from "../identity/aliases.ts";
@@ -27,6 +28,8 @@ import {
 import { actorForMember, actorForSession } from "../authz/actors.ts";
 import { orgActorForMember } from "../authz/org-actors.ts";
 import { createTaskService, type TaskAccess } from "../tasks/service.ts";
+import { createDecisionService } from "../decisions/service.ts";
+import { invokeDecisionOperation, DECISION_OBSERVATIONS, type DecisionOperation } from "../decisions/mcp.ts";
 import { invokeTaskOperation, mapTaskToolError, TASK_OBSERVATIONS, type TaskOperation } from "../tasks/mcp.ts";
 import { notifyWorkEventCommit, onWorkEventCommit } from "../tasks/events.ts";
 import type { WorkEvent } from "../../shared/tasks.ts";
@@ -450,6 +453,7 @@ export interface McpCore {
   attemptInterrupt(sessionId: string, params?: InterruptParams): Promise<InterruptAttempt>;
   heartbeat(sessionId: string): Promise<HeartbeatResult>;
   readHistory(sessionId: string, params: ReadHistoryParams): Promise<ReadHistoryResult>;
+  decisionOperation(sessionId: string, operation: DecisionOperation, input: unknown): Promise<Record<string, unknown>>;
   taskOperation(sessionId: string, operation: TaskOperation, input: unknown): Promise<Record<string, unknown>>;
   memoryOperation(sessionId: string, operation: MemoryOperation, input: unknown): Promise<Record<string, unknown>>;
   /**
@@ -483,6 +487,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   const tasks = createTaskService({ repos, now,
     onWorkEvents: events => notifyWorkEventCommit(options.db, events),
     onResourceChanged: change => notifyResourceChange(options.db, change) });
+  const decisions = createDecisionService(options.db, { now });
   const memoryRuntime = getMemoryRuntime(options.db);
   const memory = createMemoryService({ repos, now, config: memoryRuntime.config, injectionReader: memoryRuntime.reader,
     onWorkEvents: events => notifyWorkEventCommit(options.db, events),
@@ -737,14 +742,14 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
    */
   async function guard(binding: SessionBinding, capability: Capability, scope: GuardScope, denyMessage?: string): Promise<void> {
     const member = await currentBindingMember(binding);
+    const groupMemberIds = scope.groupMemberIds ?? (scope.groupId === undefined ? undefined : await repos.groups.participants(scope.groupId));
     const decision = authorize(
       (await options.authz?.actorFor?.(binding)) ?? (await orgActorForMember(repos, binding.memberId)) ?? actorForMember(member),
       capability,
       {
         ...scope,
-        ...(scope.groupId !== undefined && scope.groupMemberIds === undefined
-          ? { groupMemberIds: await (repos.groups.participants(scope.groupId)) }
-          : {}),
+        ...(groupMemberIds === undefined ? {} : { groupMemberIds,
+          groupMemberNodeIds: scope.groupMemberNodeIds ?? await Promise.all(groupMemberIds.map(async id => (await repos.members.get(id))?.nodeId ?? null)) }),
         conn: { projectId: binding.projectId, groupIds: [binding.groupId] },
       },
     );
@@ -862,6 +867,9 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         if (entry.done) return;
         if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError('FORBIDDEN', '等待所绑定的会话已失效。');
         await guard(binding, 'group:view', { projectId: binding.projectId, groupId: binding.groupId });
+        const project = await repos.projects.get(binding.projectId), group = await repos.groups.get(binding.groupId);
+        if (!project || !group || project.archivedAt !== null || group.archivedAt !== null)
+          throw new McpToolError('FORBIDDEN', '项目或群组已归档，不能兑现旧等待响应。');
         const messageIds = result.messages.map(message => message.id);
         const visible = new Set(await repos.messages.listVisibleIdsForMember(binding, messageIds, { requireActive: true }));
         if (visible.size !== messageIds.length || messageIds.some(id => !visible.has(id))) {
@@ -1079,6 +1087,20 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         };
         if (TASK_OBSERVATIONS.has(operation)) return await withAccess(binding, "observe", invoke);
         // 长 Git 采集不持有运行时/数据库锁，服务的每次短提交重新使用 runMutation fence。
+        await withAccess(binding, "observe", async () => {});
+        return await invoke();
+      } catch (error) { throw mapTaskToolError(error); }
+    },
+
+    async decisionOperation(sessionId, operation, input) {
+      const binding = bindingFor(sessionId);
+      try {
+        const access = await taskAccess(binding);
+        const invoke = async () => {
+          try { return await invokeDecisionOperation(decisions, access, binding.projectId, operation, input); }
+          catch (error) { throw mapTaskToolError(error); }
+        };
+        if (DECISION_OBSERVATIONS.has(operation)) return await withAccess(binding, "observe", invoke);
         await withAccess(binding, "observe", async () => {});
         return await invoke();
       } catch (error) { throw mapTaskToolError(error); }
@@ -1547,11 +1569,37 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
         return events;
       }) : [];
       const preparedMemory = await prepareMemoryAtSafePoint(binding);
-      reconcileMemorySoon(binding);
-      // join总是携带一次当前记忆；此处之后无异步操作，再确认已发布版本。
-      injectedVersions.set(binding.sessionId, preparedMemory.fingerprint);
-      return { ...result, context: { ...result.context, memory: preparedMemory.injection },
-        ...(workEvents.length ? { workEvents } : {}) };
+      // The isolated memory reader may yield after event delivery committed.
+      // Publish only after the real current binding and event eligibility pass
+      // again under the same project/member/fence boundary as the response.
+      const responseAccess = workEvents.length ? "consume" : "observe";
+      return withAccess(binding, responseAccess, async () => {
+        if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError('FORBIDDEN', '入群会话在响应前已失效。');
+        const project = await repos.projects.get(binding.projectId), group = await repos.groups.get(binding.groupId);
+        if (!project || !group || project.archivedAt !== null || group.archivedAt !== null)
+          throw new McpToolError('FORBIDDEN', '项目或群组已归档，不能兑现旧入群响应。');
+        // A join may legitimately observe read_only/none, including before a
+        // managed host has confirmed its permission mode. Rebuild that context
+        // under the final fence; only actual work-event delivery is consumption.
+        const context = await buildSessionContext(binding);
+        if (workEvents.length) {
+          const current = new Set((await tasks.listWorkEvents(await taskAccess(binding), binding.projectId)).map(event => event.id));
+          if (workEvents.some(event => !current.has(event.id))) throw new McpToolError('FORBIDDEN', '工作事件在入群响应前已失效。');
+        }
+        return withAccess(binding, responseAccess, async () => {
+          if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError('FORBIDDEN', '入群会话在响应前已失效。');
+          if (context.visibility.scope !== "none") {
+            injectedVersions.set(binding.sessionId, preparedMemory.fingerprint);
+            // Scheduling here would lend setImmediate the still-active SQL
+            // scope. Wait for the physical owner to commit and release it;
+            // an enclosing rollback must discard the background job too.
+            await afterCommit(options.db, () => reconcileMemorySoon(binding));
+          }
+          return { ...result, context: { ...context, memory: context.visibility.scope === "none"
+            ? unavailableMemory(memoryRuntime.config, "memory_binding_unavailable") : preparedMemory.injection },
+            ...(workEvents.length ? { workEvents } : {}) };
+        });
+      });
     },
     acknowledgeMessage: (sid, id) => withAccess(bindingFor(sid), "write", () => core.acknowledgeMessage(sid, id)),
     reportStatus: (sid, params) => withAccess(bindingFor(sid), "observe", () => core.reportStatus(sid, params)),
@@ -1608,7 +1656,8 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
   async function buildSessionContext(binding: SessionBinding): Promise<McpSessionContext> {
     const project = await (repos.projects.get(binding.projectId));
     const group = await (repos.groups.get(binding.groupId));
-    const actor = (await (options.authz?.actorFor?.(binding))) ?? actorForSession(binding);
+    const member = await currentBindingMember(binding);
+    const actor = (await options.authz?.actorFor?.(binding)) ?? (await orgActorForMember(repos, binding.memberId)) ?? actorForMember(member);
     const participantIds = await (repos.groups.participants(binding.groupId));
     const scope: GuardScope = {
       projectId: binding.projectId,
@@ -1639,7 +1688,7 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
       group: { id: group!.id, name: group!.name },
       identity: {
         memberId: binding.memberId,
-        displayName: binding.displayName,
+        displayName: member.displayName,
         role: actor.role,
         reach: actor.reach ?? ROLE_REACH[actor.role],
       },

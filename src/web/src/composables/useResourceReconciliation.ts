@@ -10,6 +10,7 @@ interface ResourceSocket { send(data: string): void; close(): void }
 export interface ResourceBrowser {
   isVisible(): boolean;
   onVisibility(listener: () => void): () => void;
+  onFocus?(listener: () => void): () => void;
   interval(callback: () => void, ms: number): () => void;
   timeout(callback: () => void, ms: number): () => void;
   connect(handlers: ResourceSocketHandlers): ResourceSocket;
@@ -22,17 +23,23 @@ interface Options<T, Scope extends ResourceScope> {
   relevant?(change: ResourceChange, scope: Scope): boolean;
   fetch?: typeof fetch;
   browser?: ResourceBrowser | null;
+  /** Decision 有独立的 5 秒可见页合同；Task 消费者继续默认 15 秒。 */
+  pollIntervalMs?: number;
 }
 interface CachedResponse { value: unknown; etag: string | null }
 interface Flight { epoch: number; again: boolean; cancel(): void; done: Promise<void> }
 
 function browserEnvironment(): ResourceBrowser | null {
-  const host = globalThis as unknown as { document?: { visibilityState: string; addEventListener(name: string, listener: () => void): void; removeEventListener(name: string, listener: () => void): void }; location?: { protocol: string; host: string } };
+  const host = globalThis as unknown as { document?: { visibilityState: string; addEventListener(name: string, listener: () => void): void; removeEventListener(name: string, listener: () => void): void }; location?: { protocol: string; host: string };
+    addEventListener?(name:string,listener:()=>void):void;removeEventListener?(name:string,listener:()=>void):void };
   const { document, location } = host;
   if (!document || !location || typeof WebSocket === "undefined") return null;
   return {
     isVisible: () => document.visibilityState !== "hidden",
     onVisibility(listener) { document.addEventListener("visibilitychange", listener); return () => document.removeEventListener("visibilitychange", listener); },
+    onFocus(listener) {
+      host.addEventListener?.('focus',listener);return ()=>host.removeEventListener?.('focus',listener);
+    },
     interval(callback, ms) { const timer = setInterval(callback, ms); return () => clearInterval(timer); },
     timeout(callback, ms) { const timer = setTimeout(callback, ms); return () => clearTimeout(timer); },
     connect(handlers) {
@@ -125,7 +132,7 @@ export function createResourceReconciliation<T, Scope extends ResourceScope = Re
   function cancelRead(): void { epoch++; pending?.cancel(); pending = null; loading.value = false; }
   function polling(): void {
     stopPoll?.(); stopPoll = undefined;
-    if (browser && scope && visible && !disposed) stopPoll = browser.interval(() => { void refresh(); }, 15_000);
+    if (browser && scope && visible && !disposed) stopPoll = browser.interval(() => { void refresh(); }, options.pollIntervalMs ?? 15_000);
   }
   function subscribe(): void {
     if (socket && socketOpen) socket.send(JSON.stringify({ type: "resource.subscribe", projectId: scope?.projectId ?? null }));
@@ -150,7 +157,7 @@ export function createResourceReconciliation<T, Scope extends ResourceScope = Re
         }
         if (event.type === "resource.changed") {
           if (typeof event.projectId === "string" && event.projectId !== scope.projectId) return;
-          if (event.projectId === scope.projectId && (event.entity === "task" || event.entity === "task-settings")
+          if (event.projectId === scope.projectId && (event.entity === "task" || event.entity === "task-settings" || event.entity === "decision")
             && typeof event.id === "string" && Number.isSafeInteger(event.revision) && Number(event.revision) >= 0) {
             const change = event as unknown as ResourceChange;
             if (!options.relevant || options.relevant(change, scope)) void refresh(true);
@@ -171,6 +178,7 @@ export function createResourceReconciliation<T, Scope extends ResourceScope = Re
     const next = browser.isVisible(); if (visible === next) return;
     visible = next; polling(); if (visible) { cancelRead(); void refresh(); }
   });
+  const stopFocus=browser?.onFocus?.(()=>{if(visible){cancelRead();void refresh();}});
 
   function setScope(next: Scope | null): Promise<void> {
     if (disposed) return Promise.resolve();
@@ -190,7 +198,7 @@ export function createResourceReconciliation<T, Scope extends ResourceScope = Re
     await refresh(true);
   }
   function dispose(): void {
-    if (disposed) return; disposed = true; cancelRead(); stopPoll?.(); stopReconnect?.(); stopVisibility?.(); socket?.close(); socket = null;
+    if (disposed) return; disposed = true; cancelRead(); stopPoll?.(); stopReconnect?.(); stopVisibility?.(); stopFocus?.(); socket?.close(); socket = null;
   }
   return { value, loading, error, lastSuccessAt, connection, setScope, refresh, committed, dispose };
 }

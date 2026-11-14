@@ -76,7 +76,10 @@ jobs:
   database-tests:
     name: Node 24 · SQLite / PostgreSQL
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # CI171 used 287s preparing and 626s in a still-progressing full suite before
+    # the old job limit. Keep the existing 900s child allowance, plus bounded
+    # preparation and post-suite SDK/restart/cleanup time; no product limit changes.
+    timeout-minutes: 25
     outputs:
       browser_dependencies_id: ${{ steps.browser_dependencies.outputs.artifact-id }}
 
@@ -140,6 +143,16 @@ jobs:
       - name: 构建 WebUI
         run: npm run build
 
+      - name: 有界 Decision 与 MCP PostgreSQL 失败点 TAP 诊断
+        shell: bash
+        env:
+          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: |
+          mkdir -p .agent-output/maintenance-native-diagnostics
+          # run169 的 spec 末尾摘要被 job 取消截断；先保全已失败入口的真实
+          # 断言详情。完整 npm test 仍在原隔离身份下运行，所有门槛保持。
+          timeout --signal=TERM --kill-after=10s 90s node --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='local HTTP source|successors require current head|reader namespace|target既有namespace|已绑定会话再次 join|join memory reconciliation starts only|完整关系 undo/undo|完整关系 remove/remove' tests/decisions-http.test.ts tests/decisions-service.test.ts tests/m1-postgres-coordination.test.ts tests/agent-alias-integrity.test.ts tests/memory-mcp.test.ts tests/phase5-concurrency-matrix.test.ts 2>&1 | tee .agent-output/maintenance-native-diagnostics/decision-mcp-regression.tap
+
       - name: 有界 PostgreSQL 维护适配器 TAP 诊断
         id: maintenance_pg_diagnostic
         shell: bash
@@ -147,7 +160,10 @@ jobs:
           AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
         run: |
           mkdir -p .agent-output/maintenance-native-diagnostics
-          timeout --signal=TERM --kill-after=10s 180s node --test --test-reporter=tap --test-concurrency=1 tests/maintenance-postgres.test.ts 2>&1 | tee .agent-output/maintenance-native-diagnostics/postgres.tap
+          # 整组串行诊断的外层预算：v19 在 run166 已需 165s；v20/v21 的
+          # 58 表矩阵在 run168 持续通过但被旧 180s 总额截断。保留所有用例、
+          # 用例自身 180/90s 时限与 TERM 后 10s 收尾，job 另设有界总时限。
+          timeout --signal=TERM --kill-after=10s 300s node --test --test-reporter=tap --test-concurrency=1 tests/maintenance-postgres.test.ts 2>&1 | tee .agent-output/maintenance-native-diagnostics/postgres.tap
 
       - name: 有界 SQLite 源使用者 TAP 诊断
         if: ${{ !cancelled() && steps.maintenance_pg_diagnostic.outcome != 'skipped' }}
@@ -477,6 +493,12 @@ jobs:
           dpkg-query -W -f='${Package}\t${Version}\n' xvfb openbox x11-utils xauth > .agent-output/resource-web-e2e/native-desktop/packages.tsv
           .agent-output/browser-venv/bin/python scripts/e2e-resource-web.py --native-desktop
 
+      - name: Decision 五秒对账、显式选择与隐藏恢复真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
+        env:
+          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.database-tests.outputs.browser_dependencies_id }}
+        run: .agent-output/browser-venv/bin/python scripts/e2e-decision-web.py --native-desktop --runtime-binding .agent-output/resource-web-e2e/runtime-binding.json --artifacts .agent-output/decision-web-e2e
+
       - name: 记忆编辑、冲突与历史真实浏览器验证
         if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-memory-web.py
@@ -514,6 +536,7 @@ jobs:
             .agent-output/webui-before/
             .agent-output/tasks-web-e2e/
             .agent-output/resource-web-e2e/
+            .agent-output/decision-web-e2e/
             .agent-output/memory-web-e2e/
             .agent-output/settings-web-e2e/
             .agent-output/navigation-web-e2e/

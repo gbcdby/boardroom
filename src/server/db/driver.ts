@@ -72,6 +72,8 @@ export interface DbDriver {
 
 /** 连接工厂入参（来自 AppConfig 的持久化相关子集）。 */
 export interface DbDriverOptions {
+  /** M1 专用连接策略；none 只禁连接初始化，显式 migrate/transaction 仍是写能力。 */
+  readonly initializationOnConnect?: "normal" | "none";
   /** 缺省即 sqlite（DEFAULT_DB_DRIVER），兼容既有配置对象。 */
   readonly dbDriver?: DbDriverKind;
   /** SQLite 数据目录；dbDriver=sqlite 时必须。 */
@@ -109,6 +111,7 @@ export function createDbDriver(options: DbDriverOptions): DbDriver {
       );
     }
     return createSqliteDriver({ dataDir: options.dataDir,
+      ...(options.initializationOnConnect === undefined ? {} : { initializationOnConnect: options.initializationOnConnect }),
       ...(options.sqlitePath === undefined ? {} : { sqlitePath: options.sqlitePath }),
       ...(options.sqliteSource === undefined ? {} : { sqliteSource: options.sqliteSource }) });
   }
@@ -120,6 +123,7 @@ export function createDbDriver(options: DbDriverOptions): DbDriver {
   }
   return createPostgresDriver({
     connectionString: options.pgConnectionString,
+    ...(options.initializationOnConnect === undefined ? {} : { initializationOnConnect: options.initializationOnConnect }),
     ...(options.pgSchema === undefined ? {} : { schema: options.pgSchema }),
   });
 }

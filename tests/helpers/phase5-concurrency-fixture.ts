@@ -47,7 +47,7 @@ class DiagnosticBudget extends CaptureBudget {
   }
 }
 
-/** Opt-in for the original PG remove/remove case; never logs during the lock/barrier path. */
+/** Opt-in for PG member pairs; never logs during the lock/barrier path. */
 export class RemovePairDiagnostics {
   private budgets = { first: new DiagnosticBudget(), second: new DiagnosticBudget() };
   private transactions = new WeakMap<object, number>();
@@ -237,10 +237,13 @@ function settled<T>(operation: () => Promise<T>, diagnostic?: RemovePairDiagnost
 export async function interleaveProjectWriters<T, U>(input: {
   firstDb: DbDriver; secondDb: DbDriver; probe: Client; first: () => Promise<T>; second: () => Promise<U>; projectId: string;
   diagnostic?: RemovePairDiagnostics;
+  /** Observe the second writer while the first's completed work is still uncommitted. */
+  secondAfterFirstWork?: boolean;
 }) {
-  const held = barrier<number>(), release = barrier();
+  const held = barrier<number>(), release = barrier(), workComplete = barrier(), commitAllowed = barrier();
   let paused = false, released = false;
   const releaseFirst = () => { if (!released) { input.diagnostic?.event("release"); released = true; } release.resolve(); };
+  const releaseCommit = () => { input.diagnostic?.event("commit_release"); commitAllowed.resolve(); };
   const firstTrace = observeLocks(input.firstDb, async lock => {
     if (!paused && lock.table === "projects" && lock.phase === "acquired") {
       paused = true;
@@ -248,28 +251,52 @@ export async function interleaveProjectWriters<T, U>(input: {
       await release.promise;
     }
   }, input.diagnostic ? { collector: input.diagnostic, writer: "first" } : undefined);
-  const first = settled(input.first, input.diagnostic);
+  // A caller-owned real transaction keeps the completed mutation uncommitted.
+  // Starting the second writer here avoids charging the first's remaining work
+  // to the second's unchanged 200ms project-lock statement.
+  const first = settled(() => input.secondAfterFirstWork ? input.firstDb.transaction(async () => {
+    const result = await input.first();
+    assert.ok(input.firstDb.currentTransactionContext(), "首操作工作完成后仍须保留真实物理事务");
+    input.diagnostic?.event("first_work_complete_before_commit"); workComplete.resolve();
+    await commitAllowed.promise; return result;
+  }) : input.first(), input.diagnostic);
   let second: Promise<Outcome<U>> | undefined, secondTrace: ReturnType<typeof observeLocks> | undefined;
-  try {
-    const holderPid = await Promise.race([held.promise, first.then(r => { throw r.ok ? new Error("首入口未经过项目锁") : r.error; })]);
-    secondTrace = observeLocks(input.secondDb, undefined, input.diagnostic ? { collector: input.diagnostic, writer: "second" } : undefined);
-    second = settled(input.second, input.diagnostic, "second");
-    const waiting = await Promise.race([secondTrace.first, second.then(r => { throw r.ok ? new Error("第二入口绕过了项目锁") : r.error; })]);
-    assert.equal(waiting.table, "projects"); assert.notEqual(waiting.pid, holderPid, "两个入口必须使用真实独立 PG 连接");
-    await observeDatabaseWait(input.probe, waiting.pid, holderPid, input.diagnostic);
+  const probeLowerLocks = async () => {
     await input.probe.query("BEGIN");
     await input.probe.query("SELECT id FROM members WHERE project_id = $1 FOR UPDATE NOWAIT", [input.projectId]);
     await input.probe.query("SELECT id FROM agent_runtimes WHERE id IN (SELECT runtime_id FROM agent_runtime_bindings WHERE project_id = $1) FOR UPDATE NOWAIT", [input.projectId]);
     await input.probe.query("ROLLBACK");
     input.diagnostic?.event("lower_lock_probe_finished");
+  };
+  try {
+    const holderPid = await Promise.race([held.promise, first.then(r => { throw r.ok ? new Error("首入口未经过项目锁") : r.error; })]);
+    if (input.secondAfterFirstWork) {
+      // Preserve the original real NOWAIT proof before the first operation is
+      // allowed to acquire its legitimate lower locks and apply its mutation.
+      await probeLowerLocks(); releaseFirst();
+      await Promise.race([workComplete.promise, first.then(r => { throw r.ok ? new Error("首入口未停在真实提交前") : r.error; })]);
+    }
+    secondTrace = observeLocks(input.secondDb, undefined, input.diagnostic ? { collector: input.diagnostic, writer: "second" } : undefined);
+    second = settled(input.second, input.diagnostic, "second");
+    const waiting = await Promise.race([secondTrace.first, second.then(r => { throw r.ok ? new Error("第二入口绕过了项目锁") : r.error; })]);
+    assert.equal(waiting.table, "projects"); assert.notEqual(waiting.pid, holderPid, "两个入口必须使用真实独立 PG 连接");
+    await observeDatabaseWait(input.probe, waiting.pid, holderPid, input.diagnostic);
+    if (input.secondAfterFirstWork) {
+      const lower = await input.probe.query(`SELECT c.relname, l.mode FROM pg_locks l
+        JOIN pg_class c ON c.oid = l.relation JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE l.pid = $1 AND l.granted AND n.nspname = current_schema()
+          AND c.relname IN ('members', 'agent_runtimes') AND l.mode <> 'AccessShareLock'`, [waiting.pid]);
+      assert.deepEqual(lower.rows, [], "第二入口等待项目锁时不得持有下层成员/runtime锁");
+      input.diagnostic?.event("second_lower_locks_verified", { pid: waiting.pid, lockCount: lower.rows.length });
+    } else await probeLowerLocks();
     assert.equal(secondTrace.locks.some(l => l.table !== "projects"), false);
-    releaseFirst();
+    if (input.secondAfterFirstWork) releaseCommit(); else releaseFirst();
     const outcomes = { first: await first, second: await second, firstLocks: firstTrace.locks, secondLocks: secondTrace.locks };
     assertProjectBeforeLowerLocks(firstTrace.locks); assertProjectBeforeLowerLocks(secondTrace.locks);
     assert.equal([...firstTrace.errors, ...secondTrace.errors].includes("40P01"), false, "40P01 一律为失败，不能接受为稳定业务冲突");
     return outcomes;
   } finally {
-    await input.probe.query("ROLLBACK").catch(error => input.diagnostic?.failure("interleave_probe_rollback", error)); releaseFirst();
+    await input.probe.query("ROLLBACK").catch(error => input.diagnostic?.failure("interleave_probe_rollback", error)); releaseFirst(); commitAllowed.resolve();
     await first; if (second) await second;
     firstTrace.restore(); secondTrace?.restore();
   }

@@ -142,12 +142,28 @@ export async function readPostgresSequenceState(client: PostgresReader, schema: 
   return [[encodePostgresCell("20", state[0].last_value), encodePostgresCell("16", state[0].is_called)]];
 }
 
+export function readPostgresMigrationFunctionBodies(sql: string): ReadonlyMap<string, string> {
+  const bodies = new Map<string, string>();
+  const header = /CREATE\s+FUNCTION\s+([A-Za-z_]\w*)\s*\(\)\s+RETURNS\s+trigger\s+LANGUAGE\s+plpgsql\s+AS\s+/gi;
+  for (let match = header.exec(sql); match; match = header.exec(sql)) {
+    const delimiter = /^\$(?:[A-Za-z_]\w*)?\$/.exec(sql.slice(header.lastIndex))?.[0];
+    if (!delimiter) throw new MaintenanceFailure("schema_guard_incomplete");
+    const start = header.lastIndex + delimiter.length;
+    // SQL keywords are case-insensitive; dollar tags are not. A regexp /i
+    // backreference would incorrectly accept $Tag$ ... $tag$ as a closed body.
+    const end = sql.indexOf(delimiter, start);
+    if (end < 0) throw new MaintenanceFailure("schema_guard_incomplete");
+    bodies.set(match[1]!, sql.slice(start, end));
+    header.lastIndex = end + delimiter.length;
+  }
+  return bodies;
+}
+
 function knownFunctionBodies(): ReadonlyMap<string, string> {
   const bodies = new Map<string, string>();
   for (const migration of migrations) {
     const sql = migrationSql(migration, "postgres");
-    for (const match of sql.matchAll(/CREATE\s+FUNCTION\s+([A-Za-z_]\w*)\s*\(\)\s+RETURNS\s+trigger\s+LANGUAGE\s+plpgsql\s+AS\s+\$\$([\s\S]*?)\$\$/gi))
-      bodies.set(match[1]!, match[2]!);
+    for (const [name, body] of readPostgresMigrationFunctionBodies(sql)) bodies.set(name, body);
   }
   return bodies;
 }

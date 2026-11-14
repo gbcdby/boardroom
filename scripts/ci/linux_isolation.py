@@ -47,7 +47,8 @@ def command_for(entry):
                 "--test-name-pattern='unknown source file users' tests/maintenance-sqlite.test.ts "
                 "2>&1 | tee .agent-output/maintenance-native-diagnostics/sqlite-source-users.tap")
     if entry == 'full-suite':
-        return 'npm test'
+        return ("mkdir -p .agent-output/linux-ci-isolation/full-suite\n"
+                "npm test 2>&1 | tee .agent-output/linux-ci-isolation/full-suite/full-suite.tap")
     raise IsolationError('Unknown fixed CI entry')
 
 
@@ -62,6 +63,9 @@ def child_environment(request, stage):
         if request.get('pg_url') != PG_URL:
             raise IsolationError('Full suite requires the original temporary CI PostgreSQL URL')
         env['AGENT_STUDIO_PG_TEST_URL'] = PG_URL
+        # Preserve each completed file's assertion details even if the outer
+        # job is later cancelled before the spec reporter's final summary.
+        env['NODE_OPTIONS'] = '--test-reporter=tap'
     elif request.get('pg_url') is not None:
         raise IsolationError('SQLite diagnostic must not acquire a PostgreSQL environment')
     return env

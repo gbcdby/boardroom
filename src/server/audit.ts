@@ -144,7 +144,7 @@ export function isTruncated(row: { before: string | null; after: string | null }
 // 形状
 // ---------------------------------------------------------------------------
 
-export type AuditTargetKind = "member" | "node" | "role" | "capability" | "group" | "project" | "task" | "memory" | "role_template" | "agent" | "policy_document";
+export type AuditTargetKind = "member" | "node" | "role" | "capability" | "group" | "project" | "task" | "memory" | "role_template" | "agent" | "policy_document" | "decision";
 
 /** 全局目录使用 user/NULL；project 审计的历史调用形状与查询边界保持兼容。 */
 export type AuditContext = { readonly scope: "user"; readonly projectId: null }

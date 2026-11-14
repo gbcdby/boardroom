@@ -63,7 +63,8 @@ export interface ReviewRound {
   state: ReviewRoundState; reviewerMemberId: string; specSnapshot: { title: string; body: string; labels: string[];
     deliveryKind?: TaskDeliveryKind | null; acceptanceText?: string; acceptanceSource?: TaskAcceptanceSource };
   candidate: ReviewCandidate | null; failure: { code: string; message: string } | null;
-  decision: { verdict: ReviewVerdict; actor: TaskAuthor; reason: string; override: boolean; taskRevision: number } | null;
+  decision: { verdict: ReviewVerdict; actor: TaskAuthor; reason: string; override: boolean; taskRevision: number;
+    decisionRef?: import('./decisions.ts').DecisionRef } | null;
   createdAt: string; updatedAt: string;
 }
 export interface ReviewEvidence {
@@ -87,7 +88,8 @@ export interface DecideReviewInput {
   expectedTaskRevision: number; expectedRoundRevision: number;
   verdict: ReviewVerdict; reason: string; override?: boolean;
 }
-export type WorkEventKind = 'task.assigned' | 'task.review_ready' | 'task.blocked' | 'task.review_decided' | 'memory.summary_requested';
+export type WorkEventKind = 'task.assigned' | 'task.review_ready' | 'task.blocked' | 'task.review_decided' | 'memory.summary_requested'
+  | 'decision.requested' | 'decision.resolved';
 export interface WorkEvent {
   id: string; projectId: string; recipientMemberId: string; taskId: string | null;
   contextGroupId?: string | null;

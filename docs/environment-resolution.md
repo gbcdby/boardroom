@@ -91,6 +91,27 @@ node scripts/migrate-other-to-dsh.ts --data-dir /absolute/existing/data --dry-ru
 
 **SQL dry-run 与文件系统零写入预检有不同职责。** SQL dry-run 使用 `fileMustExist`、`readonly` 和 `query_only`，不改业务数据或主数据库文件，并正确读取已经提交到 WAL 的内容。SQLite 正常协调可能建立或更新 `-wal/-shm` 辅助文件；此命令不承诺目录完全不变，不删除这些文件，也不使用会忽略 WAL 的 immutable 主文件快照。需要文件系统零写入清单时使用 `inspect-storage`。
 
+### 只读迁移计划预览
+
+`inspect-storage` 只检查已知来源文件，不连接数据库。需要读取既有库的实际 schema、表计数和写者阻塞项时，可使用本地 `plan` 命令。先从清单取得所选来源的 `selectedSourceId`，再明确给出计划绑定的控制根和目标根：
+
+```sh
+node scripts/inspect-storage.ts --data-dir /absolute/existing/data
+node scripts/storage-maintenance.ts plan \
+  --data-dir /absolute/existing/data \
+  --expected-source-id '<selectedSourceId>' \
+  --control-root /absolute/existing/data/maintenance-control \
+  --target-root /absolute/future-target
+```
+
+`--expected-source-id` 只核对唯一 resolver 已选的来源，不会按这个值切换数据库。配置文件与环境变量优先级保持不变；`--data-dir` 不会把 PostgreSQL 改成 SQLite。`--legacy-cwd` 可重复指定已知旧目录，其他参数不得重复；所有路径参数使用绝对路径。控制根和目标根复用唯一环境路径规则，解析已有前缀的真实路径并保留缺失尾段，不创建目录；规范化后仍检查来源身份、保护范围及路径重叠。歧义、缺失/替换源、未激活格式、坏 schema/guard 或保护路径冲突均拒绝。
+
+stdout 只包含一个安全 JSON 预览：`formatVersion`、`command: "plan"`、`result: "preview"`、`observationMode: "logical_read_only"`、`persisted: false`、`executionAuthorized: false`，以及公开来源 ID/数据库类型、`observedAt`、字符串精度的 `tableCounts`、`requiredCapabilities` 和 `blockers`。不输出完整计划、配置/连接串、文件正文、内部来源身份或维护/快照回执。动态内部 blocker 引用只输出诊断指纹。退出码 0 仅表示预览完成，可能仍有阻塞项；空 blockers 也不证明已经取得执行能力。输入或读取失败使用受控 stderr 错误和退出码 1。
+
+该命令保持逻辑只读：不登记 client、不改变业务或维护控制行，不调用普通 driver.connect/migrate，不持久化计划，也不创建控制根、目标库、journal 或备份。它只提供 `plan`，不提供 persist/execute/resume/cancel/inspectMigration。SQLite 可正确读取已提交 WAL，正常 WAL/SHM 协调仍可能发生，**不承诺物理文件系统零持久变化**。PG 只连接明确配置的既有 PG16 源做只读观察；无需 verification DB 或 pg_dump/pg_restore/psql，缺权限/连接失败不提权或回落其他源。返回前等待本次 adapter 关闭。
+
+计划预览没有捕获 Fs，没有取得 provider 资格、停写或一致快照，也不会开放维护执行。其普通读取不能作为冷打开资格的预热或通过依据；Fs 准入、恢复和取消仍遵守各自已有门槛。
+
 [`scripts/migrate-data.ts`](../scripts/migrate-data.ts) 的显式 source/target 语义保持独立；统一启动配置不替代迁移工具已指定的来源与目标。
 
 ## 边界与检查入口

@@ -2,17 +2,20 @@ import type {
   EffectivePolicyRule, PolicyEvaluation, PolicyEvaluationRequest, PolicyExecutionPrerequisite, PolicyGrantCheck,
   PolicyGrantRef, PolicyOutcome, PolicyPreview, PolicyReason, PolicyRuleMatch, PolicyRuleSource, TrustedPolicyFacts,
 } from "../../shared/policy.ts";
+import { DEFAULT_HUMAN_ACTOR_ID } from "../authz/actors.ts";
 import { compareText, normalizePolicyAction } from "./canonical.ts";
+import type { DbReviewPolicyRequestV1, PolicyObservation } from "./db-review.ts";
 import { DEFAULT_POLICY_REVISION, defaultRuleFor } from "./defaults.ts";
 import { matchPolicyGrants } from "./grants.ts";
 import { composePolicyRules } from "./rules.ts";
-import { parseEvaluationRequest, subjectKey } from "./schemas.ts";
+import { DbReviewPolicyInputError, parseDbReviewPolicyRequestV1, parseEvaluationRequest, subjectKey } from "./schemas.ts";
 
 const severity: Readonly<Record<PolicyOutcome, number>> = { auto: 0, owner: 1, human: 2, deny: 3 };
 const COMMON_FACTS = ["principal.actorId", "principal.active", "principal.membershipRevision", "principal.currentMembershipRevision", "project.projectId", "project.active", "subjects"] as const;
 const PROPOSAL_FACTS = ["proposal.readAllowed", "proposal.createAllowed", "proposal.inScope", "proposal.kindAllowed", "proposal.delegable", "proposal.prohibited"] as const;
 const EXECUTION_FACTS = ["execution.resourceAccess", "execution.capabilityAllowed", "execution.inScope", "execution.authorizationCurrent", "execution.hostSupported", "execution.prohibited"] as const;
 const POLICY_FACTS = ["authorization.authorizationEpoch", "authorization.existingAuthorization", "authorization.grants", "budget.requiredUnits", "budget.availableUnits", "budget.mayRequestIncrease", "retries.requested", "retries.available", "retries.mayRequestIncrease", "userReserved"] as const;
+const DB_REVIEW_POLICY_FACTS = POLICY_FACTS.filter(path => path !== "authorization.authorizationEpoch");
 const DELIVERY_FACTS = ["delivery.ciPassed", "delivery.independentReviewPassed", "delivery.targetCurrent"] as const;
 
 function missingPaths(facts: TrustedPolicyFacts, paths: readonly string[]): string[] {
@@ -31,6 +34,39 @@ export function previewPolicy(input: PolicyEvaluationRequest): PolicyPreview {
 /** 纯观察：不接收数据库、执行器或额度写入能力；任何 outcome 都不签发 admission。 */
 export function evaluateAction(input: PolicyEvaluationRequest): PolicyEvaluation {
   const { request, missingFacts: missingRecordFields } = parseEvaluationRequest(input);
+  return evaluateParsedRequest(request, missingRecordFields, "authorization-epoch/v1");
+}
+
+/** 独立的 DB-only 观察入口；不接收执行器，也不返回事务 guard 或执行许可。 */
+export function evaluateDbReviewPolicyV1(input: DbReviewPolicyRequestV1): PolicyObservation {
+  const request = parseDbReviewPolicyRequestV1(input);
+  const fullEvaluation = evaluateParsedRequest({
+    action: request.action, policies: request.documents, stage: request.stage,
+    context: {
+      evaluatedAt: request.evaluatedAt, policyRevision: request.policy.policyRevision,
+      registry: { revision: request.handler.revision, handlers: [request.handler] }, facts: request.facts,
+    },
+  }, [], "s1.db-review-locked/v1");
+  const mismatchedRefs: string[] = [];
+  if (request.policy.global.revision !== fullEvaluation.globalRevision) mismatchedRefs.push("policy.global.revision");
+  if ((request.policy.project?.revision ?? null) !== fullEvaluation.projectRevision) mismatchedRefs.push("policy.project.revision");
+  if (request.policy.defaultRevision !== fullEvaluation.defaultRevision) mismatchedRefs.push("policy.defaultRevision");
+  if (mismatchedRefs.length) throw new DbReviewPolicyInputError(mismatchedRefs);
+  return {
+    factsContract: request.facts.factsContract, purpose: request.facts.purpose,
+    evaluationPrincipal: { kind: request.facts.principal.actorId === DEFAULT_HUMAN_ACTOR_ID ? "human" : "agent", id: request.facts.principal.actorId },
+    mode: fullEvaluation.mode, executionAdmission: fullEvaluation.executionAdmission,
+    status: fullEvaluation.status, outcome: fullEvaluation.outcome, requiresFreshHuman: fullEvaluation.requiresFreshHuman,
+    policy: request.policy, matchedRuleIds: fullEvaluation.matchedRuleIds, reasons: fullEvaluation.reasons,
+    missingFacts: fullEvaluation.missingFacts, grantRefs: [], evaluatedAt: fullEvaluation.evaluatedAt, fullEvaluation,
+  };
+}
+
+/** 两个严格入口解析之后才能调用；合同选择不作为公开输入或可跳过检查的 API。 */
+function evaluateParsedRequest(
+  request: ReturnType<typeof parseEvaluationRequest>["request"], missingRecordFields: readonly string[],
+  factsContract: "authorization-epoch/v1" | "s1.db-review-locked/v1",
+): PolicyEvaluation {
   const normalized = normalizePolicyAction(request.action);
   const { action } = normalized;
   const composed = composePolicyRules(request.policies);
@@ -71,8 +107,8 @@ export function evaluateAction(input: PolicyEvaluationRequest): PolicyEvaluation
       missingFacts: [...new Set(missingFacts)].sort(), executionPrerequisites: prerequisites.sort((a, b) => compareText(a.code, b.code)),
     };
   }
-  function incomplete(paths: string[]): PolicyEvaluation {
-    missingFacts = paths;
+  function incomplete(paths: readonly string[]): PolicyEvaluation {
+    missingFacts = [...paths];
     gate("evaluation_incomplete", "deny", "缺少必需可信事实；请由对应权限、对象或额度适配器补齐列出的字段。");
     return finish();
   }
@@ -109,7 +145,8 @@ export function evaluateAction(input: PolicyEvaluationRequest): PolicyEvaluation
   }
   if (matches.some(match => match.outcome === "deny")) return finish();
 
-  const missingPolicy = missingPaths(facts, [...POLICY_FACTS, ...(action.kind.startsWith("delivery.") ? DELIVERY_FACTS : [])]);
+  const requiredPolicyFacts = factsContract === "authorization-epoch/v1" ? POLICY_FACTS : DB_REVIEW_POLICY_FACTS;
+  const missingPolicy = missingPaths(facts, [...requiredPolicyFacts, ...(action.kind.startsWith("delivery.") ? DELIVERY_FACTS : [])]);
   if (facts.budget?.requiredUnits === null) missingPolicy.push("facts.budget.requiredUnits");
   if (facts.budget?.requiredUnits !== 0 && facts.budget?.availableUnits === null) missingPolicy.push("facts.budget.availableUnits");
   if (missingPolicy.length) return incomplete(missingPolicy);
@@ -117,12 +154,14 @@ export function evaluateAction(input: PolicyEvaluationRequest): PolicyEvaluation
     || subjects.get(subjectKey(action.subjectRef))!.candidateDigest !== action.candidateDigest;
   const budgetExceeded = facts.budget!.requiredUnits! > (facts.budget!.availableUnits ?? 0);
   const retriesExceeded = facts.retries!.requested! > facts.retries!.available!;
-  const matchingGrants = matchPolicyGrants(normalized, {
-    actorId: facts.principal!.actorId!, authorizationEpoch: facts.authorization!.authorizationEpoch!, evaluatedAt: context.evaluatedAt,
-    requiredBudgetUnits: facts.budget!.requiredUnits!, requestedRetries: facts.retries!.requested!,
-  }, facts.authorization!.grants!);
-  grantRefs.push(...matchingGrants.refs);
-  grantChecks.push(...matchingGrants.checks);
+  if (factsContract === "authorization-epoch/v1") {
+    const matchingGrants = matchPolicyGrants(normalized, {
+      actorId: facts.principal!.actorId!, authorizationEpoch: facts.authorization!.authorizationEpoch!, evaluatedAt: context.evaluatedAt,
+      requiredBudgetUnits: facts.budget!.requiredUnits!, requestedRetries: facts.retries!.requested!,
+    }, facts.authorization!.grants!);
+    grantRefs.push(...matchingGrants.refs);
+    grantChecks.push(...matchingGrants.checks);
+  }
   const authorizationMatched = facts.authorization!.existingAuthorization! || grantRefs.length > 0;
   if (!authorizationMatched) {
     gate("authorization_required", stage === "execution" ? "deny" : "human", "未找到当前作用域和前提内的可信授权。");
