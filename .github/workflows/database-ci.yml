@@ -147,7 +147,10 @@ jobs:
           AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
         run: |
           mkdir -p .agent-output/maintenance-native-diagnostics
-          timeout --signal=TERM --kill-after=10s 180s node --test --test-reporter=tap --test-concurrency=1 tests/maintenance-postgres.test.ts 2>&1 | tee .agent-output/maintenance-native-diagnostics/postgres.tap
+          # 整组串行诊断的外层预算：v19 在 run166 已需 165s；v20/v21 的
+          # 58 表矩阵在 run168 持续通过但被旧 180s 总额截断。保留所有用例、
+          # 用例自身 180/90s 时限与 TERM 后 10s 收尾，job 仍限 15 分钟。
+          timeout --signal=TERM --kill-after=10s 300s node --test --test-reporter=tap --test-concurrency=1 tests/maintenance-postgres.test.ts 2>&1 | tee .agent-output/maintenance-native-diagnostics/postgres.tap
 
       - name: 有界 SQLite 源使用者 TAP 诊断
         if: ${{ !cancelled() && steps.maintenance_pg_diagnostic.outcome != 'skipped' }}
