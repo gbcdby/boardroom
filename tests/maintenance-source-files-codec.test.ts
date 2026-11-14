@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canonicalJson, parseCanonical } from "../src/server/storage/maintenance/canonical.ts";
+import { canonicalJson, parseCanonical, sha256 } from "../src/server/storage/maintenance/canonical.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import { parseSourceFiles, readSourceFiles } from "../src/server/storage/maintenance/parse.ts";
 
@@ -25,6 +25,16 @@ function vector(profile: "ext4" | "overlay" = "ext4") {
 }
 const invalid = (error: unknown) => error instanceof MaintenanceFailure && error.code === "snapshot_invalid";
 
+function sourceStateVector() {
+  const value = vector();
+  return { ...value, rootBindings: value.rootBindings.map(binding => ({ ...binding,
+    profile: "linux-native-ext4-fid-fsuuid-source-state-v1",
+    readEvidence: { policy: "application-source-preservation-v1", kernelDiagnosticPolicy: "ext4-last-mounted-v1",
+      profileEntryDigest: "5".repeat(64), qualificationDigest: "6".repeat(64), runtimeEnvironmentDigest: "7".repeat(64),
+      sourceStateDigest: "8".repeat(64), blockEffectsObservation: "not-observed-at-runtime" },
+  })) };
+}
+
 function directoryVector(absent = false) {
   const value = vector(), identity = { path: "/structural-source/sessions", device: "3", inode: "12" };
   const ancestor = absent ? { ...identity, path: "/structural-source", inode: "10" } : identity;
@@ -39,15 +49,79 @@ function directoryVector(absent = false) {
 }
 
 test("#152 FSI-08/16: both fixed Fs v2 codecs preserve exact canonical bytes and signed nanoseconds", () => {
+  // Frozen from main 481827 before adding the source-state codec, not recomputed expected hashes.
+  const baseline = {
+    ext4: { bytes: 1516, sha256: "7478876c8aad15a4d7b23711cdb69adabd62cf41bbb7bffb149b43f13c07d062" },
+    overlay: { bytes: 1617, sha256: "f22fa445005b7d93e09611af848f5b9e2f51c2e301c31d4566756ed930adc1ab" },
+  };
   for (const profile of ["ext4", "overlay"] as const) {
     const expected = vector(profile), bytes = Buffer.from(canonicalJson(expected));
     const parsed = parseSourceFiles(parseCanonical(bytes));
     assert.deepEqual(parsed, expected);
     assert.equal(canonicalJson(parsed), bytes.toString("utf8"));
+    assert.equal(bytes.length, baseline[profile].bytes);
+    assert.equal(sha256(canonicalJson(parsed)), baseline[profile].sha256);
     assert.equal(parsed.entries[0]!.sourceWitness?.kind, "file");
     expected.entries[0]!.sourceWitness.change.observedBirthtimeNs = null;
     assert.deepEqual(parseSourceFiles(expected), expected);
   }
+});
+
+test("#152 Fs codec A01: source-state readEvidence preserves exact canonical fields without runtime authority", () => {
+  const value = sourceStateVector(), before = structuredClone(value), bytes = Buffer.from(canonicalJson(value));
+  const parsed = parseSourceFiles(parseCanonical(bytes));
+  assert.deepEqual(parsed, value);
+  assert.equal(canonicalJson(parsed), bytes.toString("utf8"));
+  assert.equal(sha256(canonicalJson(parsed)), sha256(bytes));
+  assert.deepEqual(value, before);
+  assert.deepEqual(Object.keys(parsed).sort(), Object.keys(value).sort());
+  // The four digests are synthetic shape-valid values; parsing neither looks them up nor admits a provider.
+  assert.equal(Object.hasOwn(parsed, "authorized"), false);
+});
+
+test("#152 Fs codec A02: source-state policy, digests and nested fields are strict", () => {
+  const value = sourceStateVector(), binding = value.rootBindings[0]!, evidence = binding.readEvidence;
+  const check = (readEvidence: unknown, label: string) => assert.throws(() => parseSourceFiles({ ...value,
+    rootBindings: [{ ...binding, readEvidence }] }), invalid, label);
+  for (const field of Object.keys(evidence)) {
+    const missing = { ...evidence } as Record<string, unknown>; delete missing[field];
+    check(missing, `missing ${field}`);
+    check({ ...evidence, [field]: undefined }, `undefined ${field}`);
+  }
+  for (const field of ["profileEntryDigest", "qualificationDigest", "runtimeEnvironmentDigest", "sourceStateDigest"])
+    for (const bad of [null, 0, false, "", "5".repeat(63), "5".repeat(65), "A".repeat(64), "g".repeat(64),
+      "5".repeat(64) + "\n", " " + "5".repeat(64), "5".repeat(64) + "\0"])
+      check({ ...evidence, [field]: bad }, `${field}: ${String(bad)}`);
+  for (const bad of [null, [], true, {}, { ...evidence, future: true }, { ...evidence, authorized: true },
+    { ...evidence, policy: "application-source-preservation-v2" },
+    { ...evidence, policy: "linux-native-ext4-fid-fsuuid-v1" },
+    { ...evidence, kernelDiagnosticPolicy: "zero-block-effects-v1" },
+    { ...evidence, blockEffectsObservation: "observed-zero-writes" }]) check(bad, JSON.stringify(bad));
+  const { readEvidence: _evidence, ...withoutEvidence } = binding;
+  assert.throws(() => parseSourceFiles({ ...value, rootBindings: [withoutEvidence] }), invalid);
+  for (const change of [
+    { profile: "linux-native-ext4-fid-fsuuid-source-state-v2" }, { filesystemType: "overlay" },
+    { anchorHandle: { type: 248, byteCount: 32, hex: "0".repeat(64) } },
+    { anchorHandle: { type: 1, byteCount: 32, hex: "0123456789abcdef" } },
+    { anchorHandle: { type: 1, byteCount: 8, hex: "0123456789abcdef".repeat(4) } }, { future: true },
+  ]) assert.throws(() => parseSourceFiles({ ...value, rootBindings: [{ ...binding, ...change }] }), invalid);
+  const entry = value.entries[0]!;
+  assert.throws(() => parseSourceFiles({ ...value, entries: [{ ...entry, sourceWitness: { ...entry.sourceWitness,
+    incarnation: vector("overlay").rootBindings[0]!.anchorHandle } }] }), invalid);
+});
+
+test("#152 Fs codec A03: readEvidence never upgrades either legacy profile or Fs v1", () => {
+  const readEvidence = sourceStateVector().rootBindings[0]!.readEvidence;
+  for (const profile of ["ext4", "overlay"] as const) {
+    const value = vector(profile), before = canonicalJson(value);
+    assert.throws(() => parseSourceFiles({ ...value, rootBindings: [{ ...value.rootBindings[0]!, readEvidence }] }), invalid);
+    assert.equal(canonicalJson(value), before);
+  }
+  const value = sourceStateVector();
+  const legacy = { ...value, formatVersion: 1, entries: value.entries.map(({ sourceWitness: _witness, ...entry }) => entry) };
+  const before = canonicalJson(legacy);
+  assert.throws(() => parseSourceFiles(legacy), invalid);
+  assert.equal(canonicalJson(legacy), before);
 });
 
 test("#152 FSI-08: an anchored v1 body is invalid without live filling or an in-place upgrade", () => {
