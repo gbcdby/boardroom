@@ -68,7 +68,7 @@ onBeforeUnmount(() => { disposed = true; });
         </li>
       </ul>
     </section>
-    <section class="sidebar-bottom" aria-label="全局配置"><RouterLink to="/collaboration/connections" class="nav-link" :class="{ selected: route.path.startsWith('/collaboration/') }"><AppIcon name="layers" :size="19" /><span>角色与能力<small>连接与实例</small></span></RouterLink><RouterLink to="/settings" class="nav-link" :class="{ selected: route.path === '/settings' }"><AppIcon name="settings" :size="19" />设置</RouterLink></section>
+    <section class="sidebar-bottom" aria-label="全局配置"><RouterLink to="/collaboration/connections" class="nav-link" :class="{ selected: route.path === '/collaboration/connections' }"><AppIcon name="layers" :size="19" /><span>角色与能力<small>连接与实例</small></span></RouterLink><RouterLink to="/collaboration/mcp" class="nav-link" :class="{ selected: route.path === '/collaboration/mcp' }" :aria-current="route.path === '/collaboration/mcp' ? 'page' : undefined"><AppIcon name="server" :size="19" />MCP 目录</RouterLink><RouterLink to="/settings" class="nav-link" :class="{ selected: route.path === '/settings' }"><AppIcon name="settings" :size="19" />设置</RouterLink></section>
   </nav>
 </template>
 
