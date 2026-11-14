@@ -92,8 +92,8 @@ jobs:
           # 仅用于本次 CI 临时容器，不使用仓库或用户凭据。
           POSTGRES_PASSWORD: boardroom-ci-only
           POSTGRES_DB: boardroom_ci
-          # 只隔离此新建测试 cluster 的常规 autovacuum；真实 writer guard 不变。
-          POSTGRES_INITDB_ARGS: --set=autovacuum=off
+          # 仅此新建测试 cluster：隔离常规 autovacuum，并启用真实 PREPARE 场景。
+          POSTGRES_INITDB_ARGS: --set=autovacuum=off --set=max_prepared_transactions=8
         ports:
           - 5432:5432
         options: >-
@@ -107,6 +107,16 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+
+      - name: 确认未提交本地 Agent 过程产物
+        shell: bash
+        run: |
+          tracked_outputs="$(git ls-files -- .agent-output)"
+          if [ -n "$tracked_outputs" ]; then
+            printf '%s\n' "$tracked_outputs"
+            echo "::error::.agent-output 仅存本地过程材料；需要归档的资料请整理到 docs/ 后提交。"
+            exit 1
+          fi
 
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

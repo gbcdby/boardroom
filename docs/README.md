@@ -1,6 +1,6 @@
 # 文档目录
 
-本目录保存宏观架构、范围与项目工作流程；其他内容归属见下表。临时草稿、访谈记录、调研、原型和 agent 输出放在 `.agent-output/`。
+本目录保存宏观架构、范围、项目工作流程，以及需要长期引用的设计基准、原型和素材；其他内容归属见下表。临时草稿、访谈记录、调研、试验原型和 agent 过程输出仅保存在本地 `.agent-output/`，不提交到仓库。
 
 ## 目录结构
 
@@ -9,6 +9,7 @@
 | [agent-workflow.md](agent-workflow.md) | 可调整的 Agent 工作流程 |
 | [architecture/agent-studio.md](architecture/agent-studio.md) | 产品宏观架构、范围与验收基线 |
 | [architecture/data-model.md](architecture/data-model.md) | 持久化数据模型、v13 事实版本、v14 角色/别名、v15 项目工作区与共同事务边界 |
+| [prototypes/br-collab-20261112-v2/](prototypes/br-collab-20261112-v2/README.md) | 协作界面 v2 静态视觉基准：五类页面的浅色／深色原图与文件清单 |
 | [identity-catalog.md](identity-catalog.md) | 角色不可变版本、稳定身份与永久 alias、旧配置只读来源及本地管理 API |
 | [project-workspaces.md](project-workspaces.md) | 项目工作目录、v15 配置版本/CAS、原子创建、路径预检、旧目录来源映射及删除/复制边界 |
 | [f2-authorize-guard.md](f2-authorize-guard.md) | 统一权限矩阵、拒绝语义、接入点位 |
@@ -42,12 +43,14 @@
 | 开发门槛、工具、协作约定 | `AGENTS.md` 或 issue |
 | 可调整的 Agent 工作流程 | [agent-workflow.md](agent-workflow.md) |
 | decision map、详细 spec、子 spec、ticket、依赖与状态 | GitHub Issues |
-| 临时草稿、访谈、调研、原型、日志 | `.agent-output/` |
+| 需要长期引用的设计原型与素材，保留原始日期、对象和文件清单 | `docs/prototypes/` |
+| 临时草稿、访谈、调研、试验原型、日志和生成中间产物 | 本地 `.agent-output/`（Git 忽略，不强制加入版本库） |
 | 跨会话项目记忆 | `CONTEXT.md` |
 
 ## 规则
 
 - 架构文档只写长期有效的结论、范围、边界、约束和决策；不写逐条任务状态、排期过程或迁移记录。
+- `.agent-output/` 不作为归档目录；有长期引用价值的资料先整理到 `docs/`，再按相应目录规则提交。CI 拒绝任何被 Git 跟踪的 `.agent-output/` 内容。
 - 文件名使用 kebab-case slug；文档开头标注状态与日期。状态取值：`草案`、`已确认`、`已取代`、`已放弃`。
 - 架构决策可以并入相应架构文档，或在 `docs/architecture/` 下按需新增文档；不强制单独的决策文件格式。
 - 架构文档变更走 PR，至少经过一次独立文档或代码评审；合并到默认分支由人决定。用户已明确授权当前合并时，由 `worker-land` 核对必要门禁后执行并回读结果，无需重复询问。
