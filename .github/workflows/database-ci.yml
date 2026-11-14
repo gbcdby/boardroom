@@ -140,6 +140,16 @@ jobs:
       - name: 构建 WebUI
         run: npm run build
 
+      - name: 有界 Decision 与 MCP PostgreSQL 失败点 TAP 诊断
+        shell: bash
+        env:
+          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: |
+          mkdir -p .agent-output/maintenance-native-diagnostics
+          # run169 的 spec 末尾摘要被 job 取消截断；先保全已失败入口的真实
+          # 断言详情。完整 npm test 仍在原隔离身份下运行，所有门槛保持。
+          timeout --signal=TERM --kill-after=10s 90s node --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='local HTTP source|successors require current head|reader namespace|target既有namespace|已绑定会话再次 join|join memory reconciliation starts only' tests/decisions-http.test.ts tests/decisions-service.test.ts tests/m1-postgres-coordination.test.ts tests/agent-alias-integrity.test.ts tests/memory-mcp.test.ts 2>&1 | tee .agent-output/maintenance-native-diagnostics/decision-mcp-regression.tap
+
       - name: 有界 PostgreSQL 维护适配器 TAP 诊断
         id: maintenance_pg_diagnostic
         shell: bash

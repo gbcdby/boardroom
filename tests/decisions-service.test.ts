@@ -173,7 +173,7 @@ for (const engine of identityEngines) {
       assert.notEqual(next.decisionRef.decisionId, first.ref.decisionId); assert.equal(next.head.headRevision, first.head.headRevision + 1);
       assert.equal(next.current.actionRequest.action.payload.choice, 'changes_requested');
       const stored = await f.db.query('SELECT * FROM decision_records WHERE id=?', [first.ref.decisionId]);
-      assert.equal(stored[0]!.status, 'resolved'); assert.equal(stored[0]!.revision, rejected.decisionRef.revision);
+      assert.equal(stored[0]!.status, 'resolved'); assert.equal(Number(stored[0]!.revision), rejected.decisionRef.revision);
       await assert.rejects(service.request(manager, p.slot, { ...requested, idempotencyKey: 'stale-head', expectedHead: first.head }), { reason: 'head_revision_conflict' });
       const applied = await service.resolve(manager, p.project.id, next.decisionRef.decisionId, { decisionRef: next.decisionRef, choiceId: 'approve', reason: '批准明确的修改要求', idempotencyKey: 'apply-successor' });
       assert.equal(applied.task.state, 'in-progress'); assert.equal(applied.current.execution?.verdict, 'changes_requested');

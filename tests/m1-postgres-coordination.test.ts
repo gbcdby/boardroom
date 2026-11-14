@@ -125,7 +125,10 @@ test("M1 PG reader namespace/前后nonce/重复nonce/断连均在target初始化
         await assert.rejects(migrateData(source.options, { dbDriver: "postgres", pgConnectionString: m1PgUrl!, pgSchema: target }),
           fault === "namespace" ? /m1_postgres_namespace_mismatch/ : fault === "connection" ? /terminat|closed|Connection|Client|connection/i : /m1_owner_witness_mismatch/);
         assert.equal(injected, true);
-        if (fault === "post_nonce") assert.equal(businessReads, 57);
+        if (fault === "post_nonce") {
+          assert.ok(BUSINESS_TABLES.some(table => table.name === "work_event_delivery_invalidations"));
+          assert.equal(businessReads, BUSINESS_TABLES.length);
+        }
         assert.ok(connected.size >= 2);
         assert.ok([...connected].every(driver => closed.has(driver)));
         await assertNamespaceMissing(missing); await assertNamespaceMissing(target);
@@ -201,7 +204,7 @@ test("M1 PG owner与reader时区文本不同仍按PG时间值见证，不丢微�
   finally { hook.mock.restore(); await source.close(); await target.close(); }
 });
 
-test("M1 PG target inspect→CREATE→20迁移→clear→copy→真实COMMIT均固定同一physical client", pg, async () => {
+test("M1 PG target inspect→CREATE→21迁移→clear→copy→真实COMMIT均固定同一physical client", pg, async () => {
   const source = await m1Sqlite(true), schema = m1Schema();
   const original = Client.prototype.query as (...args: unknown[]) => unknown;
   const ids = new Set<number>(), committed: string[] = [], applied: number[] = [];
@@ -335,7 +338,7 @@ test("M1 PG target既有namespace被替换或pinned连接丢失，写前拒绝�
         if (fault === "connection") await assertNamespaceMissing(schema);
         else await m1PgControl(async client => {
           assert.equal((await client.query("SELECT to_regclass($1)::text AS name", [`${schema}.schema_migrations`])).rows[0]!.name, null);
-          assert.equal(Number((await client.query(`SELECT COUNT(*) AS n FROM "${renamed}".schema_migrations`)).rows[0]!.n), 20);
+          assert.deepEqual((await client.query(`SELECT version FROM "${renamed}".schema_migrations ORDER BY version`)).rows.map(row => row.version), migrations.map(migration => migration.version));
         });
       } finally {
         transactionHook.mock.restore(); connectHook.mock.restore();

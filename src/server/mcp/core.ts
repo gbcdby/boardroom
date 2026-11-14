@@ -8,6 +8,7 @@ import {
   RepositoryError,
 } from "../db/errors.ts";
 import { createRepositories, type RepositorySet } from "../db/repositories.ts";
+import { afterCommit } from "../db/after-commit.ts";
 import type { MutationDiscover } from "../db/mutation-scope.ts";
 import { newId } from "../db/ids.ts";
 import { findLegacyAgentId } from "../identity/aliases.ts";
@@ -1589,7 +1590,10 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
           if (closed || bindings.get(binding.sessionId) !== binding) throw new McpToolError('FORBIDDEN', '入群会话在响应前已失效。');
           if (context.visibility.scope !== "none") {
             injectedVersions.set(binding.sessionId, preparedMemory.fingerprint);
-            reconcileMemorySoon(binding);
+            // Scheduling here would lend setImmediate the still-active SQL
+            // scope. Wait for the physical owner to commit and release it;
+            // an enclosing rollback must discard the background job too.
+            await afterCommit(options.db, () => reconcileMemorySoon(binding));
           }
           return { ...result, context: { ...context, memory: context.visibility.scope === "none"
             ? unavailableMemory(memoryRuntime.config, "memory_binding_unavailable") : preparedMemory.injection },

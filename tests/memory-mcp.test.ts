@@ -12,6 +12,51 @@ import { createLogger } from "../src/server/logger.ts";
 import { DEFAULT_MEMORY_CONFIG } from "../src/server/config.ts";
 import type { MemoryConfig } from "../src/shared/memory.ts";
 import { registerMemoryRuntime, getMemoryRuntime, closeMemoryRuntime, scheduleMemoryReconciliation } from "../src/server/memory/runtime.ts";
+import { identityEngines, identityFixture, identitySkip } from "./helpers/identity-fixture.ts";
+
+for (const engine of identityEngines) for (const rollback of [false, true]) {
+  test(`${engine} #157 join memory reconciliation starts only after the owning transaction commits (${rollback ? "rollback" : "commit"})`, { skip: identitySkip(engine) }, async () => {
+    const f = await identityFixture(engine), logger = createLogger({ write: () => {} });
+    const core = createMcpCore({ db: f.db, repos: f.repos, logger, memberKey: `commit-boundary-${rollback}` });
+    const transaction = f.db.transaction.bind(f.db);
+    let transactionCalls = 0, atJoin = 0;
+    const turn = () => new Promise<void>(resolve => setImmediate(resolve));
+    try {
+      const project = await f.repos.projects.create({ name: "补扫归属" });
+      const group = await f.repos.groups.create({ projectId: project.id, name: "提交边界" });
+      f.db.transaction = async body => { transactionCalls++; return transaction(body); };
+      const invoke = () => f.db.transaction(async () => {
+        const joined = await core.join("worker", { displayName: "补扫成员", hostType: "other", projectId: project.id, groupId: group.id });
+        assert.equal(joined.context.visibility.scope, "write");
+        atJoin = transactionCalls;
+        // Let a genuinely scheduled background job run while the caller still
+        // owns the real SQL transaction. It must not borrow that transaction.
+        await turn(); await turn();
+        assert.equal(transactionCalls, atJoin, "join must not launch reconciliation before the outer physical commit");
+        if (rollback) throw new Error("join-owner-rollback");
+      });
+      if (rollback) {
+        await assert.rejects(invoke(), /join-owner-rollback/);
+        await turn(); await turn();
+        assert.equal(transactionCalls, atJoin, "rolled-back join must not leave a reconciliation job");
+      } else {
+        await invoke();
+        await new Promise<void>((resolve, reject) => {
+          const scheduled = scheduleMemoryReconciliation(f.db, "test:after-join-commit", async () => {
+            try {
+              assert.equal(f.db.currentTransactionContext(), undefined, "the scheduler must run after the transaction scope ends");
+              resolve();
+            } catch (error) { reject(error); }
+          });
+          if (!scheduled) reject(new Error("committed join reconciliation queue is unavailable"));
+        });
+        assert.ok(transactionCalls > atJoin, "the committed join still performs its real background reconciliation");
+      }
+    } finally {
+      await core.close(); await closeMemoryRuntime(f.db); f.db.transaction = transaction; await f.close();
+    }
+  });
+}
 
 async function fixture(config?: MemoryConfig) {
   const dir = await mkdtemp(path.join(tmpdir(), "boardroom-memory-mcp-"));
