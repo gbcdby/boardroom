@@ -40,7 +40,7 @@ async function fixture(repos: RepositorySet): Promise<Task> {
   const reviewer = await repos.agents.create({ displayName: "评审者", hostType: "codex-cli" });
   const assignee = await repos.members.create({ projectId: project.id, agentId: worker.id, kind: "agent", displayName: worker.displayName });
   const reviewerMember = await repos.members.create({ projectId: project.id, agentId: reviewer.id, kind: "agent", displayName: reviewer.displayName });
-  return { id: randomUUID(), projectId: project.id, title: "实现任务", body: "验收说明", labels: ["阶段 3"], state: "todo", assigneeMemberId: assignee.id,
+  return { id: randomUUID(), projectId: project.id, title: "实现任务", body: "验收说明", deliveryKind: "code", acceptanceText: "验收说明", acceptanceSource: "explicit", labels: ["阶段 3"], state: "todo", assigneeMemberId: assignee.id,
     reviewerMemberId: reviewerMember.id, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null, blockedReason: null, author, createdAt: at, updatedAt: at };
 }
 

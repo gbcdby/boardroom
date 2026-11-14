@@ -137,12 +137,14 @@ export class ApiError extends Error {
   readonly code: string;
   readonly status: number;
   readonly reason: string | undefined;
+  readonly details: unknown;
 
-  constructor(status: number, code: string, message: string, reason?: string) {
+  constructor(status: number, code: string, message: string, reason?: string, details?: unknown) {
     super(message);
     this.status = status;
     this.reason = reason;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -163,12 +165,13 @@ export async function request<T>(method: string, path: string, body?: unknown): 
   }
 
   if (!response.ok) {
-    const error = (payload as { error?: { code?: string; message?: string; reason?: string } } | null)?.error;
+    const error = (payload as { error?: { code?: string; message?: string; reason?: string; details?: unknown } } | null)?.error;
     throw new ApiError(
       response.status,
       error?.code ?? "unknown_error",
       error?.message ?? `请求失败（HTTP ${response.status}）`,
       error?.reason,
+      error?.details,
     );
   }
   return payload as T;
@@ -176,9 +179,13 @@ export async function request<T>(method: string, path: string, body?: unknown): 
 
 /**
  * 永久删除的级联清单（T1 #48）：确认弹窗里给「人」看清楚会清掉什么。
- * 项目清群组/群聊/投递/成员/状态/会话；群组只清群聊与参与者关系（成员保留）。
+ * 项目与群各自包含实际删除的托管绑定、运行状态和成员预留关系；全局托管配置保留。
+ * 群删除保留项目成员，仅清除不再被其他群绑定使用的未占用托管成员预留关系。
  */
 export interface ProjectPurgeCascade {
+  policyDocuments: number;
+  policyVersions: number;
+  workspaceVersions: number;
   memberFactRevisions: number;
   memoryDocuments: number;
   memoryVersions: number;
@@ -193,7 +200,20 @@ export interface ProjectPurgeCascade {
   taskMessageLinks: number;
   reviewRounds: number;
   reviewReports: number;
+  decisionLegacyRecords: number;
+  decisionActionRequests: number;
+  decisionRecords: number;
+  decisionReviewHeads: number;
+  decisionUserEvents: number;
+  decisionLocalInitiations: number;
+  decisionResolutions: number;
+  decisionExecutions: number;
+  decisionCommandReceipts: number;
+  decisionReviewProjections: number;
+  decisionChangeHeads: number;
+  decisionChanges: number;
   workEvents: number;
+  workEventInvalidations: number;
   groups: number;
   members: number;
   /** T2 #49：随项目一起清除的组织岗位节点数。 */
@@ -202,6 +222,9 @@ export interface ProjectPurgeCascade {
   deliveries: number;
   memberStatuses: number;
   mcpSessions: number;
+  agentRuntimeBindings: number;
+  agentRunnerStates: number;
+  agentRuntimeMembers: number;
 }
 
 export interface GroupPurgeCascade {
@@ -210,11 +233,15 @@ export interface GroupPurgeCascade {
   memoryTriggerCounters: number;
   memoryScanCheckpoints: number;
   workEvents: number;
+  workEventInvalidations: number;
   taskMessageLinks: number;
   messages: number;
   deliveries: number;
   participants: number;
   mcpSessions: number;
+  agentRuntimeBindings: number;
+  agentRunnerStates: number;
+  agentRuntimeMembers: number;
 }
 
 export interface ProjectPurgeConfirmation {

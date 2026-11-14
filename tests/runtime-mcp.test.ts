@@ -117,7 +117,7 @@ databaseTest("任务通知在托管 join 就绪后投递，旧 generation 无法
     const reviewer = await f.repos.members.create({ projectId: f.project.id, kind: "agent", agentId: agent.id, displayName: "评审成员" });
     const service = createTaskService({ repos: f.repos });
     const task = await service.create({ actor: ownerActor(f.project.id) }, f.project.id, {
-      title: "托管任务", body: "保持所有权边界", assigneeMemberId: f.view.binding.memberId, reviewerMemberId: reviewer.id,
+      title: "托管任务", body: "保持所有权边界", deliveryKind: "code", acceptanceText: "旧代际不得推进或修改任务", assigneeMemberId: f.view.binding.memberId, reviewerMemberId: reviewer.id,
     });
     const managed = await f.managed();
     const joined = await managed.join();

@@ -99,7 +99,7 @@ for (const engine of ["sqlite", "postgres"] as const) {
 
   test(`${engine} R-P4-S-002：任务通知已 ACK 后重启补偿，来源重开持久取消且不重复物化`, gating, async () => memoryFixture(async repos => {
     const p = await memoryPeople(repos);
-    const task: Task = { id: randomUUID(), projectId: p.project.id, title: "完成任务", body: "固定任务事实", labels: [], state: "done", assigneeMemberId: p.member.id,
+    const task: Task = { id: randomUUID(), projectId: p.project.id, title: "完成任务", body: "固定任务事实", deliveryKind: "code", acceptanceText: "固定任务事实", acceptanceSource: "explicit", labels: [], state: "done", assigneeMemberId: p.member.id,
       reviewerMemberId: p.outsider.id, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null, blockedReason: null,
       author: { kind: "human", actorId: "owner", displayName: "人" }, createdAt: at, updatedAt: at };
     await repos.tasks.create(task);

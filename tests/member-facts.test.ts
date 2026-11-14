@@ -47,7 +47,7 @@ for (const engine of ["sqlite", "postgres"] as const) {
       const message = await repos.messages.create({ groupId: f.group.id, senderMemberId: f.member.id, body: "不可回扫或重写的历史正文", mentions: [f.other.id], clientMessageId: "old-client-key" });
       await repos.deliveries.recordAttempt(message.id, f.other.id, "acked", at);
       const old = (await db.migrationState()).applied;
-      assert.equal((await db.migrate(migrations)).version, 13);
+      assert.equal((await db.migrate(migrations.filter(m => m.version <= 13))).version, 13);
       assert.deepEqual((await db.migrationState()).applied.slice(0, 12), old);
       for (const member of [f.member, f.other]) {
         assert.deepEqual(await facts(db, member.id), Object.fromEntries(MEMBER_FACT_KINDS.map(kind => [kind, 1])));

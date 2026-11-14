@@ -1,4 +1,5 @@
 import test from "node:test";
+import { allowCurrentReviewerForTaskFixture } from "./helpers/task-review-policy.ts";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -30,7 +31,7 @@ async function fixture(run: (repos: RepositorySet) => Promise<void>, engine: "sq
   const dir = await mkdtemp(path.join(tmpdir(), "boardroom-task-service-"));
   const schema = `task_service_${randomUUID().replaceAll("-", "")}`;
   const driver = engine === "sqlite" ? new SqliteDriver({ dataDir: dir }) : createDbDriver({ dbDriver: "postgres", pgConnectionString: pgUrl!, pgSchema: schema });
-  try { await driver.connect(); await driver.migrate(migrations); await run(createRepositories(driver)); }
+  try { await driver.connect(); await driver.migrate(migrations); const repos = createRepositories(driver); await allowCurrentReviewerForTaskFixture(repos); await run(repos); }
   finally {
     await driver.close();
     if (engine === "postgres") {
@@ -57,7 +58,7 @@ async function people(repos: RepositorySet) {
 test("AC-TASK-01/02：有效默认 reviewer、正文创建、普通成员评论与越权拒绝", async () => fixture(async repos => {
   const p = await people(repos); const service = createTaskService({ repos });
   await service.setSettings(p.owner, p.project.id, { expectedRevision: 0, defaultReviewerMemberId: p.reviewer.id });
-  const input = { title: "落实需求", body: "实现并验证", assigneeMemberId: p.worker.id };
+  const input = { title: "落实需求", body: "实现并验证", deliveryKind: "code" as const, acceptanceText: "实现并验证", assigneeMemberId: p.worker.id };
   await assert.rejects(service.create(p.workerAccess, p.project.id, input), { name: "ForbiddenError" });
   const task = await service.create(p.owner, p.project.id, input);
   assert.equal(task.reviewerMemberId, p.reviewer.id); assert.equal(task.revision, 1);
@@ -71,8 +72,11 @@ test("AC-TASK-01/02：有效默认 reviewer、正文创建、普通成员评论�
 }));
 
 async function reviewConcurrency(repos: RepositorySet): Promise<void> {
+  const managerAgent = await repos.agents.create({ displayName: '真实管理更正主体', hostType: 'other' });
   const p = await people(repos); const service = createTaskService({ repos, captureCandidate: async () => candidate });
-  let task = await service.create(p.owner, p.project.id, { title: "评审", body: "验收条件", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id, repoPath: "/fixture", fixedPoint: "base" });
+  const manager = await repos.members.create({ projectId: p.project.id, agentId: managerAgent.id, kind: 'agent', displayName: '管理者', role: 'manager' });
+  const managerAccess = { actor: actorForMember(manager) };
+  let task = await service.create(p.owner, p.project.id, { title: "评审", body: "验收条件", deliveryKind: "code" as const, acceptanceText: "验收条件", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id, repoPath: "/fixture", fixedPoint: "base" });
   task = await service.transition(p.workerAccess, p.project.id, task.id, { expectedRevision: task.revision, state: "in-progress" });
   const start = await service.startReview(p.workerAccess, p.project.id, task.id, { expectedRevision: task.revision });
   assert.equal(start.ready, true); task = start.task;
@@ -92,7 +96,7 @@ async function reviewConcurrency(repos: RepositorySet): Promise<void> {
   assert.equal((await service.submitReport(p.reviewerAccess, p.project.id, task.id, round.id, inputs[winner]!)).id, firstId);
   currentRound = (await repos.tasks.getRound(p.project.id, task.id, round.id))!;
   assert.equal(currentRound.state, "reported");
-  task = await service.decideReview(p.reviewerAccess, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "pass", reason: "两轴完成" });
+  task = (await service.decideReview(p.reviewerAccess, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "pass", reason: "两轴完成" })).task;
   assert.equal(task.state, "done");
   let decidedEvents = (await repos.tasks.listUnackedWorkEvents(p.project.id, p.worker.id)).filter(event => event.kind === "task.review_decided");
   assert.equal(decidedEvents.length, 1);
@@ -100,12 +104,12 @@ async function reviewConcurrency(repos: RepositorySet): Promise<void> {
   assert.equal(decidedEvents[0]!.payload["completionRevision"], task.revision);
   assert.equal(decidedEvents[0]!.payload["assigneeAgentId"], p.worker.agentId);
   currentRound = (await repos.tasks.getRound(p.project.id, task.id, round.id))!;
-  task = await service.decideReview(p.owner, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "pass", reason: "补充确认，未重新完成任务", override: true });
+  task = (await service.decideReview(managerAccess, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "pass", reason: "补充确认，未重新完成任务", override: true })).task;
   decidedEvents = (await repos.tasks.listUnackedWorkEvents(p.project.id, p.worker.id)).filter(event => event.kind === "task.review_decided");
   assert.equal(decidedEvents.filter(event => event.payload["enteredDone"] === true).length, 1, "重复 done 裁决不能再次触发总结");
   assert.equal(decidedEvents.find(event => event.payload["completionRevision"] === task.revision)?.payload["enteredDone"], false);
   currentRound = (await repos.tasks.getRound(p.project.id, task.id, round.id))!;
-  task = await service.decideReview(p.owner, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "changes_requested", reason: "管理者需要补充验收", override: true });
+  task = (await service.decideReview(managerAccess, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "changes_requested", reason: "管理者需要补充验收", override: true })).task;
   assert.equal(task.state, "in-progress");
   const detail = await service.get(p.owner, p.project.id, task.id);
   assert.equal(detail.reports.length, 2); assert.equal(detail.comments.filter(comment => comment.kind === "review_report").length, 2);
@@ -126,7 +130,7 @@ test("AC-TASK-03：blocked 跳过空岗上报，subtree 管理与事件 ACK 不�
   const manager = await repos.members.create({ projectId: p.project.id, agentId: agent.id, kind: "agent", displayName: agent.displayName });
   await repos.org.assignNode(manager.id, branch.id);
   const access = { actor: actorForMember(manager), connection: { projectId: p.project.id, memberId: manager.id, groupId: p.group.id, membershipRevision: manager.membershipRevision } };
-  const task = await service.create(access, p.project.id, { title: "下级任务", body: "需要支持", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id });
+  const task = await service.create(access, p.project.id, { title: "下级任务", body: "需要支持", deliveryKind: "code" as const, acceptanceText: "需要支持", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id });
   await assert.rejects(service.update(access, p.project.id, task.id, { expectedRevision: task.revision, assigneeMemberId: p.reviewer.id }), { name: "ForbiddenError" });
   const blocked = await service.transition(p.workerAccess, p.project.id, task.id, { expectedRevision: task.revision, state: "blocked", reason: "等待信息" });
   const first = await service.deliverWorkEvents(access, p.project.id);
@@ -176,7 +180,7 @@ test("#6：任务评论关系只扩大当前群可读范围，详情与历史不
   const observer = await repos.members.create({ projectId: p.project.id, agentId: agent.id, kind: "agent", displayName: agent.displayName });
   await repos.groups.addParticipant(p.group.id, observer.id);
   const access = { actor: actorForMember(observer), connection: { projectId: p.project.id, memberId: observer.id, groupId: p.group.id, membershipRevision: observer.membershipRevision } };
-  const task = await service.create(p.owner, p.project.id, { title: "消息关联", body: "限制群范围", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id });
+  const task = await service.create(p.owner, p.project.id, { title: "消息关联", body: "限制群范围", deliveryKind: "code" as const, acceptanceText: "限制群范围", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id });
   const message = await repos.messages.create({ groupId: p.group.id, senderMemberId: p.worker.id, body: "可见性测试" });
   await service.linkMessage(p.owner, p.project.id, task.id, message.id);
   assert.equal(await service.canReadLinkedMessage(access, p.project.id, message.id), false);
@@ -193,7 +197,7 @@ test("#6：任务评论关系只扩大当前群可读范围，详情与历史不
 test("评审失败可诊断；Git 采集不锁事务，采集中任务或 managed fence 改变时拒绝提交", async () => fixture(async repos => {
   const p = await people(repos);
   const service = createTaskService({ repos, captureCandidate: async () => { throw new TaskError("review_invalid_ref", "测试无效 ref"); } });
-  let task = await service.create(p.owner, p.project.id, { title: "候选", body: "固定版本", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id, repoPath: "/fixture", fixedPoint: "base" });
+  let task = await service.create(p.owner, p.project.id, { title: "候选", body: "固定版本", deliveryKind: "code" as const, acceptanceText: "固定版本", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id, repoPath: "/fixture", fixedPoint: "base" });
   task = await service.transition(p.workerAccess, p.project.id, task.id, { expectedRevision: task.revision, state: "in-progress" });
   const failed = await service.startReview(p.workerAccess, p.project.id, task.id, { expectedRevision: task.revision });
   assert.equal(failed.ready, false); assert.equal(failed.round.state, "failed"); assert.equal(failed.task.revision, task.revision);
@@ -217,7 +221,7 @@ test("任务+history+audit+event 原子回滚；失活成员与归档不能写",
   const p = await people(repos); const service = createTaskService({ repos });
   const original = repos.audit.append;
   repos.audit.append = async () => { throw new WriteFailedError("测试审计存储失败"); };
-  const input = { title: "原子任务", body: "全部回滚", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id };
+  const input = { title: "原子任务", body: "全部回滚", deliveryKind: "code" as const, acceptanceText: "全部回滚", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id };
   await assert.rejects(service.create(p.owner, p.project.id, input), { code: "write_failed" });
   repos.audit.append = original;
   assert.equal((await repos.tasks.list(p.project.id)).length, 0);
@@ -231,7 +235,7 @@ test("任务+history+audit+event 原子回滚；失活成员与归档不能写",
 
 test("两轴证据必须匹配候选、独立且并行；候选改动会使旧轮失效", async () => fixture(async repos => {
   const p = await people(repos); const service = createTaskService({ repos, captureCandidate: async () => candidate });
-  let task = await service.create(p.owner, p.project.id, { title: "证据", body: "双轴验证", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id, repoPath: "/fixture", fixedPoint: "base" });
+  let task = await service.create(p.owner, p.project.id, { title: "证据", body: "双轴验证", deliveryKind: "code" as const, acceptanceText: "双轴验证", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id, repoPath: "/fixture", fixedPoint: "base" });
   task = await service.transition(p.workerAccess, p.project.id, task.id, { expectedRevision: task.revision, state: "in-progress" });
   const started = await service.startReview(p.workerAccess, p.project.id, task.id, { expectedRevision: task.revision }); task = started.task;
   let round = await service.beginReview(p.reviewerAccess, p.project.id, task.id, started.round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: 1 });

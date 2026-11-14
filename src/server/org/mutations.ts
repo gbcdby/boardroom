@@ -79,7 +79,8 @@ export function createOrgMutationService({ repos, now = () => new Date() }: { re
             status: input.status ?? 'active', nodeId: null, removedAt: null, membershipRevision: before.member.membershipRevision + 1, updatedAt: at } };
           const result = await applyMemberCompensation(repos, { expected: before, target, compensationAuditId: auditId, at, budget: MEMBER_CAPTURE_BUDGET, tracker });
           await record({ projectId: input.projectId, actor: auditActorFrom(actor), action: 'member.add', targetKind: 'member', targetId: memberId, targetName: target.member.displayName,
-            before: result.actualBefore, after: result.actualAfter, detail: { explicitReadd: true, restartRequired: result.restartRequired } }, auditId, at);
+            before: result.actualBefore, after: result.actualAfter, detail: { explicitReadd: true, restartRequired: result.restartRequired, ...(result.workEventInvalidations ? { workEventInvalidations: result.workEventInvalidations } : {}) } }, auditId, at);
+          await result.assertWorkEventAudit();
           return { member: result.actualAfter.member!, auditId };
         }
         const before = emptyMemberSnapshot(input.projectId, memberId);
@@ -102,7 +103,8 @@ export function createOrgMutationService({ repos, now = () => new Date() }: { re
           removedAt: at, membershipRevision: before.member.membershipRevision + 1, updatedAt: at } };
         const result = await applyMemberCompensation(repos, { expected: before, target, compensationAuditId: auditId, at, budget: MEMBER_CAPTURE_BUDGET, tracker });
         await record({ projectId, actor: auditActorFrom(actor), action: 'member.remove', targetKind: 'member', targetId: memberId, targetName: before.member.displayName,
-          before: result.actualBefore, after: result.actualAfter, detail: { restartRequired: result.restartRequired } }, auditId, at);
+          before: result.actualBefore, after: result.actualAfter, detail: { restartRequired: result.restartRequired, ...(result.workEventInvalidations ? { workEventInvalidations: result.workEventInvalidations } : {}) } }, auditId, at);
+        await result.assertWorkEventAudit();
         tracker.check(); return { auditId, restartRequired: result.restartRequired };
       }));
     },

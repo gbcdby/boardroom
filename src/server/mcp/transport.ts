@@ -44,7 +44,7 @@ export interface McpSessionsHandler {
    */
   wakeGroup(groupId: string, wakeGate?: ReadonlySet<string>): void;
   /** 关闭所有 HTTP 会话与挂起等待。幂等。 */
-  close(): Promise<void>;
+  close(options?: { strict?: boolean }): Promise<void>;
 }
 
 interface HttpSession {
@@ -73,40 +73,40 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
    * （PostgreSQL 跨网络往返）导致查询在 `driver.close()` 之后才落地而崩溃。
    */
   const inflightWakes = new Set<Promise<unknown>>();
+  const disposals = new Map<string, Promise<void>>();
+  let closing: Promise<void> | null = null;
+  const closeFailures: unknown[] = [];
 
   function sweepIdle(): void {
     const now = Date.now();
     for (const [sid, session] of sessions) {
       if (now - session.lastActivity < MCP_SESSION_IDLE_TIMEOUT_MS) continue;
       log.info("mcp_session_idle_timeout", { sessionId: sid });
-      void disposeSession(sid);
+      void disposeSession(sid).catch(() => log.warn("mcp_session_dispose_incomplete", { sessionId: sid }));
     }
   }
   const sweepTimer = setInterval(sweepIdle, Math.min(MCP_SESSION_IDLE_TIMEOUT_MS, 60_000));
   sweepTimer.unref?.();
 
-  async function disposeSession(sid: string): Promise<void> {
+  function disposeSession(sid: string): Promise<void> {
+    const pending = disposals.get(sid);
+    if (pending) return pending;
     const session = sessions.get(sid);
-    if (!session) return;
-    sessions.delete(sid);
+    if (!session) return Promise.resolve();
+    const operation = (async () => {
     // 连接会话回收：把持久化的 MCP 会话标记为断开，并把成员运行状态置为 offline。
     // #61：必须 await，否则 disconnect 内的数据库写入会在 driver.close() 之后才落地
     // （PostgreSQL 异步延迟放大该竞态），导致连接已关闭的查询崩溃。
-    try {
-      await session.core.disconnect();
-    } catch (error) {
-      log.warn("mcp_session_disconnect_failed", { error, sessionId: sid });
-    }
-    try {
-      await session.core.close();
-    } catch (error) {
-      log.warn("mcp_session_close_failed", { error, sessionId: sid });
-    }
-    try {
-      await session.server.close();
-    } catch {
-      // 关闭失败不影响清理。
-    }
+    // Cancel waits before awaiting actual calls. Preserve a failed session so a
+    // maintenance callback can retry its exact disconnect under the trusted scope.
+    await session.core.close({ drain: true });
+    await session.core.disconnect({ strict: true });
+    await session.server.close();
+    sessions.delete(sid);
+    })();
+    disposals.set(sid, operation);
+    void operation.then(() => disposals.delete(sid), () => disposals.delete(sid));
+    return operation;
   }
 
   async function createSession(request: IncomingMessage, response: ServerResponse, body: unknown): Promise<void> {
@@ -130,11 +130,9 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
 
     transport.onclose = () => {
       if (transport.sessionId) {
-        sessions.delete(transport.sessionId);
         log.info("mcp_session_closed", { sessionId: transport.sessionId });
+        void disposeSession(transport.sessionId).catch(() => log.warn("mcp_session_dispose_incomplete"));
       }
-      core.disconnect();
-      core.close();
     };
 
     // exactOptionalPropertyTypes 下 SDK 的 Transport 可选项类型与 McpServer.connect 不完全一致，
@@ -185,6 +183,7 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
     },
 
     wakeGroup(groupId, wakeGate) {
+      if (closed) return;
       // 遍历所有 HTTP 会话（每个会话一个 core），只唤醒在该群组等待且被放行的成员。
       // #61：承诺纳入 inflightWakes 跟踪，并就地兜错，避免 fire-and-forget 产生未处理 rejection。
       for (const session of sessions.values()) {
@@ -200,15 +199,28 @@ export function createMcpSessionsHandler(options: McpTransportOptions): McpSessi
       }
     },
 
-    async close() {
-      if (closed) return;
+    close(closeOptions) {
+      const checked = () => {
+        if (closeOptions?.strict && closeFailures.length) throw new AggregateError(closeFailures, "mcp_http_close_incomplete");
+      };
+      if (closing) return closing.then(checked);
       closed = true;
       clearInterval(sweepTimer);
+      closing = (async () => {
       // #61：先排空在途的唤醒结算，确保底层驱动关闭前所有数据库操作已落地。
       await Promise.all([...inflightWakes]);
+      await Promise.allSettled([...disposals.values()]);
       const ids = [...sessions.keys()];
-      await Promise.all(ids.map((sid) => disposeSession(sid)));
-      log.info("mcp_http_closed", { sessionsClosed: ids.length });
+      const results = await Promise.allSettled(ids.map((sid) => disposeSession(sid)));
+      const failed = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+      if (failed.length) {
+        closeFailures.push(...failed.map(r => r.reason));
+        log.warn("mcp_http_close_incomplete", { sessions: failed.length });
+      } else {
+        log.info("mcp_http_closed", { sessionsClosed: ids.length });
+      }
+      })();
+      return closing.then(checked);
     },
   };
 }

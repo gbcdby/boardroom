@@ -26,7 +26,7 @@ async function fixture() {
   const reviewer = await core.join("reviewer", { displayName: "评审", hostType: "other", projectId: project.id, groupId: group.id });
   const observer = await core.join("observer", { displayName: "观察", hostType: "other", projectId: project.id, groupId: group.id });
   return { db, repos, project, group, otherGroup, logger, core, manager, worker, reviewer, observer,
-    async create() { return (await core.taskOperation("manager", "create", { title: "任务", body: "明确范围", assigneeMemberId: worker.memberId, reviewerMemberId: reviewer.memberId })).task as { id: string; revision: number; state: string }; },
+    async create() { return (await core.taskOperation("manager", "create", { title: "任务", body: "明确范围", deliveryKind: "code" as const, acceptanceText: "明确范围", assigneeMemberId: worker.memberId, reviewerMemberId: reviewer.memberId })).task as { id: string; revision: number; state: string }; },
     async close() { await core.close(); await db.close(); await rm(dir, { recursive: true, force: true }); } };
 }
 
@@ -52,7 +52,7 @@ test("MCP 工作通知兑现等待、未确认重投，ACK 不推进任务；冲
       assert.equal((error as { code: string }).code, "CONFLICT");
       assert.doesNotMatch((error as Error).message, /运行所有权/); return true;
     });
-    await assert.rejects(f.core.taskOperation("worker", "create", { title: "越权", body: "", assigneeMemberId: f.worker.memberId, reviewerMemberId: f.reviewer.memberId }), error => (error as { code: string }).code === "FORBIDDEN");
+    await assert.rejects(f.core.taskOperation("worker", "create", { title: "越权", body: "", deliveryKind: "code" as const, acceptanceText: "", assigneeMemberId: f.worker.memberId, reviewerMemberId: f.reviewer.memberId }), error => (error as { code: string }).code === "FORBIDDEN");
   } finally { await f.close(); }
 });
 

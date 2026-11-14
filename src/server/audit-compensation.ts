@@ -1,3 +1,4 @@
+import type { WorkEventInvalidationClosure } from "./tasks/work-event-storage.ts";
 import { isDeepStrictEqual } from "node:util";
 import { appendAuditEntry, assertCompleteAuditFields, auditActorFrom, isReversible, type AuditRow } from "./audit.ts";
 import type { RepoCtx, RepositorySet } from "./db/repositories.ts";
@@ -14,6 +15,7 @@ import { applyMemberCompensation, discoverMemberRelations, validateMemberSnapsho
 type ObjectValue = Record<string, unknown>;
 type Snapshot = OrgGraphSnapshotV2 | AssignmentSnapshotV2 | StatusSnapshotV2 | MemberRelationsSnapshotV2;
 type ChainAudit = Pick<AuditRow, 'id' | 'projectId' | 'action' | 'targetKind' | 'targetId' | 'detail' | 'reversedAt' | 'reversedByAuditId'>;
+type AuditHeader = Omit<ChainAudit, 'detail'>;
 type SnapshotAudit = ChainAudit & Pick<AuditRow, 'before' | 'after' | 'targetName'>;
 function invalid(message = "审计快照字段不完整或与事件范围不一致。"): never { throw new RepositoryError("invalid_argument", message); }
 function broken(): never { throw new RepositoryError("chain_broken", "审计补偿链缺失、循环或前驱不一致，不能推测恢复。"); }
@@ -44,7 +46,7 @@ async function readAuditField(ctx: RepoCtx, projectId: string, id: string, field
   }
   throw new RepositoryError('audit_snapshot_too_large', '历史审计字段超出完整快照上限。');
 }
-async function readChainAudit(ctx: RepoCtx, projectId: string, id: string): Promise<ChainAudit | null> {
+async function readAuditHeader(ctx: RepoCtx, projectId: string, id: string): Promise<AuditHeader | null> {
   const row = await ctx.one<{ id: string; project_id: string; action: string; target_kind: AuditRow['targetKind']; target_id: string; reversed_at: string | null; reversed_by_audit_id: string | null }>(
     `SELECT substr(id, 1, 1025) AS id, substr(project_id, 1, 1025) AS project_id, substr(action, 1, 129) AS action,
        target_kind, substr(target_id, 1, 1025) AS target_id, substr(reversed_at, 1, 129) AS reversed_at,
@@ -52,7 +54,11 @@ async function readChainAudit(ctx: RepoCtx, projectId: string, id: string): Prom
   if (!row) return null;
   return { id: boundedText(row.id)!, projectId: boundedText(row.project_id)!, action: boundedText(row.action, 128)!,
     targetKind: row.target_kind, targetId: boundedText(row.target_id)!, reversedAt: boundedText(row.reversed_at, 128, true),
-    reversedByAuditId: boundedText(row.reversed_by_audit_id, 1024, true), detail: await readAuditField(ctx, projectId, id, 'detail') };
+    reversedByAuditId: boundedText(row.reversed_by_audit_id, 1024, true) };
+}
+async function readChainAudit(ctx: RepoCtx, projectId: string, id: string): Promise<ChainAudit | null> {
+  const header = await readAuditHeader(ctx, projectId, id);
+  return header ? { ...header, detail: await readAuditField(ctx, projectId, id, 'detail') } : null;
 }
 function validNode(value: unknown, row: ChainAudit): value is OrgNode {
   if (!object(value)) return false;
@@ -213,15 +219,20 @@ export function createAuditCompensationService({ repos, now = () => new Date() }
       throw new RepositoryError("invalid_argument", "只有本项目的人（owner）可以撤销审计操作。");
     }
     let plannedMembers: string[] = [];
+    let plannedHeader: AuditHeader | undefined;
     let plannedRow: SnapshotAudit | undefined;
     const tracker = CaptureBudget.current() ?? new CaptureBudget(MEMBER_CAPTURE_BUDGET, access.signal);
     return tracker.run(() => withOrgMutation(repos, access, projectId, async tx => {
-      const header = await readChainAudit(tx, projectId, auditId);
+      const header = await readAuditHeader(tx, projectId, auditId);
       if (!header) throw new RepositoryError("not_found", "审计事件不存在。");
+      plannedHeader = header;
+      // 共同项目锁下已知终态无需再读快照或发现关系；仍由 body 在 projectActive 后拒绝。
+      if (header.reversedAt !== null) return { memberIds: [], groupIds: [], runtimeIds: [] };
+      const detail = await readAuditField(tx, projectId, auditId, 'detail');
       const before = await readAuditField(tx, projectId, auditId, 'before'), after = await readAuditField(tx, projectId, auditId, 'after');
       const targetName = await readAuditField(tx, projectId, auditId, 'target_name');
       if (targetName === null) invalid();
-      plannedRow = { ...header, before, after, targetName };
+      plannedRow = { ...header, detail, before, after, targetName };
       const values = [decode(before), decode(after)]; const members: string[] = [];
       if (values.every(v => object(v) && v.schema === 'member-relations/v2')) {
         const snapshots = values.map(v => validateMemberSnapshot(v, projectId, (v as ObjectValue).targetId as string));
@@ -240,10 +251,12 @@ export function createAuditCompensationService({ repos, now = () => new Date() }
       return { memberIds: plannedMembers, groupIds: [], runtimeIds: [] };
     }, async () => {
       // discover 已持共同项目锁；快照与链元数据不在锁外缓存，也无需整行二次加载。
+      const header = plannedHeader;
+      if (!header) broken();
+      if (!isReversible(header.action)) throw new RepositoryError("invalid_argument", "该审计动作不提供撤销。");
+      if (header.reversedAt !== null) conflict("该事件已经被撤销，请刷新审计列表查看后继事件。");
       const row = plannedRow;
       if (!row) broken();
-      if (!isReversible(row.action)) throw new RepositoryError("invalid_argument", "该审计动作不提供撤销。");
-      if (row.reversedAt !== null) conflict("该事件已经被撤销，请刷新审计列表查看后继事件。");
       const meta = await chain(repos, row), pair = snapshotPair(row, meta.rootAction);
       repos.mutations.current()!.assertCovers([projectId], plannedMembers);
       const id = newId(), at = now().toISOString();
@@ -252,9 +265,12 @@ export function createAuditCompensationService({ repos, now = () => new Date() }
       assertCompleteAuditFields(pair.before, pair.after, { reversal });
       let actual: { actualBefore: Snapshot; actualAfter: Snapshot };
       let restartRequired: RestartRequired[] = [];
+      let workEventInvalidations: WorkEventInvalidationClosure | undefined;
+      let assertWorkEventAudit: (() => Promise<void>) | undefined;
       if (pair.after.schema === 'member-relations/v2' && pair.before.schema === 'member-relations/v2') {
         const result = await applyMemberCompensation(repos, { expected: pair.after, target: pair.before, compensationAuditId: id, at, budget: MEMBER_CAPTURE_BUDGET, tracker });
         actual = result; restartRequired = result.restartRequired;
+        workEventInvalidations = result.workEventInvalidations; assertWorkEventAudit = result.assertWorkEventAudit;
       } else if (pair.after.schema === "org-graph/v2" && pair.before.schema === "org-graph/v2") {
         actual = await applyOrgGraph(repos, pair.after, pair.before, at, meta.rootAction !== "org.node_update");
       } else if (pair.after.schema === "org-assignment/v2" && pair.before.schema === "org-assignment/v2") {
@@ -269,7 +285,8 @@ export function createAuditCompensationService({ repos, now = () => new Date() }
       } else return invalid();
       const next = await appendAuditEntry(repos.audit, { projectId, actor: auditActorFrom(access.actor), action: meta.rootAction.startsWith("org.") ? "org.revoke" : "member.revoke",
         targetKind: row.targetKind, targetId: row.targetId, targetName: row.targetName, before: actual.actualBefore, after: actual.actualAfter,
-        detail: { reversal, ...(restartRequired.length ? { restartRequired, normalization: 'new-membership-revision; no-old-session-round-runtime-or-summary' } : {}) } }, { id, createdAt: at });
+        detail: { reversal, ...(workEventInvalidations ? { workEventInvalidations } : {}), ...(restartRequired.length ? { restartRequired, normalization: 'new-membership-revision; no-old-session-round-runtime-or-summary' } : {}) } }, { id, createdAt: at });
+      await assertWorkEventAudit?.();
       if (!await repos.audit.markReversed(projectId, row.id, next.id, at)) conflict("该事件刚被另一个请求撤销。");
       tracker.check(); return next;
     }));

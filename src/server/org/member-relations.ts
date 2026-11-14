@@ -1,5 +1,8 @@
 import { isDeepStrictEqual } from "node:util";
-import type { RepoCtx, RepositorySet } from "../db/repositories.ts";
+import { repositoryDriver, type RepoCtx, type RepositorySet } from "../db/repositories.ts";
+import { eligibleWorkEventSql, hasWorkEventInvalidations, type WorkEventInvalidationClosure } from "../tasks/work-event-storage.ts";
+import { prepareWorkEventInvalidations } from "../tasks/work-event-lifecycle.ts";
+import { prepareLifecycleDecisionCancellations } from "../decisions/lifecycle.ts";
 import type { DbRow } from "../db/driver.ts";
 import type { Member } from "../db/types.ts";
 import { MEMBER_FACT_KINDS } from "../db/types.ts";
@@ -153,7 +156,7 @@ export async function captureMember(repos: RepositorySet, input: MemberCaptureIn
   completePrefixes(reservation);
   cleanup.reservation = reservation ? { bindingId: nullable(reservation.binding_id), leased: Number(reservation.leased) === 1 } : null;
   cleanup.hasStatus = Boolean(await ctx.one("SELECT member_id FROM member_statuses WHERE project_id = ? AND member_id = ?", [projectId, memberId]));
-  cleanup.events = (await pages<{ id: string; recipient_member_id: string }>(ctx, tracker, `${prefix('id')}, ${prefix('recipient_member_id')}`, 'work_events', 'project_id = ? AND recipient_member_id = ?', [projectId, memberId]))
+  cleanup.events = (await pages<{ id: string; recipient_member_id: string }>(ctx, tracker, `${prefix('id')}, ${prefix('recipient_member_id')}`, 'work_events', `project_id = ? AND recipient_member_id = ?${await eligibleWorkEventSql(ctx)}`, [projectId, memberId]))
     .map(r => ({ id: id(r.id), recipientMemberId: id(r.recipient_member_id) }));
   const snapshot: MemberRelationsSnapshotV2 = { schema: 'member-relations/v2', projectId, targetId: memberId, presence: member.removedAt === null ? 'present' : 'removed', member, participants,
     tasks: actualTasks, settings, invalidatedRounds: sorted(rounds.filter(r => actualTasks.some(t => t.taskId === r.taskId) || input.watchedRoundIds.includes(r.roundId)), r => r.roundId), retained,
@@ -186,14 +189,17 @@ export function discoverMemberRelations(projectId: string, memberId: string, wat
     refs.push(...await byIds<{ id: string; assignee_member_id: string | null; reviewer_member_id: string | null }>(tx, tracker, columns, 'tasks', projectId, rounds.map(r => id(r.task_id))));
     const groups = await pages<{ group_id: string }>(tx, tracker, prefix('group_id'), 'group_participants', 'member_id = ?', [memberId], 'group_id', 128);
     const bindings = await pages<{ id: string; runtime_id: string; group_id: string }>(tx, tracker, `${prefix('id')}, ${prefix('runtime_id')}, ${prefix('group_id')}`, 'agent_runtime_bindings', 'project_id = ? AND member_id = ?', [projectId, memberId]);
-    const events = await pages<{ id: string; recipient_member_id: string; context_group_id: string | null }>(tx, tracker, `${prefix('id')}, ${prefix('recipient_member_id')}, ${prefix('context_group_id')}`, 'work_events', 'project_id = ? AND recipient_member_id = ?', [projectId, memberId]);
+    const events = await pages<{ id: string; recipient_member_id: string; context_group_id: string | null }>(tx, tracker, `${prefix('id')}, ${prefix('recipient_member_id')}, ${prefix('context_group_id')}`, 'work_events', `project_id = ? AND recipient_member_id = ?${await eligibleWorkEventSql(tx)}`, [projectId, memberId]);
     for (const taskId of uniqueIds(refs.map(t => id(t.id)))) for (const state of ['pending','delivered']) events.push(...await pages<{ id: string; recipient_member_id: string; context_group_id: string | null }>(tx, tracker,
-      `${prefix('id')}, ${prefix('recipient_member_id')}, ${prefix('context_group_id')}`, 'work_events', 'project_id = ? AND task_id = ? AND delivery_state = ?', [projectId, taskId, state]));
+      `${prefix('id')}, ${prefix('recipient_member_id')}, ${prefix('context_group_id')}`, 'work_events', `project_id = ? AND task_id = ? AND delivery_state = ?${await eligibleWorkEventSql(tx)}`, [projectId, taskId, state]));
     uniqueIds(events.map(e => id(e.id)));
     const sessions = await pages<{ id: string; group_id: string }>(tx, tracker, `${prefix('id')}, ${prefix('group_id')}`, 'mcp_sessions', "project_id = ? AND member_id = ? AND state = 'connected'", [projectId, memberId]);
     const reservation = await tx.one<{ runtime_id: string }>(`SELECT ${prefix('runtime_id')} FROM agent_runtime_members WHERE project_id = ? AND member_id = ?`, [projectId, memberId]);
     completePrefixes(reservation);
-    return { memberIds: uniqueIds([memberId, ...extraMembers, ...refs.flatMap(r => [nullable(r.assignee_member_id), nullable(r.reviewer_member_id)]).filter((v): v is string => v !== null), ...events.map(e => id(e.recipient_member_id))], 2048),
+    const decisionOwners = await tx.one('SELECT version FROM schema_migrations WHERE version = 20')
+      ? await tx.query<{ id: string }>(`SELECT m.id FROM members m LEFT JOIN org_nodes n ON n.id = m.node_id
+          WHERE m.project_id = ? AND (m.role = 'manager' OR n.role IN ('top_manager','sub_manager')) ORDER BY m.id LIMIT 2049`, [projectId]) : [];
+    return { memberIds: uniqueIds([memberId, ...extraMembers, ...decisionOwners.map(m => id(m.id)), ...refs.flatMap(r => [nullable(r.assignee_member_id), nullable(r.reviewer_member_id)]).filter((v): v is string => v !== null), ...events.map(e => id(e.recipient_member_id))], 2048),
       groupIds: uniqueIds([...extraGroups, ...groups.map(g => id(g.group_id)), ...bindings.map(b => id(b.group_id)), ...sessions.map(s => id(s.group_id)), ...events.map(e => nullable(e.context_group_id)).filter((v): v is string => v !== null)]),
       runtimeIds: uniqueIds([...bindings.map(b => id(b.runtime_id)), ...(reservation ? [id(reservation.runtime_id)] : [])]) };
   };
@@ -218,7 +224,8 @@ async function validateRestoredPosition(repos: RepositorySet, member: Member): P
 export async function applyMemberCompensation(repos: RepositorySet, input: {
   expected: MemberRelationsSnapshotV2; target: MemberRelationsSnapshotV2; compensationAuditId: string; at: string;
   budget: Readonly<MemberCaptureBudget>; tracker?: CaptureBudget;
-}): Promise<{ actualBefore: MemberRelationsSnapshotV2; actualAfter: MemberRelationsSnapshotV2; restartRequired: RestartRequired[] }> {
+}): Promise<{ actualBefore: MemberRelationsSnapshotV2; actualAfter: MemberRelationsSnapshotV2; restartRequired: RestartRequired[];
+  workEventInvalidations?: WorkEventInvalidationClosure; assertWorkEventAudit(): Promise<void> }> {
   const { expected, target, at, compensationAuditId } = input, ctx = repos.context;
   validateMemberSnapshot(expected, expected.projectId, expected.targetId); validateMemberSnapshot(target, expected.projectId, expected.targetId);
   const tracker = CaptureBudget.current() ?? input.tracker ?? new CaptureBudget(input.budget), watch = watchFromSnapshots(expected, target);
@@ -261,7 +268,7 @@ export async function applyMemberCompensation(repos: RepositorySet, input: {
   }
   const events = new Map(captured.cleanup.events.map(e => [e.id, e]));
   for (const { before } of plans) for (const state of ['pending','delivered']) {
-    const rows = await pages<{ id: string; recipient_member_id: string }>(ctx, tracker, `${prefix('id')}, ${prefix('recipient_member_id')}`, 'work_events', 'project_id = ? AND task_id = ? AND delivery_state = ?', [current.projectId, before.taskId, state]);
+    const rows = await pages<{ id: string; recipient_member_id: string }>(ctx, tracker, `${prefix('id')}, ${prefix('recipient_member_id')}`, 'work_events', `project_id = ? AND task_id = ? AND delivery_state = ?${await eligibleWorkEventSql(ctx)}`, [current.projectId, before.taskId, state]);
     for (const r of rows) events.set(id(r.id), { id: id(r.id), recipientMemberId: id(r.recipient_member_id) });
   }
   uniqueIds([...events.keys()]);
@@ -277,17 +284,23 @@ export async function applyMemberCompensation(repos: RepositorySet, input: {
   const projections = { ...expected, member: desiredMember, tasks: plans.map(p => p.after), presence: restoring ? 'present' : 'removed',
     participants: desiredParticipants, transient: { workEventIds: [], mcpSessionIds: [], runtimeBindingIds: [] } };
   assertCompleteAuditFields(expected, projections, { compensationAuditId, restartRequired: ['mcp-session','review','runtime-binding','memory-summary'] });
+  const workEvents = await hasWorkEventInvalidations(ctx) ? await prepareWorkEventInvalidations(repos.tasks, {
+    before: captured.snapshot, eventIds: [...events.keys()], auditId: compensationAuditId, restored: restoring, at,
+  }) : null;
+  const cancellations = await prepareLifecycleDecisionCancellations(repositoryDriver(repos), current.projectId,
+    plans.map(p => p.before.taskId), at, restoring ? 'member_restored' : 'member_removed');
   const cleanup = captured.cleanup;
   const estimatedChanged = 2 + plans.length * 5 + rounds.length + cleanup.requests.length * 2 + cleanup.sessions.length + cleanup.bindings.length * 2 + events.size + expected.participants.length + desiredParticipants.length + 3;
   tracker.plan({ rows: 15 + expected.participants.length + plans.length * 6 + rounds.length + cleanup.bindings.length + cleanup.sessions.length + plans.length * 2,
     bytes: Buffer.byteLength(JSON.stringify(projections)) * 3 + 32768,
-    sql: 35 + plans.length * 15 + rounds.length * 2 + cleanup.requests.length * 3 + cleanup.sessions.length + cleanup.bindings.length * 2 + events.size + expected.participants.length + desiredParticipants.length,
-    changedRows: estimatedChanged });
+    sql: 35 + plans.length * 15 + rounds.length * 2 + cleanup.requests.length * 3 + cleanup.sessions.length + cleanup.bindings.length * 2 + events.size + expected.participants.length + desiredParticipants.length + (workEvents ? 6 + Math.ceil(events.size / 32) : 0) + cancellations.count * 10,
+    changedRows: estimatedChanged + cancellations.count * 5 });
   const restart = new Set<RestartRequired>(['mcp-session']);
   if (rounds.length || expected.invalidatedRounds.length || target.invalidatedRounds.length) restart.add('review');
   if (cleanup.bindings.length || target.transient.runtimeBindingIds.length) restart.add('runtime-binding');
   if (cleanup.requests.length || target.retained.length && expected.retained.find(f => f.kind === 'memory-requests')?.revision !== target.retained.find(f => f.kind === 'memory-requests')?.revision) restart.add('memory-summary');
   // 全部验证和预算预检已结束；此后任何失败都必须等实际事务回滚，不能提前响应。
+  await cancellations.apply();
   await repos.members.applyLifecycleCas(current.projectId, current.id, current.membershipRevision, desiredMember, at);
   for (const p of expected.participants) if (!desiredParticipants.some(d => d.groupId === p.groupId && d.joinedAt === p.joinedAt)) await exactExec(ctx, 'DELETE FROM group_participants WHERE member_id = ? AND group_id = ? AND joined_at = ?', [current.id, p.groupId, p.joinedAt]);
   for (const p of desiredParticipants) if (!expected.participants.some(d => d.groupId === p.groupId && d.joinedAt === p.joinedAt)) await exactExec(ctx, 'INSERT INTO group_participants (group_id, member_id, joined_at) VALUES (?, ?, ?)', [p.groupId, current.id, p.joinedAt]);
@@ -306,7 +319,8 @@ export async function applyMemberCompensation(repos: RepositorySet, input: {
     await exactExec(ctx, 'DELETE FROM agent_runner_states WHERE binding_id = ?', [b.id]);
     await exactExec(ctx, 'DELETE FROM agent_runtime_bindings WHERE project_id = ? AND member_id = ? AND id = ? AND revision = ?', [current.projectId, current.id, b.id, b.revision]);
   }
-  for (const event of events.values()) await exactExec(ctx, 'DELETE FROM work_events WHERE project_id = ? AND id = ?', [current.projectId, event.id]);
+  if (workEvents) await workEvents.apply();
+  else for (const event of events.values()) await exactExec(ctx, 'DELETE FROM work_events WHERE project_id = ? AND id = ?', [current.projectId, event.id]);
   for (const { after } of plans) {
     if (after.state === 'done') continue;
     for (const recipientId of uniqueIds([after.assigneeMemberId, after.reviewerMemberId].filter((v): v is string => v !== null))) {
@@ -320,7 +334,9 @@ export async function applyMemberCompensation(repos: RepositorySet, input: {
   }
   const actualAfter = (await captureMember(repos, { projectId: current.projectId, memberId: current.id, ...watch, budget: input.budget, tracker })).snapshot;
   assertCompleteAuditFields(actualAfter); tracker.check();
-  return { actualBefore: captured.snapshot, actualAfter, restartRequired: [...restart].sort() };
+  return { actualBefore: captured.snapshot, actualAfter, restartRequired: [...restart].sort(),
+    ...(workEvents ? { workEventInvalidations: workEvents.auditDetail } : {}),
+    assertWorkEventAudit: () => workEvents?.assertAudit() ?? Promise.resolve() };
 }
 
 /** 快照 shape 校验不读取历史正文，拒绝跨项目/重复关系/无代际等不完整输入。 */

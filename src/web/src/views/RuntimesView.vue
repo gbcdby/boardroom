@@ -9,7 +9,7 @@ import RuntimeBindingCard from "../components/RuntimeBindingCard.vue";
 
 import { useCurrentProject, useProjectDraft } from "../composables/useCurrentProject.ts";
 const context = useCurrentProject();
-const { projects, currentProjectId, readonly: projectReadonly } = context;
+const { projects } = context;
 const route = useRoute();
 const router = useRouter();
 const runtimes = ref<RuntimeViewDto[]>([]);
@@ -21,16 +21,28 @@ const notice = ref<string | null>(null);
 const refreshWarning = ref<string | null>(null);
 const lastRefreshedAt = ref<string | null>(null);
 const queryValue = (value: unknown): string => typeof value === "string" ? value : "";
-const projectFilter = computed(() => currentProjectId.value ?? "");
-const groupFilter = ref(queryValue(route.query["groupId"]));
+// 全局连接页仅消费显式 URL 范围；项目导航的记忆选择不构成隐藏筛选或操作目标。
+const projectFilter = computed(() => queryValue(route.query["projectId"]));
+const groupFilter = computed(() => queryValue(route.query["groupId"]));
+const filterGroups = computed(() => projects.value.filter(project => !projectFilter.value || project.id === projectFilter.value)
+  .flatMap(project => groupsFor(project.id).map(group => ({ ...group, projectId: project.id }))));
+const writableProjects = computed(() => projects.value.filter(project => project.archivedAt === null));
+const scopeReadonly = computed(() => !!(projectFilter.value && projectIsReadonly(projectFilter.value))
+  || !!(groupFilter.value && (!filterGroups.value.some(group => group.id === groupFilter.value)
+    || filterGroups.value.some(group => group.id === groupFilter.value && (group.archivedAt !== null || projectIsReadonly(group.projectId))))));
 let refreshSequence = 0;
+let scopeRevision = 0;
+let mutationSequence = 0;
+let formSequence = 0;
+const groupRequests = new Map<string, number>();
+const targetLoading = ref(false);
 let polling: ReturnType<typeof setInterval> | undefined;
 let disposed = false;
 
 const createOpen = ref(false);
 const newName = ref("");
 const newBackend = ref<RuntimeBackend>("claude-code");
-const newProjectId = computed(() => currentProjectId.value ?? "");
+const newProjectId = ref("");
 const newGroupId = ref("");
 const newConfig = ref<RuntimeConfigDraft>(initialConfig("claude-code"));
 interface ConfigEditorState {
@@ -53,20 +65,28 @@ const formOpen = computed(() => createOpen.value || editor.value !== null || add
 const visibleRuntimes = computed(() => runtimes.value.map((entry) => ({
   ...entry, bindings: entry.bindings.filter((view) => (!projectFilter.value || view.binding.projectId === projectFilter.value)
     && (!groupFilter.value || view.binding.groupId === groupFilter.value)),
-})).filter((entry) => entry.bindings.length || fullRuntime(entry).bindings.length === 0 || (!projectFilter.value && !groupFilter.value)));
+})).filter((entry) => entry.bindings.length || (!projectFilter.value && !groupFilter.value)));
 const visibleBindings = computed(() => visibleRuntimes.value.flatMap((entry) => entry.bindings));
 const queuedCount = computed(() => visibleBindings.value.filter((view) => view.status.summary === "queued").length);
-const reusableRuntimes = computed(() => runtimes.value.filter(entry => groupsFor(projectFilter.value)
-  .some(group => !group.archivedAt && !entry.bindings.some(view => view.binding.groupId === group.id))));
+const reusableRuntimes = computed(() => runtimes.value.filter(entry => writableProjects.value
+  .filter(project => !(addingBinding.value?.projectId || projectFilter.value) || project.id === (addingBinding.value?.projectId || projectFilter.value))
+  .some(project => groupsFor(project.id).some(group => !group.archivedAt && !entry.bindings.some(view => view.binding.groupId === group.id)))));
 function groupsFor(projectId: string): GroupDto[] { return projectGroups.value[projectId] ?? []; }
+function projectIsReadonly(projectId: string): boolean { return !projects.value.some(project => project.id === projectId && project.archivedAt === null); }
+function targetIsReadonly(projectId: string, groupId: string): boolean {
+  return projectIsReadonly(projectId) || !groupsFor(projectId).some(group => group.id === groupId && group.archivedAt === null);
+}
+function bindingIsReadonly(view: RuntimeBindingViewDto): boolean { return targetIsReadonly(view.binding.projectId, view.binding.groupId); }
 function projectName(projectId: string): string { return projects.value.find((p) => p.id === projectId)?.name ?? "未加载的项目"; }
 function groupName(projectId: string, groupId: string): string { return groupsFor(projectId).find((g) => g.id === groupId)?.name ?? "未加载的群组"; }
 function fullRuntime(entry: RuntimeViewDto): RuntimeViewDto { return runtimes.value.find((item) => item.runtime.id === entry.runtime.id) ?? entry; }
 
-async function loadGroups(projectId: string): Promise<void> {
+async function loadGroups(projectId: string, current: () => boolean = () => !disposed): Promise<void> {
   if (!projectId) return;
+  const sequence = (groupRequests.get(projectId) ?? 0) + 1;
+  groupRequests.set(projectId, sequence);
   const result = await api.listGroups(projectId, { includeArchived: true });
-  if (!disposed) projectGroups.value = { ...projectGroups.value, [projectId]: result.groups };
+  if (!disposed && current() && groupRequests.get(projectId) === sequence) projectGroups.value = { ...projectGroups.value, [projectId]: result.groups };
 }
 async function refresh(loadNames = false, background = false): Promise<void> {
   const sequence = ++refreshSequence;
@@ -81,7 +101,7 @@ async function refresh(loadNames = false, background = false): Promise<void> {
     const missing = projects.value.filter((project) => loadNames || projectGroups.value[project.id] === undefined
       || runtimes.value.some((runtime) => runtime.bindings.some((view) => view.binding.projectId === project.id
         && !groupsFor(project.id).some((group) => group.id === view.binding.groupId))));
-    const names = await Promise.allSettled(missing.map((project) => loadGroups(project.id)));
+    const names = await Promise.allSettled(missing.map((project) => loadGroups(project.id, () => sequence === refreshSequence)));
     if (disposed || sequence !== refreshSequence) return;
     refreshWarning.value = names.some((result) => result.status === "rejected") ? "部分群组名称暂不可用，可手动刷新重试。" : null;
     lastRefreshedAt.value = new Date().toLocaleTimeString("zh-CN", { hour12: false });
@@ -92,9 +112,10 @@ async function refresh(loadNames = false, background = false): Promise<void> {
     }
   } finally { if (sequence === refreshSequence && !disposed) loading.value = false; }
 }
-async function mutate(action: () => Promise<void>, success: string): Promise<void> {
-  if (busy.value || projectReadonly.value) return;
-  const generation = context.generation.value;
+async function mutate(action: () => Promise<unknown>, success: string, committed?: () => void): Promise<void> {
+  if (busy.value || scopeReadonly.value) return;
+  const scope = scopeRevision, sequence = ++mutationSequence;
+  const current = () => !disposed && scope === scopeRevision && sequence === mutationSequence;
   busy.value = true;
   error.value = null;
   notice.value = null;
@@ -102,19 +123,39 @@ async function mutate(action: () => Promise<void>, success: string): Promise<voi
   loading.value = false;
   try {
     await action();
-    if (disposed || context.generation.value !== generation) return;
+    if (!current()) return;
+    committed?.();
     notice.value = success;
     await refresh(true);
-  } catch (cause) { error.value = runtimeError(cause); }
-  finally { busy.value = false; }
+  } catch (cause) { if (current()) error.value = runtimeError(cause); }
+  finally { if (current()) busy.value = false; }
 }
-function setGroupFilter(): void {
-  void router.replace({ path: "/runtimes", query: {
-    ...(projectFilter.value ? { projectId: projectFilter.value } : {}), ...(groupFilter.value ? { groupId: groupFilter.value } : {}),
-  } });
+async function setScope(projectId: string, groupId: string): Promise<void> {
+  const query = { ...route.query };
+  delete query["projectId"]; delete query["groupId"];
+  if (projectId) query["projectId"] = projectId;
+  if (groupId) query["groupId"] = groupId;
+  await router.push({ path: route.path, query, hash: route.hash });
 }
-watch(() => route.query, (query) => { groupFilter.value = queryValue(query["groupId"]); });
-useProjectDraft(() => formOpen.value, () => { createOpen.value = false; editor.value = null; addingBinding.value = null; confirmation.value = null; newName.value = ""; });
+async function changeProjectFilter(event: Event): Promise<void> {
+  const control = event.target as HTMLSelectElement;
+  await setScope(control.value, ""); control.value = projectFilter.value;
+}
+async function changeGroupFilter(event: Event): Promise<void> {
+  const control = event.target as HTMLSelectElement;
+  await setScope(projectFilter.value, control.value); control.value = groupFilter.value;
+}
+function resetForms(): void {
+  ++formSequence; targetLoading.value = false;
+  createOpen.value = false; editor.value = null; addingBinding.value = null; confirmation.value = null;
+  newName.value = ""; newProjectId.value = ""; newGroupId.value = ""; choosingExistingRuntime.value = false;
+}
+useProjectDraft(() => formOpen.value, resetForms);
+watch(() => route.fullPath, () => {
+  ++scopeRevision; ++mutationSequence; ++refreshSequence;
+  resetForms(); busy.value = false; loading.value = false; error.value = null; notice.value = null; refreshWarning.value = null;
+  if (["/runtimes", "/collaboration/connections"].includes(route.path)) void refresh();
+}, { flush: "sync" });
 async function focusForm(): Promise<void> {
   await nextTick();
   const element = document.getElementById("runtime-editor");
@@ -122,26 +163,40 @@ async function focusForm(): Promise<void> {
   element?.querySelector<HTMLInputElement>("input:not(:disabled)")?.focus({ preventScroll: true });
 }
 async function openCreate(): Promise<void> {
-  if (formOpen.value) return;
+  if (formOpen.value || busy.value || scopeReadonly.value) return;
   newName.value = ""; newBackend.value = "claude-code"; newConfig.value = initialConfig("claude-code");
-  newGroupId.value = groupFilter.value || groupsFor(newProjectId.value).find((group) => !group.archivedAt)?.id || "";
+  newProjectId.value = initialTargetProject();
+  newGroupId.value = "";
   createOpen.value = true;
+  await changeCreateProject();
   await focusForm();
+}
+function initialTargetProject(): string {
+  const id = projectFilter.value || filterGroups.value.find(group => group.id === groupFilter.value)?.projectId || "";
+  return !projectIsReadonly(id) ? id : "";
+}
+async function changeCreateProject(): Promise<void> {
+  const projectId = newProjectId.value, scope = scopeRevision, sequence = ++formSequence;
+  const current = () => !disposed && createOpen.value && scope === scopeRevision && sequence === formSequence && newProjectId.value === projectId;
+  newGroupId.value = ""; targetLoading.value = true; error.value = null;
+  try {
+    await loadGroups(projectId, current);
+    if (current()) newGroupId.value = groupsFor(projectId).find(group => group.id === groupFilter.value && !group.archivedAt)?.id
+      ?? groupsFor(projectId).find(group => !group.archivedAt)?.id ?? "";
+  } catch (cause) { if (current()) error.value = runtimeError(cause); }
+  finally { if (current()) targetLoading.value = false; }
 }
 function changeBackend(): void { newConfig.value = { ...newConfig.value, permissionMode: initialConfig(newBackend.value).permissionMode }; }
 async function create(): Promise<void> {
-  if (!newProjectId.value || !newGroupId.value) { error.value = "请选择一个已有项目和群组。"; return; }
-  await mutate(async () => {
-    await runtimeApi.create({ name: newName.value.trim(), backend: newBackend.value,
-      defaults: configFromDraft(newConfig.value), bindings: [{ projectId: newProjectId.value, groupId: newGroupId.value }] });
-    createOpen.value = false;
-  }, "托管 Agent 已创建并加入群组，当前保持停止。可以检查配置后显式启动。");
+  if (targetLoading.value || targetIsReadonly(newProjectId.value, newGroupId.value)) { error.value = "请选择一个可用项目和群组。"; return; }
+  const payload = { name: newName.value.trim(), backend: newBackend.value, defaults: configFromDraft(newConfig.value), bindings: [{ projectId: newProjectId.value, groupId: newGroupId.value }] };
+  await mutate(() => runtimeApi.create(payload), "托管 Agent 已创建并加入群组，当前保持停止。可以检查配置后显式启动。", resetForms);
 }
 function enableAll(enabled: boolean): Record<keyof RuntimeConfigDto, boolean> {
   return { model: enabled, workdir: enabled, tools: enabled, systemPrompt: enabled, permissionMode: enabled };
 }
 async function editDefaults(entry: RuntimeViewDto): Promise<void> {
-  if (formOpen.value) return;
+  if (formOpen.value || busy.value || scopeReadonly.value) return;
   editor.value = { kind: "default", runtimeId: entry.runtime.id, runtimeName: entry.runtime.name,
     backend: entry.runtime.backend, runtimeRevision: entry.runtime.revision, bindingId: null, bindingRevision: 0,
     groupName: "", inherited: { ...entry.runtime.defaults }, draft: configDraft(entry.runtime.defaults),
@@ -149,6 +204,7 @@ async function editDefaults(entry: RuntimeViewDto): Promise<void> {
   await focusForm();
 }
 async function editBinding(view: RuntimeBindingViewDto): Promise<void> {
+  if (bindingIsReadonly(view) || busy.value || scopeReadonly.value) return;
   if (formOpen.value) { error.value = "请先保存或取消当前正在编辑的配置。"; return; }
   const enabledFields = enableAll(false);
   for (const field of configFields) enabledFields[field] = Object.prototype.hasOwnProperty.call(view.binding.overrides, field);
@@ -182,12 +238,11 @@ async function saveEditor(): Promise<void> {
       await runtimeApi.saveBinding(edit.bindingId, { runtimeRevision: edit.runtimeRevision, bindingRevision: edit.bindingRevision,
         overrides, advancedStrategy: edit.advanced ? "bypassPermissions" : null });
     }
-    editor.value = null;
-  }, "配置已保存。已有进程继续使用已应用配置；选择对应群组的“应用并重启”后才生效。");
+  }, "配置已保存。已有进程继续使用已应用配置；选择对应群组的“应用并重启”后才生效。", () => { if (editor.value === edit) editor.value = null; });
 }
 async function openAddBinding(entry: RuntimeViewDto, chooseExisting = false): Promise<void> {
-  if (formOpen.value) return;
-  const projectId = projectFilter.value;
+  if (formOpen.value || busy.value || scopeReadonly.value) return;
+  const projectId = initialTargetProject();
   choosingExistingRuntime.value = chooseExisting;
   existingRuntimeId.value = entry.runtime.id;
   addingBinding.value = { runtime: entry, projectId, groupId: "" };
@@ -201,30 +256,33 @@ async function openExistingRuntime(): Promise<void> {
 async function changeExistingRuntime(): Promise<void> {
   const entry = reusableRuntimes.value.find(item => item.runtime.id === existingRuntimeId.value);
   if (!entry || !addingBinding.value) return;
-  addingBinding.value = { runtime: entry, projectId: projectFilter.value, groupId: "" };
+  addingBinding.value = { runtime: entry, projectId: addingBinding.value.projectId, groupId: "" };
   await changeBindingProject();
 }
 const availableBindingGroups = computed(() => {
   const adding = addingBinding.value;
-  return adding ? groupsFor(adding.projectId).filter((group) => !group.archivedAt && !adding.runtime.bindings.some((view) => view.binding.groupId === group.id)) : [];
+  return adding && !projectIsReadonly(adding.projectId) ? groupsFor(adding.projectId).filter((group) => !group.archivedAt && !adding.runtime.bindings.some((view) => view.binding.groupId === group.id)) : [];
 });
 async function changeBindingProject(): Promise<void> {
   const adding = addingBinding.value;
   if (!adding) return;
-  adding.groupId = "";
-  try { await loadGroups(adding.projectId); if (addingBinding.value === adding) adding.groupId = availableBindingGroups.value[0]?.id ?? ""; }
-  catch (cause) { error.value = runtimeError(cause); }
+  const projectId = adding.projectId, scope = scopeRevision, sequence = ++formSequence;
+  const current = () => !disposed && scope === scopeRevision && sequence === formSequence && addingBinding.value === adding && adding.projectId === projectId;
+  adding.groupId = ""; targetLoading.value = true; error.value = null;
+  try { await loadGroups(projectId, current); if (current()) adding.groupId = availableBindingGroups.value.find(group => group.id === groupFilter.value)?.id ?? availableBindingGroups.value[0]?.id ?? ""; }
+  catch (cause) { if (current()) error.value = runtimeError(cause); }
+  finally { if (current()) targetLoading.value = false; }
 }
 async function addBinding(): Promise<void> {
   const adding = addingBinding.value;
-  if (!adding?.projectId || !adding.groupId) return;
+  if (!adding?.projectId || !adding.groupId || targetLoading.value || targetIsReadonly(adding.projectId, adding.groupId)) return;
   await mutate(async () => {
     await runtimeApi.addBinding(adding.runtime.runtime.id, { projectId: adding.projectId, groupId: adding.groupId,
       expectedRuntimeRevision: adding.runtime.runtime.revision });
-    addingBinding.value = null;
-  }, "群组绑定已创建，继承全局默认并保持停止。");
+  }, "群组绑定已创建，继承全局默认并保持停止。", () => { if (addingBinding.value === adding) addingBinding.value = null; });
 }
 async function action(view: RuntimeBindingViewDto, requested: RuntimeAction): Promise<void> {
+  if (bindingIsReadonly(view) || busy.value || scopeReadonly.value) return;
   if (requested === "new-session") { confirmation.value = { kind: "new-session", view }; return; }
   const notices: Record<Exclude<RuntimeAction, "new-session">, string> = {
     start: "运行意图已保存；进程和连接状态以随后观测为准。", stop: "停止意图已保存；在途工作会等待安全点，确认退出后显示已停止。",
@@ -240,13 +298,12 @@ watch(confirmation, async (value) => {
 function cancelConfirmation(event?: Event): void { if (busy.value) event?.preventDefault(); else confirmation.value = null; }
 async function confirm(): Promise<void> {
   const pending = confirmation.value;
-  if (!pending) return;
+  if (!pending || (pending.kind !== "runtime" && bindingIsReadonly(pending.view))) return;
   await mutate(async () => {
     if (pending.kind === "runtime") await runtimeApi.removeRuntime(pending.view.runtime.id);
     else if (pending.kind === "binding") await runtimeApi.removeBinding(pending.view.binding.id);
     else await runtimeApi.action(pending.view, "new-session");
-    confirmation.value = null;
-  }, pending.kind === "new-session" ? "新会话请求已保存；历史消息和待处理投递保留。" : "托管配置已移除，成员身份和历史消息保留。");
+  }, pending.kind === "new-session" ? "新会话请求已保存；历史消息和待处理投递保留。" : "托管配置已移除，成员身份和历史消息保留。", () => { if (confirmation.value === pending) confirmation.value = null; });
 }
 
 onMounted(async () => {
@@ -259,8 +316,8 @@ onBeforeUnmount(() => { disposed = true; ++refreshSequence; if (polling) clearIn
 
 <template>
   <section class="page runtime-page">
-    <header class="page-header"><div><h1>托管 Agent</h1><p class="page-description">配置你的协作助手，掌握每个群组的运行情况。</p></div><div class="actions"><button type="button" :disabled="busy || loading" @click="refresh(true)">{{ loading ? '刷新中…' : '刷新' }}</button><button type="button" :disabled="busy || loading || formOpen || projectReadonly || reusableRuntimes.length === 0" data-testid="runtime-reuse-open" @click="openExistingRuntime">添加已有 Agent</button><button type="button" class="primary" :disabled="busy || formOpen || projectReadonly || !currentProjectId" data-testid="open-runtime-create" @click="openCreate">创建托管 Agent</button></div></header>
-    <p v-if="projectReadonly" class="notice" role="status">当前项目已归档，托管配置仅供查看。</p>
+    <header class="page-header"><div><h1>托管 Agent</h1><p class="page-description">配置你的协作助手，掌握每个群组的运行情况。</p></div><div class="actions"><button type="button" :disabled="busy || loading" @click="refresh(true)">{{ loading ? '刷新中…' : '刷新' }}</button><button type="button" :disabled="busy || loading || formOpen || scopeReadonly || reusableRuntimes.length === 0" data-testid="runtime-reuse-open" @click="openExistingRuntime">添加已有 Agent</button><button type="button" class="primary" :disabled="busy || loading || formOpen || scopeReadonly || writableProjects.length === 0" data-testid="open-runtime-create" @click="openCreate">创建托管 Agent</button></div></header>
+    <p v-if="scopeReadonly" class="notice" role="status">当前筛选范围已归档或不可用，托管配置仅供查看。清除筛选后可管理其他项目。</p>
     <p v-if="error" class="error" role="alert" data-testid="runtime-error">{{ error }}</p>
     <p v-if="notice" class="notice" role="status" data-testid="runtime-notice">{{ notice }}</p>
     <p v-if="refreshWarning" class="muted small" role="status">{{ refreshWarning }}</p>
@@ -268,10 +325,10 @@ onBeforeUnmount(() => { disposed = true; ++refreshSequence; if (polling) clearIn
     <form v-if="createOpen" id="runtime-editor" class="card runtime-form" data-testid="runtime-create-form" @submit.prevent="create">
       <h2>创建托管 Agent</h2><p class="muted small">选择已有项目与群组。创建后保持停止，CLI 登录由宿主自行管理。</p>
       <div class="form-grid"><label class="field">名称<input v-model="newName" required maxlength="64" :disabled="busy" autocomplete="off" data-testid="runtime-name"></label><label class="field">CLI 宿主<select v-model="newBackend" :disabled="busy" data-testid="runtime-backend" @change="changeBackend"><option value="claude-code">Claude Code</option><option value="codex-cli">Codex CLI</option><option value="dsh">DSH</option></select></label>
-        <p class="field">绑定项目<span class="muted">{{ context.currentProject.value?.name ?? "请在顶栏选择项目" }}</span></p><label class="field">群组<select v-model="newGroupId" required :disabled="busy"><option value="" disabled>选择群组</option><option v-for="group in groupsFor(newProjectId)" :key="group.id" :value="group.id" :disabled="!!group.archivedAt">{{ group.name }}</option></select></label></div>
-      <p v-if="projects.length === 0 || groupsFor(newProjectId).length === 0" class="muted small">还没有可绑定的群组。<RouterLink to="/projects">前往项目与群组创建</RouterLink>。</p>
+        <label class="field">绑定项目<select v-model="newProjectId" required :disabled="busy" data-testid="runtime-create-project" @change="changeCreateProject"><option value="" disabled>选择项目</option><option v-for="project in projects" :key="project.id" :value="project.id" :disabled="!!project.archivedAt">{{ project.name }}{{ project.archivedAt ? '（已归档）' : '' }}</option></select></label><label class="field">群组<select v-model="newGroupId" required :disabled="busy || targetLoading || !newProjectId" data-testid="runtime-create-group"><option value="" disabled>{{ targetLoading ? '加载群组中…' : '选择群组' }}</option><option v-for="group in groupsFor(newProjectId)" :key="group.id" :value="group.id" :disabled="!!group.archivedAt">{{ group.name }}{{ group.archivedAt ? '（已归档）' : '' }}</option></select></label></div>
+      <p v-if="newProjectId && !targetLoading && groupsFor(newProjectId).every(group => group.archivedAt)" class="muted small">此项目还没有可绑定的群组。<RouterLink to="/projects">前往项目与群组创建</RouterLink>。</p>
       <RuntimeConfigEditor v-model="newConfig" :backend="newBackend" id-prefix="runtime-create" :disabled="busy" />
-      <div class="actions form-actions"><button type="submit" class="primary" :disabled="busy || !newProjectId || !newGroupId" data-testid="runtime-create">创建并保持停止</button><button type="button" :disabled="busy" @click="createOpen = false">取消</button></div>
+      <div class="actions form-actions"><button type="submit" class="primary" :disabled="busy || targetLoading || targetIsReadonly(newProjectId, newGroupId)" data-testid="runtime-create">创建并保持停止</button><button type="button" :disabled="busy" data-testid="runtime-cancel-create" @click="resetForms">取消</button></div>
     </form>
 
     <form v-if="editor" id="runtime-editor" class="card runtime-form" data-testid="runtime-config-form" @submit.prevent="saveEditor">
@@ -291,16 +348,16 @@ onBeforeUnmount(() => { disposed = true; ++refreshSequence; if (polling) clearIn
           <option v-for="entry in reusableRuntimes" :key="entry.runtime.id" :value="entry.runtime.id">{{ entry.runtime.name }} · {{ backendLabels[entry.runtime.backend] }}</option>
         </select>
       </label>
-      <div class="form-grid"><p class="field">绑定项目<span class="muted">{{ context.currentProject.value?.name }}</span></p><label class="field">群组<select v-model="addingBinding.groupId" required :disabled="busy"><option value="" disabled>选择未绑定的群组</option><option v-for="group in availableBindingGroups" :key="group.id" :value="group.id">{{ group.name }}</option></select></label></div>
-      <p v-if="availableBindingGroups.length === 0" class="muted small">此项目暂无可添加的群组。</p>
-      <div class="actions"><button type="submit" class="primary" :disabled="busy || !addingBinding.groupId" data-testid="runtime-add-binding">添加绑定</button><button type="button" :disabled="busy" @click="addingBinding = null">取消</button></div>
+      <div class="form-grid"><label class="field">绑定项目<select v-model="addingBinding.projectId" required :disabled="busy" data-testid="runtime-binding-project" @change="changeBindingProject"><option value="" disabled>选择项目</option><option v-for="project in projects" :key="project.id" :value="project.id" :disabled="!!project.archivedAt">{{ project.name }}{{ project.archivedAt ? '（已归档）' : '' }}</option></select></label><label class="field">群组<select v-model="addingBinding.groupId" required :disabled="busy || targetLoading || !addingBinding.projectId" data-testid="runtime-binding-group"><option value="" disabled>{{ targetLoading ? '加载群组中…' : '选择未绑定的群组' }}</option><option v-for="group in availableBindingGroups" :key="group.id" :value="group.id">{{ group.name }}</option></select></label></div>
+      <p v-if="addingBinding.projectId && !targetLoading && availableBindingGroups.length === 0" class="muted small">此项目暂无可添加的群组。</p>
+      <div class="actions"><button type="submit" class="primary" :disabled="busy || targetLoading || targetIsReadonly(addingBinding.projectId, addingBinding.groupId)" data-testid="runtime-add-binding">添加绑定</button><button type="button" :disabled="busy" @click="resetForms">取消</button></div>
     </form>
 
-    <div class="runtime-filters"><label v-if="projectFilter" class="field">群组范围<select v-model="groupFilter" @change="setGroupFilter"><option value="">全部群组</option><option v-for="group in groupsFor(projectFilter)" :key="group.id" :value="group.id">{{ group.name }}</option></select></label><p class="muted small">{{ visibleRuntimes.length }} 个托管配置 · {{ visibleBindings.length }} 个群组绑定 · {{ queuedCount }} 个排队中<br><span v-if="lastRefreshedAt">快照更新于 {{ lastRefreshedAt }}</span></p></div>
+    <div class="runtime-filters"><label class="field">项目范围<select :value="projectFilter" data-testid="runtime-project-filter" @change="changeProjectFilter"><option value="">全部项目</option><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}{{ project.archivedAt ? '（已归档）' : '' }}</option></select></label><label class="field">群组范围<select :value="groupFilter" data-testid="runtime-group-filter" @change="changeGroupFilter"><option value="">全部群组</option><option v-if="groupFilter && !filterGroups.some(group => group.id === groupFilter)" :value="groupFilter">当前群组（{{ groupFilter }}）</option><option v-for="group in filterGroups" :key="group.id" :value="group.id">{{ projectFilter ? '' : `${projectName(group.projectId)} · ` }}{{ group.name }}{{ group.archivedAt ? '（已归档）' : '' }}</option></select></label><button type="button" :disabled="!projectFilter && !groupFilter" data-testid="runtime-scope-clear" @click="setScope('', '')">清除筛选</button><p class="muted small">{{ visibleRuntimes.length }} 个托管配置 · {{ visibleBindings.length }} 个群组绑定 · {{ queuedCount }} 个排队中<br><span v-if="lastRefreshedAt">快照更新于 {{ lastRefreshedAt }}</span></p></div>
     <div v-if="!loading && visibleRuntimes.length === 0" class="card empty-state"><h2>{{ projectFilter || groupFilter ? '此范围内还没有托管 Agent' : '开始第一个托管 Agent' }}</h2><p class="muted">创建配置并绑定群组后，可以在这里显式启动、停止或应用更新。</p></div>
     <article v-for="entry in visibleRuntimes" :key="entry.runtime.id" class="card runtime-entry">
-      <div class="runtime-entry-heading"><div><h2>{{ entry.runtime.name }} <span class="backend-tag">{{ backendLabels[entry.runtime.backend] }}</span></h2><p class="muted small">全局默认 v{{ entry.runtime.revision }} · {{ configValue(entry.runtime.defaults, 'model') }}</p><p class="muted small workdir">{{ entry.runtime.defaults.workdir }}</p></div><div class="actions"><button type="button" :disabled="busy || formOpen || projectReadonly" @click="editDefaults(entry)">全局默认</button><button type="button" :disabled="busy || formOpen || projectReadonly" @click="openAddBinding(fullRuntime(entry))">添加群组</button><button type="button" class="danger" :disabled="busy || projectReadonly || !fullRuntime(entry).bindings.every(isStopped)" title="所有绑定停止并确认进程退出后可删除" @click="confirmation = { kind: 'runtime', view: fullRuntime(entry) }">删除配置</button></div></div>
-      <div class="binding-list"><RuntimeBindingCard v-for="view in entry.bindings" :key="view.binding.id" :view="view" :busy="busy || projectReadonly" :project-name="projectName(view.binding.projectId)" :group-name="groupName(view.binding.projectId, view.binding.groupId)" @edit="editBinding(view)" @action="action(view, $event)" @remove="confirmation = { kind: 'binding', view }" /></div>
+      <div class="runtime-entry-heading"><div><h2>{{ entry.runtime.name }} <span class="backend-tag">{{ backendLabels[entry.runtime.backend] }}</span></h2><p class="muted small">全局默认 v{{ entry.runtime.revision }} · {{ configValue(entry.runtime.defaults, 'model') }}</p><p class="muted small workdir">{{ entry.runtime.defaults.workdir }}</p></div><div class="actions"><button type="button" :disabled="busy || formOpen || scopeReadonly" @click="editDefaults(entry)">全局默认</button><button type="button" :disabled="busy || formOpen || scopeReadonly" @click="openAddBinding(fullRuntime(entry))">添加群组</button><button type="button" class="danger" :disabled="busy || scopeReadonly || !fullRuntime(entry).bindings.every(isStopped)" title="所有绑定停止并确认进程退出后可删除" @click="confirmation = { kind: 'runtime', view: fullRuntime(entry) }">删除配置</button></div></div>
+      <div class="binding-list"><RuntimeBindingCard v-for="view in entry.bindings" :key="view.binding.id" :view="view" :busy="busy || scopeReadonly || bindingIsReadonly(view)" :project-name="projectName(view.binding.projectId)" :group-name="groupName(view.binding.projectId, view.binding.groupId)" @edit="editBinding(view)" @action="action(view, $event)" @remove="confirmation = { kind: 'binding', view }" /></div>
       <p v-if="entry.bindings.length === 0" class="muted small">暂无群组绑定，可以添加已有群组。</p>
     </article>
 
@@ -325,7 +382,7 @@ onBeforeUnmount(() => { disposed = true; ++refreshSequence; if (polling) clearIn
 .runtime-filters .field { min-width: 0; flex: 0 1 240px; max-width: 100%; }.runtime-filters p { margin: 0 0 .3rem auto; text-align: right; }
 .backend-tag { display: inline-block; font-size: .72rem; font-weight: 400; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: .15rem .4rem; vertical-align: middle; margin-left: .4rem; }
 .binding-list { display: grid; gap: 1rem; margin-top: 1rem; }.workdir { overflow-wrap: anywhere; }
-.runtime-dialog { width: min(520px, calc(100% - 2rem)); border: 1px solid var(--border); border-radius: 10px; padding: 1.4rem; color: var(--fg); background: var(--card-bg); }
-.runtime-dialog::backdrop { background: rgba(0, 0, 0, .4); }.runtime-dialog p { font-size: .9rem; }.runtime-dialog .actions { justify-content: flex-end; margin-top: 1.2rem; }
+.runtime-dialog { width: min(520px, calc(100% - 2rem)); border: 1px solid var(--control-border); border-radius: 10px; padding: 1.4rem; color: var(--fg); background: var(--surface-raised); box-shadow: var(--shadow-popup); }
+.runtime-dialog::backdrop { background: var(--backdrop); }.runtime-dialog p { font-size: .9rem; }.runtime-dialog .actions { justify-content: flex-end; margin-top: 1.2rem; }
 @media (max-width: 620px) { .form-grid { grid-template-columns: 1fr; }.runtime-filters p { text-align: left; margin-left: 0; }.runtime-entry { padding: 1rem; } }
 </style>

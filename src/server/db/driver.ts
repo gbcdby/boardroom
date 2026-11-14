@@ -9,7 +9,8 @@
  * Seam：本文件的 DbDriver 接口 + createDbDriver 工厂（ticket #46 确认的测试 seam）。
  */
 import type { DbDriverKind } from "../config.ts";
-import { ConfigError } from "../config.ts";
+import { ConfigError } from "../config-error.ts";
+import type { SqliteDatabaseDescriptor } from "../environment.ts";
 import type { AppliedMigration, Migration, MigrationRunResult } from "./migrate.ts";
 import type { SqlDialect } from "./dialect.ts";
 import { createSqliteDriver } from "./drivers/sqlite.ts";
@@ -34,6 +35,9 @@ export interface DbTransaction {
   exec(sql: string, params?: readonly unknown[]): Promise<number>;
 }
 
+/** A real consistent read transaction; this view deliberately has no exec or write capability. */
+export type DbReadSnapshot = Pick<DbTransaction, "query">;
+
 /** 持久化驱动公共接口：connect → migrate → query/transaction → close。 */
 export interface DbDriver {
   readonly kind: DbDriverKind;
@@ -56,16 +60,28 @@ export interface DbDriver {
   exec(sql: string, params?: readonly unknown[]): Promise<number>;
   /** 单个写事务：fn  reject 即整体回滚并向上抛出。支持 SAVEPOINT 嵌套（#61）。 */
   transaction<T>(fn: (tx: DbTransaction) => Promise<T>): Promise<T>;
+  /**
+   * 独立只读一致视图；不继承已有事务。PG 在 BEGIN 固定 REPEATABLE READ READ ONLY，
+   * SQLite 使用既有文件的独立 readonly/query_only 连接。快照只验证开始时的源准入；
+   * 结果不授权后续写入或维护推进，后续写仍须重新经过普通事务门禁。
+   */
+  readSnapshot<T>(fn: (snapshot: DbReadSnapshot) => Promise<T>): Promise<T>;
   /** 关闭连接/连接池。未连接或已关闭时静默返回（幂等）。 */
   close(): Promise<void>;
 }
 
 /** 连接工厂入参（来自 AppConfig 的持久化相关子集）。 */
 export interface DbDriverOptions {
+  /** M1 专用连接策略；none 只禁连接初始化，显式 migrate/transaction 仍是写能力。 */
+  readonly initializationOnConnect?: "normal" | "none";
   /** 缺省即 sqlite（DEFAULT_DB_DRIVER），兼容既有配置对象。 */
   readonly dbDriver?: DbDriverKind;
   /** SQLite 数据目录；dbDriver=sqlite 时必须。 */
   readonly dataDir?: string;
+  /** 统一 resolver 指定的真实 SQLite 文件；可与管理 dataDir 不同。 */
+  readonly sqlitePath?: string;
+  /** 既有源的原入口与身份；连接前重新核实，拒绝移动/替换后创建空库。 */
+  readonly sqliteSource?: SqliteDatabaseDescriptor;
   /** PostgreSQL 连接串；dbDriver=postgres 时必须。 */
   readonly pgConnectionString?: string;
   /**
@@ -94,7 +110,10 @@ export function createDbDriver(options: DbDriverOptions): DbDriver {
         "dbDriver=sqlite 需要 dataDir。请设置 AGENT_STUDIO_DATA_DIR 或配置文件中的 dataDir 字段。",
       );
     }
-    return createSqliteDriver({ dataDir: options.dataDir });
+    return createSqliteDriver({ dataDir: options.dataDir,
+      ...(options.initializationOnConnect === undefined ? {} : { initializationOnConnect: options.initializationOnConnect }),
+      ...(options.sqlitePath === undefined ? {} : { sqlitePath: options.sqlitePath }),
+      ...(options.sqliteSource === undefined ? {} : { sqliteSource: options.sqliteSource }) });
   }
   if (options.pgConnectionString === undefined || options.pgConnectionString.trim() === "") {
     throw new ConfigError(
@@ -104,6 +123,7 @@ export function createDbDriver(options: DbDriverOptions): DbDriver {
   }
   return createPostgresDriver({
     connectionString: options.pgConnectionString,
+    ...(options.initializationOnConnect === undefined ? {} : { initializationOnConnect: options.initializationOnConnect }),
     ...(options.pgSchema === undefined ? {} : { schema: options.pgSchema }),
   });
 }

@@ -2,6 +2,10 @@
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { RouterLink } from "vue-router";
 import { settingsApi, type EffectiveSettings } from "../api/settings.ts";
+import { useTheme } from "../composables/useTheme.ts";
+
+const { snapshot: theme, available: themeAvailable, setPreference } = useTheme();
+const appearances = [{ value: "system", label: "跟随系统" }, { value: "light", label: "浅色" }, { value: "dark", label: "深色" }] as const;
 
 const settings = ref<EffectiveSettings | null>(null);
 const loading = ref(false);
@@ -52,10 +56,19 @@ onBeforeUnmount(() => { disposed = true; readRequest++; copyRequest++; });
 <template>
   <section class="page settings-page" :aria-busy="loading">
     <header class="page-header">
-      <div><h1>设置</h1><p class="page-description">查看本地服务当前生效的配置。</p></div>
+      <div><h1>设置</h1><p class="page-description">调整显示外观，查看本地服务当前生效的配置。</p></div>
       <button type="button" :disabled="loading" data-testid="settings-refresh" @click="refresh">{{ loading ? '正在读取…' : '刷新配置' }}</button>
     </header>
-    <div class="settings-status" role="status"><span class="badge">全局 · 只读</span><span v-if="lastReadAt" class="muted small">上次成功读取：<time :datetime="lastReadAt" data-testid="settings-last-read">{{ time(lastReadAt) }}</time></span></div>
+    <section class="panel appearance-panel" aria-labelledby="appearance-title" data-testid="appearance-settings">
+      <div><h2 id="appearance-title">外观</h2><p class="muted small">应用于这台浏览器的所有页面。</p></div>
+      <div class="appearance-choices" role="group" aria-label="显示外观">
+        <button v-for="appearance in appearances" :key="appearance.value" type="button" :aria-pressed="theme.preference === appearance.value" :disabled="!themeAvailable" :data-testid="`theme-${appearance.value}`" @click="setPreference(appearance.value)"><span class="appearance-check" aria-hidden="true">{{ theme.preference === appearance.value ? '✓' : '' }}</span>{{ appearance.label }}</button>
+      </div>
+      <p v-if="!themeAvailable" class="warning-text small" role="status">外观设置暂不可用，请刷新页面。</p>
+      <p v-else-if="!theme.persistent" class="warning-text small" role="status" data-testid="theme-storage-notice">浏览器无法保存外观偏好，本次页面内仍可切换；刷新后可能恢复默认。</p>
+      <p v-else class="muted small" role="status" data-testid="theme-current">当前显示：{{ theme.appearance === 'dark' ? '深色' : '浅色' }}{{ theme.preference === 'system' ? '，随系统外观变化。' : '，已记住你的选择。' }}</p>
+    </section>
+    <div class="settings-status" role="status"><span class="badge">服务配置 · 只读</span><span v-if="lastReadAt" class="muted small">上次成功读取：<time :datetime="lastReadAt" data-testid="settings-last-read">{{ time(lastReadAt) }}</time></span></div>
     <div v-if="error" class="error" role="alert" data-testid="settings-error"><p>{{ error }}</p><p v-if="settings">刷新失败，以下仍为上次成功读取的值。</p><button type="button" class="text-button" :disabled="loading" data-testid="settings-retry" @click="refresh">重新读取</button></div>
     <p v-if="loading && !settings" class="muted" role="status" data-testid="settings-loading">正在读取生效配置…</p>
     <div v-if="settings" class="settings-grid">
@@ -118,6 +131,13 @@ onBeforeUnmount(() => { disposed = true; readRequest++; copyRequest++; });
 </template>
 
 <style scoped>
+.appearance-panel { margin-bottom: 28px; }
+.appearance-panel h2 { margin-bottom: .35rem; }
+.appearance-choices { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 12px; }
+.appearance-choices button { min-width: 108px; min-height: 44px; }
+.appearance-choices button[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.appearance-check { width: 1em; font-weight: 700; }
+@media (max-width: 480px) { .appearance-choices button { min-width: 0; flex: 1 1 100px; } }
 .settings-status { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; margin: -6px 0 24px; }
 .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 20px; }
 .settings-grid > .panel { margin: 0; }

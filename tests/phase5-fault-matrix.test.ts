@@ -4,7 +4,7 @@ import { ownerActor } from "../src/server/authz/actors.ts";
 import { createOrgMutationService } from "../src/server/org/mutations.ts";
 import { createAuditCompensationService } from "../src/server/audit-compensation.ts";
 import { memoryFixture, pgUnavailable } from "./helpers/memory-fixture.ts";
-import { seedCompleteMemberRelations, snapshotRelationsDatabase, tableRows } from "./helpers/phase5-relations-fixture.ts";
+import { relationTime, seedCompleteMemberRelations, snapshotRelationsDatabase, tableRows } from "./helpers/phase5-relations-fixture.ts";
 
 const access = { actor: ownerActor() };
 const faults = [
@@ -68,7 +68,9 @@ for (const engine of ["sqlite", "postgres"] as const) {
     const cancelledRequests = await tableRows(db, "memory_summary_requests");
     const factsAfterRemove = await tableRows(db, "member_fact_revisions");
     const oldEventIds = new Set(f.events.filter(e => e.deliveryState !== "acked").map(e => e.id));
-    const priorGeneratedEvents = new Set<string>();
+    const preservedEvents = new Map(before.work_events!.map(event => [String(event.id), event]));
+    const firstInvalidations = (await tableRows(db, "work_event_delivery_invalidations")).filter(marker => oldEventIds.has(String(marker.work_event_id)));
+    assert.deepEqual(firstInvalidations.map(marker => String(marker.work_event_id)).sort(), [...oldEventIds].sort());
     for (let step = 0; step < 6; step++) {
       if (step > 0) current = await compensation.revoke(access, f.project.id, current.id);
       const present = step % 2 === 1;
@@ -117,16 +119,26 @@ for (const engine of ["sqlite", "postgres"] as const) {
       assert.equal(rows.mcp_sessions![0]!.state, "disconnected");
       assert.equal(rows.mcp_sessions![0]!.id, f.session.id);
       assert.equal(rows.audit_log!.length, step + 1);
-      assert.equal(rows.work_events!.some(e => oldEventIds.has(String(e.id))), false);
-      const preservedAck = f.events.find(e => e.deliveryState === "acked")!;
-      assert.deepEqual(rows.work_events!.find(e => e.id === preservedAck.id), before.work_events!.find(e => e.id === preservedAck.id));
-      const generated = rows.work_events!.filter(e => e.id !== preservedAck.id);
+      // v21 retains every original event/delivery/ACK byte. Its first-cause
+      // sidecar permanently excludes the old generation, including after undo.
+      for (const [id, original] of preservedEvents) assert.deepEqual(rows.work_events!.find(e => e.id === id), original);
+      assert.deepEqual((await tableRows(db, "work_event_delivery_invalidations")).filter(marker => oldEventIds.has(String(marker.work_event_id))), firstInvalidations);
+      for (const recipient of [f.member.id, f.peer.id]) {
+        assert.equal((await repos.tasks.listUnackedWorkEvents(f.project.id, recipient)).some(event => oldEventIds.has(event.id)), false);
+        const old = f.events.filter(event => event.recipientMemberId === recipient && oldEventIds.has(event.id));
+        if (recipient === f.member.id && !present) {
+          await assert.rejects(repos.tasks.markWorkEventsDelivered(f.project.id, recipient, old.map(event => event.id), relationTime), /成员不存在、已移除/);
+          continue;
+        }
+        assert.deepEqual(await repos.tasks.markWorkEventsDelivered(f.project.id, recipient, old.map(event => event.id), relationTime), []);
+        for (const event of old) await assert.rejects(repos.tasks.acknowledgeWorkEvent(f.project.id, recipient, event.id, relationTime), { reason: "work_event_delivery_invalidated" });
+      }
+      const generated = rows.work_events!.filter(e => !preservedEvents.has(String(e.id)));
       assert.equal(generated.length, present ? 6 : 3, "只生成当前有效任务引用人的新通知");
       for (const event of generated) {
-        assert.equal(priorGeneratedEvents.has(String(event.id)), false, "禁止复活任一上一代通知 ID");
         assert.ok(String(event.event_key).startsWith(`${current.id}:`));
         assert.equal(event.delivery_state, "pending");
-        priorGeneratedEvents.add(String(event.id));
+        preservedEvents.set(String(event.id), event);
       }
     }
   }, engine));

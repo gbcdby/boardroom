@@ -22,8 +22,8 @@ import path from "node:path";
 
 import { DATABASE_FILE_NAME } from "./database.ts";
 import { createDbDriver } from "./driver.ts";
-import type { DbDriver, DbDriverOptions, DbRow, DbTransaction } from "./driver.ts";
-import type { Migration } from "./migrate.ts";
+import type { DbDriver, DbDriverOptions, DbReadSnapshot, DbRow, DbTransaction } from "./driver.ts";
+import { MigrationError, type Migration } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { durableMessageDispatch } from "./migrations/message-dispatch.ts";
 import { managedRuntime } from "./migrations/runtime.ts";
@@ -32,6 +32,21 @@ import { runtimeProcessIdentityMigration } from "./migrations/runtime-process-id
 import { tasksMigration } from "./migrations/tasks.ts";
 import { memoryMigration } from "./migrations/memory.ts";
 import { memberLifecycleMigration } from "./migrations/member-lifecycle.ts";
+import { identityCatalogMigration } from "./migrations/identity-catalog.ts";
+import { projectWorkspacesMigration } from "./migrations/project-workspaces.ts";
+import { taskIntakeMigration } from "./migrations/task-intake.ts";
+import { policyConfigurationMigration } from "./migrations/policy-configuration.ts";
+import { storageMaintenanceMigration } from "./migrations/storage-maintenance.ts";
+import { mcpConnectionsMigration } from "./migrations/mcp-connections.ts";
+import { decisionsMigration } from "./migrations/decisions.ts";
+import { workEventDeliveryInvalidationsMigration } from "./migrations/work-event-delivery-invalidations.ts";
+import { DECISION_TABLES } from "../decisions/tables.ts";
+import { validateDecisionStorageGraph } from "../decisions/storage-validation.ts";
+import { WORK_EVENT_INVALIDATION_COLUMNS, validateWorkEventInvalidations } from "../tasks/work-event-storage.ts";
+import { openM1SourceExisting, withM1BorrowedSource, m1PermitFacts, type M1SourcePermit } from "./m1-source.ts";
+import { assertM1DifferentTarget, withM1TargetLease } from "./m1-target.ts";
+import { withM1Cleanup } from "./m1-resources.ts";
+import type { M1ReadPlan, M1Rows } from "./m1-inspection.ts";
 
 // ---------------------------------------------------------------------------
 // 业务表清单（外键安全的拷贝顺序：父表先于子表）
@@ -43,6 +58,8 @@ export interface TableSpec {
   readonly name: string;
   /** 作为主键的「键列」，用于跨库一致性校验（复合主键用多列）。 */
   readonly keyColumns: readonly string[];
+  /** 明确声明的整数键列：按有符号 64 位整数无损比较；其他键保留原类型/文本，不推测数值。 */
+  readonly integerKeyColumns?: readonly string[];
   /** v13 事实代际必须数值一致，不能只核对键集合。 */
   readonly valueColumns?: readonly string[];
   /** 覆盖默认 `SELECT *` 的源读取 SQL（如 org_nodes 的层级排序）。 */
@@ -57,8 +74,32 @@ export interface TableSpec {
  * → messages → message_deliveries → member_statuses → mcp_sessions → audit_log。
  */
 export const BUSINESS_TABLES: readonly TableSpec[] = [
+  { name: "mcp_connections", keyColumns: ["id"], valueColumns: ["revision", "discovery_sequence", "created_at", "updated_at"] },
+  { name: "mcp_connection_versions", keyColumns: ["connection_id", "revision"], integerKeyColumns: ["revision"], valueColumns: ["name", "configuration_json", "configuration_digest", "created_at"] },
+  { name: "mcp_catalog_snapshots", keyColumns: ["id"], valueColumns: ["connection_id", "connection_revision", "snapshot_json", "observed_at"] },
+  { name: "mcp_catalog_heads", keyColumns: ["connection_id", "connection_revision"], integerKeyColumns: ["connection_revision"], valueColumns: ["snapshot_id"] },
+  { name: "mcp_connection_mutations", keyColumns: ["request_id"], valueColumns: ["input_digest", "connection_id", "result_json", "created_at"] },
+  { name: "mcp_discovery_attempts", keyColumns: ["id"], valueColumns: ["request_id", "input_digest", "connection_id", "connection_revision",
+    "sequence", "owner_id", "status", "error_code", "snapshot_id", "cleanup", "protocol_version", "page_count", "created_at", "finished_at"] },
   { name: "agents", keyColumns: ["id"] },
-  { name: "projects", keyColumns: ["id"] },
+  { name: "agent_legacy_aliases", keyColumns: ["display_name", "host_type"], valueColumns: ["agent_id", "retired_at"] },
+  { name: "role_templates", keyColumns: ["id"], valueColumns: ["revision"] },
+  { name: "role_template_versions", keyColumns: ["role_template_id", "revision"],
+    valueColumns: ["name", "purpose", "instructions", "recommended_skill_refs_json", "archived_at", "copied_from_role_template_id", "copied_from_revision"],
+    readSql: `WITH RECURSIVE version_depth AS (
+      SELECT role_template_id, revision, 0 AS depth FROM role_template_versions WHERE copied_from_role_template_id IS NULL
+      UNION ALL
+      SELECT c.role_template_id, c.revision, p.depth + 1 FROM role_template_versions c
+        JOIN version_depth p ON c.copied_from_role_template_id = p.role_template_id AND c.copied_from_revision = p.revision
+    ) SELECT v.* FROM role_template_versions v JOIN version_depth d
+      ON v.role_template_id = d.role_template_id AND v.revision = d.revision ORDER BY d.depth, v.role_template_id, v.revision` },
+  { name: "projects", keyColumns: ["id"], valueColumns: ["project_revision", "workspace_revision"] },
+  { name: "policy_documents", keyColumns: ["scope_key"], valueColumns: ["scope", "project_id", "revision", "created_at", "updated_at"] },
+  { name: "policy_document_versions", keyColumns: ["document_id", "revision"], valueColumns: ["schema_version", "document_json", "content_digest",
+    "based_on_global_revision", "default_revision", "created_by_kind", "created_by_id", "created_at"] },
+  { name: "project_workspace_versions", keyColumns: ["project_id", "workspace_revision"], valueColumns: ["project_revision",
+    "root_path", "canonical_root", "mode", "root_identity_json", "physical_resource_key", "repository_info_json", "observed_at",
+    "mutation_id", "input_digest", "updated_at"] },
   { name: "memory_documents", keyColumns: ["id"] },
   { name: "memory_versions", keyColumns: ["id"] },
   {
@@ -76,7 +117,7 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
   },
   { name: "members", keyColumns: ["id"] },
   { name: "project_task_settings", keyColumns: ["project_id"] },
-  { name: "tasks", keyColumns: ["id"] },
+  { name: "tasks", keyColumns: ["id"], valueColumns: ["delivery_kind", "acceptance_text", "acceptance_source"] },
   { name: "task_review_rounds", keyColumns: ["id"] },
   { name: "task_review_reports", keyColumns: ["id"] },
   { name: "task_comments", keyColumns: ["id"] },
@@ -94,6 +135,8 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
   { name: "member_statuses", keyColumns: ["project_id", "member_id"] },
   { name: "mcp_sessions", keyColumns: ["id"] },
   { name: "audit_log", keyColumns: ["id"] },
+  { name: "work_event_delivery_invalidations", keyColumns: ["work_event_id"],
+    valueColumns: WORK_EVENT_INVALIDATION_COLUMNS.filter(column => column !== "work_event_id") },
   { name: "agent_runtimes", keyColumns: ["id"] },
   { name: "agent_runtime_bindings", keyColumns: ["id"] },
   { name: "agent_runner_states", keyColumns: ["binding_id"] },
@@ -101,6 +144,9 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
   { name: "agent_runtime_events", keyColumns: ["id"] },
   { name: "agent_runtime_observation_meta", keyColumns: ["id"] },
   { name: "agent_runtime_usage_snapshots", keyColumns: ["id"] },
+  ...DECISION_TABLES.map(table => ({ name: table.name, keyColumns: table.keyColumns,
+    integerKeyColumns: table.columns.filter(column => column.integer && table.keyColumns.includes(column.name)).map(column => column.name),
+    valueColumns: table.columns.filter(column => !table.keyColumns.includes(column.name)).map(column => column.name) })),
   { name: "member_fact_revisions", keyColumns: ["member_id", "kind"], valueColumns: ["revision"] },
 ];
 
@@ -323,7 +369,20 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   tasksMigration,
   memoryMigration,
   memberLifecycleMigration,
+  identityCatalogMigration,
+  projectWorkspacesMigration,
+  taskIntakeMigration,
+  policyConfigurationMigration,
+  storageMaintenanceMigration,
+  mcpConnectionsMigration,
+  decisionsMigration,
+  workEventDeliveryInvalidationsMigration,
 ];
+
+/** Both complete, already-existing PG catalogs remain legal sources. No mixed checksum catalog. */
+export const M1_READ_PLAN: M1ReadPlan = Object.freeze({ tables: BUSINESS_TABLES,
+  catalogs: { sqlite: [migrations], postgres: [migrations, PG_BUSINESS_SCHEMA_MIGRATIONS] },
+  validate(rows: Parameters<NonNullable<M1ReadPlan['validate']>>[0]) { validateDecisionStorageGraph(rows); validateWorkEventInvalidations(rows); } });
 
 // ---------------------------------------------------------------------------
 // 驱动打开 / 目标建表 / 清空
@@ -332,8 +391,8 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
 /** 按配置打开并连接一个驱动（源或目标）。 */
 export async function openDriver(options: DbDriverOptions): Promise<DbDriver> {
   const driver = createDbDriver(options);
-  await driver.connect();
-  return driver;
+  try { await driver.connect(); return driver; }
+  catch (error) { return withM1Cleanup(async () => { throw error; }, [() => driver.close()]); }
 }
 
 /** 在目标库创建业务表（PG 用镜像 DDL，SQLite 用生产 DDL）。幂等。 */
@@ -355,13 +414,12 @@ export async function clearTargetTables(driver: DbDriver): Promise<void> {
 // 拷贝 / 校验
 // ---------------------------------------------------------------------------
 
-async function copyTable(source: DbDriver, tx: DbTransaction, spec: TableSpec): Promise<number> {
-  const rows = await source.query<DbRow>(spec.readSql ?? `SELECT * FROM ${spec.name}`);
+async function copyTable(rows: readonly Readonly<DbRow>[], tx: DbTransaction, spec: TableSpec): Promise<number> {
   for (const row of rows) {
     const cols = Object.keys(row);
     if (cols.length === 0) continue;
     const placeholders = cols.map(() => "?").join(", ");
-    const sql = `INSERT INTO ${spec.name} (${cols.join(", ")}) VALUES (${placeholders})`;
+    const sql = `INSERT INTO ${spec.name} (${cols.map(column => `"${column.replaceAll('"', '""')}"`).join(", ")}) VALUES (${placeholders})`;
     await tx.exec(sql, Object.values(row));
   }
   return rows.length;
@@ -372,19 +430,43 @@ export async function copyAllTables(
   source: DbDriver,
   target: DbDriver,
 ): Promise<Record<string, number>> {
-  const counts: Record<string, number> = {};
-  await target.transaction(async (tx) => {
+  // A concrete existing-only reader descriptor is required for borrowed PG sources.
+  // This helper does not own/close either driver and does not commit a caller's outer SAVEPOINT.
+  return withM1BorrowedSource(source, M1_READ_PLAN, async permit => (await copyM1Batch(permit, target)).counts);
+}
+
+async function copyM1Batch(permit: M1SourcePermit, target: DbDriver):
+  Promise<{ counts: Record<string, number>; validation: ValidationReport }> {
+  const facts = m1PermitFacts(permit);
+  return target.transaction(async tx => {
+    await facts.assertAlive();
+    await assertM1DifferentTarget(target, tx, permit);
+    const counts: Record<string, number> = {};
     for (const spec of BUSINESS_TABLES) {
       // 前面的 member/事实 INSERT 已产生临时代际；最后精确覆盖源值，之后不再写监控表。
       if (spec.name === "member_fact_revisions") await tx.exec("DELETE FROM member_fact_revisions");
-      counts[spec.name] = await copyTable(source, tx, spec);
+      counts[spec.name] = await copyTable(facts.rows[spec.name]!, tx, spec);
     }
+    const validation = await compareM1Batch(facts.rows, tx);
+    if (!validation.ok) throw new MigrationError("m1_copy_validation_failed");
+    await facts.assertAlive();
+    return { counts, validation };
   });
-  return counts;
 }
 
-function keyOf(row: DbRow, cols: readonly string[]): string {
-  return JSON.stringify(cols.map((c) => row[c]));
+function integerKey(value: unknown): string {
+  // PG BIGINT 的默认表示是十进制字符串，SQLite 是 number。绝不能先 Number(string) 丢失低位。
+  let integer: bigint;
+  if (typeof value === "number" && Number.isSafeInteger(value)) integer = BigInt(value);
+  else if (typeof value === "bigint") integer = value;
+  else if (typeof value === "string" && /^(0|-?[1-9][0-9]{0,18})$/.test(value)) integer = BigInt(value);
+  else throw new MigrationError("migration_integer_key_invalid");
+  if (integer < -(1n << 63n) || integer > (1n << 63n) - 1n) throw new MigrationError("migration_integer_key_invalid");
+  return integer.toString();
+}
+
+function keyOf(row: DbRow, spec: TableSpec): string {
+  return JSON.stringify(spec.keyColumns.map(column => spec.integerKeyColumns?.includes(column) ? integerKey(row[column]) : row[column]));
 }
 
 export interface TableValidation {
@@ -402,24 +484,29 @@ export interface ValidationReport {
 }
 
 /** 逐表校验行数相等 + 主键集合一致（跨库一致性）。 */
-export async function compareData(source: DbDriver, target: DbDriver): Promise<ValidationReport> {
+export async function compareData(source: DbReadSnapshot, target: DbReadSnapshot): Promise<ValidationReport> {
+  const rows: Record<string, readonly DbRow[]> = {};
+  for (const spec of BUSINESS_TABLES) rows[spec.name] = await source.query<DbRow>(
+    `SELECT ${[...spec.keyColumns, ...(spec.valueColumns ?? [])].join(", ")} FROM ${spec.name}`);
+  return compareM1Batch(rows, target);
+}
+
+async function compareM1Batch(source: M1Rows, target: DbReadSnapshot): Promise<ValidationReport> {
   const tables: TableValidation[] = [];
   let ok = true;
   for (const spec of BUSINESS_TABLES) {
     const columns = [...spec.keyColumns, ...(spec.valueColumns ?? [])];
-    const srcRows = await source.query<DbRow>(
-      `SELECT ${columns.join(", ")} FROM ${spec.name}`,
-    );
+    const srcRows = source[spec.name]!;
     const dstRows = await target.query<DbRow>(
       `SELECT ${columns.join(", ")} FROM ${spec.name}`,
     );
-    const srcKeys = new Set(srcRows.map((r) => keyOf(r, spec.keyColumns)));
-    const dstKeys = new Set(dstRows.map((r) => keyOf(r, spec.keyColumns)));
+    const srcKeys = new Set(srcRows.map((r) => keyOf(r, spec)));
+    const dstKeys = new Set(dstRows.map((r) => keyOf(r, spec)));
     const countMatch = srcRows.length === dstRows.length;
     const keysMatch = srcKeys.size === dstKeys.size && [...srcKeys].every((k) => dstKeys.has(k));
     const values = (row: DbRow) => JSON.stringify((spec.valueColumns ?? []).map(column => row[column] === null ? null : String(row[column])));
-    const dstValues = new Map(dstRows.map(row => [keyOf(row, spec.keyColumns), values(row)]));
-    const valuesMatch = !spec.valueColumns || srcRows.every(row => dstValues.get(keyOf(row, spec.keyColumns)) === values(row));
+    const dstValues = new Map(dstRows.map(row => [keyOf(row, spec), values(row)]));
+    const valuesMatch = !spec.valueColumns || srcRows.every(row => dstValues.get(keyOf(row, spec)) === values(row));
     if (!countMatch || !keysMatch || !valuesMatch) ok = false;
     tables.push({
       table: spec.name,
@@ -438,14 +525,11 @@ export async function validateData(
   sourceOpts: DbDriverOptions,
   targetOpts: DbDriverOptions,
 ): Promise<ValidationReport> {
-  const source = await openDriver(sourceOpts);
-  const target = await openDriver(targetOpts);
-  try {
-    return await compareData(source, target);
-  } finally {
-    await source.close();
-    await target.close();
-  }
+  const source = await openM1SourceExisting(sourceOpts, M1_READ_PLAN);
+  return withM1Cleanup(() => source.withBatch(async permit => {
+    const target = await openM1SourceExisting(targetOpts, M1_READ_PLAN);
+    return withM1Cleanup(() => target.readSnapshot(read => compareM1Batch(m1PermitFacts(permit).rows, read)), [() => target.close()]);
+  }), [() => source.close()]);
 }
 
 // ---------------------------------------------------------------------------
@@ -468,8 +552,9 @@ export interface MigrateReport {
 }
 
 /**
- * 数据迁移主流程：打开源/目标 → 目标建表 → （可选清空目标）→ 拷贝 → 自检。
- * 源库全程只读。
+ * M1 D2：既有源无初始化准入 → 单次原行快照/typed图 → 获准目标检查/初始化
+ * → 独立clear → 同一目标事务copy与同批比较 → 真实提交 → 释放源owner。
+ * 源不创建或升级；SQLite IMMEDIATE/PG门禁锁保持到真实目标提交后。
  */
 export async function migrateData(
   sourceOpts: DbDriverOptions,
@@ -477,31 +562,19 @@ export async function migrateData(
   opts: MigrateOptions = {},
 ): Promise<MigrateReport> {
   let snapshot: string | undefined;
-  if (opts.snapshotSource === true && sourceOpts.dbDriver !== "postgres" && sourceOpts.dataDir !== undefined) {
-    snapshot = await snapshotSqliteSource(sourceOpts.dataDir);
-  }
-
-  const source = await openDriver(sourceOpts);
-  const target = await openDriver(targetOpts);
-  try {
-    await ensureTargetSchema(target);
-    if (opts.clear !== false) {
-      await clearTargetTables(target);
-    }
-    const perTableCounts = await copyAllTables(source, target);
-    const validation = await compareData(source, target);
-    const totalRows = Object.values(perTableCounts).reduce((a, b) => a + b, 0);
-    return {
-      direction: `${source.kind}->${target.kind}`,
-      perTableCounts,
-      totalRows,
-      validation,
-      snapshot,
-    };
-  } finally {
-    await source.close();
-    await target.close();
-  }
+  const source = await openM1SourceExisting(sourceOpts, M1_READ_PLAN);
+  return withM1Cleanup(() => source.withBatch(async permit => {
+    const facts = m1PermitFacts(permit);
+    if (opts.snapshotSource === true && facts.binding.sqlite)
+      snapshot = await snapshotSqliteFile(facts.binding.sqlite.sqlitePath);
+    return withM1TargetLease(targetOpts, permit, M1_READ_PLAN, async destination => {
+      // Clear retains its independent committed boundary. Copy failure does not undo it.
+      if (opts.clear !== false) await clearTargetTables(destination);
+      const { counts: perTableCounts, validation } = await copyM1Batch(permit, destination);
+      const totalRows = Object.values(perTableCounts).reduce((a,b)=>a+b,0);
+      return { direction: `${source.kind}->${destination.kind}`, perTableCounts, totalRows, validation, snapshot };
+    });
+  }), [() => source.close()]);
 }
 
 export interface RollbackReport {
@@ -541,6 +614,10 @@ export async function rollbackTarget(
  */
 export async function snapshotSqliteSource(dataDir: string): Promise<string> {
   const base = path.join(dataDir, DATABASE_FILE_NAME);
+  return snapshotSqliteFile(base);
+}
+
+async function snapshotSqliteFile(base: string): Promise<string> {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const dest = `${base}.pre-migration.${stamp}.snapshot`;
   await copyFile(base, dest);

@@ -23,9 +23,8 @@
 import path from "node:path";
 
 import {
-  compareData,
+  validateData,
   migrateData,
-  openDriver,
   rollbackTarget,
   type RollbackReport,
   type ValidationReport,
@@ -134,12 +133,13 @@ function toOpts(
 
 function formatValidation(report: ValidationReport): string {
   const lines: string[] = [];
-  lines.push("表                源行数  目标行数  行数  键集");
+  lines.push("表                源行数  目标行数  行数  键集  值");
   for (const t of report.tables) {
     const count = t.countMatch ? "OK" : "✗";
     const keys = t.keysMatch ? "OK" : "✗";
+    const values = t.valuesMatch ? "OK" : "✗";
     lines.push(
-      `${t.table.padEnd(18)} ${String(t.sourceCount).padStart(6)} ${String(t.targetCount).padStart(9)}  ${count.padEnd(4)} ${keys}`,
+      `${t.table.padEnd(18)} ${String(t.sourceCount).padStart(6)} ${String(t.targetCount).padStart(9)}  ${count.padEnd(4)} ${keys.padEnd(4)} ${values}`,
     );
   }
   lines.push(report.ok ? "校验：通过 ✅" : "校验：失败 ❌");
@@ -190,14 +190,7 @@ async function compareDataViaDrivers(
   srcOpts: DbDriverOptions,
   dstOpts: DbDriverOptions,
 ): Promise<ValidationReport> {
-  const src = await openDriver(srcOpts);
-  const dst = await openDriver(dstOpts);
-  try {
-    return await compareData(src, dst);
-  } finally {
-    await src.close();
-    await dst.close();
-  }
+  return validateData(srcOpts, dstOpts);
 }
 
 main().catch((error) => {

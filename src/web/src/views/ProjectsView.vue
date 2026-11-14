@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
+import ConfirmDialog from "../components/ConfirmDialog.vue";
+import CreationDialog from "../components/CreationDialog.vue";
+import PurgeImpact from "../components/PurgeImpact.vue";
+import { useConfirmedAction } from "../composables/useConfirmedAction.ts";
+import { useToast } from "../composables/useToast.ts";
 import {
   ApiError,
   api,
@@ -27,11 +32,17 @@ import {
  */
 
 import { projectPath, useCurrentProject, useProjectDraft } from "../composables/useCurrentProject.ts";
+const props = defineProps<{ mode?: "list" | "overview" | "members" | "settings" | "groups" }>();
 const route = useRoute();
+const viewMode = computed(() => props.mode ?? (!route.params["projectId"] ? "list" : route.meta["projectSection"] === "members" ? "members" : route.meta["projectSection"] === "settings" ? "settings" : route.query["manage"] === "groups" ? "groups" : "overview"));
+const creation = ref<"project" | "group" | null>(null);
+const projectSearch = computed({ get: () => typeof route.query["q"] === "string" ? route.query["q"] : "", set: value => { void router.replace({ path: route.path, query: { ...route.query, q: value || undefined }, hash: route.hash }); } });
+const memberCreateOpen = ref(false);
+const pageTitle = computed(() => ({ list: "所有项目", overview: "项目概览", members: "项目成员", settings: "项目设置", groups: "群组管理" })[viewMode.value]);
 const router = useRouter();
 const context = useCurrentProject();
 const { currentProjectId: activeProjectId, currentProject: activeProject, readonly: projectReadonly } = context;
-const projects = computed(() => context.projects.value.filter((project) => showArchived.value || !project.archivedAt));
+const projects = computed(() => context.projects.value.filter((project) => (showArchived.value || !project.archivedAt) && project.name.toLocaleLowerCase().includes(projectSearch.value.trim().toLocaleLowerCase())));
 let disposed = false;
 let projectRequest = 0;
 const members = ref<MemberDto[]>([]);
@@ -45,13 +56,16 @@ const showArchived = ref(route.query["archived"] === "1");
 /** 等待人二次确认的永久删除（#48）。 */
 const pendingProjectPurge = ref<ProjectPurgeConfirmation | null>(null);
 const pendingGroupPurge = ref<GroupPurgeConfirmation | null>(null);
+const confirmationKind = ref<"project-purge" | "group-purge" | "normal">("normal");
 
 const pendingRequests = ref(0);
 const loading = ref(true);
 const loadingProject = ref(false);
 const busy = computed(() => pendingRequests.value > 0 || loading.value || loadingProject.value);
 const error = ref<string | null>(null);
-const notice = ref<string | null>(null);
+const toast = useToast();
+const confirmation = useConfirmedAction({ success: toast.success, refreshError: (message) => { error.value = message; } });
+const { action: confirmationAction, phase: confirmationPhase, error: confirmationError, pending: confirmationPending, canConfirm } = confirmation;
 
 const newProjectName = ref("");
 const newMemberName = ref("");
@@ -63,7 +77,6 @@ const manager = computed<MemberDto | null>(() => activeProject.value?.manager ??
 
 function clearMessages(): void {
   error.value = null;
-  notice.value = null;
 }
 
 async function run<T>(fn: () => Promise<T>, success?: string, preserveFeedback = false): Promise<T | null> {
@@ -73,7 +86,7 @@ async function run<T>(fn: () => Promise<T>, success?: string, preserveFeedback =
   try {
     const result = await fn();
     if (disposed || generation !== context.generation.value) return null;
-    if (success !== undefined) notice.value = success;
+    if (success !== undefined) toast.success(success);
     return result;
   } catch (err) {
     if (!disposed && generation === context.generation.value) error.value = err instanceof ApiError ? err.message : (err as Error).message;
@@ -92,20 +105,20 @@ async function loadProjects(): Promise<void> {
 async function toggleShowArchived(): Promise<void> {
   if (busy.value) return;
   clearMessages();
-  showArchived.value = !showArchived.value;
-  await loadProjects();
+  await router.replace({ path: route.path, query: { ...route.query, archived: showArchived.value ? undefined : "1" }, hash: route.hash });
 }
 
 async function loadActiveProject(): Promise<void> {
   const projectId = activeProjectId.value;
-  if (projectId === null) {
+  const version = ++projectRequest;
+  if (projectId === null || viewMode.value === "list") {
     members.value = [];
     groups.value = [];
     participants.value = {};
     statuses.value = {};
+    loadingProject.value = false;
     return;
   }
-  const version = ++projectRequest;
   loadingProject.value = true;
   try {
     const [memberResult, groupResult] = await Promise.all([
@@ -159,12 +172,11 @@ async function createProject(): Promise<void> {
     error.value = "项目名称不能为空。";
     return;
   }
-  const result = await run(() => api.createProject(name), "项目已创建。");
+  const result = await run(() => api.createProject(name), `项目「${name}」已创建。`);
   if (!result) return;
-  newProjectName.value = "";
+  newProjectName.value = ""; creation.value = null;
   await context.refreshProjects();
-  await context.selectProject(result.project.id);
-  context.announce("项目已创建。");
+  await router.push(projectPath(result.project.id));
 }
 
 async function addMember(): Promise<void> {
@@ -176,23 +188,46 @@ async function addMember(): Promise<void> {
     error.value = "成员名称不能为空。";
     return;
   }
-  const result = await run(() => api.addHumanMember(projectId, name), "成员已添加。");
+  const result = await run(() => api.addHumanMember(projectId, name), `成员「${name}」已添加。`);
   if (!result) return;
   newMemberName.value = "";
   await loadActiveProject();
 }
 
-async function removeMember(member: MemberDto): Promise<void> {
-  if (busy.value || projectReadonly.value) return;
+function removeMember(member: MemberDto): void {
+  if (busy.value || projectReadonly.value || confirmationAction.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
-  const result = await run(
-    () => api.removeMember(projectId, member.id),
-    `成员「${member.displayName}」已移除。`,
-  );
-  if (result === null) return;
-  newGroupSelection.value = newGroupSelection.value.filter((id) => id !== member.id);
-  await loadActiveProject();
+  const memberId = member.id, generation = context.generation.value;
+  const projectName = activeProject.value?.name ?? projectId;
+  clearMessages(); confirmationKind.value = "normal";
+  void confirmation.open({
+    key: `member.remove:${projectId}:${memberId}`,
+    title: `移除成员「${member.displayName}」？`, description: `此成员将离开项目「${projectName}」与群组，相关执行会失效；成员身份与历史记录保留。`,
+    confirmLabel: "确认移除成员", successMessage: `成员「${member.displayName}」已移除。`,
+    isCurrent: () => !disposed && projectId === activeProjectId.value && generation === context.generation.value,
+    execute: () => api.removeMember(projectId, memberId),
+    reconcile: async (isActive) => {
+      await requireProjectScope(projectId);
+      const latest = (await api.listMembers(projectId)).members.find(item => item.id === memberId);
+      if (isActive() && latest && confirmationAction.value) {
+        confirmationAction.value.title = `移除成员「${latest.displayName}」？`;
+        confirmationAction.value.successMessage = `成员「${latest.displayName}」已移除。`;
+      }
+      return !latest;
+    },
+    afterSuccess: async () => { newGroupSelection.value = newGroupSelection.value.filter(id => id !== memberId); await loadActiveProject(); },
+  });
+}
+
+async function requireProjectScope(projectId: string): Promise<void> {
+  const result = await api.listProjects({ includeArchived: true });
+  if (!result.projects.some(project => project.id === projectId)) throw new Error("原项目已不存在或当前作用域不可用，无法核对这次操作。");
+}
+
+function captureScope(projectId: string): () => boolean {
+  const generation = context.generation.value;
+  return () => !disposed && activeProjectId.value === projectId && context.generation.value === generation;
 }
 
 /** T3 #50：生命周期状态中文标签（与在线/离线、等待/工作等运行状态分开）。 */
@@ -252,12 +287,13 @@ async function createGroup(): Promise<void> {
   }
   const result = await run(
     () => api.createGroup(projectId, name, [...newGroupSelection.value]),
-    "群组已创建。",
+    `群组「${name}」已创建。`,
   );
   if (!result) return;
   newGroupName.value = "";
-  newGroupSelection.value = [];
+  newGroupSelection.value = []; creation.value = null;
   await loadActiveProject();
+  await context.refreshProjects();
 }
 
 // ---------------------------------------------------------------------------
@@ -265,89 +301,101 @@ async function createGroup(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function archiveProject(): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || confirmationAction.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
-  const result = await run(() => api.archiveProject(projectId), "项目已归档（可恢复）。");
-  if (!result) return;
-  await loadProjects();
+  const name = activeProject.value?.name ?? projectId;
+  clearMessages(); confirmationKind.value = "normal";
+  await confirmation.open({ key: `project.archive:${projectId}`, title: `归档项目「${name}」？`, description: "归档后项目保留历史，但不能继续新增或修改内容。可从归档列表恢复。",
+    confirmLabel: "确认归档项目", successMessage: `项目「${name}」已归档，可在归档列表恢复。`, isCurrent: captureScope(projectId),
+    execute: async () => { await api.archiveProject(projectId); },
+    reconcile: async () => { const latest = (await api.listProjects({ includeArchived: true })).projects.find(item => item.id === projectId);
+      if (!latest) throw new Error("原项目已不存在或当前作用域不可用，无法核对归档结果。"); return latest.archivedAt !== null; },
+    afterSuccess: loadProjects,
+  });
 }
 
 async function restoreProject(): Promise<void> {
   if (busy.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
-  const result = await run(() => api.restoreProject(projectId), "项目已恢复。");
+  const result = await run(() => api.restoreProject(projectId), `项目「${activeProject.value?.name ?? projectId}」已恢复。`);
   if (!result) return;
   await loadProjects();
 }
 
 /** 第一刀：只取级联清单与确认凭据，不删除；清单显示在确认面板里等人点「确认永久删除」。 */
 async function requestProjectPurge(): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || confirmationAction.value) return;
   const projectId = activeProjectId.value;
   if (projectId === null) return;
-  const outcome = await run(() => api.purgeProject(projectId));
-  if (!outcome) return;
-  if (outcome.state === "confirmation_required") pendingProjectPurge.value = outcome.confirmation;
-  else pendingProjectPurge.value = null;
-}
-
-async function confirmProjectPurge(): Promise<void> {
-  if (busy.value) return;
-  const confirmation = pendingProjectPurge.value;
-  if (confirmation === null) return;
-  const outcome = await run(() => api.purgeProject(confirmation.projectId, confirmation.token));
-  if (!outcome) return;
-  pendingProjectPurge.value = null;
-  if (outcome.state === "deleted") {
-    notice.value = "项目已永久删除。";
-    await loadProjects();
-    context.announce("项目已永久删除。");
-  }
-}
-
-function cancelProjectPurge(): void {
-  pendingProjectPurge.value = null;
-  notice.value = "已取消永久删除（确认凭据过期后需重新发起）。";
+  const name = activeProject.value?.name ?? projectId;
+  clearMessages(); confirmationKind.value = "project-purge"; pendingProjectPurge.value = null; pendingGroupPurge.value = null;
+  await confirmation.open({ key: `project.purge:${projectId}`, title: `永久删除项目「${name}」？`, description: "此操作不可恢复。请核对服务端返回的影响范围后再确认。",
+    confirmLabel: "确认永久删除", successMessage: `项目「${name}」已永久删除。`, isCurrent: captureScope(projectId),
+    prepare: async (isActive) => {
+      const outcome = await api.purgeProject(projectId);
+      if (!isActive()) return;
+      if (outcome.state !== "confirmation_required" || outcome.confirmation.projectId !== projectId) throw new Error("无法获取此项目的有效预览，请重新读取。");
+      pendingProjectPurge.value = outcome.confirmation;
+      confirmationAction.value!.title = `永久删除项目「${outcome.confirmation.projectName}」？`;
+      confirmationAction.value!.successMessage = `项目「${outcome.confirmation.projectName}」已永久删除。`;
+    },
+    execute: async () => {
+      const preview = pendingProjectPurge.value;
+      if (!preview || preview.projectId !== projectId) throw new ApiError(400, "invalid_confirmation", "请重新读取删除影响范围。");
+      const outcome = await api.purgeProject(projectId, preview.token);
+      if (outcome.state !== "deleted") throw new ApiError(409, "confirmation_changed", "删除范围已变化，请重新预览并再次确认。");
+    },
+    // includeArchived=true 返回完整全局项目列表；读取失败/403 会抛出，不能推断为不存在。
+    reconcile: async () => !(await api.listProjects({ includeArchived: true })).projects.some(item => item.id === projectId),
+    afterSuccess: loadProjects,
+  });
 }
 
 async function archiveGroup(group: GroupDto): Promise<void> {
-  if (busy.value || projectReadonly.value) return;
-  const result = await run(() => api.archiveGroup(group.id), `群组「${group.name}」已归档（可恢复）。`);
-  if (!result) return;
-  await loadActiveProject();
+  if (busy.value || projectReadonly.value || confirmationAction.value) return;
+  const projectId = group.projectId, groupId = group.id, name = group.name;
+  clearMessages(); confirmationKind.value = "normal";
+  await confirmation.open({ key: `group.archive:${projectId}:${groupId}`, title: `归档群组「${name}」？`, description: `归档后项目「${activeProject.value?.name ?? projectId}」中的该群历史保留，群组不能继续新增内容。可通过恢复群组继续协作。`,
+    confirmLabel: "确认归档群组", successMessage: `群组「${name}」已归档，可恢复。`, isCurrent: captureScope(projectId),
+    execute: async () => { await api.archiveGroup(groupId); },
+    reconcile: async () => { await requireProjectScope(projectId); const latest = (await api.listGroups(projectId, { includeArchived: true })).groups.find(item => item.id === groupId);
+      if (!latest) throw new Error("原群组已不存在，无法确认归档结果，请刷新项目查看。"); return latest.archivedAt !== null; },
+    afterSuccess: loadProjects,
+  });
 }
 
 async function restoreGroup(group: GroupDto): Promise<void> {
   if (busy.value || projectReadonly.value) return;
   const result = await run(() => api.restoreGroup(group.id), `群组「${group.name}」已恢复。`);
   if (!result) return;
-  await loadActiveProject();
+  await loadProjects();
 }
 
 async function requestGroupPurge(group: GroupDto): Promise<void> {
-  if (busy.value || projectReadonly.value) return;
-  const outcome = await run(() => api.purgeGroup(group.id));
-  if (!outcome) return;
-  if (outcome.state === "confirmation_required") pendingGroupPurge.value = outcome.confirmation;
-  else pendingGroupPurge.value = null;
-}
-
-async function confirmGroupPurge(): Promise<void> {
-  if (busy.value || projectReadonly.value) return;
-  const confirmation = pendingGroupPurge.value;
-  if (confirmation === null) return;
-  const outcome = await run(() => api.purgeGroup(confirmation.groupId, confirmation.token));
-  if (!outcome) return;
-  pendingGroupPurge.value = null;
-  if (outcome.state === "deleted") notice.value = "群组已永久删除。";
-  await loadActiveProject();
-}
-
-function cancelGroupPurge(): void {
-  pendingGroupPurge.value = null;
-  notice.value = "已取消永久删除群组。";
+  if (busy.value || projectReadonly.value || confirmationAction.value) return;
+  const projectId = group.projectId, groupId = group.id, name = group.name;
+  clearMessages(); confirmationKind.value = "group-purge"; pendingProjectPurge.value = null; pendingGroupPurge.value = null;
+  await confirmation.open({ key: `group.purge:${projectId}:${groupId}`, title: `永久删除群组「${name}」？`, description: `此操作不可恢复，将清除群聊与参与者关系；项目「${activeProject.value?.name ?? projectId}」的成员仍会保留。`,
+    confirmLabel: "确认永久删除", successMessage: `群组「${name}」已永久删除。`, isCurrent: captureScope(projectId),
+    prepare: async (isActive) => {
+      const outcome = await api.purgeGroup(groupId);
+      if (!isActive()) return;
+      if (outcome.state !== "confirmation_required" || outcome.confirmation.groupId !== groupId || outcome.confirmation.projectId !== projectId) throw new Error("无法获取此群组的有效预览，请重新读取。");
+      pendingGroupPurge.value = outcome.confirmation;
+      confirmationAction.value!.title = `永久删除群组「${outcome.confirmation.groupName}」？`;
+      confirmationAction.value!.successMessage = `群组「${outcome.confirmation.groupName}」已永久删除；项目成员保留。`;
+    },
+    execute: async () => {
+      const preview = pendingGroupPurge.value;
+      if (!preview || preview.groupId !== groupId) throw new ApiError(400, "invalid_confirmation", "请重新读取删除影响范围。");
+      const outcome = await api.purgeGroup(groupId, preview.token);
+      if (outcome.state !== "deleted") throw new ApiError(409, "confirmation_changed", "删除范围已变化，请重新预览并再次确认。");
+    },
+    reconcile: async () => { await requireProjectScope(projectId); return !(await api.listGroups(projectId, { includeArchived: true })).groups.some(item => item.id === groupId); },
+    afterSuccess: loadProjects,
+  });
 }
 
 /** 连接状态的中文标签（全局 MCP 会话层，D1）。 */
@@ -399,43 +447,58 @@ function participantNames(groupId: string): string {
   return (participants.value[groupId] ?? []).map((m) => m.displayName).join("、") || "（暂无参与者）";
 }
 
+function openCreation(kind: "project" | "group"): void { if (!busy.value && !confirmationAction.value) { clearMessages(); creation.value = kind; } }
+function closeCreation(): void {
+  if (busy.value) return;
+  creation.value = null; newProjectName.value = ""; newGroupName.value = ""; newGroupSelection.value = []; clearMessages();
+  if (route.query["create"] === "project") void router.replace({ path: route.path, query: { ...route.query, create: undefined }, hash: route.hash });
+}
+watch(() => route.query["create"], value => { if (value === "project" && viewMode.value === "list") creation.value = "project"; }, { immediate: true });
+watch(viewMode, () => { creation.value = null; void loadActiveProject(); });
+watch(() => route.query["archived"], value => { showArchived.value = value === "1"; void loadActiveProject(); });
+watch(() => context.generation.value, () => { confirmation.reset(); creation.value = null; });
 watch(activeProjectId, () => { projectRequest++; members.value = []; groups.value = []; participants.value = {}; statuses.value = {}; loading.value = false; void loadActiveProject(); }, { immediate: true });
 onBeforeUnmount(() => { disposed = true; projectRequest++; });
 </script>
 
 <template>
   <section class="page projects-page">
-    <header class="page-header">
-      <div>
-        <h1>{{ route.meta["projectSection"] === "members" ? "成员" : route.params["projectId"] ? "项目概览" : "项目与群组" }}</h1>
-        <p class="page-description">把成员和对话放在同一个项目中，让协作井然有序。</p>
-      </div>
-    </header>
+    <ConfirmDialog :open="!!confirmationAction" :title="confirmationAction?.title ?? ''" :description="confirmationAction?.description ?? ''" :confirm-label="confirmationAction?.confirmLabel ?? '确认'" :cancel-label="confirmationPhase === 'unknown' ? '关闭' : '取消'" :pending="confirmationPending" :disabled="!canConfirm" :error="confirmationError" :confirm-test-id="confirmationKind === 'project-purge' ? 'confirm-purge-project' : confirmationKind === 'group-purge' ? 'confirm-purge-group' : 'confirm-submit'" :cancel-test-id="confirmationKind === 'project-purge' ? 'cancel-purge-project' : confirmationKind === 'group-purge' ? 'cancel-purge-group' : 'confirm-cancel'" @cancel="confirmation.cancel" @confirm="confirmation.confirm">
+      <p v-if="confirmationPhase === 'preparing'" class="muted" role="status">正在读取影响范围…</p>
+      <PurgeImpact v-if="confirmationKind === 'project-purge' && pendingProjectPurge" :confirmation="pendingProjectPurge" />
+      <PurgeImpact v-if="confirmationKind === 'group-purge' && pendingGroupPurge" :confirmation="pendingGroupPurge" />
+      <template #recovery>
+        <button v-if="confirmationPhase === 'unknown'" type="button" data-testid="confirmation-reconcile" @click="confirmation.reconcile">核对操作结果</button>
+        <button v-if="confirmationPhase === 'refresh-required'" type="button" data-testid="confirmation-preview" @click="confirmation.retryPreview">重新读取影响范围</button>
+      </template>
+    </ConfirmDialog>
+    <CreationDialog :open="creation !== null" :title="creation === 'project' ? '新建项目' : '创建群组'" :pending="busy" :dirty="creation === 'project' ? !!newProjectName : !!newGroupName || newGroupSelection.length > 0" :error="error" :confirm-label="creation === 'project' ? '创建项目' : '创建群组'" :confirm-test-id="creation === 'project' ? 'create-project' : 'create-group'" @confirm="creation === 'project' ? createProject() : createGroup()" @close="closeCreation">
+      <template v-if="creation === 'project'"><label class="field" for="new-project-name">项目名称<input id="new-project-name" v-model="newProjectName" :disabled="busy" required placeholder="例如：产品研发" data-testid="new-project-name" /></label><p class="muted small">创建后可添加成员、建立群组，配置项目协作。</p></template>
+      <template v-else><label class="field" for="new-group-name">群组名称<input id="new-group-name" v-model="newGroupName" :disabled="busy || projectReadonly" required placeholder="例如：设计讨论" data-testid="new-group-name" /></label><fieldset class="participants-picker" :disabled="busy || projectReadonly" data-testid="participant-picker"><legend>参与者</legend><p v-if="members.length === 0" class="muted small">暂无可选择的成员，可先建立群组。</p><label v-for="member in members" :key="member.id" class="participant-option"><input type="checkbox" :checked="newGroupSelection.includes(member.id)" @change="toggleGroupSelection(member.id)" />{{ member.displayName }}</label></fieldset><p class="muted small">已选 {{ newGroupSelection.length }} 位参与者。创建群组不会自动启动 Agent。</p></template>
+    </CreationDialog>
+    <header class="page-header"><div><h1>{{ pageTitle }}</h1><p class="page-description">{{ viewMode === 'list' ? '每个项目都有独立的成员、群组和工作记录。' : viewMode === 'settings' ? '管理当前项目的配置与生命周期。' : '把成员和对话放在同一个项目中，让协作井然有序。' }}</p></div><button v-if="viewMode === 'list'" type="button" class="primary" :disabled="busy" data-testid="open-create-project" @click="openCreation('project')">新建项目</button><button v-else-if="viewMode === 'groups'" type="button" class="primary" :disabled="busy || projectReadonly" data-testid="open-create-group" @click="openCreation('group')">创建群组</button></header>
 
-    <p v-if="error" class="error" role="alert" data-testid="error">{{ error }}</p>
-    <p v-if="notice" class="notice" role="status" data-testid="notice">{{ notice }}</p>
+    <p v-if="error && !creation" class="error" role="alert" data-testid="error">{{ error }}</p>
 
-    <section v-if="!route.params['projectId']" class="panel project-picker" aria-labelledby="project-picker-title" :aria-busy="loading">
+    <section v-if="viewMode === 'list'" class="panel project-picker" aria-labelledby="project-picker-title" :aria-busy="loading">
       <div class="section-heading">
         <h2 id="project-picker-title">我的项目 <span class="count">{{ projects.length }}</span></h2>
         <button type="button" class="text-button" :disabled="busy" :aria-pressed="showArchived" data-testid="toggle-archived" @click="toggleShowArchived">
           {{ showArchived ? "隐藏已归档" : "显示已归档" }}
         </button>
       </div>
+      <label class="field project-search">筛选项目<input v-model="projectSearch" type="search" placeholder="按项目名称查找" data-testid="project-search" /></label>
       <div v-if="projects.length > 0" class="project-tabs" role="group" aria-label="浏览项目" data-testid="project-list">
         <button v-for="project in projects" :key="project.id" type="button" class="project-tab" :class="{ active: project.id === activeProjectId }" :aria-pressed="project.id === activeProjectId" :disabled="busy" @click="selectProject(project.id)">
           {{ project.name }}<span v-if="project.archivedAt" class="muted small"> · 已归档</span>
         </button>
       </div>
       <p v-if="loading && projects.length === 0" class="muted small" role="status">正在加载项目…</p>
-      <form class="project-create" @submit.prevent="createProject">
-        <label class="field" for="new-project-name">新项目名称<input id="new-project-name" v-model="newProjectName" :disabled="busy" required placeholder="例如：产品研发" data-testid="new-project-name" /></label>
-        <button type="submit" class="primary" :disabled="busy" data-testid="create-project">创建项目</button>
-      </form>
+
     </section>
 
-    <template v-if="activeProject">
-      <section class="panel project-summary" aria-labelledby="active-project-title" data-testid="project-detail">
+    <template v-if="activeProject && viewMode !== 'list'">
+      <section v-if="viewMode === 'overview' || viewMode === 'settings'" class="panel project-summary" aria-labelledby="active-project-title" data-testid="project-detail">
         <div class="section-heading">
           <div>
             <h2 id="active-project-title">{{ activeProject.name }} <span v-if="activeProject.archivedAt" class="badge" data-testid="project-archived-badge">已归档</span></h2>
@@ -444,7 +507,7 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
           <RouterLink :to="{ path: '/runtimes', query: { projectId: activeProject.id } }">管理托管 Agent <span aria-hidden="true">↗</span></RouterLink>
         </div>
         <p v-if="activeProject.archivedAt" class="muted small">项目已归档。恢复项目后，可以继续添加成员与群组。</p>
-        <details class="project-management" data-testid="project-actions">
+        <details class="project-management" data-testid="project-actions" :open="viewMode === 'settings'">
           <summary>项目管理</summary>
           <p class="muted small project-id">项目 ID：<code>{{ activeProject.id }}</code></p>
           <div class="actions" data-testid="project-lifecycle">
@@ -453,42 +516,22 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
             <button type="button" :disabled="busy" class="text-button danger" data-testid="purge-project" @click="requestProjectPurge">永久删除项目</button>
           </div>
           <p class="muted small">归档可恢复；永久删除会清除项目数据，并需要再次确认。</p>
-          <div v-if="pendingProjectPurge" class="confirm" role="region" aria-labelledby="project-purge-title" data-testid="project-purge-confirm">
-            <h3 id="project-purge-title">确认永久删除项目「{{ pendingProjectPurge.projectName }}」？</h3>
-            <p class="muted small">此操作不可恢复，将同时删除以下内容：</p>
-            <ul class="small">
-              <li>群组：{{ pendingProjectPurge.cascade.groups }} 个</li>
-              <li>任务：{{ pendingProjectPurge.cascade.tasks }} 项（评论 {{ pendingProjectPurge.cascade.taskComments }} 条，历史 {{ pendingProjectPurge.cascade.taskHistory }} 条）</li>
-              <li>评审：{{ pendingProjectPurge.cascade.reviewRounds }} 轮，报告 {{ pendingProjectPurge.cascade.reviewReports }} 份</li>
-              <li>任务关联消息：{{ pendingProjectPurge.cascade.taskMessageLinks }} 条，工作事件 {{ pendingProjectPurge.cascade.workEvents }} 条，任务设置 {{ pendingProjectPurge.cascade.taskSettings }} 条</li>
-              <li>记忆文档：{{ pendingProjectPurge.cascade.memoryDocuments }} 份（历史版本 {{ pendingProjectPurge.cascade.memoryVersions }} 个）</li>
-              <li>自总结请求：{{ pendingProjectPurge.cascade.memorySummaryRequests }} 条</li>
-              <li>记忆投递收据：{{ pendingProjectPurge.cascade.memoryMessageReceipts }} 条，触发计数 {{ pendingProjectPurge.cascade.memoryTriggerCounters }} 条，扫描检查点 {{ pendingProjectPurge.cascade.memoryScanCheckpoints }} 条</li>
-              <li>成员：{{ pendingProjectPurge.cascade.members }} 个</li>
-              <li>群聊消息：{{ pendingProjectPurge.cascade.messages }} 条（投递记录 {{ pendingProjectPurge.cascade.deliveries }} 条）</li>
-              <li>成员状态：{{ pendingProjectPurge.cascade.memberStatuses }} 条</li>
-              <li>成员关系版本：{{ pendingProjectPurge.cascade.memberFactRevisions }} 条</li>
-              <li>MCP 会话记录：{{ pendingProjectPurge.cascade.mcpSessions }} 条</li>
-            </ul>
-            <p class="muted small">项目共享与成员记忆会随项目删除。Agent 的全局私有记忆保留。</p>
-            <p class="muted small">确认凭据在 {{ pendingProjectPurge.expiresAt }} 后失效。</p>
-            <div class="actions">
-              <button type="button" class="secondary" :disabled="busy" data-testid="cancel-purge-project" @click="cancelProjectPurge">取消</button>
-              <button type="button" :disabled="busy" class="danger" data-testid="confirm-purge-project" @click="confirmProjectPurge">确认永久删除</button>
-            </div>
-          </div>
+
         </details>
       </section>
 
       <p v-if="loadingProject" class="muted small" role="status">正在更新项目内容…</p>
-      <div class="project-columns" :aria-busy="loadingProject">
-        <section class="panel members-panel" aria-labelledby="members-title">
+      <div v-if="viewMode === 'settings'" class="panel"><h2>协作配置</h2><p class="muted small">当前项目的任务默认评审者在任务页维护，成员与岗位在成员页维护。</p><div class="actions"><RouterLink :to="projectPath(activeProject.id, 'tasks')">任务与默认评审者</RouterLink><RouterLink :to="projectPath(activeProject.id, 'members')">成员与岗位</RouterLink></div></div>
+      <div v-if="viewMode !== 'settings'" class="project-columns" :class="{ 'single-column': viewMode !== 'overview' }" :aria-busy="loadingProject">
+        <section v-if="viewMode === 'members' || viewMode === 'overview'" class="panel members-panel" aria-labelledby="members-title">
           <div class="section-heading"><h2 id="members-title">成员 <span class="count">{{ members.length }}</span></h2></div>
           <p class="muted small section-description">添加人类成员，Agent 可通过 CLI 接入项目。</p>
+          <details class="member-create-context" data-testid="member-create-context" :open="memberCreateOpen" @toggle="memberCreateOpen = ($event.target as HTMLDetailsElement).open"><summary data-testid="open-add-member">添加人类成员</summary>
           <form class="inline-create" @submit.prevent="addMember">
             <label class="field" for="new-member-name">成员显示名<input id="new-member-name" v-model="newMemberName" :disabled="busy || !!activeProject.archivedAt" required placeholder="填写成员名称" data-testid="new-member-name" /></label>
             <button type="submit" class="secondary" :disabled="busy || !!activeProject.archivedAt" data-testid="add-member">添加成员</button>
           </form>
+          </details>
           <div v-if="members.length === 0 && !loadingProject" class="empty-state compact-empty"><p>暂无成员。添加第一位成员，开始协作。</p></div>
           <ul v-else class="member-list" data-testid="member-list">
             <li v-for="member in members" :key="member.id" class="member-item">
@@ -525,21 +568,10 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
           </details>
         </section>
 
-        <section v-if="route.meta['projectSection'] !== 'members'" class="panel groups-panel" aria-labelledby="groups-title">
-          <div class="section-heading"><h2 id="groups-title">群组 <span class="count">{{ groups.length }}</span></h2></div>
+        <section v-if="viewMode === 'groups' || viewMode === 'overview'" class="panel groups-panel" aria-labelledby="groups-title">
+          <div class="section-heading"><h2 id="groups-title">群组 <span class="count">{{ groups.length }}</span></h2><button type="button" class="text-button" :disabled="busy" :aria-pressed="showArchived" data-testid="toggle-archived" @click="toggleShowArchived">{{ showArchived ? "隐藏已归档" : "显示已归档" }}</button></div>
           <p class="muted small section-description">按协作主题建群，为每个群组选择参与者。</p>
-          <details class="create-section" data-testid="group-create" :open="groups.length === 0">
-            <summary>创建群组</summary>
-            <form class="group-create" @submit.prevent="createGroup">
-              <label class="field" for="new-group-name">群组名称<input id="new-group-name" v-model="newGroupName" :disabled="busy || !!activeProject.archivedAt" required placeholder="例如：设计讨论" data-testid="new-group-name" /></label>
-              <fieldset class="participants-picker" :disabled="busy || !!activeProject.archivedAt" data-testid="participant-picker">
-                <legend>参与者</legend>
-                <p v-if="members.length === 0" class="muted small">先添加成员，才能选择参与者。</p>
-                <label v-for="member in members" :key="member.id" class="participant-option"><input type="checkbox" :checked="newGroupSelection.includes(member.id)" @change="toggleGroupSelection(member.id)" />{{ member.displayName }}</label>
-              </fieldset>
-              <div class="actions"><button type="submit" class="secondary" :disabled="busy || !!activeProject.archivedAt" data-testid="create-group">创建群组</button><span class="muted small">已选 {{ newGroupSelection.length }} 位参与者</span></div>
-            </form>
-          </details>
+          <button v-if="viewMode === 'overview'" type="button" class="text-button" :disabled="busy || projectReadonly" data-testid="open-create-group" @click="openCreation('group')">创建群组</button>
           <div v-if="groups.length === 0 && !loadingProject" class="empty-state compact-empty"><p>暂无群组。创建一个群组，把相关讨论放在一起。</p></div>
           <ul v-else class="group-list" data-testid="group-list">
             <li v-for="group in groups" :key="group.id" class="group-item">
@@ -557,25 +589,11 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
             </li>
           </ul>
 
-          <div v-if="pendingGroupPurge" class="confirm" role="region" aria-labelledby="group-purge-title" data-testid="group-purge-confirm">
-            <h3 id="group-purge-title">确认永久删除群组「{{ pendingGroupPurge.groupName }}」？</h3>
-            <p class="muted small">此操作不可恢复。删除群组会清除群聊与参与者关系，项目成员仍会保留。</p>
-            <ul class="small">
-              <li>群聊消息：{{ pendingGroupPurge.cascade.messages }} 条（投递记录 {{ pendingGroupPurge.cascade.deliveries }} 条）</li>
-              <li>参与者关系：{{ pendingGroupPurge.cascade.participants }} 条</li>
-              <li>任务关联消息：{{ pendingGroupPurge.cascade.taskMessageLinks }} 条（任务与评审保留）</li>
-              <li>该群工作事件：{{ pendingGroupPurge.cascade.workEvents }} 条（其它工作事件保留）</li>
-              <li>自总结请求：{{ pendingGroupPurge.cascade.memorySummaryRequests }} 条</li>
-              <li>记忆投递收据：{{ pendingGroupPurge.cascade.memoryMessageReceipts }} 条，触发计数 {{ pendingGroupPurge.cascade.memoryTriggerCounters }} 条，扫描检查点 {{ pendingGroupPurge.cascade.memoryScanCheckpoints }} 条</li>
-              <li>MCP 会话记录：{{ pendingGroupPurge.cascade.mcpSessions }} 条</li>
-            </ul>
-            <p class="muted small">记忆正文与版本历史全部保留；该群的总结请求与触发记录会一并清除。</p>
-            <div class="actions"><button type="button" class="secondary" :disabled="busy" data-testid="cancel-purge-group" @click="cancelGroupPurge">取消</button><button type="button" :disabled="busy" class="danger" data-testid="confirm-purge-group" @click="confirmGroupPurge">确认永久删除</button></div>
-          </div>
+
         </section>
       </div>
     </template>
-    <div v-else-if="!loading && !error" class="panel empty-state"><h2>开始第一个项目</h2><p>在上方填写项目名称，然后添加成员、创建群组。</p></div>
+    <div v-if="viewMode === 'list' && !loading && !error && !projects.length" class="empty-state"><h2>{{ projectSearch ? '没有匹配的项目' : '从一个项目开始' }}</h2><p>新建项目后，就可以添加成员、建立群组。</p></div>
   </section>
 </template>
 
@@ -586,7 +604,7 @@ onBeforeUnmount(() => { disposed = true; projectRequest++; });
 .section-heading p { margin: .35rem 0 0; }
 .section-heading > div { min-width: 0; }
 .count { color: var(--muted); font-size: .85rem; font-weight: 400; margin-left: .35rem; }
-.project-tabs { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1rem; }
+.project-tabs { display: grid; gap: 0; margin-top: 1rem; }.project-search { max-width: 25rem; margin-top: 20px; }.project-tab { justify-content: flex-start; border: 0; border-radius: 0; padding: 18px 8px; border-bottom: 1px solid var(--border); min-height: 58px; }.project-columns.single-column { grid-template-columns: minmax(0, 1fr); }.member-create-context { margin-top: 16px; padding: 12px 16px; border: 1px solid var(--border); border-radius: 9px; }.member-create-context summary { color: var(--accent); }
 .project-tab { max-width: 100%; text-align: left; overflow-wrap: anywhere; background: var(--surface-subtle); }
 .project-tab.active { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
 .project-create, .inline-create { display: flex; align-items: end; flex-wrap: wrap; gap: .75rem; margin-top: 1.25rem; }
@@ -631,9 +649,6 @@ summary::marker { color: var(--muted); }
 .group-links { font-size: .85rem; gap: 1rem; }
 .group-management { margin-top: .65rem; }
 .group-management .actions { margin-top: .5rem; }
-.confirm { margin-top: 1rem; padding: 1rem; border: 1px solid var(--bad); border-radius: 10px; background: var(--card-bg); overflow-wrap: anywhere; }
-.confirm h3 { font-size: 1rem; margin: 0 0 .5rem; }
-.confirm ul { padding-left: 1.15rem; }
 .compact-empty { padding: 1.25rem .5rem; }
 @media (max-width: 1100px) { .project-columns { grid-template-columns: 1fr; } }
 @media (max-width: 620px) { .project-create .field { max-width: none; width: 100%; flex-basis: 100%; } .project-tabs { gap: .4rem; } .member-manage { margin-left: 0; } }

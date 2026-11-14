@@ -40,8 +40,27 @@ jobs:
       - name: 按锁文件安装依赖
         run: npm ci
 
+      - name: 严格构建 macOS 存储维护原生能力
+        run: node scripts/build-maintenance-platform.mjs --required
+
+      - name: macOS APFS 强制落盘、原生写者库存与真实子进程故障恢复
+        shell: bash
+        run: node --test --test-reporter=tap --test-timeout=60000 --test-concurrency=1 tests/maintenance-darwin.acceptance.ts 2>&1 | tee .agent-output/macos-tests/maintenance-native.log
+
+      - name: macOS 原生管理与维护恢复定向回归（保留即时失败详情）
+        shell: bash
+        run: node --test --test-reporter=tap --test-timeout=60000 --test-concurrency=1 tests/db-host-migration.test.ts tests/native-management-admission.test.ts tests/storage-source-client.test.ts tests/maintenance-platform.test.ts tests/maintenance-sqlite.test.ts tests/maintenance-objects.test.ts tests/maintenance-plan.test.ts 2>&1 | tee .agent-output/macos-tests/maintenance-regression.log
+
       - name: 全量测试（macOS / SQLite，不启用 PostgreSQL 门控用例）
         shell: bash
+        env:
+          # 只增加观察；绝对路径允许既有测试从不同 cwd 启动普通 Node 子进程。
+          NODE_OPTIONS: >-
+            --test-reporter=spec
+            --test-reporter-destination=stdout
+            --test-reporter=${{ github.workspace }}/scripts/ci/test-execution-reporter.mjs
+            --test-reporter-destination=stdout
+            --import=${{ github.workspace }}/scripts/ci/test-process-observer.mjs
         run: npm test 2>&1 | tee .agent-output/macos-tests/full-suite.log
 
       - name: 保存环境与完整测试日志
@@ -57,16 +76,24 @@ jobs:
   database-tests:
     name: Node 24 · SQLite / PostgreSQL
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # CI171 used 287s preparing and 626s in a still-progressing full suite before
+    # the old job limit. Keep the existing 900s child allowance, plus bounded
+    # preparation and post-suite SDK/restart/cleanup time; no product limit changes.
+    timeout-minutes: 25
+    outputs:
+      browser_dependencies_id: ${{ steps.browser_dependencies.outputs.artifact-id }}
 
     services:
       postgres:
-        image: postgres:16-alpine
+        # 固定 run43322971867 实际使用的官方 16.16 镜像；客户端工具仍单独记录。
+        image: postgres@sha256:f377d590e5474681d4d7838635031a2b50647923b7abfa803ce9b5ff35d5c663
         env:
           POSTGRES_USER: boardroom
           # 仅用于本次 CI 临时容器，不使用仓库或用户凭据。
           POSTGRES_PASSWORD: boardroom-ci-only
           POSTGRES_DB: boardroom_ci
+          # 只隔离此新建测试 cluster 的常规 autovacuum；真实 writer guard 不变。
+          POSTGRES_INITDB_ARGS: --set=autovacuum=off
         ports:
           - 5432:5432
         options: >-
@@ -91,16 +118,105 @@ jobs:
       - name: 按锁文件安装依赖
         run: npm ci
 
+      - name: 准备 PostgreSQL 16 原生备份与恢复工具
+        run: |
+          sudo apt-get update
+          apt-cache policy postgresql-client-16
+          sudo apt-get install --yes --no-install-recommends postgresql-client-16
+          echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/16/bin/pg_dump --version
+          /usr/lib/postgresql/16/bin/pg_restore --version
+
+      - name: 私有解包 PostgreSQL 16 重启验证工具（不运行 postinst 或宿主服务）
+        id: pg_restart_tools
+        shell: bash
+        run: bash scripts/prepare-ci-pg16-tools.sh
+
+      - name: 核对自有 PostgreSQL 服务版本与静默 fixture 配置
+        env:
+          BOARDROOM_CI_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: node scripts/ci/verify-pg-fixture.mjs
+
       - name: 类型检查
         run: npm run typecheck
 
       - name: 构建 WebUI
         run: npm run build
 
+      - name: 有界 Decision 与 MCP PostgreSQL 失败点 TAP 诊断
+        shell: bash
+        env:
+          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: |
+          mkdir -p .agent-output/maintenance-native-diagnostics
+          # run169 的 spec 末尾摘要被 job 取消截断；先保全已失败入口的真实
+          # 断言详情。完整 npm test 仍在原隔离身份下运行，所有门槛保持。
+          timeout --signal=TERM --kill-after=10s 90s node --test --test-reporter=tap --test-concurrency=1 --test-name-pattern='local HTTP source|successors require current head|reader namespace|target既有namespace|已绑定会话再次 join|join memory reconciliation starts only|完整关系 undo/undo|完整关系 remove/remove' tests/decisions-http.test.ts tests/decisions-service.test.ts tests/m1-postgres-coordination.test.ts tests/agent-alias-integrity.test.ts tests/memory-mcp.test.ts tests/phase5-concurrency-matrix.test.ts 2>&1 | tee .agent-output/maintenance-native-diagnostics/decision-mcp-regression.tap
+
+      - name: 有界 PostgreSQL 维护适配器 TAP 诊断
+        id: maintenance_pg_diagnostic
+        shell: bash
+        env:
+          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+        run: |
+          mkdir -p .agent-output/maintenance-native-diagnostics
+          # 整组串行诊断的外层预算：v19 在 run166 已需 165s；v20/v21 的
+          # 58 表矩阵在 run168 持续通过但被旧 180s 总额截断。保留所有用例、
+          # 用例自身 180/90s 时限与 TERM 后 10s 收尾，job 另设有界总时限。
+          timeout --signal=TERM --kill-after=10s 300s node --test --test-reporter=tap --test-concurrency=1 tests/maintenance-postgres.test.ts 2>&1 | tee .agent-output/maintenance-native-diagnostics/postgres.tap
+
+      - name: 有界 SQLite 源使用者 TAP 诊断
+        if: ${{ !cancelled() && steps.maintenance_pg_diagnostic.outcome != 'skipped' }}
+        shell: bash
+        run: python3 scripts/ci/linux_isolation.py sqlite
+
       - name: 全量测试（启用 PostgreSQL 门控用例）
         env:
           AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
-        run: npm test
+        run: python3 scripts/ci/linux_isolation.py full-suite
+
+      - name: 核对 Linux 专属测试身份、进程与工件收尾
+        if: always()
+        run: python3 scripts/ci/linux_isolation.py cleanup
+
+      - name: 保存原生维护即时诊断证据
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: maintenance-native-diagnostics-${{ github.run_attempt }}
+          path: .agent-output/maintenance-native-diagnostics/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 保存 Linux 测试身份与资源收尾证据
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-ci-isolation-${{ github.run_attempt }}
+          path: .agent-output/linux-ci-isolation/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 独立私有 cluster 真实重启与旧句柄失效验证
+        shell: bash
+        env:
+          AGENT_STUDIO_PG_RESTART_BIN: ${{ steps.pg_restart_tools.outputs.bin }}
+        run: |
+          test -n "$AGENT_STUDIO_PG_RESTART_BIN"
+          mkdir -p .agent-output/maintenance-pg-restart
+          node --test tests/maintenance-postgres-restart.test.ts 2>&1 | tee .agent-output/maintenance-pg-restart/native-restart.log
+
+      - name: 保存独立 PostgreSQL 重启验证证据
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: maintenance-pg-restart-${{ github.run_attempt }}
+          path: .agent-output/maintenance-pg-restart/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: 固定 V1 与万条历史负载逐次计时（SQLite / PostgreSQL）
         env:
@@ -191,10 +307,60 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: 打包本候选已验证的浏览器服务依赖
+        run: |
+          mkdir -p .agent-output/browser-dependencies
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          import { createHash } from 'node:crypto';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const manifest = {
+            candidate: process.env.GITHUB_SHA,
+            node: process.version,
+            abi: process.versions.modules,
+            platform: process.platform,
+            arch: process.arch,
+            libc: process.report.getReport().header.glibcVersionRuntime,
+            lockSha256: createHash('sha256').update(readFileSync('package-lock.json')).digest('hex'),
+          };
+          writeFileSync('.agent-output/browser-dependencies/environment.json', JSON.stringify(manifest, null, 2));
+          assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim(), manifest.candidate);
+          const producer = {schema:1, runId:Number(process.env.GITHUB_RUN_ID),
+            attempt:Number(process.env.GITHUB_RUN_ATTEMPT), candidate:manifest.candidate,
+            tree:execFileSync('git', ['rev-parse', 'HEAD^{tree}'], {encoding:'utf8'}).trim()};
+          assert.match(producer.candidate, /^[0-9a-f]{40}$/);
+          assert.match(producer.tree, /^[0-9a-f]{40}$/);
+          assert.ok(Number.isSafeInteger(producer.runId) && producer.runId > 0);
+          assert.ok(Number.isSafeInteger(producer.attempt) && producer.attempt > 0);
+          writeFileSync('.agent-output/browser-dependencies/producer.json', JSON.stringify(producer, null, 2));
+          JS
+          # tar 保留原生模块、可执行位和 .bin 符号链接；来源为本 job 已完成的 npm ci。
+          tar -czf .agent-output/browser-dependencies/node_modules.tar.gz node_modules
+          (cd .agent-output/browser-dependencies && sha256sum node_modules.tar.gz environment.json producer.json > SHA256SUMS)
+
+      - name: 交接同候选原生依赖
+        id: browser_dependencies
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: browser-dependencies-${{ github.run_attempt }}
+          path: .agent-output/browser-dependencies/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
   managed-web-browser:
     name: Chromium · 工作台与托管 Agent 页面
+    needs: database-tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # 与下方 Python 包版本一致；资源隐藏验收另在本 job 安装固定 Openbox。
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.62.0-noble@sha256:aa81288e738725378becba5b3e06cb0f3a7f012a610e87e8d767a090ea3f740d
+      options: --init --shm-size=1g
+    defaults:
+      run:
+        shell: bash
     services:
       postgres:
         image: postgres:16-alpine
@@ -216,6 +382,12 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: 核对浏览器容器的已检出候选
+        run: |
+          # 只信任本次 runner 检出的确切工作区，不放宽其他 Git 目录。
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -223,22 +395,72 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      - name: 安装并构建真实 WebUI
+      - name: 取得同次运行的原生依赖
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          # 只重跑失败的 browser 时仍引用成功 producer 的实际产物。
+          artifact-ids: ${{ needs.database-tests.outputs.browser_dependencies_id }}
+          path: .agent-output/browser-dependencies
+          digest-mismatch: error
+
+      - name: 核对依赖身份并构建真实 WebUI
+        env:
+          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.database-tests.outputs.browser_dependencies_id }}
         run: |
-          npm ci
+          (cd .agent-output/browser-dependencies && sha256sum --check SHA256SUMS)
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+          const manifest = JSON.parse(readFileSync('.agent-output/browser-dependencies/environment.json', 'utf8'));
+          assert.match(manifest.candidate, /^[0-9a-f]{40}$/);
+          const current = {
+            candidate: process.env.GITHUB_SHA,
+            node: process.version,
+            abi: process.versions.modules,
+            platform: process.platform,
+            arch: process.arch,
+            libc: process.report.getReport().header.glibcVersionRuntime,
+            lockSha256: createHash('sha256').update(readFileSync('package-lock.json')).digest('hex'),
+          };
+          assert.deepEqual(manifest, current, '依赖必须来自本候选、同一锁文件和相同 Node/Linux ABI');
+          console.log(JSON.stringify(current));
+          JS
+          # 元数据来自实际 producer；browser-only retry 仍使用成功 producer 的真实 artifact ID。
+          python3 scripts/resource_browser_binding.py --artifact-dir .agent-output/browser-dependencies --output .agent-output/resource-web-e2e/runtime-binding.json
+          tar --extract --gzip --no-same-owner --file .agent-output/browser-dependencies/node_modules.tar.gz
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import Database from 'better-sqlite3';
+          const db = new Database(':memory:');
+          assert.equal(db.prepare('SELECT 1 AS value').get().value, 1);
+          db.close();
+          JS
           npm run build
 
-      - name: 安装固定版本 Playwright 与 Chromium
+      - name: 安装固定版本 Playwright 并核对预置 Chromium
+        id: browser_ready
         run: |
-          python3 -m venv .agent-output/browser-venv
-          .agent-output/browser-venv/bin/python -m pip install playwright==1.62.0
-          .agent-output/browser-venv/bin/python -m playwright install --with-deps chromium
+          python3 -m virtualenv .agent-output/browser-venv
+          .agent-output/browser-venv/bin/python -m pip install playwright==1.62.0 pyee==13.0.1 greenlet==3.5.6 typing-extensions==4.16.0
+          .agent-output/browser-venv/bin/python - <<'PY'
+          from importlib.metadata import version
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+          assert version('playwright') == '1.62.0'
+          with sync_playwright() as playwright:
+              executable = Path(playwright.chromium.executable_path)
+              assert executable.is_file(), f'固定版本 Chromium 缺失: {executable}'
+              print(f'Playwright {version("playwright")} / {executable}')
+          PY
 
+      # 各脚本独立启动临时服务；准备成功后分别收证，任一失败仍使 job 失败。
       - name: 真实浏览器操作临时 SQLite 服务
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-managed-web.py --ci
 
       - name: 保存主线页面对照截图
-        if: github.event_name == 'pull_request'
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' && github.event_name == 'pull_request' }}
         env:
           WEBUI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -250,23 +472,57 @@ jobs:
           .agent-output/browser-venv/bin/python scripts/e2e-webui.py --capture-only --web-root .agent-output/ui-before/dist/web --artifacts .agent-output/webui-before
 
       - name: 工作台真实浏览器交互与布局验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-webui.py
 
       - name: 任务与项目切换真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-tasks-web.py
 
+      - name: 提交后资源刷新、断线对账与草稿真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
+        env:
+          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.database-tests.outputs.browser_dependencies_id }}
+        run: |
+          mkdir -p .agent-output/resource-web-e2e/native-desktop
+          # 仅本次 browser 容器；不改其他脚本、job、时限或现有桌面。
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get -o Acquire::Retries=0 update
+          apt-get -o Acquire::Retries=0 install -y --no-install-recommends openbox=3.6.1-12build5 x11-utils=7.7+6build2
+          command -v Xvfb openbox xprop xauth
+          dpkg-query -W -f='${Package}\t${Version}\n' xvfb openbox x11-utils xauth > .agent-output/resource-web-e2e/native-desktop/packages.tsv
+          .agent-output/browser-venv/bin/python scripts/e2e-resource-web.py --native-desktop
+
+      - name: Decision 五秒对账、显式选择与隐藏恢复真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
+        env:
+          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.database-tests.outputs.browser_dependencies_id }}
+        run: .agent-output/browser-venv/bin/python scripts/e2e-decision-web.py --native-desktop --runtime-binding .agent-output/resource-web-e2e/runtime-binding.json --artifacts .agent-output/decision-web-e2e
+
       - name: 记忆编辑、冲突与历史真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-memory-web.py
 
       - name: 只读设置、配置重启与键盘布局真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-settings-web.py
 
+      - name: 聊天式导航、项目范围与草稿保护真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
+        run: .agent-output/browser-venv/bin/python scripts/e2e-navigation-web.py --artifacts .agent-output/navigation-web-e2e
+
+      - name: 三态主题、首帧与页面状态保持真实浏览器验证
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
+        run: .agent-output/browser-venv/bin/python scripts/e2e-theme-web.py
+
       - name: SQLite 固定负载与真实 DOM 消息时延
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-v1-load-web.py --ci --db sqlite
 
       - name: PostgreSQL 固定负载与真实 DOM 消息时延
+        if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         env:
-          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+          AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@postgres:5432/boardroom_ci
         run: .agent-output/browser-venv/bin/python scripts/e2e-v1-load-web.py --ci --db postgres
 
       - name: 保存浏览器截图与逐项报告
@@ -279,8 +535,12 @@ jobs:
             .agent-output/webui-e2e/
             .agent-output/webui-before/
             .agent-output/tasks-web-e2e/
+            .agent-output/resource-web-e2e/
+            .agent-output/decision-web-e2e/
             .agent-output/memory-web-e2e/
             .agent-output/settings-web-e2e/
+            .agent-output/navigation-web-e2e/
+            .agent-output/theme-web-e2e/
             .agent-output/v1-load-web/
           include-hidden-files: true
           if-no-files-found: warn

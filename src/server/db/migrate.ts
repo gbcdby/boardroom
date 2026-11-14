@@ -1,5 +1,7 @@
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
+import { assertStorageAdmission, readSqliteMaintenanceState } from "../storage/admission.ts";
+import { assertSqliteGuardCoverage, extendSqliteStorageGuards } from "../storage/schema-guards.ts";
 
 /** 一条迁移。版本号必须唯一且单调递增。 */
 export interface Migration {
@@ -64,6 +66,9 @@ export class MigrationError extends Error {
  */
 export function runMigrations(db: Database.Database, migrations: readonly Migration[]): MigrationRunResult {
   const ordered = validateAndSort(migrations);
+  const gate = readSqliteMaintenanceState(db);
+  assertStorageAdmission(gate);
+  if (gate) assertSqliteGuardCoverage(db);
   ensureMigrationTable(db);
 
   const applied = new Map<number, AppliedMigration>();
@@ -110,7 +115,11 @@ function applyOne(db: Database.Database, migration: Migration): void {
 
   db.exec("BEGIN IMMEDIATE");
   try {
+    const gate = readSqliteMaintenanceState(db);
+    assertStorageAdmission(gate);
+    if (gate) assertSqliteGuardCoverage(db);
     db.exec(upSql);
+    extendSqliteStorageGuards(db);
     insert.run(migration.version, migration.name, checksumOf(upSql), new Date().toISOString());
     db.exec("COMMIT");
   } catch (error) {

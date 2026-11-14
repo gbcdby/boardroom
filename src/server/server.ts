@@ -1,12 +1,16 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.ts";
+import { resolveBoardroomEnvironment, assertEnvironmentWritable, databaseForConnectedReader } from "./environment.ts";
 import { createDbDriver, type DbDriver } from "./db/driver.ts";
 import type { MigrationState } from "./db/migrate.ts";
 import { migrations } from "./db/migrations/index.ts";
 import { buildHealthReport } from "./health.ts";
 import { createRepositories } from "./db/repositories.ts";
+import { initializeDecisions } from "./decisions/startup.ts";
+import { initializePolicyConfiguration } from "./policy/configuration.ts";
 import type { Logger } from "./logger.ts";
 import { createStaticHandler, isWebUiBuilt } from "./static.ts";
 import { createWebSocketHub, type ServerEvent, type WebSocketHub } from "./ws.ts";
@@ -24,9 +28,12 @@ import { createRuntimeSupervisor, type RuntimeSupervisor } from "./runtime/super
 import { createHostLauncher } from "./runtime/hosts/launcher.ts";
 import type { HostLauncher } from "./runtime/hosts/types.ts";
 import { notifyMessageCommit, onMessageCommit } from "./runtime/dispatch-events.ts";
+import { onResourceChange } from "./resource-changes.ts";
 import { createTaskApi } from "./tasks/api.ts";
 import { createMemoryApi } from "./memory/api.ts";
-import { registerMemoryRuntime, closeMemoryRuntime } from "./memory/runtime.ts";
+import { registerMemoryRuntime, closeMemoryRuntime, pauseMemoryRuntime } from "./memory/runtime.ts";
+import { registerStorageSourceClient, storageClientDriverOptions, type StorageSourceClient } from "./storage/source-client.ts";
+import { StorageMaintenanceError } from "./storage/admission.ts";
 import { createSettingsApi } from "./settings/api.ts";
 import { buildEffectiveSettings } from "./settings.ts";
 
@@ -82,6 +89,9 @@ export interface RunningServer {
   /** 当前挂起中的 MCP 等待调用数（测试与观测）。 */
   readonly mcpPendingWaitCount: number;
   readonly runtimeSupervisor: RuntimeSupervisor;
+  readonly storageClient: StorageSourceClient;
+  /** Trusted local lifecycle; callers must use the returned fresh driver/client. */
+  reopenAfterMaintenance(): Promise<RunningServer>;
   /** 服务端主动广播事件给所有 WebUI 连接。 */
   broadcast(event: ServerEvent): void;
   /** 立即把某项目状态看板快照广播给可见客户端（T4）。 */
@@ -111,15 +121,14 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   const log = logger.child({ component: "server" });
   const webRoot = options.webRoot ?? defaultWebRoot();
   const startedAt = Date.now();
+  const environment = await resolveBoardroomEnvironment({ config });
+  await assertEnvironmentWritable(environment);
 
   // F1（#46）：经连接工厂打开持久化驱动；默认 SQLite，阶段 1 行为不变。
   let driver: DbDriver;
+  const storageClientId = randomUUID();
   try {
-    driver = createDbDriver({
-      dbDriver: config.dbDriver ?? "sqlite",
-      dataDir: config.dataDir,
-      ...(config.pgConnectionString === undefined ? {} : { pgConnectionString: config.pgConnectionString }),
-    });
+    driver = createDbDriver(storageClientDriverOptions(environment, storageClientId));
   } catch (error) {
     log.error("数据库驱动配置无效", { error, dataDir: config.dataDir });
     throw new ServerStartupError((error as Error).message);
@@ -128,6 +137,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   try {
     await driver.connect();
   } catch (error) {
+    if (error instanceof StorageMaintenanceError) throw error;
     log.error("数据库初始化失败", { error, dataDir: config.dataDir });
     throw new ServerStartupError((error as Error).message);
   }
@@ -143,6 +153,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     });
   } catch (error) {
     await driver.close();
+    if (error instanceof StorageMaintenanceError) throw error;
     log.error("迁移失败", { error });
     throw new ServerStartupError(
       `${(error as Error).message}\n数据目录：${config.dataDir}\n` +
@@ -150,24 +161,51 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     );
   }
 
+  let storageClient: StorageSourceClient;
+  try { storageClient = await registerStorageSourceClient({ db: driver, clientId: storageClientId, entrypoint: "http",
+    database: databaseForConnectedReader(environment.databaseDescriptor) }); }
+  catch (error) { await driver.close(); throw error; }
+  let ownedSupervisor: RuntimeSupervisor | undefined;
+  let ownedMcp: McpSessionsHandler | undefined;
+  let ownedHub: WebSocketHub | undefined;
+  let ownedApi: ReturnType<typeof createT1ApiRouter> | undefined;
+  let stopStatus = () => {};
+  let stopMessages = () => {};
+  let stopResources = () => {};
+  await storageClient.bind({
+    stopNewWork(epoch) { stopStatus(); stopMessages(); stopResources(); pauseMemoryRuntime(driver); ownedSupervisor?.beginMaintenanceDrain(epoch); },
+    async disconnectSessions() { await ownedApi?.close(); await ownedMcp?.close({ strict: true }); await ownedHub?.close(); },
+    stopOwnedRuntime: () => ownedSupervisor?.drainMaintenance() ?? Promise.resolve({ ownedExits: [], unknownOwners: [] }),
+    observeOwnedExit: input => ownedSupervisor?.observeMaintenanceExit(input) ?? Promise.reject(new StorageMaintenanceError("active")),
+    closeMemory: () => closeMemoryRuntime(driver),
+  });
+  storageClient.startWatching();
+
+  const repos = createRepositories(driver);
   try {
+    await storageClient.run(async () => {
+    // 环境与迁移已验证，任何监听/后台任务之前显式建立一次默认策略；普通 GET 绝不初始化。
+    await initializePolicyConfiguration(repos);
+    await initializeDecisions(driver);
+    await storageClient.assertAdmission();
     registerMemoryRuntime(driver, {
-      database: driver.kind === "sqlite" ? { kind: "sqlite", sqlitePath: path.join(config.dataDir, "agent-studio.db") }
-        : { kind: "postgres", connectionString: config.pgConnectionString! },
+      database: databaseForConnectedReader(environment.databaseDescriptor),
       ...(config.memory ? { config: config.memory } : {}),
       onDiagnostic: code => log.warn("memory_reader_unavailable", { code }),
     });
+    });
   } catch (error) {
-    await driver.close();
+    await closeMemoryRuntime(driver);
+    await storageClient.close();
+    if (error instanceof StorageMaintenanceError) throw error;
     throw new ServerStartupError((error as Error).message);
   }
-
-  const repos = createRepositories(driver);
 
   // T2 / D6：进程重启后，上一进程遗留的「connected」MCP 会话已失效。
   // 启动时统一标记为断开，并把这些成员的运行状态置为 offline——恢复完全依赖
   // 服务端持久化 + agent 重连后主动 join/心跳，不臆造在线（STATUS-02）。
   try {
+    await storageClient.assertAdmission();
     const recovered = repos;
     const staleAt = new Date().toISOString();
     const staleCount = await (recovered.mcpSessions.markAllStale(staleAt));
@@ -185,6 +223,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
       log.info("启动恢复：清理遗留 MCP 会话", { staleSessions: staleCount });
     }
   } catch (error) {
+    if (error instanceof StorageMaintenanceError) { await storageClient.close(); throw error; }
     // 恢复失败不阻止启动；记录并继续（下次心跳/重连会纠正状态）。
     log.warn("启动恢复清理失败", { error });
   }
@@ -207,6 +246,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     });
   }
   const serveStatic = createStaticHandler({ root: webRoot });
+  await storageClient.assertAdmission();
   const mcpHandler: McpSessionsHandler = createMcpSessionsHandler({
     logger,
     heartbeat: config.heartbeat,
@@ -214,26 +254,29 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     antiLoop: { ...(config.antiLoop ? { config: config.antiLoop } : {}) },
     ...(authorization.resolveMcpActor ? { actorFor: authorization.resolveMcpActor } : {}),
   });
+  ownedMcp = mcpHandler;
   // hub 在 httpServer 之后创建；HTTP 提交后的通知使用晚绑定回调。
   let notifyHttpMessage: (message: import("./api.ts").MessageView) => void | Promise<void> = () => {};
   // 权威组织审计由 API 领域服务原子提交；可选 hook 只作提交后观察。
   const t1Api = createT1ApiRouter({
-    db: driver, repos,
+    db: driver, repos, environment,
     logger,
     heartbeat: config.heartbeat,
     onMessage: (message) => notifyHttpMessage(message),
     ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}),
     ...(options.orgChangeRecorder ? { orgChangeRecorder: options.orgChangeRecorder } : {}),
   });
+  ownedApi = t1Api;
   const runtimeObservations = createRuntimeObservability({ db: driver, logger });
-  const runtimeStateRoot = path.join(config.dataDir, "managed");
+  const runtimeStateRoot = environment.runtimeRoot;
   const runtimeSupervisor = createRuntimeSupervisor({ db: driver, repos, logger, observations: runtimeObservations,
+    storageClient, manual: true,
     stateRoot: runtimeStateRoot,
     ...(authorization.resolveMcpActor ? { actorFor: authorization.resolveMcpActor } : {}),
     launcher: options.runtimeLauncher ?? createHostLauncher({ stateRoot: runtimeStateRoot,
-      protectedPaths: [path.resolve(import.meta.dirname, "../.."), config.dataDir,
-        ...(config.configFile ? [config.configFile] : [])] }),
+      protectedPaths: environment.protectedPaths }),
   });
+  ownedSupervisor = runtimeSupervisor;
   const runtimeApi = createRuntimeApi({ db: driver, repos, logger, heartbeat: config.heartbeat,
     supervisor: runtimeSupervisor, observations: runtimeObservations,
     ...(authorization.resolveHttpActor ? { resolveActor: authorization.resolveHttpActor } : {}),
@@ -253,6 +296,12 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
 
   const httpServer = createServer((request, response) => {
     void handleRequest(request, response).catch((error: unknown) => {
+      if (error instanceof StorageMaintenanceError) {
+        if (!response.headersSent) writeJson(response, 503, { error: error.code, message: "存储正在维护，当前入口不接收新工作。",
+          recoveryAction: error.recoveryAction });
+        else response.end();
+        return;
+      }
       log.error("请求处理失败", { error, method: request.method, path: request.url });
       if (!response.headersSent) {
         writeJson(response, 500, { error: "internal_error", message: "服务端内部错误" });
@@ -264,6 +313,15 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
 
   async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+    if (pathname === "/api/storage-maintenance") {
+      if (request.method !== "GET" && request.method !== "HEAD") { writeJson(response, 405, { error: "method_not_allowed" }); return; }
+      await storageClient.refresh().catch(() => {});
+      writeJson(response, storageClient.accepting ? 200 : 503, storageClient.diagnostic, request.method === "HEAD"); return;
+    }
+    await storageClient.run(() => handleBusinessRequest(request, response, pathname));
+  }
+
+  async function handleBusinessRequest(request: IncomingMessage, response: ServerResponse, pathname: string): Promise<void> {
 
     if (pathname === "/api/health") {
       if (request.method !== "GET" && request.method !== "HEAD") {
@@ -307,20 +365,29 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     path: WS_PATH,
     heartbeat: config.heartbeat,
     logger,
-    ...(authorization.resolveWsActor ? { resolveActor: authorization.resolveWsActor } : {}),
+    ...(authorization.resolveWsActor ? { resolveActor: async (context: WsActorContext) => {
+      try { return await storageClient.run(() => authorization.resolveWsActor!(context)); }
+      catch (error) { if (error instanceof StorageMaintenanceError) return null; throw error; }
+    } } : {}),
   });
+  ownedHub = hub;
+  const unsubscribeResources = onResourceChange(driver, change => hub.broadcastResourceChange(change));
+  stopResources = unsubscribeResources;
 
   // WebUI 是人的视角，实时读取所有来源的已提交消息。MCP core 与 HTTP 都发送
   // 同一提交通知，因此 Agent 的消息也可见，HTTP 消息不会重复广播。
   const unsubscribeMessages = onMessageCommit(driver, async (messageId) => {
     if (!messageId) return;
     try {
+      await storageClient.run(async () => {
       const message = await repos.messages.get(messageId);
       if (message) hub.broadcast({ type: "message", message: await messageView(repos, message) });
+      });
     } catch (error) {
       log.warn("广播已提交消息失败", { error, messageId });
     }
   });
+  stopMessages = unsubscribeMessages;
   notifyHttpMessage = async (message) => {
     await notifyMessageCommit(driver, message.id);
     // T8（#21）修复：人的消息经 HTTP 写入后，唤醒 HTTP 会话中在该群组等待、且被该消息
@@ -363,8 +430,11 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
       }
     }
   };
-  const statusTimer = setInterval(statusPublisher, config.heartbeat.intervalMs);
+  const statusTimer = setInterval(() => { void storageClient.run(statusPublisher).catch(error => {
+    if (!(error instanceof StorageMaintenanceError)) log.warn("状态看板广播失败");
+  }); }, config.heartbeat.intervalMs);
   statusTimer.unref();
+  stopStatus = () => clearInterval(statusTimer);
 
   try {
     await new Promise<void>((resolve, reject) => {
@@ -381,13 +451,15 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
       httpServer.listen(config.port, HOST);
     });
   } catch (error) {
+    await t1Api.close();
     await runtimeSupervisor.close();
     await mcpHandler.close();
     clearInterval(statusTimer);
     unsubscribeMessages();
+    unsubscribeResources();
     await hub.close();
     await closeMemoryRuntime(driver);
-    await driver.close();
+    await storageClient.close();
     const err = error as NodeJS.ErrnoException;
     const message =
       err.code === "EADDRINUSE"
@@ -404,6 +476,7 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
   const address = httpServer.address() as AddressInfo;
   const port = address.port;
   const url = `http://${HOST}:${port}`;
+  runtimeSupervisor.start();
 
   log.info("服务已启动", {
     url,
@@ -414,7 +487,8 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     webuiBuilt,
   });
 
-  return {
+  let closing: Promise<void> | null = null;
+  const running: RunningServer = {
     port,
     host: HOST,
     url,
@@ -422,14 +496,23 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     database: driver,
     migrationState,
     runtimeSupervisor,
+    storageClient,
+    async reopenAfterMaintenance() {
+      await storageClient.refresh();
+      if (storageClient.diagnostic.status !== "restart_required") throw new StorageMaintenanceError("active");
+      await running.close();
+      return startServer({ ...options, config: { ...config, port } });
+    },
     broadcast: (event) => hub.broadcast(event),
     broadcastStatus: async (projectId) => {
+      await storageClient.run(async () => {
       const statuses = await (buildStatusBoard(statusRepos, projectId, {
         heartbeat: config.heartbeat,
         now: new Date(),
         humanOnlineMemberIds: hub.humanPresenceMembers(projectId),
       }));
       hub.broadcastProjectStatus(projectId, statuses);
+      });
     },
     get clientCount() {
       return hub.clientCount;
@@ -442,24 +525,38 @@ export async function startServer(options: StartServerOptions): Promise<RunningS
     get mcpPendingWaitCount() {
       return mcpHandler.pendingWaitCount;
     },
-    async close() {
+    close() {
+      if (closing) return closing;
+      closing = (async () => {
       clearInterval(statusTimer);
-      await runtimeSupervisor.close();
-      await mcpHandler.close();
+      pauseMemoryRuntime(driver);
+      const httpClosed = new Promise<void>(resolve => { httpServer.close(() => resolve()); });
+      const failures: unknown[] = [];
+      const closeResource = async (operation: () => Promise<unknown>) => {
+        try { await operation(); } catch (error) { failures.push(error); }
+      };
+      await closeResource(() => t1Api.close());
+      await closeResource(() => storageClient.refresh());
+      if (storageClient.diagnostic.status === "draining" || storageClient.diagnostic.status === "blocked")
+        await closeResource(() => storageClient.waitForDrain());
+      await closeResource(() => runtimeSupervisor.close());
+      await closeResource(() => mcpHandler.close());
       unsubscribeMessages();
-      await hub.close();
+      unsubscribeResources();
+      await closeResource(() => hub.close());
       // 先在途的连接一并断开：Streamable HTTP 的 SSE 响应会持续保持连接，
       // 仅 close() 不会中断它们；closeAllConnections 让进行中的等待随连接结束。
       httpServer.closeAllConnections();
-      await new Promise<void>((resolve) => {
-        httpServer.close(() => resolve());
-        httpServer.closeAllConnections();
-      });
-      await closeMemoryRuntime(driver);
-      await driver.close();
+      await httpClosed;
+      await closeResource(() => closeMemoryRuntime(driver));
+      await closeResource(() => storageClient.close());
+      if (failures.length) throw new AggregateError(failures, "server_close_incomplete");
       log.info("服务已停止");
+      })();
+      return closing;
     },
   };
+  return running;
 }
 
 /** 读取并解析 JSON 请求体；空体或非法 JSON 返回 undefined（由 MCP 层给出协议错误）。 */

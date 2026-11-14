@@ -1,10 +1,10 @@
 # MCP 工具契约
 
 状态：已确认（当前工具目录与兼容聊天契约）
-日期：2026-10-22 初版；2026-11-11 更新任务、记忆与成员代际
-来源：[主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)、阶段 3/4/5 共享合同及当前注册代码。
+日期：2026-10-22 初版；2026-11-14 更新 Decision 工具目录
+来源：[主 Spec #1](https://github.com/gbcdby/boardroom/issues/1)、阶段 3/4/5 共享合同、[Decision 评审合同 #157](https://github.com/gbcdby/boardroom/issues/157)及当前注册代码。
 
-当前注册 **32 个工具：7 个聊天/连接、15 个任务/评审/工作事件、10 个记忆工具**。工具名字、实际 schema 与调用装配以 [MCP 注册层](../src/server/mcp/server.ts)、[任务入口](../src/server/tasks/mcp.ts)、[记忆入口](../src/server/memory/mcp.ts)为准。以下目录列全现有工具；§7 起保留早期阶段增量的来源背景，不能单独据旧段落判断当前支持范围。
+当前注册 **37 个工具：7 个聊天/连接、15 个任务/评审/工作事件、5 个 Decision、10 个记忆工具**。工具名字、实际 schema 与调用装配以 [MCP 注册层](../src/server/mcp/server.ts)、[任务入口](../src/server/tasks/mcp.ts)、[Decision 入口](../src/server/decisions/mcp.ts)、[记忆入口](../src/server/memory/mcp.ts)为准。以下目录列全现有工具；§7 起保留早期阶段增量的来源背景，不能单独据旧段落判断当前支持范围。
 
 | 分组 | 工具名 | 参数与行为说明 |
 | --- | --- | --- |
@@ -13,10 +13,11 @@
 | 任务修改（5） | `create_task`、`update_task`、`transition_task`、`comment_task`、`link_task_message` | 创建/分配受管理范围限制，评论受项目成员权限，状态受负责人/管理权限 |
 | 评审（4） | `start_task_review`、`begin_task_review`、`submit_task_review_report`、`decide_task_review` | 固定 Git 候选，独立轴报告，指定 reviewer / 有理由管理覆盖 |
 | 工作事件（2） | `list_work_events`、`acknowledge_work_event` | 当前绑定成员自己的持久通知；ACK 不改变任务或总结状态 |
+| Decision（5） | `list_decisions`、`read_decision`、`request_review_decision`、`resolve_decision`、`refresh_decision` | 当前绑定项目的查询、明确提案/后继、选择与策略刷新；参数见 `src/server/decisions/schemas.ts`，身份和权限由当前绑定决定，不能经 MCP 提交人工来源 |
 | 文档/历史（3） | `read_memory`、`write_memory`、`list_memory_versions` | [记忆范围与版本](memory.md)、`src/server/memory/schemas.ts` |
 | 总结（7） | `list_memory_summary_requests`、`read_memory_summary`、`begin_memory_summary`、`submit_memory_summary`、`fail_memory_summary`、`retry_memory_summary`、`report_memory_session_end` | 材料/begin/submit/fail/session-end 由目标 Agent 本体有效绑定执行；重试另按管理权限与状态核验 |
 
-任务、记忆输入严格拒绝未知字段。身份、绑定代际和项目权限由服务端取当前连接/数据库事实；客户端不能通过传 actor、projectId 或 targetAgentId 获得额外权限。真实模型证据门槛见 [V1 验收索引](v1-acceptance.md)，工具返回成功与模型真实运行分开记录。
+任务、Decision、记忆输入严格拒绝未知字段。身份、绑定代际和项目权限由服务端取当前连接/数据库事实；客户端不能通过传 actor、projectId 或 targetAgentId 获得额外权限。Decision 命令区分 `pending`、`refreshed`、`applied`、`not_required`；提案待裁决不表示 Task 已执行，选择必须携带返回的当前 Decision 引用。真实模型证据门槛见 [V1 验收索引](v1-acceptance.md)，工具返回成功与模型真实运行分开记录。
 
 ## 1. 传输选择
 
@@ -84,6 +85,7 @@ HTTP/传输层错误（Streamable HTTP 自身）由 SDK 返回 JSON-RPC 错误�
 
 - MCP 会话与成员身份分离：一个会话可能在未 `join` 前调用工具（此时返回 `NOT_IN_GROUP`）。
 - `join` 之后该会话绑定一个 `memberId` + `projectId` + `groupId`；后续工具读取该绑定。
+- v14 的旧 `displayName + hostType` 通过永久 alias 解析到稳定 agentId。改名保留旧 alias，旧客户端重连继续复用身份并读取当前显示名；不恢复旧名、不重设已有权限或成员生命周期。已删除身份的 alias 返回 `CONFLICT / agent_identity_retired`，损坏关联返回 `CONFLICT / migration_identity_ambiguous`，不会静默另建身份。详见[稳定身份契约](identity-catalog.md)。
 - 连接层心跳（D4：interval 10s / timeout 30s，可配置）记录在**会话**上，不与成员 `waiting/working` 混同。
 - 绑定保存成员加入代际，操作时重查当前成员、项目/群和运行所有权。移除返回 `FORBIDDEN` / `reason:member_removed`；明确恢复或重新添加后，旧代际返回 `membership_changed`，需要新连接重新 join。普通 join 不隐式恢复已移除成员。
 - 任务编辑/流转、配置和评审分别使用各自 expected revision。记忆保存使用 `expectedVersion` 与 `clientMutationId`；同作者/文档/mutation 的成功重放返回原版本，换正文复用 mutation 拒绝。报告/attempt 的重放按各自合同处理，不对所有写工具笼统承诺幂等。
@@ -101,7 +103,7 @@ HTTP/传输层错误（Streamable HTTP 自身）由 SDK 返回 JSON-RPC 错误�
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `displayName` | string | 是 | 显示名（非空，≤ 64 字符）。 |
+| `displayName` | string | 是 | 旧客户端接入 alias 的名称（非空，≤ 64 字符）；已改名身份仍可用原 alias，返回当前显示名。 |
 | `hostType` | string | 是 | 必须是已注册 adapter ID；当前内置 `claude-code` / `codex-cli` / `dsh` / `other`。注册不等于真实能力验收。 |
 | `projectId` | string | 是 | 已存在的项目 ID。 |
 | `groupId` | string | 是 | 群组 ID。 |
@@ -158,6 +160,16 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 - `status:"timeout"` 是**正常返回**，不是错误；`status:"cancelled"` 表示宿主取消（`signal` abort）。
 - 可选 `workEvents` 包含本人任务/记忆通知；只有通知时为 `work`，有聊天消息时仍是 `message` 并可同时带通知。ACK 只表示收到。可选 `memory` 给出本人记忆版本变化或 unavailable 状态。
 - 未入群：`NOT_IN_GROUP`。超限：`INVALID_ARGUMENT`。
+
+#### 完整积压、持久化与最终兑现
+
+积压查询在数据库内按当前成员代际、参与关系、岗位及任务关系筛选；未传游标时返回全部合法的未 ACK 积压，传游标时沿用群内原始 `seq`。内部 SQL 分块只用于控制参数数量，不给一次返回增加消息条数上限。
+
+真实 MCP 投递通过内部批量仓储，在同一项目、成员、群组锁和一个物理事务内复核整批来源并写入投递事实。任一消息不存在、跨项目/群组、失去当前可见性，或后续分块写失败，都使整批回滚。重投保持 `first_mcp_delivered_at`、已有首次投递时间、ACK 与唤醒判定，只增加尝试次数并更新最后投递时间；历史读取和直接 ACK 不生成首次 MCP 投递事实。
+
+记忆 reader 在业务事务外运行。它返回后，消息 ID 集合使用与正文查询相同的当前权限谓词再次完整复核，并检查项目/群组仍为活跃态。成员代际、岗位/任务关系、参与边、托管运行 fence 或会话在此期间失效时，旧等待返回不带正文的 `cancelled`；归档历史仍可按读取权限查询。最终绑定/fence 检查与同步 resolve 保持在同一个锁边界内。此前已提交且未 ACK 的投递事实保留，权限恢复后可重投。
+
+取消信号同步标记当前 wait，在任何数据库等待前收口，最终锁内兑现再次核对该标记。取消不返回准备中的消息、记忆或工作通知，且 `cursor` 为 `null`，不提供可推进游标；下一次等待仍可读取已提交但未 ACK 的积压。正常成功和超时结果沿用既有游标规则。取消不会放弃正在执行的 drain/数据库事务，其真实写入失败仍向调用方报错；已兑现后的旧取消信号不影响新的 wait。
 
 ### 3.3 `send_message` —— 发送消息
 
@@ -268,7 +280,7 @@ MCP 没有 server→client 工具结果推送，只能让宿主停在工具调�
 ## 4. 超时、并发与生命周期
 
 - **等待超时**：`wait_for_messages.timeoutMs` 由工具自身 `setTimeout` 控制，超时以 `status:"timeout"` 正常返回。
-- **宿主取消**：监听 `extra.signal`，abort 时以 `status:"cancelled"` resolve，不抛错。
+- **宿主取消**：监听 `extra.signal`，abort 同步取消当前 wait，以 `status:"cancelled"`、空 payload、`cursor:null` resolve。取消本身不抛错，也不吞掉在途事务的实际失败。
 - **并发限制**：
   - 单会话同时最多 **1 个**未完成的 `wait_for_messages`；第二个并发等待返回 `CONFLICT`。
   - 全局负载与时序按固定候选单独验收，不能由一次成功等待推出吞吐保证；见 [V1 门禁](v1-acceptance.md#4-横切故障负载与迁移门禁)。
@@ -297,7 +309,7 @@ T2 已把上述**内存 `McpStore` 替换为 F2 的 SQLite 持久化**（`src/se
 - **新增 `heartbeat` 工具**（第 7 个）：刷新本 MCP 会话的连接心跳与 Agent `last_seen_at`；不改成员运行状态。
   入参无；出参 `{ ok, sessionId, state:"connected", lastHeartbeatAt }`。未入群 → `NOT_IN_GROUP`。
 - `wait_for_messages` 返回的 `cursor` 形如 `c_<seq>`（群组内单调 seq，稳定可解析）；`afterCursor` 接受同格式。
-- 持久化落点：`agents`（全局身份，`(display_name, host_type)` 唯一）、`members`、`group_participants`、
+- 持久化落点：`agents`（全局稳定身份 ID，当前名称/宿主仍保留唯一约束；v14 起接入由永久 `agent_legacy_aliases` 解析）、`members`、`group_participants`、
   `mcp_sessions`（连接状态，D1）、`member_statuses`（运行状态，D1）、`messages`、`message_deliveries`。
 - 挂起中的等待仍是运行时对象（不落库）；进程重启后由 agent 重连重新等待（重连积压留 T5）。
 

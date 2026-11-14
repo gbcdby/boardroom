@@ -59,7 +59,7 @@ export async function seedCompleteMemberRelations(repos: RepositorySet, db: DbDr
     ["运行评审", peer.id, member.id, "in-progress"],
     ["已完成事实", member.id, peer.id, "done"],
   ] as const) {
-    tasks.push(await repos.tasks.create({ id: randomUUID(), projectId: project.id, title, body: "固定任务正文 🧠", labels: ["不可变正文"], state,
+    tasks.push(await repos.tasks.create({ id: randomUUID(), projectId: project.id, title, body: "固定任务正文 🧠", deliveryKind: "code", acceptanceText: "固定任务正文 🧠", acceptanceSource: "explicit", labels: ["不可变正文"], state,
       assigneeMemberId, reviewerMemberId, repoPath: null, fixedPoint: null, revision: 1, currentReviewRoundId: null, blockedReason: null,
       author, createdAt: relationTime, updatedAt: relationTime }));
   }

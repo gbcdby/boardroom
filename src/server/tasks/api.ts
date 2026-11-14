@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DbDriver } from "../db/driver.ts";
 import { createRepositories } from "../db/repositories.ts";
 import { InvalidArgumentError, RepositoryError } from "../db/errors.ts";
+import { TaskError } from "./errors.ts";
 import type { Logger } from "../logger.ts";
 import type { ActorResolution } from "../api.ts";
 import type { Actor } from "../authz/authorize.ts";
@@ -9,6 +10,10 @@ import { ForbiddenError } from "../authz/authorize.ts";
 import { ownerActor } from "../authz/actors.ts";
 import { createTaskService, type TaskAccess } from "./service.ts";
 import { notifyWorkEventCommit } from "./events.ts";
+import { notifyResourceChange } from "../resource-changes.ts";
+import { conditionalJson } from "../conditional-json.ts";
+import { createDecisionApi, writeDecisionError } from "../decisions/api.ts";
+import { trustedLocalDecisionRequest } from "../decisions/trusted-local.ts";
 import {
   parseTaskInput, createTaskSchema, updateTaskSchema, transitionTaskSchema, commentTaskSchema,
   linkTaskMessageSchema, startTaskReviewSchema, beginTaskReviewSchema, submitReviewReportSchema,
@@ -44,9 +49,12 @@ export function createTaskApi(options: { db: DbDriver; logger: Logger;
   resolveActor?: (resolution: ActorResolution) => Promise<Actor | null>;
 }): { handle(request: IncomingMessage, response: ServerResponse, pathname: string): Promise<boolean> } {
   const log = options.logger.child({ component: "tasks-api" });
+  const decisions = createDecisionApi(options);
   const service = createTaskService({ repos: createRepositories(options.db),
-    onWorkEvents: events => notifyWorkEventCommit(options.db, events) });
+    onWorkEvents: events => notifyWorkEventCommit(options.db, events),
+    onResourceChanged: change => notifyResourceChange(options.db, change) });
   return { async handle(request, response, pathname) {
+    if (await decisions.handle(request,response,pathname)) return true;
     if (!/^\/api\/projects\/[^/]+\/(tasks|task-settings)(\/|$)/.test(pathname)) return false;
     try {
       if (!sameOrigin(request)) { json(response, 403, { error: { code: "forbidden", message: "仅接受本地同源任务请求。" } }); return true; }
@@ -59,7 +67,7 @@ export function createTaskApi(options: { db: DbDriver; logger: Logger;
       const access: TaskAccess = { actor };
       const method = request.method ?? "GET";
       if (parts[3] === "task-settings" && parts.length === 4) {
-        if (method === "GET") json(response, 200, { settings: await service.getSettings(access, projectId) });
+        if (method === "GET") conditionalJson(request, response, { settings: await service.getSettings(access, projectId) });
         else if (method === "PUT") json(response, 200, { settings: await service.setSettings(access, projectId, parseTaskInput(taskSettingsSchema, await body(request))) });
         else json(response, 405, { error: { code: "method_not_allowed", message: "此接口支持 GET / PUT。" } });
         return true;
@@ -68,14 +76,14 @@ export function createTaskApi(options: { db: DbDriver; logger: Logger;
       if (parts[3] === "tasks" && parts.length === 4) {
         if (method === "GET") {
           const query = Object.fromEntries(new URL(request.url ?? pathname, "http://127.0.0.1").searchParams);
-          json(response, 200, { tasks: await service.list(access, projectId, parseTaskInput(listTasksSchema, query)) });
+          conditionalJson(request, response, { tasks: await service.list(access, projectId, parseTaskInput(listTasksSchema, query)) });
         } else if (method === "POST") json(response, 201, { task: await service.create(access, projectId, parseTaskInput(createTaskSchema, await body(request))) });
         else json(response, 405, { error: { code: "method_not_allowed", message: "此接口支持 GET / POST。" } });
         return true;
       }
       const taskId = parts[4]!;
       if (parts.length === 5) {
-        if (method === "GET") json(response, 200, await service.get(access, projectId, taskId));
+        if (method === "GET") conditionalJson(request, response, await service.get(access, projectId, taskId));
         else if (method === "PATCH") json(response, 200, { task: await service.update(access, projectId, taskId, parseTaskInput(updateTaskSchema, await body(request))) });
         else json(response, 405, { error: { code: "method_not_allowed", message: "此接口支持 GET / PATCH。" } });
         return true;
@@ -98,15 +106,21 @@ export function createTaskApi(options: { db: DbDriver; logger: Logger;
         switch (parts[7]) {
           case "begin": json(response, 200, { round: await service.beginReview(access, projectId, taskId, roundId, parseTaskInput(beginTaskReviewSchema, input)) }); return true;
           case "reports": json(response, 201, { report: await service.submitReport(access, projectId, taskId, roundId, parseTaskInput(submitReviewReportSchema, input)) }); return true;
-          case "decision": json(response, 200, { task: await service.decideReview(access, projectId, taskId, roundId, parseTaskInput(decideTaskReviewSchema, input)) }); return true;
+          case "decision": {
+            const result=await service.decideReview(access,projectId,taskId,roundId,parseTaskInput(decideTaskReviewSchema,input),
+              actor.kind==='human'?trustedLocalDecisionRequest(request,actor):undefined);
+            json(response,result.receipt.httpStatus,result);return true;
+          }
         }
       }
       json(response, 404, { error: { code: "not_found", message: "任务接口不存在。" } });
     } catch (error) {
+      if (writeDecisionError(response,error)) return true;
       if (error instanceof ForbiddenError) json(response, 403, { error: { code: error.code, message: error.message } });
       else if (error instanceof RepositoryError) {
         const reason = "reason" in error && typeof error.reason === "string" ? error.reason : undefined;
-        json(response, errorStatus[error.code] ?? 500, { error: { code: error.code, message: error.message, ...(reason ? { reason } : {}) } });
+        json(response, errorStatus[error.code] ?? 500, { error: { code: error.code, message: error.message, ...(reason ? { reason } : {}),
+          ...(error instanceof TaskError ? { details: error.details } : {}) } });
       } else {
         log.error("task_request_failed", { error });
         json(response, 500, { error: { code: "internal_error", message: "任务操作失败，请重试。" } });

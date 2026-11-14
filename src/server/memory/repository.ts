@@ -1,3 +1,5 @@
+import { isWorkEventEligible } from "../tasks/work-event-storage.ts";
+import { validateLiveCompletionSource } from '../decisions/storage-validation.ts';
 import type { MemoryKey, MemoryDocument, MemoryVersion, MemorySummaryRequest, SummaryState } from "../../shared/memory.ts";
 
 export type ScanCursor = { at: string; id: string }; // messages: first_mcp_delivered_at+deliveryId；task: event.created_at+eventId
@@ -342,10 +344,12 @@ export function createMemoryRepository(ctx: RepoCtx): MemoryRepository {
     },
     async scanUnmaterializedTaskCompletions(projectId, agentId, page) {
       const cursor = pageWhere('created_at', 'id', page);
-      const raw = await ctx.query<{ id: string; created_at: string; task_id: string | null; recipient_member_id: string; payload: string }>(`SELECT id, created_at, task_id, recipient_member_id, payload FROM work_events
+      const raw = await ctx.query<{ id: string; project_id: string; kind: string; event_key: string; created_at: string; task_id: string | null; recipient_member_id: string; payload: string }>(`SELECT id, project_id, kind, event_key, created_at, task_id, recipient_member_id, payload FROM work_events
         WHERE project_id = ? AND kind = 'task.review_decided'${cursor.sql} ORDER BY created_at, id LIMIT ?`, [projectId, ...cursor.params, page.limit + 1]);
       const scanned = raw.slice(0, page.limit); const rows: TaskCompletionSource[] = [];
       for (const event of scanned) {
+        if (!await isWorkEventEligible(ctx, projectId, event.id)) continue;
+        await validateLiveCompletionSource(ctx, event);
         let payload: Record<string, unknown>;
         try { payload = JSON.parse(event.payload); } catch { continue; }
         if (!payload || typeof payload !== 'object' || payload.enteredDone !== true || payload.assigneeAgentId !== agentId

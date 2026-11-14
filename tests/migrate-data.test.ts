@@ -28,10 +28,15 @@ import {
 import { seedSampleData } from "../src/server/db/seed-sample-data.ts";
 import { createRepositories } from "../src/server/db/repositories.ts";
 import { appendAuditEntry } from "../src/server/audit.ts";
+import { createMcpConnections } from "../src/server/mcp/connections/service.ts";
+import { ownerActor } from "../src/server/authz/actors.ts";
+import { discoveryTestServer, discoveryTool } from "./helpers/mcp-discovery-server.ts";
 import type { Task, ReviewRound, ReviewReport } from "../src/shared/tasks.ts";
 
 const PG_URL =
   process.env["AGENT_STUDIO_PG_TEST_URL"] ?? process.env["AGENT_STUDIO_PG_CONNECTION_STRING"];
+// 独立于生产清单的 v19 覆盖合同，不能用 BUSINESS_TABLES 自己证明自己完整。
+const MCP_TABLES = ["mcp_connections", "mcp_connection_versions", "mcp_catalog_snapshots", "mcp_catalog_heads", "mcp_connection_mutations", "mcp_discovery_attempts"];
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-m1-"));
@@ -63,7 +68,7 @@ async function seedSqliteDir(dir: string): Promise<void> {
     const repos = createRepositories(driver);
     const at = "2026-11-10T12:00:00.000Z";
     const author = { kind: "human" as const, actorId: "owner", displayName: "人" };
-    const task: Task = { id: "task-copy", projectId: "pr1", title: "迁移任务", body: "验收正文", labels: ["迁移"], state: "in-progress",
+    const task: Task = { id: "task-copy", projectId: "pr1", title: "迁移任务", body: "验收正文", deliveryKind: "code", acceptanceText: "明确验收与 Unicode 🧪\n独立于目标", acceptanceSource: "explicit", labels: ["迁移"], state: "in-progress",
       assigneeMemberId: "mb1", reviewerMemberId: "mb2", repoPath: "/repo", fixedPoint: "HEAD~1", revision: 1,
       currentReviewRoundId: null, blockedReason: null, author, createdAt: at, updatedAt: at };
     await repos.tasks.setSettings("pr1", 0, "mb2");
@@ -117,7 +122,13 @@ async function seedSqliteDir(dir: string): Promise<void> {
     for (const [index, kind] of ["authored-messages", "deliveries", "memory-requests", "memory-receipts", "memory-counters", "memory-checkpoints"].entries()) {
       await driver.exec("UPDATE member_fact_revisions SET revision = ? WHERE kind = ?", [101 + index, kind]);
     }
-
+    const service = createMcpConnections({ db: driver }), upstream = await discoveryTestServer({ page: () => ({ tools: [discoveryTool("migrate")] }) });
+    try {
+      const connection = await service.create({ actor: ownerActor() }, { requestId: "migrate-connection", name: "迁移目录", enabled: true,
+        transport: { type: "streamable-http", endpoint: upstream.endpoint } });
+      assert.equal((await service.discover({ actor: ownerActor() }, connection.connectionId, { requestId: "migrate-discovery", expectedRevision: 1 })).status, "succeeded");
+      for (const table of MCP_TABLES) assert.ok((await driver.query(`SELECT * FROM ${table}`)).length > 0, `${table} 需实际非空`);
+    } finally { await service.close(); await upstream.close(); }
   } finally {
     await driver.close();
   }
@@ -127,6 +138,8 @@ async function assertDispatchValues(options: DbDriverOptions): Promise<void> {
   const driver = createDbDriver(options);
   await driver.connect();
   try {
+    assert.deepEqual(await driver.query("SELECT delivery_kind, acceptance_text, acceptance_source FROM tasks WHERE id = 'task-copy'"),
+      [{ delivery_kind: "code", acceptance_text: "明确验收与 Unicode 🧪\n独立于目标", acceptance_source: "explicit" }]);
     assert.deepEqual(await driver.query("SELECT id, client_message_id FROM messages ORDER BY id"), [
       { id: "msg1", client_message_id: "migration-request" },
       { id: "msg2", client_message_id: null },
@@ -152,6 +165,15 @@ async function assertDispatchValues(options: DbDriverOptions): Promise<void> {
 
 // 跨表外键依赖（自引用 org_nodes 由递归读取处理，此处不计入顺序约束）。
 const FK_DEPS: Record<string, string[]> = {
+  mcp_connection_versions: ["mcp_connections"],
+  mcp_catalog_snapshots: ["mcp_connection_versions"],
+  mcp_catalog_heads: ["mcp_catalog_snapshots"],
+  mcp_connection_mutations: ["mcp_connections"],
+  mcp_discovery_attempts: ["mcp_connection_versions", "mcp_catalog_snapshots"],
+  policy_documents: ["projects"],
+  policy_document_versions: ["policy_documents"],
+  project_workspace_versions: ["projects"],
+  role_template_versions: ["role_templates"],
   org_nodes: ["projects"],
   members: ["projects", "agents", "org_nodes"],
   groups: ["projects"],
@@ -178,14 +200,19 @@ const FK_DEPS: Record<string, string[]> = {
   memory_trigger_counters: ["projects", "agents", "groups"], memory_scan_checkpoints: ["projects", "agents", "groups"],
 };
 
-test("业务表清单：33 张表、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
+test("业务表清单：58 张表含 v19 MCP、v20 Decision 与 v21 WorkEvent 失效边车、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
   const names = BUSINESS_TABLES.map((t) => t.name);
-  assert.equal(names.length, 33);
+  assert.equal(names.length, 58);
+  assert.ok(names.includes("work_event_delivery_invalidations"));
   assert.equal(names.at(-1), "member_fact_revisions");
   assert.ok(!names.includes("schema_migrations"));
   for (const expected of [
+    ...MCP_TABLES,
     "agents",
+    "agent_legacy_aliases", "role_templates", "role_template_versions",
     "projects",
+    "policy_documents", "policy_document_versions",
+    "project_workspace_versions",
     "members",
     "groups",
     "org_nodes",
@@ -316,16 +343,35 @@ test("SQLite → SQLite：目标键集完整（含复合主键表与 id 保留�
   });
 });
 
+test("任务资料值参与复制校验，相同主键但验收漂移不能通过", async () => {
+  await withTempDir(async srcDir => {
+    await seedSqliteDir(srcDir);
+    await withTempDir(async dstDir => {
+      const source: DbDriverOptions = { dbDriver: "sqlite", dataDir: srcDir }, target: DbDriverOptions = { dbDriver: "sqlite", dataDir: dstDir };
+      assert.equal((await migrateData(source, target)).validation.ok, true);
+      const driver = createDbDriver(target); await driver.connect();
+      try { await driver.exec("UPDATE tasks SET acceptance_text = ? WHERE id = 'task-copy'", ["被错误替换的验收"]); }
+      finally { await driver.close(); }
+      assert.equal((await validateData(source, target)).ok, false);
+    });
+  });
+});
+
 test("回滚：清空目标业务表，源库不受影响；可重新迁移恢复", async () => {
   await withTempDir(async (srcDir) => {
     await seedSqliteDir(srcDir);
     const srcOpts: DbDriverOptions = { dbDriver: "sqlite", dataDir: srcDir };
     await withTempDir(async (dstDir) => {
       const dstOpts: DbDriverOptions = { dbDriver: "sqlite", dataDir: dstDir };
-      await migrateData(srcOpts, dstOpts);
+      const migrated = await migrateData(srcOpts, dstOpts);
+      for (const table of MCP_TABLES) assert.ok(migrated.validation.tables.find(row => row.table === table)!.targetCount > 0, `${table} 需实际复制`);
 
       const rb = await rollbackTarget(dstOpts);
-      assert.equal(rb.clearedTables.length, 33);
+      assert.equal(rb.clearedTables.length, 58);
+      for (const table of MCP_TABLES) assert.ok(rb.clearedTables.includes(table), `${table} 需参与clear`);
+      const emptied = createDbDriver(dstOpts); await emptied.connect();
+      try { for (const table of MCP_TABLES) assert.equal((await emptied.query(`SELECT * FROM ${table}`)).length, 0, `${table} 未清空`); }
+      finally { await emptied.close(); }
 
       // 目标业务表已清空，校验失败。
       const afterRollback = await validateData(srcOpts, dstOpts);

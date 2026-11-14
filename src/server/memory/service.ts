@@ -1,3 +1,5 @@
+import { isWorkEventEligible } from "../tasks/work-event-storage.ts";
+import { validateLiveCompletionSource } from '../decisions/storage-validation.ts';
 import { createHash } from "node:crypto";
 import type { MemoryAuthor, MemoryConfig, MemoryDocument, MemoryInjection, MemoryKey, MemorySummaryPacket, MemorySummaryRequest,
   MemoryVersion, MemoryWriteSource, SelfSummaryEvidence, SubmitMemorySummaryInput, SummaryTrigger, WriteMemoryInput, WriteMemoryResult } from "../../shared/memory.ts";
@@ -214,8 +216,20 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
     await repos.tasks.acknowledgeWorkEvent(request.projectId, request.recipientMemberId, summaryEventId(request.id), ctx.at,
       request.contextGroupId === null ? undefined : { contextGroupId: request.contextGroupId });
   }
+  async function eligibleCompletion(projectId: string, eventId: string, agentId: string): Promise<boolean> {
+    if (!await isWorkEventEligible(repos.context, projectId, eventId)) return false;
+    const event = await repos.context.one('SELECT * FROM work_events WHERE project_id=? AND id=?', [projectId, eventId]);
+    if (!event || event.kind !== 'task.review_decided') return false;
+    await validateLiveCompletionSource(repos.context, event);
+    let payload: Record<string, unknown>;
+    try { payload = JSON.parse(String(event.payload)); } catch { return false; }
+    return payload?.enteredDone === true && payload.assigneeAgentId === agentId;
+  }
   async function createRequest(ctx: Context, target: Member, source: SummarySource, invalid?: InvalidSummary): Promise<{ request: MemorySummaryRequest; created: boolean }> {
     if (!target.agentId || target.kind !== "agent" || target.status !== "active") throw new MemoryError("memory_summary_target_inactive", "目标 Agent 当前不可执行总结。", "conflict");
+    if (source.sourceWorkEventId && !await eligibleCompletion(target.projectId, source.sourceWorkEventId, target.agentId!)) {
+      throw new MemoryError("memory_summary_source_changed", "来源工作事件已因成员生命周期变化失效。", "conflict");
+    }
     const prior = await repos.memory.findRequestByTrigger(target.projectId, target.agentId, source.triggerKey);
     if (prior) return { request: prior, created: false };
     const current = await repos.memory.get({ scope: "project-agent", projectId: target.projectId, agentId: target.agentId });
@@ -245,6 +259,9 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
     return { request, created: true };
   }
   async function invalidSource(request: MemorySummaryRequest): Promise<InvalidSummary | null> {
+    if (request.sourceWorkEventId && !await eligibleCompletion(request.projectId, request.sourceWorkEventId, request.agentId)) {
+      return { state: "cancelled", code: "memory_summary_source_changed", message: "来源工作事件已因成员生命周期变化失效。" };
+    }
     if (request.taskId !== null) {
       const task = await repos.tasks.get(request.projectId, request.taskId);
       if (!task || task.state !== "done" || task.revision !== request.completedTaskRevision) {
@@ -340,6 +357,7 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
       // 每安全点共两页来源：任务一页、消息一页，各最多50 raw rows；无 while 追新数据。
       await run("task_completed", ctx => reconcileTaskCompletionPage({ repo: repos.memory, projectId, agentId: ctx.member!.agentId!,
         materialize: async source => {
+          if (!await isWorkEventEligible(repos.context, projectId, source.eventId)) return false;
           const task = await repos.tasks.get(projectId, source.taskId);
           const invalid: InvalidSummary | undefined = !task || task.state !== "done" || task.revision !== source.completionRevision
             ? { state: "cancelled", code: "memory_summary_source_changed", message: "来源任务已变化，旧完成记录不再启动总结。" } : undefined;
@@ -511,6 +529,7 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
         const target = await repos.members.findByAgent(old.projectId, old.agentId);
         if (!target || target.status !== "active" || target.kind !== "agent") throw new MemoryError("memory_summary_target_inactive", "目标 Agent 当前不可执行总结。", "conflict");
         if (old.contextGroupId !== null) await requireGroup(ctx, access, old.contextGroupId, true);
+        if (old.sourceWorkEventId && !await eligibleCompletion(old.projectId, old.sourceWorkEventId, old.agentId)) throw new MemoryError("memory_summary_source_changed", "来源工作事件已因成员生命周期变化失效。", "conflict");
         const triggerKey = `retry:${hash(JSON.stringify([old.id, ctx.actor.actorId, clientMutationId]))}`;
         const duplicate = await repos.memory.findRequestByTrigger(old.projectId, old.agentId, triggerKey);
         if (duplicate) return duplicate;

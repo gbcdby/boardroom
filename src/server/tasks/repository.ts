@@ -2,6 +2,8 @@ import type { Task, TaskSettings, TaskState, TaskComment, TaskHistory, TaskMessa
 import type { RepoCtx } from "../db/repositories.ts";
 import { ArchivedError, ConflictError, InvalidArgumentError, InvalidReferenceError, NotFoundError } from "../db/errors.ts";
 import { isDeepStrictEqual } from "node:util";
+import { eligibleWorkEventSql, isWorkEventEligible } from "./work-event-storage.ts";
+import { TaskError } from "./errors.ts";
 
 export interface TasksRepository {
   getSettings(projectId: string): Promise<TaskSettings>;
@@ -12,11 +14,11 @@ export interface TasksRepository {
   get(projectId: string, taskId: string): Promise<Task | null>;
   list(projectId: string, filter?: { state?: TaskState; assigneeMemberId?: string }): Promise<Task[]>;
   updateCas(projectId: string, taskId: string, expectedRevision: number,
-    patch: Partial<Pick<Task, 'title'|'body'|'labels'|'state'|'assigneeMemberId'|'reviewerMemberId'|'repoPath'|'fixedPoint'|'currentReviewRoundId'|'blockedReason'>>,
+    patch: Partial<Pick<Task, 'title'|'body'|'labels'|'state'|'assigneeMemberId'|'reviewerMemberId'|'repoPath'|'fixedPoint'|'currentReviewRoundId'|'blockedReason'|'deliveryKind'|'acceptanceText'|'acceptanceSource'>>,
     at: string): Promise<Task>; // UPDATE ... WHERE revision=?；成功恰好 +1，零行 conflict
   /** server-only 历史投影补偿；非 active 引用只允许 blocked/done，revision 从当前值递增。 */
   updateLifecycleCas(projectId: string, taskId: string, expectedRevision: number,
-    patch: Partial<Pick<Task, 'title'|'body'|'labels'|'state'|'assigneeMemberId'|'reviewerMemberId'|'repoPath'|'fixedPoint'|'currentReviewRoundId'|'blockedReason'>>,
+    patch: Partial<Pick<Task, 'title'|'body'|'labels'|'state'|'assigneeMemberId'|'reviewerMemberId'|'repoPath'|'fixedPoint'|'currentReviewRoundId'|'blockedReason'|'deliveryKind'|'acceptanceText'|'acceptanceSource'>>,
     at: string): Promise<Task>;
   /** 有界补偿专用：不读任务正文，只更新已捕获的生命周期投影；调用方定向读回。 */
   updateLifecycleProjectionCas(projectId: string, taskId: string, expectedRevision: number,
@@ -47,6 +49,7 @@ export interface TasksRepository {
 type TaskRow = {
   id: string; project_id: string; title: string; body: string; labels: string; state: TaskState;
   assignee_member_id: string | null; reviewer_member_id: string | null; repo_path: string | null; fixed_point: string | null;
+  delivery_kind?: Task['deliveryKind']; acceptance_text?: string; acceptance_source?: Task['acceptanceSource'];
   revision: number; current_review_round_id: string | null; blocked_reason: string | null; author: string; created_at: string; updated_at: string;
 };
 type RoundRow = {
@@ -76,6 +79,8 @@ function json(value: unknown): string {
 function toTask(row: TaskRow): Task {
   return { id: row.id, projectId: row.project_id, title: row.title, body: row.body, labels: JSON.parse(row.labels), state: row.state,
     assigneeMemberId: row.assignee_member_id, reviewerMemberId: row.reviewer_member_id, repoPath: row.repo_path, fixedPoint: row.fixed_point,
+    deliveryKind: row.delivery_kind === undefined ? 'code' : row.delivery_kind, acceptanceText: row.acceptance_text ?? row.body,
+    acceptanceSource: row.acceptance_source ?? 'legacy_task_body',
     revision: row.revision, currentReviewRoundId: row.current_review_round_id, blockedReason: row.blocked_reason,
     author: JSON.parse(row.author), createdAt: row.created_at, updatedAt: row.updated_at };
 }
@@ -173,7 +178,8 @@ export function createTasksRepository(ctx: RepoCtx): TasksRepository {
       const inactive = await checkTaskReferences(next, !lifecycle && patch.assigneeMemberId !== undefined, !lifecycle && patch.reviewerMemberId !== undefined);
       if (lifecycle && inactive && !["blocked", "done"].includes(next.state)) throw new InvalidReferenceError("失活成员的历史任务只能保持 blocked；已完成任务不重新执行。");
       const columns = { title: "title", body: "body", labels: "labels", state: "state", assigneeMemberId: "assignee_member_id",
-        reviewerMemberId: "reviewer_member_id", repoPath: "repo_path", fixedPoint: "fixed_point", currentReviewRoundId: "current_review_round_id", blockedReason: "blocked_reason" } as const;
+        reviewerMemberId: "reviewer_member_id", repoPath: "repo_path", fixedPoint: "fixed_point", currentReviewRoundId: "current_review_round_id", blockedReason: "blocked_reason",
+        deliveryKind: "delivery_kind", acceptanceText: "acceptance_text", acceptanceSource: "acceptance_source" } as const;
       const changes: string[] = []; const values: unknown[] = [];
       for (const key of Object.keys(columns) as Array<keyof typeof columns>) {
         if (patch[key] === undefined) continue;
@@ -210,11 +216,13 @@ export function createTasksRepository(ctx: RepoCtx): TasksRepository {
         await requireActive(task.projectId);
         if (task.revision !== 1) throw new InvalidArgumentError("新任务 revision 必须为 1。");
         await checkTaskReferences(task);
+        const intake = Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 16"));
         await ctx.exec(`INSERT INTO tasks (id, project_id, title, body, labels, state, assignee_member_id, reviewer_member_id,
-          repo_path, fixed_point, revision, current_review_round_id, blocked_reason, author, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          repo_path, fixed_point, revision, current_review_round_id, blocked_reason, author, created_at, updated_at${intake ? ", delivery_kind, acceptance_text, acceptance_source" : ""})
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${intake ? ", ?, ?, ?" : ""})`,
           [task.id, task.projectId, task.title, task.body, json(task.labels), task.state, task.assigneeMemberId, task.reviewerMemberId,
-            task.repoPath, task.fixedPoint, task.revision, task.currentReviewRoundId, task.blockedReason, json(task.author), task.createdAt, task.updatedAt]);
+            task.repoPath, task.fixedPoint, task.revision, task.currentReviewRoundId, task.blockedReason, json(task.author), task.createdAt, task.updatedAt,
+            ...(intake ? [task.deliveryKind, task.acceptanceText, task.acceptanceSource] : [])]);
         return (await repo.get(task.projectId, task.id))!;
       });
     },
@@ -394,7 +402,7 @@ export function createTasksRepository(ctx: RepoCtx): TasksRepository {
     async listUnackedWorkEvents(projectId, memberId, limit = 100, options = {}) {
       if (!Number.isSafeInteger(limit) || limit < 1) throw new InvalidArgumentError("事件数量必须为正整数。");
       const group = await eventGroupFilter(options);
-      return (await ctx.query<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND delivery_state <> 'acked'${group.sql} ORDER BY created_at, id LIMIT ?`,
+      return (await ctx.query<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND delivery_state <> 'acked'${group.sql}${await eligibleWorkEventSql(ctx)} ORDER BY created_at, id LIMIT ?`,
         [projectId, memberId, ...group.params, limit])).map(toEvent);
     },
     async markWorkEventsDelivered(projectId, memberId, ids, at, options = {}) {
@@ -407,10 +415,10 @@ export function createTasksRepository(ctx: RepoCtx): TasksRepository {
           const params = [projectId, memberId, id, ...group.params];
           const row = await ctx.one<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql}`, params);
           if (!row) throw new NotFoundError("工作事件不存在或不属于当前接收人和群组范围。");
-          if (row.delivery_state === "acked") continue;
-          await ctx.exec(`UPDATE work_events SET delivery_state = 'delivered', attempts = attempts + 1, first_delivered_at = COALESCE(first_delivered_at, ?), last_delivered_at = ? WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql} AND delivery_state <> 'acked'`, [at, at, ...params]);
+          if (row.delivery_state === "acked" || !await isWorkEventEligible(ctx, projectId, id)) continue;
+          await ctx.exec(`UPDATE work_events SET delivery_state = 'delivered', attempts = attempts + 1, first_delivered_at = COALESCE(first_delivered_at, ?), last_delivered_at = ? WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql} AND delivery_state <> 'acked'${await eligibleWorkEventSql(ctx)}`, [at, at, ...params]);
           const saved = (await ctx.one<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql}`, params))!;
-          if (saved.delivery_state !== "acked") result.push(toEvent(saved));
+          if (saved.delivery_state !== "acked" && await isWorkEventEligible(ctx, projectId, id)) result.push(toEvent(saved));
         }
         return result;
       });
@@ -423,8 +431,9 @@ export function createTasksRepository(ctx: RepoCtx): TasksRepository {
         const params = [projectId, memberId, id, ...group.params];
         const row = await ctx.one<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql}`, params);
         if (!row) throw new NotFoundError("工作事件不存在或不属于当前接收人和群组范围。");
+        if (!await isWorkEventEligible(ctx, projectId, id)) throw new TaskError("work_event_delivery_invalidated", "工作事件已因成员生命周期变化失效。", "conflict");
         if (row.delivery_state === "acked") return { event: toEvent(row), alreadyAcknowledged: true };
-        const changed = await ctx.exec(`UPDATE work_events SET delivery_state = 'acked', acked_at = ? WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql} AND delivery_state <> 'acked'`, [at, ...params]);
+        const changed = await ctx.exec(`UPDATE work_events SET delivery_state = 'acked', acked_at = ? WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql} AND delivery_state <> 'acked'${await eligibleWorkEventSql(ctx)}`, [at, ...params]);
         const saved = (await ctx.one<EventRow>(`SELECT * FROM work_events WHERE project_id = ? AND recipient_member_id = ? AND id = ?${group.sql}`, params))!;
         return { event: toEvent(saved), alreadyAcknowledged: changed === 0 };
       });

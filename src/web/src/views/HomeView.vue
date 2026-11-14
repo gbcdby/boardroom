@@ -73,7 +73,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 
 <template>
   <section class="page home-page">
-    <header class="page-header"><div><h1>工作概览</h1><p class="page-description">项目、对话与 Agent，在这里有序协作。</p></div><RouterLink to="/projects" class="primary"><AppIcon name="plus" :size="17" />创建项目</RouterLink></header>
+    <header class="page-header"><div><h1>协作总览</h1><p class="page-description">项目、对话与 Agent，在这里有序协作。</p></div><RouterLink to="/projects?create=project" class="primary"><AppIcon name="plus" :size="17" />创建项目</RouterLink></header>
     <div v-if="projectError" class="error" role="alert">项目暂时无法加载：{{ projectError }} <button type="button" class="text-button" :disabled="refreshing" @click="refresh">重新加载</button></div>
     <dl class="overview-metrics" :aria-busy="loading">
       <div><dt>进行中的项目</dt><dd>{{ loading || projectError ? '—' : projects.length }}</dd><span>未归档的协作空间</span></div>
@@ -84,7 +84,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
       <section class="panel project-overview" aria-labelledby="projects-title">
         <div class="section-heading"><h2 id="projects-title">你的项目</h2><button type="button" class="text-button" :disabled="refreshing" @click="refresh">{{ refreshing ? '刷新中…' : '刷新' }}</button></div>
         <p v-if="loading" class="muted loading-state" role="status">正在读取项目…</p>
-        <div v-else-if="!projectError && projects.length === 0" class="empty-state"><span class="empty-icon"><AppIcon name="folder" :size="30" /></span><h3>从一个项目开始</h3><p>添加成员，创建群组，开始你的第一段协作。</p><RouterLink to="/projects" class="secondary">创建第一个项目<AppIcon name="arrow" :size="16" /></RouterLink></div>
+        <div v-else-if="!projectError && projects.length === 0" class="empty-state"><span class="empty-icon"><AppIcon name="folder" :size="30" /></span><h3>从一个项目开始</h3><p>添加成员，创建群组，开始你的第一段协作。</p><RouterLink to="/projects?create=project" class="secondary">创建第一个项目<AppIcon name="arrow" :size="16" /></RouterLink></div>
         <ul v-else class="home-projects"><li v-for="project in projects" :key="project.id"><RouterLink :to="projectPath(project.id)" class="home-project-link"><span class="project-monogram">{{ project.name.slice(0, 1) }}</span><span class="project-copy"><strong>{{ project.name }}</strong><span>{{ project.memberCount ?? 0 }} 位成员<span aria-hidden="true"> · </span>{{ project.groupCount ?? 0 }} 个群组</span></span><span class="project-activity"><span class="badge" :class="{ ok: project.status === 'active' }">{{ project.status === 'active' ? '活跃' : '空闲' }}</span><small>{{ recentActivity(project.lastActivityAt) }}</small></span><AppIcon name="chevron" :size="16" /></RouterLink></li></ul>
         <RouterLink v-if="projects.length" to="/projects" class="manage-projects">管理项目与群组<AppIcon name="arrow" :size="15" /></RouterLink>
       </section>

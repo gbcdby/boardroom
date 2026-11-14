@@ -42,7 +42,7 @@ npm start
 | WebSocket | `ws://127.0.0.1:4317/ws` |
 | MCP（Streamable HTTP） | `http://127.0.0.1:4317/mcp` |
 
-默认首次启动会创建 `data/agent-studio.db` 并应用数据库迁移；后续启动校验已应用迁移并执行新增迁移。数据目录相对进程工作目录解析，重启要保留同一份数据。当前迁移定义见[迁移列表](src/server/db/migrations/index.ts)。
+合法的首次 v1 启动会创建 `data/agent-studio.db` 并应用数据库迁移；后续启动校验已应用迁移并执行新增迁移。旧相对数据目录仍按原启动工作目录解析，重启要保留同一份数据。发现来源歧义、未完成迁移或配置错误时，服务会拒绝启动并给出恢复动作，避免另开空库。当前迁移定义见[迁移列表](src/server/db/migrations/index.ts)，来源检查见[环境解析](docs/environment-resolution.md)。
 
 ### 从 WebUI 到 agent 入群
 
@@ -65,9 +65,21 @@ npm start
 
 服务注册了 `join`、`wait_for_messages`、`send_message`、`acknowledge_message`、`report_status`、`heartbeat`、`read_history` 七个聊天工具，十五个任务、评审与工作通知工具，以及十个记忆工具，共 **32 个**。完整分组、参数来源和错误格式见 [MCP 工具契约](docs/mcp-tool-contract.md)，当前注册以[工具实现](src/server/mcp/server.ts)为准。每个 MCP 会话绑定一个项目/群组；连接成功不等于已经入群，ACK 不代表任务或自总结已完成。
 
-另有 [stdio 入口](src/server/mcp/stdio.ts)：由宿主运行 `node /绝对路径/src/server/mcp/stdio.ts`。它独立打开数据库，必须与 Web 服务使用同一存储配置（SQLite 使用相同的绝对数据目录）。**共享数据库不会共享进程内唤醒通知**；跨进程新消息需在再次调用 `wait_for_messages` 时读取积压。需要 WebUI 发消息及时结束挂起等待时，使用同一服务上的 Streamable HTTP。
+另有 [stdio 入口](src/server/mcp/stdio.ts)：由宿主运行 `node /绝对路径/src/server/mcp/stdio.ts`。它与 Web 服务共用环境解析规则，但独立打开数据库；从不同工作目录启动时，应使用同一显式配置及绝对数据目录。显式配置无效会非零退出，诊断仅写 stderr，不回落为另一份 SQLite 数据。**共享数据库不会共享进程内唤醒通知**；跨进程新消息需在再次调用 `wait_for_messages` 时读取积压。需要 WebUI 发消息及时结束挂起等待时，使用同一服务上的 Streamable HTTP。
+
+## 角色库与稳定身份
+
+角色职责模板可通过 `/api/roles` 创建、复制、编辑、归档和读取历史版本；推荐 Skills 作为元数据保存。模板名称和指令不会授予系统权限。稳定 Agent 可通过 `/api/agents` 查询或改显示名，旧客户端 alias 永久保留；改名后以旧名字重新接入，仍使用同一个 Agent 和项目成员身份。
+
+旧 runtime 仍是当前可写配置来源。Profile/Binding 检查接口只读，分别展示有效、请求及已应用快照、原目录和运行观察，供后续迁移核对；读取不会应用配置。角色库目前提供本地管理 API，完整请求、二次确认、审计和 v14 兼容边界见[角色与身份契约](docs/identity-catalog.md)。
+
+## 外部 MCP 连接与工具目录
+
+本地用户可通过 `/api/mcp/connections` 保存全局连接配置及不可变版本，显式发起检查/刷新后读取完整工具目录。当前发现支持无凭据 Streamable HTTP 的 `initialize`、`tools/list` 和分页；需要凭据或外部 stdio 启动条件时明确返回 `blocked`。发现结果、配置登记和模型实际装载分开记录，完整接口与支持边界见[外部 MCP 目录](docs/mcp-connections.md)。
 
 ## 可选托管 Agent 运行时
+
+项目创建与工作区管理 API 可保存已有目录或 `rootPath: null`，返回独立配置版本、规范路径与只读 Git 观察；详情见[项目工作区配置](docs/project-workspaces.md)。保存和改绑不会修改已有托管实例的 cwd，也不创建工作副本或写入目录内的 Skills。
 
 打开 `/runtimes` 创建一个托管身份及项目/群绑定，填写独立于 boardroom 服务目录和数据目录的工作目录。创建后处于停止状态。每个绑定按字段选择继承全局配置或显式覆盖；空工具列表表示不开放普通工具，与继承不同。普通 Claude 配置默认 Auto；高级“跳过 CLI 普通权限确认”默认关闭，只属于当前绑定与配置修订，下一次编辑需要重新明确开启。
 
@@ -87,7 +99,9 @@ npm start
 
 ## 配置与存储
 
-优先级为 **默认值 → 配置文件 → 环境变量**。`AGENT_STUDIO_CONFIG` 可指定配置文件；未设置时读取 `<cwd>/config.json`，默认文件不存在则使用默认值。参考 [config.example.json](config.example.json)，实际解析规则见 [config.ts](src/server/config.ts)。
+字段优先级为 **默认值 → 配置文件 → 环境变量**。配置文件依次选择显式 `AGENT_STUDIO_CONFIG`、`<BOARDROOM_HOME>/config.json`、旧 `<cwd>/config.json`；默认文件均不存在时才使用默认值。`BOARDROOM_HOME` 默认是用户目录下的 `~/.boardroom`，覆盖值必须为绝对路径。显式配置缺失、损坏或不可访问会拒绝启动。参考 [config.example.json](config.example.json)，完整选择、恢复和路径规则见[环境解析与旧数据来源预检](docs/environment-resolution.md)。
+
+当前仍使用原 v1 数据库和库内记忆正文，`~/.boardroom` 的 state/skills/memory 等新布局位置只作规划；此阶段不会自动搬迁或激活新存储。运行 `node scripts/inspect-storage.ts` 可取得不打开数据库、不写文件的来源清单；已知旧启动目录可用重复的 `--legacy-cwd /绝对路径` 指定。
 
 在 `/settings` 查看当前进程已经生效的配置与实际 MCP 地址。修改配置文件或启动环境后，正常停止并重新启动服务，再刷新页面核对；页面不保存配置或执行重启。详见[设置与配置生效](docs/settings.md)。
 
@@ -95,6 +109,7 @@ npm start
 | --- | --- | --- |
 | `port` | `AGENT_STUDIO_PORT` | `4317`，只绑定 `127.0.0.1` |
 | `dataDir` | `AGENT_STUDIO_DATA_DIR` | `data`，SQLite 数据目录，相对 cwd 解析 |
+| — | `BOARDROOM_HOME` | 用户目录下的 `.boardroom`；须为绝对路径，不改写 `HOME` 或自动移动旧数据 |
 | `dbDriver` | `AGENT_STUDIO_DB_DRIVER` | `sqlite`；可选 `postgres` |
 | `pgConnectionString` | `AGENT_STUDIO_PG_CONNECTION_STRING` | 无；选择 `postgres` 时必填 |
 | `heartbeat.intervalMs` | `AGENT_STUDIO_HEARTBEAT_INTERVAL_MS` | `10000` ms |
@@ -137,6 +152,10 @@ HTTP、MCP 与业务仓储已通过统一 `DbDriver` 接入两种数据库，选
 开发代理把 `/api`、`/ws` 固定转到后端 4317；修改后端端口时也要调整 [Vite 代理](src/web/vite.config.ts)。MCP 客户端直接连接后端 `/mcp`。
 
 真实 PostgreSQL 测试需显式设置 `AGENT_STUDIO_PG_TEST_URL` 后运行 `npm test`；使用专用测试库。缺少 PG 配置时，相关用例会跳过或不注册，默认测试通过不证明 PG 运行路径已验收。三个 SDK e2e 命令默认用 SQLite，可通过 `AGENT_STUDIO_DB_DRIVER=postgres` 和 `AGENT_STUDIO_PG_CONNECTION_STRING` 切换。真实 Chromium 安装/运行及干净启动复验步骤见[接入指南](docs/getting-started-mcp.md#8-验收与可重复验证)。
+
+PostgreSQL 维护快照的 `public` 隔离恢复使用 `pg16-public-native-segments-v1` 能力：当前要求原生 `pg_dump`、`pg_restore`、`psql` 均为 **16.15**，通过完整 TOC 审计后，由 `psql` 在一个事务内执行未改写的原生 SQL；工具缺失、版本不匹配或无法核实输入文件身份时阻断。自定义 schema 继续使用原 `pg_restore --single-transaction` 路径。
+
+public 的单次 **300 秒整体期限**从首次 native 阶段起算，贯穿 backend 退出核对、完整 manifest、最终只读 COMMIT、监控与资源收尾，直到成功回执。超时、取消、源/目标失效或最终 monitor 失败均拒绝成功；失败清理仍等待本次 child 实际 close 与自有 backend 退出。native 隔离恢复事务若已经提交，后续验证失败不会把该事实记作回滚。普通 PG 回归覆盖真实恢复、权限与失败退出；`tests/maintenance-postgres-public-terminal.test.ts` 用真实 PG 和受控单调时钟注入检查成功尾部，实际 300 秒 native 超时另用 `node --test tests/maintenance-postgres-public-deadline.acceptance.ts` 在专用 PG 环境执行，不缩短生产预算。平台上的受控 FD 能力、CI 和整票验收仍分别记录。
 
 **SDK 检查不会启动真实模型或 harness**，也不覆盖浏览器中的完整人工操作。2026-11-11 的独立真实宿主回传见 [#112](https://github.com/gbcdby/boardroom/issues/112#issuecomment-6790053498)及 [V1 验收索引](docs/v1-acceptance.md)：Claude Code 2.1.233、Codex CLI 0.167.0，macOS 26.5.2 arm64 / SQLite / Streamable HTTP。它与 Linux 双数据库 CI 分开取证；没有将代理模型线路视为托管官方 OAuth profile，也没有宣称 macOS PostgreSQL 或修复后 Codex reviewer 已重新实测。更早的宿主结果见 [2026-11-03 验收报告](docs/t8-acceptance-report.md)与 [DSH 证据索引](evidence/real-host-retest/README.md)，适用范围如下：
 

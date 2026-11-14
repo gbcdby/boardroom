@@ -3,6 +3,8 @@ import type { MemoryConfig } from "../../shared/memory.ts";
 import { resolveMemoryConfig } from "../config.ts";
 import { createMemoryInjectionReader, type MemoryDatabaseDescriptor, type MemoryInjectionReader } from "./injection-reader.ts";
 import { unavailableMemory } from "./injection.ts";
+import { runStorageWork, storageWorkMayStart } from "../storage/source-client.ts";
+import { StorageMaintenanceError } from "../storage/admission.ts";
 
 export interface MemoryRuntime { config: MemoryConfig; reader: MemoryInjectionReader }
 const runtimes = new WeakMap<DbDriver, MemoryRuntime>();
@@ -10,6 +12,10 @@ type ReconciliationJob = { run: () => Promise<void>; onFailure?: () => void };
 type ReconciliationQueue = { jobs: Map<string, ReconciliationJob>; timer: ReturnType<typeof setImmediate> | null;
   active: Promise<void> | null; closed: boolean };
 const reconciliations = new WeakMap<DbDriver, ReconciliationQueue>();
+// A driver belongs to one admission epoch. Closing it must not permit a later caller
+// to recreate an empty queue and silently resume work on the old epoch.
+const stopped = new WeakSet<DbDriver>();
+const closing = new WeakMap<DbDriver, Promise<void>>();
 const defaults = Object.freeze(resolveMemoryConfig());
 const unavailable: MemoryRuntime = { config: defaults, reader: {
   readOwn: async () => unavailableMemory(defaults, "memory_reader_unconfigured"), close: async () => {},
@@ -19,12 +25,20 @@ const unavailable: MemoryRuntime = { config: defaults, reader: {
 export function registerMemoryRuntime(db: DbDriver, options: {
   database: MemoryDatabaseDescriptor; config?: MemoryConfig; onDiagnostic?: (code: string) => void;
 }): MemoryRuntime {
-  if (runtimes.has(db)) throw new Error("memory_runtime_already_configured");
+  if (runtimes.has(db) || stopped.has(db)) throw new Error("memory_runtime_already_configured");
   const config = Object.freeze(resolveMemoryConfig(options.config));
-  const runtime = { config, reader: createMemoryInjectionReader({
+  const reader = createMemoryInjectionReader({
     database: { ...options.database }, config,
     ...(options.onDiagnostic ? { onDiagnostic: options.onDiagnostic } : {}),
-  }) };
+  });
+  const runtime: MemoryRuntime = { config, reader: {
+    async readOwn(input) {
+      if (stopped.has(db)) return unavailableMemory(config, "storage_maintenance");
+      try { return await runStorageWork(db, () => reader.readOwn(input)); }
+      catch (error) { if (error instanceof StorageMaintenanceError) return unavailableMemory(config, "storage_maintenance"); throw error; }
+    },
+    close: () => reader.close(),
+  } };
   runtimes.set(db, runtime);
   return runtime;
 }
@@ -34,15 +48,27 @@ export function getMemoryRuntime(db: DbDriver): MemoryRuntime { return runtimes.
 
 /** 持久来源可在后续安全点补扫；队列满时不阻塞主消息，也不声称已完成补偿。 */
 export function scheduleMemoryReconciliation(db: DbDriver, key: string, run: () => Promise<void>, onFailure?: () => void): boolean {
+  if (stopped.has(db) || !storageWorkMayStart(db)) return false;
   let queue = reconciliations.get(db);
   if (!queue) {
     queue = { jobs: new Map(), timer: null, active: null, closed: false };
     reconciliations.set(db, queue);
   }
   if (queue.closed || (!queue.jobs.has(key) && queue.jobs.size >= 64)) return false;
-  queue.jobs.set(key, { run, ...(onFailure ? { onFailure } : {}) });
+  queue.jobs.set(key, { run: () => runStorageWork(db, run), ...(onFailure ? { onFailure } : {}) });
   armReconciliation(queue);
   return true;
+}
+
+/** Synchronous admission stop; existing work retains its original, ordinary scope. */
+export function pauseMemoryRuntime(db: DbDriver): void {
+  stopped.add(db);
+  const queue = reconciliations.get(db);
+  if (!queue) return;
+  queue.closed = true;
+  queue.jobs.clear();
+  if (queue.timer) clearImmediate(queue.timer);
+  queue.timer = null;
 }
 function armReconciliation(queue: ReconciliationQueue): void {
   if (queue.closed || queue.active || queue.timer || queue.jobs.size === 0) return;
@@ -66,7 +92,16 @@ export function cancelMemoryReconciliations(db: DbDriver, keyPrefix: string): vo
 }
 
 /** 只有资源拥有者关闭；某个 MCP core 关闭不能结束其他会话共用的 reader。 */
-export async function closeMemoryRuntime(db: DbDriver): Promise<void> {
+export function closeMemoryRuntime(db: DbDriver): Promise<void> {
+  const existing = closing.get(db);
+  if (existing) return existing;
+  pauseMemoryRuntime(db);
+  const pending = closeResources(db);
+  closing.set(db, pending);
+  return pending;
+}
+
+async function closeResources(db: DbDriver): Promise<void> {
   const queue = reconciliations.get(db);
   if (queue) {
     queue.closed = true;

@@ -6,9 +6,21 @@ import path from "node:path";
 import { createDbDriver } from "../src/server/db/driver.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createRepositories } from "../src/server/db/repositories.ts";
-import { registerMemoryRuntime, getMemoryRuntime, closeMemoryRuntime, scheduleMemoryReconciliation } from "../src/server/memory/runtime.ts";
+import { registerMemoryRuntime, getMemoryRuntime, closeMemoryRuntime, pauseMemoryRuntime, scheduleMemoryReconciliation } from "../src/server/memory/runtime.ts";
 import type { DbDriver } from "../src/server/db/driver.ts";
 import { setImmediate as tick } from "node:timers/promises";
+
+test("维护停新立即撤回待办，真实关闭后旧driver不能重新创建后台队列", async () => {
+  const db = {} as DbDriver;
+  let executed = false;
+  assert.equal(scheduleMemoryReconciliation(db, "pending", async () => { executed = true; }), true);
+  pauseMemoryRuntime(db);
+  assert.equal(scheduleMemoryReconciliation(db, "new", async () => { executed = true; }), false);
+  await closeMemoryRuntime(db);
+  assert.equal(scheduleMemoryReconciliation(db, "after-close", async () => { executed = true; }), false);
+  await tick();
+  assert.equal(executed, false);
+});
 
 test("自动补偿串行并合并同绑定待办，关闭等待真实在途结束且不启动剩余任务", async () => {
   const db = {} as DbDriver;

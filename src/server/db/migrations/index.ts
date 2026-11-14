@@ -1,3 +1,5 @@
+import { decisionsMigration } from "./decisions.ts";
+import { workEventDeliveryInvalidationsMigration } from "./work-event-delivery-invalidations.ts";
 import { memoryMigration } from "./memory.ts";
 import { memberLifecycleMigration } from "./member-lifecycle.ts";
 import type { Migration } from "../migrate.ts";
@@ -6,6 +8,12 @@ import { managedRuntime } from "./runtime.ts";
 import { runtimeObservabilityMigration } from "./runtime-observability.ts";
 import { runtimeProcessIdentityMigration } from "./runtime-process-identity.ts";
 import { tasksMigration } from "./tasks.ts";
+import { identityCatalogMigration } from "./identity-catalog.ts";
+import { projectWorkspacesMigration } from "./project-workspaces.ts";
+import { taskIntakeMigration } from "./task-intake.ts";
+import { policyConfigurationMigration } from "./policy-configuration.ts";
+import { storageMaintenanceMigration } from "./storage-maintenance.ts";
+import { mcpConnectionsMigration } from "./mcp-connections.ts";
 
 /**
  * 生产迁移列表。
@@ -436,4 +444,12 @@ export const migrations: readonly Migration[] = [
   tasksMigration,
   memoryMigration,
   memberLifecycleMigration,
+  identityCatalogMigration,
+  projectWorkspacesMigration,
+  taskIntakeMigration,
+  policyConfigurationMigration,
+  storageMaintenanceMigration,
+  mcpConnectionsMigration,
+  decisionsMigration,
+  workEventDeliveryInvalidationsMigration,
 ];

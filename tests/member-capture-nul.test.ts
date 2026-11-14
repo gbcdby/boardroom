@@ -10,7 +10,7 @@ import type { RepositorySet } from "../src/server/db/repositories.ts";
 const at = "2026-11-11T12:00:00.000Z";
 async function fixture(repos: RepositorySet) {
   const people = await memoryPeople(repos), { project, member, agent } = people;
-  const task = await repos.tasks.create({ id: randomUUID(), projectId: project.id, title: "保留阻塞原因", body: "正文不属于补偿采集", labels: [],
+  const task = await repos.tasks.create({ id: randomUUID(), projectId: project.id, title: "保留阻塞原因", body: "正文不属于补偿采集", deliveryKind: "code", acceptanceText: "正文不属于补偿采集", acceptanceSource: "explicit", labels: [],
     state: "blocked", assigneeMemberId: member.id, reviewerMemberId: null, repoPath: null, fixedPoint: null, revision: 1,
     currentReviewRoundId: null, blockedReason: "原始原因", author: { kind: "human", actorId: "human:local", displayName: "人" }, createdAt: at, updatedAt: at });
   const request = await repos.memory.createRequest({ id: randomUUID(), projectId: project.id, agentId: agent.id, recipientMemberId: member.id,

@@ -45,7 +45,7 @@ test("SQLite 驱动 connect/migrate/query 走通，迁移可幂等重放", async
 
       const replay = await driver.migrate(migrations);
       assert.equal(replay.applied.length, 0);
-      assert.equal(replay.version, migrations.length);
+      assert.equal(replay.version, Math.max(...migrations.map(migration => migration.version)));
 
       const rows = await driver.query<{ version: number; name: string }>(
         `SELECT version, name FROM schema_migrations ORDER BY version`,
@@ -148,7 +148,7 @@ test("服务启动经连接工厂：默认 SQLite 正常，迁移完成", async 
       logger: silentLogger,
     });
     try {
-      assert.equal(server.migrationState.version, migrations.length);
+      assert.equal(server.migrationState.version, Math.max(...migrations.map(migration => migration.version)));
     } finally {
       await server.close();
     }
@@ -175,7 +175,7 @@ postgresStartupTest("服务启动经连接工厂：postgres 完成迁移", async
       logger: silentLogger,
     });
     try {
-      assert.equal(server.migrationState.version, migrations.length);
+      assert.equal(server.migrationState.version, Math.max(...migrations.map(migration => migration.version)));
     } finally {
       await server.close();
     }

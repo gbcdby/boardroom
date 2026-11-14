@@ -1,8 +1,14 @@
+import { prepareLifecycleDecisionCancellations } from "../decisions/lifecycle.ts";
+import { DECISION_TABLE_NAMES } from "../decisions/tables.ts";
+import { registerWorkEventLifecycleOwner } from "../tasks/work-event-lifecycle.ts";
+import { hasWorkEventInvalidations } from "../tasks/work-event-storage.ts";
+import { decode as decodeDecisionText } from "../decisions/text-codec.ts";
 import { createMemoryRepository, type MemoryRepository } from "../memory/repository.ts";
 import { getMutationScopeCoordinator, type MutationScopeCoordinator } from "./mutation-scope.ts";
 import { observeSql, repositorySqlObserver } from "./sql-observer.ts";
 import { ForbiddenError } from "../authz/authorize.ts";
 import { coordinateRepositoryWrites } from "./coordinated-repositories.ts";
+import { groupOrphanRuntimeMembers, purgeImpactDigest } from "./purge-impact.ts";
 import type { DbDriver, DbTransaction, DbRow } from "./driver.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
@@ -15,6 +21,7 @@ import {
   WriteFailedError,
 } from "./errors.ts";
 import { newId } from "./ids.ts";
+import { findLegacyAgentId, hasIdentityCatalogSchema, listLegacyAliases, reserveLegacyAlias, type LegacyAgentAlias } from "../identity/aliases.ts";
 import { MEMBER_FACT_KINDS, type MemberFactRevision } from "./types.ts";
 import { createTasksRepository, type TasksRepository } from "../tasks/repository.ts";
 import {
@@ -94,12 +101,16 @@ export interface AgentsRepository {
   insertRaw(agent: Agent): Promise<Agent>;
   get(id: string): Promise<Agent | null>;
   /**
-   * 按全局身份键（displayName + hostType）查找 agent（T2 身份唯一性）。
+   * 按永久 legacy alias（displayName + hostType）查找稳定 Agent；v14 前保持旧键查询。
    * 命中返回已有 agent；未命中返回 null，由调用方决定创建。
    */
   findByIdentity(displayName: string, hostType: string): Promise<Agent | null>;
   list(): Promise<Agent[]>;
   update(id: string, patch: Partial<Pick<Agent, "displayName" | "hostType">>): Promise<Agent>;
+  /** 本地管理服务的显示名 CAS；不修改宿主、权限、成员代际或运行配置。 */
+  rename(id: string, expectedDisplayName: string, displayName: string): Promise<Agent>;
+  aliases(id: string): Promise<LegacyAgentAlias[]>;
+  addAlias(id: string, input: Pick<LegacyAgentAlias, "displayName" | "hostType">): Promise<LegacyAgentAlias[]>;
   touchLastSeen(id: string, at: string): Promise<Agent>;
   delete(id: string): Promise<void>;
 }
@@ -109,6 +120,22 @@ export interface AgentsRepository {
  * 删除后作为实际清除的行数返回。项目记忆计数不包含 Agent 的 global 文档与版本。
  */
 export interface PurgeCounts {
+  readonly decisionLegacyRecords: number;
+  readonly decisionActionRequests: number;
+  readonly decisionRecords: number;
+  readonly decisionReviewHeads: number;
+  readonly decisionUserEvents: number;
+  readonly decisionLocalInitiations: number;
+  readonly decisionResolutions: number;
+  readonly decisionExecutions: number;
+  readonly decisionCommandReceipts: number;
+  readonly decisionReviewProjections: number;
+  readonly decisionChangeHeads: number;
+  readonly decisionChanges: number;
+
+  readonly policyDocuments: number;
+  readonly policyVersions: number;
+  readonly workspaceVersions: number;
   /** v13：保留历史事实的固定版本行，随最后的成员物理清除。 */
   readonly memberFactRevisions: number;
   readonly groups: number;
@@ -130,6 +157,7 @@ export interface PurgeCounts {
   readonly reviewRounds: number;
   readonly reviewReports: number;
   readonly workEvents: number;
+  readonly workEventInvalidations: number;
   readonly memoryDocuments: number;
   readonly memoryVersions: number;
   readonly memorySummaryRequests: number;
@@ -145,6 +173,7 @@ export interface GroupPurgeCounts {
   readonly memoryTriggerCounters: number;
   readonly memoryScanCheckpoints: number;
   readonly workEvents: number;
+  readonly workEventInvalidations: number;
   readonly taskMessageLinks: number;
   readonly messages: number;
   readonly deliveries: number;
@@ -153,6 +182,13 @@ export interface GroupPurgeCounts {
   readonly agentRuntimeBindings: number;
   readonly agentRunnerStates: number;
   readonly agentRuntimeMembers: number;
+}
+
+/** 服务端持有的删除预览；target、cascade 与 digest 来自同一事务/协调范围。 */
+export interface PurgeSnapshot<T, C> {
+  readonly target: T;
+  readonly cascade: C;
+  readonly digest: string;
 }
 
 export interface ProjectsRepository {
@@ -167,12 +203,13 @@ export interface ProjectsRepository {
   restore(id: string): Promise<Project>;
   /** 永久删除前的级联清单（只读，不改数据）。项目不存在时抛 NotFoundError。 */
   previewPurge(id: string): Promise<PurgeCounts>;
+  capturePurge(id: string): Promise<PurgeSnapshot<Project, PurgeCounts>>;
   /**
    * 永久删除项目：在**单个事务**内按「子 → 父」顺序级联清除群组、群聊消息、投递、
    * 参与者关系、成员、成员状态与 MCP 会话，最后删项目本身；返回实际清除的行数。
    * 只应在人二次确认后由入口调用（PROJECT-03）：agent 主体没有 `project:purge` 能力点。
    */
-  purge(id: string): Promise<PurgeCounts>;
+  purge(id: string, expectedDigest?: string): Promise<PurgeCounts>;
   delete(id: string): Promise<void>;
 }
 
@@ -269,12 +306,13 @@ export interface GroupsRepository {
   restore(id: string): Promise<Group>;
   /** 永久删除前的级联清单（只读）。群组不存在时抛 NotFoundError。 */
   previewPurge(id: string): Promise<GroupPurgeCounts>;
+  capturePurge(id: string): Promise<PurgeSnapshot<Group, GroupPurgeCounts>>;
   /**
    * 永久删除群组（#48 / GROUP-04、LIFE-ARC-02）：单事务内清除**该群组的群聊**
    * （消息与投递记录）、**参与者关系**，以及随群组消失的连接会话记录。
    * 项目成员本身**不动**——这是与 {@link ProjectsRepository.purge} 的关键差别。
    */
-  purge(id: string): Promise<GroupPurgeCounts>;
+  purge(id: string, expectedDigest?: string): Promise<GroupPurgeCounts>;
   participants(groupId: string): Promise<string[]>;
   addParticipant(groupId: string, memberId: string): Promise<void>;
   removeParticipant(groupId: string, memberId: string): Promise<void>;
@@ -309,6 +347,8 @@ export interface MessagesRepository {
   listByGroup(groupId: string, options?: MessageListOptions): Promise<Message[]>;
   /** 当前群的可见行先在 SQL 过滤；不提供 limit 时保留全部合法积压。调用方仍须检查能力/fence。 */
   listVisibleForMember(scope: MessageReadScope, options?: VisibleMessageOptions): Promise<Message[]>;
+  /** 同一当前 ACL 的批量 ID 复核；不加载正文。requireActive 用于最终投递，历史读取仍可读归档群。 */
+  listVisibleIdsForMember(scope: MessageReadScope, messageIds: readonly string[], options?: { requireActive?: boolean }): Promise<string[]>;
   /** 只计算原始 seq；不加载历史正文，也不将不可见行推进为已投递。 */
   lastDeliveredSeq(scope: MessageReadScope): Promise<number | null>;
   /** T4（#51）：项目内消息总数（跨其全部群组），用于跨项目概览的「消息数」。 */
@@ -332,6 +372,8 @@ export interface DeliveriesRepository {
   listPending(projectId: string, memberId: string): Promise<MessageDelivery[]>;
   /** 仅真实 MCP wait 返回消息的内部投递边界调用；ACK/历史读取不得使用。 */
   markMcpDelivered(messageId: string, memberId: string, at?: string): Promise<MessageDelivery>;
+  /** 内部完整批次：同一当前代际、项目/成员/群锁和物理事务；任一来源失效则整批回滚。 */
+  markMcpDeliveredBatch(scope: MessageReadScope, messageIds: readonly string[], at?: string): Promise<void>;
   /** 可自动触发的持久化积压；ACK 与唤醒判定分别过滤，不重新评估历史抑制。 */
   listWakeable(projectId: string, memberId: string): Promise<MessageDelivery[]>;
   delete(messageId: string, memberId: string): Promise<void>;
@@ -428,6 +470,12 @@ const MEMBER_STATUS_TRANSITIONS: Readonly<Record<MemberLifecycleStatus, readonly
 };
 
 /** 创建 repository 集合；同一 db 连接共享。所有仓储经 {@link RepoCtx} 访问持久化。 */
+const repositoryDrivers = new WeakMap<RepositorySet, DbDriver>();
+export function repositoryDriver(repos: RepositorySet): DbDriver {
+  const driver = repositoryDrivers.get(repos);
+  if (!driver) throw new InvalidArgumentError("仓储不属于当前数据库工厂。");
+  return driver;
+}
 export function createRepositories(db: DbDriver): RepositorySet {
   // 只有当前异步调用链才能使用自己的事务会话；其它请求回落到顶层 DbDriver。
   // 不再用共享闭包变量，避免请求交错时把已回滚/未提交连接交给另一请求。
@@ -459,16 +507,17 @@ export function createRepositories(db: DbDriver): RepositorySet {
       }),
   };
 
-  return coordinateRepositoryWrites({
+  const messages = createMessages(ctx, db.kind);
+  const result = coordinateRepositoryWrites({
     context: ctx,
     mutations: getMutationScopeCoordinator(db),
     agents: createAgents(ctx),
-    projects: createProjects(ctx, getMutationScopeCoordinator(db)),
+    projects: createProjects(ctx, getMutationScopeCoordinator(db), db),
     members: createMembers(ctx, getMutationScopeCoordinator(db)),
     org: createOrg(ctx),
     groups: createGroups(ctx, getMutationScopeCoordinator(db)),
-    messages: createMessages(ctx, db.kind),
-    deliveries: createDeliveries(ctx),
+    messages,
+    deliveries: createDeliveries(ctx, messages),
     statuses: createStatuses(ctx),
     mcpSessions: createMcpSessions(ctx, getMutationScopeCoordinator(db)),
     audit: createAuditRepository(ctx),
@@ -476,6 +525,9 @@ export function createRepositories(db: DbDriver): RepositorySet {
     memory: createMemoryRepository(ctx),
     transaction: ctx.withTransaction,
   });
+  repositoryDrivers.set(result, db);
+  registerWorkEventLifecycleOwner(result.tasks, ctx, db);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +622,24 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
   const managed = await hasRuntimeSchema(ctx);
   const tasks = await hasTasksSchema(ctx);
   const memory = await hasMemorySchema(ctx);
+  const policies = await hasPolicyConfigurationSchema(ctx);
+  const decisions = await hasDecisionSchema(ctx);
   return {
+    decisionLegacyRecords: decisions ? await count("SELECT COUNT(*) AS c FROM decision_legacy_records WHERE project_id = ?") : 0,
+    decisionActionRequests: decisions ? await count("SELECT COUNT(*) AS c FROM decision_action_requests WHERE project_id = ?") : 0,
+    decisionRecords: decisions ? await count("SELECT COUNT(*) AS c FROM decision_records WHERE project_id = ?") : 0,
+    decisionReviewHeads: decisions ? await count("SELECT COUNT(*) AS c FROM decision_review_heads WHERE project_id = ?") : 0,
+    decisionUserEvents: decisions ? await count("SELECT COUNT(*) AS c FROM decision_user_events WHERE project_id = ?") : 0,
+    decisionLocalInitiations: decisions ? await count("SELECT COUNT(*) AS c FROM decision_local_initiations WHERE project_id = ?") : 0,
+    decisionResolutions: decisions ? await count("SELECT COUNT(*) AS c FROM decision_resolutions WHERE project_id = ?") : 0,
+    decisionExecutions: decisions ? await count("SELECT COUNT(*) AS c FROM decision_executions WHERE project_id = ?") : 0,
+    decisionCommandReceipts: decisions ? await count("SELECT COUNT(*) AS c FROM decision_command_receipts WHERE project_id = ?") : 0,
+    decisionReviewProjections: decisions ? await count("SELECT COUNT(*) AS c FROM decision_review_projections WHERE project_id = ?") : 0,
+    decisionChangeHeads: decisions ? await count("SELECT COUNT(*) AS c FROM decision_change_heads WHERE project_id = ?") : 0,
+    decisionChanges: decisions ? await count("SELECT COUNT(*) AS c FROM decision_changes WHERE project_id = ?") : 0,
+    policyDocuments: policies ? await count("SELECT COUNT(*) AS c FROM policy_documents WHERE project_id = ?") : 0,
+    policyVersions: policies ? await count("SELECT COUNT(*) AS c FROM policy_document_versions WHERE document_id IN (SELECT scope_key FROM policy_documents WHERE project_id = ?)") : 0,
+    workspaceVersions: await hasWorkspaceSchema(ctx) ? await count("SELECT COUNT(*) AS c FROM project_workspace_versions WHERE project_id = ?") : 0,
     memberFactRevisions: await hasMemberLifecycleSchema(ctx) ? await count('SELECT COUNT(*) AS c FROM member_fact_revisions WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)') : 0,
     memoryDocuments: memory ? await count("SELECT COUNT(*) AS c FROM memory_documents WHERE project_id = ?") : 0,
     memoryVersions: memory ? await count("SELECT COUNT(*) AS c FROM memory_versions WHERE document_id IN (SELECT id FROM memory_documents WHERE project_id = ?)") : 0,
@@ -586,6 +655,7 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
     reviewRounds: tasks ? await count("SELECT COUNT(*) AS c FROM task_review_rounds WHERE project_id = ?") : 0,
     reviewReports: tasks ? await count("SELECT COUNT(*) AS c FROM task_review_reports WHERE project_id = ?") : 0,
     workEvents: tasks ? await count("SELECT COUNT(*) AS c FROM work_events WHERE project_id = ?") : 0,
+    workEventInvalidations: await hasWorkEventInvalidations(ctx) ? await count("SELECT COUNT(*) AS c FROM work_event_delivery_invalidations WHERE project_id = ?") : 0,
     groups: await count("SELECT COUNT(*) AS c FROM groups WHERE project_id = ?"),
     members: await count("SELECT COUNT(*) AS c FROM members WHERE project_id = ?"),
     orgNodes: await count("SELECT COUNT(*) AS c FROM org_nodes WHERE project_id = ?"),
@@ -618,6 +688,7 @@ async function groupPurgeCounts(ctx: RepoCtx, groupId: string): Promise<GroupPur
     memoryTriggerCounters: memory ? await count("SELECT COUNT(*) AS c FROM memory_trigger_counters WHERE group_id = ?") : 0,
     memoryScanCheckpoints: memory ? await count("SELECT COUNT(*) AS c FROM memory_scan_checkpoints WHERE group_id = ?") : 0,
     workEvents: memory ? await count("SELECT COUNT(*) AS c FROM work_events WHERE context_group_id = ?") : 0,
+    workEventInvalidations: await hasWorkEventInvalidations(ctx) ? await count("SELECT COUNT(*) AS c FROM work_event_delivery_invalidations WHERE work_event_id IN (SELECT id FROM work_events WHERE context_group_id = ?)") : 0,
     taskMessageLinks: await hasTasksSchema(ctx) ? await count("SELECT COUNT(*) AS c FROM task_message_links WHERE group_id = ?") : 0,
     messages: await count("SELECT COUNT(*) AS c FROM messages WHERE group_id = ?"),
     deliveries: await count(
@@ -627,9 +698,7 @@ async function groupPurgeCounts(ctx: RepoCtx, groupId: string): Promise<GroupPur
     mcpSessions: await count("SELECT COUNT(*) AS c FROM mcp_sessions WHERE group_id = ?"),
     agentRuntimeBindings: managed ? await count("SELECT COUNT(*) AS c FROM agent_runtime_bindings WHERE group_id = ?") : 0,
     agentRunnerStates: managed ? await count("SELECT COUNT(*) AS c FROM agent_runner_states WHERE binding_id IN (SELECT id FROM agent_runtime_bindings WHERE group_id = ?)") : 0,
-    agentRuntimeMembers: managed ? await count(`SELECT COUNT(*) AS c FROM agent_runtime_members rm
-      WHERE rm.member_id IN (SELECT member_id FROM agent_runtime_bindings WHERE group_id = ?)
-        AND (SELECT COUNT(*) FROM agent_runtime_bindings b WHERE b.member_id = rm.member_id) = 1`) : 0,
+    agentRuntimeMembers: managed ? Number((await ctx.one<CountRow>(`SELECT COUNT(*) AS c FROM (${groupOrphanRuntimeMembers}) affected`, [groupId, groupId, groupId]))?.c ?? 0) : 0,
   };
 }
 
@@ -731,6 +800,14 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
         agent.updatedAt,
         agent.lastSeenAt,
       ]);
+      if (await hasIdentityCatalogSchema(ctx)) {
+        // 放在 INSERT 获得 ID 的排他性之后检查，避免与旧身份删除交错时复活同一 ID。
+        if (await ctx.one("SELECT agent_id FROM agent_legacy_aliases WHERE agent_id = ? AND retired_at IS NOT NULL LIMIT 1", [agent.id])) {
+          throw new ConflictError("agent_identity_retired");
+        }
+        await reserveLegacyAlias(ctx, { agentId: agent.id,
+          displayName: agent.displayName, hostType: agent.hostType, createdAt: agent.createdAt });
+      }
     } catch (error) {
       throw normalizeError(error);
     }
@@ -753,7 +830,7 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
       return agent;
     },
     async insertRaw(agent) {
-      await insertRow(agent);
+      await ctx.withTransaction(async () => insertRow(agent));
       return agent;
     },
     async get(id) {
@@ -761,11 +838,8 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
       return row ? toAgent(row) : null;
     },
     async findByIdentity(displayName, hostType) {
-      const row = await ctx.one<AgentRow>(
-        "SELECT * FROM agents WHERE display_name = ? AND host_type = ?",
-        [displayName, hostType],
-      );
-      return row ? toAgent(row) : null;
+      const id = await findLegacyAgentId(ctx, displayName, hostType);
+      return id === null ? null : this.get(id);
     },
     async list() {
       return (await ctx.query<AgentRow>("SELECT * FROM agents ORDER BY created_at, id")).map(toAgent);
@@ -782,12 +856,52 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
           && await ctx.one("SELECT id FROM agent_runtimes WHERE agent_id = ?", [id])) {
           throw new ConflictError("runtime_identity_immutable");
         }
+        if (await hasIdentityCatalogSchema(ctx)) {
+          await findLegacyAgentId(ctx, existing.displayName, existing.hostType);
+          await reserveLegacyAlias(ctx, { agentId: id, displayName: existing.displayName, hostType: existing.hostType, createdAt: existing.createdAt });
+          await reserveLegacyAlias(ctx, { agentId: id, displayName, hostType, createdAt: nowIso() });
+        }
         await ctx.exec(
           "UPDATE agents SET display_name = ?, host_type = ?, updated_at = ? WHERE id = ?",
           [displayName, hostType, nowIso(), id],
         );
       });
       return (await this.get(id))!;
+    },
+    async rename(id, expectedDisplayName, value) {
+      const displayName = requireNonEmpty(value, "Agent.displayName");
+      requireNonEmpty(expectedDisplayName, "Agent.expectedDisplayName");
+      return ctx.withTransaction(async () => {
+        if (!await hasIdentityCatalogSchema(ctx)) throw new InvalidArgumentError("identity_catalog_upgrade_required");
+        const existing = await this.get(id);
+        if (!existing) throw new NotFoundError("agent_not_found");
+        await findLegacyAgentId(ctx, existing.displayName, existing.hostType);
+        const at = nowIso();
+        // 先以稳定 ID 和旧值取得写锁/CAS；任何后续 alias 冲突都会回滚此次改名。
+        const changed = await ctx.exec("UPDATE agents SET display_name = ?, updated_at = ? WHERE id = ? AND display_name = ?",
+          [displayName, at, id, expectedDisplayName]);
+        if (changed !== 1) throw new ConflictError("agent_name_conflict");
+        await reserveLegacyAlias(ctx, { agentId: id, displayName: existing.displayName, hostType: existing.hostType, createdAt: existing.createdAt });
+        await reserveLegacyAlias(ctx, { agentId: id, displayName, hostType: existing.hostType, createdAt: at });
+        return (await this.get(id))!;
+      });
+    },
+    async aliases(id) {
+      if (!await this.get(id)) throw new NotFoundError("agent_not_found");
+      return listLegacyAliases(ctx, id);
+    },
+    async addAlias(id, input) {
+      const displayName = requireNonEmpty(input.displayName, "AgentAlias.displayName");
+      const hostType = requireNonEmpty(input.hostType, "AgentAlias.hostType");
+      return ctx.withTransaction(async () => {
+        if (!await hasIdentityCatalogSchema(ctx)) throw new InvalidArgumentError("identity_catalog_upgrade_required");
+        // 同一 Agent 的改名、追加 alias 与删除串行；不持项目或成员的长期租约。
+        if (await ctx.exec("UPDATE agents SET updated_at = updated_at WHERE id = ?", [id]) !== 1) throw new NotFoundError("agent_not_found");
+        const existing = (await this.get(id))!;
+        await findLegacyAgentId(ctx, existing.displayName, existing.hostType);
+        await reserveLegacyAlias(ctx, { agentId: id, displayName, hostType, createdAt: nowIso() });
+        return listLegacyAliases(ctx, id);
+      });
     },
     async touchLastSeen(id, at) {
       const existing = await this.get(id);
@@ -801,8 +915,14 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
       return (await this.get(id))!;
     },
     async delete(id) {
-      const result = await ctx.exec("DELETE FROM agents WHERE id = ?", [id]);
-      if (result === 0) throw new NotFoundError(`Agent ${id} 不存在。`);
+      await ctx.withTransaction(async () => {
+        if (await hasIdentityCatalogSchema(ctx)) {
+          if (await ctx.exec("UPDATE agents SET updated_at = updated_at WHERE id = ?", [id]) !== 1) throw new NotFoundError(`Agent ${id} 不存在。`);
+          await ctx.exec("UPDATE agent_legacy_aliases SET retired_at = ? WHERE agent_id = ? AND retired_at IS NULL", [nowIso(), id]);
+        }
+        const result = await ctx.exec("DELETE FROM agents WHERE id = ?", [id]);
+        if (result === 0) throw new NotFoundError(`Agent ${id} 不存在。`);
+      });
     },
   };
 }
@@ -811,12 +931,24 @@ function createAgents(ctx: RepoCtx): AgentsRepository {
 // Projects
 // ---------------------------------------------------------------------------
 
+export async function hasWorkspaceSchema(ctx: RepoCtx): Promise<boolean> {
+  return Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 15"));
+}
+
+async function hasDecisionSchema(ctx: RepoCtx): Promise<boolean> { return Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 20")); }
+
+async function hasPolicyConfigurationSchema(ctx: RepoCtx): Promise<boolean> {
+  return Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 17"));
+}
+
 type ProjectRow = {
   id: string;
   name: string;
   created_at: string;
   updated_at: string;
   archived_at: string | null;
+  project_revision?: number;
+  workspace_revision?: number;
 };
 
 function toProject(row: ProjectRow): Project {
@@ -826,10 +958,12 @@ function toProject(row: ProjectRow): Project {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     archivedAt: row.archived_at ?? null,
+    projectRevision: Number(row.project_revision ?? 1),
+    workspaceRevision: Number(row.workspace_revision ?? 0),
   };
 }
 
-function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): ProjectsRepository {
+function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator, db: DbDriver): ProjectsRepository {
   return {
     async create(input) {
       const name = requireNonEmpty(input.name, "Project.name");
@@ -850,7 +984,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
         managerName = agent.display_name;
       }
       const at = nowIso();
-      const project: Project = { id: newId(), name, createdAt: at, updatedAt: at, archivedAt: null };
+      const project: Project = { id: newId(), name, createdAt: at, updatedAt: at, archivedAt: null, projectRevision: 1, workspaceRevision: 0 };
       await ctx.withTransaction(async () => {
         await ctx.exec(
           "INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
@@ -880,7 +1014,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
     async rename(id, name) {
       const value = requireNonEmpty(name, "Project.name");
       const result = await ctx.exec(
-        "UPDATE projects SET name = ?, updated_at = ? WHERE id = ?",
+        `UPDATE projects SET name = ?, updated_at = ?${await hasWorkspaceSchema(ctx) ? ", project_revision = project_revision + 1" : ""} WHERE id = ?`,
         [value, nowIso(), id],
       );
       if (result === 0) throw new NotFoundError(`Project ${id} 不存在。`);
@@ -891,12 +1025,14 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
       if (!existing) throw new NotFoundError(`Project ${id} 不存在。`);
       if (existing.archivedAt !== null) return existing;
       const stamp = at ?? nowIso();
-      await ctx.withTransaction(async () =>
-        ctx.exec(
-          "UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?",
+      await ctx.withTransaction(async () => {
+        const decisions = await prepareLifecycleDecisionCancellations(db, id, null, stamp, 'project_archived');
+        await decisions.apply();
+        await ctx.exec(
+          `UPDATE projects SET archived_at = ?, updated_at = ?${await hasWorkspaceSchema(ctx) ? ", project_revision = project_revision + 1" : ""} WHERE id = ?`,
           [stamp, stamp, id],
-        ),
-      );
+        );
+      });
       return (await this.get(id))!;
     },
     async restore(id) {
@@ -905,7 +1041,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
       if (existing.archivedAt === null) return existing;
       await ctx.withTransaction(async () =>
         ctx.exec(
-          "UPDATE projects SET archived_at = NULL, updated_at = ? WHERE id = ?",
+          `UPDATE projects SET archived_at = NULL, updated_at = ?${await hasWorkspaceSchema(ctx) ? ", project_revision = project_revision + 1" : ""} WHERE id = ?`,
           [nowIso(), id],
         ),
       );
@@ -915,11 +1051,30 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
       if (!(await this.get(id))) throw new NotFoundError(`Project ${id} 不存在。`);
       return projectPurgeCounts(ctx, id);
     },
-    async purge(id) {
+    async capturePurge(id) {
+      return ctx.withTransaction(async () => {
+        const target = await this.get(id);
+        if (!target) throw new NotFoundError(`Project ${id} 不存在。`);
+        return { target, cascade: await projectPurgeCounts(ctx, id), digest: await purgeImpactDigest(ctx, "project", id) };
+      });
+    },
+    async purge(id, expectedDigest) {
       if (!(await this.get(id))) throw new NotFoundError(`Project ${id} 不存在。`);
       return ctx.withTransaction(async () => {
         await requireManagedStopped(ctx, "project", id, mutations);
+        if (expectedDigest !== undefined && expectedDigest !== await purgeImpactDigest(ctx, "project", id)) {
+          throw new RepositoryError("confirmation_changed", "永久删除的影响范围已变化，请重新获取级联清单并再次确认。");
+        }
         const counts = await projectPurgeCounts(ctx, id);
+        if (await hasWorkEventInvalidations(ctx)) await ctx.exec("DELETE FROM work_event_delivery_invalidations WHERE project_id = ?", [id]);
+        if (await hasDecisionSchema(ctx)) {
+          for (const table of [...DECISION_TABLE_NAMES].reverse()) await ctx.exec(`DELETE FROM ${table} WHERE project_id = ?`, [id]);
+        }
+        if (await hasPolicyConfigurationSchema(ctx)) {
+          await ctx.exec("DELETE FROM policy_document_versions WHERE document_id IN (SELECT scope_key FROM policy_documents WHERE project_id = ?)", [id]);
+          await ctx.exec("DELETE FROM policy_documents WHERE project_id = ?", [id]);
+        }
+        if (await hasWorkspaceSchema(ctx)) await ctx.exec("DELETE FROM project_workspace_versions WHERE project_id = ?", [id]);
         if (await hasMemorySchema(ctx)) {
           for (const table of ["memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints"]) {
             await ctx.exec(`DELETE FROM ${table} WHERE project_id = ?`, [id]);
@@ -1298,13 +1453,33 @@ function createGroups(ctx: RepoCtx, mutations: MutationScopeCoordinator): Groups
       if (!(await repo.get(id))) throw new NotFoundError(`Group ${id} 不存在。`);
       return groupPurgeCounts(ctx, id);
     },
-    async purge(id) {
+    async capturePurge(id) {
+      return ctx.withTransaction(async () => {
+        const target = await repo.get(id);
+        if (!target) throw new NotFoundError(`Group ${id} 不存在。`);
+        return { target, cascade: await groupPurgeCounts(ctx, id), digest: await purgeImpactDigest(ctx, "group", id) };
+      });
+    },
+    async purge(id, expectedDigest) {
       if (!(await repo.get(id))) throw new NotFoundError(`Group ${id} 不存在。`);
       return ctx.withTransaction(async () => {
         await requireManagedStopped(ctx, "group", id, mutations);
+        if (expectedDigest !== undefined && expectedDigest !== await purgeImpactDigest(ctx, "group", id)) {
+          throw new RepositoryError("confirmation_changed", "永久删除的影响范围已变化，请重新获取级联清单并再次确认。");
+        }
         const projectId = (await repo.get(id))!.projectId;
         const affected = await hasRuntimeSchema(ctx) ? await ctx.query<MemberIdRow>('SELECT DISTINCT member_id FROM agent_runtime_bindings WHERE group_id = ? ORDER BY member_id', [id]) : [];
         const counts = await groupPurgeCounts(ctx, id);
+        // A surviving Decision execution must retain its exact immutable events.
+        // This guard precedes every delete in the group purge transaction.
+        if (await hasDecisionSchema(ctx)) {
+          const groupEvents = new Set((await ctx.query<{id:string}>("SELECT id FROM work_events WHERE context_group_id = ?", [id])).map(event => event.id));
+          const effects = await ctx.query<{work_event_ids_json:string}>("SELECT work_event_ids_json FROM decision_executions WHERE project_id = ?", [projectId]);
+          if (effects.some(effect => (decodeDecisionText('decision_executions.work_event_ids_json', effect.work_event_ids_json) as string[]).some(eventId => groupEvents.has(eventId)))) {
+            throw new ConflictError("群删除会破坏仍保留的评审执行事实，请先处理所属项目。");
+          }
+        }
+        if (await hasWorkEventInvalidations(ctx)) await ctx.exec("DELETE FROM work_event_delivery_invalidations WHERE work_event_id IN (SELECT id FROM work_events WHERE context_group_id = ?)", [id]);
         if (await hasMemorySchema(ctx)) {
           await ctx.exec("DELETE FROM memory_summary_requests WHERE context_group_id = ?", [id]);
           await ctx.exec("DELETE FROM work_events WHERE context_group_id = ?", [id]);
@@ -1401,16 +1576,50 @@ function toMessage(row: MessageRow): Message {
   };
 }
 
+// 每块 INSERT 最多 128 × 6 个参数，连同范围查询均低于 SQLite 的保守 999 参数上限。
+// 分块只约束单条 SQL，不裁剪调用方的完整消息集合。
+const MESSAGE_ID_BATCH_SIZE = 128;
+function messageIdBatches(messageIds: readonly string[]): string[][] {
+  if (!Array.isArray(messageIds)) throw new InvalidArgumentError('消息 ID 集合必须是数组。');
+  const unique = new Set<string>();
+  for (const id of messageIds) {
+    requireNonEmpty(id, 'messageId');
+    if (unique.has(id)) throw new InvalidArgumentError('同一投递批次不能重复消息 ID。');
+    unique.add(id);
+  }
+  const batches: string[][] = [];
+  for (let start = 0; start < messageIds.length; start += MESSAGE_ID_BATCH_SIZE) batches.push(messageIds.slice(start, start + MESSAGE_ID_BATCH_SIZE));
+  return batches;
+}
+function messageReadParams(scope: MessageReadScope): unknown[] {
+  if (!scope || typeof scope !== 'object') throw new InvalidArgumentError('消息读取需要可信成员范围。');
+  requireNonEmpty(scope.projectId, 'projectId'); requireNonEmpty(scope.groupId, 'groupId'); requireNonEmpty(scope.memberId, 'memberId');
+  if (!Number.isSafeInteger(scope.membershipRevision) || scope.membershipRevision < 1) throw new InvalidArgumentError('消息读取需要当前有效成员代际。');
+  return [scope.memberId, scope.projectId, scope.groupId, scope.membershipRevision];
+}
+
 function createMessages(ctx: RepoCtx, driverKind: DbDriver["kind"]): MessagesRepository {
   const mentionContains = driverKind === 'postgres'
     ? 'm.mentions::jsonb @> jsonb_build_array(viewer.id)'
     : "EXISTS (SELECT 1 FROM json_each(m.mentions) mention WHERE mention.type = 'text' AND mention.value = viewer.id)";
   const participant = 'EXISTS (SELECT 1 FROM group_participants gp WHERE gp.group_id = m.group_id AND gp.member_id = viewer.id)';
-  function readScope(scope: MessageReadScope): unknown[] {
-    requireNonEmpty(scope.projectId, 'projectId'); requireNonEmpty(scope.groupId, 'groupId'); requireNonEmpty(scope.memberId, 'memberId');
-    if (!Number.isSafeInteger(scope.membershipRevision) || scope.membershipRevision < 1) throw new InvalidArgumentError('消息读取需要当前有效成员代际。');
-    return [scope.memberId, scope.projectId, scope.groupId, scope.membershipRevision];
-  }
+  // 历史、积压和最终 ID 集合共用这一个可见性谓词，避免权限变化时两条读取路径漂移。
+  // 能力/连接仍由 core guard 判定；这里复核项目、当前代际、参与边、当前岗位和任务关系。
+  const visibleFrom = `FROM messages m
+    JOIN groups g ON g.id = m.group_id
+    JOIN members viewer ON viewer.id = ? AND viewer.project_id = g.project_id
+    LEFT JOIN org_nodes n ON n.id = viewer.node_id AND n.project_id = viewer.project_id
+    WHERE g.project_id = ? AND m.group_id = ? AND viewer.membership_revision = ?
+      AND viewer.removed_at IS NULL AND viewer.status = 'active'
+      AND (viewer.kind = 'human' OR n.role = 'top_manager' OR (n.id IS NULL AND viewer.role = 'manager') OR ${participant})
+      AND (viewer.kind = 'human' OR (n.id IS NULL AND viewer.role = 'manager') OR n.role IN ('top_manager', 'sub_manager')
+        OR m.sender_member_id = viewer.id OR ${mentionContains}
+        OR EXISTS (SELECT 1 FROM task_message_links link
+          JOIN tasks task ON task.project_id = link.project_id AND task.id = link.task_id
+          WHERE link.project_id = g.project_id AND link.group_id = m.group_id AND link.message_id = m.id
+            AND (task.assignee_member_id = viewer.id OR task.reviewer_member_id = viewer.id
+              OR EXISTS (SELECT 1 FROM task_comments comment WHERE comment.project_id = task.project_id
+                AND comment.task_id = task.id AND comment.author_actor_id = viewer.id))))`;
   return {
     async create(input) {
       // 前置校验：错误必须明确，不留给数据库外键泛化报错。
@@ -1498,24 +1707,8 @@ function createMessages(ctx: RepoCtx, driverKind: DbDriver["kind"]): MessagesRep
       return (await ctx.query<MessageRow>(sql, params)).map(toMessage);
     },
     async listVisibleForMember(scope, options = {}) {
-      const params = readScope(scope);
-      // 等价于路由可见性 + task.messageVisible：能力/连接先由 core guard 判定，
-      // SQL 再复核同项目、当前代际、参与边、当前岗位与任务关系，不依赖发送时投递快照。
-      let sql = `SELECT m.* FROM messages m
-        JOIN groups g ON g.id = m.group_id
-        JOIN members viewer ON viewer.id = ? AND viewer.project_id = g.project_id
-        LEFT JOIN org_nodes n ON n.id = viewer.node_id AND n.project_id = viewer.project_id
-        WHERE g.project_id = ? AND m.group_id = ? AND viewer.membership_revision = ?
-          AND viewer.removed_at IS NULL AND viewer.status = 'active'
-          AND (viewer.kind = 'human' OR n.role = 'top_manager' OR (n.id IS NULL AND viewer.role = 'manager') OR ${participant})
-          AND (viewer.kind = 'human' OR (n.id IS NULL AND viewer.role = 'manager') OR n.role IN ('top_manager', 'sub_manager')
-            OR m.sender_member_id = viewer.id OR ${mentionContains}
-            OR EXISTS (SELECT 1 FROM task_message_links link
-              JOIN tasks task ON task.project_id = link.project_id AND task.id = link.task_id
-              WHERE link.project_id = g.project_id AND link.group_id = m.group_id AND link.message_id = m.id
-                AND (task.assignee_member_id = viewer.id OR task.reviewer_member_id = viewer.id
-                  OR EXISTS (SELECT 1 FROM task_comments comment WHERE comment.project_id = task.project_id
-                    AND comment.task_id = task.id AND comment.author_actor_id = viewer.id))))`;
+      const params = messageReadParams(scope);
+      let sql = `SELECT m.* ${visibleFrom}`;
       if (options.unackedOnly) sql += " AND NOT EXISTS (SELECT 1 FROM message_deliveries d WHERE d.message_id = m.id AND d.member_id = viewer.id AND d.project_id = g.project_id AND d.status = 'acked')";
       if (options.afterSeq !== undefined) { sql += ' AND m.seq > ?'; params.push(options.afterSeq); }
       if (options.beforeSeq !== undefined) { sql += ' AND m.seq < ?'; params.push(options.beforeSeq); }
@@ -1528,8 +1721,18 @@ function createMessages(ctx: RepoCtx, driverKind: DbDriver["kind"]): MessagesRep
       }
       return (await ctx.query<MessageRow>(sql, params)).map(toMessage);
     },
+    async listVisibleIdsForMember(scope, messageIds, options = {}) {
+      const params = messageReadParams(scope), batches = messageIdBatches(messageIds), visible: string[] = [];
+      const active = options.requireActive
+        ? ' AND g.archived_at IS NULL AND EXISTS (SELECT 1 FROM projects p WHERE p.id = g.project_id AND p.archived_at IS NULL)' : '';
+      for (const batch of batches) {
+        const rows = await ctx.query<{ id: string }>(`SELECT m.id ${visibleFrom}${active} AND m.id IN (${batch.map(() => '?').join(',')})`, [...params, ...batch]);
+        visible.push(...rows.map(row => row.id));
+      }
+      return visible;
+    },
     async lastDeliveredSeq(scope) {
-      const params = readScope(scope);
+      const params = messageReadParams(scope);
       const row = await ctx.one<{ seq: number | string | null }>(`SELECT MAX(m.seq) AS seq FROM messages m
         JOIN groups g ON g.id = m.group_id
         JOIN members viewer ON viewer.id = ? AND viewer.project_id = g.project_id
@@ -1595,7 +1798,7 @@ function toDelivery(row: DeliveryRow): MessageDelivery {
   };
 }
 
-function createDeliveries(ctx: RepoCtx): DeliveriesRepository {
+function createDeliveries(ctx: RepoCtx, messages: MessagesRepository): DeliveriesRepository {
   const getRowSql = "SELECT * FROM message_deliveries WHERE message_id = ? AND member_id = ?";
 
   const getRow = async (messageId: string, memberId: string): Promise<DeliveryRow | undefined> =>
@@ -1668,6 +1871,43 @@ function createDeliveries(ctx: RepoCtx): DeliveriesRepository {
           first_delivered_at = COALESCE(first_delivered_at, ?), last_delivered_at = ?, updated_at = ?
           WHERE message_id = ? AND member_id = ?`, [timestamp, timestamp, timestamp, timestamp, messageId, memberId]);
         return toDelivery((await getRow(messageId, memberId))!);
+      });
+    },
+    async markMcpDeliveredBatch(scope, messageIds, at) {
+      const scopeParams = messageReadParams(scope), batches = messageIdBatches(messageIds);
+      if (!batches.length) return;
+      return ctx.withTransaction(async () => {
+        // 新批量边界依赖当前成员代际；旧 schema fixture 继续使用兼容的单条入口。
+        if (!await hasMemberLifecycleSchema(ctx)) throw new RepositoryError('legacy_incomplete_snapshot', '批量 MCP 投递需要当前成员代际 schema。');
+        const source = await ctx.one(`SELECT mem.id FROM members mem JOIN groups g ON g.project_id = mem.project_id
+          WHERE mem.id = ? AND mem.project_id = ? AND g.id = ? AND mem.membership_revision = ?
+            AND mem.kind = 'agent' AND mem.status = 'active' AND mem.removed_at IS NULL`, scopeParams);
+        if (!source) throw new InvalidReferenceError('真实 MCP 批量投递必须引用同项目、当前代际的 active Agent 成员与群组。');
+        await requireGroupActive(ctx, scope.groupId, '投递消息');
+        const visible = new Set(await messages.listVisibleIdsForMember(scope, messageIds, { requireActive: true }));
+        if (visible.size !== messageIds.length || messageIds.some(id => !visible.has(id))) {
+          throw new InvalidReferenceError('批量投递包含不存在、跨范围或当前已不可见的消息，拒绝整批写入。');
+        }
+        const timestamp = at ?? nowIso();
+        // 所有分块复用上层 coordinator 的完整锁集合与同一物理事务。
+        // 已有行保留 ACK、wake 决策与首次时间；真实重投只增加本次尝试并推进最后时间。
+        for (const batch of batches) {
+          const insertParams: unknown[] = [];
+          for (const id of batch) insertParams.push(newId(), id, scope.memberId, scope.projectId, timestamp, timestamp);
+          await ctx.exec(`INSERT INTO message_deliveries
+            (id, message_id, member_id, project_id, status, attempt_count,
+             first_delivered_at, last_delivered_at, acked_at, created_at, updated_at, wake_decision, wake_suppressed_reason)
+            VALUES ${batch.map(() => "(?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, ?, ?, NULL, NULL)").join(',')}
+            ON CONFLICT (message_id, member_id) DO NOTHING`, insertParams);
+          const changed = await ctx.exec(`UPDATE message_deliveries SET
+            first_mcp_delivered_at = COALESCE(first_mcp_delivered_at, ?),
+            status = CASE WHEN status = 'acked' THEN 'acked' ELSE 'delivered' END,
+            attempt_count = attempt_count + 1,
+            first_delivered_at = COALESCE(first_delivered_at, ?), last_delivered_at = ?, updated_at = ?
+            WHERE member_id = ? AND project_id = ? AND message_id IN (${batch.map(() => '?').join(',')})`,
+          [timestamp, timestamp, timestamp, timestamp, scope.memberId, scope.projectId, ...batch]);
+          if (changed !== batch.length) throw new InvalidReferenceError('批量投递的持久化集合不完整，整批事务回滚。');
+        }
       });
     },
     async listPending(projectId, memberId) {

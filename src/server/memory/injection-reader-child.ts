@@ -3,6 +3,7 @@ import { Client } from "pg";
 import type { MemoryConfig, MemoryDocument, MemoryInjection } from "../../shared/memory.ts";
 import type { MemoryDatabaseDescriptor, MemoryReadBinding } from "./injection-reader.ts";
 import { buildMemoryInjection, unavailableMemory } from "./injection.ts";
+import { assertSqliteSourceUnchanged } from "../environment.ts";
 
 type Row = { member_id: string; binding_agent_id: string; id: string | null; scope: "global" | "project-agent";
   project_id: string | null; version: number; markdown: string | null; byte_length: number | null };
@@ -19,6 +20,10 @@ async function init(database: MemoryDatabaseDescriptor, values: MemoryConfig): P
   if (config) throw new Error("already initialized");
   config = values;
   if (database.kind === "sqlite") {
+    // 受信父进程通过 IPC 发送规范 descriptor；子进程不读配置，也不从 cwd 拼路径。
+    if (database.sourcePath !== undefined && database.identity !== undefined) assertSqliteSourceUnchanged({
+      sqlitePath: database.sqlitePath, sourcePath: database.sourcePath, identity: database.identity,
+    });
     sqlite = openReadonlyMemorySqlite(database.sqlitePath);
   } else {
     if (database.schema !== undefined && !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(database.schema)) throw new Error("invalid schema");

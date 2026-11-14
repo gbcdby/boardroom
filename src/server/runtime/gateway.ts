@@ -15,7 +15,7 @@ export interface RuntimeGateway {
   /** 每 generation 只允许一个受控通道；模型不能选择/提交 owner 或 fence。 */
   attach(transport: Transport): Promise<void>;
   wake(): Promise<void>;
-  close(): Promise<void>;
+  close(options?: { strict?: boolean }): Promise<void>;
 }
 
 export async function createRuntimeGateway(options: {
@@ -37,6 +37,7 @@ export async function createRuntimeGateway(options: {
   let businessClosing: Promise<void> | null = null;
   let loss: Promise<void> | null = null;
   let closing: Promise<void> | null = null;
+  const closeFailures: unknown[] = [];
   const log = options.logger.child({ component: "managed-mcp" });
   const repos = options.repos ?? createRepositories(options.db);
   const orgResolver = createOrgActorResolver(repos);
@@ -45,10 +46,12 @@ export async function createRuntimeGateway(options: {
     joined = false;
     disconnected = true;
     businessClosing = (async () => {
-      await core?.close();
+      await core?.close({ drain: true });
       await Promise.allSettled([...inflight]);
-      await core?.disconnect();
+      await core?.disconnect({ strict: true });
     })();
+    const attempt = businessClosing;
+    void attempt.catch(() => { if (businessClosing === attempt) businessClosing = null; });
     return businessClosing;
   }
   function transportLost(): void {
@@ -56,8 +59,8 @@ export async function createRuntimeGateway(options: {
     joined = false;
     disconnected = true;
     // 业务通道失效不关闭共用的停止控制管道；忙碌进程继续由真实退出证明约束。
-    loss = (async () => { await options.onDisconnected?.(); await closeBusiness(); })()
-      .catch(() => { log.warn("managed_disconnect_observation_failed"); });
+    loss = (async () => { await options.onDisconnected?.(); await closeBusiness(); })();
+    void loss.catch(() => { log.warn("managed_disconnect_observation_failed"); });
   }
   return {
     get joined() { return joined; },
@@ -93,16 +96,21 @@ export async function createRuntimeGateway(options: {
       try { await core.resolveGroup(options.authority.identity.groupId, new Set([options.authority.identity.memberId])); }
       catch { log.warn("managed_wake_failed"); }
     },
-    close() {
-      if (closing) return closing;
+    close(closeOptions) {
+      const checked = () => {
+        if (closeOptions?.strict && closeFailures.length) throw new AggregateError(closeFailures, "managed_gateway_close_incomplete");
+      };
+      if (closing) return closing.then(checked);
       normalClosing = true;
       closing = (async () => {
-        await loss;
-        await closeBusiness();
-        await transport?.close();
-        await mcp?.close();
+        // An earlier out-of-scope disconnect may have been denied by maintenance.
+        // Retry the same owned core here; the final strict attempt must succeed.
+        await loss?.catch(() => {});
+        for (const close of [closeBusiness, () => transport?.close(), () => mcp?.close()]) {
+          try { await close(); } catch (error) { closeFailures.push(error); }
+        }
       })();
-      return closing;
+      return closing.then(checked);
     },
   };
 }
