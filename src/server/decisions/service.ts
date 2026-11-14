@@ -15,6 +15,7 @@ import type { DbReviewHandlerDescriptorV1 } from '../policy/db-review.ts';
 import { canonicalJson } from '../policy/canonical.ts';
 import { createDecisionRepository, readDecisionProjectGraph, type DecisionWriter } from './repository.ts';
 import type { StorageRow } from './storage-validation.ts';
+import { storageInteger } from './row-validation.ts';
 import { withLockedReviewTransaction, assertReviewTransaction } from './locked-transaction.ts';
 import { encode, commandDigest, permissionDigest } from './text-codec.ts';
 import { actionOf, currentPolicyRef, headRef, legacyView, observationOf, presentDecision, recordRef, responseOf } from './read-model.ts';
@@ -278,7 +279,10 @@ export function createDecisionService(db: DbDriver, options: { now?: () => Date;
           source_contract: 's1.local-db-decision-choice/v1', authority_basis: 'same-transaction-current-permissions', transfer_mode: 'same-transaction-only',
           consumed_receipt_id: receiptId, issued_at: ctx.at, consumed_at: ctx.at });
         const source = await repos.context.one('SELECT * FROM decision_local_initiations WHERE id=?', [initiationId]);
-        if (!source || Object.entries(binding).some(([key, value]) => source[key] !== value) || source.nonce_hash !== createHash('sha256').update(nonce).digest('hex') ||
+        // PostgreSQL exposes BIGINT as canonical decimal text. Normalize only
+        // this typed revision; all other source bindings remain exact values.
+        if (!source || Object.entries(binding).some(([key, value]) => (key === 'input_decision_revision'
+          ? storageInteger(source[key], 'decision_local_initiations.input_decision_revision') : source[key]) !== value) || source.nonce_hash !== createHash('sha256').update(nonce).digest('hex') ||
           source.user_event_id !== userEventId || source.consumed_receipt_id !== receiptId) throw new DecisionCommandError('source_binding_mismatch', '本地命令来源绑定不一致。');
         nonce.fill(0);
       }

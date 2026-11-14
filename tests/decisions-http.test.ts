@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { types as pgTypes } from 'pg';
+import type { DbRow } from '../src/server/db/driver.ts';
 import { identityEngines,identityFixture,identitySkip } from './helpers/identity-fixture.ts';
 import { decisionDomainFixture } from './helpers/decision-domain-fixture.ts';
 import { initializePolicyConfiguration } from '../src/server/policy/configuration.ts';
@@ -11,8 +13,10 @@ import { onResourceChange } from '../src/server/resource-changes.ts';
 import type { DecisionCommandResult,LiveDecisionView } from '../src/shared/decisions.ts';
 import { DECISION_TABLE_NAMES } from '../src/server/decisions/tables.ts';
 
-for(const engine of identityEngines)test(`${engine}: Decision real local HTTP source, rollback, current GET and same-key durable receipt`,{skip:identitySkip(engine)},async()=>{
+const cases = [...identityEngines.map(engine => ({engine,int8Control:false})),{engine:'sqlite' as const,int8Control:true}];
+for(const {engine,int8Control} of cases)test(`${engine}: Decision real local HTTP source, rollback, current GET and same-key durable receipt${int8Control?' (PG int8 representation control)':''}`,{skip:identitySkip(engine)},async()=>{
   const f=await identityFixture(engine);let closeHttp:(()=>Promise<void>)|undefined;
+  const query=f.db.query.bind(f.db),exec=f.db.exec.bind(f.db),transaction=f.db.transaction.bind(f.db);
   try{
     await initializePolicyConfiguration(f.repos);const p=await decisionDomainFixture(f.repos),api=createTaskApi({db:f.db,logger:createLogger({write:()=>{}})});
     const server=createServer((req,res)=>{void api.handle(req,res,new URL(req.url??'/','http://127.0.0.1').pathname).then(handled=>{if(!handled){res.statusCode=404;res.end();}});});
@@ -34,10 +38,45 @@ for(const engine of identityEngines)test(`${engine}: Decision real local HTTP so
     const unchanged=await fetch(listUrl,{headers:{'if-none-match':etag}});assert.equal(unchanged.status,304);
     assert.deepEqual(await f.db.query('SELECT * FROM decision_records'),before);
     const notified:unknown[]=[];const stopWork=onWorkEventCommit(f.db,events=>{notified.push(...events);}),stopResource=onResourceChange(f.db,event=>{notified.push(event);});
-    const exec=f.db.exec.bind(f.db),transaction=f.db.transaction.bind(f.db);
     const capture=async()=>Object.fromEntries(await Promise.all([...DECISION_TABLE_NAMES,'tasks','task_review_rounds','task_history','work_events','audit_log','member_fact_revisions'].map(async table=>
       [table,(await f.db.query(`SELECT * FROM ${table}`)).map(r=>JSON.stringify(r)).sort()])));
     const fullBefore=await capture();
+    // This additional SQLite control uses pg's actual int8 representation only
+    // for the trusted source reread. Native SQLite and PostgreSQL cases above
+    // keep their driver results; SQL, transactions and effects remain real.
+    const int8=pgTypes.getTypeParser(20,'text');
+    if(int8Control)assert.equal(typeof int8('1'),'string');
+    let sourceOverride:Record<string,unknown>|undefined,sourceReads=0;
+    const wrapRead=(read:typeof query):typeof query=>async<T extends DbRow>(sql:string,params?:readonly unknown[]):Promise<T[]>=>{
+      const rows=await read<T>(sql,params);
+      if(!int8Control||!/^SELECT \* FROM decision_local_initiations WHERE id=\?$/.test(sql.trim()))return rows;
+      sourceReads++;
+      return rows.map(row=>({...row,input_decision_revision:int8(String(row.input_decision_revision)),...sourceOverride}));
+    };
+    const readTransaction:typeof transaction=body=>transaction(tx=>body({query:wrapRead(tx.query.bind(tx)),exec:tx.exec.bind(tx)}));
+    f.db.query=wrapRead(query);f.db.transaction=readTransaction;
+    const rejectMismatchedSources=async()=>{
+      if(!int8Control)return;
+      const badSources:[string,Record<string,unknown>,number,string][]=[
+        ['different revision',{input_decision_revision:String(current.ref.revision+1)},409,'source_binding_mismatch'],
+        ['different actor',{actor_id:'human:another'},409,'source_binding_mismatch'],
+        ['different digest',{request_digest:`sha256:${'0'.repeat(64)}`},409,'source_binding_mismatch'],
+        ['different nonce',{nonce_hash:'0'.repeat(64)},409,'source_binding_mismatch'],
+        ['different user event',{user_event_id:'another-user-event'},409,'source_binding_mismatch'],
+        ['different receipt',{consumed_receipt_id:'another-receipt'},409,'source_binding_mismatch'],
+        ['noncanonical revision',{input_decision_revision:'01'},500,'decision_storage_invalid'],
+        ['exponent revision',{input_decision_revision:'1e0'},500,'decision_storage_invalid'],
+        ['unsafe revision',{input_decision_revision:'9007199254740992'},500,'decision_storage_invalid'],
+        ['boolean revision',{input_decision_revision:true},500,'decision_storage_invalid'],
+      ];
+      for(const [label,override,status,code] of badSources){
+        sourceOverride=override;
+        const response=await post(input),body=await response.json() as {error:{code:string}};
+        assert.equal(response.status,status,`${label}: ${JSON.stringify(body)}`);assert.equal(body.error.code,code,label);
+        assert.equal(notified.length,0,label);assert.deepEqual(await capture(),fullBefore,label);
+      }
+      sourceOverride=undefined;
+    };
     const writePoints=[['user-event',/^INSERT INTO decision_user_events\b/],['initiation',/^INSERT INTO decision_local_initiations\b/],
       ['resolution',/^INSERT INTO decision_resolutions\b/],['task',/^UPDATE tasks SET /],['round',/^UPDATE task_review_rounds SET /],
       ['history',/^INSERT INTO task_history\b/],['audit',/^INSERT INTO audit_log\b/],['work-event',/^INSERT INTO work_events\b/],
@@ -49,10 +88,13 @@ for(const engine of identityEngines)test(`${engine}: Decision real local HTTP so
       // Repository mutations use the driver's real transaction facade, while
       // the Decision writer uses the same driver's current physical context.
       // Observe both paths without replacing either DB transaction or effect.
-      f.db.transaction=body=>transaction(tx=>body({query:tx.query.bind(tx),exec:wrap(tx.exec.bind(tx))}));
-      try{assert.equal((await post(input)).status,500,point);}finally{f.db.exec=exec;f.db.transaction=transaction;}
+      f.db.transaction=body=>transaction(tx=>body({query:wrapRead(tx.query.bind(tx)),exec:wrap(tx.exec.bind(tx))}));
+      try{const response=await post(input),body=await response.json();
+        assert.equal(response.status,500,`${point}; injected=${injected}; response=${JSON.stringify(body)}`);
+      }finally{f.db.exec=exec;f.db.transaction=readTransaction;}
       assert.equal(injected,true,point);assert.equal(notified.length,0,point);assert.deepEqual(await capture(),fullBefore,point);
     }
+    await rejectMismatchedSources();
     assert.deepEqual(await f.db.query('SELECT * FROM decision_records'),before);
     for(const table of ['decision_resolutions','decision_executions','decision_user_events','decision_local_initiations','decision_command_receipts'])assert.equal((await f.db.query(`SELECT * FROM ${table}`)).length,0);
     assert.equal((await f.repos.tasks.get(p.project.id,p.task.id))!.state,'review');
@@ -72,5 +114,6 @@ for(const engine of identityEngines)test(`${engine}: Decision real local HTTP so
     const changes=await fetch(`${base}/api/projects/${p.project.id}/decisions/changes?afterRevision=0`);assert.equal(changes.status,200);
     assert.ok((await changes.json() as {cursor:number}).cursor>=2);
     const all=await fetch(`${base}/api/decisions`);assert.equal(all.status,200);
-  }finally{await closeHttp?.();await f.close();}
+    if(int8Control)assert.ok(sourceReads>0,'representation control reached the source reread');
+  }finally{f.db.query=query;f.db.exec=exec;f.db.transaction=transaction;await closeHttp?.();await f.close();}
 });
