@@ -168,12 +168,25 @@ test("#152 A10-R05 SQLite rejects catalog changes before projecting rows", async
   });
 });
 
-test("#152 A10-R07 SQLite actual unreadable source is not a successful empty roster", async () => {
-  const f = await fixture(); const mode = (await stat(f.file)).mode & 0o777;
+test("#152 A10-R07 SQLite actual unreadable source fails at its platform preflight before raw state/rows", async t => {
+  const f = await fixture(), prepare = Database.prototype.prepare;
+  const mode = (await stat(f.file)).mode & 0o777;
+  let stateReads = 0, rawReads = 0, darwinChecks = 0;
   try {
+    t.mock.method(Database.prototype, "prepare", function(this: Database.Database, sql: string) {
+      if (this.name === f.file && this !== f.db) {
+        if (sql === "SELECT * FROM storage_maintenance") stateReads++;
+        if (sql.endsWith("FROM main.storage_source_clients")) rawReads++;
+        if (sql === "SELECT boardroom_maintenance_source_unchanged() AS unchanged") darwinChecks++;
+      }
+      return Reflect.apply(prepare, this, [sql]);
+    });
     await chmod(f.file, 0);
-    await assert.rejects(f.adapter.observeSourceClients(), /source_changed|snapshot_invalid/);
-  } finally { await chmod(f.file, mode); await f.close(); }
+    // Darwin's fixed native handle inventory cannot observe the unreadable source;
+    // Linux reaches the failed readonly database open. Neither entered the raw read.
+    await assert.rejects(f.adapter.observeSourceClients(), { code: process.platform === "darwin" ? "source_writer_unknown" : "snapshot_invalid" });
+    assert.equal(stateReads, 0); assert.equal(rawReads, 0); assert.equal(darwinChecks, 0);
+  } finally { t.mock.restoreAll(); await chmod(f.file, mode); await f.close(); }
 });
 
 test("#152 A10-R07 SQLite owned close rejection blocks success after the real handle is closed", async t => {
@@ -203,16 +216,82 @@ test("#152 A10-R08 SQLite lost real mutex rejects a retained SourceLock method",
   } finally { await mutex?.release(); await f.close(); }
 });
 
-test("#152 A10-R07 SQLite real exclusive lock reports busy and source rename reports identity drift", async () => {
-  const f = await fixture();
+test("#152 A10-R07 SQLite an existing exclusive lock preserves platform preflight refusal before raw state", async t => {
+  const f = await fixture(), prepare = Database.prototype.prepare, pragma = Database.prototype.pragma, loadExtension = Database.prototype.loadExtension;
+  let stateReads = 0, schemaReads = 0, bindLoads = 0;
   try {
+    t.mock.method(Database.prototype, "prepare", function(this: Database.Database, sql: string) {
+      if (this.name === f.file && this !== f.db) {
+        if (sql === "SELECT * FROM storage_maintenance") stateReads++;
+      }
+      return Reflect.apply(prepare, this, [sql]);
+    });
+    t.mock.method(Database.prototype, "pragma", function(this: Database.Database, ...args: unknown[]) {
+      if (this.name === f.file && this !== f.db && args[0] === "schema_version") schemaReads++;
+      return Reflect.apply(pragma, this, args);
+    });
+    t.mock.method(Database.prototype, "loadExtension", function(this: Database.Database, ...args: unknown[]) {
+      if (this.name === f.file && this !== f.db) bindLoads++;
+      return Reflect.apply(loadExtension, this, args);
+    });
     f.db.pragma("journal_mode=DELETE"); f.db.exec("BEGIN EXCLUSIVE");
-    try { await assert.rejects(f.adapter.observeSourceClients(), /maintenance_busy/); }
+    try {
+      // Darwin's unchanged bind/loadExtension source guard refuses this locked source
+      // before schema_version; Linux reports BUSY while opening the schema view.
+      await assert.rejects(f.adapter.observeSourceClients(), { code: process.platform === "darwin" ? "source_changed" : "maintenance_busy" });
+      assert.equal(stateReads, 0); assert.equal(bindLoads, process.platform === "darwin" ? 1 : 0);
+      assert.equal(schemaReads, process.platform === "darwin" ? 0 : 1);
+    }
     finally { f.db.exec("ROLLBACK"); }
+    t.mock.restoreAll();
     await rename(f.file, f.file + ".moved");
     try { await assert.rejects(f.adapter.observeSourceClients(), /source_changed/); }
     finally { await rename(f.file + ".moved", f.file); }
-  } finally { await f.close(); }
+  } finally { t.mock.restoreAll(); await f.close(); }
+});
+
+test("#152 R-152-SCA10-REQ-001 real lock acquired after open still reports busy at the first state read", async t => {
+  const f = await fixture(), prepare = Database.prototype.prepare;
+  try {
+    f.db.pragma("journal_mode=DELETE");
+    for (const entry of ["raw", "legacy"] as const) {
+      let acquired = false;
+      const hook = t.mock.method(Database.prototype, "prepare", function(this: Database.Database, sql: string) {
+        if (this.name === f.file && this !== f.db && sql === "SELECT * FROM storage_maintenance" && !acquired) {
+          f.db.exec("BEGIN EXCLUSIVE"); acquired = f.db.inTransaction;
+        }
+        return Reflect.apply(prepare, this, [sql]);
+      });
+      try {
+        await assert.rejects(entry === "raw" ? f.adapter.observeSourceClients() : f.adapter.observe(), error => entry === "raw"
+          ? (error as { code?: string }).code === "maintenance_busy"
+          : (error as { reason?: string }).reason === "metadata_invalid");
+        assert.equal(acquired, true, "第二个真实 handle 在 adapter 打开/schema_version 后成功持有 EXCLUSIVE");
+      } finally { hook.mock.restore(); if (f.db.inTransaction) f.db.exec("ROLLBACK"); }
+    }
+    assert.deepEqual((await f.adapter.observeSourceClients()).rows, []);
+  } finally { t.mock.restoreAll(); if (f.db.inTransaction) f.db.exec("ROLLBACK"); await f.close(); }
+});
+
+test("#152 A10-R07 raw state validation separates malformed schema from native read errors", async t => {
+  for (const sql of ["DELETE FROM storage_maintenance", "DROP TABLE storage_maintenance"]) await t.test(sql, async () => {
+    const f = await fixture();
+    try { f.db.exec(sql); await assert.rejects(f.adapter.observeSourceClients(), /schema_guard_incomplete/); }
+    finally { await f.close(); }
+  });
+  for (const code of ["SQLITE_LOCKED", "SQLITE_IOERR_READ"]) await t.test(`synthetic ${code}`, async child => {
+    const f = await fixture(), prepare = Database.prototype.prepare;
+    try {
+      child.mock.method(Database.prototype, "prepare", function(this: Database.Database, sql: string) {
+        if (this.name === f.file && this !== f.db && sql === "SELECT * FROM storage_maintenance")
+          throw Object.assign(new Error("private-state-read-canary"), { code });
+        return Reflect.apply(prepare, this, [sql]);
+      });
+      await assert.rejects(f.adapter.observeSourceClients(), error =>
+        (error as { code?: string }).code === (code === "SQLITE_LOCKED" ? "maintenance_busy" : "snapshot_invalid")
+        && !String(error).includes("canary"));
+    } finally { child.mock.restoreAll(); await f.close(); }
+  });
 });
 
 test("#152 A10-R08 SQLite read view preserves count and raw cells across an actual second-handle commit", async t => {

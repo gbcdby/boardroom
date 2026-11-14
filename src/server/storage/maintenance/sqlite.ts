@@ -4,7 +4,7 @@ import { chmod, copyFile, lstat, mkdir, open, stat } from "node:fs/promises";
 import path from "node:path";
 import { assertSqliteSourceUnchanged, type SqliteDatabaseDescriptor } from "../../environment.ts";
 import { inspectOwnedProcess } from "../../runtime/hosts/process-identity.ts";
-import { readSqliteMaintenanceState, type StorageMaintenanceState } from "../admission.ts";
+import { parseStorageMaintenanceState, readSqliteMaintenanceState, type StorageMaintenanceState } from "../admission.ts";
 import { assertSqliteGuardCoverage } from "../schema-guards.ts";
 import { canonicalJson, digestJson } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
@@ -170,8 +170,15 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   }
   private sourceClientsObservation(db: Database.Database): SourceClientsObservation {
     this.assertSource();
+    let rows: Record<string, unknown>[];
+    try { rows = db.prepare("SELECT * FROM storage_maintenance").all() as Record<string, unknown>[]; }
+    catch (error) {
+      // The fixed query's missing/invalid schema is distinct from native BUSY/LOCKED or I/O failure.
+      if ((error as { code?: string }).code === "SQLITE_ERROR") throw new MaintenanceFailure("schema_guard_incomplete", "source-clients");
+      throw error;
+    }
     let state: StorageMaintenanceState;
-    try { state = readSqliteMaintenanceState(db, true)!; }
+    try { state = parseStorageMaintenanceState(rows); }
     catch { throw new MaintenanceFailure("schema_guard_incomplete", "source-clients"); }
     const sourceIdentity = { kind: "sqlite", sourcePath: this.source.sourcePath, sqlitePath: this.source.sqlitePath,
       device: this.source.identity!.device, inode: this.source.identity!.inode };
