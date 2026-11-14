@@ -1,0 +1,14 @@
+{
+  "support.py": {
+    "source_commit": "76f24e9e77546372582a5192039ccfade580ff6c",
+    "source_path": "scripts/qualification/fs-native-ext4-r04/support.py",
+    "sha256": "698698fb520ac213351d8676b53220373bcbc9ec89fd7499c0cf6c6cf36b6b90",
+    "reuse": "byte-for-byte unchanged; no legacy verdict copied"
+  },
+  "observer.py": {
+    "source_commit": "76f24e9e77546372582a5192039ccfade580ff6c",
+    "source_path": "scripts/qualification/fs-native-ext4-r04/observer.py",
+    "sha256": "5ee8bb27a4f111071adac563322521ce14ab570e5379ef16f1574504f85d9eb2",
+    "reuse": "byte-for-byte unchanged; no legacy verdict copied"
+  }
+}

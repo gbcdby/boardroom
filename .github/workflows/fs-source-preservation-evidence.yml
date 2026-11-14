@@ -1,0 +1,41 @@
+name: Fs source preservation bounded evidence
+
+on:
+  push:
+    branches: [qualification/152-fs-source-preservation-r1]
+    paths:
+      - '.github/workflows/fs-source-preservation-evidence.yml'
+      - 'scripts/qualification/fs-source-preservation/**'
+      - 'tests/fs-source-preservation.test.py'
+      - 'tests/fixtures/fs-source-preservation/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fs-source-preservation-evidence
+  cancel-in-progress: false
+
+jobs:
+  bounded-source-preservation-evidence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Offline structure and window controls
+        run: python3 tests/fs-source-preservation.test.py
+      - name: One bounded owned-fixture observation
+        run: python3 scripts/qualification/fs-source-preservation/run.py --mode hosted-linux --out "$GITHUB_WORKSPACE/.agent-output/fs-source-preservation-evidence"
+      - name: Preserve originals and exact non-release status
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fs-source-preservation-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: .agent-output/fs-source-preservation-evidence
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
