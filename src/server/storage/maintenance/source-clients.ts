@@ -10,7 +10,7 @@ const decimal = (maximum: string, positive = false) => z.string()
 const integer = z.tuple([z.literal("integer"), decimal("9223372036854775807")]);
 const text = z.tuple([z.literal("text"), z.string().regex(/^(?:[a-f0-9]{2})*$/)]);
 const nil = z.tuple([z.literal("null")]);
-const row = z.object({
+export const sourceClientRawRowSchema = z.object({
   client_id: text, database_instance_id: text, entrypoint: text, build_id: text,
   host_identity_json: text, process_identity_json: text, db_sessions_json: text,
   registered_at: text, last_observed_at: text, drain_state: text,
@@ -18,7 +18,7 @@ const row = z.object({
   protocol_version: z.tuple([z.literal("integer"), z.literal("1")]),
   registered_epoch: integer, observed_epoch: integer, drain_epoch: z.union([integer, nil]),
 }).strict();
-const encoding = z.discriminatedUnion("backend", [
+export const sourceClientsEncodingSchema = z.discriminatedUnion("backend", [
   z.object({ backend: z.literal("sqlite"), name: z.enum(["UTF-8", "UTF-16le", "UTF-16be"]) }).strict(),
   z.object({ backend: z.literal("postgres"), name: z.enum([
     "EUC_CN", "EUC_JP", "EUC_JIS_2004", "EUC_KR", "EUC_TW", "ISO_8859_5", "ISO_8859_6", "ISO_8859_7", "ISO_8859_8",
@@ -30,7 +30,7 @@ const encoding = z.discriminatedUnion("backend", [
 const rosterShape = z.object({
   formatVersion: z.literal(1), kind: z.literal("source-clients-roster"), source, migrationId: id, plan: ref,
   fenceEpoch: decimal("9007199254740991", true), receiptGeneration: decimal("9007199254740991", true),
-  textEncoding: encoding, rows: z.array(row),
+  textEncoding: sourceClientsEncodingSchema, rows: z.array(sourceClientRawRowSchema),
 }).strict().refine(value => value.textEncoding.backend === value.source.kind);
 
 // With strictly lowercase, even hex, string order is unsigned byte order, including short prefixes.
