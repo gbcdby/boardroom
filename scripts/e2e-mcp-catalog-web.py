@@ -120,6 +120,14 @@ def wait_fixture(page, fixture, predicate):
     raise AssertionError("实际 MCP 请求未到达指定边界")
 
 
+def activate_for_input(page, report, step):
+    page.bring_to_front()
+    page.wait_for_function("document.visibilityState === 'visible'", polling=100, timeout=5000)
+    observed = page.evaluate("() => ({visibility:document.visibilityState, focused:document.hasFocus()})")
+    assert observed["visibility"] == "visible", (step, observed)
+    report.setdefault("pageActivations", []).append({"step": step, "url": page.url, **observed})
+
+
 def visibility_recovery(page, context, origin, requests, report):
     cdp = context.new_cdp_session(page)
     window = None
@@ -236,19 +244,24 @@ def exercise(page, context, fixture, output, report, native):
     second = context.new_page()
     try:
         second.goto(origin + "/collaboration/mcp")
+        activate_for_input(second, report, "cas-second-loaded")
         expect(second.get_by_test_id("mcp-connection")).to_have_value(connection)
-        page.bring_to_front(); page.get_by_test_id("mcp-edit").click()
+        activate_for_input(page, report, "cas-first-draft")
+        page.get_by_test_id("mcp-edit").click()
         expect(page.get_by_test_id("mcp-endpoint")).to_have_value(endpoint)
         page.get_by_test_id("mcp-name").fill("保留本窗口草稿")
+        activate_for_input(second, report, "cas-second-update")
         second.get_by_test_id("mcp-edit").click()
         second.get_by_test_id("mcp-name").fill("另一窗口的新版本"); save(second)
-        page.bring_to_front(); page.get_by_test_id("mcp-save").click()
+        activate_for_input(page, report, "cas-first-conflict")
+        page.get_by_test_id("mcp-save").click()
         expect(page.get_by_test_id("mcp-editor")).to_contain_text("编辑稿保留")
         expect(page.get_by_test_id("mcp-name")).to_have_value("保留本窗口草稿")
         page.get_by_test_id("mcp-adopt-revision").click()
         expect(page.get_by_test_id("mcp-editor")).to_contain_text("编辑基准：v2")
         save(page)
     finally: second.close()
+    activate_for_input(page, report, "cas-first-after-close")
     assert api(page, origin, "GET", COLLECTION + "/" + connection)["connection"]["revision"] == 3
     expect(page.get_by_test_id("mcp-undiscovered")).to_be_visible()
     report["checks"].append("A02/A05: 两真实窗口CAS冲突保留稿，显式采用v2后保存v3；旧配置目录不当当前")
