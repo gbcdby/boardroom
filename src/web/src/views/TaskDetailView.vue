@@ -5,6 +5,9 @@ import { ApiError, type MemberDto, type OrgNodeDto } from "../api/client.ts";
 import { changedTaskInput, deliveryKindLabel, emptyTaskDraft, NO_REVIEWER, taskDraft, taskFieldErrors, taskStateLabel, tasksApi, type ReviewRound, type TaskDetail, type ReviewVerdict, type TaskDraft, type TaskFieldErrors } from "../api/tasks.ts";
 import TaskFields from "../components/TaskFields.vue";
 import ResourceSyncStatus from "../components/ResourceSyncStatus.vue";
+import DecisionPanel from "../components/DecisionPanel.vue";
+import { decisionResultMessage, postDecision, type DecisionRef, type LiveDecisionView, type RequestReviewDecisionInput, type ReviewHeadRef } from "../api/decisions.ts";
+import type { DecideReviewInput } from "../../../shared/tasks.ts";
 import { acceptsTaskDetail, readTaskDetail, type TaskDetailResource } from "../api/task-resources.ts";
 import { useResourceReconciliation } from "../composables/useResourceReconciliation.ts";
 import { projectPath, useCurrentProject, useProjectDraft } from "../composables/useCurrentProject.ts";
@@ -31,7 +34,17 @@ const comment = ref("");
 const reason = ref("");
 const reasonRevision = ref<number | null>(null);
 const decisionReason = ref("");
-const decisionBase = ref<{ taskRevision: number; roundId: string; roundRevision: number } | null>(null);
+const currentDecision = ref<LiveDecisionView | null>(null);
+const decisionBase = ref<{ taskRevision: number; roundId: string; roundRevision: number; head: ReviewHeadRef | null; decisionRef: DecisionRef | null } | null>(null);
+const decisionUnknown = ref(false);
+const decisionRefreshed = ref(false);
+const choiceLocked = ref(false);
+type FrozenDecisionCommand = { kind: "legacy"; roundId: string; input: DecideReviewInput }
+  | { kind: "proposal"; url: string; input: RequestReviewDecisionInput };
+const frozenDecision = ref<FrozenDecisionCommand | null>(null);
+const decisionReadSerial = ref(0);
+const decisionConflictReadSerial = ref<number | null>(null);
+const decisionLocked = computed(() => decisionUnknown.value || choiceLocked.value);
 const verdict = ref<ReviewVerdict>("changes_requested");
 const busy = ref<string | null>(null);
 const error = ref<string | null>(null);
@@ -55,14 +68,36 @@ const loading = computed(() => resource.loading.value && resource.value.value ==
 const displayError = computed(() => error.value ?? resource.error.value);
 const activeRound = computed(() => detail.value?.rounds.find((round) => round.id === task.value?.currentReviewRoundId) ?? null);
 const reasonRemoteChanged = computed(() => !!reason.value.trim() && reasonRevision.value !== null && reasonRevision.value !== task.value?.revision);
-const decisionRemoteChanged = computed(() => !!decisionReason.value.trim() && decisionBase.value !== null && (decisionBase.value.taskRevision !== task.value?.revision || decisionBase.value.roundId !== activeRound.value?.id || decisionBase.value.roundRevision !== activeRound.value?.revision));
+function sameDecisionRef(left: DecisionRef | null, right: DecisionRef | null): boolean {
+  return left === null || right === null ? left === right : left.decisionId === right.decisionId && left.revision === right.revision
+    && left.actionDigest === right.actionDigest && left.projectId === right.projectId;
+}
+function sameDecisionHead(left: ReviewHeadRef | null, right: ReviewHeadRef | null): boolean {
+  return left === null || right === null ? left === right : left.projectId === right.projectId && left.taskId === right.taskId
+    && left.roundId === right.roundId && left.headRevision === right.headRevision && left.currentDecisionId === right.currentDecisionId;
+}
+const decisionRemoteChanged = computed(() => !!decisionReason.value.trim() && decisionBase.value !== null && (decisionBase.value.taskRevision !== task.value?.revision
+  || decisionBase.value.roundId !== activeRound.value?.id || decisionBase.value.roundRevision !== activeRound.value?.revision
+  || !sameDecisionHead(decisionBase.value.head, currentDecision.value?.head ?? null)
+  || !sameDecisionRef(decisionBase.value.decisionRef, currentDecision.value?.ref ?? null)));
+const needsExplicitProposal = computed(() => !!currentDecision.value && (currentDecision.value.status === "pending"
+  ? currentDecision.value.actionRequest.action.payload.choice !== verdict.value : activeRound.value?.state === "reported"));
+const proposalAllowed = computed(() => !needsExplicitProposal.value || !!decisionBase.value?.head && !!currentDecision.value?.allowedOperations.includes("propose-successor"));
+const decisionRebaseNeeded = computed(() => decisionRemoteChanged.value || decisionConflictReadSerial.value !== null);
+const decisionRebaseReady = computed(() => decisionConflictReadSerial.value === null || decisionReadSerial.value > decisionConflictReadSerial.value);
+function receiveDecision(value: LiveDecisionView | null): void { currentDecision.value = value; decisionReadSerial.value++; }
+function pinDecisionBase(): void {
+  if (task.value && activeRound.value) decisionBase.value = { taskRevision: task.value.revision, roundId: activeRound.value.id,
+    roundRevision: activeRound.value.revision, head: currentDecision.value ? { ...currentDecision.value.head } : null,
+    decisionRef: currentDecision.value ? { ...currentDecision.value.ref } : null };
+}
 watch(reason, value => {
   if (!value.trim()) reasonRevision.value = null;
   else if (reasonRevision.value === null) reasonRevision.value = task.value?.revision ?? null;
 }, { flush: "sync" });
 watch(decisionReason, value => {
-  if (!value.trim()) decisionBase.value = null;
-  else if (!decisionBase.value && task.value && activeRound.value) decisionBase.value = { taskRevision: task.value.revision, roundId: activeRound.value.id, roundRevision: activeRound.value.revision };
+  if (!value.trim() && !decisionUnknown.value) { decisionBase.value = null; frozenDecision.value = null; decisionRefreshed.value = false; decisionConflictReadSerial.value = null; }
+  else if (!decisionBase.value) pinDecisionBase();
 }, { flush: "sync" });
 const canOverride = computed(() => activeRound.value && ["reported", "decided"].includes(activeRound.value.state) && ["spec", "standards"].every((axis) => detail.value?.reports.some((report) => report.roundId === activeRound.value?.id && report.axis === axis)));
 const blockedEscalation = computed(() => [...(detail.value?.history ?? [])].reverse().find((entry) => entry.action === "task.transitioned" && entry.detail["to"] === "blocked")?.detail["escalation"] as { unresolved?: boolean; recipientMemberId?: string | null } | undefined);
@@ -73,8 +108,8 @@ const canSave = computed(() => !!task.value && baseRevision.value !== null && !p
   && (!changedInput.value.assigneeMemberId || members.value.some(member => member.id === changedInput.value.assigneeMemberId && member.status === "active"))
   && (!changedInput.value.reviewerMemberId || members.value.some(member => member.id === changedInput.value.reviewerMemberId && member.kind === "agent" && member.status === "active"))
   && (!draft.value.assigneeMemberId || draft.value.reviewerMemberId === NO_REVIEWER || draft.value.assigneeMemberId !== draft.value.reviewerMemberId));
-const hasDraft = () => (editing.value && JSON.stringify(draft.value) !== savedDraft.value) || !!comment.value || !!reason.value || !!decisionReason.value;
-useProjectDraft(hasDraft, () => { editing.value = false; comment.value = ""; reason.value = ""; decisionReason.value = ""; draft.value = emptyTaskDraft(); });
+const hasDraft = () => (editing.value && JSON.stringify(draft.value) !== savedDraft.value) || !!comment.value || !!reason.value || !!decisionReason.value || decisionUnknown.value;
+useProjectDraft(hasDraft, () => { editing.value = false; comment.value = ""; reason.value = ""; decisionUnknown.value = false; decisionReason.value = ""; draft.value = emptyTaskDraft(); });
 function nameOf(id: string | null): string { return members.value.find((member) => member.id === id)?.displayName ?? (id ? "成员已不可用" : "待分派"); }
 function time(iso: string): string { return new Date(iso).toLocaleString("zh-CN"); }
 function isCurrent(projectId: string, id: string, generation: number, scope: number): boolean { return !disposed && currentProjectId.value === projectId && taskId.value === id && context.generation.value === generation && scopeVersion === scope; }
@@ -137,17 +172,62 @@ async function sendComment(): Promise<void> {
   const body = comment.value.trim(); if (!body) return;
   await runMutation("comment", (projectId, id) => tasksApi.comment(projectId, id, body), "评论已保存。", () => { comment.value = ""; });
 }
-async function decide(): Promise<void> {
-  if (!task.value || !activeRound.value || !canOverride.value || !decisionReason.value.trim() || !decisionBase.value || decisionRemoteChanged.value) return;
-  const roundId = decisionBase.value.roundId;
-  const input = { expectedTaskRevision: decisionBase.value.taskRevision, expectedRoundRevision: decisionBase.value.roundRevision, verdict: verdict.value, reason: decisionReason.value.trim(), override: true };
-  await runMutation("decision", (projectId, id) => tasksApi.decide(projectId, id, roundId, input), "管理者裁决已保存，原报告与历史结论仍保留。", () => { decisionReason.value = ""; });
+async function decide(retry = false): Promise<void> {
+  const projectId = currentProjectId.value, id = taskId.value;
+  if (!projectId || !id || busy.value || projectReadonly.value || choiceLocked.value) return;
+  if (retry ? !decisionUnknown.value || !frozenDecision.value : !task.value || !activeRound.value || !canOverride.value || !decisionReason.value.trim()
+    || !decisionBase.value || decisionRebaseNeeded.value || !proposalAllowed.value || decisionUnknown.value || decisionRefreshed.value || !!resource.error.value) return;
+  if (!retry) {
+    const base = decisionBase.value!;
+    frozenDecision.value = needsExplicitProposal.value ? {
+      kind: "proposal", url: `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(id)}/reviews/${encodeURIComponent(base.roundId)}/decision-requests`,
+      input: { expectedTaskRevision: base.taskRevision, expectedRoundRevision: base.roundRevision, proposedVerdict: verdict.value,
+        reason: decisionReason.value.trim(), requestedPath: "management", expectedHead: { ...base.head! }, idempotencyKey: crypto.randomUUID() },
+    } : {
+      kind: "legacy", roundId: base.roundId,
+      input: { expectedTaskRevision: base.taskRevision, expectedRoundRevision: base.roundRevision, verdict: verdict.value,
+        reason: decisionReason.value.trim(), override: true },
+    };
+  }
+  const command = frozenDecision.value!, generation = context.generation.value, scope = scopeVersion;
+  busy.value = "decision"; error.value = null; notice.value = null;
+  try {
+    // The compatibility key is derived by the server from this exact command.
+    // A lost reply must not adopt a later Task/Round or manufacture a new choice.
+    const result = command.kind === "proposal" ? await postDecision(command.url, command.input)
+      : await tasksApi.decide(projectId, id, command.roundId, command.input);
+    if (!isCurrent(projectId, id, generation, scope)) return;
+    if (command.kind === "proposal" && (result.state === "applied" || result.state === "not_required" || result.receipt.execution !== null))
+      throw new Error("提案回执包含未请求的执行结果，无法确认本次操作。");
+    decisionUnknown.value = false;
+    decisionRefreshed.value = result.state === "refreshed";
+    if (decisionRefreshed.value && command.kind === "proposal") decisionConflictReadSerial.value = decisionReadSerial.value;
+    notice.value = command.kind === "proposal" && result.state === "pending"
+      ? `${decisionResultMessage(result)} 此次只建立替代提案，未应用任务结论；当前状态以上方记录为准。若仍待决，请另行选择是否同意应用。`
+      : decisionResultMessage(result);
+    if (result.state !== "refreshed") { decisionReason.value = ""; frozenDecision.value = null; }
+    if (result.state === "applied") toast.success(notice.value);
+    await resource.committed(snapshot => snapshot && result.task.revision >= snapshot.detail.task.revision
+      ? { ...snapshot, detail: { ...snapshot.detail, task: result.task } } : snapshot);
+  } catch (err) {
+    if (!isCurrent(projectId, id, generation, scope)) return;
+    // A rejected retry may mean that the current actor can no longer read the
+    // receipt. It does not prove that the original command never committed.
+    decisionUnknown.value = retry || !(err instanceof ApiError) || err.status >= 500 || err.status === 408;
+    if (err instanceof ApiError && err.status === 409) decisionConflictReadSerial.value = decisionReadSerial.value;
+    error.value = decisionUnknown.value
+      ? "本次裁决结果尚未确认。原评审轮次、结论、理由和请求已锁定，只能原样重试确认。"
+      : `${err instanceof Error ? err.message : "裁决操作失败。"} 原输入和版本已保留，请读取并核对当前任务与决定。`;
+  } finally { if (isCurrent(projectId, id, generation, scope)) busy.value = null; }
 }
 function rebaseReason(): void {
   if (task.value && !busy.value && !projectReadonly.value && !resource.error.value) reasonRevision.value = task.value.revision;
 }
 function rebaseDecision(): void {
-  if (task.value && activeRound.value && canOverride.value && !busy.value && !projectReadonly.value && !resource.error.value) decisionBase.value = { taskRevision: task.value.revision, roundId: activeRound.value.id, roundRevision: activeRound.value.revision };
+  if (!task.value || !activeRound.value || !canOverride.value || busy.value || decisionLocked.value || projectReadonly.value || resource.error.value || !decisionRebaseReady.value) return;
+  pinDecisionBase(); decisionConflictReadSerial.value = null;
+  if (frozenDecision.value?.kind === "proposal") { frozenDecision.value = null; decisionRefreshed.value = false; }
+  error.value = null;
 }
 async function reloadLatest(): Promise<void> {
   const projectId = currentProjectId.value, id = taskId.value, generation = context.generation.value, scope = scopeVersion;
@@ -169,6 +249,8 @@ watch([currentProjectId, taskId, context.generation], () => {
   scopeVersion++; busy.value = null;
   detail.value = null; error.value = null; notice.value = null; conflict.value = false; editing.value = false;
   baseRevision.value = null; saveUnknown.value = false; latestReadSucceeded.value = false;
+  decisionUnknown.value = false; decisionRefreshed.value = false; choiceLocked.value = false; frozenDecision.value = null;
+  currentDecision.value = null; decisionReadSerial.value = 0; decisionConflictReadSerial.value = null;
   comment.value = ""; reason.value = ""; decisionReason.value = "";
   const projectId = currentProjectId.value, id = taskId.value;
   void resource.setScope(projectId && id ? { projectId, taskId: id, key: `${projectId}:${id}:${context.generation.value}:${scopeVersion}` } : null);
@@ -211,16 +293,20 @@ onBeforeUnmount(() => { disposed = true; });
           <div class="review-axes"><section v-for="axis in ['spec', 'standards']" :key="axis" class="review-axis" :data-testid="`task-report-${axis}`"><h3>{{ axis === 'spec' ? '需求轴' : '标准轴' }}</h3><template v-for="report in reportsOf(round).filter((report) => report.axis === axis)" :key="report.id"><span class="badge" :class="report.verdict === 'pass' ? 'ok' : 'warning-text'">{{ report.verdict === 'pass' ? '通过' : '需要修改' }}</span><p class="task-body">{{ report.body }}</p><details><summary>来源与执行证据</summary><ul><li v-for="source in report.sources" :key="source" class="small">{{ source }}</li></ul><p class="muted small">以下执行记录由 reviewer 声明，平台未据此验证真实宿主。</p><pre class="task-evidence">{{ JSON.stringify(report.evidence, null, 2) }}</pre></details></template><p v-if="!reportsOf(round).some((report) => report.axis === axis)" class="muted small">尚无此轴报告。</p></section></div>
           <details v-if="round.candidate" class="candidate-evidence"><summary>固定候选与采集记录</summary><dl class="task-meta"><div><dt>基准</dt><dd><code>{{ round.candidate.baseCommit }}</code></dd></div><div><dt>候选</dt><dd><code>{{ round.candidate.candidateCommit }}</code></dd></div><div><dt>Diff 摘要</dt><dd><code>{{ round.candidate.diffSha256 }}</code></dd></div></dl><h3>目标快照</h3><p class="task-body">{{ round.specSnapshot.body }}</p><template v-if="round.specSnapshot.acceptanceText !== undefined"><h3>验收快照</h3><p class="task-body">{{ round.specSnapshot.acceptanceText }}</p><p class="muted small">{{ round.specSnapshot.acceptanceSource === 'legacy_task_body' ? '来源：旧任务正文快照' : '来源：明确填写' }}</p></template><h3>提交记录</h3><ul><li v-for="commit in round.candidate.commits" :key="commit.sha"><code>{{ commit.sha }}</code> {{ commit.subject }}</li></ul><h3>代码差异</h3><pre class="task-evidence" tabindex="0" aria-label="评审代码差异">{{ round.candidate.diff }}</pre><details><summary>Git 采集命令</summary><pre class="task-evidence">{{ JSON.stringify(round.candidate.commands, null, 2) }}</pre></details></details>
         </details>
-        <form v-if="canOverride || !!decisionReason" class="override-form" @submit.prevent="decide">
+        <DecisionPanel :task-id="task.id" :round-id="task.currentReviewRoundId" :round-state="activeRound?.state ?? null" :blocked="!!busy || decisionUnknown" @current="receiveDecision" @locked="choiceLocked = $event" @committed="resource.committed()" />
+        <form v-if="canOverride || !!decisionReason || decisionUnknown" class="override-form" @submit.prevent="decide()">
           <h3>{{ canOverride ? '管理者覆盖裁决' : '未提交的裁决草稿' }}</h3>
-          <p class="muted small">以当前网页的管理者身份决定。两轴报告和原裁决会保留，必须说明原因。</p>
+          <p class="muted small">以当前网页的管理者身份提出并确认此任务结论。两轴报告和原裁决会保留；是否已应用以回执为准。拒绝或退回上方提案不会改变任务结论。</p>
+          <p v-if="needsExplicitProposal" class="notice" data-testid="task-decision-proposal-notice">当前已有{{ currentDecision?.actionRequest.action.payload.choice === 'pass' ? '通过评审' : '要求修改' }}提案。建立替代提案只保存你提出的结论，任务保持原样；随后须在上方新提案中另行选择是否同意应用。</p>
           <p v-if="!canOverride" class="notice" data-testid="task-decision-unavailable">当前没有可提交裁决的评审轮次。理由保留在这里，可继续编辑或单独丢弃；新的两轴报告齐备后，请核对候选再明确采用。</p>
-          <label class="field">结论<select v-model="verdict" :disabled="projectReadonly || !!busy" data-testid="task-decision-verdict"><option value="changes_requested">需要修改，返回进行中</option><option value="pass">通过，标记完成</option></select></label>
-          <label class="field">裁决原因<textarea v-model="decisionReason" rows="3" maxlength="2000" required :disabled="projectReadonly || !!busy" data-testid="task-decision-reason" /></label>
-          <p v-if="decisionBase" class="muted small" data-testid="task-decision-base">草稿基于任务版本 {{ decisionBase.taskRevision }}，评审轮次 {{ decisionBase.roundId }} / 版本 {{ decisionBase.roundRevision }}。</p>
-          <p v-if="decisionRemoteChanged" class="notice" data-testid="task-decision-conflict">任务或评审轮次已更新，裁决理由仍绑定原版本。当前任务为版本 {{ task.revision }}；<template v-if="activeRound">当前评审为 {{ activeRound.id }} / 版本 {{ activeRound.revision }}（{{ roundState(activeRound.state) }}）</template><template v-else>暂无当前评审轮次</template>。请核对上方当前候选与两轴报告。<button type="button" class="text-button" :disabled="!canOverride || !!busy || projectReadonly || !!resource.error.value" data-testid="task-decision-rebase" @click="rebaseDecision">已核对当前候选，保留理由并采用当前版本</button></p>
-          <button v-if="!!decisionReason" type="button" :disabled="!!busy" data-testid="task-decision-discard" @click="decisionReason = ''">仅丢弃这份裁决理由</button>
-          <button type="submit" class="primary" :disabled="!canOverride || projectReadonly || !!busy || !decisionReason.trim() || decisionRemoteChanged" data-testid="task-decide">保存覆盖裁决</button>
+          <label class="field">结论<select v-model="verdict" :disabled="projectReadonly || !!busy || decisionLocked" data-testid="task-decision-verdict"><option value="changes_requested">需要修改，返回进行中</option><option value="pass">通过，标记完成</option></select></label>
+          <label class="field">裁决原因<textarea v-model="decisionReason" rows="3" maxlength="2000" required :disabled="projectReadonly || !!busy || decisionLocked" data-testid="task-decision-reason" /></label>
+          <p v-if="decisionBase" class="muted small" data-testid="task-decision-base">草稿基于任务版本 {{ decisionBase.taskRevision }}，评审轮次 {{ decisionBase.roundId }} / 版本 {{ decisionBase.roundRevision }}。<span v-if="decisionBase.head">当前提案 {{ decisionBase.head.currentDecisionId }} / 提案链版本 {{ decisionBase.head.headRevision }}，决定版本 {{ decisionBase.decisionRef?.revision }}。</span></p>
+          <p v-if="decisionRebaseNeeded" class="notice" data-testid="task-decision-conflict">任务、评审轮次或提案已变化，裁决理由仍绑定原版本。当前任务为版本 {{ task.revision }}；<template v-if="activeRound">当前评审为 {{ activeRound.id }} / 版本 {{ activeRound.revision }}（{{ roundState(activeRound.state) }}）</template><template v-else>暂无当前评审轮次</template><template v-if="currentDecision">；当前提案 {{ currentDecision.ref.decisionId }} / 提案链版本 {{ currentDecision.head.headRevision }}，决定版本 {{ currentDecision.ref.revision }}</template>。请核对上方当前候选与两轴报告。<span v-if="!decisionRebaseReady">正在等待读取当前决定；读取成功前保留原基准。</span><button type="button" class="text-button" :disabled="!canOverride || !decisionRebaseReady || !!busy || decisionLocked || projectReadonly || !!resource.error.value" data-testid="task-decision-rebase" @click="rebaseDecision">已核对当前候选，保留理由并采用当前版本</button></p>
+          <p v-if="decisionRefreshed" class="notice" data-testid="task-decision-refreshed">本次仅更新了策略评估，原裁决未执行。请在上方“评审提案与选择”核对最新提案并明确选择；重试原裁决不会自动应用新策略。</p>
+          <button v-if="!!decisionReason" type="button" :disabled="!!busy || decisionLocked" data-testid="task-decision-discard" @click="decisionReason = ''">仅丢弃这份裁决理由</button>
+          <button v-if="decisionUnknown" type="button" class="primary" :disabled="projectReadonly || !!busy || choiceLocked" data-testid="task-decision-retry" @click="decide(true)">原样重试，确认这次裁决结果</button>
+          <button v-else type="submit" class="primary" :disabled="!canOverride || !proposalAllowed || projectReadonly || !!busy || choiceLocked || decisionRefreshed || !!resource.error.value || !decisionReason.trim() || decisionRebaseNeeded" data-testid="task-decide">{{ needsExplicitProposal ? '建立替代提案（需另行选择）' : '保存覆盖裁决' }}</button>
         </form>
       </section>
 

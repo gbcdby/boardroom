@@ -3,6 +3,7 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createLogger } from "../src/server/logger.ts";
@@ -85,10 +86,25 @@ try {
     return (await service.get(owner, first.project.id, task.id)).task;
   }
   const review = await reportedTask("两轴报告等待管理者裁决");
+  // These are already-completed historical UI fixtures, not the browser choice
+  // under test. Use the real HTTP adapter to obtain a genuine current request
+  // source; an internal ownerActor must not impersonate a local UI initiation.
+  async function completeFixture(task, round, reason) {
+    const response = await fetch(`${server.url}/api/projects/${first.project.id}/tasks/${task.id}/reviews/${round.id}/decision`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expectedTaskRevision: task.revision, expectedRoundRevision: round.revision,
+        verdict: "pass", reason, override: true }),
+    });
+    const result = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(result));
+    assert.equal(result.state, "applied"); assert.equal(result.task.state, "done");
+    assert.equal(result.receipt.execution.status, "succeeded");
+    return result;
+  }
   const complete = await reportedTask("已完成的交付任务");
   const completeDetail = await service.get(owner, first.project.id, complete.id);
   const completeRound = completeDetail.rounds.find((round) => round.id === complete.currentReviewRoundId);
-  await service.decideReview(owner, first.project.id, complete.id, completeRound.id, { expectedTaskRevision: complete.revision, expectedRoundRevision: completeRound.revision, verdict: "pass", reason: "浏览器样本：已有交付完成", override: true });
+  await completeFixture(complete, completeRound, "浏览器样本：已有交付完成");
   const recoveryTasks = [];
   for (const lifecycle of ["disabled", "removed"]) {
     const agent = await repos.agents.create({ displayName: `重开验收 · ${lifecycle}`, hostType: "codex-cli" });
@@ -96,8 +112,7 @@ try {
     const recovery = await reportedTask(`负责人${lifecycle}后需要重开的任务`, member.id);
     const detail = await service.get(owner, first.project.id, recovery.id);
     const round = detail.rounds.find(item => item.id === recovery.currentReviewRoundId);
-    await service.decideReview(owner, first.project.id, recovery.id, round.id, { expectedTaskRevision: recovery.revision,
-      expectedRoundRevision: round.revision, verdict: "pass", reason: "恢复入口的完整生命周期 fixture", override: true });
+    await completeFixture(recovery, round, "恢复入口的完整生命周期 fixture");
     recoveryTasks.push({ taskId: recovery.id, assigneeMemberId: member.id, lifecycle });
   }
   const second = records[1];

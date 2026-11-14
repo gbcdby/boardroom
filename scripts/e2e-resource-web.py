@@ -41,12 +41,12 @@ def candidate():
 
 class Fixture:
     """串行 stdin 控制；保存原始 stdout/stderr，不能伪造业务响应。"""
-    def __init__(self, output):
+    def __init__(self, output, *, decision_probes=False):
         self.output, self.messages, self.serial = output, Queue(), 0
         self.stderr = (output / "fixture-stderr.log").open("w")
         self.stdout = (output / "fixture-stdout.jsonl").open("w")
         self.process = subprocess.Popen(
-            ["node", "scripts/resource-web-fixture.mjs"], cwd=ROOT,
+            ["node", "scripts/resource-web-fixture.mjs", *(["--decision-probes"] if decision_probes else [])], cwd=ROOT,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
             text=True, bufsize=1)
         self.reader = Thread(target=self._read, daemon=True)
@@ -123,8 +123,8 @@ def wait_fixture(page, fixture, predicate, timeout=5000):
 
 
 def connected(page):
-    expect(page.get_by_test_id("resource-sync-status")).to_contain_text("更新提示已连接")
-    expect(page.get_by_test_id("resource-sync-status").locator("time")).to_have_count(1)
+    expect(page.get_by_test_id("resource-sync-status").first).to_contain_text("更新提示已连接")
+    expect(page.get_by_test_id("resource-sync-status").first.locator("time")).to_have_count(1)
 
 
 def screenshot(page, output, report, name):
@@ -389,20 +389,20 @@ def exercise(page, context, fixture, data, width, output, report):
     fixture.command("network", dropResources=False)
 
     # 关闭真实 WS 并拒绝重连；最后成功值/时间必须保留，恢复后主动对账。
-    previous, last_read = task, page.get_by_test_id("resource-sync-status").locator("time").get_attribute("datetime")
+    previous, last_read = task, page.get_by_test_id("resource-sync-status").first.locator("time").get_attribute("datetime")
     fixture.command("network", blocked=True)
-    expect(page.get_by_test_id("resource-sync-status")).to_contain_text("离线", timeout=1500)
+    expect(page.get_by_test_id("resource-sync-status").first).to_contain_text("离线", timeout=1500)
     task = api(page, writer, "PATCH", path, {
         "expectedRevision": task["revision"], "title": f"重连后新稿 {width}"})["task"]
     page.wait_for_timeout(2300)
     expect(page.locator("h1")).to_have_text(previous["title"])
-    assert page.get_by_test_id("resource-sync-status").locator("time").get_attribute("datetime") == last_read
+    assert page.get_by_test_id("resource-sync-status").first.locator("time").get_attribute("datetime") == last_read
     disconnected = fixture.snapshot()
     assert any(event["kind"] == "ws.rejected" for event in disconnected["events"]), disconnected
     started = monotonic()
     fixture.command("network", blocked=False)
     expect(page.locator("h1")).to_have_text(task["title"], timeout=6000); connected(page)
-    assert page.get_by_test_id("resource-sync-status").locator("time").get_attribute("datetime") != last_read
+    assert page.get_by_test_id("resource-sync-status").first.locator("time").get_attribute("datetime") != last_read
     check(report, width, "S5-AC07-reconnect", "断线保留上次值与读取时间，真实 WS 重连后立即对账",
           retainedReadAt=last_read, recoveryMs=round((monotonic() - started) * 1000))
     task = native_hidden_recovery(page, context, fixture, data, task, path, width, report)

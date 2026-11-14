@@ -1,3 +1,8 @@
+import { prepareLifecycleDecisionCancellations } from "../decisions/lifecycle.ts";
+import { DECISION_TABLE_NAMES } from "../decisions/tables.ts";
+import { registerWorkEventLifecycleOwner } from "../tasks/work-event-lifecycle.ts";
+import { hasWorkEventInvalidations } from "../tasks/work-event-storage.ts";
+import { decode as decodeDecisionText } from "../decisions/text-codec.ts";
 import { createMemoryRepository, type MemoryRepository } from "../memory/repository.ts";
 import { getMutationScopeCoordinator, type MutationScopeCoordinator } from "./mutation-scope.ts";
 import { observeSql, repositorySqlObserver } from "./sql-observer.ts";
@@ -115,6 +120,19 @@ export interface AgentsRepository {
  * 删除后作为实际清除的行数返回。项目记忆计数不包含 Agent 的 global 文档与版本。
  */
 export interface PurgeCounts {
+  readonly decisionLegacyRecords: number;
+  readonly decisionActionRequests: number;
+  readonly decisionRecords: number;
+  readonly decisionReviewHeads: number;
+  readonly decisionUserEvents: number;
+  readonly decisionLocalInitiations: number;
+  readonly decisionResolutions: number;
+  readonly decisionExecutions: number;
+  readonly decisionCommandReceipts: number;
+  readonly decisionReviewProjections: number;
+  readonly decisionChangeHeads: number;
+  readonly decisionChanges: number;
+
   readonly policyDocuments: number;
   readonly policyVersions: number;
   readonly workspaceVersions: number;
@@ -139,6 +157,7 @@ export interface PurgeCounts {
   readonly reviewRounds: number;
   readonly reviewReports: number;
   readonly workEvents: number;
+  readonly workEventInvalidations: number;
   readonly memoryDocuments: number;
   readonly memoryVersions: number;
   readonly memorySummaryRequests: number;
@@ -154,6 +173,7 @@ export interface GroupPurgeCounts {
   readonly memoryTriggerCounters: number;
   readonly memoryScanCheckpoints: number;
   readonly workEvents: number;
+  readonly workEventInvalidations: number;
   readonly taskMessageLinks: number;
   readonly messages: number;
   readonly deliveries: number;
@@ -450,6 +470,12 @@ const MEMBER_STATUS_TRANSITIONS: Readonly<Record<MemberLifecycleStatus, readonly
 };
 
 /** 创建 repository 集合；同一 db 连接共享。所有仓储经 {@link RepoCtx} 访问持久化。 */
+const repositoryDrivers = new WeakMap<RepositorySet, DbDriver>();
+export function repositoryDriver(repos: RepositorySet): DbDriver {
+  const driver = repositoryDrivers.get(repos);
+  if (!driver) throw new InvalidArgumentError("仓储不属于当前数据库工厂。");
+  return driver;
+}
 export function createRepositories(db: DbDriver): RepositorySet {
   // 只有当前异步调用链才能使用自己的事务会话；其它请求回落到顶层 DbDriver。
   // 不再用共享闭包变量，避免请求交错时把已回滚/未提交连接交给另一请求。
@@ -482,11 +508,11 @@ export function createRepositories(db: DbDriver): RepositorySet {
   };
 
   const messages = createMessages(ctx, db.kind);
-  return coordinateRepositoryWrites({
+  const result = coordinateRepositoryWrites({
     context: ctx,
     mutations: getMutationScopeCoordinator(db),
     agents: createAgents(ctx),
-    projects: createProjects(ctx, getMutationScopeCoordinator(db)),
+    projects: createProjects(ctx, getMutationScopeCoordinator(db), db),
     members: createMembers(ctx, getMutationScopeCoordinator(db)),
     org: createOrg(ctx),
     groups: createGroups(ctx, getMutationScopeCoordinator(db)),
@@ -499,6 +525,9 @@ export function createRepositories(db: DbDriver): RepositorySet {
     memory: createMemoryRepository(ctx),
     transaction: ctx.withTransaction,
   });
+  repositoryDrivers.set(result, db);
+  registerWorkEventLifecycleOwner(result.tasks, ctx, db);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -594,7 +623,20 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
   const tasks = await hasTasksSchema(ctx);
   const memory = await hasMemorySchema(ctx);
   const policies = await hasPolicyConfigurationSchema(ctx);
+  const decisions = await hasDecisionSchema(ctx);
   return {
+    decisionLegacyRecords: decisions ? await count("SELECT COUNT(*) AS c FROM decision_legacy_records WHERE project_id = ?") : 0,
+    decisionActionRequests: decisions ? await count("SELECT COUNT(*) AS c FROM decision_action_requests WHERE project_id = ?") : 0,
+    decisionRecords: decisions ? await count("SELECT COUNT(*) AS c FROM decision_records WHERE project_id = ?") : 0,
+    decisionReviewHeads: decisions ? await count("SELECT COUNT(*) AS c FROM decision_review_heads WHERE project_id = ?") : 0,
+    decisionUserEvents: decisions ? await count("SELECT COUNT(*) AS c FROM decision_user_events WHERE project_id = ?") : 0,
+    decisionLocalInitiations: decisions ? await count("SELECT COUNT(*) AS c FROM decision_local_initiations WHERE project_id = ?") : 0,
+    decisionResolutions: decisions ? await count("SELECT COUNT(*) AS c FROM decision_resolutions WHERE project_id = ?") : 0,
+    decisionExecutions: decisions ? await count("SELECT COUNT(*) AS c FROM decision_executions WHERE project_id = ?") : 0,
+    decisionCommandReceipts: decisions ? await count("SELECT COUNT(*) AS c FROM decision_command_receipts WHERE project_id = ?") : 0,
+    decisionReviewProjections: decisions ? await count("SELECT COUNT(*) AS c FROM decision_review_projections WHERE project_id = ?") : 0,
+    decisionChangeHeads: decisions ? await count("SELECT COUNT(*) AS c FROM decision_change_heads WHERE project_id = ?") : 0,
+    decisionChanges: decisions ? await count("SELECT COUNT(*) AS c FROM decision_changes WHERE project_id = ?") : 0,
     policyDocuments: policies ? await count("SELECT COUNT(*) AS c FROM policy_documents WHERE project_id = ?") : 0,
     policyVersions: policies ? await count("SELECT COUNT(*) AS c FROM policy_document_versions WHERE document_id IN (SELECT scope_key FROM policy_documents WHERE project_id = ?)") : 0,
     workspaceVersions: await hasWorkspaceSchema(ctx) ? await count("SELECT COUNT(*) AS c FROM project_workspace_versions WHERE project_id = ?") : 0,
@@ -613,6 +655,7 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
     reviewRounds: tasks ? await count("SELECT COUNT(*) AS c FROM task_review_rounds WHERE project_id = ?") : 0,
     reviewReports: tasks ? await count("SELECT COUNT(*) AS c FROM task_review_reports WHERE project_id = ?") : 0,
     workEvents: tasks ? await count("SELECT COUNT(*) AS c FROM work_events WHERE project_id = ?") : 0,
+    workEventInvalidations: await hasWorkEventInvalidations(ctx) ? await count("SELECT COUNT(*) AS c FROM work_event_delivery_invalidations WHERE project_id = ?") : 0,
     groups: await count("SELECT COUNT(*) AS c FROM groups WHERE project_id = ?"),
     members: await count("SELECT COUNT(*) AS c FROM members WHERE project_id = ?"),
     orgNodes: await count("SELECT COUNT(*) AS c FROM org_nodes WHERE project_id = ?"),
@@ -645,6 +688,7 @@ async function groupPurgeCounts(ctx: RepoCtx, groupId: string): Promise<GroupPur
     memoryTriggerCounters: memory ? await count("SELECT COUNT(*) AS c FROM memory_trigger_counters WHERE group_id = ?") : 0,
     memoryScanCheckpoints: memory ? await count("SELECT COUNT(*) AS c FROM memory_scan_checkpoints WHERE group_id = ?") : 0,
     workEvents: memory ? await count("SELECT COUNT(*) AS c FROM work_events WHERE context_group_id = ?") : 0,
+    workEventInvalidations: await hasWorkEventInvalidations(ctx) ? await count("SELECT COUNT(*) AS c FROM work_event_delivery_invalidations WHERE work_event_id IN (SELECT id FROM work_events WHERE context_group_id = ?)") : 0,
     taskMessageLinks: await hasTasksSchema(ctx) ? await count("SELECT COUNT(*) AS c FROM task_message_links WHERE group_id = ?") : 0,
     messages: await count("SELECT COUNT(*) AS c FROM messages WHERE group_id = ?"),
     deliveries: await count(
@@ -891,6 +935,8 @@ export async function hasWorkspaceSchema(ctx: RepoCtx): Promise<boolean> {
   return Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 15"));
 }
 
+async function hasDecisionSchema(ctx: RepoCtx): Promise<boolean> { return Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 20")); }
+
 async function hasPolicyConfigurationSchema(ctx: RepoCtx): Promise<boolean> {
   return Boolean(await ctx.one("SELECT version FROM schema_migrations WHERE version = 17"));
 }
@@ -917,7 +963,7 @@ function toProject(row: ProjectRow): Project {
   };
 }
 
-function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): ProjectsRepository {
+function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator, db: DbDriver): ProjectsRepository {
   return {
     async create(input) {
       const name = requireNonEmpty(input.name, "Project.name");
@@ -979,12 +1025,14 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
       if (!existing) throw new NotFoundError(`Project ${id} 不存在。`);
       if (existing.archivedAt !== null) return existing;
       const stamp = at ?? nowIso();
-      await ctx.withTransaction(async () =>
-        ctx.exec(
+      await ctx.withTransaction(async () => {
+        const decisions = await prepareLifecycleDecisionCancellations(db, id, null, stamp, 'project_archived');
+        await decisions.apply();
+        await ctx.exec(
           `UPDATE projects SET archived_at = ?, updated_at = ?${await hasWorkspaceSchema(ctx) ? ", project_revision = project_revision + 1" : ""} WHERE id = ?`,
           [stamp, stamp, id],
-        ),
-      );
+        );
+      });
       return (await this.get(id))!;
     },
     async restore(id) {
@@ -1018,6 +1066,10 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator): Proj
           throw new RepositoryError("confirmation_changed", "永久删除的影响范围已变化，请重新获取级联清单并再次确认。");
         }
         const counts = await projectPurgeCounts(ctx, id);
+        if (await hasWorkEventInvalidations(ctx)) await ctx.exec("DELETE FROM work_event_delivery_invalidations WHERE project_id = ?", [id]);
+        if (await hasDecisionSchema(ctx)) {
+          for (const table of [...DECISION_TABLE_NAMES].reverse()) await ctx.exec(`DELETE FROM ${table} WHERE project_id = ?`, [id]);
+        }
         if (await hasPolicyConfigurationSchema(ctx)) {
           await ctx.exec("DELETE FROM policy_document_versions WHERE document_id IN (SELECT scope_key FROM policy_documents WHERE project_id = ?)", [id]);
           await ctx.exec("DELETE FROM policy_documents WHERE project_id = ?", [id]);
@@ -1418,6 +1470,16 @@ function createGroups(ctx: RepoCtx, mutations: MutationScopeCoordinator): Groups
         const projectId = (await repo.get(id))!.projectId;
         const affected = await hasRuntimeSchema(ctx) ? await ctx.query<MemberIdRow>('SELECT DISTINCT member_id FROM agent_runtime_bindings WHERE group_id = ? ORDER BY member_id', [id]) : [];
         const counts = await groupPurgeCounts(ctx, id);
+        // A surviving Decision execution must retain its exact immutable events.
+        // This guard precedes every delete in the group purge transaction.
+        if (await hasDecisionSchema(ctx)) {
+          const groupEvents = new Set((await ctx.query<{id:string}>("SELECT id FROM work_events WHERE context_group_id = ?", [id])).map(event => event.id));
+          const effects = await ctx.query<{work_event_ids_json:string}>("SELECT work_event_ids_json FROM decision_executions WHERE project_id = ?", [projectId]);
+          if (effects.some(effect => (decodeDecisionText('decision_executions.work_event_ids_json', effect.work_event_ids_json) as string[]).some(eventId => groupEvents.has(eventId)))) {
+            throw new ConflictError("群删除会破坏仍保留的评审执行事实，请先处理所属项目。");
+          }
+        }
+        if (await hasWorkEventInvalidations(ctx)) await ctx.exec("DELETE FROM work_event_delivery_invalidations WHERE work_event_id IN (SELECT id FROM work_events WHERE context_group_id = ?)", [id]);
         if (await hasMemorySchema(ctx)) {
           await ctx.exec("DELETE FROM memory_summary_requests WHERE context_group_id = ?", [id]);
           await ctx.exec("DELETE FROM work_events WHERE context_group_id = ?", [id]);

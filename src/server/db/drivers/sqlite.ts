@@ -25,8 +25,10 @@ import { assertSqliteStartupAdmission } from "../../storage/sqlite-startup.ts";
 import { assertStorageAdmission, readSqliteMaintenanceState, StorageMaintenanceError,
   type StorageAdmissionIdentity } from "../../storage/admission.ts";
 import { storageDrainClientToCheck, assertStorageDrainClient } from "../../storage/drain-boundary.ts";
+import { withM1Cleanup } from "../m1-resources.ts";
 
 export interface SqliteDriverOptions {
+  readonly initializationOnConnect?: "normal" | "none";
   readonly dataDir: string;
   readonly sqlitePath?: string;
   readonly sqliteSource?: SqliteDatabaseDescriptor;
@@ -35,6 +37,7 @@ export interface SqliteDriverOptions {
 export class SqliteDriver implements DbDriver {
   readonly kind = "sqlite" as const;
   readonly dialect = sqliteDialect;
+  readonly initializationOnConnect: "normal" | "none";
 
   private readonly dataDir: string;
   private readonly sqlitePath: string | undefined;
@@ -55,6 +58,7 @@ export class SqliteDriver implements DbDriver {
   }
 
   constructor(options: SqliteDriverOptions) {
+    this.initializationOnConnect = options.initializationOnConnect ?? "normal";
     this.dataDir = options.dataDir;
     this.sqlitePath = options.sqlitePath;
     this.sqliteSource = options.sqliteSource;
@@ -85,6 +89,28 @@ export class SqliteDriver implements DbDriver {
 
   async connect(): Promise<void> {
     if (this.opened !== null) return;
+    if (this.initializationOnConnect === "none") {
+      const file = this.sqlitePath ?? path.resolve(this.dataDir, DATABASE_FILE_NAME);
+      if (this.sqliteSource) assertSqliteSourceUnchanged(this.sqliteSource);
+      assertSqliteSingleLink(file);
+      const before = statSync(file, { bigint: true });
+      if (!before.isFile() || before.nlink !== 1n) throw new StorageMaintenanceError("metadata_invalid");
+      const db = new Database(file, { fileMustExist: true });
+      try {
+        this.opened = { db, file };
+        this.fileIdentity = before;
+        // Connection-local settings only: no mkdir, journal conversion or write probe.
+        db.pragma("foreign_keys = ON");
+        db.pragma("busy_timeout = 5000");
+        this.checkAdmission();
+      } catch (error) {
+        this.opened = null;
+        this.fileIdentity = undefined;
+        this.admissionIdentity = undefined;
+        return withM1Cleanup(async () => { throw error; }, [async () => { db.close(); }]);
+      }
+      return;
+    }
     // openDatabase 抛 DatabaseSetupError（含恢复路径），原样向上传播。
     if (this.sqliteSource) assertSqliteSourceUnchanged(this.sqliteSource, true);
     else assertSqliteSingleLink(this.sqlitePath ?? path.resolve(this.dataDir, DATABASE_FILE_NAME));

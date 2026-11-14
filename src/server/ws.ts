@@ -260,7 +260,7 @@ export function createWebSocketHub(options: WebSocketHubOptions): WebSocketHub {
 
   async function broadcastResourceChange(change: ResourceChange): Promise<void> {
     // 新实体必须提供自己的读取权限；不能把未知模块自动视作 Task 可见。
-    if (change.entity !== "task" && change.entity !== "task-settings") return;
+    if (change.entity !== "task" && change.entity !== "task-settings" && change.entity !== "decision") return;
     const event: ResourceChangedEvent = { type: "resource.changed", projectId: change.projectId, entity: change.entity, id: change.id, revision: change.revision };
     await Promise.allSettled([...wss.clients].map(async client => {
       const selection = resources.get(client);

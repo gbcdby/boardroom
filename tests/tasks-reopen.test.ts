@@ -7,6 +7,8 @@ import { ownerActor } from "../src/server/authz/actors.ts";
 import { WriteFailedError } from "../src/server/db/errors.ts";
 import { TaskError } from "../src/server/tasks/errors.ts";
 import type { ReviewCandidate, ReviewEvidence, WorkEvent } from "../src/shared/tasks.ts";
+import { allowCurrentReviewerForTaskFixture } from './helpers/task-review-policy.ts';
+import type { RepositorySet } from '../src/server/db/repositories.ts';
 
 // 完成态由真实任务领域链建立；Git 与模型内容是明确声明的协议 fixture。
 const candidate: ReviewCandidate = { repositoryRoot: "/fixture", fixedPointInput: "base", baseCommit: "a".repeat(40),
@@ -20,7 +22,8 @@ function evidence(axis: string): ReviewEvidence {
     transcriptSha256: "e".repeat(64), evidenceRef: "reopen-protocol-fixture", baseCommit: candidate.baseCommit,
     candidateCommit: candidate.candidateCommit, diffSha256: candidate.diffSha256 };
 }
-async function complete(service: TaskService, p: Awaited<ReturnType<typeof memoryPeople>>) {
+async function complete(service: TaskService, p: Awaited<ReturnType<typeof memoryPeople>>,repos:RepositorySet) {
+  await allowCurrentReviewerForTaskFixture(repos);
   let task = await service.create(p.owner, p.project.id, { title: "需要后续恢复的完成任务", body: "目标与范围",
     deliveryKind: "code", acceptanceText: "可复核的验收条件", assigneeMemberId: p.member.id, reviewerMemberId: p.outsider.id,
     repoPath: "/fixture", fixedPoint: "base" });
@@ -35,8 +38,8 @@ async function complete(service: TaskService, p: Awaited<ReturnType<typeof memor
         body: "只用于完成生命周期的协议 fixture", sources: ["fixture"], evidence: evidence(axis) });
     round = (await service.get(p.owner, p.project.id, task.id)).rounds.find(item => item.id === round.id)!;
   }
-  task = await service.decideReview(p.foreign, p.project.id, task.id, round.id,
-    { expectedTaskRevision: task.revision, expectedRoundRevision: round.revision, verdict: "pass", reason: "两轴协议检查完成" });
+  task = (await service.decideReview(p.foreign, p.project.id, task.id, round.id,
+    { expectedTaskRevision: task.revision, expectedRoundRevision: round.revision, verdict: "pass", reason: "两轴协议检查完成" })).task;
   assert.equal(task.state, "done");
   return task;
 }
@@ -50,7 +53,7 @@ for (const engine of ["sqlite", "postgres"] as const) {
         const service = createTaskService({ repos, captureCandidate: async () => candidate,
           onWorkEvents: events => { notified.push(...events); },
           onTaskChanged: (_projectId, taskId, revision) => { changed.push({ taskId, revision }); } });
-        let task = await complete(service, p);
+        let task = await complete(service, p,repos);
         const orgAccess = { actor: ownerActor(p.project.id) };
         if (lifecycle === "disabled") await org.setMemberStatus(orgAccess, p.project.id, p.member.id, "disabled");
         if (lifecycle === "removed") await org.removeMember(orgAccess, p.project.id, p.member.id);
@@ -122,7 +125,7 @@ for (const engine of ["sqlite", "postgres"] as const) {
       const p = await memoryPeople(repos), notified: WorkEvent[] = [], changed: number[] = [];
       const service = createTaskService({ repos, captureCandidate: async () => candidate,
         onWorkEvents: events => { notified.push(...events); }, onTaskChanged: (_p, _t, revision) => { changed.push(revision); } });
-      let task = await complete(service, p); notified.length = 0; changed.length = 0;
+      let task = await complete(service, p,repos); notified.length = 0; changed.length = 0;
       const snapshot = async () => ({ detail: await service.get(p.owner, p.project.id, task.id), audit: await repos.audit.list(p.project.id, { limit: 250 }),
         events: await db.query("SELECT * FROM work_events WHERE project_id = ? ORDER BY id", [p.project.id]), notified: [...notified], changed: [...changed] });
       const before = await snapshot();

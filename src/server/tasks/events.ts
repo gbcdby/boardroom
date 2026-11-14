@@ -1,4 +1,5 @@
 import type { DbDriver } from "../db/driver.ts";
+import { afterCommit } from "../db/after-commit.ts";
 import type { WorkEvent } from "../../shared/tasks.ts";
 
 type Listener = (events: readonly WorkEvent[]) => void | Promise<void>;
@@ -13,5 +14,7 @@ export function onWorkEventCommit(db: DbDriver, listener: Listener): () => void 
 }
 
 export async function notifyWorkEventCommit(db: DbDriver, events: readonly WorkEvent[]): Promise<void> {
-  await Promise.allSettled([...listeners.get(db) ?? []].map(listener => listener(events)));
+  await afterCommit(db, async () => {
+    await Promise.allSettled([...listeners.get(db) ?? []].map(listener => listener(events)));
+  });
 }

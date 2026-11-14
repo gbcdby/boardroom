@@ -33,10 +33,28 @@ const DOMAIN_TABLES = [
   "memory_documents", "memory_versions", "memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints",
   "member_fact_revisions",
   "agent_legacy_aliases", "role_templates", "role_template_versions",
+  'mcp_connections',
+  'mcp_connection_versions',
+  'mcp_catalog_snapshots',
+  'mcp_catalog_heads',
+  'mcp_connection_mutations',
+  'mcp_discovery_attempts',
+  'decision_legacy_records',
+  'decision_action_requests',
+  'decision_records',
+  'decision_review_heads',
+  'decision_user_events',
+  'decision_local_initiations',
+  'decision_resolutions',
+  'decision_executions',
+  'decision_command_receipts',
+  'decision_review_projections',
+  'decision_change_heads',
+  'decision_changes',
 ] as const;
 
-/** 当前组合保留 v1–18，并追加 #159 已分配的 v19 MCP 连接与目录。 */
-const EXPECTED_VERSION = 19;
+/** 当前组合保留 v1–19，并追加 #157 已分配的 v20 Decision 十二表。 */
+const EXPECTED_VERSION = 20;
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(path.join(tmpdir(), "agent-studio-schema-"));
@@ -209,7 +227,7 @@ test("阶段 1 已有库（v2）升级到当前版本：补上归档列与组织
       const result = runMigrations(db, migrations);
       assert.deepEqual(
         result.applied.map((m) => m.version),
-        [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+        [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
       );
       assert.equal(result.version, EXPECTED_VERSION);
       assert.equal(
@@ -267,7 +285,7 @@ test("v3 库升级到当前版本（v4 组织树 + v5 成员状态）：旧数�
       const result = runMigrations(db, migrations);
       assert.deepEqual(
         result.applied.map((m) => m.version),
-        [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+        [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
       );
       assert.equal(result.version, EXPECTED_VERSION);
 
@@ -345,7 +363,7 @@ test("v4 库升级到 v5：成员状态列默认 active、旧数据不丢、状�
       const result = runMigrations(db, migrations);
       assert.deepEqual(
         result.applied.map((m) => m.version),
-        [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+        [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
       );
       assert.equal(result.version, EXPECTED_VERSION);
       assert.equal(
@@ -395,7 +413,7 @@ test("v5 库升级到 v6：audit_log 为空表、旧数据不丢、审计写入�
 
       // 2) 追加 v6：只建 audit_log，不回填、不影响既有数据。
       const result = runMigrations(db, migrations);
-      assert.deepEqual(result.applied.map((m) => m.version), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+      assert.deepEqual(result.applied.map((m) => m.version), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
       assert.equal(result.version, EXPECTED_VERSION);
 
       // 3) v6 只建表、空表：项目被删除后审计痕迹才需要存活，升级路径上审计本就为空。

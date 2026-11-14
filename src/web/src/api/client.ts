@@ -200,7 +200,20 @@ export interface ProjectPurgeCascade {
   taskMessageLinks: number;
   reviewRounds: number;
   reviewReports: number;
+  decisionLegacyRecords: number;
+  decisionActionRequests: number;
+  decisionRecords: number;
+  decisionReviewHeads: number;
+  decisionUserEvents: number;
+  decisionLocalInitiations: number;
+  decisionResolutions: number;
+  decisionExecutions: number;
+  decisionCommandReceipts: number;
+  decisionReviewProjections: number;
+  decisionChangeHeads: number;
+  decisionChanges: number;
   workEvents: number;
+  workEventInvalidations: number;
   groups: number;
   members: number;
   /** T2 #49：随项目一起清除的组织岗位节点数。 */
@@ -220,6 +233,7 @@ export interface GroupPurgeCascade {
   memoryTriggerCounters: number;
   memoryScanCheckpoints: number;
   workEvents: number;
+  workEventInvalidations: number;
   taskMessageLinks: number;
   messages: number;
   deliveries: number;

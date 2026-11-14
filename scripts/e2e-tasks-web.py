@@ -17,6 +17,83 @@ def request(page, origin, method, path, body=None):
     assert response.ok, f"{method} {path}: {response.status} {response.text()[:500]}"
     return response.json() if response.status != 204 else None
 
+def exercise_proposal_replacement(page, fixture, output, report):
+    """A reported review stays unchanged while explicit opposing proposals replace its head."""
+    origin, pid, task_id = fixture["url"], fixture["records"][0]["project"]["id"], fixture["reviewTaskId"]
+    task_path = f"/api/projects/{pid}/tasks/{task_id}"
+    current = next(item for item in request(page, origin, "GET", f"/api/projects/{pid}/decisions?taskId={task_id}")["decisions"]
+                   if item["recordKind"] == "live-review-decision" and item["isCurrent"])
+    original = request(page, origin, "GET", task_path)
+    round_id = original["task"]["currentReviewRoundId"]
+    round_revision = next(item["revision"] for item in original["rounds"] if item["id"] == round_id)
+    proposal_url = origin + f"{task_path}/reviews/{round_id}/decision-requests"
+    choice_requests = []
+    def record_choices(req):
+        if req.method == "POST" and req.url.endswith("/choices"): choice_requests.append(req.url)
+    page.on("request", record_choices)
+    receipts = []
+    for index, (verdict, expected_action, width, height) in enumerate([
+            ("changes_requested", "要求修改并返回进行中", 390, 844),
+            ("pass", "通过评审并标记任务完成", 1440, 1000)]):
+        page.set_viewport_size({"width": width, "height": height})
+        page.get_by_test_id("task-decision-verdict").select_option(verdict)
+        reason = f"明确替代提案 {index + 1}，随后单独核对选择"
+        page.get_by_test_id("task-decision-reason").fill(reason)
+        expect(page.get_by_test_id("task-decide")).to_have_text("建立替代提案（需另行选择）")
+        expect(page.get_by_test_id("task-decision-base")).to_contain_text(current["head"]["currentDecisionId"])
+        attempts = []
+        def capture_reply(route):
+            response = route.fetch()
+            attempts.append({"url": route.request.url, "input": route.request.post_data_json,
+                             "status": response.status, "body": response.json()})
+            if index == 0 and len(attempts) == 1: route.abort("failed")
+            else: route.fulfill(response=response)
+        page.route(proposal_url, capture_reply)
+        page.get_by_test_id("task-decide").click()
+        if index == 0:
+            expect(page.get_by_test_id("task-decision-retry")).to_be_enabled()
+            expect(page.get_by_test_id("task-decision-reason")).to_be_disabled()
+            expect(page.get_by_test_id("task-decision-verdict")).to_be_disabled()
+            expect(page.get_by_test_id("decision-choice")).to_be_disabled()
+            expect(page.get_by_test_id("decision-proposed-action")).to_contain_text(expected_action)
+            expect(page.get_by_test_id("task-decision-reason")).to_have_value(reason)
+            expect(page.get_by_test_id("task-decision-base")).to_contain_text(current["head"]["currentDecisionId"])
+            expect(page.get_by_test_id("task-decision-rebase")).to_be_disabled()
+            page.get_by_test_id("task-decision-retry").click()
+            expect(page.get_by_test_id("task-decision-retry")).to_have_count(0)
+            assert len(attempts) == 2 and attempts[0]["input"] == attempts[1]["input"]
+            assert attempts[0]["body"]["receipt"]["receiptId"] == attempts[1]["body"]["receipt"]["receiptId"]
+        else:
+            expect(page.get_by_test_id("task-notice")).to_contain_text("只建立替代提案")
+            assert len(attempts) == 1
+        page.unroute(proposal_url, capture_reply)
+        sent, result = attempts[0]["input"], attempts[-1]["body"]
+        assert sent["expectedHead"] == current["head"] and sent["idempotencyKey"]
+        assert sent["expectedTaskRevision"] == original["task"]["revision"] and sent["expectedRoundRevision"] == round_revision
+        assert sent["proposedVerdict"] == verdict and sent["requestedPath"] == "management" and sent["reason"] == reason
+        assert all(attempt["status"] == 202 and attempt["body"]["state"] == "pending" for attempt in attempts)
+        assert result["receipt"]["execution"] is None and result["receipt"]["resolutionId"] is None
+        assert result["task"]["state"] == "review" and result["task"]["revision"] == original["task"]["revision"]
+        expect(page.get_by_test_id("decision-proposed-action")).to_contain_text(expected_action)
+        expect(page.get_by_test_id("task-state")).to_have_text("评审中")
+        expect(page.get_by_test_id("task-decision-reason")).to_have_value("")
+        expect(page.get_by_test_id("decision-submit")).to_be_disabled()
+        assert choice_requests == [], "建立替代提案不得隐式发送approve"
+        latest = request(page, origin, "GET", task_path)
+        assert latest["task"]["revision"] == original["task"]["revision"] and latest["task"]["state"] == "review"
+        assert next(item["revision"] for item in latest["rounds"] if item["id"] == round_id) == round_revision
+        rows = request(page, origin, "GET", f"/api/projects/{pid}/decisions?taskId={task_id}")["decisions"]
+        assert all(item["resolution"] is None and item["execution"] is None for item in rows if item["recordKind"] == "live-review-decision")
+        current = next(item for item in rows if item["recordKind"] == "live-review-decision" and item["isCurrent"])
+        assert current["ref"] == result["decisionRef"]
+        receipts.append({"width": width, "attempts": attempts})
+        filename = f"explicit-proposal-{verdict}-{width}.png"
+        page.screenshot(path=str(output / filename), full_page=True, animations="disabled")
+        report["screenshots"].append(filename)
+    page.remove_listener("request", record_choices)
+    report.setdefault("decisionProposalReceipts", []).extend(receipts)
+    report["checks"].append("#157: reported相反提案须显式head/CAS/key；390真实提交丢回复后原样重试同pending回执；1440另一次明确替代仍零Task效果/零choices，后续选择独立操作")
+
 def exercise_quick_intake(page, fixture, output, report):
     origin = fixture["url"]
     page.emulate_media(color_scheme="light", reduced_motion="reduce")
@@ -398,18 +475,77 @@ def exercise(page, fixture, output, report):
     expect(page.get_by_test_id("task-report-spec")).to_contain_text("需求轴的浏览器合成报告")
     expect(page.get_by_test_id("task-report-standards")).to_contain_text("标准轴的浏览器合成报告")
     expect(page.get_by_test_id("task-decide")).to_be_disabled()
+    exercise_proposal_replacement(page, fixture, output, report)
     page.get_by_test_id("task-decision-verdict").select_option("pass")
     page.get_by_test_id("task-decision-reason").fill("已逐项核对两轴报告，批准这次候选")
-    page.get_by_test_id("task-decide").click()
+    # A real policy revision makes the old command commit only a refresh. The
+    # UI must retain its draft and require a new, explicit native choice.
+    policy = request(page, origin, "GET", "/api/policies/global")["policy"]
+    assert any(rule["ruleId"] == "default.review.decide" for rule in policy["document"]["rules"])
+    request(page, origin, "PUT", "/api/policies/global", {
+        "expectedRevision": policy["ref"]["revision"],
+        "rules": [{**rule, "reason": "浏览器实际修改规则，原命令不得自动批准"} if rule["ruleId"] == "default.review.decide" else rule
+                  for rule in policy["document"]["rules"]],
+    })
+    with page.expect_response(lambda response: response.request.method == "POST" and response.url.endswith("/decision")) as refreshed_response:
+        page.get_by_test_id("task-decide").click()
+    refreshed = refreshed_response.value.json()
+    assert refreshed_response.value.status == 409 and refreshed["state"] == "refreshed"
+    assert refreshed["receipt"]["httpStatus"] == 409 and refreshed["receipt"]["execution"] is None
+    expect(page.get_by_test_id("task-state")).to_have_text("评审中")
+    expect(page.get_by_test_id("task-decision-reason")).to_have_value("已逐项核对两轴报告，批准这次候选")
+    expect(page.get_by_test_id("task-decide")).to_be_disabled()
+    expect(page.get_by_test_id("task-decision-refreshed")).to_contain_text("原裁决未执行")
+    expect(page.get_by_test_id("decision-state")).to_contain_text(f"决定版本 {refreshed['current']['ref']['revision']}")
+    page.get_by_test_id("decision-choice").select_option("approve")
+    page.get_by_test_id("decision-choice-reason").fill("已逐项核对两轴报告，批准这次候选")
+    choice_url = origin + f"/api/projects/{pid}/decisions/{refreshed['current']['ref']['decisionId']}/choices"
+    attempts = []
+    def lose_actual_reply(route):
+        # Forward the real write and record its original response. Only delivery
+        # of the first reply is lost; no outcome or response body is fabricated.
+        response = route.fetch()
+        body = response.json()
+        attempts.append({"url": route.request.url, "input": route.request.post_data_json, "status": response.status, "body": body})
+        if len(attempts) == 1: route.abort("failed")
+        else: route.fulfill(response=response)
+    page.route(choice_url, lose_actual_reply)
+    page.get_by_test_id("decision-submit").click()
+    expect(page.get_by_test_id("decision-retry")).to_be_enabled()
+    expect(page.get_by_test_id("decision-choice")).to_be_disabled()
+    expect(page.get_by_test_id("decision-choice-reason")).to_be_disabled()
+    expect(page.get_by_test_id("task-decision-reason")).to_be_disabled()
+    expect(page.get_by_test_id("decision-state")).to_contain_text("选择已记录")
+    expect(page.get_by_test_id("decision-choice-reason")).to_have_value("已逐项核对两轴报告，批准这次候选")
+    page.get_by_test_id("decision-retry").click()
+    expect(page.get_by_test_id("decision-retry")).to_have_count(0)
+    page.unroute(choice_url, lose_actual_reply)
+    assert len(attempts) == 2 and attempts[0]["input"] == attempts[1]["input"]
+    assert attempts[0]["url"] == attempts[1]["url"] == choice_url
+    assert attempts[0]["input"]["clientMutationId"] and attempts[0]["input"]["decisionRef"] == refreshed["current"]["ref"]
+    assert attempts[0]["body"]["receipt"]["receiptId"] == attempts[1]["body"]["receipt"]["receiptId"]
+    for attempt in attempts:
+        assert attempt["status"] == 200 and attempt["body"]["state"] == "applied"
+        assert attempt["body"]["receipt"]["execution"]["status"] == "succeeded"
+    report.setdefault("decisionReceipts", []).append({"refreshed": refreshed, "lostReplyAndExactRetry": attempts})
     expect(page.get_by_test_id("task-state")).to_have_text("已完成")
+    expect(page.get_by_test_id("decision-panel")).to_contain_text("裁决已保存并应用")
+    # The preserved old management draft is not silently reused for correction.
+    page.get_by_test_id("task-decision-discard").click()
     page.get_by_test_id("task-decision-verdict").select_option("changes_requested")
     page.get_by_test_id("task-decision-reason").fill("发现新的交付要求，保留原结论并继续修改")
-    page.get_by_test_id("task-decide").click()
+    with page.expect_response(lambda response: response.request.method == "POST" and response.url.endswith("/decision")) as correction_response:
+        page.get_by_test_id("task-decide").click()
+    correction = correction_response.value.json()
+    assert correction_response.value.status == 200 and correction["state"] == "applied"
+    assert correction["receipt"]["execution"]["status"] == "succeeded"
+    assert correction["current"]["actionRequest"]["action"]["payload"]["choice"] == "changes_requested"
+    assert correction["current"]["resolution"]["choiceId"] == "approve"
     expect(page.get_by_test_id("task-state")).to_have_text("进行中")
     decided = request(page, origin, "GET", f"/api/projects/{pid}/tasks/{review_id}")
     assert len(decided["reports"]) == 2
     assert "已逐项核对两轴报告" in json.dumps(decided["history"], ensure_ascii=False)
-    report["checks"].append("AC-REVIEW-03: 两轴分别呈现，管理者必填原因覆盖与再次覆盖，原报告/裁决历史保留（合成UI报告）")
+    report["checks"].append("AC-REVIEW-03/#157: 真实策略409保留旧管理草稿；新choices提交后丢响应锁定且原样重试同回执；明确管理更正是approve修改提案，原报告/历史保留（报告为UI合成输入）")
 
     # R-173-REQ-002：沿用真实服务中仍可覆盖的 decided 轮次，外部合法修改令它 superseded。
     # reported -> superseded 的原始反例及新轮次未就绪/归档分支由真实 SFC 回归另验。

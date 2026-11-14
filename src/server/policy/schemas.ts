@@ -149,6 +149,72 @@ export function parseEvaluationRequest(input: unknown) {
   };
 }
 
+/** 新合同的错误不改变已发布 v1 的输入错误类型和拒绝语义。 */
+export class DbReviewPolicyInputError extends Error {
+  readonly code = "fact_contract_mismatch";
+  readonly fields: readonly string[];
+  constructor(fields: readonly string[]) {
+    const stableFields = [...new Set(fields)].sort();
+    super(`fact_contract_mismatch：请检查 ${stableFields.join("、")}。`);
+    this.name = "DbReviewPolicyInputError";
+    this.fields = stableFields;
+  }
+}
+
+const dbReviewActionSchema = policyActionSchema.refine(action => action.kind === "review.decide"
+  && action.projectId !== null && action.candidateDigest !== null
+  && action.expectedSubjectRevisions.length === 2
+  && action.expectedSubjectRevisions[0]?.subjectRef.kind === "review-round"
+  && action.expectedSubjectRevisions[1]?.subjectRef.kind === "task", { message: "仅接受完整的 DB review 动作" });
+const dbReviewSubjectSchema = z.object({
+  subjectRef: z.object({ kind: z.enum(["task", "review-round"]), id }).strict(),
+  revision, active: z.boolean(), candidateDigest: digest.nullable(),
+}).strict();
+const dbReviewFactsSchema = z.object({
+  factsContract: z.literal("s1.db-review-locked/v1"),
+  authorityBasis: z.literal("same-transaction-current-permissions"),
+  purpose: z.enum(["eligibility-observation", "resolver-check"]),
+  principal: z.object({ actorId: id, active: z.boolean(), membershipRevision: revision.nullable(), currentMembershipRevision: revision.nullable() }).strict(),
+  project: z.object({ projectId: id, active: z.boolean() }).strict(),
+  subjects: z.array(dbReviewSubjectSchema).max(100),
+  proposal: z.object({ readAllowed: z.boolean(), createAllowed: z.boolean(), inScope: z.boolean(), kindAllowed: z.boolean(), delegable: z.boolean(), prohibited: z.boolean() }).strict(),
+  execution: z.object({ resourceAccess: z.boolean(), capabilityAllowed: z.boolean(), inScope: z.boolean(), authorizationCurrent: z.boolean(), hostSupported: z.boolean(), prohibited: z.boolean() }).strict(),
+  authorization: z.object({ existingAuthorization: z.boolean(), grants: z.tuple([]) }).strict(),
+  budget: z.object({ requiredUnits: z.literal(0), availableUnits: z.literal(0), mayRequestIncrease: z.literal(false) }).strict(),
+  retries: z.object({ requested: z.literal(0), available: z.literal(0), mayRequestIncrease: z.literal(false) }).strict(),
+  userReserved: z.literal(false),
+}).strict().superRefine((facts, ctx) => {
+  const subjects = facts.subjects.map(fact => subjectKey(fact.subjectRef));
+  if (new Set(subjects).size !== subjects.length) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["subjects"], message: "主体事实重复" });
+});
+const dbReviewPolicyRequestSchema = z.object({
+  contractVersion: z.literal("s1.db-review-policy/v1"),
+  action: dbReviewActionSchema, stage: z.enum(["proposal", "execution"]),
+  policy: z.object({
+    policyRevision: id,
+    global: z.object({ revision, contentDigest: digest }).strict(),
+    project: z.object({ revision, contentDigest: digest }).strict().nullable(),
+    defaultRevision: revision,
+  }).strict(),
+  documents: z.unknown(),
+  handler: z.object({
+    handlerId: z.literal("s1.review-decide.db/v1"), revision: z.literal(1), kind: z.literal("review.decide"), available: z.boolean(),
+    effects: z.literal("single-database-transaction"), resources: z.literal("database-only"),
+    delegation: z.literal("none"), deferredEffects: z.literal("none"), grantUse: z.literal("none"),
+  }).strict(),
+  facts: dbReviewFactsSchema, evaluatedAt: timestamp,
+}).strict();
+
+/** 所有层级拒绝额外字段；零预算是固定 handler 合同，不是缺省值或未知预算的替身。 */
+export function parseDbReviewPolicyRequestV1(input: unknown) {
+  const parsed = dbReviewPolicyRequestSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new DbReviewPolicyInputError(parsed.error.issues.flatMap(issue =>
+      issue.code === "unrecognized_keys" ? issue.keys.map(key => [...issue.path, key].join(".")) : [issue.path.join(".") || "input"]));
+  }
+  return parsed.data;
+}
+
 export function parsePolicyInput<T>(schema: z.ZodType<T>, input: unknown, code: PolicyInputErrorCode): T {
   const parsed = schema.safeParse(input);
   if (!parsed.success) {

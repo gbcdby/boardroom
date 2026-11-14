@@ -1,3 +1,4 @@
+import { postDecision, type DecisionCommandResult } from './decisions.ts';
 import { ApiError, request } from "./client.ts";
 import type { CreateTaskInput, DecideReviewInput, StartReviewResult, TaskView as Task, TaskDeliveryKind, TaskComment, TaskDetail, TaskSettings, TaskState, TransitionTaskInput, UpdateTaskInput } from "../../../shared/tasks.ts";
 export type { TaskView as Task, TaskDetail, TaskSettings, TaskState, ReviewRound, ReviewReport, ReviewVerdict } from "../../../shared/tasks.ts";
@@ -22,8 +23,8 @@ export const tasksApi = {
   transition(projectId: string, taskId: string, input: TransitionTaskInput): Promise<{ task: Task }> { return request("POST", `${taskUrl(projectId, taskId)}/transitions`, input); },
   comment(projectId: string, taskId: string, body: string): Promise<{ comment: TaskComment }> { return request("POST", `${taskUrl(projectId, taskId)}/comments`, { body }); },
   startReview(projectId: string, taskId: string, expectedRevision: number): Promise<StartReviewResult> { return request("POST", `${taskUrl(projectId, taskId)}/reviews`, { expectedRevision }); },
-  decide(projectId: string, taskId: string, roundId: string, input: DecideReviewInput): Promise<{ task: Task }> {
-    return request("POST", `${taskUrl(projectId, taskId)}/reviews/${encodeURIComponent(roundId)}/decision`, input);
+  decide(projectId: string, taskId: string, roundId: string, input: DecideReviewInput): Promise<DecisionCommandResult> {
+    return postDecision( `${taskUrl(projectId, taskId)}/reviews/${encodeURIComponent(roundId)}/decision`, input);
   },
 };
 

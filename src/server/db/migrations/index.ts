@@ -1,3 +1,5 @@
+import { decisionsMigration } from "./decisions.ts";
+import { workEventDeliveryInvalidationsMigration } from "./work-event-delivery-invalidations.ts";
 import { memoryMigration } from "./memory.ts";
 import { memberLifecycleMigration } from "./member-lifecycle.ts";
 import type { Migration } from "../migrate.ts";
@@ -448,4 +450,6 @@ export const migrations: readonly Migration[] = [
   policyConfigurationMigration,
   storageMaintenanceMigration,
   mcpConnectionsMigration,
+  decisionsMigration,
+  workEventDeliveryInvalidationsMigration,
 ];

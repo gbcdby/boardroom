@@ -1,3 +1,4 @@
+import type { WorkEventInvalidationClosure } from "./tasks/work-event-storage.ts";
 import { isDeepStrictEqual } from "node:util";
 import { appendAuditEntry, assertCompleteAuditFields, auditActorFrom, isReversible, type AuditRow } from "./audit.ts";
 import type { RepoCtx, RepositorySet } from "./db/repositories.ts";
@@ -252,9 +253,12 @@ export function createAuditCompensationService({ repos, now = () => new Date() }
       assertCompleteAuditFields(pair.before, pair.after, { reversal });
       let actual: { actualBefore: Snapshot; actualAfter: Snapshot };
       let restartRequired: RestartRequired[] = [];
+      let workEventInvalidations: WorkEventInvalidationClosure | undefined;
+      let assertWorkEventAudit: (() => Promise<void>) | undefined;
       if (pair.after.schema === 'member-relations/v2' && pair.before.schema === 'member-relations/v2') {
         const result = await applyMemberCompensation(repos, { expected: pair.after, target: pair.before, compensationAuditId: id, at, budget: MEMBER_CAPTURE_BUDGET, tracker });
         actual = result; restartRequired = result.restartRequired;
+        workEventInvalidations = result.workEventInvalidations; assertWorkEventAudit = result.assertWorkEventAudit;
       } else if (pair.after.schema === "org-graph/v2" && pair.before.schema === "org-graph/v2") {
         actual = await applyOrgGraph(repos, pair.after, pair.before, at, meta.rootAction !== "org.node_update");
       } else if (pair.after.schema === "org-assignment/v2" && pair.before.schema === "org-assignment/v2") {
@@ -269,7 +273,8 @@ export function createAuditCompensationService({ repos, now = () => new Date() }
       } else return invalid();
       const next = await appendAuditEntry(repos.audit, { projectId, actor: auditActorFrom(access.actor), action: meta.rootAction.startsWith("org.") ? "org.revoke" : "member.revoke",
         targetKind: row.targetKind, targetId: row.targetId, targetName: row.targetName, before: actual.actualBefore, after: actual.actualAfter,
-        detail: { reversal, ...(restartRequired.length ? { restartRequired, normalization: 'new-membership-revision; no-old-session-round-runtime-or-summary' } : {}) } }, { id, createdAt: at });
+        detail: { reversal, ...(workEventInvalidations ? { workEventInvalidations } : {}), ...(restartRequired.length ? { restartRequired, normalization: 'new-membership-revision; no-old-session-round-runtime-or-summary' } : {}) } }, { id, createdAt: at });
+      await assertWorkEventAudit?.();
       if (!await repos.audit.markReversed(projectId, row.id, next.id, at)) conflict("该事件刚被另一个请求撤销。");
       tracker.check(); return next;
     }));

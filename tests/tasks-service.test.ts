@@ -1,4 +1,5 @@
 import test from "node:test";
+import { allowCurrentReviewerForTaskFixture } from "./helpers/task-review-policy.ts";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -30,7 +31,7 @@ async function fixture(run: (repos: RepositorySet) => Promise<void>, engine: "sq
   const dir = await mkdtemp(path.join(tmpdir(), "boardroom-task-service-"));
   const schema = `task_service_${randomUUID().replaceAll("-", "")}`;
   const driver = engine === "sqlite" ? new SqliteDriver({ dataDir: dir }) : createDbDriver({ dbDriver: "postgres", pgConnectionString: pgUrl!, pgSchema: schema });
-  try { await driver.connect(); await driver.migrate(migrations); await run(createRepositories(driver)); }
+  try { await driver.connect(); await driver.migrate(migrations); const repos = createRepositories(driver); await allowCurrentReviewerForTaskFixture(repos); await run(repos); }
   finally {
     await driver.close();
     if (engine === "postgres") {
@@ -71,7 +72,10 @@ test("AC-TASK-01/02：有效默认 reviewer、正文创建、普通成员评论�
 }));
 
 async function reviewConcurrency(repos: RepositorySet): Promise<void> {
+  const managerAgent = await repos.agents.create({ displayName: '真实管理更正主体', hostType: 'other' });
   const p = await people(repos); const service = createTaskService({ repos, captureCandidate: async () => candidate });
+  const manager = await repos.members.create({ projectId: p.project.id, agentId: managerAgent.id, kind: 'agent', displayName: '管理者', role: 'manager' });
+  const managerAccess = { actor: actorForMember(manager) };
   let task = await service.create(p.owner, p.project.id, { title: "评审", body: "验收条件", deliveryKind: "code" as const, acceptanceText: "验收条件", assigneeMemberId: p.worker.id, reviewerMemberId: p.reviewer.id, repoPath: "/fixture", fixedPoint: "base" });
   task = await service.transition(p.workerAccess, p.project.id, task.id, { expectedRevision: task.revision, state: "in-progress" });
   const start = await service.startReview(p.workerAccess, p.project.id, task.id, { expectedRevision: task.revision });
@@ -92,7 +96,7 @@ async function reviewConcurrency(repos: RepositorySet): Promise<void> {
   assert.equal((await service.submitReport(p.reviewerAccess, p.project.id, task.id, round.id, inputs[winner]!)).id, firstId);
   currentRound = (await repos.tasks.getRound(p.project.id, task.id, round.id))!;
   assert.equal(currentRound.state, "reported");
-  task = await service.decideReview(p.reviewerAccess, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "pass", reason: "两轴完成" });
+  task = (await service.decideReview(p.reviewerAccess, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "pass", reason: "两轴完成" })).task;
   assert.equal(task.state, "done");
   let decidedEvents = (await repos.tasks.listUnackedWorkEvents(p.project.id, p.worker.id)).filter(event => event.kind === "task.review_decided");
   assert.equal(decidedEvents.length, 1);
@@ -100,12 +104,12 @@ async function reviewConcurrency(repos: RepositorySet): Promise<void> {
   assert.equal(decidedEvents[0]!.payload["completionRevision"], task.revision);
   assert.equal(decidedEvents[0]!.payload["assigneeAgentId"], p.worker.agentId);
   currentRound = (await repos.tasks.getRound(p.project.id, task.id, round.id))!;
-  task = await service.decideReview(p.owner, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "pass", reason: "补充确认，未重新完成任务", override: true });
+  task = (await service.decideReview(managerAccess, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "pass", reason: "补充确认，未重新完成任务", override: true })).task;
   decidedEvents = (await repos.tasks.listUnackedWorkEvents(p.project.id, p.worker.id)).filter(event => event.kind === "task.review_decided");
   assert.equal(decidedEvents.filter(event => event.payload["enteredDone"] === true).length, 1, "重复 done 裁决不能再次触发总结");
   assert.equal(decidedEvents.find(event => event.payload["completionRevision"] === task.revision)?.payload["enteredDone"], false);
   currentRound = (await repos.tasks.getRound(p.project.id, task.id, round.id))!;
-  task = await service.decideReview(p.owner, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "changes_requested", reason: "管理者需要补充验收", override: true });
+  task = (await service.decideReview(managerAccess, p.project.id, task.id, round.id, { expectedTaskRevision: task.revision, expectedRoundRevision: currentRound.revision, verdict: "changes_requested", reason: "管理者需要补充验收", override: true })).task;
   assert.equal(task.state, "in-progress");
   const detail = await service.get(p.owner, p.project.id, task.id);
   assert.equal(detail.reports.length, 2); assert.equal(detail.comments.filter(comment => comment.kind === "review_report").length, 2);

@@ -410,7 +410,10 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
         // 归档与恢复共用 `project:archive` 能力点：恢复 = 取消归档，权限同位。
         // 顶层 manager 可归档（LIFE-ARC-01），但矩阵里没有 project:purge → 不能永久删除。
         const { actor } = (await (guard(r, request, "project:archive", { projectId: project.id })));
-        const next = await withHttpMutation(r, projectId, actor.kind === "agent" ? [actor.actorId] : [], [], async () => {
+        const next = await r.transaction(() => r.mutations.run({ projectIds: [projectId], discover: async tx => ({
+          memberIds: (await tx.query<{ id: string }>('SELECT id FROM members WHERE project_id=? ORDER BY id LIMIT 2049', [projectId])).map(member => member.id),
+          groupIds: [], runtimeIds: [],
+        }) }, async () => {
           const current = await requireProject(r, projectId);
           await authorizeMutation(r, { actor }, "project:archive", { projectId });
           const updated = segments[3] === "archive" ? await r.projects.archive(projectId) : await r.projects.restore(projectId);
@@ -419,7 +422,7 @@ export function createT1ApiRouter(options: T1ApiOptions): T1ApiRouter {
             targetKind: "project", targetId: projectId, targetName: current.name, before: current, after: updated,
           });
           return updated;
-        });
+        }));
         log.info(segments[3] === "archive" ? "归档项目" : "恢复项目", { projectId });
         writeJson(response, 200, { project: (await (projectView(r, next))) });
         return true;

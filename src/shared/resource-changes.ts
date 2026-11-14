@@ -4,7 +4,7 @@
  */
 export interface ResourceChange {
   projectId: string;
-  entity: "task" | "task-settings";
+  entity: "task" | "task-settings" | "decision";
   id: string;
   revision: number;
 }
