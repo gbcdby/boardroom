@@ -67,7 +67,7 @@ function preview(plan: MigrationPlan, sourceId: string): PlanPreview {
 async function main(): Promise<void> {
   // Reject unsupported operations and malformed arguments before resolver I/O or adapter loading.
   const args = parseArguments(process.argv.slice(2));
-  const { resolveBoardroomEnvironment, assertEnvironmentSelected } = await import("../src/server/environment.ts");
+  const { resolveBoardroomEnvironment, assertEnvironmentSelected, canonicalizePath } = await import("../src/server/environment.ts");
   const env = { ...process.env };
   if (args.dataDir !== undefined) env["AGENT_STUDIO_DATA_DIR"] = args.dataDir;
   const environment = await resolveBoardroomEnvironment({ env, knownLegacyCwds: args.knownLegacyCwds });
@@ -77,6 +77,8 @@ async function main(): Promise<void> {
   if (environment.inventory.selectedSourceId !== args.expectedSourceId) throw new MaintenanceFailure("source_changed");
   const descriptor = environment.databaseDescriptor;
   if (descriptor.kind === "sqlite" && descriptor.identity === null) throw new MaintenanceFailure("source_missing");
+  // Resolve existing aliases without creating missing suffixes; shared planning still checks identities and protected roots.
+  const controlRoot = canonicalizePath(args.controlRoot), targetRoot = canonicalizePath(args.targetRoot);
   const { planMigration } = await import("../src/server/storage/maintenance/plan.ts");
   let adapter: MaintenanceAdapter | undefined, result: PlanPreview;
   try {
@@ -84,7 +86,7 @@ async function main(): Promise<void> {
       ? await (await import("../src/server/storage/maintenance/sqlite.ts")).createSqliteMaintenanceAdapter(descriptor)
       : await (await import("../src/server/storage/maintenance/postgres.ts")).createPostgresMaintenanceAdapter(descriptor, undefined);
     result = preview(await planMigration({ environment, originalCwd: process.cwd(), expectedSourceId: args.expectedSourceId,
-      controlRoot: args.controlRoot, targetRoot: args.targetRoot }, adapter), environment.inventory.selectedSourceId);
+      controlRoot, targetRoot }, adapter), environment.inventory.selectedSourceId);
   } finally { await adapter?.close(); }
   // A successful observation (including its blockers) is not a persisted plan or an execution permit.
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

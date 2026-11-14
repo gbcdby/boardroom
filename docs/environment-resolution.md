@@ -104,7 +104,7 @@ node scripts/storage-maintenance.ts plan \
   --target-root /absolute/future-target
 ```
 
-`--expected-source-id` 只核对唯一 resolver 已选的来源，不会按这个值切换数据库。配置文件与环境变量优先级保持不变；`--data-dir` 不会把 PostgreSQL 改成 SQLite。`--legacy-cwd` 可重复指定已知旧目录，其他参数不得重复；所有路径参数使用绝对路径。歧义、缺失/替换源、未激活格式、坏 schema/guard 或保护路径冲突均拒绝。
+`--expected-source-id` 只核对唯一 resolver 已选的来源，不会按这个值切换数据库。配置文件与环境变量优先级保持不变；`--data-dir` 不会把 PostgreSQL 改成 SQLite。`--legacy-cwd` 可重复指定已知旧目录，其他参数不得重复；所有路径参数使用绝对路径。控制根和目标根复用唯一环境路径规则，解析已有前缀的真实路径并保留缺失尾段，不创建目录；规范化后仍检查来源身份、保护范围及路径重叠。歧义、缺失/替换源、未激活格式、坏 schema/guard 或保护路径冲突均拒绝。
 
 stdout 只包含一个安全 JSON 预览：`formatVersion`、`command: "plan"`、`result: "preview"`、`observationMode: "logical_read_only"`、`persisted: false`、`executionAuthorized: false`，以及公开来源 ID/数据库类型、`observedAt`、字符串精度的 `tableCounts`、`requiredCapabilities` 和 `blockers`。不输出完整计划、配置/连接串、文件正文、内部来源身份或维护/快照回执。动态内部 blocker 引用只输出诊断指纹。退出码 0 仅表示预览完成，可能仍有阻塞项；空 blockers 也不证明已经取得执行能力。输入或读取失败使用受控 stderr 错误和退出码 1。
 

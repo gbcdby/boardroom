@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -133,6 +133,33 @@ platformTest("P152-PLAN-04: 错来源与保护路径严格拒绝，不修复、�
       const result = run(args, f.dir, f.env, true);
       assert.equal(result.status, 1); assert.equal(result.stdout, ""); assert.ok(result.stderr.startsWith(`[${code}]`), result.stderr);
       assert.ok(!result.stderr.includes(secret)); assert.ok(!result.stderr.includes(f.dir));
+      assert.deepEqual(f.logical(), before); await assertNoArtifacts(f);
+    }
+  } finally { await f.close(); }
+});
+
+platformTest("P152-PLAN-01/04: 绝对目录别名支持只读预览，仍拒绝源重叠与控制目标碰撞", async () => {
+  const f = await sqliteFixture();
+  try {
+    const alias = path.join(f.dir, "location-alias");
+    await symlink(await realpath(f.dir), alias, "dir");
+    const args = [...f.args], before = f.logical();
+    args[4] = path.join(alias, "data", "maintenance-control");
+    args[6] = path.join(alias, "future-target", "missing-tail");
+    const result = run(args, f.dir, f.env, true);
+    assert.equal(result.status, 0, result.stderr); assert.equal(result.stderr, "");
+    const preview = readPreview(result.stdout);
+    assert.equal(preview.source.sourceId, f.resolved.inventory.selectedSourceId);
+    assert.equal(preview.tableCounts.plan_cli_observation, "2");
+    assert.ok(!result.stdout.includes(alias));
+    assert.deepEqual(f.logical(), before);
+    await assert.rejects(stat(path.join(f.dir, "future-target")), { code: "ENOENT" });
+    const protectedTarget = [...args]; protectedTarget[6] = path.join(alias, "data", "agent-studio.db");
+    const collision = [...args]; collision[6] = args[4]!;
+    for (const [input, code] of [[protectedTarget, "target_conflict"], [collision, "control_root_mismatch"]] as const) {
+      const rejected = run(input, f.dir, f.env, true);
+      assert.equal(rejected.status, 1); assert.equal(rejected.stdout, "");
+      assert.ok(rejected.stderr.startsWith(`[${code}]`), rejected.stderr);
       assert.deepEqual(f.logical(), before); await assertNoArtifacts(f);
     }
   } finally { await f.close(); }
