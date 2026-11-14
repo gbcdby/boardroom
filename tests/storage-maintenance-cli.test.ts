@@ -60,7 +60,8 @@ async function sqliteFixture() {
     import("better-sqlite3"), import("../src/server/db/migrate.ts"), import("../src/server/db/migrations/index.ts"),
     import("../src/server/environment.ts"), import("../src/server/storage/maintenance/sqlite-manifests.ts"),
   ]);
-  const dir = await mkdtemp(path.join(tmpdir(), "boardroom-plan-cli-sqlite-"));
+  // ArtifactStore binds canonical root paths; keep independent API reads on the same fixture identity.
+  const dir = await realpath(await mkdtemp(path.join(tmpdir(), "boardroom-plan-cli-sqlite-")));
   const dataDir = path.join(dir, "data"), file = path.join(dataDir, "agent-studio.db"), config = path.join(dir, "config.json");
   await mkdir(dataDir);
   const writer = new Database(file);
@@ -401,7 +402,7 @@ test("P152-PLAN-03/PERSIST-06: 真实 PG16 CLI 预览与显式保存回读，无
     import("pg"), import("../src/server/db/drivers/postgres.ts"), import("../src/server/db/migrations/index.ts"),
     import("../src/server/storage/maintenance/postgres.ts"), import("../src/server/environment.ts"),
   ]);
-  const dir = await mkdtemp(path.join(tmpdir(), "boardroom-plan-cli-pg-")), databaseName = `br_m152_plan_${randomUUID().replaceAll("-", "")}`;
+  const dir = await realpath(await mkdtemp(path.join(tmpdir(), "boardroom-plan-cli-pg-"))), databaseName = `br_m152_plan_${randomUUID().replaceAll("-", "")}`;
   const sourceUrl = new URL(testUrl); sourceUrl.pathname = `/${databaseName}`;
   const admin = new Client({ connectionString: testUrl });
   const driver = new PostgresDriver({ connectionString: sourceUrl.toString() });
