@@ -406,15 +406,28 @@ static const unsigned char F2_EXPECTED_CONFIG[] = {1};
 #define execve test_execve
 #define fcntl test_fcntl
 #define ioctl test_ioctl
+#define clock_gettime test_clock_gettime
+#define nanosleep test_nanosleep
 #include "f2-guest.c"
 #include <stdarg.h>
-static int mode, next_fd=700, closed[1024], ack_count, root_operations, fork_count, pipe_count, reboot_count, read_count;
+static int mode, next_fd=700, closed[1024], ack_count, root_operations, fork_count, pipe_count, reboot_count, read_count, wait_count, signal_count, held_pidfd=-1;
+static unsigned clock_ticks;
 int test_pipe2(int fds[2], int flags) { (void)flags; ++pipe_count; if(mode==4){errno=EMFILE;return -1;} fds[0]=next_fd++;fds[1]=next_fd++;return 0; }
 pid_t test_fork(void) { ++fork_count; if(mode==3||mode==5){errno=EAGAIN;return -1;}return 1234; }
 int test_close(int fd) { if(fd<700||fd>=1024)abort();++closed[fd];if(fd==700&&mode==1){errno=EBADF;return -1;}return 0; }
 int test_open(const char *path, int flags, ...) { (void)flags; ++root_operations;if(mode<5)abort();if(strcmp(path,"/usr/sbin/mke2fs")&&strcmp(path,"/dev/null"))abort();return next_fd++; }
 int test_fstat(int fd, struct stat *s) { if(fd!=700)abort();memset(s,0,sizeof(*s));s->st_mode=S_IFREG|0555;s->st_size=146000;s->st_nlink=1;return 0; }
-long test_syscall(long number, ...) { if(number!=SYS_pidfd_open)abort();if(mode==2){errno=EIO;return -1;}return next_fd++; }
+long test_syscall(long number, ...) {
+    if(number==SYS_pidfd_send_signal){
+        va_list args;va_start(args,number);int fd=va_arg(args,int),sig=va_arg(args,int);va_end(args);
+        if(fd!=held_pidfd||fd<700||closed[fd]||sig!=SIGKILL)abort();
+        ++signal_count;return 0;
+    }
+    if(number!=SYS_pidfd_open)abort();
+    if(mode==2){errno=EIO;return -1;}
+    if(mode==16||mode==17){errno=EMFILE;return -1;}
+    held_pidfd=next_fd++;return held_pidfd;
+}
 ssize_t test_read(int fd, void *data, size_t size) {
     (void)fd;if(mode<5)abort();
     if(read_count<0){errno=EIO;return -1;}
@@ -423,7 +436,18 @@ ssize_t test_read(int fd, void *data, size_t size) {
     return read_count;
 }
 ssize_t test_write(int fd, const void *data, size_t size) { (void)fd;if(size!=1||*(const char*)data!='G')abort();++ack_count;return 1; }
-pid_t test_waitpid(pid_t pid, int *status, int flags) { (void)flags;if(pid!=1234)abort();*status=mode>=5?0:256;return pid; }
+pid_t test_waitpid(pid_t pid, int *status, int flags) {
+    if(pid!=1234||flags!=WNOHANG)abort();
+    ++wait_count;
+    if(mode==16||mode==17){errno=ECHILD;return -1;}
+    if(mode>=8&&mode<=15&&(wait_count==1||mode>=12)){errno=(mode==8||mode==9||mode==12||mode==13)?EINTR:EIO;return -1;}
+    *status=signal_count?SIGKILL:mode>=5?0:256;return pid;
+}
+int test_clock_gettime(clockid_t clock, struct timespec *value) {
+    if(clock!=CLOCK_MONOTONIC)abort();
+    unsigned ticks=mode>=8?clock_ticks++:0;value->tv_sec=ticks/4;value->tv_nsec=(ticks%4)*250000000L;return 0;
+}
+int test_nanosleep(const struct timespec *request, struct timespec *remaining) { (void)request;(void)remaining;return 0; }
 pid_t test_getpid(void) { return 1; }
 uid_t test_getuid(void) { return 0; }
 uid_t test_geteuid(void) { return 0; }
@@ -446,6 +470,18 @@ int main(int argc,char**argv){
         read_count=0;if(test_read(700,buffer,sizeof(buffer))!=0||memcmp(buffer,"DDXX",4))return 85;
         read_count=-1;if(test_read(700,buffer,sizeof(buffer))!=-1||errno!=EIO||memcmp(buffer,"DDXX",4))return 86;
         puts("READ_CONTRACT positive_range_only eof_unchanged error_unchanged");return 0;
+    }
+    if(mode>=8&&mode<=17){
+        struct child_result child=mode%2?format_child():ordinary_child("p1");
+        for(int fd=700;fd<next_fd;++fd)if(closed[fd]!=1)return 87;
+        if(wait_count<2)return 88;
+        if(mode<10){if(!child_ok(child)||signal_count)return 89;}
+        else if(mode<12){if(!child.reaped||child.error!=EIO||signal_count!=1||child_ok(child))return 90;}
+        else if(mode<16){if(child.reaped||signal_count!=1||child_ok(child)||child.error!=(mode<14?ETIMEDOUT:EIO))return 91;}
+        else {if(child.reaped||child.error!=EMFILE||signal_count||child_ok(child))return 92;}
+        printf("WAIT_CONTROL {\"mode\":%d,\"wait_calls\":%d,\"signals\":%d,\"reaped\":%s,\"error\":%d,\"timed_out\":%s,\"clock_ticks\":%u}\n",
+            mode,wait_count,signal_count,child.reaped?"true":"false",child.error,child.timed_out?"true":"false",clock_ticks);
+        return 0;
     }
     int rc;
     if(mode<5){rc=bootstrap_f2();if(rc!=1||root_operations||reboot_count!=1)return 80;}
@@ -488,6 +524,16 @@ int main(int argc,char**argv){
         result = subprocess.run([str(self.binary), "7"], stdin=subprocess.DEVNULL, capture_output=True, timeout=3)
         self.assertEqual(result.returncode, 0, result.stdout.decode()+result.stderr.decode())
         self.assertEqual(result.stdout, b"READ_CONTRACT positive_range_only eof_unchanged error_unchanged\n")
+
+    def test_wait_interruption_and_errors_retain_ownership_until_reap_or_original_deadline(self):
+        for mode in range(8, 18):
+            with self.subTest(mode=mode):
+                result = subprocess.run([str(self.binary), str(mode)], stdin=subprocess.DEVNULL, capture_output=True, timeout=3)
+                self.assertEqual(result.returncode, 0, result.stdout.decode()+result.stderr.decode())
+                rows = [json.loads(line[13:]) for line in result.stdout.splitlines() if line.startswith(b"WAIT_CONTROL ")]
+                self.assertEqual(len(rows), 1)
+                self.assertLess(rows[0]["clock_ticks"], 160)
+                self.assertEqual(rows[0]["timed_out"], mode in (12, 13))
 
 
 if __name__ == "__main__": unittest.main()

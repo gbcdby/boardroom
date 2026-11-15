@@ -147,6 +147,13 @@ static int collect_p1(void) {
 
 struct child_result { pid_t pid; int code, signal, error, close_error; bool timed_out, reaped, pidfd_before_ack; };
 
+static int kill_owned_child(pid_t pid, int pidfd, bool no_waitable_child) {
+    if (pidfd >= 0) return (int)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, 0);
+    /* ECHILD without a pidfd cannot justify signalling a possibly reused PID. */
+    if (no_waitable_child) { errno = ECHILD; return -1; }
+    return kill(pid, SIGKILL);
+}
+
 static struct child_result ordinary_child(const char *mode) {
     struct child_result r = {.code = -1}; int gate[2] = {-1, -1}, pidfd = -1;
     if (pipe2(gate, O_CLOEXEC)) { r.error = errno; return r; }
@@ -171,17 +178,23 @@ static struct child_result ordinary_child(const char *mode) {
     event(!strcmp(mode, "p1") ? "p1-start" : "metadata-start", 0, 0, 0, "", 0);
     if (!r.error && !r.close_error && !output_error && write(gate[1], "G", 1) != 1) r.error = errno ? errno : EIO;
     int ce = close_once(&gate[1]); if (!r.close_error) r.close_error = ce;
-    int status = 0; double deadline = monotonic() + 3.0; bool killed = false;
+    int status = 0; double deadline = monotonic() + 3.0; bool killed = false, no_waitable_child = false;
     for (;;) {
         pid_t done = waitpid(r.pid, &status, WNOHANG);
         if (done == r.pid) { r.reaped = true; break; }
-        if (done < 0) { if (!r.error) r.error = errno; break; }
-        if (!killed && (r.error || r.close_error || output_error || monotonic() >= deadline)) {
-            r.timed_out = monotonic() >= deadline;
-            int kr = pidfd >= 0 ? (int)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, 0) : kill(r.pid, SIGKILL);
+        if (done < 0) {
+            int error = errno;
+            if (error == ECHILD) no_waitable_child = true;
+            if (error != EINTR && !r.error) r.error = error;
+            /* Retain the owner through the existing wait/termination deadline. */
+        }
+        double now = monotonic();
+        if (!killed && (r.error || r.close_error || output_error || now >= deadline)) {
+            r.timed_out = now >= deadline;
+            int kr = kill_owned_child(r.pid, pidfd, no_waitable_child);
             if (kr && errno != ESRCH && !r.error) r.error = errno;
             killed = true; deadline = monotonic() + 2.0;
-        } else if (killed && monotonic() >= deadline) { if (!r.error) r.error = ETIMEDOUT; break; }
+        } else if (killed && now >= deadline) { if (!r.error) r.error = ETIMEDOUT; break; }
         struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL);
     }
     if (r.reaped) { r.code = WIFEXITED(status) ? WEXITSTATUS(status) : -1; r.signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0; }
@@ -399,12 +412,16 @@ static struct child_result format_child(void) {
     event("format-start", 0, 0, r.close_error, "", 0);
     if (!r.error && !r.close_error && !output_error && write(gate[1], "G", 1) != 1) r.error = errno ? errno : EIO;
     { int e = close_once(&gate[1]); if (!r.close_error) r.close_error = e; }
-    double deadline = monotonic() + 30.0; bool killed = false; int status = 0;
+    double deadline = monotonic() + 30.0; bool killed = false, no_waitable_child = false; int status = 0;
     while (!r.reaped || !eof[0] || !eof[1]) {
         if (!r.reaped) {
             pid_t done = waitpid(r.pid, &status, WNOHANG);
             if (done == r.pid) r.reaped = true;
-            else if (done < 0) { if (!r.error) r.error = errno; break; }
+            else if (done < 0) {
+                int error = errno;
+                if (error == ECHILD) no_waitable_child = true;
+                if (error != EINTR && !r.error) r.error = error;
+            }
         }
         int fds[2] = {out[0], err[0]};
         for (int i = 0; i < 2; ++i) {
@@ -417,13 +434,14 @@ static struct child_result format_child(void) {
             } else if (!n) eof[i] = true;
             else if (errno != EAGAIN && errno != EINTR) { if (!r.error) r.error = errno; eof[i] = true; }
         }
-        if (!killed && !r.reaped && (r.error || r.close_error || output_error || monotonic() >= deadline)) {
-            r.timed_out = monotonic() >= deadline;
-            int kr = pidfd >= 0 ? (int)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, 0) : kill(r.pid, SIGKILL);
+        double now = monotonic();
+        if (!killed && !r.reaped && (r.error || r.close_error || output_error || now >= deadline)) {
+            r.timed_out = now >= deadline;
+            int kr = kill_owned_child(r.pid, pidfd, no_waitable_child);
             if (kr && errno != ESRCH && !r.error) r.error = errno;
             killed = true; deadline = monotonic() + 2.0;
         }
-        if (monotonic() >= deadline && (!r.reaped || !eof[0] || !eof[1])) { if (!r.error) r.error = ETIMEDOUT; break; }
+        if (now >= deadline && (!r.reaped || !eof[0] || !eof[1])) { if (!r.error) r.error = ETIMEDOUT; break; }
         struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL);
     }
     if (r.reaped) { r.code = WIFEXITED(status) ? WEXITSTATUS(status) : -1; r.signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0; }
