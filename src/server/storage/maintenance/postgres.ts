@@ -35,6 +35,7 @@ interface Session {
   backendStart: string;
   ending: boolean;
   ended: boolean;
+  endAttempt?: Promise<{ failed: boolean; error?: unknown }> | undefined;
 }
 const writerObservation = channel("boardroom.maintenance.postgres.writer-observation");
 const observationRows = 32;
@@ -66,6 +67,10 @@ function safeError(error: unknown, fallback: BlockerCode, subjectRef = "source")
   if (error instanceof MaintenanceFailure) return error;
   const code = String((error as { code?: unknown } | null)?.code ?? "");
   return new MaintenanceFailure(code === "55P03" ? "maintenance_busy" : ["40001", "40P01"].includes(code) ? "source_changed" : fallback, subjectRef);
+}
+function throwResourceFailures(errors: readonly MaintenanceFailure[]): void {
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, "maintenance resource cleanup failed", { cause: errors[0] });
 }
 function checkedCounter(value: number): boolean { return Number.isSafeInteger(value) && value >= 0; }
 /** Internal readers use promise queries. Bound every actual query dispatch and its
@@ -125,6 +130,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   const auditFactories = new WeakMap<HeldMutex, BootstrapAuditFactory>();
   const abort = new AbortController();
   let closed = false, lost = false, mutex: HeldMutex | undefined, lockActive = false;
+  let closingStarted = false, closeAttempt: Promise<void> | undefined;
   let firstSourceIdentity: Json | undefined, mutexTimer: ReturnType<typeof setInterval> | undefined;
   let firstServerIdentity: PostgresDatabaseIdentity | undefined;
   let assertSnapshotLock: ((check?: () => void) => Promise<void>) | undefined;
@@ -145,19 +151,25 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     ending: session.ending, ended: session.ended, truncated: session.backendStart.length > 128 });
   const invalidate = () => { if (mutex) auditFactories.get(mutex)?.close(); lost = true; abort.abort(); };
   function assertOpen(): void {
-    if (closed || lost) throw new MaintenanceFailure("maintenance_lost");
+    if (closed || closingStarted || lost) throw new MaintenanceFailure("maintenance_lost");
   }
   async function endSession(session: Session, requireConfirmed = false): Promise<boolean> {
-    session.ending = true;
-    if (writerObservation.hasSubscribers) note({ kind: "session-end-start", session: sessionMetadata(session) });
-    let failed = false, closeError: unknown;
-    await session.client.end().catch(error => { failed = true; closeError = error; });
-    // Source-lock completion must retain an unconfirmed owned session and reject, even for throw undefined.
-    // Other existing best-effort callers keep their prior retirement behavior.
-    if (!failed || !requireConfirmed) { session.ended = true; sessions.delete(session); }
-    if (writerObservation.hasSubscribers) note({ kind: "session-end-complete", outcome: failed ? "rejected" : "fulfilled", session: sessionMetadata(session) });
-    if (failed && requireConfirmed) throw closeError;
-    return !failed;
+    // Concurrent cleanup callers share the same native completion, including its failure.
+    session.endAttempt ??= (async () => {
+      session.ending = true;
+      if (writerObservation.hasSubscribers) note({ kind: "session-end-start", session: sessionMetadata(session) });
+      let failed = false, error: unknown;
+      try { await session.client.end(); } catch (caught) { failed = true; error = caught; }
+      if (!failed) { session.ended = true; sessions.delete(session); }
+      if (writerObservation.hasSubscribers) note({ kind: "session-end-complete", outcome: failed ? "rejected" : "fulfilled", session: sessionMetadata(session) });
+      return { failed, error };
+    })();
+    const attempt = session.endAttempt;
+    try {
+      const result = await attempt;
+      if (result.failed && requireConfirmed) throw result.error;
+      return !result.failed;
+    } finally { if (session.endAttempt === attempt) session.endAttempt = undefined; }
   }
   async function endFactsSession(session: Session): Promise<void> {
     let confirmed = false;
@@ -170,10 +182,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     const client = new Client({ ...connection.clientConfig,
       application_name: `boardroom-maintenance:${randomUUID()}` });
     const session: Session = { client, source: sourceSession, critical, role, pid: 0, backendStart: "", ending: false, ended: false };
+    sessions.add(session);
     client.on("error", () => { if (critical && !session.ending) invalidate(); });
     client.on("end", () => { session.ended = true; if (critical && !session.ending) invalidate(); });
     try {
-      await client.connect(); sessions.add(session);
+      await client.connect();
       await client.query(`SET search_path TO ${quote(connection.schema)},pg_catalog`);
       await client.query("SET DateStyle='ISO,YMD'; SET TimeZone='UTC'; SET bytea_output='hex'; SET extra_float_digits=3; SET IntervalStyle='postgres'");
       const row = (await client.query("SELECT pid,backend_start::text FROM pg_catalog.pg_stat_activity WHERE pid=pg_backend_pid()")).rows[0];
@@ -181,8 +194,9 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       session.pid = row.pid; session.backendStart = row.backend_start;
       return session;
     } catch (error) {
-      await endSession(session);
-      throw safeError(error, sourceSession ? "source_missing" : "restore_verification_unavailable");
+      const errors = [safeError(error, sourceSession ? "source_missing" : "restore_verification_unavailable")];
+      try { await endSession(session, true); } catch (closeError) { errors.push(safeError(closeError, "maintenance_lost", "connection-close")); }
+      throwResourceFailures(errors); throw errors[0];
     }
   }
   async function readIdentity(session: Session, connection: PostgresConnection, requireSchema: boolean,
@@ -220,12 +234,16 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   }
   async function observe(): Promise<SourceObservation> {
     const session = await connect(sourceConnection, true);
+    const errors: MaintenanceFailure[] = [];
     try {
       await session.client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
       const result = await observation(session);
       await session.client.query("COMMIT"); return result;
-    } catch (error) { throw safeError(error, "schema_guard_incomplete"); }
-    finally { await endSession(session); }
+    } catch (error) { const mapped = safeError(error, "schema_guard_incomplete"); errors.push(mapped); throw mapped; }
+    finally {
+      try { await endSession(session, true); } catch (error) { errors.push(safeError(error, "maintenance_lost", "observation-close")); }
+      throwResourceFailures(errors);
+    }
   }
   async function sourceClientsObservation(session: Session): Promise<SourceClientsObservation> {
     assertOpen();
@@ -264,7 +282,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   }
   async function assertMutex(held = mutex, check?: () => void): Promise<void> {
     check?.(); assertOpen();
-    if (!held || held.released || held.session.ended) throw new MaintenanceFailure("maintenance_lost");
+    if (!held || held.released || held.session.ending || held.session.ended) throw new MaintenanceFailure("maintenance_lost");
     try {
       const live = await readIdentity(held.session, sourceConnection, true, check);
       const row = (await checkedReader(held.session.client, check).query(`SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_locks
@@ -332,14 +350,19 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         async release() {
           if (held.released) return;
           if (lockActive) throw new MaintenanceFailure("maintenance_busy");
-          auditFactories.get(held)?.close(); held.released = true; clearInterval(mutexTimer); mutexTimer = undefined;
-          await endSession(session);
+          auditFactories.get(held)?.close(); clearInterval(mutexTimer); mutexTimer = undefined;
+          try { await endSession(session, true); } catch (error) { throw safeError(error, "maintenance_lost", "mutex-close"); }
+          held.released = true;
           if (mutex === held) mutex = undefined;
         },
       };
     } catch (error) {
-      if (acquired) await session.client.query("ROLLBACK").catch(() => {});
-      await endSession(session); throw safeError(error, "maintenance_lost");
+      const errors = [safeError(error, "maintenance_lost")];
+      if (acquired) {
+        try { await session.client.query("ROLLBACK"); } catch (rollbackError) { errors.push(safeError(rollbackError, "maintenance_lost", "mutex-rollback")); }
+      }
+      try { await endSession(session, true); } catch (closeError) { errors.push(safeError(closeError, "maintenance_lost", "mutex-close")); }
+      throwResourceFailures(errors); throw errors[0];
     }
   }
   async function inspectWriters(current: Pick<SourceObservation, "sourceIdentity" | "state" | "clients">, phase: WriterPhase = "external", sourceFacts = false,
@@ -347,6 +370,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     const session = await connect(sourceConnection, true);
     const observing = writerObservation.hasSubscribers, inspectionId = observing ? ++inspectionSequence : 0;
     let stage = "source-identity";
+    let inspectionError: MaintenanceFailure | undefined;
     try {
       const identity = await readIdentity(session, sourceConnection, true);
       if (!same(current.sourceIdentity, stablePostgresSourceIdentity(identity,
@@ -456,9 +480,19 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         note({ kind: "inspection-error", phase, inspectionId, stage,
           code: typeof code === "string" ? code.slice(0, 64) : null, truncated: typeof code === "string" && code.length > 64 });
       }
-      throw safeError(error, "source_writer_unknown");
+      inspectionError = safeError(error, "source_writer_unknown"); throw inspectionError;
     }
-    finally { if (sourceFacts) await endFactsSession(session); else await endSession(session); }
+    finally {
+      if (sourceFacts) await endFactsSession(session);
+      else {
+        try { await endSession(session, true); }
+        catch (error) {
+          const closeError = safeError(error, "maintenance_lost", "inspection-close");
+          if (inspectionError) throw new AggregateError([inspectionError, closeError], "maintenance resource cleanup failed", { cause: inspectionError });
+          throw closeError;
+        }
+      }
+    }
   }
   async function withPassfile<T>(connection: PostgresConnection, directory: string,
     callback: (environment: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
@@ -887,10 +921,21 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   }
   const adapter: MaintenanceAdapter = { dialect: "postgres", observe, observeSourceClients, acquireMutex, withSourceLock, inspectWriters, verifyDatabase,
     async close() {
-      if (closed) return; if (mutex) auditFactories.get(mutex)?.close(); closed = true; clearInterval(mutexTimer); abort.abort();
-      await waitForPostgresTools(abort.signal);
-      await Promise.allSettled([...activeVerifications]);
-      await Promise.all([...sessions].map(session => endSession(session))); mutex = undefined;
+      if (closed) return;
+      if (closeAttempt) return closeAttempt;
+      closingStarted = true; if (mutex) auditFactories.get(mutex)?.close(); clearInterval(mutexTimer); abort.abort();
+      const attempt = (async () => {
+        const errors: MaintenanceFailure[] = [];
+        try { await waitForPostgresTools(abort.signal); } catch (error) { errors.push(safeError(error, "maintenance_lost", "tool-close")); }
+        await Promise.allSettled([...activeVerifications]);
+        const results = await Promise.allSettled([...sessions].map(session => endSession(session, true)));
+        for (const result of results) if (result.status === "rejected") errors.push(safeError(result.reason, "maintenance_lost", "session-close"));
+        if (mutex && !sessions.has(mutex.session)) { mutex.released = true; mutex = undefined; }
+        if (!errors.length && !sessions.size) closed = true;
+        throwResourceFailures(errors);
+      })();
+      closeAttempt = attempt;
+      try { await attempt; } finally { if (closeAttempt === attempt) closeAttempt = undefined; }
     },
   };
   return adapter;

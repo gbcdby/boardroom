@@ -4,6 +4,9 @@ import Database from "better-sqlite3";
 import { Client, type QueryResult } from "pg";
 import { mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, statfs, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { inspect } from "node:util";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { enterFixture } from "./fixtures/maintenance-enter.ts";
 import { enterMaintenance } from "../src/server/storage/maintenance/enter.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
@@ -94,12 +97,26 @@ for (const kind of ["sqlite", "postgres"] as const) {
       await assert.rejects(enterMaintenance(f.options, f.request), { code: "ENOENT" }); await rename(`${planPath}.missing`, planPath);
       const config = await readFile(f.configFile); await writeFile(f.configFile, Buffer.concat([config, Buffer.from(" ")]));
       await assert.rejects(enterMaintenance(f.options, f.request), { code: "plan_stale" }); await writeFile(f.configFile, config);
-      await f.exec("CREATE VIEW changed_enter_schema AS SELECT value FROM enter_observation");
-      await assert.rejects(enterMaintenance(f.options, f.request), { code: "plan_stale" }); await f.exec("DROP VIEW changed_enter_schema");
+      await f.exec("CREATE INDEX changed_enter_schema ON enter_observation(value)");
+      await assert.rejects(enterMaintenance(f.options, f.request), { code: "plan_stale" }); await f.exec("DROP INDEX changed_enter_schema");
       await mkdir(f.options.targetRoot);
       await assert.rejects(enterMaintenance(f.options, f.request), { code: "plan_stale" }); await rm(f.options.targetRoot, { recursive: true });
       await assert.rejects(enterMaintenance({ ...f.options, originalCwd: f.dataDir }, f.request), { code: "plan_stale" });
       await assert.rejects(enterMaintenance({ ...f.options, expectedSourceId: "another-source" }, f.request), { code: "source_changed" });
+      assert.deepEqual((await f.observe()).state, f.initial.state);
+    } finally { await f.close(); }
+  });
+  if (kind === "postgres") nativeTest("#152 internal enter postgres: unsupported view keeps the original closed-profile rejection and source state", async () => {
+    const f = await enterFixture(kind);
+    try {
+      const state = await f.query("SELECT * FROM storage_maintenance"), clients = await f.query("SELECT * FROM storage_source_clients ORDER BY client_id");
+      const business = await f.query("SELECT * FROM enter_observation");
+      await f.exec("CREATE VIEW unsupported_enter_schema AS SELECT value FROM enter_observation");
+      await assert.rejects(enterMaintenance(f.options, f.request), { code: "schema_guard_incomplete" });
+      assert.deepEqual(await f.query("SELECT * FROM storage_maintenance"), state);
+      assert.deepEqual(await f.query("SELECT * FROM storage_source_clients ORDER BY client_id"), clients);
+      assert.deepEqual(await f.query("SELECT * FROM enter_observation"), business);
+      await f.exec("DROP VIEW unsupported_enter_schema");
       assert.deepEqual((await f.observe()).state, f.initial.state);
     } finally { await f.close(); }
   });
@@ -225,6 +242,203 @@ for (const kind of ["sqlite", "postgres"] as const) {
         if (committed) assert.deepEqual(recovered.state, actual.state, "committed-but-unknown is read, never applied again");
       } finally { child.mock.restoreAll(); await f.close(); }
     });
+  });
+  nativeTest(`#152 internal enter ${kind}: actual ordinary rollback and close failures remain safe auxiliary facts`, async t => {
+    for (const first of ["classified", "undefined"] as const) await t.test(first, async t => {
+      const f = await enterFixture(kind), prepare = Database.prototype.prepare, exec = Database.prototype.exec, close = Database.prototype.close;
+      const query = Client.prototype.query, end = Client.prototype.end;
+      const primary = first === "classified" ? new MaintenanceFailure("source_changed", "enter-primary") : undefined;
+      const rollbackCanary = new Error("private rollback canary postgres://secret@source/db");
+      const closeCanary = new Error("private close canary SELECT secret FROM private_source");
+      let sqliteWriter: Database.Database | undefined, pgWriter: Client | undefined, anchors = 0, rollbacks = 0, closes = 0;
+      try {
+        if (kind === "sqlite") {
+          t.mock.method(Database.prototype, "prepare", function (this: Database.Database, sql: string) {
+            if (this.name === f.file && sql.startsWith("UPDATE storage_maintenance SET admission=")) { sqliteWriter = this; anchors++; throw primary; }
+            return prepare.call(this, sql);
+          });
+          t.mock.method(Database.prototype, "exec", function (this: Database.Database, sql: string) {
+            const result = exec.call(this, sql);
+            if (this === sqliteWriter && sql === "ROLLBACK") { rollbacks++; throw rollbackCanary; }
+            return result;
+          });
+          t.mock.method(Database.prototype, "close", function (this: Database.Database) {
+            const result = close.call(this);
+            if (this === sqliteWriter && closes === 0) { closes++; throw closeCanary; }
+            return result;
+          });
+        } else {
+          t.mock.method(Client.prototype, "query", async function (this: Client, ...args: unknown[]) {
+            const sql = typeof args[0] === "string" ? args[0] : (args[0] as { text?: string } | null)?.text ?? "";
+            const database = (this as unknown as { connectionParameters: { database: string } }).connectionParameters.database;
+            if (database === f.database && sql.startsWith("UPDATE storage_maintenance SET admission=")) { pgWriter = this; anchors++; throw primary; }
+            const result = await Reflect.apply(query, this, args);
+            if (this === pgWriter && sql === "ROLLBACK") { rollbacks++; throw rollbackCanary; }
+            return result;
+          } as typeof query);
+          t.mock.method(Client.prototype, "end", async function (this: Client) {
+            await Reflect.apply(end, this, []);
+            if (this === pgWriter && closes === 0) { closes++; throw closeCanary; }
+          } as typeof end);
+        }
+        await assert.rejects(enterMaintenance(f.options, f.request), error => {
+          assert.ok(error instanceof AggregateError); assert.equal(error.errors.length, 3);
+          if (kind === "postgres" && first === "undefined") {
+            assert.ok(error.errors[0] instanceof MaintenanceFailure); assert.equal(error.errors[0].code, "snapshot_invalid");
+          } else assert.equal(error.errors[0], primary);
+          assert.equal(error.cause, error.errors[0]);
+          for (const [index, stage] of [[1, "source-rollback-failure"], [2, "source-close-failure"]] as const) {
+            assert.ok(error.errors[index] instanceof MaintenanceFailure); assert.equal(error.errors[index].code, "maintenance_lost");
+            assert.equal(error.errors[index].message, `storage_maintenance: maintenance_lost (${stage})`);
+          }
+          const diagnostic = inspect(error, { depth: 10 });
+          for (const value of [rollbackCanary.message, closeCanary.message, "postgres://secret", "SELECT secret"]) assert.equal(diagnostic.includes(value), false);
+          return true;
+        });
+        assert.equal(anchors, 1); assert.equal(rollbacks, 1); assert.equal(closes, 1);
+        t.mock.restoreAll();
+        const actual = await f.observe(); assert.equal(actual.state.admission, "open"); assert.equal(actual.state.journalSequence, 0);
+        assert.equal(actual.manifests.frozenBusinessManifestDigest, f.initial.manifests.frozenBusinessManifestDigest);
+        assert.deepEqual(actual.clients, f.initial.clients);
+        assert.equal((await enterMaintenance(f.options, f.request)).status, "paused", "fresh real locks classify the rollback before explicit entry");
+        assert.equal((await f.observe()).state.journalSequence, 1);
+      } finally { t.mock.restoreAll(); await f.close(); }
+    });
+  });
+  nativeTest(`#152 internal enter ${kind}: actual mutex release failure cannot skip whole-adapter close or become success`, async t => {
+    const f = await enterFixture(kind), exec = Database.prototype.exec;
+    const open = fs.openSync, close = fs.closeSync, fstat = fs.fstatSync;
+    const query = Client.prototype.query, end = Client.prototype.end;
+    const secondary = new MaintenanceFailure("maintenance_lost", "whole-adapter-close");
+    const privateEnd = new Error("private second-end canary postgres://secret@source/db");
+    let sourceFd: number | undefined, sqliteMutex: Database.Database | undefined, pgMutex: Client | undefined;
+    let releases = 0, descriptorCloses = 0, ends = 0;
+    try {
+      if (kind === "sqlite") {
+        t.mock.method(fs, "openSync", (...args: Parameters<typeof fs.openSync>) => {
+          const fd = open(...args); if (args[0] === f.file && sourceFd === undefined) sourceFd = fd; return fd;
+        });
+        t.mock.method(Database.prototype, "exec", function (this: Database.Database, sql: string) {
+          const result = exec.call(this, sql);
+          if (this.name === path.join(f.reference.controlRoot, "mutex.sqlite") && sql === "ROLLBACK") {
+            sqliteMutex = this; releases++; throw undefined;
+          }
+          return result;
+        });
+        t.mock.method(fs, "closeSync", (fd: number) => {
+          if (fd === sourceFd) { descriptorCloses++; close(fd); throw secondary; }
+          close(fd);
+        });
+        syncBuiltinESMExports();
+      } else {
+        t.mock.method(Client.prototype, "query", async function (this: Client, ...args: unknown[]) {
+          const sql = typeof args[0] === "string" ? args[0] : (args[0] as { text?: string } | null)?.text ?? "";
+          const database = (this as unknown as { connectionParameters: { database: string } }).connectionParameters.database;
+          const result = await Reflect.apply(query, this, args);
+          if (database === f.database && sql.startsWith("SELECT pg_catalog.pg_try_advisory_lock")) pgMutex = this;
+          return result;
+        } as typeof query);
+        t.mock.method(Client.prototype, "end", async function (this: Client) {
+          await Reflect.apply(end, this, []);
+          if (this === pgMutex) { ends++; if (ends === 1) throw undefined; throw privateEnd; }
+        } as typeof end);
+      }
+      await assert.rejects(enterMaintenance(f.options, f.request), error => {
+        assert.ok(error instanceof AggregateError); assert.equal(error.errors.length, 2); assert.equal(error.cause, error.errors[0]);
+        if (kind === "sqlite") { assert.equal(error.errors[0], undefined); assert.equal(error.errors[1], secondary); }
+        else for (const [index, stage] of [[0, "mutex-close"], [1, "session-close"]] as const) {
+          assert.ok(error.errors[index] instanceof MaintenanceFailure); assert.equal(error.errors[index].code, "maintenance_lost");
+          assert.equal(error.errors[index].message, `storage_maintenance: maintenance_lost (${stage})`);
+        }
+        assert.doesNotMatch(inspect(error, { depth: 10 }), /private second-end canary|postgres:\/\/secret/); return true;
+      });
+      if (kind === "sqlite") {
+        assert.equal(releases, 1); assert.equal(descriptorCloses, 1); assert.equal(sqliteMutex?.open, false);
+        assert.notEqual(sourceFd, undefined); assert.throws(() => fstat(sourceFd!), { code: "EBADF" });
+      } else { assert.ok(pgMutex); assert.equal(ends, 2, "whole-adapter cleanup follows the rejected native mutex end"); }
+      t.mock.restoreAll(); syncBuiltinESMExports();
+      const actual = await f.observe(); assert.equal(actual.state.admission, "draining"); assert.equal(actual.state.journalSequence, 1);
+      assert.equal(actual.manifests.frozenBusinessManifestDigest, f.initial.manifests.frozenBusinessManifestDigest);
+      assert.deepEqual(actual.clients, f.initial.clients);
+      assert.equal((await enterMaintenance(f.options, f.request)).status, "paused");
+      assert.deepEqual((await f.observe()).state, actual.state, "fresh real owners read the committed anchor without another generation");
+    } finally {
+      t.mock.restoreAll(); syncBuiltinESMExports();
+      if (sourceFd !== undefined && descriptorCloses === 0) { try { close(sourceFd); } catch {} }
+      if (pgMutex) await Reflect.apply(end, pgMutex, []);
+      await f.close();
+    }
+  });
+  nativeTest(`#152 internal enter ${kind}: unknown cleanup keeps its private owner until explicit same-source cleanup`, async t => {
+    const f = await enterFixture(kind), independent = await enterFixture(kind);
+    const open = fs.openSync, close = fs.closeSync, fstat = fs.fstatSync, query = Client.prototype.query, end = Client.prototype.end;
+    let ownedFd: number | undefined, pgMutex: Client | undefined, sourceOpens = 0, sourceQueries = 0, closeAttempts = 0, testClosed = false;
+    const alias = `${f.file}.renamed`; let renamed = false;
+    try {
+      if (kind === "sqlite") {
+        t.mock.method(fs, "openSync", (...args: Parameters<typeof fs.openSync>) => {
+          const fd = open(...args); if (args[0] === f.file || args[0] === alias) { sourceOpens++; ownedFd ??= fd; } return fd;
+        });
+        t.mock.method(fs, "closeSync", (fd: number) => {
+          if (fd === ownedFd) { closeAttempts++; throw undefined; } close(fd);
+        });
+        syncBuiltinESMExports();
+      } else {
+        t.mock.method(Client.prototype, "query", async function (this: Client, ...args: unknown[]) {
+          const sql = typeof args[0] === "string" ? args[0] : (args[0] as { text?: string } | null)?.text ?? "";
+          const database = (this as unknown as { connectionParameters: { database: string } }).connectionParameters.database;
+          if (database === f.database) sourceQueries++;
+          const result = await Reflect.apply(query, this, args);
+          if (database === f.database && sql.startsWith("SELECT pg_catalog.pg_try_advisory_lock")) pgMutex = this;
+          return result;
+        } as typeof query);
+        t.mock.method(Client.prototype, "end", async function (this: Client) {
+          if (this === pgMutex) { closeAttempts++; throw new Error("private unconfirmed end canary"); }
+          await Reflect.apply(end, this, []);
+        } as typeof end);
+      }
+      let failed = false;
+      try { await enterMaintenance(f.options, f.request); } catch (error) {
+        failed = true;
+        if (kind === "sqlite") assert.equal(error, undefined);
+        else { assert.ok(error instanceof AggregateError); assert.equal(error.errors.length, 2); assert.doesNotMatch(inspect(error), /private unconfirmed/); }
+      }
+      assert.equal(failed, true);
+      const activity = { opens: sourceOpens, queries: sourceQueries };
+      const pendingFailure = (error: unknown) => {
+        assert.ok(error instanceof MaintenanceFailure); assert.equal(error.code, "maintenance_lost");
+        assert.doesNotMatch(inspect(error), /private unconfirmed/); return true;
+      };
+      await assert.rejects(enterMaintenance(f.options, f.request), pendingFailure);
+      await assert.rejects(enterMaintenance(f.options, { ...f.request, requestId: "another-request-same-owner" }), pendingFailure);
+      if (kind === "sqlite") {
+        assert.notEqual(ownedFd, undefined); fstat(ownedFd!);
+        assert.equal(closeAttempts, 1, "the unconfirmed numeric fd is never blindly closed again");
+        assert.equal(f.descriptor.kind, "sqlite"); if (f.descriptor.kind !== "sqlite") throw new Error("sqlite source required");
+        await rename(f.file, alias); renamed = true;
+        const options = { ...f.options, environment: { ...f.options.environment,
+          databaseDescriptor: { ...f.descriptor, sqlitePath: alias, sourcePath: alias } } };
+        await assert.rejects(enterMaintenance(options, { ...f.request, requestId: "renamed-same-owner" }), pendingFailure);
+        await rename(alias, f.file); renamed = false;
+      } else assert.ok(closeAttempts >= 4, "explicit later calls reach the original session owner for cleanup");
+      assert.deepEqual({ opens: sourceOpens, queries: sourceQueries }, activity, "pending cleanup precedes creation or SQL of a new same-source adapter");
+      assert.equal((await enterMaintenance(independent.options, independent.request)).status, "paused", "another actual source is independent");
+      t.mock.restoreAll(); syncBuiltinESMExports();
+      if (kind === "sqlite") {
+        close(ownedFd!); testClosed = true; assert.throws(() => fstat(ownedFd!), { code: "EBADF" });
+      }
+      const committed = await f.observe(); assert.equal(committed.state.admission, "draining"); assert.equal(committed.state.journalSequence, 1);
+      assert.equal((await enterMaintenance(f.options, f.request)).status, "paused");
+      assert.deepEqual((await f.observe()).state, committed.state);
+      assert.equal(committed.manifests.frozenBusinessManifestDigest, f.initial.manifests.frozenBusinessManifestDigest);
+      assert.deepEqual(committed.clients, f.initial.clients);
+    } finally {
+      t.mock.restoreAll(); syncBuiltinESMExports();
+      if (renamed) await rename(alias, f.file);
+      if (ownedFd !== undefined && !testClosed) { try { close(ownedFd); } catch {} }
+      if (pgMutex) await Reflect.apply(end, pgMutex, []);
+      await independent.close(); await f.close();
+    }
   });
   nativeTest(`#152 internal enter ${kind}: an existing real write transaction must end before entry can acquire source control`, async () => {
     const f = await enterFixture(kind);
