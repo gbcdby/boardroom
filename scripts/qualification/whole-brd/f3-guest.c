@@ -218,6 +218,7 @@ static int f3_object_view(const char *phase, int root, const char *name) {
         error = f3_event("view-attr", phase, 0, 0, raw, 6+name_len+(size_t)size);
         pos += name_len+1;
     }
+    if (!error && S_ISDIR(first.st_mode) && strcmp(name, ".")) error = f3_members(phase, fd);
     if (!error && !strcmp(name, "ancestor")) {
         struct stat missing = {0}; errno = 0;
         int rc = fstatat(fd, "missing", &missing, AT_SYMLINK_NOFOLLOW), actual = rc ? errno : 0;
@@ -293,3 +294,163 @@ static int f3_prepare_objects(void) {
     int emitted = f3_event("prepare-objects","prepare",error,cleanup,F3_EXPECTED_PAYLOAD,sizeof(F3_EXPECTED_PAYLOAD));
     return error ? error : cleanup ? cleanup : emitted;
 }
+
+extern int brdf3_sp_main(int argc, char **argv);
+
+static int f3_mount_at(const char *path, const char *phase, bool *mounted) {
+    int rc = mount("/dev/ram0",path,"ext4",MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_RELATIME,
+                   "errors=remount-ro,data=ordered,acl,user_xattr,dax=never");
+    int error = rc ? errno : 0; *mounted = rc == 0;
+    int emitted = f3_event("mount",phase,error,0,path,strlen(path));
+    return error ? error : emitted;
+}
+
+static int f3_unmount_at(const char *path, const char *phase, bool *mounted) {
+    struct stat source = {0}; int error = 0;
+    if (lstat(path,&source)) error = errno;
+    else if (source.st_ino != 2 || source.st_dev != makedev(1,0)) error = ESTALE;
+    if (!error) { if (umount2(path,0)) error = errno; else *mounted = false; }
+    int emitted = f3_event("unmount",phase,error,0,path,strlen(path));
+    return error ? error : emitted;
+}
+
+static int f3_native(const char *phase, bool reading, bool *children_done) {
+    const char *mode = reading ? "ordinary" : "context";
+    int error = f3_event("native-begin",phase,0,0,mode,strlen(mode));
+    if (error) return error;
+    struct child_result child = ordinary_child(mode);
+    *children_done = child.pid <= 0 || child.reaped;
+    if (!child_ok(child)) error = child.error ? child.error : child.close_error ? child.close_error : ECHILD;
+    uint64_t joined = f3_now(CLOCK_MONOTONIC,&error);
+    char text[768]; int n = snprintf(text,sizeof(text),
+        "{\"pid\":%d,\"exit\":%d,\"signal\":%d,\"timeout\":%s,\"reaped\":%s,"
+        "\"pidfd_before_ack\":%s,\"joined_ns\":\"%"PRIu64"\"}",
+        child.pid,child.code,child.signal,child.timed_out?"true":"false",child.reaped?"true":"false",
+        child.pidfd_before_ack?"true":"false",joined);
+    int emitted = f3_event("native-end",phase,error,child.close_error,text,(size_t)n);
+    return error ? error : emitted;
+}
+
+static int f3_round(const char *phase, bool reading, bool *mounted, bool *children_done) {
+    const char *before = reading ? "read-before" : "control-before";
+    const char *after = reading ? "read-after" : "control-after";
+    int error = f3_event("round-begin",phase,0,0,"",0);
+    if (!error) error = f3_statistics(phase,true);
+    if (!error) error = f3_raw_superblock(phase);
+    if (!error) error = f3_mount_at("/mnt/brd",phase,mounted);
+    if (!error && !reading) {
+        struct child_result child = ordinary_child("metadata");
+        *children_done = child.pid <= 0 || child.reaped;
+        if (!child_ok(child)) error = child.error ? child.error : child.close_error ? child.close_error : ECHILD;
+        if (output_error && !error) error = EIO;
+    }
+    if (!error) error = f3_snapshot(before);
+    if (!error) error = f3_source_view(before);
+    if (!error) error = f3_native(phase,reading,children_done);
+    if (!error) error = f3_source_view(after);
+    if (!error) error = f3_unmount_at("/mnt/brd",phase,mounted);
+    if (!error) error = f3_statistics(phase,false);
+    if (!error) error = f3_snapshot(after);
+    int emitted = f3_event("round-end",phase,error,0,"",0);
+    return error ? error : emitted;
+}
+
+static int f3_bootstrap(void) {
+    if (getpid() != 1 || getuid() != 0 || geteuid() != 0) return 77;
+    bool loaded = false, node = false, mounted = false, children_done = true, metadata_ok = false;
+    const char *mountpoint = "/mnt/f3-prepare";
+    int original = 0, cleanup_error = 0, fd = -1, rc = 0, error = 0, ce = 0;
+    struct child_result child = ordinary_child("p1");
+    if (!child_ok(child) || output_error) { original = child.error ? child.error : child.close_error ? child.close_error : EPROTO; children_done = child.pid <= 0 || child.reaped; goto cleanup; }
+    event("policy-gate", 0, 0, 0, "SOURCE_INFERRED_FALSE_FOR_CURRENT_BOOT", sizeof("SOURCE_INFERRED_FALSE_FOR_CURRENT_BOOT") - 1);
+    if ((original = config_check()) || output_error) { if (!original) original = EIO; goto cleanup; }
+    fd = open("/usr/lib/modules/brd.ko", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    error = fd < 0 ? errno : 0; struct stat module = {0};
+    if (!error && (fstat(fd, &module) || !S_ISREG(module.st_mode) || module.st_uid || module.st_gid ||
+        module.st_nlink != 1 || module.st_size != 30017 || (module.st_mode & 07777) != 0444)) error = errno ? errno : EINVAL;
+    if (!error) { rc = (int)syscall(SYS_finit_module, fd, "rd_nr=1 rd_size=65536 max_part=1", 0); error = rc ? errno : 0; loaded = rc == 0; }
+    ce = close_once(&fd); event("module-load", error ? -1 : 0, error, ce, "rd_nr=1 rd_size=65536 max_part=1", 32);
+    if (error || ce || output_error) { original = error ? error : ce ? ce : EIO; goto cleanup; }
+    if ((original = family_check()) || output_error) { if (!original) original = EIO; goto cleanup; }
+    struct stat prior = {0}; errno = 0;
+    if (lstat("/dev/ram0", &prior) == 0 || errno != ENOENT) { original = EEXIST; goto cleanup; }
+    rc = mknod("/dev/ram0", S_IFBLK | 0600, makedev(1, 0)); error = rc ? errno : 0; node = rc == 0;
+    if (!error && lstat("/dev/ram0", &owned_node)) error = errno;
+    event("device-create", error ? -1 : 0, error, 0, "1:0", 3);
+    if (error || output_error) { original = error ? error : EIO; goto cleanup; }
+    fd = device_open(); error = fd < 0 ? errno : 0; uint64_t capacity = 0; unsigned logical = 0;
+    if (!error && ioctl(fd, BLKGETSIZE64, &capacity)) error = errno;
+    if (!error && ioctl(fd, BLKSSZGET, &logical)) error = errno;
+    if (!error && (capacity != 64 * 1024 * 1024U || !logical || logical > 1024)) error = EPROTO;
+    ce = close_once(&fd); char geometry[128]; int n = snprintf(geometry, sizeof(geometry), "{\"bytes\":%"PRIu64",\"logical_block_size\":%u}", capacity, logical);
+    event("device-geometry", error ? -1 : 0, error, ce, geometry, (size_t)n);
+    if (error || ce || output_error) { original = error ? error : ce ? ce : EIO; goto cleanup; }
+    child = format_child(); children_done = child.pid <= 0 || child.reaped;
+    if (!child_ok(child) || output_error) { original = child.error ? child.error : child.close_error ? child.close_error : EPROTO; goto cleanup; }
+    if ((original = raw_metadata("prepared")) || output_error) { if (!original) original = EIO; goto cleanup; }
+    rc = mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL); error = rc ? errno : 0;
+    event("mount-private", rc, error, 0, "", 0);
+    if (error || output_error) { original = error ? error : EIO; goto cleanup; }
+
+    mountpoint = "/mnt/f3-prepare";
+    if ((original = f3_mount_at(mountpoint,"prepare",&mounted))) goto cleanup;
+    if ((original = f3_prepare_objects())) goto cleanup;
+    if ((original = f3_unmount_at(mountpoint,"prepare",&mounted))) goto cleanup;
+    mountpoint = "/mnt/brd";
+    if ((original = f3_round("control",false,&mounted,&children_done))) goto cleanup;
+    if ((original = f3_round("read",true,&mounted,&children_done))) goto cleanup;
+    metadata_ok = true;
+cleanup:
+    ce = close_once(&fd); if (ce && !cleanup_error) cleanup_error = ce;
+    event("cleanup-fd",ce?-1:0,ce,ce,"",0);
+    if (mounted && children_done) {
+        int e = f3_unmount_at(mountpoint,"cleanup",&mounted); if (e && !cleanup_error) cleanup_error=e;
+    } else if (mounted) {
+        f3_event("unmount","cleanup",EBUSY,0,"unreaped-child",14); cleanup_error=EBUSY;
+    }
+    if (node && !mounted && children_done) {
+        struct stat actual={0};
+        if (lstat("/dev/ram0",&actual)) {rc=-1;error=errno;}
+        else if(actual.st_dev!=owned_node.st_dev||actual.st_ino!=owned_node.st_ino||actual.st_rdev!=owned_node.st_rdev){rc=-1;error=ESTALE;}
+        else {rc=unlink("/dev/ram0");error=rc?errno:0;if(!rc)node=false;}
+        event("device-remove",rc,error,0,"",0);if(error&&!cleanup_error)cleanup_error=error;
+    }
+    if (loaded && !mounted && children_done) {
+        rc=(int)syscall(SYS_delete_module,"brd",O_NONBLOCK);error=rc?errno:0;if(!rc)loaded=false;
+        event("module-unload",rc,error,0,"",0);if(error&&!cleanup_error)cleanup_error=error;
+    }
+    if(loaded||mounted||node||!children_done) {if(!cleanup_error)cleanup_error=EBUSY;}
+    char summary[8192]; int len=snprintf(summary,sizeof(summary),
+        "{\"original_errno\":%d,\"cleanup_errno\":%d,\"source_observations_complete\":%s,"
+        "\"module_loaded\":%s,\"mounted\":%s,\"node_exists\":%s,\"children_reaped\":%s,\"parent_closes\":[",
+        original,cleanup_error,metadata_ok?"true":"false",loaded?"true":"false",mounted?"true":"false",
+        node?"true":"false",children_done?"true":"false");
+    for(unsigned i=0;i<parent_close_count;++i){
+        int added=snprintf(summary+len,sizeof(summary)-(size_t)len,"%s{\"fd\":%d,\"errno\":%d}",
+                           i?",":"",parent_closes[i].fd,parent_closes[i].error);
+        if(added<0||(size_t)added>=sizeof(summary)-(size_t)len){output_error=true;break;}
+        len+=added;
+    }
+    if((size_t)len+3<sizeof(summary)){memcpy(summary+len,"]}",3);len+=2;}else output_error=true;
+    bool ok=!original&&!cleanup_error&&!output_error&&metadata_ok;
+    f3_event("guest-complete","cleanup",original?original:cleanup_error?cleanup_error:output_error?EIO:0,
+             cleanup_error,summary,(size_t)len);
+    if(reboot(RB_POWER_OFF)){f3_event("poweroff-failed","cleanup",errno,0,"",0);return 1;}
+    return ok?0:1;
+}
+
+#ifndef F3_PURE_TEST
+int main(int argc,char **argv) {
+    (void)bootstrap_f2; /* Read-only included implementation, never selected here. */
+    if(argc!=2||(strcmp(argv[1],"bootstrap")&&strcmp(argv[1],"p1")&&strcmp(argv[1],"metadata")&&
+                  strcmp(argv[1],"context")&&strcmp(argv[1],"ordinary")))return 64;
+    bool boot=!strcmp(argv[1],"bootstrap");
+    if(boot?(getpid()!=1||getuid()!=0||geteuid()!=0):(getuid()!=1000||geteuid()!=1000||getppid()!=1))return 77;
+    if(load_uuid("/run/run-id",run_id)||load_uuid("/run/fs-uuid",fs_uuid)||load_uuid("/run/hash-seed",hash_seed))return 65;
+    if(boot)return f3_bootstrap();
+    if(!strcmp(argv[1],"p1"))return collect_p1();
+    if(!strcmp(argv[1],"metadata"))return metadata();
+    char *native_argv[]={"brdf3-native",argv[1],"1000","1000","/mnt/brd",NULL};
+    return brdf3_sp_main(5,native_argv);
+}
+#endif

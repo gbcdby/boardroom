@@ -211,5 +211,105 @@ class NativeBlockControls(unittest.TestCase):
         self.assertNotEqual(result.returncode,0)
         self.assertLessEqual(len(result.stdout),7*1024*1024)
 
+
+
+def synthetic_view(phase="control-before"):
+    rows = []
+    def add(event, value):
+        raw = value if type(value) is bytes else raw_json(value)
+        rows.append(frame(event,phase,raw,len(rows)+1))
+    head={"root_fd":3,"dev":256,"ino":2,"object_count":5,"ordinary_source_open_count":0}
+    add("view-begin",head);add("view-members",b"payload\0directory\0ancestor\0lost+found\0")
+    for name,number in zip(f3.VIEW_NAMES,(2,12,13,14,11)):
+        value={"name":name,"fd":4,"dev":256,"ino":number,"mode":0o100600 if name=="payload" else 0o40700,
+          "uid":0 if name=="lost+found" else 1000,"gid":0 if name=="lost+found" else 1000,
+          "nlink":1 if name=="payload" else 2,"size":len(f3.PAYLOAD) if name=="payload" else BLOCK,
+          "atime":[100,1],"mtime":[100,2],"ctime":[100,3]}
+        add("view-object",value)
+        if name!="lost+found":
+            for key,val in f3.FIXED_ATTR.items():add("view-attr",struct.pack("<HI",len(key),len(val))+key+val)
+        if name not in (".","payload"):add("view-members",b"")
+        if name=="ancestor":add("view-absence",{"path":"ancestor/missing","ancestor_fd":4,"dev":256,"ino":number,"errno":2})
+        add("view-close",{"name":name,"fd":4})
+    add("view-close",{"name":"root","fd":3});add("view-end",head)
+    return rows
+
+
+def synthetic_inode_image():
+    d=f2._module("diagnostics")
+    sb=bytearray(1024)
+    struct.pack_into("<I",sb,4,BLOCKS);struct.pack_into("<I",sb,24,2)
+    struct.pack_into("<I",sb,32,32768);struct.pack_into("<I",sb,40,2048)
+    struct.pack_into("<HH",sb,56,0xef53,1);struct.pack_into("<H",sb,88,256)
+    struct.pack_into("<III",sb,92,60,710,1131);sb[104:120]=bytes(range(16))
+    struct.pack_into("<I",sb,0xe0,8);sb[0x175]=1
+    struct.pack_into("<I",sb,1020,d.crc32c(sb[:1020]))
+    block0=bytearray(BLOCK);block0[1024:2048]=sb
+    group=bytearray(BLOCK);struct.pack_into("<I",group,8,4)
+    table=bytearray(BLOCK)
+    def item(size,physical,count):
+        value=bytearray(256);struct.pack_into("<H",value,0,0o100600)
+        struct.pack_into("<I",value,4,size);struct.pack_into("<I",value,32,0x80000)
+        struct.pack_into("<HHHHI",value,40,0xf30a,1,4,0,0)
+        struct.pack_into("<IHHI",value,52,0,count,0,physical)
+        return value
+    table[7*256:8*256]=item(4*1024*1024,2048,1024)
+    table[11*256:12*256]=item(len(f3.PAYLOAD),4096,1)
+    data={0:bytes(block0),1:bytes(group),4:bytes(table),4096:f3.PAYLOAD+bytes(BLOCK-len(f3.PAYLOAD))}
+    return f3.decode_snapshot(synthetic_snapshot(data),RUN,"control-before")
+
+
+class ClosureControls(unittest.TestCase):
+    def test_actual_raw_inode_offsets_determine_the_complete_extent_map(self):
+        image=synthetic_inode_image()
+        mapped=f3.extent_blocks(f3.inode(image,8),1024)
+        self.assertEqual(mapped,tuple(range(2048,3072)))
+        view=f3.source_view(synthetic_view(),RUN,"control-before")
+        self.assertEqual(f3.source_payload(image,view)["sha256"],hashlib.sha256(f3.PAYLOAD).hexdigest())
+        for field,value in ((40,0),(46,1),(52,1),(56,0),(56,32768),(60,BLOCKS)):
+            changed=bytearray(f3.inode(image,8))
+            struct.pack_into("<H" if field in (40,46,56) else "<I",changed,field,value)
+            with self.subTest(field=field,value=value),self.assertRaises(ValueError):
+                f3.extent_blocks(bytes(changed),1024)
+
+    def test_complete_views_require_membership_attributes_absence_and_real_close_receipts(self):
+        original=synthetic_view()
+        actual=f3.source_view(original,RUN,"control-before")
+        self.assertEqual(actual["content_opens"],0)
+        self.assertEqual(actual["members"],["ancestor","directory","lost+found","payload"])
+        for kind in ("missing-attr","extra-member","nonempty-directory","absence","wrong-close","close-failed","missing-end","duplicate-attr"):
+            rows=copy.deepcopy(original)
+            if kind=="missing-attr":del rows[3]
+            elif kind=="duplicate-attr":rows.insert(4,copy.deepcopy(rows[3]))
+            elif kind=="extra-member":
+                rows[1].update(bytes=rows[1]["bytes"]+6,data_hex=rows[1]["data_hex"]+b"extra\0".hex())
+            elif kind=="nonempty-directory":
+                row=next(r for r in rows[2:] if r["event"]=="view-members");row.update(bytes=5,data_hex=b"file\0".hex())
+            elif kind=="absence":
+                row=next(r for r in rows if r["event"]=="view-absence")
+                value=json.loads(bytes.fromhex(row["data_hex"]));value["ino"]+=1
+                raw=raw_json(value);row.update(bytes=len(raw),data_hex=raw.hex())
+            elif kind=="wrong-close":
+                row=next(r for r in rows if r["event"]=="view-close");raw=raw_json({"name":".","fd":99});row.update(bytes=len(raw),data_hex=raw.hex())
+            elif kind=="close-failed":next(r for r in rows if r["event"]=="view-close")["close_errno"]=5
+            elif kind=="missing-end":rows.pop()
+            with self.subTest(kind=kind),self.assertRaises(ValueError):f3.source_view(rows,RUN,"control-before")
+
+    def test_native_positive_entry_links_to_unchanged_real_probe_but_cannot_boot_here(self):
+        with tempfile.TemporaryDirectory(prefix="brdf3-link-") as directory:
+            out=Path(directory);header=out/"fixed.h"
+            header.write_text("#define F2_FIXED_INPUTS 1\n#define F3_FIXED_INPUTS 1\n"+
+              "static const unsigned char F2_EXPECTED_NOTES[]={0};\nstatic const unsigned char F2_EXPECTED_CONFIG[]={0};\n"+
+              "static const unsigned char F3_EXPECTED_PAYLOAD[]={"+",".join(str(n) for n in f3.PAYLOAD)+"};\n")
+            common=["cc","-std=c11","-Os","-Wall","-Wextra","-Werror"]
+            result=subprocess.run(["cc","-std=gnu11","-O2","-Wall","-Wextra","-Werror","-Dmain=brdf3_sp_main","-c",str(ROOT/"scripts/qualification/fs-source-preservation/probe.c"),"-o",str(out/"probe.o")],capture_output=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr.decode(errors="replace"))
+            result=subprocess.run(common+["-static","-include",str(header),str(ROOT/"scripts/qualification/whole-brd/f3-guest.c"),
+              str(out/"probe.o"),"-o",str(out/"guest")],capture_output=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr.decode(errors="replace"))
+            for mode,expected in (("bootstrap",77),("ordinary",77),("unknown",64)):
+                result=subprocess.run([str(out/"guest"),mode],capture_output=True,timeout=3)
+                self.assertEqual(result.returncode,expected);self.assertEqual(result.stdout,b"")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

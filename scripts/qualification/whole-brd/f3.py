@@ -183,3 +183,174 @@ def decode_snapshots(frames, run_id):
         need(total_wire <= LIMITS["serial_bytes"], "all snapshots encoded budget")
     need(offset == len(frames), "extra or reordered snapshot")
     return result
+
+
+def _entries(run_id, busybox, helper, notes, brd, config, files):
+    # The F2 allowlist stays unchanged. F3 adds one explicit preparation mountpoint.
+    return f2._entries(run_id, busybox, helper, notes, brd, config, files) + [
+        f0b._entry("mnt/f3-prepare", stat.S_IFDIR | 0o700)]
+
+
+def payload(run_id, busybox, helper, notes, brd, config, files):
+    entries = _entries(run_id, busybox, helper, notes, brd, config, files)
+    raw = b"".join(f0b._newc_record(entry, i + 1) for i, entry in enumerate(entries))
+    raw += f0b._newc_record(f0b._entry("TRAILER!!!", 0), 0)
+    need(len(raw) <= LIMITS["expanded_bytes"], "expanded F3 payload budget")
+    result = gzip.compress(raw, compresslevel=9, mtime=0)
+    inspect_payload(result, run_id)
+    return result
+
+
+def inspect_payload(data, run_id):
+    need(type(data) is bytes and len(data) <= LIMITS["compressed_bytes"], "compressed F3 payload budget")
+    try:
+        decoder = zlib.decompressobj(31)
+        raw = decoder.decompress(data, LIMITS["expanded_bytes"] + 1)
+    except zlib.error as error:
+        raise ValueError("invalid F3 gzip") from error
+    need(len(raw) <= LIMITS["expanded_bytes"] and decoder.eof and not decoder.unused_data
+         and not decoder.unconsumed_tail, "incomplete/trailing/oversized F3 archive")
+    entries = f2.decode_newc(raw)
+    by_name = {entry["name"]: entry for entry in entries}
+    need(len(by_name) == len(entries), "duplicate F3 member")
+    try:
+        expected = _entries(run_id, by_name["bin/busybox"]["data"], by_name["bin/brd-f2"]["data"],
+            by_name["run/notes"]["data"], by_name["usr/lib/modules/brd.ko"]["data"],
+            by_name["etc/mke2fs-f2.conf"]["data"], {name: by_name[name]["data"] for name in f2.PAYLOAD_FILES})
+    except KeyError as error:
+        raise ValueError("missing F3 fixed member") from error
+    need(entries == expected and len(entries) == 43, "F3 exact member/content mismatch")
+    return {"state": "OFFLINE_F3_PAYLOAD_ONLY", "guest_execution": "NOT_RUN", "qualification": "UNSUPPORTED",
+            "compressed_bytes": len(data), "expanded_bytes": len(raw), "sha256": hashlib.sha256(data).hexdigest(),
+            "members": [{k: v for k, v in entry.items() if k != "data"} |
+                {"bytes": len(entry["data"]), "sha256": hashlib.sha256(entry["data"]).hexdigest()} for entry in entries]}
+
+
+def inode(snapshot, number):
+    """Resolve a real inode from the complete measured single-group device."""
+    sb = snapshot.range(1024, 1024)
+    d = f2._module("diagnostics")
+    d.ext4_superblock(sb, unmounted=struct.unpack_from("<I", sb, 96)[0] == 706)
+    total, per_group, inodes, inode_size = (struct.unpack_from("<I", sb, at)[0] for at in (4, 32, 40, 88))
+    # s_inode_size is u16, with s_block_group_nr immediately after it.
+    need(total == BLOCKS and per_group >= BLOCKS and inodes > 12 and inode_size == 256
+         and struct.unpack_from("<I", sb, 0x150)[0] == 0, "fixed single-group inode geometry")
+    need(type(number) is int and 1 <= number <= inodes, "inode number outside measured group")
+    descriptor = snapshot.range(BLOCK_BYTES, 64)
+    table = struct.unpack_from("<I", descriptor, 8)[0] | struct.unpack_from("<I", descriptor, 40)[0] << 32
+    offset = table * BLOCK_BYTES + (number - 1) * 256
+    need(1 < table < BLOCKS and offset + 256 <= DEVICE_BYTES, "inode table outside measured device")
+    return snapshot.range(offset, 256)
+
+
+def extent_blocks(raw, count):
+    need(type(raw) is bytes and len(raw) == 256 and type(count) is int and 1 <= count <= 1024, "bounded inode/extent request")
+    need(struct.unpack_from("<I", raw, 32)[0] & 0x80000, "extent inode required")
+    magic, entries, maximum, depth, _ = struct.unpack_from("<HHHHI", raw, 40)
+    need(magic == 0xf30a and 1 <= entries <= 4 and maximum == 4 and depth == 0, "unsupported extent tree")
+    blocks = []
+    for index in range(entries):
+        logical, length, high, low = struct.unpack_from("<IHHI", raw, 52 + index * 12)
+        need(logical == len(blocks) and 0 < length < 32768 and len(blocks) + length <= count, "hole/unwritten/overlapping extent")
+        physical = low | high << 32
+        need(1 <= physical < BLOCKS and physical + length <= BLOCKS, "extent beyond owned whole device")
+        blocks.extend(range(physical, physical + length))
+    need(len(blocks) == count and len(set(blocks)) == count, "incomplete/repeated extent mapping")
+    return tuple(blocks)
+
+
+def journal(snapshot):
+    raw_inode = inode(snapshot, 8)
+    size = struct.unpack_from("<I", raw_inode, 4)[0] | struct.unpack_from("<I", raw_inode, 108)[0] << 32
+    need(stat.S_IFMT(struct.unpack_from("<H", raw_inode)[0]) == stat.S_IFREG and size == 4 * MIB, "fixed actual journal inode8")
+    blocks = extent_blocks(raw_inode, 1024)
+    raw = b"".join(snapshot.block(index) for index in blocks)
+    sb = snapshot.range(1024, 1024)
+    f2._module("diagnostics")._journal(raw, sb[104:120].hex())
+    return blocks, raw
+
+
+VIEW_NAMES = (".", "payload", "directory", "ancestor", "lost+found")
+VIEW_FIELDS = ("name", "fd", "dev", "ino", "mode", "uid", "gid", "nlink", "size", "atime", "mtime", "ctime")
+FIXED_ATTR = {b"user.boardroom-source-preservation": b"owned-fixture"}
+
+
+def source_view(rows, run_id, phase):
+    need(type(rows) is list and 19 <= len(rows) <= 400, "bounded complete source view")
+    frames = []
+    for row in rows:
+        raw, _ = _frame(row, run_id, phase)
+        need(row["rc"] == row["errno"] == row["close_errno"] == 0, "source view call/close failed")
+        frames.append((row["event"], raw))
+    cursor = 0
+
+    def take(name):
+        nonlocal cursor
+        need(cursor < len(frames) and frames[cursor][0] == name, "missing/reordered source view " + name)
+        value = frames[cursor][1]
+        cursor += 1
+        return value
+
+    head = f0b._json(take("view-begin"))
+    f0._fields(head, ("root_fd", "dev", "ino", "object_count", "ordinary_source_open_count"))
+    need(type(head["root_fd"]) is int and head["root_fd"] >= 3
+         and head | {"root_fd": 0} == {"root_fd": 0, "dev": 256, "ino": 2, "object_count": 5, "ordinary_source_open_count": 0},
+         "held view root binding")
+    members = take("view-members").split(b"\0")
+    need(members[-1:] == [b""] and len(members) == 5 and set(members[:-1]) ==
+         {b"payload", b"directory", b"ancestor", b"lost+found"}, "complete root membership")
+    objects = {}
+    for name in VIEW_NAMES:
+        value = f0b._json(take("view-object"))
+        f0._fields(value, VIEW_FIELDS)
+        need(value["name"] == name, "source object order")
+        for field in ("fd", "dev", "ino", "mode", "uid", "gid", "nlink", "size"):
+            need(type(value[field]) is int and 0 <= value[field] < 1 << 63, "source metadata integer")
+        need(value["fd"] >= 3 and value["fd"] != head["root_fd"] and value["dev"] == 256 and value["ino"] > 0
+             and value["nlink"] >= 1, "held source object")
+        file = name == "payload"
+        need(value["mode"] == (stat.S_IFREG | 0o600 if file else stat.S_IFDIR | 0o700)
+             and value["uid"] == value["gid"] == (0 if name == "lost+found" else 1000), "source owner/type/mode")
+        need(value["ino"] == 2 if name == "." else value["ino"] != 2, "root inode guard")
+        need(not file or value["nlink"] == 1 and value["size"] == len(PAYLOAD), "fixed nonempty payload")
+        for field in ("atime", "mtime", "ctime"):
+            times = value[field]
+            need(type(times) is list and len(times) == 2 and all(type(v) is int for v in times)
+                 and 0 <= times[0] < 1 << 63 and 0 <= times[1] < 1000000000, "source timestamp")
+        attrs = {}
+        while cursor < len(frames) and frames[cursor][0] == "view-attr":
+            raw = take("view-attr")
+            need(len(raw) >= 6, "attribute header")
+            n, size = struct.unpack_from("<HI", raw)
+            key, val = raw[6:6+n], raw[6+n:]
+            need(0 < n <= 255 and size <= 16384 and len(raw) == 6+n+size and b"\0" not in key
+                 and key not in attrs and len(attrs) < 64, "duplicate/truncated/oversized source attribute")
+            attrs[key] = val
+        need(attrs == ({} if name == "lost+found" else FIXED_ATTR), "complete fixed source attributes")
+        if not file and name != ".":
+            need(take("view-members") == b"", "unexpected child in fixed empty directory")
+        if name == "ancestor":
+            absence = f0b._json(take("view-absence"))
+            need(absence == {"path": "ancestor/missing", "ancestor_fd": value["fd"],
+                            "dev": value["dev"], "ino": value["ino"], "errno": 2}, "exact absent leaf/ancestor")
+        need(f0b._json(take("view-close")) == {"name": name, "fd": value["fd"]}, "source object close binding")
+        objects[name] = {k: v for k, v in value.items() if k != "fd"} | {
+            "attributes": {k.hex(): v.hex() for k, v in attrs.items()}}
+    need(f0b._json(take("view-close")) == {"name": "root", "fd": head["root_fd"]}, "held view root close")
+    need(f0b._json(take("view-end")) == head and cursor == len(frames), "incomplete/extra source view")
+    need(len({row["ino"] for row in objects.values()}) == 5, "aliased fixture source inode")
+    return {"objects": objects, "members": sorted(part.decode("ascii") for part in members[:-1]),
+            "absence": "ancestor/missing", "content_opens": 0,
+            "method": "held-O_PATH-metadata-xattr-and-NOATIME-directory-membership"}
+
+
+def source_payload(snapshot, view):
+    number = view["objects"]["payload"]["ino"]
+    raw = inode(snapshot, number)
+    need(struct.unpack_from("<H", raw)[0] == stat.S_IFREG | 0o600
+         and struct.unpack_from("<I", raw, 4)[0] == len(PAYLOAD)
+         and struct.unpack_from("<I", raw, 108)[0] == 0, "actual payload inode type/size")
+    blocks = extent_blocks(raw, 1)
+    content = snapshot.block(blocks[0])[:len(PAYLOAD)]
+    need(content == PAYLOAD, "measured baseline payload differs")
+    return {"inode": number, "blocks": list(blocks), "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
