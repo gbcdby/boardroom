@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { closeSync, fstatSync, openSync } from "node:fs";
+import { mkdtemp, open, readFile, rm, type FileHandle } from "node:fs/promises";
+import path from "node:path";
 import ts from "typescript";
 import { inspect } from "node:util";
 import { Client, type QueryResult } from "pg";
@@ -30,6 +33,133 @@ async function isolatedEnd() {
     sessions, { hasSubscribers: false }, () => {}, () => ({})) as (session: unknown, confirmed?: boolean) => Promise<boolean>;
   return { sessions, end };
 }
+
+/** Exact production catch/finally and whole-adapter cleanup, with only the native restore body
+ * replaced by controlled results. Real FileHandles below are not native PostgreSQL evidence. */
+async function isolatedVerification(controls: { input: FileHandle; end(): Promise<void>; failPrimary?: boolean; first?: unknown }) {
+  const text = await readFile(new URL("../src/server/storage/maintenance/postgres.ts", import.meta.url), "utf8");
+  const source = ts.createSourceFile("postgres.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const names = ["safeError", "throwResourceFailures", "endSession", "closeVerificationInput", "verifyDatabaseOperation"];
+  const found = new Map<string, ts.FunctionDeclaration>(); let closeBody: string | undefined;
+  function visit(node: ts.Node) {
+    if (ts.isFunctionDeclaration(node) && node.name && names.includes(node.name.text)) found.set(node.name.text, node);
+    if (ts.isVariableDeclaration(node) && node.name.getText(source) === "adapter" && node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
+      const close = node.initializer.properties.find(item => ts.isMethodDeclaration(item) && item.name.getText(source) === "close");
+      if (close && ts.isMethodDeclaration(close)) closeBody = close.body!.getText(source);
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(source); assert.ok(closeBody);
+  const operation = found.get("verifyDatabaseOperation")!, nativeTry = operation.body!.statements.find(ts.isTryStatement)!;
+  assert.ok(nativeTry.catchClause && nativeTry.finallyBlock);
+  const original = operation.getText(source), offset = operation.getStart(source);
+  const nativeStub = `{
+    input = controls.input; const owner = {fd:input.fd}; verificationInputs.set(input, owner);
+    const info = await input.stat({bigint:true}); owner.identity = String(info.dev)+':'+String(info.ino);
+    if (controls.failPrimary) throw controls.first;
+    result = {kind:'controlled-restore-result'};
+  }`;
+  const operationControl = original.slice(0, nativeTry.tryBlock.getStart(source) - offset) + nativeStub + original.slice(nativeTry.tryBlock.end - offset);
+  const body = ts.transpileModule(names.filter(name => name !== "verifyDatabaseOperation").flatMap(name => {
+    const declaration = found.get(name); return declaration ? [declaration.getText(source)] : [];
+  }).join("\n") + "\n" + operationControl + "\nasync function closeAdapter()" + closeBody,
+  { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const session = { ending: false, ended: false, client: { end: controls.end } }, sessions = new Set([session]);
+  const owners = new Map<FileHandle, { fd: number; identity?: string }>();
+  const invoke = new Function("MaintenanceFailure", "fstatSync", "controls", "targetSession", "sessions", "verificationInputs", `
+    const sourceConnection={schema:'app'}, verificationConnection={schema:'app'}, expected={schema:{profile:'boardroom-pg16-closed-schema-v1'}};
+    const writerObservation={hasSubscribers:false}, activeVerifications=new Set(), auditFactories=new WeakMap(), abort=new AbortController();
+    let closed=false, closingStarted=false, closeAttempt, mutex, mutexTimer;
+    function note(){} function sessionMetadata(){return {};} function randomUUID(){return 'control';}
+    async function assertMutex(){} async function assertSnapshotLock(){} async function privateDirectory(){}
+    async function connect(){return targetSession;} async function waitForPostgresTools(){}
+    function object(value){return value;} function buildDatabaseManifests(){return expected;}
+    function same(a,b){return JSON.stringify(a)===JSON.stringify(b);} function checkedReader(value){return value;}
+    ${body}
+    return {run:()=>verifyDatabaseOperation('unused-input',expected,'unused-restore'),close:closeAdapter};
+  `)(MaintenanceFailure, fstatSync, controls, session, sessions, owners) as { run(): Promise<unknown>; close(): Promise<void> };
+  return { ...invoke, session, sessions, owners };
+}
+
+test("#152 PostgreSQL exact verification cleanup preserves first errors and attempts every owned resource", async t => {
+  for (const phase of ["success", "target-sync", "target-async", "target-undefined", "primary-and-close", "input-and-target", "all-errors"] as const) {
+    await t.test(phase, async child => {
+      const directory = await mkdtemp(path.join(process.cwd(), "verification-close-control-"));
+      const input = await open(path.join(directory, "private-input"), "wx+", 0o600), realClose = input.close.bind(input);
+      const first = phase === "all-errors" ? undefined : new MaintenanceFailure("source_changed", "verification-first");
+      const order: string[] = []; let released = false;
+      const canary = new Error("postgres://verification-private-canary@host/private-db");
+      const badInput = phase === "input-and-target" || phase === "all-errors";
+      child.mock.method(input, "close", async () => {
+        order.push("input"); if (badInput && !released) throw canary; await realClose();
+      });
+      const f = await isolatedVerification({ input, failPrimary: phase === "primary-and-close" || phase === "all-errors", first,
+        end() {
+          order.push("target"); if (released || phase === "success") return Promise.resolve();
+          if (phase === "target-async") return Promise.reject(canary);
+          throw phase === "target-undefined" ? undefined : canary;
+        } });
+      try {
+        if (phase === "success") assert.deepEqual(await f.run(), { kind: "controlled-restore-result" });
+        else await assert.rejects(f.run(), error => {
+          assert.doesNotMatch(inspect(error), /verification-private-canary|private-db|postgres:\/\//);
+          const failures = error instanceof AggregateError ? error.errors : [error];
+          const expectedCount = phase === "all-errors" ? 3 : ["primary-and-close", "input-and-target"].includes(phase) ? 2 : 1;
+          assert.equal(failures.length, expectedCount);
+          if (expectedCount > 1) {
+            assert.ok(error instanceof AggregateError); assert.equal(Object.hasOwn(error, "cause"), true); assert.equal(error.cause, failures[0]);
+          }
+          if (phase === "primary-and-close") assert.equal(failures[0], first);
+          if (phase === "all-errors") assert.equal(failures[0].message, "storage_maintenance: restore_verification_unavailable (source)");
+          if (badInput) assert.equal(failures.at(-2)!.message, "storage_maintenance: maintenance_lost (verification-input-close)");
+          assert.equal(failures.at(-1)!.message, "storage_maintenance: maintenance_lost (verification-target-close)");
+          return true;
+        });
+        assert.deepEqual(order, ["input", "target"], "input failure cannot skip the target end attempt");
+        assert.equal(f.owners.size, badInput ? 1 : 0); assert.equal(f.sessions.size, phase === "success" ? 0 : 1);
+        if (badInput) assert.ok((await input.stat()).isFile(), "the actual open input retains its FileHandle owner");
+        released = true; await f.close();
+        assert.equal(f.owners.size, 0); assert.equal(f.sessions.size, 0); assert.equal(input.fd, -1);
+        await assert.rejects(input.stat(), { code: "EBADF" });
+        assert.deepEqual(order, phase === "success" ? ["input", "target"] : badInput
+          ? ["input", "target", "input", "target"] : ["input", "target", "target"]);
+      } finally { released = true; child.mock.restoreAll(); await f.close(); if (input.fd !== -1) await realClose(); await rm(directory, { recursive: true }); }
+    });
+  }
+});
+
+test("#152 PostgreSQL verification input close response failure never closes a reused same-inode descriptor", async t => {
+  const directory = await mkdtemp(path.join(process.cwd(), "verification-close-reuse-")), file = path.join(directory, "input");
+  const input = await open(file, "wx+", 0o600), fd = input.fd, realClose = input.close.bind(input);
+  let replacement: number | undefined;
+  const f = await isolatedVerification({ input, end: async () => {} });
+  t.mock.method(input, "close", async () => {
+    await realClose(); replacement = openSync(file, "r"); assert.equal(replacement, fd); throw undefined;
+  });
+  try {
+    await assert.rejects(f.run(), error => error instanceof MaintenanceFailure
+      && error.message === "storage_maintenance: maintenance_lost (verification-input-close)");
+    assert.equal(f.sessions.size, 0); assert.equal(f.owners.size, 1);
+    await assert.rejects(f.close(), /verification-input-close-unknown/);
+    assert.equal(f.owners.size, 1); assert.ok(fstatSync(replacement!).isFile());
+    closeSync(replacement!); replacement = undefined;
+    await f.close(); assert.equal(f.owners.size, 0);
+  } finally { t.mock.restoreAll(); if (replacement !== undefined) closeSync(replacement); if (input.fd !== -1) await realClose(); await f.close(); await rm(directory, { recursive: true }); }
+});
+
+test("#152 PostgreSQL verification input close-after error rejects while confirmed closure retires its owner", async t => {
+  const directory = await mkdtemp(path.join(process.cwd(), "verification-close-after-"));
+  const input = await open(path.join(directory, "input"), "wx+", 0o600), realClose = input.close.bind(input);
+  let targetEnds = 0;
+  const f = await isolatedVerification({ input, end: async () => { targetEnds++; } });
+  t.mock.method(input, "close", async () => { await realClose(); throw undefined; });
+  try {
+    await assert.rejects(f.run(), error => error instanceof MaintenanceFailure
+      && error.message === "storage_maintenance: maintenance_lost (verification-input-close)");
+    assert.equal(targetEnds, 1); assert.equal(input.fd, -1); assert.equal(f.owners.size, 0); assert.equal(f.sessions.size, 0);
+    await f.close(); assert.equal(targetEnds, 1);
+  } finally { t.mock.restoreAll(); if (input.fd !== -1) await realClose(); await f.close(); await rm(directory, { recursive: true }); }
+});
 
 test("#152 PostgreSQL private end control never retires an unconfirmed owned session", async t => {
   for (const phase of ["sync", "reject", "undefined"] as const) await t.test(phase, async () => {
@@ -279,4 +409,73 @@ pgTest("#152 PostgreSQL real ordinary writer inspection rejects sole and combine
       assert.equal((await f.admin.query("SELECT count(*)::text AS n FROM pg_stat_activity WHERE datname=$1 AND application_name LIKE 'boardroom-maintenance:%'", [f.database])).rows[0].n, "0");
     } finally { child.mock.restoreAll(); if (owned) await invokeEnd(end, owned); await f.close(); }
   });
+});
+
+pgTest("#152 PostgreSQL real restored target cannot succeed after sync or async end failure", async t => {
+  const f = await postgresAuditFixture(), end = Client.prototype.end;
+  try {
+    // Physical verification fixture only: this native sealed anchor is not an Fs/Jq
+    // qualification claim and is never consumed by the finite journal closure reader.
+    await f.adapter.withSourceLock("control", async lock => {
+      const current = await lock.observe(), prior = await f.store.readJson(f.head, "journal") as Record<string, unknown>;
+      const captured = await f.store.putJson("journal", { ...prior, sequence: 2, previous: f.head,
+        phase: "quiesced", event: "capture", requestId: "verification-close-fixture" });
+      await lock.anchor({ expected: current.state, admission: "sealed", fenceEpoch: current.state.fenceEpoch,
+        ownerGeneration: current.state.ownerGeneration, activeMigrationId: f.plan.migrationId, planDigest: f.reference.planDigest,
+        controlRootIdentity: f.store.identity as never, mutexIdentity: f.mutex.identity, journal: captured, journalSequence: 2 });
+    });
+    await f.mutex.release(); await f.adapter.close();
+    for (const phase of ["sync-before", "async-after"] as const) await t.test(phase, async child => {
+      const targetName = `br_verify_close_${randomUUID().replaceAll("-", "")}`;
+      const targetUrl = new URL(process.env.AGENT_STUDIO_PG_TEST_URL!); targetUrl.pathname = `/${targetName}`;
+      await f.admin.query(`CREATE DATABASE "${targetName}" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'`);
+      const adapter = await createPostgresMaintenanceAdapter(f.descriptor, { kind: "postgres", connectionString: targetUrl.toString() });
+      let owned: Client | undefined, ends = 0, cleanup = 0;
+      try {
+        const initial = await adapter.observe(), mutex = await adapter.acquireMutex(f.store.identity, initial.state);
+        const attempt = await f.store.createAttempt(initial.state.ownerGeneration), file = path.join(attempt, "snapshot.dump");
+        await adapter.withSourceLock("snapshot", async lock => {
+          const backup = await lock.backup(file);
+          child.mock.method(Client.prototype, "end", function (this: Client) {
+            if (database(this) !== targetName) return invokeEnd(end, this);
+            owned = this; ends++;
+            const canary = new Error("postgres://verification-private-canary@host/private-db");
+            if (phase === "sync-before") throw canary;
+            return invokeEnd(end, this).then(() => { throw canary; });
+          });
+          await assert.rejects(adapter.verifyDatabase(file, backup.manifests, attempt), error => {
+            assert.ok(error instanceof MaintenanceFailure);
+            assert.equal(error.message, "storage_maintenance: maintenance_lost (verification-target-close)");
+            assert.doesNotMatch(inspect(error), /verification-private-canary|private-db|postgres:\/\//); return true;
+          });
+          assert.ok(owned); assert.equal(ends, 1); child.mock.restoreAll();
+        });
+        const pid = (owned as unknown as { processID: number }).processID;
+        assert.ok(Number.isSafeInteger(pid) && pid > 0);
+        assert.equal((await f.admin.query("SELECT count(*)::text AS count FROM pg_stat_activity WHERE pid=$1", [pid])).rows[0].count,
+          phase === "sync-before" ? "1" : "0");
+        child.mock.method(Client.prototype, "end", function (this: Client) {
+          if (this === owned) cleanup++; return invokeEnd(end, this);
+        });
+        await mutex.release(); await adapter.close(); assert.equal(cleanup, 1);
+        assert.equal((await f.admin.query("SELECT count(*)::text AS count FROM pg_stat_activity WHERE datname=$1", [targetName])).rows[0].count, "0");
+        child.mock.restoreAll();
+        const restored = new Client({ connectionString: targetUrl.toString() }); await restored.connect();
+        try {
+          const state = (await restored.query("SELECT admission,journal_digest,journal_sequence FROM storage_maintenance")).rows[0];
+          assert.equal(state.admission, "sealed"); assert.equal(state.journal_digest, initial.state.journalDigest);
+          assert.equal(String(state.journal_sequence), String(initial.state.journalSequence));
+        } finally { await restored.end(); }
+        const reader = await f.connect("verification-close-independent");
+        try {
+          const state = (await reader.query("SELECT admission,journal_digest,journal_sequence FROM storage_maintenance")).rows[0];
+          assert.equal(state.admission, initial.state.admission); assert.equal(state.journal_digest, initial.state.journalDigest);
+          assert.equal(String(state.journal_sequence), String(initial.state.journalSequence));
+        } finally { await f.closeClient(reader); }
+      } finally {
+        child.mock.restoreAll(); await adapter.close();
+        await f.admin.query(`DROP DATABASE "${targetName}"`);
+      }
+    });
+  } finally { await f.close(); }
 });
