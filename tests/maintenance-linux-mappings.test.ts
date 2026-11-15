@@ -15,9 +15,23 @@ import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createSqliteMaintenanceAdapter } from "../src/server/storage/maintenance/sqlite.ts";
 import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
-import { linuxMappingIdentity, linuxMappingIdentityAvailable, linuxSourceMappingIdentities, parseLinuxMappings } from "../src/server/storage/maintenance/linux-mappings.ts";
+import { confirmedLinuxZombieExit, linuxMappingIdentity, linuxMappingIdentityAvailable, linuxSourceMappingIdentities, parseLinuxMappings } from "../src/server/storage/maintenance/linux-mappings.ts";
 
 const linuxTest = process.platform === "linux" ? test : test.skip;
+
+test("#152 scanner only accepts exact same-identity one-thread zombie evidence", () => {
+  const dead = { pid: "12831", startTicks: "136416", state: "Z", threads: "1" };
+  assert.equal(confirmedLinuxZombieExit(dead, { ...dead }, 46279, 46279, 46279), true);
+  // A child that is still running at entry could have held source FDs or mmaps.
+  assert.equal(confirmedLinuxZombieExit({ ...dead, state: "S" }, dead, 46279, 46279, 46279), false);
+  assert.equal(confirmedLinuxZombieExit(dead, { ...dead, state: "R" }, 46279, 46279, 46279), false);
+  assert.equal(confirmedLinuxZombieExit({ ...dead, threads: "2" }, dead, 46279, 46279, 46279), false);
+  assert.equal(confirmedLinuxZombieExit(dead, { ...dead, threads: "2" }, 46279, 46279, 46279), false);
+  assert.equal(confirmedLinuxZombieExit(dead, { ...dead, pid: "12832" }, 46279, 46279, 46279), false);
+  assert.equal(confirmedLinuxZombieExit(dead, { ...dead, startTicks: "136417" }, 46279, 46279, 46279), false);
+  assert.equal(confirmedLinuxZombieExit(dead, dead, 46279, 46280, 46279), false);
+  assert.equal(confirmedLinuxZombieExit(dead, dead, 46280, 46279, 46279), false);
+});
 const fixtureScript = fileURLToPath(new URL("./fixtures/maintenance-linux-mapped-user.py", import.meta.url));
 const row = "1000-2000 rw-s 00000000 0a:01 9007199254740993 /a path (deleted)\n";
 
