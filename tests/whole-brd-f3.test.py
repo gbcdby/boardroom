@@ -311,5 +311,309 @@ class ClosureControls(unittest.TestCase):
                 result=subprocess.run([str(out/"guest"),mode],capture_output=True,timeout=3)
                 self.assertEqual(result.returncode,expected);self.assertEqual(result.stdout,b"")
 
+
+
+def synthetic_effects():
+    """Four measured-encoding controls plus constructed checksummed ext4/JBD2.
+    These bytes were not produced by a guest and never enter qualification artifacts.
+    """
+    _,d,_=f3._sp()
+    source=synthetic_inode_image()
+    uuid=bytes.fromhex(f3.plan(raw_json({"run_id":RUN}))["filesystem_uuid"].replace("-",""))
+    template=bytearray(source.range(1024,1024));template[104:120]=uuid
+    def sb(mounted,path,kbytes,wtime):
+        raw=bytearray(template);struct.pack_into("<I",raw,96,710 if mounted else 706)
+        raw[136:200]=path.encode().ljust(64,b"\0");struct.pack_into("<Q",raw,0x178,kbytes)
+        struct.pack_into("<I",raw,48,wtime);struct.pack_into("<I",raw,1020,d.crc32c(raw[:1020]));return bytes(raw)
+    def checksum(raw,offset,seed):
+        struct.pack_into(">I",raw,offset,0);struct.pack_into(">I",raw,offset,d.crc32c(raw,seed));return bytes(raw)
+    head=bytearray(1024);struct.pack_into(">6I",head,0,0xc03b3998,4,0,4096,1024,1)
+    struct.pack_into(">I",head,0x18,5);struct.pack_into(">3I",head,0x24,0,0x12,0)
+    head[0x30:0x40]=uuid;struct.pack_into(">I",head,0x40,1);head[0x50]=4;struct.pack_into(">I",head,0x58,14)
+    original=checksum(head,0xfc,0xffffffff)+bytes(4*1024*1024-1024)
+    altered=bytearray(original);head=bytearray(original[:1024]);struct.pack_into(">I",head,0x18,8);struct.pack_into(">I",head,0x58,17)
+    altered[:1024]=checksum(head,0xfc,0xffffffff)
+    sample=sb(True,"/mnt/brd",4,100);payload=bytes(1024)+sample+bytes(2048)
+    seed=d.crc32c(uuid);tx=6
+    descriptor=bytearray(BLOCK);struct.pack_into(">3I",descriptor,0,0xc03b3998,1,tx)
+    struct.pack_into(">4I",descriptor,12,0,8,0,d.crc32c(payload,d.crc32c(struct.pack(">I",tx),seed)))
+    commit=bytearray(BLOCK);struct.pack_into(">3I",commit,0,0xc03b3998,2,tx);struct.pack_into(">QI",commit,48,102,1)
+    for index,block in ((14,checksum(descriptor,4092,seed)),(15,payload),(16,checksum(commit,16,seed))):
+        altered[index*BLOCK:(index+1)*BLOCK]=block
+    snapshots,views={},{}
+    specifications=(("control-before",True,"/mnt/f3-prepare",0,90,10,20,original),
+                    ("control-after",False,"/mnt/f3-prepare",4,100,40,50,original),
+                    ("read-before",True,"/mnt/f3-prepare",4,100,70,80,original),
+                    ("read-after",False,"/mnt/brd",20,102,100,110,bytes(altered)))
+    for phase,mounted,point,kbytes,wtime,begin,end,raw_journal in specifications:
+        blocks={index:source.block(index) for index in (1,4,4096)}
+        blocks[0]=bytes(1024)+sb(mounted,point,kbytes,wtime)+bytes(2048)
+        for index in range(1024):
+            raw=raw_journal[index*BLOCK:(index+1)*BLOCK]
+            if raw!=ZERO:blocks[2048+index]=raw
+        rows=synthetic_snapshot(blocks,phase)
+        for row,at,closed in ((rows[0],begin,False),(rows[-1],end,True)):
+            data=raw_json(binding(at,closed));row.update(bytes=len(data),data_hex=data.hex())
+        snapshots[phase]=f3.decode_snapshot(rows,RUN,phase)
+        views[phase]=f3.source_view(synthetic_view(phase),RUN,phase)
+    def stats(mono,real,sectors):
+        values=[0]*17;values[6]=sectors
+        raw=(" ".join(str(n) for n in values)+"\n").encode()
+        return raw_json({"monotonic_ns":str(mono),"realtime_ns":str(real*1000000000),"raw_hex":raw.hex()})
+    records={"control":{"before":stats(1,90,0),"after":stats(30,101,16),"base":sb(False,"/mnt/f3-prepare",0,90)},
+             "read":{"before":stats(60,101,16),"after":stats(90,103,56),"base":sb(False,"/mnt/f3-prepare",4,100)}}
+    return snapshots,views,records
+
+
+class FullEffectsControls(unittest.TestCase):
+    def test_checksums_exact_diagnostic_unmount_and_complete_four_device_observations(self):
+        snapshots,views,records=synthetic_effects()
+        result=f3.device_effects(snapshots,views,records,RUN)
+        self.assertEqual(result["effects"]["control"]["changed_device_blocks"],[0])
+        self.assertEqual(result["effects"]["read"]["changed_device_blocks"],[0,2048,2062,2063,2064])
+        self.assertEqual(result["effects"]["read"]["diagnostic"]["transaction_id"],6)
+        self.assertEqual(result["effects"]["read"]["harness_unmount"]["observed_kbytes"],20)
+        self.assertFalse(result["effects"]["read"]["diagnostic"]["production_supported"])
+        self.assertEqual(len([name for name in result["artifacts"] if name.endswith("-journal.bin")]),4)
+        self.assertLess(sum(map(len,result["artifacts"].values())),64*1024*1024)
+
+    def test_unknown_application_bytes_extra_transaction_and_block_zero_tail_are_rejected(self):
+        for index,offset in ((10,0),(2048+100,0),(0,2500)):
+            snapshots,views,records=synthetic_effects()
+            image=snapshots["read-after"];blocks=dict(image.nonzero)
+            raw=bytearray(image.block(index));raw[offset]^=1;blocks[index]=bytes(raw)
+            rows=synthetic_snapshot(blocks,"read-after")
+            for row,at,closed in ((rows[0],100,False),(rows[-1],110,True)):
+                data=raw_json(binding(at,closed));row.update(bytes=len(data),data_hex=data.hex())
+            snapshots["read-after"]=f3.decode_snapshot(rows,RUN,"read-after")
+            with self.subTest(index=index),self.assertRaises(ValueError):f3.device_effects(snapshots,views,records,RUN)
+
+    def test_accounting_time_uuid_or_application_view_uncertainty_is_not_success(self):
+        for case in ("sectors","time","uuid","view"):
+            snapshots,views,records=synthetic_effects()
+            if case=="view":views["read-after"]=copy.deepcopy(views["read-after"]);views["read-after"]["objects"]["payload"]["mode"]=0o100640
+            elif case=="uuid":pass
+            else:
+                value=json.loads(records["read"]["after"])
+                if case=="time":value["realtime_ns"]="99000000000"
+                else:
+                    fields=bytes.fromhex(value["raw_hex"]).decode().split();fields[6]="58";value["raw_hex"]=(" ".join(fields)+"\n").encode().hex()
+                records["read"]["after"]=raw_json(value)
+            with self.subTest(case=case),self.assertRaises(ValueError):
+                f3.device_effects(snapshots,views,records,"831af363-b224-4d47-a5b6-5a4573192db3" if case=="uuid" else RUN)
+
+
+
+def load_module(name, path):
+    spec=importlib.util.spec_from_file_location(name,path)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    return module
+
+
+def synthetic_serial():
+    """Whole protocol ordering with constructed metadata/images, not boot evidence.
+    Native parsing is a separately frozen consumer and is stubbed only by these
+    ordering tests; no old live FD/boot identity enters a runtime bundle.
+    """
+    prior=load_module("f3_f2_synthetic_controls",ROOT/"tests/whole-brd-f2.test.py")
+    prior.RUN=RUN
+    old=prior.DecoderTests().frames()
+    prefix=[];ordinary=[]
+    for tag,row in old:
+        if tag=="BRDF1" or row.get("event") in f2.EVENTS[:17]:prefix.append((tag,copy.deepcopy(row)))
+        if row.get("origin")=="ordinary" and tag=="BRDF2":ordinary.append(copy.deepcopy(row))
+    snapshots,_,records=synthetic_effects()
+    output=prefix;next_legacy=18;next_f3=1
+    def add(event,phase,raw=b""):
+        nonlocal next_f3
+        output.append(("BRDF3",frame(event,phase,raw,next_f3)));next_f3+=1
+    def legacy(event,raw=b""):
+        nonlocal next_legacy
+        output.append(("BRDF2",{"run_id":RUN,"origin":"management","seq":next_legacy,"event":event,
+          "rc":0,"errno":0,"close_errno":0,"bytes":len(raw),"data_hex":raw.hex()}));next_legacy+=1
+    def wait(pid):
+        return {"pid":pid,"exit":0,"signal":0,"timeout":False,"reaped":True,"pidfd_before_ack":True}
+    def image(key):
+        value=snapshots[key];rows=synthetic_snapshot(value.nonzero,key)
+        for row,info in ((rows[0],value.before),(rows[-1],value.after)):
+            raw=raw_json(dict(info));row.update(bytes=len(raw),data_hex=raw.hex())
+        for row in rows:add(row["event"],key,bytes.fromhex(row["data_hex"]))
+    def view(key):
+        for row in synthetic_view():
+            add(row["event"],key,bytes.fromhex(row["data_hex"]))
+    add("mount","prepare",b"/mnt/f3-prepare");add("prepare-objects","prepare",f3.PAYLOAD)
+    add("unmount","prepare",b"/mnt/f3-prepare")
+    for phase,pid,joined in (("control",5,25),("read",6,85)):
+        add("round-begin",phase);add("block-stat-before",phase,records[phase]["before"])
+        add("mount-base",phase,records[phase]["base"]);add("mount",phase,b"/mnt/brd")
+        if phase=="control":
+            legacy("metadata-start")
+            output.extend(("BRDF2",row) for row in ordinary)
+            legacy("metadata-exit",raw_json(wait(4)))
+        image(phase+"-before");view(phase+"-before")
+        add("native-begin",phase,b"context" if phase=="control" else b"ordinary")
+        legacy("metadata-start")
+        output.append(("NATIVE",{"synthetic-only":True}))
+        legacy("metadata-exit",raw_json(wait(pid)))
+        add("native-end",phase,raw_json(wait(pid)|{"joined_ns":str(joined)}))
+        view(phase+"-after");add("unmount",phase,b"/mnt/brd")
+        add("block-stat-after",phase,records[phase]["after"]);image(phase+"-after");add("round-end",phase)
+    for name in ("cleanup-fd","device-remove","module-unload"):legacy(name)
+    add("guest-complete","cleanup",raw_json({"original_errno":0,"cleanup_errno":0,"source_observations_complete":True,
+      "module_loaded":False,"mounted":False,"node_exists":False,"children_reaped":True,
+      "parent_closes":[{"fd":5,"errno":0}]}))
+    return output
+
+
+def serial_bytes(rows):
+    return b"".join((b"" if tag=="NATIVE" else tag.encode()+b" ")+raw_json(row)+b"\n" for tag,row in rows)
+
+
+class SequenceControls(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.original=synthetic_serial()
+
+    def consume(self,rows):
+        with patch.object(f3,"native_window",return_value={"status":"SYNTHETIC_NATIVE_SEAM_ONLY"}) as native:
+            result=f3.decode_serial(serial_bytes(rows),RUN,b"exact-notes")
+        self.assertEqual(native.call_count,2)
+        self.assertEqual([call.args[1] for call in native.call_args_list],["control","read"])
+        self.assertTrue(all(call.args[0]==b'{"synthetic-only":true}\n' for call in native.call_args_list))
+        return result
+
+    def test_complete_control_and_read_sequence_consumes_all_four_images(self):
+        result=self.consume(copy.deepcopy(self.original))
+        self.assertEqual(result["state"],"F3_SOURCE_PRESERVATION_OBSERVED")
+        self.assertEqual(result["qualification"],"UNSUPPORTED")
+        self.assertEqual(result["accepted_provider_profiles"],[])
+        self.assertFalse(result["commit_barrier"]);self.assertEqual(result["content_probes"],1)
+        self.assertEqual(len([name for name in result["raw_artifacts"] if name in [phase+"-blocks.json" for phase in f3.SNAPSHOT_PHASES]]),4)
+
+    def test_missing_replayed_failed_close_or_early_cleanup_is_rejected(self):
+        for case in ("missing","replay","close","end","cleanup","before-p1","extra-native","prepared-sb"):
+            rows=copy.deepcopy(self.original)
+            i=next(i for i,(_,row) in enumerate(rows) if row.get("event")=="view-absence")
+            if case=="missing":rows.pop(i)
+            elif case=="replay":rows.insert(i,copy.deepcopy(rows[i]))
+            elif case=="close":next(row for _,row in rows if row.get("event")=="view-close")["close_errno"]=5
+            elif case=="end":rows.pop()
+            elif case=="cleanup":
+                i=next(i for i,(_,row) in enumerate(rows) if row.get("event")=="cleanup-fd")
+                rows.insert(1,rows.pop(i))
+            elif case=="extra-native":rows.append(("NATIVE",{"kind":"content","hex":"ff"}))
+            elif case=="prepared-sb":
+                row=next(row for _,row in rows if row.get("event")=="prepared-superblock")
+                raw=bytearray.fromhex(row["data_hex"]);raw[120]^=1;row["data_hex"]=raw.hex()
+            else:
+                # Preserve every per-protocol sequence while moving all preparation
+                # before the current-boot policy; this must not become a valid run.
+                prepare=[pair for pair in rows if pair[0]=="BRDF3" and pair[1]["phase"]=="prepare"]
+                rows=prepare+[pair for pair in rows if pair not in prepare]
+            with self.subTest(case=case),self.assertRaises(ValueError):self.consume(rows)
+
+
+class BundleAndRunnerControls(unittest.TestCase):
+    def test_offline_archive_is_exactly_new_scope_and_old_allowlist_stays_unchanged(self):
+        import gzip,stat
+        # Synthetic fixed-byte contract for archive parsing only, never a build.
+        notes=b"synthetic-notes";brd=b"B"*30017
+        files={name:("synthetic:"+name).encode() for name in f2.PAYLOAD_FILES}
+        catalog={name:(len(raw),hashlib.sha256(raw).hexdigest(),f2.PAYLOAD_FILES[name][2]) for name,raw in files.items()}
+        config=(ROOT/"scripts/qualification/whole-brd/mke2fs-f2.conf").read_bytes()
+        with patch.object(f2,"NOTES_SHA",hashlib.sha256(notes).hexdigest()),patch.object(f2,"BRD_SHA",hashlib.sha256(brd).hexdigest()),patch.object(f2,"PAYLOAD_FILES",catalog):
+            args=(RUN,b"synthetic-busybox",b"synthetic-helper",notes,brd,config,files)
+            old=f2.payload(*args);new=f3.payload(*args)
+            self.assertEqual(len(f2.inspect_payload(old,RUN)["members"]),42)
+            members=f3.inspect_payload(new,RUN)["members"]
+            self.assertEqual(len(members),43)
+            self.assertEqual(members[-1]["name"],"mnt/f3-prepare")
+            self.assertEqual(members[-1]["mode"],stat.S_IFDIR|0o700)
+            with self.assertRaises(ValueError):f2.inspect_payload(new,RUN)
+            with self.assertRaises(ValueError):f3.inspect_payload(old,RUN)
+            with self.assertRaises(ValueError):f3.inspect_payload(new+b"trailing",RUN)
+            raw=gzip.decompress(new)
+            with self.assertRaises(ValueError):f3.inspect_payload(gzip.compress(raw.replace(b"mnt/f3-prepare",b"mnt/foreignxx"),mtime=0),RUN)
+
+    def test_bundle_binds_all_six_files_and_rejects_old_or_changed_sources_before_spawn(self):
+        runner=load_module("f3_runner_controls",ROOT/"scripts/qualification/whole-brd/f3-run.py")
+        bound=runner.builder.source_bindings()
+        for name in ("f3.py","f3-build.py","f3-run.py","f3-guest.c","F3.md","../../../tests/whole-brd-f3.test.py"):
+            self.assertEqual(bound[name]["sha256"],hashlib.sha256((runner.builder.HERE/name).read_bytes()).hexdigest())
+        self.assertIs(runner.finish_artifacts,runner._old.finish_artifacts)
+        self.assertIs(runner.create_claim,runner._old.create_claim)
+        wrong={"state":"FIXED_F2_BUNDLE_NOT_BOOTED"}
+        changed={"state":"FIXED_F3_BUNDLE_NOT_BOOTED","request":{"run_id":RUN},
+                 "proposal":f3.plan(raw_json({"run_id":RUN})),"source":{}}
+        for value in (wrong,changed):
+            with self.subTest(value=value["state"]),tempfile.TemporaryDirectory(prefix="brdf3-validation-") as directory:
+                path=Path(directory)/"BUNDLE.json";raw=raw_json(value);path.write_bytes(raw)
+                with patch.object(runner,"OwnedChild",side_effect=AssertionError("no guest")) as child,self.assertRaises(ValueError):
+                    runner.execute(str(path),hashlib.sha256(raw).hexdigest(),str(Path(directory)/"out"))
+                child.assert_not_called()
+                self.assertFalse((Path(directory)/"EXECUTION-ATTEMPT.json").exists())
+                self.assertFalse((Path(directory)/"out").exists())
+
+    def test_host_claim_and_final_close_failures_never_succeed_or_retry(self):
+        runner=load_module("f3_runner_cleanup_controls",ROOT/"scripts/qualification/whole-brd/f3-run.py")
+        class FakeArtifacts:
+            entries={}
+            closed=0
+            def seal(self):return []
+            def put(self,*_):pass
+            def close(self):self.closed+=1;return [{"errno":5}]
+        artifacts=FakeArtifacts()
+        bundle={"request":{"run_id":RUN},"proposal":f3.plan(raw_json({"run_id":RUN}))}
+        first=FileExistsError(17,"exclusive synthetic claim")
+        with patch.object(runner,"validate",return_value=({},bundle,{})),patch.object(runner,"Artifacts",return_value=artifacts), \
+             patch.object(runner,"create_claim",side_effect=first),patch.object(runner,"OwnedChild",side_effect=AssertionError("no guest")) as child:
+            result=runner.execute("/unused/BUNDLE.json","0"*64,"/unused/output")
+        child.assert_not_called();self.assertEqual(artifacts.closed,1)
+        self.assertEqual(result["guest_attempts"],0);self.assertEqual(result["state"],"FAILED_NO_RETRY")
+        self.assertEqual(result["original_error"]["errno"],17);self.assertEqual(result["final_artifact_errors"],[{"errno":5}])
+
+
+    def test_normal_exit_owned_cleanup_and_last_artifact_close_all_gate_success(self):
+        runner=load_module("f3_host_completion_controls",ROOT/"scripts/qualification/whole-brd/f3-run.py")
+        raw=serial_bytes(synthetic_serial())
+        bundle={"request":{"run_id":RUN},"proposal":f3.plan(raw_json({"run_id":RUN})),"runtime_environment":{},
+          "qemu_data":{"path":"/unused/firmware"},"inputs":{name:{"path":"/unused/"+name,"sha256":"0"*64}
+          for name in ("qemu","kernel","bios","initramfs","gate")}}
+        normal={"verified":True,"forced":False,"wait_timeout":False,"wait":{"reaped":True,"returncode":0}}
+        class FakeArtifacts:
+            entries={}
+            closed=0
+            def seal(self):return []
+            def put(self,*_):pass
+            def close(self):self.closed+=1;return close_errors
+        class FakeProcess:
+            def poll(self):return exit_code
+        class FakeOwned:
+            proc=FakeProcess();argv=[];gate_argv=[];serial_identity={};before={};after={};events=[]
+            def release(self,*_):pass
+            def cleanup(self,*_):return cleanup
+        class FakePump:
+            errors=[];eof={"serial","qmp","stderr"};read_counts={}
+            def __init__(self,_,artifacts,callback):self.serial=raw;callback(raw)
+            def poll(self,*_):pass
+            def finish(self,*_):pass
+        class FakeQMP:
+            receipts=[]
+            def __init__(self,*_):pass
+        cases=((normal,0,[],"F3_SOURCE_PRESERVATION_OBSERVED"),
+               (normal|{"forced":True},0,[],"FAILED_NO_RETRY"),
+               (normal,1,[],"FAILED_NO_RETRY"),
+               (normal,0,[{"errno":5}],"EVIDENCE_UNPROVEN"))
+        for cleanup,exit_code,close_errors,state in cases:
+            artifacts=FakeArtifacts()
+            with self.subTest(state=state),patch.object(runner,"validate",return_value=({},bundle,{"notes":b"exact-notes"})), \
+                 patch.object(runner,"Artifacts",return_value=artifacts),patch.object(runner,"create_claim"), \
+                 patch.object(runner,"bounded_read",return_value=b""),patch.object(runner,"OwnedChild",return_value=FakeOwned()), \
+                 patch.object(runner,"Pump",FakePump),patch.object(runner,"QMP",FakeQMP), \
+                 patch.object(f3,"native_window",return_value={"status":"SYNTHETIC_NATIVE_SEAM_ONLY"}):
+                result=runner.execute("/unused/BUNDLE.json","0"*64,"/unused/output")
+            self.assertEqual(result["state"],state);self.assertEqual(artifacts.closed,1)
+            self.assertEqual(result["attempts"],1);self.assertEqual(result["guest_attempts"],1)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

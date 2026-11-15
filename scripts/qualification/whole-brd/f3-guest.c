@@ -116,8 +116,16 @@ static int f3_snapshot(const char *phase) {
     if (fd >= 0) {
         if (fstat(fd, &after) && !error) error = errno;
         if (lstat("/dev/ram0", &path) && !error) error = errno;
-        if ((!f3_same_stat(&before, &after) || before.st_dev != path.st_dev || before.st_ino != path.st_ino ||
-             before.st_rdev != path.st_rdev) && !error) error = ESTALE;
+        /* This is the owned device node, not an application source inode.
+           Its access time may reflect our actual pread; bind structural identity. */
+        if ((before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+             before.st_rdev != after.st_rdev || before.st_mode != after.st_mode ||
+             before.st_uid != after.st_uid || before.st_gid != after.st_gid ||
+             before.st_nlink != after.st_nlink || before.st_size != after.st_size ||
+             before.st_dev != path.st_dev || before.st_ino != path.st_ino ||
+             before.st_rdev != path.st_rdev || before.st_mode != path.st_mode ||
+             before.st_uid != path.st_uid || before.st_gid != path.st_gid ||
+             before.st_nlink != path.st_nlink) && !error) error = ESTALE;
     }
     ce = close_once(&fd);
     uint64_t end = f3_now(CLOCK_MONOTONIC, &error);

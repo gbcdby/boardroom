@@ -278,8 +278,9 @@ FIXED_ATTR = {b"user.boardroom-source-preservation": b"owned-fixture"}
 def source_view(rows, run_id, phase):
     need(type(rows) is list and 19 <= len(rows) <= 400, "bounded complete source view")
     frames = []
-    for row in rows:
+    for index, row in enumerate(rows):
         raw, _ = _frame(row, run_id, phase)
+        need(row["seq"] == rows[0]["seq"] + index, "source view sequence")
         need(row["rc"] == row["errno"] == row["close_errno"] == 0, "source view call/close failed")
         frames.append((row["event"], raw))
     cursor = 0
@@ -354,3 +355,291 @@ def source_payload(snapshot, view):
     content = snapshot.block(blocks[0])[:len(PAYLOAD)]
     need(content == PAYLOAD, "measured baseline payload differs")
     return {"inode": number, "blocks": list(blocks), "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+
+
+def _sp():
+    """Load only the frozen pure consumers; no old fixture/run is imported."""
+    import sys
+    base = Path(__file__).resolve().parent.parent / "fs-source-preservation"
+    loaded = {}
+    for name in ("native", "diagnostics", "window"):
+        path = (base / (name + ".py")).resolve()
+        if name in sys.modules:
+            module = sys.modules[name]
+            need(Path(module.__file__).resolve() == path, "foreign pure-consumer module")
+        else:
+            spec = importlib.util.spec_from_file_location(name, path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+        loaded[name] = module
+    return loaded["native"], loaded["diagnostics"], loaded["window"]
+
+
+def block_statistics(raw):
+    value = f0b._json(raw)
+    f0._fields(value, ("monotonic_ns", "realtime_ns", "raw_hex"))
+    for key in ("monotonic_ns", "realtime_ns"):
+        need(type(value[key]) is str and re.fullmatch("[1-9][0-9]{0,18}", value[key])
+             and int(value[key]) < 1 << 63, "actual block-stat clock")
+    need(type(value["raw_hex"]) is str and re.fullmatch("[0-9a-f]{2,8192}", value["raw_hex"])
+         and len(value["raw_hex"]) % 2 == 0, "block statistics original")
+    raw_stat = bytes.fromhex(value["raw_hex"])
+    need(re.fullmatch(rb"[ \t]*[0-9]+(?:[ \t]+[0-9]+){10,31}[ \t]*\n", raw_stat), "block statistics fields")
+    fields = [int(part) for part in raw_stat.split()]
+    need(all(0 <= field < 1 << 63 for field in fields), "block statistics range")
+    return {"monotonic_ns": int(value["monotonic_ns"]), "realtime_ns": int(value["realtime_ns"]),
+            "write_sectors": fields[6], "raw_sha256": hashlib.sha256(raw_stat).hexdigest()}
+
+
+def device_effects(snapshots, views, mount_records, run_id):
+    """Full measured blocks; only the existing exact SP diagnostic policy is reused."""
+    _, d, _ = _sp()
+    need(tuple(snapshots) == tuple(views) == SNAPSHOT_PHASES, "complete ordered source closure")
+    reference = views[SNAPSHOT_PHASES[0]]
+    need(all(view == reference for view in views.values()), "application source metadata/attributes/membership changed")
+    raw_artifacts, mappings, journals = {}, {}, {}
+    last_time = 0
+    expected_uuid = f0._uuid(plan(encoded({"run_id": run_id}))["filesystem_uuid"]).bytes.hex()
+    stable_binding = None
+    for phase in SNAPSHOT_PHASES:
+        image = snapshots[phase]
+        need(int(image.before["at_ns"]) > last_time, "full snapshot interval order")
+        last_time = int(image.after["at_ns"])
+        current_binding = {key: value for key, value in image.before.items() if key not in ("fd", "at_ns", "closed")}
+        if stable_binding is None: stable_binding = current_binding
+        need(current_binding == stable_binding, "snapshots of different device objects")
+        mappings[phase], journals[phase] = journal(image)
+        sb = image.range(1024,1024)
+        need(sb[104:120].hex() == expected_uuid, "measured filesystem differs from this run")
+        source_payload(image, views[phase])
+        raw_artifacts[phase + "-blocks.json"] = encoded(image.record())
+        raw_artifacts[phase + "-journal.bin"] = journals[phase]
+        raw_artifacts[phase + "-source-view.json"] = encoded(views[phase])
+    blocks = mappings["control-before"]
+    need(all(mapping == blocks for mapping in mappings.values()), "journal physical mapping changed")
+    need(journals["control-after"] == journals["read-before"], "remount changed journal outside explicit windows")
+    excluded = {0, *blocks}
+    first = snapshots["control-before"]
+    need(all(image.hashes[index] == first.hashes[index] for image in snapshots.values()
+             for index in range(BLOCKS) if index not in excluded), "application/allocation block changed across rounds")
+    raw_artifacts["journal-map.json"] = encoded({"inode":8,"blocks":list(blocks),"device_binding":stable_binding})
+    effects = {}
+    for phase in ("control", "read"):
+        before, after = snapshots[phase+"-before"], snapshots[phase+"-after"]
+        a, b = journals[phase+"-before"], journals[phase+"-after"]
+        changed = [index for index in range(BLOCKS) if before.hashes[index] != after.hashes[index]]
+        journal_changed = [index for index in range(1024) if a[index*BLOCK_BYTES:(index+1)*BLOCK_BYTES] != b[index*BLOCK_BYTES:(index+1)*BLOCK_BYTES]]
+        need(changed == sorted([0]+[blocks[index] for index in journal_changed])
+             and len(changed) <= 128, "unknown/missing device mutation outside exact SB/journal")
+        need(before.block(0)[:1024] == after.block(0)[:1024] and before.block(0)[2048:] == after.block(0)[2048:],
+             "unknown block0 mutation outside superblock")
+        sb_before, sb_after = before.range(1024,1024), after.range(1024,1024)
+        record = mount_records[phase]
+        start, end = block_statistics(record["before"]), block_statistics(record["after"])
+        need(start["monotonic_ns"] < int(before.before["at_ns"]) < int(before.after["at_ns"]) <
+             end["monotonic_ns"] < int(after.before["at_ns"]), "statistics/full snapshot order")
+        sample = None
+        if phase == "read":
+            head = d.be32(a,0x58)
+            sample = b[(head+1)*BLOCK_BYTES+1024:(head+1)*BLOCK_BYTES+2048]
+            diagnostic = d.classify_diagnostic_transaction(a,b,sb_before,sample,"/mnt/brd")
+            need(start["realtime_ns"] <= int(diagnostic["commit_realtime_ns"]) <= end["realtime_ns"],
+                 "diagnostic commit outside explicit harness lifecycle")
+        else:
+            need(a == b, "non-content control wrote journal")
+            diagnostic = {"status":"NO_JOURNAL_MUTATION","content_opens":0}
+        lifecycle = d.classify_unmount(sb_before,sb_after,record["base"],start["write_sectors"],end["write_sectors"],
+                                      start["realtime_ns"],end["realtime_ns"],"/mnt/brd" if phase=="read" else None)
+        delta = {"complete":True,"changed_blocks":changed,"raw_blocks":[{"block":index,
+             "before_hex":before.block(index).hex(),"after_hex":after.block(index).hex()} for index in changed]}
+        raw_artifacts[phase+"-changed-blocks.json"] = encoded(delta)
+        raw_artifacts[phase+"-mount-base.sb"] = record["base"]
+        effects[phase] = {"status":"CLASSIFIED","changed_device_blocks":changed,
+            "journal_changed_logical_blocks":journal_changed,"diagnostic":diagnostic,"harness_unmount":lifecycle,
+            "full_device_block_hashes":BLOCKS,"atomic_live_snapshot":False}
+    need(sum(map(len,raw_artifacts.values())) <= LIMITS["evidence_bytes"], "decoded evidence budget")
+    return {"effects":effects,"baseline_payload":source_payload(first,reference),"artifacts":raw_artifacts}
+
+
+def native_window(raw, phase, end_frame, metadata, before, after, view):
+    native, _, window = _sp()
+    value = f0b._json(end_frame["raw"])
+    f0._fields(value, ("pid","exit","signal","timeout","reaped","pidfd_before_ack","joined_ns"))
+    joined = value.pop("joined_ns")
+    wait = f2._wait({"raw":encoded(value)})
+    need(type(joined) is str and re.fullmatch("[1-9][0-9]{0,18}",joined)
+         and int(before.after["at_ns"]) < int(joined) < int(after.before["at_ns"]), "actual native join/window bound")
+    mode = "context" if phase == "control" else "ordinary"
+    receipt = {"pid":wait["pid"],"returncode":wait["exit"],"reaped":True,"timed_out":False,
+               "call_error":None,"cleanup_errors":[],"output_complete":True}
+    data = native.parse_stream(raw,mode)
+    result = window.capture(raw,mode,receipt,int(joined))
+    need(data["uid"] == data["gid"] == 1000, "ordinary process identity")
+    need(int(before.after["at_ns"]) < int(result["native_window_closed_ns"]), "native completion before baseline")
+    root = data["parsed"]["root-before"]
+    need(root["uuid"] == metadata["uuid"].replace("-","") and root["fid"] == metadata["fid_hex"],
+         "native root differs from this boot's F2 metadata")
+    if phase=="control":
+        need(root["mount"]==metadata["mount"], "control native uses another mount than its F2 admission")
+    for label, item in data["parsed"].items():
+        name="." if label.startswith("root-") else "payload" if label.startswith("payload-") else "directory"
+        need(all(item["statx"][key]==view["objects"][name][key] for key in ("ino","mode","size","uid","gid","nlink")),
+             "native object differs from the measured application closure")
+        need(item["mount"]["root"] == "/" and item["mount"]["point"] == "/mnt/brd"
+             and item["mount"]["attr"] == 0xe and item["mount"]["propagation"] == 1 << 18
+             and (item["statx"]["dev_major"],item["statx"]["dev_minor"]) == (1,0)
+             and item["tune"]["feature_masks"] == [60,710,1131], "whole-brd native configuration")
+    need(data["context"]["before"]["options"] == metadata["effective_options"], "effective options drift")
+    notes = [row for row in data["rows"] if row.get("kind")=="pseudo" and row.get("name")=="kernel-notes"]
+    need(len(notes)==1 and hashlib.sha256(native.rawhex(notes[0]["hex"])).hexdigest()==f2.NOTES_SHA, "native kernel build notes")
+    content = [row for row in data["rows"] if row.get("kind")=="content"]
+    need(len(content)==(1 if phase=="read" else 0), "control/prewarm/ordinary content count")
+    if content:
+        need(native.rawhex(content[0]["hex"])==PAYLOAD, "ordinary held-FD payload differs from measured baseline")
+    return result
+
+
+def decode_serial(raw, run_id, expected_notes):
+    plan(encoded({"run_id":run_id}))
+    need(type(raw) is bytes and len(raw)<=LIMITS["serial_bytes"], "F3 serial byte budget")
+    legacy, ordinary, frames, positions, native_raw = [], [], [], {}, {}
+    active = None
+    p1_positions = []
+    for pos, line in enumerate(raw.splitlines(keepends=True)):
+        protocol = line.startswith((b"BRDF1 ",b"BRDF2 ",b"BRDF3 "))
+        if protocol or active is not None:
+            need(line.endswith(b"\n") and len(line)<=FRAME_BYTES, "incomplete/oversized serial frame")
+        if line.startswith(b"BRDF1 "): p1_positions.append(pos)
+        if b"BRDF3 " in line:
+            need(line.startswith(b"BRDF3 "), "interleaved F3 frame")
+            row = f0b._json(line[6:].rstrip(b"\r\n"))
+            data, _ = _frame(row,run_id)
+            need(row["seq"]==len(frames)+1 and len(frames)<34816, "F3 sequence/replay/count")
+            need(row["rc"]==row["errno"]==row["close_errno"]==0, "F3 native/cleanup failure")
+            if row["event"]=="native-begin":
+                need(active is None and row["phase"] in ("control","read") and row["phase"] not in native_raw, "native phase replay")
+                need(data== (b"context" if row["phase"]=="control" else b"ordinary"),"native mode binding")
+                active=row["phase"];native_raw[active]=bytearray()
+            elif row["event"]=="native-end":
+                need(active==row["phase"],"native end without owner");active=None
+            frames.append(row | {"raw":data,"position":pos})
+            positions.setdefault((row["phase"],row["event"]),[]).append(pos)
+            continue
+        if b"BRDF2 " in line:
+            need(line.startswith(b"BRDF2 ") and len(line)<=FRAME_BYTES and line.endswith(b"\n"),"F2 frame integrity")
+            row=f0b._json(line[6:].rstrip(b"\r\n"))
+            need(row.get("run_id")==run_id,"current boot F2 origin")
+            if row.get("origin")=="ordinary": ordinary.append((pos,row));continue
+            f0._fields(row,("run_id","origin","seq","event","rc","errno","close_errno","bytes","data_hex"))
+            need(row["origin"]=="management" and type(row["seq"]) is int and row["seq"]==len(legacy)+1,
+                 "F2 management sequence")
+            need(all(type(row[key]) is int and row[key]==0 for key in ("rc","errno","close_errno")),"F2 management failure")
+            legacy.append(row|{"raw":f2._raw(row,(FRAME_BYTES-512)//2),"position":pos})
+            continue
+        if active is not None:
+            need(line.startswith(b"{"),"interleaved native output")
+            native_raw[active].extend(line)
+        elif line.startswith(b"{"):
+            need(False,"native output outside its owned window")
+    need(active is None,"native output not ended")
+    expected_legacy= f2.EVENTS[:17]+("metadata-start","metadata-exit")*3+("cleanup-fd","device-remove","module-unload")
+    need(tuple(row["event"] for row in legacy)==expected_legacy,"incomplete/unknown F2 owned lifecycle")
+    by_name={row["event"]:row for row in legacy[:17]}
+    p1=f0b.decode_serial(raw,run_id,expected_notes)
+    policy=f2.policy(p1)
+    need(p1_positions and p1_positions[0]<by_name["p1-start"]["position"]<p1_positions[1]
+         and p1_positions[-1]<by_name["p1-exit"]["position"],"same-boot P1 before preparation")
+    need(by_name["policy-gate"]["raw"]==policy.encode(),"same-boot policy gate")
+    f2.config_bytes(by_name["config-check"]["raw"])
+    p1_wait=f2._wait(by_name["p1-exit"]);format_wait=f2._wait(by_name["format-exit"],format_child=True)
+    need(p1_wait["pid"]==p1["ordinary_identity"]["pid"],"P1 owner PID")
+    child_starts=[row for row in legacy if row["event"]=="metadata-start"]
+    child_ends=[row for row in legacy if row["event"]=="metadata-exit"]
+    need(all(child_starts[0]["position"]<pos<child_ends[0]["position"] for pos,_ in ordinary),"metadata outside actual owned child")
+    metadata=f2._metadata([row for _,row in ordinary],p1,run_id)
+    waits=[f2._wait(row) for row in child_ends]
+    need(waits[0]["pid"]==metadata["identity"]["pid"] and len({p1_wait["pid"],format_wait["pid"],*(wait["pid"] for wait in waits)})==5,
+         "distinct actual P1/format/metadata/control/read owners")
+    need(by_name["module-load"]["raw"]==b"rd_nr=1 rd_size=65536 max_part=1"
+         and by_name["device-create"]["raw"]==b"1:0","fixed single target creation")
+    need(set(by_name["brd-family"]["raw"].split(b"\0")) == set(metadata["observations"]["sys_block"]["raw"].split(b"\0")),
+         "actual target inventory")
+    need(f0b._json(by_name["device-geometry"]["raw"])=={"bytes":DEVICE_BYTES,"logical_block_size":metadata["logical_block_size"]},
+         "geometry vs native metadata")
+
+    cursor=0
+    def take(event,phase):
+        nonlocal cursor
+        need(cursor<len(frames) and (frames[cursor]["event"],frames[cursor]["phase"])==(event,phase),
+             "missing/reordered F3 lifecycle "+phase+":"+event)
+        row=frames[cursor];cursor+=1;return row
+    need(frames and by_name["mount-private"]["position"] < frames[0]["position"],
+         "F3 preparation precedes this boot's P1/F2 policy and target setup")
+    need(take("mount","prepare")["raw"]==b"/mnt/f3-prepare","fixed preparation mount")
+    need(take("prepare-objects","prepare")["raw"]==PAYLOAD,"fixed prepared source content")
+    need(take("unmount","prepare")["raw"]==b"/mnt/f3-prepare","preparation writers/handles ended")
+    snapshots,views,mount_records,windows={}, {}, {}, {}
+    for index,phase in enumerate(("control","read")):
+        take("round-begin",phase)
+        start=take("block-stat-before",phase);base=take("mount-base",phase)
+        mounted=take("mount",phase)
+        need(mounted["raw"]==b"/mnt/brd","whole-source mountpoint")
+        if phase=="control":
+            need(cursor<len(frames) and mounted["position"]<child_starts[0]["position"]<child_ends[0]["position"]<frames[cursor]["position"],
+                 "same-boot metadata outside the control mount/baseline interval")
+        for suffix in ("before","after"):
+            key=phase+"-"+suffix
+            if suffix=="after":
+                native_begin=take("native-begin",phase);native_end=take("native-end",phase)
+                need(native_begin["position"]<child_starts[index+1]["position"]<child_ends[index+1]["position"]<native_end["position"],
+                     "native owner lifecycle envelope")
+                need(f0b._json(native_end["raw"])["pid"]==waits[index+1]["pid"],"native receipt PID")
+                selected=[]
+                while cursor<len(frames) and frames[cursor]["event"].startswith("view-"):
+                    row=frames[cursor];selected.append({k:row[k] for k in FRAME_FIELDS});cursor+=1
+                views[key]=source_view(selected,run_id,key)
+                need(take("unmount",phase)["raw"]==b"/mnt/brd","explicit post-Tcut harness unmount")
+                end=take("block-stat-after",phase)
+                mount_records[phase]={"before":start["raw"],"after":end["raw"],"base":base["raw"]}
+            selected=[]
+            while cursor<len(frames) and frames[cursor]["event"].startswith("snapshot-"):
+                row=frames[cursor];selected.append({k:row[k] for k in FRAME_FIELDS});cursor+=1
+            snapshots[key]=decode_snapshot(selected,run_id,key)
+            if suffix=="before":
+                selected=[]
+                while cursor<len(frames) and frames[cursor]["event"].startswith("view-"):
+                    row=frames[cursor];selected.append({k:row[k] for k in FRAME_FIELDS});cursor+=1
+                views[key]=source_view(selected,run_id,key)
+        round_end=take("round-end",phase)
+        windows[phase]=native_window(bytes(native_raw[phase]),phase,native_end,metadata,snapshots[phase+"-before"],snapshots[phase+"-after"],views[phase+"-before"])
+    need(round_end["position"] < legacy[-3]["position"],"target cleanup before source windows ended")
+    final=take("guest-complete","cleanup")
+    need(cursor==len(frames) and final["position"]>legacy[-1]["position"],"extra/incomplete cleanup")
+    cleanup=f0b._json(final["raw"]);closes=cleanup.pop("parent_closes",None)
+    need(type(closes) is list and 1<=len(closes)<=128,"missing parent FD cleanup")
+    for row in closes:
+        f0._fields(row,("fd","errno"));need(type(row["fd"]) is int and row["fd"]>=3 and type(row["errno"]) is int and row["errno"]==0,"unconfirmed parent close")
+    need(cleanup=={"original_errno":0,"cleanup_errno":0,"source_observations_complete":True,
+        "module_loaded":False,"mounted":False,"node_exists":False,"children_reaped":True},"owned resources remain")
+    after=snapshots["read-after"];_,journal_after=journal(after)
+    filesystem=f2._raw_filesystem(by_name | {
+        "unmounted-superblock":{"raw":after.range(1024,1024)},
+        "unmounted-group-descriptor":{"raw":after.range(BLOCK_BYTES,64)},
+        "unmounted-journal-inode":{"raw":inode(after,8)},
+        "unmounted-journal-header":{"raw":journal_after[:BLOCK_BYTES]}},run_id)
+    effects=device_effects(snapshots,views,mount_records,run_id)
+    artifacts=effects.pop("artifacts")
+    for phase,output in native_raw.items():artifacts[phase+"-native.jsonl"]=bytes(output)
+    for phase,data in (("p1",p1),("metadata",metadata)):
+        for name,observation in data["observations"].items():
+            artifacts[phase+"-"+name+".raw"]=observation.pop("raw")
+    for row in legacy:
+        artifacts["management-"+str(row["seq"])+"-"+row["event"]+".raw"]=row["raw"]
+    need(sum(map(len,artifacts.values()))<=LIMITS["evidence_bytes"],"complete evidence output budget")
+    return {"state":"F3_SOURCE_PRESERVATION_OBSERVED","qualification":"UNSUPPORTED","content_probes":1,
+        "production_bound":False,"commit_barrier":False,"accepted_provider_profiles":[],"qualified_kernel_builds":[],
+        "policy":policy,"p1":p1,"metadata":metadata,"filesystem":filesystem,"windows":windows,**effects,
+        "guest_cleanup":cleanup|{"parent_closes":closes},"raw_artifacts":artifacts,
+        "unresolved":["production_source_db_plan_binding","complete_M04_writer_special_path_coverage",
+                      "full_native_ext4_SP_qualification","R05_and_durable_restore","native_ext4_B1"]}
