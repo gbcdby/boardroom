@@ -5,12 +5,14 @@ import { chmod, lstat, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "pg";
+import { inspect } from "node:util";
 import { PostgresDriver } from "../src/server/db/drivers/postgres.ts";
 import { checksumOf, migrationSql } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { digestJson } from "../src/server/storage/maintenance/canonical.ts";
 import { maintenanceHostIdentityDigest } from "../src/server/storage/maintenance/host.ts";
 import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";
+import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import { readPostgresCatalog, readPostgresManifests } from "../src/server/storage/maintenance/postgres-manifests.ts";
 import { parsePostgresConnection } from "../src/server/storage/maintenance/postgres-tools.ts";
 import { buildSourceClientsRoster, parseSourceClientsRoster, sourceClientsDigest } from "../src/server/storage/maintenance/source-clients.ts";
@@ -154,6 +156,8 @@ pgTest("#152 A10-R07 PG owned close rejection and synchronous failure never retu
       });
       await assert.rejects(f.adapter.observeSourceClients(), error =>
         /maintenance_lost/.test(String(error)) && !String(error).includes("canary"));
+      t.mock.restoreAll();
+      await assert.rejects(f.adapter.observe(), /maintenance_lost/, "unconfirmed facts close still retires this adapter");
     } finally { t.mock.restoreAll(); await f.close(); }
   });
 });
@@ -302,15 +306,27 @@ pgTest("#152 A10-R08 PG real critical backend loss invalidates a borrowed raw re
   } finally { await mutex?.release(); await f.close(); }
 });
 
-pgTest("#152 A10-R11 old PG observe keeps its existing asynchronous close behavior", async t => {
+pgTest("#152 A10-R11 ordinary PG observe propagates an unconfirmed close and remains usable after cleanup", async t => {
   const f = await fixture("UTF8"); const original = Client.prototype.end;
+  let endedPid: number | undefined, completedEnds = 0;
   try {
     t.mock.method(Client.prototype, "end", function(this: Client, ...args: unknown[]) {
       const result = Reflect.apply(original, this, args);
       const database = (this as unknown as { connectionParameters: { database: string } }).connectionParameters.database;
-      if (database === f.database && this !== f.writer) return Promise.resolve(result).then(() => { throw new Error("private-old-close-canary"); });
+      if (database === f.database && this !== f.writer) return Promise.resolve(result).then(() => {
+        endedPid = (this as unknown as { processID: number }).processID; completedEnds++;
+        throw new Error("private-old-close-canary");
+      });
       return result;
     });
+    await assert.rejects(f.adapter.observe(), error => {
+      assert.ok(error instanceof MaintenanceFailure); assert.equal(error.code, "maintenance_lost");
+      assert.equal(error.message, "storage_maintenance: maintenance_lost (observation-close)");
+      assert.doesNotMatch(inspect(error, { depth: 10 }), /private-old-close-canary/); return true;
+    });
+    assert.equal(completedEnds, 1); assert.equal(typeof endedPid, "number");
+    assert.equal((await f.admin.query("SELECT count(*)::text AS n FROM pg_catalog.pg_stat_activity WHERE datname=$1 AND pid=$2", [f.database, endedPid])).rows[0].n, "0");
+    t.mock.restoreAll();
     const old = await f.adapter.observe(); assert.equal(old.source.databaseInstanceId, marker);
   } finally { t.mock.restoreAll(); await f.close(); }
 });
@@ -354,6 +370,10 @@ pgTest("#152 A10-R05/R07 private PG transport faults never become empty or parti
       });
       try { await assert.rejects(f.adapter.observeSourceClients(), error => String(error).includes(code!) && !String(error).includes("canary")); assert.equal(injected, true); }
       finally { t.mock.restoreAll(); }
+      if (mode === "bad-hex") {
+        assert.equal((await f.admin.query("SELECT count(*)::text AS n FROM pg_catalog.pg_stat_activity WHERE datname=$1 AND application_name LIKE 'boardroom-maintenance:%'", [f.database])).rows[0].n, "0");
+        assert.equal((await f.adapter.observe()).source.databaseInstanceId, marker, "a decoded-row rejection with confirmed close does not retire ordinary observation");
+      }
     });
     assert.deepEqual((await f.adapter.observeSourceClients()).rows, [cells("UTF8")]);
   } finally { t.mock.restoreAll(); await f.close(); }
