@@ -70,4 +70,35 @@ if (process.platform !== "darwin") {
     process.stderr.write("macOS public 恢复目录 FD 组件未构建；public 验证恢复保持不可用。\n");
     if (required) { process.stderr.write(publicDiagnostics); process.exitCode = 1; }
   }
+  // Source-file verification has its own single-leaf mkdirat/openat seam. It does
+  // not extend the public archive allowlist or change any existing component.
+  const restoreTarget = path.join(directory, `maintenance-restore-directory-${process.arch}.node`);
+  const restoreTemporary = `${restoreTarget}.${randomUUID()}.tmp`;
+  let restoreDiagnostics = "restore directory bridge unavailable\n";
+  try {
+    if (Number(process.versions.napi) < 8) throw new Error("Node-API 8 is required");
+    const headers = path.join(root, "native", "node-api", "v24.22.1");
+    const sources = JSON.parse(readFileSync(path.join(headers, "SOURCES.json"), "utf8"));
+    if (sources.upstreamVersion !== "v24.22.1" || sources.napiVersion !== 8 || !Array.isArray(sources.files)
+      || sources.files.length !== 5) throw new Error("Unexpected Node-API header source");
+    for (const name of ["node_api.h", "node_api_types.h", "js_native_api.h", "js_native_api_types.h", "LICENSE"]) {
+      const matches = sources.files.filter(file => file.name === name);
+      if (matches.length !== 1 || createHash("sha256").update(readFileSync(path.join(headers, name))).digest("hex") !== matches[0].sha256)
+        throw new Error("Node-API source checksum mismatch");
+    }
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const built = spawnSync("/usr/bin/cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-DNAPI_VERSION=8",
+      "-DNODE_GYP_MODULE_NAME=boardroom_restore_directory", "-bundle", "-undefined", "dynamic_lookup", "-I", headers,
+      path.join(root, "native", "maintenance-restore-directory.c"), "-o", restoreTemporary],
+    { encoding: "utf8", timeout: 60_000 });
+    restoreDiagnostics = built.stderr || restoreDiagnostics;
+    if (built.status !== 0 || built.error) throw new Error("restore directory bridge compiler failed");
+    chmodSync(restoreTemporary, 0o700); renameSync(restoreTemporary, restoreTarget);
+  } catch {
+    for (const file of [restoreTemporary, restoreTarget]) {
+      try { rmSync(file, { force: true }); } catch { /* Isolated file restore remains unavailable. */ }
+    }
+    process.stderr.write("macOS 隔离文件恢复目录 FD 组件未构建；隔离文件恢复保持不可用。\n");
+    if (required) { process.stderr.write(restoreDiagnostics); process.exitCode = 1; }
+  }
 }
