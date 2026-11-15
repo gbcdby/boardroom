@@ -293,7 +293,7 @@ export interface SourceClientProcessFact {
 }
 export interface SourceClientFact {
   readonly clientId: string;
-  readonly classification: "current-client" | "historical-client";
+  readonly classification: "current-client" | "historical-client" | "historical-controller";
   readonly receipt: import("../source-client.ts").StorageDrainReceipt | null;
   readonly process: SourceClientProcessFact;
 }

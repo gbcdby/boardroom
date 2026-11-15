@@ -6,9 +6,10 @@ import type { OwnedProcessIdentity } from "../../runtime/hosts/types.ts";
 import { verifyStorageDrainReceipt, type StorageDrainReceipt } from "../source-client.ts";
 import { canonicalJson, digestJson } from "./canonical.ts";
 import type { EventFacts, ProcessCheck } from "./control-candidate/schema.ts";
+import { validateHistoricalControllerProfile } from "./control-candidate/rows.ts";
 import { darwinProcessObservation } from "./darwin.ts";
 import { MaintenanceFailure } from "./error.ts";
-import type { SourceClientFact, SourceClientProcessFact, SourceClientsObservation, SourceRuntimeFact } from "./types.ts";
+import type { JournalRecord, SourceClientFact, SourceClientProcessFact, SourceClientsObservation, SourceRuntimeFact } from "./types.ts";
 
 export function unknownWriter(): never { throw new MaintenanceFailure("source_writer_unknown"); }
 export function factsObject(value: unknown): Record<string, unknown> {
@@ -158,10 +159,27 @@ function envelopeFor(row: Record<string, unknown>, sourceKind: SourceClientsObse
 
 export async function sourceClientFacts(observation: SourceClientsObservation, rows: readonly Record<string, unknown>[],
   receiptGeneration: number, validateSource: (value: unknown, observation: SourceClientsObservation) => void,
-  audit?: EventFacts["clients"]): Promise<SourceClientFact[]> {
+  audit?: EventFacts["clients"], historicalControllerHead?: JournalRecord): Promise<SourceClientFact[]> {
   const result: SourceClientFact[] = [];
   if (rows.length !== observation.rows.length) throw new MaintenanceFailure("source_changed");
   for (const [index, row] of rows.entries()) {
+    if (row.entrypoint === "maintenance-controller" || row.build_id === "boardroom-maintenance-control-v1") {
+      // Only the actual private audit path supplies its already verified no-capture planned head.
+      if (!audit || !historicalControllerHead || historicalControllerHead.phase !== "planned" || observation.state.admission !== "draining"
+        || historicalControllerHead.fenceEpoch !== observation.state.fenceEpoch
+        || canonicalJson(historicalControllerHead.source) !== canonicalJson(observation.source)) return unknownWriter();
+      const raw = observation.rows[index]!, host = json(row.host_identity_json), identity = json(row.process_identity_json);
+      try { validateHistoricalControllerProfile(raw, row, observation.source, observation.state.fenceEpoch, { host, process: identity }); }
+      catch { return unknownWriter(); }
+      const inspected = await inspectRegisteredSourceProcess(host, identity);
+      if (inspected.fact.status !== "exited") return unknownWriter();
+      result.push({ clientId: String(row.client_id), classification: "historical-controller", receipt: null, process: inspected.fact });
+      audit.push({ kind: "maintenance-controller", classification: "exited-actor", registration: "R0-historical",
+        subject: [...raw.client_id], rowDigest: digestJson({ formatVersion: 1, kind: "source-client-row", source: observation.source,
+          textEncoding: observation.textEncoding, row: raw }),
+        host: host as EventFacts["actor"]["host"], process: identity as EventFacts["actor"]["process"], processCheck: inspected.check });
+      continue;
+    }
     const envelope = envelopeFor(row, observation.source.kind);
     if (row.database_instance_id !== observation.source.databaseInstanceId) throw new MaintenanceFailure("source_changed");
     if (counter(row.registered_epoch) >= observation.state.fenceEpoch) return unknownWriter();

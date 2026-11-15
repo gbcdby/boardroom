@@ -93,8 +93,8 @@ export async function postgresAuditFixture(encoding: "UTF8" | "LATIN1" | "SQL_AS
       const raw = await lock.observeSourceClients();
       const journal = await store.putJson("journal", { formatVersion: 2, kind: "journal", migrationId: plan.migrationId, sequence: 1,
         previous: null, phase: "planned", event: "enter", requestId: "pg-fixture-enter", requestDigest: "a".repeat(64), source: plan.source,
-        plan: reference.immutablePlan, fenceEpoch: 1, ownerGeneration: 1, evidence: [], snapshot: null, sourceClients: null, frozen: null });
-      await lock.anchor({ expected: raw.state, admission: "draining", fenceEpoch: 1, ownerGeneration: 1,
+        plan: reference.immutablePlan, fenceEpoch: raw.state.fenceEpoch + 1, ownerGeneration: 1, evidence: [], snapshot: null, sourceClients: null, frozen: null });
+      await lock.anchor({ expected: raw.state, admission: "draining", fenceEpoch: raw.state.fenceEpoch + 1, ownerGeneration: 1,
         activeMigrationId: plan.migrationId, planDigest: reference.planDigest, controlRootIdentity: store.identity as never,
         mutexIdentity: mutex!.identity, journal, journalSequence: 1 });
       return journal;

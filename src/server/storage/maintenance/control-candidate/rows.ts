@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { canonicalJson, digestJson } from "../canonical.ts";
 import { counter, hash, id, ref, source } from "../parse-primitives.ts";
-import type { JournalRecord, MigrationPlan, SourceClientRawRow, SourceClientTextCell, SourceClientsRosterV1 } from "../types.ts";
+import type { JournalRecord, MigrationPlan, SourceClientRawRow, SourceClientTextCell, SourceClientsRosterV1, SourceRef } from "../types.ts";
 import type { UntrustedJournalCandidate } from "./codec.ts";
 import { compareText, equal, ordered, requireCandidate } from "./common.ts";
 import { fence, ownedIdentity, safePos, processDisposition, type ClientFact, type EventFacts, type SuccessorProof } from "./schema.ts";
@@ -141,17 +141,35 @@ function ordinaryProfile(row: SourceClientRawRow, decoded: Decoded, fact: Exclud
     && equal(item.processIdentity, fact.receipt.ownedExits[index]!.processIdentity));
   return registered;
 }
-function controllerProfile(row: SourceClientRawRow, decoded: Decoded, fact: Extract<ClientFact, { kind: "maintenance-controller" }>, context: RowContext): void {
-  const body = parse(registrationSchema, json(decoded.db_sessions_json)), prior = context.registrations.get(row.client_id[1]);
-  requireCandidate(decoded.client_id !== null && decoded.client_id !== "" && decoded.database_instance_id === context.record.source.databaseInstanceId
+type ControllerDecoded = Pick<Decoded, "client_id" | "database_instance_id" | "entrypoint" | "build_id" | "drain_state"
+  | "db_sessions_json" | "host_identity_json" | "process_identity_json">;
+function controllerRegistration(row: SourceClientRawRow, decoded: ControllerDecoded,
+  identity: { readonly host: unknown; readonly process: unknown }, source: SourceRef) {
+  const body = parse(registrationSchema, json(decoded.db_sessions_json));
+  requireCandidate(decoded.client_id !== null && decoded.client_id !== "" && decoded.database_instance_id === source.databaseInstanceId
     && decoded.entrypoint === "maintenance-controller" && decoded.build_id === "boardroom-maintenance-control-v1"
     && decoded.drain_state === "none" && row.drain_epoch[0] === "null" && row.drain_receipt_digest[0] === "null"
     && row.registered_epoch[1] === row.observed_epoch[1] && body.creation.fenceEpoch === row.registered_epoch[1]
-    && equal(body.source, context.record.source) && body.sourceIdentityDigest === context.record.source.identityDigest
-    && canonicalJson(body) === decoded.db_sessions_json && canonicalJson(fact.host) === decoded.host_identity_json
-    && canonicalJson(fact.process) === decoded.process_identity_json);
+    && equal(body.source, source) && body.sourceIdentityDigest === source.identityDigest
+    && canonicalJson(body) === decoded.db_sessions_json && canonicalJson(identity.host) === decoded.host_identity_json
+    && canonicalJson(identity.process) === decoded.process_identity_json);
   requireCandidate(body.creation.plan.ref === `plans/${body.creation.plan.sha256}.json` && BigInt(body.creation.targetSequence) > 1n
     && body.creation.previousAnchor.ref === `journals/${body.creation.migrationId}/${BigInt(body.creation.targetSequence) - 1n}-${body.creation.previousAnchor.sha256}.json`);
+  return body;
+}
+/** Strict existing S6/S7 data rules only. This does not inspect a process or grant registration/ownership. */
+export function validateHistoricalControllerProfile(row: SourceClientRawRow, values: Readonly<Record<string, unknown>>,
+  source: SourceRef, fenceEpoch: number, identity: { readonly host: unknown; readonly process: unknown }): void {
+  const keys = ["client_id", "database_instance_id", "entrypoint", "build_id", "drain_state", "db_sessions_json",
+    "host_identity_json", "process_identity_json"] as const;
+  const decoded = Object.fromEntries(keys.map(key => {
+    const value = values[key]; requireCandidate(typeof value === "string"); return [key, value];
+  })) as ControllerDecoded;
+  const body = controllerRegistration(row, decoded, identity, source);
+  requireCandidate(row.protocol_version[1] === "1" && BigInt(body.creation.fenceEpoch) < BigInt(fenceEpoch));
+}
+function controllerProfile(row: SourceClientRawRow, decoded: Decoded, fact: Extract<ClientFact, { kind: "maintenance-controller" }>, context: RowContext): void {
+  const body = controllerRegistration(row, decoded, fact, context.record.source), prior = context.registrations.get(row.client_id[1]);
   if (prior) requireCandidate(fact.registration === "current-chain" && equal(prior.creation, body.creation) && prior.actorId === fact.process.instanceId
     && body.creation.fenceEpoch === String(context.record.fenceEpoch));
   else requireCandidate(fact.registration === "R0-historical" && BigInt(body.creation.fenceEpoch) < BigInt(context.record.fenceEpoch)

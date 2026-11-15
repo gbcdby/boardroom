@@ -90,7 +90,8 @@ export async function withSourceClientFacts<T>(access: SourceFactsAccess, input:
         throw new MaintenanceFailure("source_changed");
     }
     const rows = await access.decodedRows(observation);
-    const clients = await sourceClientFacts(observation, rows, receiptGeneration, access.validateSource, clientAudit);
+    const clients = await sourceClientFacts(observation, rows, receiptGeneration, access.validateSource, clientAudit,
+      actor && !first ? last : undefined);
     const runtimeRows = await access.runtimeRows();
     const runtime = await sourceRuntimeFacts(runtimeRows, clients, runtimeAudit);
     const blockers = await access.inspectWriters(observation, rows, sessionAudit);
