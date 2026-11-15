@@ -51,6 +51,29 @@ test("#152 FSI-11 pure projection: identical content in both Fs v2 codecs exclud
   assert.deepEqual(projectRestoreContent(overlay), expected);
 });
 
+test("#152 Fs codec A04: source-state evidence and identities never enter the content projection", () => {
+  const original = sourceFiles("ext4");
+  const source = parseSourceFiles({ ...original, rootBindings: original.rootBindings.map(binding => ({ ...binding,
+    profile: "linux-native-ext4-fid-fsuuid-source-state-v1",
+    readEvidence: { policy: "application-source-preservation-v1", kernelDiagnosticPolicy: "ext4-last-mounted-v1",
+      profileEntryDigest: "1".repeat(64), qualificationDigest: "2".repeat(64), runtimeEnvironmentDigest: "3".repeat(64),
+      sourceStateDigest: "4".repeat(64), blockEffectsObservation: "not-observed-at-runtime" },
+  })) });
+  const before = structuredClone(source);
+  assert.deepEqual(projectRestoreContent(source), expected);
+  assert.deepEqual(source, before);
+  for (const field of ["profileEntryDigest", "qualificationDigest", "runtimeEnvironmentDigest", "sourceStateDigest"]) {
+    const differentSource = parseSourceFiles({ ...source, rootBindings: source.rootBindings.map(binding => {
+      assert(binding.profile === "linux-native-ext4-fid-fsuuid-source-state-v1");
+      return { ...binding, hostIdentityDigest: "5".repeat(64), filesystemUuidHex: "6".repeat(32),
+        readEvidence: { ...binding.readEvidence, [field]: "7".repeat(64) } };
+    }) });
+    assert.notDeepEqual(differentSource, source);
+    assert.deepEqual(projectRestoreContent(differentSource), expected,
+      "equal content projection does not establish equal source identity or runtime qualification");
+  }
+});
+
 test("#152 FSI-11 pure projection: content and membership differences remain observable", () => {
   const source = sourceFiles("ext4"), file = source.entries[1]!, directory = source.entries[3]!;
   assert.ok(file.kind === "file" && directory.kind === "directory");

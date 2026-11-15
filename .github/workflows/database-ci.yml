@@ -118,6 +118,12 @@ jobs:
             exit 1
           fi
 
+      - name: M02 有效选项纯解析拒绝控制
+        run: python3 tests/fs-effective-options.test.py
+
+      - name: Fs 历史原件与观察窗口离线控制
+        run: python3 tests/fs-source-preservation.test.py
+
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:

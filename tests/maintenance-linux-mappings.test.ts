@@ -2,7 +2,7 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import promises from "node:fs/promises";
-import { mkdtemp, readdir, readlink, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, readlink, readFile, writeFile, rm, stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
@@ -11,6 +11,7 @@ import Database from "better-sqlite3";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createSqliteMaintenanceAdapter } from "../src/server/storage/maintenance/sqlite.ts";
+import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
 import { linuxMappingIdentity, linuxMappingIdentityAvailable, linuxSourceMappingIdentities, parseLinuxMappings } from "../src/server/storage/maintenance/linux-mappings.ts";
 
 const linuxTest = process.platform === "linux" ? test : test.skip;
@@ -198,4 +199,100 @@ linuxTest("#152 an observed exit during the pinned proc walk is distinguished fr
     try { assert.deepEqual(await f.adapter.inspectWriters(observation), []); assert.equal(released, true); }
     finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
   } finally { if (!released) await user.stop(); await f.close(); }
+});
+
+
+linuxTest("#152 inventory diagnostics distinguish original denied, missing-live, partial maps and incarnation faults", async t => {
+  const f = await fixture(), user = await startUser(f.file, "idle");
+  try {
+    for (const fault of ["EACCES", "ENOENT", "partial-maps", "identity-changed"] as const) await t.test(fault, async st => {
+      const original = { open: fs.openSync, read: fs.readSync, close: fs.closeSync };
+      const pins = new Set<number>(), maps = new Set<number>(), laterStats = new Set<number>();
+      let mapsOpened = false, mapReads = 0, injections = 0;
+      const output = path.join(f.dir, `diagnostic-${fault}`);
+      st.mock.method(fs, "openSync", ((file: fs.PathLike, ...args: unknown[]) => {
+        const name = String(file), mapped = /^\/proc\/self\/fd\/([0-9]+)\/maps$/.exec(name);
+        const target = mapped !== null && pins.has(Number(mapped[1]));
+        if (target) {
+          mapsOpened = true;
+          if (fault === "EACCES" || fault === "ENOENT") { injections++; throw Object.assign(new Error("private diagnostic canary"), { code: fault, syscall: "open" }); }
+        }
+        const fd = Reflect.apply(original.open, fs, [file, ...args]) as number;
+        if (name === `/proc/${user.child.pid}`) pins.add(fd);
+        if (target) maps.add(fd);
+        const identity = /^\/proc\/self\/fd\/([0-9]+)\/stat$/.exec(name);
+        if (fault === "identity-changed" && mapsOpened && identity && pins.has(Number(identity[1]))) laterStats.add(fd);
+        return fd;
+      }) as typeof fs.openSync);
+      st.mock.method(fs, "readSync", ((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+        if (maps.has(fd) && fault === "partial-maps") {
+          mapReads++; if (mapReads > 1) return 0;
+          injections++; return buffer.write(row.slice(0, -1), offset, length, "latin1");
+        }
+        const size = original.read(fd, buffer, offset, length, position);
+        if (laterStats.has(fd) && size) {
+          const value = buffer.toString("latin1", offset, offset + size), end = value.lastIndexOf(") ");
+          const fields = value.slice(end + 2).trim().split(/\s+/); fields[19] = String(BigInt(fields[19]!) + 1n);
+          const changed = value.slice(0, end + 2) + fields.join(" ") + "\n";
+          assert(changed.length <= length); injections++; return buffer.write(changed, offset, length, "latin1");
+        }
+        return size;
+      }) as typeof fs.readSync);
+      st.mock.method(fs, "closeSync", (fd: number) => { pins.delete(fd); maps.delete(fd); laterStats.delete(fd); original.close(fd); });
+      syncBuiltinESMExports();
+      try {
+        const observed = await f.adapter.observe(); let originalResult: unknown;
+        const returned = await withSqliteSourceInventoryDiagnostics(f.adapter, async phase => {
+          phase("canary-single-inspection");
+          originalResult = await f.adapter.inspectWriters(observed); return originalResult;
+        }, output) as Awaited<ReturnType<typeof f.adapter.inspectWriters>>;
+        assert.strictEqual(returned, originalResult, "observer preserves the original return object");
+        assert.equal(injections, 1, "the target original fault point is invoked once"); assert.equal(user.child.exitCode, null);
+        assert(returned.some(item => item.code === "source_writer_unknown" && item.subjectRef === `unreadable-process:${user.child.pid}`));
+        const directories = await readdir(output);
+        assert.equal(directories.length, 1);
+        const report = JSON.parse(await readFile(path.join(output, directories[0]!, "report.json"), "utf8"));
+        assert.equal(report.inspectionCalls, 1);
+        assert.equal(report.restorationErrors, 0);
+        const failure = report.failures.find((item: { pid: number }) => item.pid === user.child.pid);
+        assert(failure); assert.equal(failure.phase, "canary-single-inspection");
+        assert.equal(failure.frame.observationErrors, 0);
+        if (fault === "EACCES" || fault === "ENOENT") {
+          assert(failure.frame.errors.some((event: { subject: string; error: { code: string; syscall: string } }) =>
+            event.subject === "maps" && event.error.code === fault && event.error.syscall === "open"));
+        } else if (fault === "partial-maps") {
+          assert.equal(failure.frame.maps[0].eof, true);
+          assert.equal(failure.frame.maps[0].endsWithNewline, false);
+          assert.equal(failure.frame.stageHint, "maps-input-shape");
+        } else {
+          assert.equal(failure.frame.stageHint, "identity-check");
+          assert.notEqual(failure.frame.stats[0].identity.startTicks, failure.frame.stats.at(-1).identity.startTicks);
+        }
+        assert(!JSON.stringify(report).includes("private diagnostic canary"), "raw error messages are not diagnostic output");
+        st.diagnostic(JSON.stringify({ fault, originalBlockerPreserved: true, inspectionCalls: report.inspectionCalls,
+          phase: failure.phase, pid: failure.pid, evidence: failure.frame }));
+      } finally { st.mock.restoreAll(); syncBuiltinESMExports(); }
+    });
+  } finally { await user.stop(); await f.close(); }
+});
+
+linuxTest("#152 inventory diagnostic failure cannot replace the original exception or retry its boundary", async () => {
+  const directory = await mkdtemp(path.join(process.cwd(), "br-inventory-diagnostic-"));
+  try {
+    const output = path.join(directory, "not-a-directory"); await writeFile(output, "fixed diagnostic failure");
+    const originalError = Object.assign(new Error("original boundary marker"), { code: "EIO" });
+    const blockers = [{ code: "source_writer_unknown", subjectRef: `unreadable-process:${process.pid}` }];
+    let calls = 0;
+    const adapter = { async inspectCurrentWriters() { calls++; return blockers; } };
+    await assert.rejects(withSqliteSourceInventoryDiagnostics(adapter, async () => {
+      assert.strictEqual(await adapter.inspectCurrentWriters(), blockers); throw originalError;
+    }, output), error => error === originalError);
+    assert.equal(calls, 1);
+    let throws = 0;
+    const throwing = { async inspectCurrentWriters() { throws++; throw originalError; } };
+    const originalMethod = throwing.inspectCurrentWriters;
+    await assert.rejects(withSqliteSourceInventoryDiagnostics(throwing,
+      () => throwing.inspectCurrentWriters(), output), error => error === originalError);
+    assert.equal(throws, 1); assert.strictEqual(throwing.inspectCurrentWriters, originalMethod);
+  } finally { await rm(directory, { recursive: true }); }
 });

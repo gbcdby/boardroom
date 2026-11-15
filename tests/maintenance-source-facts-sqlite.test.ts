@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, mkdir, open, readFile, readlink, writeFile, rm, realpath, stat, type FileHandle } from "node:fs/promises";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { mkdtemp, mkdir, open, readFile, readdir, readlink, writeFile, rm, realpath, stat, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runMigrations } from "../src/server/db/migrate.ts";
@@ -20,7 +22,9 @@ import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { verifyJournalChain } from "../src/server/storage/maintenance/journal.ts";
 import { buildSourceClientsRoster, sourceClientsDigest } from "../src/server/storage/maintenance/source-clients.ts";
 import { registerStorageSourceClient, storageReceiptDigest, type StorageClientLifecycle } from "../src/server/storage/source-client.ts";
+import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
 import type { JournalRecordV2, OperationMutex, SourceClientFactsWindow, SourceFilesManifest } from "../src/server/storage/maintenance/types.ts";
+import { withSqliteSourceCloseDiagnostics } from "./fixtures/maintenance-source-close-diagnostic.ts";
 
 async function fixture(withClient = false, encoding: "UTF-8" | "UTF-16le" | "UTF-16be" = "UTF-8", nativeChild = false,
   setup?: (driver: SqliteDriver, directory: string) => Promise<Partial<StorageClientLifecycle>>, initialGeneration = 1) {
@@ -436,16 +440,20 @@ test("A11A uses only the actually anchored first capture for old receipt generat
         activeMigrationId: f.plan.migrationId, planDigest: f.reference.planDigest, controlRootIdentity: f.store.identity as never,
         mutexIdentity: f.mutex.identity, journal: takeover, journalSequence: 3 });
     });
-    await f.adapter.withSourceLock("snapshot", lock => lock.withSourceClientFacts(f.reference, async window => {
-      assert.equal(window.observation.state.ownerGeneration, 2);
-      assert.equal(window.origin.kind, "captured-generation");
-      assert.equal(window.origin.receiptGeneration, 1);
-      assert.deepEqual(window.origin.capture, capture.head);
-      assert.deepEqual(window.origin.head, takeover);
-      assert.deepEqual(window.origin.chain.nodes.map(node => node.reference), [f.head, capture.head, takeover]);
-      assert.equal(window.clients[0]!.receipt!.ownerGeneration, 1);
-      await window.assertCurrent();
-    }));
+    await withSqliteSourceInventoryDiagnostics(f.adapter, phase => f.adapter.withSourceLock("snapshot",
+      lock => lock.withSourceClientFacts(f.reference, async window => {
+        phase("consume");
+        assert.equal(window.observation.state.ownerGeneration, 2);
+        assert.equal(window.origin.kind, "captured-generation");
+        assert.equal(window.origin.receiptGeneration, 1);
+        assert.deepEqual(window.origin.capture, capture.head);
+        assert.deepEqual(window.origin.head, takeover);
+        assert.deepEqual(window.origin.chain.nodes.map(node => node.reference), [f.head, capture.head, takeover]);
+        assert.equal(window.clients[0]!.receipt!.ownerGeneration, 1);
+        phase("consume-explicit-assert-current");
+        await window.assertCurrent();
+        phase("consume-return");
+      })));
     const db = new Database(f.file, { fileMustExist: true, timeout: 0 });
     try { db.prepare("UPDATE storage_source_clients SET last_observed_at=?").run("2026-11-15T12:00:00.000Z"); } finally { db.close(); }
     await assert.rejects(f.adapter.withSourceLock("snapshot", lock => lock.withSourceClientFacts(f.reference,
@@ -648,7 +656,7 @@ test("A11A SQLite uses both real lock modes without DML or new source artifacts"
     for (const mode of ["control", "snapshot"] as const) {
       if (mode === "snapshot") await anchorStructuralCapture(f);
       const before = await f.adapter.observe(), config = await readFile(f.environment.configFile!);
-      await f.adapter.withSourceLock(mode, async lock => {
+      await withSqliteSourceCloseDiagnostics(mode, f.file, f.adapter, () => f.adapter.withSourceLock(mode, async lock => {
         const assertCompetitorBlocked = () => new Promise<void>((resolve, reject) => {
           const competitor = spawn(process.execPath, ["--input-type=module", "-e", `
             import Database from 'better-sqlite3';
@@ -665,7 +673,7 @@ test("A11A SQLite uses both real lock modes without DML or new source artifacts"
           await assertCompetitorBlocked();
         });
         await assertCompetitorBlocked();
-      });
+      }));
       const after = await f.adapter.observe();
       assert.deepEqual(after.manifests, before.manifests); assert.deepEqual(after.state, before.state); assert.deepEqual(after.clients, before.clients);
       assert.deepEqual(await readFile(f.environment.configFile!), config);
@@ -675,16 +683,82 @@ test("A11A SQLite uses both real lock modes without DML or new source artifacts"
 
 test("A11A SQLite rejects and sanitizes a real-handle close completion fault", async t => {
   const f = await fixture(true); const original = Database.prototype.close; let attempted = false, consumed = false;
+  const output = path.join(f.directory, "close-diagnostic");
   try {
     t.mock.method(Database.prototype, "close", function(this: Database.Database) {
       const result = Reflect.apply(original, this, []);
       if (this.name === f.file && !attempted) { attempted = true; throw new Error("private-sqlite-facts-close-canary"); }
       return result;
     });
-    await assert.rejects(f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference,
-      async () => { consumed = true; })), error => /maintenance_lost/.test(String(error)) && !String(error).includes("canary"));
+    let observedError: unknown;
+    await assert.rejects(withSqliteSourceCloseDiagnostics("control", f.file, f.adapter,
+      () => f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference,
+        async () => { consumed = true; })).catch(error => { observedError = error; throw error; }), output),
+    error => error === observedError && /maintenance_lost/.test(String(error)) && !String(error).includes("canary"));
     assert.equal(attempted, true); assert.equal(consumed, false);
+    const files = await readdir(output); assert.equal(files.length, 1);
+    const bytes = await readFile(path.join(output, files[0]!, "report.json"), "utf8"), report = JSON.parse(bytes);
+    assert.equal(report.failures[0].phase, "native-close");
+    assert.equal(report.failures[0].nativeCloseCalls, 1);
+    assert.equal(report.failures[0].nativeCloseReturned, false);
+    assert.equal(report.originalOperationThrew, true);
+    assert.equal(report.restorationErrors, 0);
+    assert(!bytes.includes("private-sqlite-facts-close-canary"));
   } finally { t.mock.restoreAll(); await f.close(); }
+});
+
+test("A11A close diagnostics preserve post-close syscall and semantic failures", async t => {
+  if (process.platform !== "linux") { t.skip("Linux self proc close-inventory diagnostics; native close canary is cross-platform"); return; }
+  for (const fault of ["read-error", "malformed-maps"] as const) await t.test(fault, async t => {
+    const f = await fixture(true), output = path.join(f.directory, "close-diagnostic");
+    const originals = { close: Database.prototype.close, open: fs.openSync, read: fs.readSync, closeFd: fs.closeSync };
+    const mapFds = new Set<number>(); let armed = false, injected = false, malformedFd: number | undefined;
+    try {
+      t.mock.method(Database.prototype, "close", function(this: Database.Database) {
+        const result = Reflect.apply(originals.close, this, []);
+        if (this.name === f.file) armed = true;
+        return result;
+      });
+      t.mock.method(fs, "openSync", ((file: fs.PathLike, ...args: unknown[]) => {
+        const fd = Reflect.apply(originals.open, fs, [file, ...args]) as number;
+        if (armed && String(file) === "/proc/self/maps") mapFds.add(fd);
+        return fd;
+      }) as typeof fs.openSync);
+      t.mock.method(fs, "readSync", ((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+        if (fd === malformedFd) return 0;
+        if (mapFds.has(fd) && !injected) {
+          injected = true;
+          if (fault === "read-error") throw Object.assign(new Error("private-close-read-canary"), { code: "EIO", syscall: "read" });
+          malformedFd = fd; return buffer.write("invalid-maps-canary\n", offset, length, "latin1");
+        }
+        return originals.read(fd, buffer, offset, length, position);
+      }) as typeof fs.readSync);
+      t.mock.method(fs, "closeSync", (fd: number) => {
+        mapFds.delete(fd); if (malformedFd === fd) malformedFd = undefined; return originals.closeFd(fd);
+      });
+      syncBuiltinESMExports();
+      let consumed = false, observedError: unknown;
+      await assert.rejects(withSqliteSourceCloseDiagnostics("control", f.file, f.adapter,
+        () => f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference,
+          async () => { consumed = true; })).catch(error => { observedError = error; throw error; }), output), error => {
+        assert.equal(error, observedError); assert.equal((error as { code: string }).code, "maintenance_lost"); return true;
+      });
+      assert.equal(injected, true); assert.equal(consumed, false);
+      const directories = await readdir(output); assert.equal(directories.length, 1);
+      const directory = path.join(output, directories[0]!), report = JSON.parse(await readFile(path.join(directory, "report.json"), "utf8"));
+      const failure = report.failures[0];
+      assert.equal(failure.phase, "post-close-inventory"); assert.equal(failure.nativeCloseCalls, 1);
+      assert.equal(failure.nativeCloseReturned, true); assert.equal(report.originalOperationThrew, true);
+      assert.equal(report.restorationErrors, 0);
+      assert.equal(failure.error.code, fault === "read-error" ? "EIO" : null);
+      if (fault === "read-error") assert.equal(failure.error.syscall, "read");
+      else {
+        const capture = failure.captures.find((item: { kind: string }) => item.kind === "self-maps");
+        assert(capture); assert.equal(capture.eof, true); assert.equal(capture.truncated, false);
+        assert.equal(await readFile(path.join(directory, capture.file), "latin1"), "invalid-maps-canary\n");
+      }
+    } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
+  });
 });
 
 test("A11A refuses an uncertain registered-process handle close without exposing its error", async t => {
