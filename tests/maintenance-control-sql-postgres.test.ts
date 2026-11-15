@@ -5,6 +5,7 @@ import { postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgr
 import { controlSeedColumns, controlSqlVector } from "./fixtures/maintenance-control-sql.ts";
 import { applyUntrustedControlSql, controlSqlOutcome, resolveUntrustedControlSql } from "../src/server/storage/maintenance/control-sql.ts";
 import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";
+import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import type { SourceLock } from "../src/server/storage/maintenance/types.ts";
 const pgTest = process.env.AGENT_STUDIO_PG_TEST_URL ? test : test.skip;
 const invokeQuery = (query: typeof Client.prototype.query, client: Client, args: unknown[]) => Reflect.apply(query, client, args) as Promise<QueryResult>;
@@ -109,7 +110,7 @@ pgTest("A12-C PostgreSQL row, constraint, anchor and after failures cannot leave
   });
 });
 
-pgTest("A12-C PostgreSQL exact successor classification cannot be replaced with an orphan or a larger sequence", async () => {
+pgTest("A12-C PostgreSQL exact successor classification cannot be replaced with an orphan or a larger sequence", async t => {
   const f = await fixture(); let first: SourceLock | undefined;
   try {
     await f.adapter.withSourceLock("control", async lock => { first = lock; return applyUntrustedControlSql(lock, f.v.input(f.v.insertedRef)); });
@@ -117,7 +118,24 @@ pgTest("A12-C PostgreSQL exact successor classification cannot be replaced with 
     await f.mutex.release();
     assert.equal((await resolveUntrustedControlSql(f.adapter, first!)).classification, "unknown");
     assert.equal((await resolveUntrustedControlSql(f.adapter, first!, f.v.input(f.v.zeroRef))).classification, "unknown");
-    assert.equal((await resolveUntrustedControlSql(f.adapter, first!, f.v.input(f.v.updatedRef))).classification, "observed-legal-successor");
+    const resolution = await resolveUntrustedControlSql(f.adapter, first!, f.v.input(f.v.updatedRef));
+    if (resolution.classification !== "observed-legal-successor") {
+      try {
+        const error = "error" in resolution ? resolution.error : undefined;
+        const outcome = controlSqlOutcome(first!);
+        const oldLock: Record<string, boolean | null> = {};
+        for (const key of ["localSourceHandleClosed", "localMutexHandleClosed", "afterValidated", "finalValidated", "commitStarted", "commitReturned",
+          "failureObserved", "rollbackFailureObserved", "closeFailureObserved"] as const) oldLock[key] = typeof outcome[key] === "boolean" ? outcome[key]! : null;
+        const diagnostic = JSON.stringify({ phase: "legal-successor", classification: resolution.classification,
+          reason: "reason" in resolution && ["old-local-handle-exit-unproven", "fresh-observation-or-close-unproven"].includes(resolution.reason) ? resolution.reason : null,
+          errorPresent: "error" in resolution,
+          errorKind: error instanceof MaintenanceFailure ? "MaintenanceFailure" : error === null ? "null" : typeof error,
+          errorCode: error instanceof MaintenanceFailure && /^[a-z][a-z0-9_]{0,63}$/.test(error.code) ? error.code : null,
+          oldLock });
+        if (Buffer.byteLength(diagnostic) <= 2048) t.diagnostic(diagnostic);
+      } catch { /* Observation must never replace the original classification assertion. */ }
+    }
+    assert.equal(resolution.classification, "observed-legal-successor");
     const changed = await f.connect();
     try { await changed.query("UPDATE storage_maintenance SET journal_sequence=99"); } finally { await f.closeClient(changed); }
     assert.equal((await resolveUntrustedControlSql(f.adapter, first!, f.v.input(f.v.updatedRef))).classification, "unknown");
