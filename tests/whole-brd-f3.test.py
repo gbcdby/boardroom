@@ -1,9 +1,11 @@
 """F3 offline controls. Synthetic envelopes are never native qualification evidence."""
 from __future__ import annotations
 import copy
+from contextlib import contextmanager, ExitStack
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -658,6 +660,126 @@ class BundleAndRunnerControls(unittest.TestCase):
                 result=runner.execute("/unused/BUNDLE.json","0"*64,"/unused/output")
             self.assertEqual(result["state"],state);self.assertEqual(artifacts.closed,1)
             self.assertEqual(result["attempts"],1);self.assertEqual(result["guest_attempts"],1)
+
+class PrivateInputClosureControls(unittest.TestCase):
+    @contextmanager
+    def fixed_inputs(self):
+        """Only synthetic ordinary files and an explicit test source literal; no real input inventory."""
+        builder = load_module("f3_private_input_control", ROOT / "scripts/qualification/whole-brd/f3-build.py")
+        with tempfile.TemporaryDirectory(prefix="f3-private-control-") as temporary:
+            base = Path(temporary).resolve(); here = base / "source"; here.mkdir()
+            inputs = base / "inputs"; inputs.mkdir(); provider = inputs / "provider/usr"
+            lib = provider / "lib/x86_64-linux-gnu"; lib.mkdir(parents=True)
+            modules = lib / "qemu"; modules.mkdir()
+            firmware = provider / "share/qemu"; firmware.mkdir(parents=True)
+            def item(location, raw):
+                file = (here if location["root"] == "source" else inputs) / location["path"]
+                file.parent.mkdir(parents=True, exist_ok=True); file.write_bytes(raw)
+                return location | {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+            libraries = []
+            for index in range(50):
+                name = "fixture-loader" if index == 0 else "libfixture-%02d.so" % index
+                location = {"root": "input", "path": "provider/usr/lib/x86_64-linux-gnu/" + name}
+                bound = item(location, ("library control %d" % index).encode())
+                libraries.append({"requested": location, "resolved": location, "links": [],
+                                  "bytes": bound["bytes"], "sha256": bound["sha256"], "origin": "fixed_package", "old_comparison": "unknown"})
+            requested = {"root": "input", "path": "provider/usr/lib/x86_64-linux-gnu/libfixture-alias.so"}
+            (inputs / requested["path"]).symlink_to("libfixture-01.so")
+            libraries[1]["requested"] = requested; libraries[1]["links"] = [{"at": requested, "target": "libfixture-01.so"}]
+            module_entries = []
+            for index in range(12):
+                name = "fixture-module-%02d.so" % index; raw = ("optional module %d" % index).encode()
+                (modules / name).write_bytes(raw)
+                module_entries.append({"name": name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(), "needed": []})
+            (firmware / "linuxboot_dma.bin").write_bytes(b"synthetic boot rom")
+            interpreter = str(inputs / libraries[0]["requested"]["path"]).encode() + b"\0"
+            qemu = bytearray(120 + len(interpreter)); qemu[:7] = b"\x7fELF\x02\x01\x01"
+            struct.pack_into("<HH", qemu, 16, 2, 62); struct.pack_into("<Q", qemu, 32, 64)
+            struct.pack_into("<HH", qemu, 54, 56, 1); struct.pack_into("<I", qemu, 64, 3)
+            struct.pack_into("<Q", qemu, 72, 120); struct.pack_into("<Q", qemu, 96, len(interpreter)); qemu[120:] = interpreter
+            kernel = bytearray(0x208); kernel[0x202:0x206] = b"HdrS"; struct.pack_into("<H", kernel, 0x206, 0x20f)
+            core = {}
+            for name in ("qemu", "kernel", "bios", "busybox", "notes", "brd", "config"):
+                location = {"root": "input", "path": "leaves/" + name}; raw = ("core " + name).encode()
+                if name == "qemu": location["path"] = "provider/usr/bin/qemu-system-x86_64"; raw = bytes(qemu)
+                elif name == "kernel": raw = bytes(kernel)
+                elif name == "brd": raw = b"B" * 30017
+                elif name == "config":
+                    location = {"root": "source", "path": "mke2fs-f2.conf"}
+                    raw = (ROOT / "scripts/qualification/whole-brd/mke2fs-f2.conf").read_bytes()
+                core[name] = item(location, raw)
+            payload = {name: item({"root": "input", "path": "payload-root/" + name}, ("payload " + name).encode()) for name in f2.PAYLOAD_FILES}
+            for name, target in f2.PAYLOAD_LINKS.items():
+                file = inputs / "payload-root" / name; file.parent.mkdir(parents=True, exist_ok=True); file.symlink_to(target)
+            cache_file = item({"root": "input", "path": "synthetic-host/cache"}, b"synthetic ld cache")
+            cache_location = {key: cache_file[key] for key in ("root", "path")}
+            host = inputs / "synthetic-host"; (host / "absent").mkdir()
+            paths = {"cache": str(inputs / cache_file["path"]), "preload": str(host / "absent/preload"),
+                     "module_roots": [str(host / "absent/modules"), str(host / "absent/upgrade")],
+                     "firmware_roots": [str(host / ("absent/firmware-%d" % i)) for i in range(3)]}
+            catalog = {"format_version": 1, "kind": "FIXED_F3_INPUT_CLOSURE_NOT_BOOTED",
+                       "provenance": {"description": "Synthetic test input, never qualification", "old_manifest_equivalence": "NOT_ESTABLISHED"},
+                       "core": core, "payload": payload, "payload_aliases": dict(f2.PAYLOAD_LINKS), "libraries": libraries,
+                       "provider_libraries": {"path": "provider/usr/lib/x86_64-linux-gnu", "entries": builder.build.data_inventory(str(lib))},
+                       "provider_executables": {"path": "provider/usr/bin", "entries": builder.build.data_inventory(str(provider / "bin"))},
+                       "firmware": {"path": "provider/usr/share/qemu", "entries": builder.build.data_inventory(str(firmware)), "targets": []},
+                       "modules": {"path": "provider/usr/lib/x86_64-linux-gnu/qemu", "entries": module_entries, "role": "inventory_only_not_observed_runtime_load"},
+                       "runtime_use": "NOT_OBSERVED", "runtime": {"loader": libraries[0]["requested"],
+                           "cache": {"requested": cache_location, "resolved": cache_location, "links": [], "bytes": cache_file["bytes"], "sha256": cache_file["sha256"]},
+                           "search_profile": "fixed-q35-direct-kernel-v1", "kernel_protocol": 0x20f, "boot_rom": "linuxboot_dma.bin"}}
+            (here / "f3-inputs.json").write_bytes((ROOT / "scripts/qualification/whole-brd/f3-inputs.json").read_bytes())
+            raw = raw_json(catalog); (inputs / "F3-INPUTS.private.json").write_bytes(raw)
+            request = {"run_id": RUN, "input_kind": catalog["kind"], "input_root": str(inputs)}
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(builder, "HERE", here))
+                stack.enter_context(patch.object(builder, "PRIVATE_CATALOG_SHA256", hashlib.sha256(raw).hexdigest()))
+                stack.enter_context(patch.object(builder, "official_core_pins", return_value={k: v["sha256"] for k, v in core.items()}))
+                stack.enter_context(patch.object(builder, "host_runtime_paths", return_value=paths))
+                stack.enter_context(patch.object(f2, "NOTES_SHA", core["notes"]["sha256"]))
+                stack.enter_context(patch.object(f2, "BRD_SHA", core["brd"]["sha256"]))
+                stack.enter_context(patch.object(f2, "PAYLOAD_FILES", {name: (v["bytes"], v["sha256"], f2.PAYLOAD_FILES[name][2]) for name, v in payload.items()}))
+                yield builder, request, inputs, here, catalog, paths
+
+    def test_fixed_private_source_reads_real_synthetic_routes_and_preflight_without_starting_programs(self):
+        with self.fixed_inputs() as (builder, request, inputs, _, catalog, _):
+            with patch.object(builder.subprocess, "run", side_effect=AssertionError("no process")) as child:
+                closure, data, payload = builder.verify_input_closure(request)
+            child.assert_not_called(); self.assertEqual(len(closure["libraries"]), 50); self.assertEqual(len(payload), 8)
+            self.assertEqual(closure["core"]["qemu"]["path"], str(inputs / catalog["core"]["qemu"]["path"]))
+            self.assertEqual(closure["runtime_inputs"]["status"], "FIXED_PRECONDITIONS_NOT_RUNTIME_EVIDENCE")
+            self.assertEqual(closure["runtime_use"], "NOT_OBSERVED")
+
+
+class PrivateInputAuthorityControls(unittest.TestCase):
+    def test_public_source_refuses_every_new_kind_entry_before_any_effect(self):
+        builder = load_module("f3_public_authority", ROOT / "scripts/qualification/whole-brd/f3-build.py")
+        runner = load_module("f3_public_run_authority", ROOT / "scripts/qualification/whole-brd/f3-run.py")
+        self.assertIsNone(builder.PRIVATE_CATALOG_SHA256)
+        request = {"run_id": RUN, "input_kind": "FIXED_F3_INPUT_CLOSURE_NOT_BOOTED", "input_root": "/unused/private-input"}
+        with tempfile.TemporaryDirectory(prefix="f3-public-reject-") as directory:
+            root = Path(directory); bundle = root / "BUNDLE.json"
+            raw = raw_json({"kind": request["input_kind"]}); bundle.write_bytes(raw)
+            with patch.object(builder.subprocess, "run") as process, \
+                 patch.object(runner, "Artifacts") as artifacts, patch.object(runner, "create_claim") as claim, \
+                 patch.object(runner, "OwnedChild") as child:
+                for callback in (lambda: builder.read_input_catalog(root), lambda: builder.verify_input_closure(request),
+                                 lambda: builder.prepare_input_closure(request, root / "output"),
+                                 lambda: builder.prepare(request, root / "output"),
+                                 lambda: runner.validate(str(bundle), hashlib.sha256(raw).hexdigest()),
+                                 lambda: runner.execute(str(bundle), hashlib.sha256(raw).hexdigest(), root / "output")):
+                    with self.subTest(entry=callback), self.assertRaisesRegex(ValueError, "private_source_not_pinned"):
+                        callback()
+                process.assert_not_called(); artifacts.assert_not_called(); claim.assert_not_called(); child.assert_not_called()
+            self.assertFalse((root / "output").exists())
+
+    def test_environment_or_request_cannot_set_the_private_source_literal(self):
+        builder = load_module("f3_private_pin_override", ROOT / "scripts/qualification/whole-brd/f3-build.py")
+        request = {"run_id": RUN, "input_kind": "FIXED_F3_INPUT_CLOSURE_NOT_BOOTED", "input_root": "/unused"}
+        with patch.dict(os.environ, {"PRIVATE_CATALOG_SHA256": "a" * 64, "F3_INPUTS": "/unused/approved"}):
+            for addition in ({}, {"verified": True}, {"catalog_sha256": "a" * 64}, {"private_pin": "a" * 64}):
+                with self.subTest(addition=addition), self.assertRaisesRegex(ValueError, "private_source_not_pinned"):
+                    builder.verify_input_closure(request | addition)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -26,6 +26,7 @@ builder = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(build
 
 def validate(bundle_path, digest):
     binding, raw = build.file_binding(bundle_path, f2.MIB, digest); bundle = f0b._json(raw)
+    if bundle.get("kind") == builder.NEW_INPUT_KIND: builder.require_private_source()
     if bundle.get("state") != "FIXED_F3_BUNDLE_NOT_BOOTED": raise ValueError("fixed offline F3 bundle required")
     run_id = bundle["request"]["run_id"]
     if bundle["proposal"] != f3.plan(json.dumps({"run_id": run_id}).encode()): raise ValueError("F3 proposal changed")
@@ -34,11 +35,25 @@ def validate(bundle_path, digest):
         raise ValueError("fixed mkfs contract changed")
     keys = {"qemu", "kernel", "bios", "busybox", "notes", "gate", "helper", "brd", "config", "initramfs"}
     if set(bundle["inputs"]) != keys or set(bundle["e2fs"]) != set(f2.PAYLOAD_FILES): raise ValueError("fixed input set changed")
-    _, base = builder.verify_base(bundle["base_bundle"]["path"], bundle["base_bundle"]["sha256"])
-    for key in ("qemu", "kernel", "bios", "busybox", "notes", "gate"):
-        if bundle["inputs"][key]["sha256"] != base["inputs"][key]["sha256"]: raise ValueError("provider/gate input changed")
-    if any(bundle[name] != base[name] for name in ("libraries", "qemu_data", "runtime_environment")):
-        raise ValueError("provider runtime closure changed")
+    if bundle.get("kind") == builder.NEW_INPUT_KIND:
+        f0._fields(bundle, ("kind", "state", "qualification", "guest_execution", "request", "proposal", "source", "inputs",
+                           "e2fs", "commands", "input_closure", "libraries", "qemu_data", "runtime_environment", "compiler",
+                           "archive", "mkfs_argv", "mkfs_environment", "elapsed_seconds"))
+        if bundle["qualification"] != "UNSUPPORTED" or bundle["guest_execution"] != "NOT_RUN":
+            raise ValueError("offline input cannot assert a runtime qualification")
+        closure, _, _ = builder.verify_input_closure(bundle["request"])
+        if closure != bundle["input_closure"]: raise ValueError("fixed F3 input closure changed")
+        if any(bundle["inputs"][key] != value for key, value in closure["core"].items()):
+            raise ValueError("actual provider input route/bytes changed")
+        if bundle["e2fs"] != closure["payload"] or any(bundle[name] != closure[name] for name in ("libraries", "qemu_data", "runtime_environment")):
+            raise ValueError("new input family was mixed with another runtime closure")
+    else:
+        if "input_kind" in bundle["request"]: raise ValueError("new input family cannot be relabelled as a legacy bundle")
+        _, base = builder.verify_base(bundle["base_bundle"]["path"], bundle["base_bundle"]["sha256"])
+        for key in ("qemu", "kernel", "bios", "busybox", "notes", "gate"):
+            if bundle["inputs"][key]["sha256"] != base["inputs"][key]["sha256"]: raise ValueError("provider/gate input changed")
+        if any(bundle[name] != base[name] for name in ("libraries", "qemu_data", "runtime_environment")):
+            raise ValueError("provider runtime closure changed")
     inputs = {name: build.file_binding(item["path"], 64 * f2.MIB, item["sha256"])[1] for name, item in bundle["inputs"].items()}
     if hashlib.sha256(inputs["brd"]).hexdigest() != f2.BRD_SHA: raise ValueError("module changed")
     f2.config_bytes(inputs["config"])
@@ -65,6 +80,8 @@ create_claim = _old.create_claim
 def execute(bundle_path, digest, output):
     started = time.monotonic()
     binding, bundle, inputs = validate(bundle_path, digest)
+    if bundle.get("kind") == builder.NEW_INPUT_KIND:
+        raise ValueError("runtime_use_NOT_ESTABLISHED")
     run_id = bundle["request"]["run_id"]; out = Path(f0._asset_path(str(Path(output).absolute())))
     artifacts = Artifacts(out)
     result = {"kind": "private-f3-source-preservation-run", "bundle": binding, "proposal": bundle["proposal"], "state": "NOT_STARTED",
