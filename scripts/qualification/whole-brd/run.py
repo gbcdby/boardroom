@@ -22,6 +22,22 @@ import f0b
 from supervise import OwnedChild, QMP, bounded_read, result_state
 
 
+def _wait_for_qmp(socket_path, owned, drain):
+    deadline = time.monotonic() + 3
+    while not socket_path.exists():
+        drain()
+        returncode = owned.proc.poll()
+        if returncode is not None:
+            raise ChildProcessError(f"owned child exited before QMP readiness: returncode={returncode}")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("owned QMP socket not ready")
+        select.select([owned.proc.stdout], [], [], 0.005)
+
+
+def _execution_error_state(error, ordinary_started):
+    return "TIMEOUT" if isinstance(error, TimeoutError) else "BOOT_FAILED" if ordinary_started is None else "ORDINARY_FAILED"
+
+
 def execute(bundle_path, digest, output):
     started = time.monotonic()
     bundle_binding, raw = build.file_binding(bundle_path, f0b.MIB, digest)
@@ -140,12 +156,8 @@ def execute(bundle_path, digest, output):
         result["actual_child"] = {"before": owned.before, "after": owned.after, "events": owned.events}
         # One connection after bounded readiness of our own socket; no
         # alternate socket or connection retry is attempted.
-        socket_path = directory / "qmp.sock"; qmp_deadline = time.monotonic() + 3
-        while not socket_path.exists():
-            drain()
-            if owned.proc.poll() is not None or time.monotonic() >= qmp_deadline:
-                raise TimeoutError("owned QMP socket not ready")
-            select.select([owned.proc.stdout], [], [], 0.005)
+        socket_path = directory / "qmp.sock"
+        _wait_for_qmp(socket_path, owned, drain)
         if not stat.S_ISSOCK(socket_path.lstat().st_mode): raise ValueError("owned QMP path is not a socket")
         qmp = QMP(str(socket_path))
         boot_deadline = boot_started + 60
@@ -162,7 +174,7 @@ def execute(bundle_path, digest, output):
             capture = f0b.decode_serial(bytes(serial), run_id, input_bytes["notes"])
             result["ordinary"] = capture["state"]; result["policy"] = capture["policy"]
     except BaseException as error:
-        fail("TIMEOUT" if isinstance(error, TimeoutError) else "BOOT_FAILED" if ordinary_started is None else "ORDINARY_FAILED", error, "execution")
+        fail(_execution_error_state(error, ordinary_started), error, "execution")
         if hasattr(error, "owned_cleanup"): result["constructor_cleanup"] = error.owned_cleanup
     finally:
         if owned is not None:

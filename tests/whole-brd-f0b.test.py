@@ -234,5 +234,60 @@ class ResultBoundaries(unittest.TestCase):
                 with self.subTest(candidate=candidate), self.assertRaises(ValueError): supervise.pinned_executable(candidate,digest)
 
 
+class QMPReadinessTests(unittest.TestCase):
+    def test_early_exit_is_boot_failed_with_returncode_serial_and_cleanup_preserved(self):
+        import run, supervise
+        for code in (1, 0, -9):
+            with self.subTest(returncode=code):
+                serial = bytearray()
+                original_bytes = b"controlled QMP failure diagnostic\n"
+                def drain(): serial.extend(original_bytes)
+                proc = SimpleNamespace(returncode=code, poll=unittest.mock.Mock(return_value=code),
+                                       stdout=SimpleNamespace(close=unittest.mock.Mock()))
+                owned = object.__new__(supervise.OwnedChild)
+                owned.proc = proc; owned._finished = False
+                owned.ack = owned.pidfd = owned.status = None
+                path = SimpleNamespace(exists=unittest.mock.Mock(return_value=False))
+                with patch.object(run.time, "monotonic", side_effect=[100, 100.5]), \
+                     patch.object(run.select, "select") as wait:
+                    with self.assertRaises(ChildProcessError) as caught:
+                        run._wait_for_qmp(path, owned, drain)
+                wait.assert_not_called(); proc.poll.assert_called_once_with()
+                self.assertEqual(run._execution_error_state(caught.exception, None), "BOOT_FAILED")
+                self.assertIn("returncode=" + str(code), str(caught.exception))
+                self.assertEqual(bytes(serial), original_bytes)
+                cleanup = owned.cleanup(None)
+                self.assertTrue(cleanup["verified"])
+                self.assertEqual(cleanup["wait"], {"reaped":True,"returncode":code})
+                self.assertEqual(supervise.result_state(None, {"state":"BOOT_FAILED"}, cleanup), "BOOT_FAILED")
+                first = {"state":"OUTPUT_LIMIT","phase":"serial","errno":errno.EIO}
+                self.assertEqual(supervise.result_state(None, first, cleanup), "OUTPUT_LIMIT")
+                self.assertEqual(first, {"state":"OUTPUT_LIMIT","phase":"serial","errno":errno.EIO})
+
+    def test_live_child_at_actual_virtual_deadline_remains_timeout(self):
+        import run
+        proc = SimpleNamespace(poll=unittest.mock.Mock(return_value=None), stdout=object())
+        path = SimpleNamespace(exists=unittest.mock.Mock(return_value=False))
+        drain = unittest.mock.Mock()
+        with patch.object(run.time, "monotonic", side_effect=[100, 103]), \
+             patch.object(run.select, "select") as wait:
+            with self.assertRaises(TimeoutError) as caught:
+                run._wait_for_qmp(path, SimpleNamespace(proc=proc), drain)
+        self.assertEqual(run._execution_error_state(caught.exception, None), "TIMEOUT")
+        drain.assert_called_once_with(); proc.poll.assert_called_once_with(); wait.assert_not_called()
+
+    def test_ready_path_returns_without_a_connection_or_extra_child_poll(self):
+        import run
+        proc = SimpleNamespace(poll=unittest.mock.Mock(return_value=None), stdout=object())
+        path = SimpleNamespace(exists=unittest.mock.Mock(side_effect=[False, True]))
+        drain = unittest.mock.Mock()
+        with patch.object(run.time, "monotonic", side_effect=[100, 100.01]), \
+             patch.object(run.select, "select") as wait:
+            self.assertIsNone(run._wait_for_qmp(path, SimpleNamespace(proc=proc), drain))
+        drain.assert_called_once_with(); proc.poll.assert_called_once_with()
+        wait.assert_called_once_with([proc.stdout], [], [], 0.005)
+        self.assertEqual(path.exists.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

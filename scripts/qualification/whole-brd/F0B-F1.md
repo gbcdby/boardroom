@@ -50,6 +50,8 @@ console=ttyS0,115200n8 rdinit=/init loglevel=4 panic=0 bdev_allow_write_mounted=
 
 实际回收完成与运行正常退出分别判断。已 reap 的非零退出或信号终止保留原 returncode，总结果为 `GUEST_FAILED`；退出结果缺失或未证为 `EXIT_UNPROVEN`，不能由完整 ordinary 帧补成成功。更早的原错误仍优先。串口关闭失败保留原 errno，cleanup 标为未证并继续其它句柄收尾及已有串口/结果保存；失败关闭不隐式重试。
 
+QMP 就绪等待也区分提前退出和实际期限：路径尚未出现且 child 已退出时保存 returncode，ordinary 尚未开始则沿用 `BOOT_FAILED`；child 仍存活并到达原三秒期限才为 `TIMEOUT`。原 serial、first-error、回收与单次 claim 语义保持不变，历史运行原件不回写。
+
 运行入口需要已独审的 bundle 摘要及新的输出目录。摘要不是授权 token；本实现交付阶段不执行此入口：
 
 ```sh
