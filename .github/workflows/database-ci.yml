@@ -127,6 +127,9 @@ jobs:
       - name: whole-brd F0 纯准备控制
         run: python3 -B tests/whole-brd-f0.test.py
 
+      - name: whole-brd F0B/F1 离线输入与回收边界
+        run: python3 -B tests/whole-brd-f0b.test.py
+
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
