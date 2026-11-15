@@ -1,5 +1,5 @@
-import { constants, type BigIntStats } from "node:fs";
-import { lstat, open, readdir, realpath, type FileHandle } from "node:fs/promises";
+import { constants, closeSync, fstatSync, lstatSync, openSync, realpathSync, type BigIntStats } from "node:fs";
+import { lstat, open, opendir, readdir, realpath, type FileHandle } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { MaintenanceFailure } from "./error.ts";
@@ -40,12 +40,16 @@ export class SourceFilesRestoreFailure extends MaintenanceFailure {
   }
 }
 
-interface HeldDirectory { readonly file: string; readonly identity: PathIdentity; readonly handle: FileHandle; readonly access: RestoreDirectory }
+interface HeldDirectory {
+  readonly file: string; readonly identity: PathIdentity; readonly handle: FileHandle;
+  readonly access: RestoreDirectory; readonly witness: number | undefined;
+}
 interface HeldFile {
   readonly entry: Extract<SourceFileEntry, {kind: "file"}>;
   readonly identity: PathIdentity;
   readonly handle: FileHandle;
-  readonly facts: BigIntStats;
+  readonly witness: number;
+  facts: BigIntStats;
 }
 const identity = (file: string, info: BigIntStats): PathIdentity => ({ path: file, device: String(info.dev), inode: String(info.ino) });
 const sameIdentity = (a: PathIdentity, b: PathIdentity) => a.path === b.path && a.device === b.device && a.inode === b.inode;
@@ -53,11 +57,62 @@ const modeOf = (info: BigIntStats) => (info.mode & 0o7777n).toString(8).padStart
 const modeNumber = (mode: string) => Number.parseInt(mode, 8);
 const invalid = (): never => { throw new MaintenanceFailure("snapshot_invalid"); };
 const isOwned = (info: BigIntStats) => process.getuid !== undefined && info.uid === BigInt(process.getuid());
+const factFields = ["dev", "ino", "mode", "uid", "nlink", "size", "mtimeNs", "ctimeNs"] as const;
+const sameFacts = (a: BigIntStats, b: BigIntStats) => factFields.every(field => a[field] === b[field]);
 const key = (entry: SourceFileEntry) => `${entry.sourceRoot}/${entry.sourceRelativePath}`;
 const relative = (entry: SourceFileEntry) => path.join(entry.sourceRoot, entry.sourceRelativePath);
 // Local execution budgets, not new Fs codec or provider eligibility rules.
 const MAX_MANIFEST_BYTES = 16n * 1024n * 1024n;
 const MAX_ENTRIES = 4096, MAX_DIRECTORIES = 256, MAX_TARGET_HANDLES = 512;
+const MAX_PROTECTED_ENTRIES = 16384, MAX_PROTECTED_DEPTH = 64;
+
+/** Read-only internal guard; successful inspection grants no source or restore authority. */
+export async function assertRestoreArtifactSeparation(store: ArtifactStore, targets: readonly PathIdentity[]): Promise<void> {
+  const forbidden = new Set(targets.map(item => `${item.device}:${item.inode}`));
+  const visited = new Set<string>(), checked = new Map<string, BigIntStats>();
+  const pending: { file: string; depth: number; expected: BigIntStats }[] = [];
+  let count = 0;
+  const directory = (info: BigIntStats) => {
+    const id = `${info.dev}:${info.ino}`;
+    if (!info.isDirectory() || !isOwned(info) || (info.mode & 0o7777n) !== 0o700n || forbidden.has(id) || visited.has(id)) invalid();
+    visited.add(id);
+  };
+  for (const name of ["plans", "journals", "snapshots"]) {
+    const file = path.join(store.root, name);
+    let info: BigIntStats;
+    try { info = await lstat(file, { bigint: true }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+    directory(info); pending.push({ file, depth: 0, expected: info });
+  }
+  // Inspect the entire protected directory domain, not only the three top-level
+  // names. A pre-existing bind alias retains the protected descendant's dev/ino.
+  for (let index = 0; index < pending.length; index++) {
+    const { file, depth, expected } = pending[index]!;
+    const before = await lstat(file, { bigint: true });
+    if (!sameFacts(before, expected) || await realpath(file) !== file) invalid();
+    const stream = await opendir(file, { bufferSize: 32 });
+    let failed = false, firstError: unknown;
+    try {
+      for (;;) {
+        const entry = await stream.read(); if (entry === null) break;
+        if (++count > MAX_PROTECTED_ENTRIES) throw new MaintenanceFailure("restore_verification_unavailable", "file-restore-artifact-budget");
+        const child = path.join(file, entry.name), info = await lstat(child, { bigint: true });
+        if (info.isDirectory()) {
+          if (depth >= MAX_PROTECTED_DEPTH) throw new MaintenanceFailure("restore_verification_unavailable", "file-restore-artifact-budget");
+          directory(info); pending.push({ file: child, depth: depth + 1, expected: info });
+        } else if (!info.isFile() || !isOwned(info) || info.nlink !== 1n || (info.mode & 0o7777n) !== 0o600n) invalid();
+      }
+      if (!sameFacts(before, await lstat(file, { bigint: true }))) invalid();
+      checked.set(file, before);
+    } catch (error) { failed = true; firstError = error; }
+    try { await stream.close(); }
+    catch (error) { throw new RestoreDirectoryFailure(failed ? firstError : error, [error], !failed); }
+    if (failed) throw firstError;
+  }
+  // An earlier directory must not have changed while its descendants were read.
+  for (const [file, before] of checked) if (!sameFacts(before, await lstat(file, { bigint: true }))) invalid();
+  await store.assertRoot();
+}
 
 function completeTopology(manifest: SourceFilesManifest): void {
   const entries = new Map(manifest.entries.map(entry => [key(entry), entry]));
@@ -92,11 +147,21 @@ async function readDigest(handle: FileHandle, expectedBytes: bigint): Promise<{ 
 export async function restoreSourceFiles(store: ArtifactStore, reference: ArtifactRef, destination: string): Promise<RestoredSourceFiles> {
   let stage: Stage = "input", partialTarget: SourceFilesRestoreFailure["partialTarget"] = null;
   let result: RestoredSourceFiles | undefined, failed = false, firstError: unknown, failureStage: Stage | undefined;
-  const handles = new Set<FileHandle>(), closeErrors: unknown[] = [];
+  const handles = new Set<FileHandle>(), witnesses = new Set<number>(), closeErrors: unknown[] = [];
+  let finalize: (() => RestoredSourceFiles) | undefined;
   const own = (handle: FileHandle) => { handles.add(handle); return handle; };
   const close = async (handle: FileHandle) => {
     const previous = stage; stage = "close";
     handles.delete(handle); await handle.close(); stage = previous;
+  };
+  const witness = (handle: FileHandle, expected: BigIntStats): number => {
+    // Acquire before chmod, including mode 000. These are terminal descriptors,
+    // never a directory path through which a target child could be redirected.
+    const fd = openSync(`${process.platform === "linux" ? "/proc/self/fd" : "/dev/fd"}/${handle.fd}`,
+      constants.O_RDONLY | (process.platform === "darwin" ? constants.O_NOFOLLOW : 0));
+    witnesses.add(fd);
+    if (!sameFacts(expected, fstatSync(fd, { bigint: true }))) invalid();
+    return fd;
   };
   try {
     assertMaintenancePlatform(); assertRestoreDirectoryAvailable();
@@ -105,7 +170,9 @@ export async function restoreSourceFiles(store: ArtifactStore, reference: Artifa
     const fixedReference = { ref: reference.ref, sha256: reference.sha256, bytes: reference.bytes };
     const manifest = await readSourceFiles(store, fixedReference);
     if (manifest.entries.length > MAX_ENTRIES || manifest.entries.filter(entry => entry.kind === "directory").length > MAX_DIRECTORIES
-      || manifest.entries.filter(entry => entry.kind !== "absent").length > MAX_TARGET_HANDLES)
+      // Two retained descriptors per target, plus target root, three anchors,
+      // and the bounded transient source/output/native acquisition descriptors.
+      || 2 * manifest.entries.filter(entry => entry.kind !== "absent").length + 10 > MAX_TARGET_HANDLES)
       throw new MaintenanceFailure("restore_verification_unavailable", "file-restore-budget");
     // Re-open the real marker to bind this Fs source to this store, not a caller assertion.
     await ArtifactStore.open(store.root, manifest.source);
@@ -129,27 +196,22 @@ export async function restoreSourceFiles(store: ArtifactStore, reference: Artifa
       || path.dirname(parent) !== attempts
       || !/^(0|[1-9][0-9]*)-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(path.basename(parent))) invalid();
     const ancestors: HeldDirectory[] = [], directories: HeldDirectory[] = [];
-    const openDirectory = async (file: string, opened?: FileHandle): Promise<HeldDirectory> => {
+    const openDirectory = async (file: string, opened?: FileHandle, retainWitness = false): Promise<HeldDirectory> => {
       const handle = own(opened ?? await open(file, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW));
       const info = await handle.stat({ bigint: true });
       assertNotSource(info);
       if (!info.isDirectory() || !isOwned(info) || (info.mode & 0o7777n) !== 0o700n
         || await realpath(file) !== file || !sameIdentity(identity(file, info), identity(file, await lstat(file, { bigint: true })))) invalid();
       if ([...ancestors, ...directories].some(existing => existing.identity.device === String(info.dev) && existing.identity.inode === String(info.ino))) invalid();
-      return { file, identity: identity(file, info), handle, access: restoreDirectory(handle, info) };
+      return { file, identity: identity(file, info), handle, access: restoreDirectory(handle, info),
+        witness: retainWitness ? witness(handle, info) : undefined };
     };
     const root = await openDirectory(store.root);
     if (!sameIdentity(root.identity, store.identity)) invalid();
     ancestors.push(root);
     const attemptRoot = await openDirectory(attempts, await root.access.directory("attempts")); ancestors.push(attemptRoot);
     const attempt = await openDirectory(parent, await attemptRoot.access.directory(path.basename(parent))); ancestors.push(attempt);
-    // Existing artifact domains cannot be repurposed as an attempt through a bind/alias.
-    for (const name of ["plans", "journals", "snapshots"]) {
-      let info: BigIntStats;
-      try { info = await lstat(path.join(store.root, name), { bigint: true }); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
-      if (!info.isDirectory() || [attemptRoot, attempt].some(item => item.identity.device === String(info.dev) && item.identity.inode === String(info.ino))) invalid();
-    }
+    await assertRestoreArtifactSeparation(store, [attemptRoot.identity, attempt.identity]);
     const assertBoundaries = async () => {
       await store.assertRoot();
       for (const directory of [...ancestors, ...directories]) {
@@ -162,7 +224,7 @@ export async function restoreSourceFiles(store: ArtifactStore, reference: Artifa
     await assertBoundaries();
     // mkdir is exclusive even for an existing empty directory. No old target is adopted.
     await attempt.access.mkdir(path.basename(destination), () => { partialTarget = { path: destination, identity: null }; });
-    const target = await openDirectory(destination, await attempt.access.directory(path.basename(destination)));
+    const target = await openDirectory(destination, await attempt.access.directory(path.basename(destination)), true);
     directories.push(target); partialTarget = { path: destination, identity: target.identity };
 
     stage = "materialize";
@@ -173,7 +235,7 @@ export async function restoreSourceFiles(store: ArtifactStore, reference: Artifa
       await assertBoundaries();
       const file = path.join(destination, relative(entry)), parentDirectory = directories.find(item => item.file === path.dirname(file))!;
       await parentDirectory.access.mkdir(path.basename(file), () => {});
-      const directory = await openDirectory(file, await parentDirectory.access.directory(path.basename(file)));
+      const directory = await openDirectory(file, await parentDirectory.access.directory(path.basename(file)), true);
       directories.push(directory); created.set(key(entry), directory.identity);
     }
     for (const entry of manifest.entries) {
@@ -210,6 +272,7 @@ export async function restoreSourceFiles(store: ArtifactStore, reference: Artifa
       const reader = own(await parentDirectory.access.read(path.basename(file)));
       const readInfo = await reader.stat({ bigint: true });
       if (!readInfo.isFile() || readInfo.nlink !== 1n || !sameIdentity(outputIdentity, identity(file, readInfo))) invalid();
+      const retained = witness(reader, readInfo);
       const observed = await readDigest(reader, BigInt(entry.size));
       if (observed.bytes !== entry.size || observed.sha256 !== entry.payload.sha256) invalid();
       stage = "permissions"; await output.chmod(modeNumber(entry.mode));
@@ -218,7 +281,7 @@ export async function restoreSourceFiles(store: ArtifactStore, reference: Artifa
       if (!finalInfo.isFile() || finalInfo.nlink !== 1n || !sameIdentity(outputIdentity, identity(file, finalInfo))
         || Number(finalInfo.mode & 0o7777n) !== modeNumber(entry.mode) || String(finalInfo.size) !== entry.size) invalid();
       await close(output);
-      files.push({ entry, identity: outputIdentity, handle: reader, facts: finalInfo });
+      files.push({ entry, identity: outputIdentity, handle: reader, witness: retained, facts: finalInfo });
       observations.set(key(entry), { sourceRoot: entry.sourceRoot, relativePath: entry.sourceRelativePath, kind: "file",
         identity: outputIdentity, mode: modeOf(finalInfo), bytes: observed.bytes, sha256: observed.sha256 });
       stage = "materialize";
@@ -301,11 +364,37 @@ export async function restoreSourceFiles(store: ArtifactStore, reference: Artifa
         || !after.isFile() || after.nlink !== 1n || !sameIdentity(file.identity, identity(file.identity.path, after))
         || after.mode !== before.mode || after.uid !== before.uid || after.size !== before.size
         || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs) invalid();
+      file.facts = after;
       observations.set(key(file.entry), { sourceRoot: file.entry.sourceRoot, relativePath: file.entry.sourceRelativePath, kind: "file",
         identity: file.identity, mode: modeOf(after), bytes: observed.bytes, sha256: observed.sha256 });
     }
-    result = { kind: "isolated-source-files-restore", sourceFilesManifest: fixedReference, target: target.identity,
-      entries: manifest.entries.map(entry => observations.get(key(entry))!) };
+    finalize = () => {
+      // All asynchronous reads, syncs and closes finish before this bounded,
+      // synchronous final fact boundary. No pending owned callback may then
+      // invalidate an earlier directory/absence observation before success.
+      for (const directory of [...ancestors, target]) {
+        const info = lstatSync(directory.file, { bigint: true });
+        if (!info.isDirectory() || !isOwned(info) || (info.mode & 0o7777n) !== 0o700n
+          || realpathSync(directory.file) !== directory.file || !sameIdentity(directory.identity, identity(directory.file, info))) invalid();
+      }
+      for (const directory of directories) {
+        const info = fstatSync(directory.witness!, { bigint: true }), expected = finalDirectoryFacts.get(directory)!;
+        const entry = orderedDirectories.find(item => path.join(destination, relative(item)) === directory.file);
+        if (!info.isDirectory() || !isOwned(info) || !sameFacts(info, expected)
+          || Number(info.mode & 0o7777n) !== (entry ? modeNumber(entry.mode!) : 0o700)) invalid();
+      }
+      for (const file of files) {
+        const info = fstatSync(file.witness, { bigint: true });
+        if (!info.isFile() || info.nlink !== 1n || !isOwned(info) || !sameFacts(info, file.facts)
+          || Number(info.mode & 0o7777n) !== modeNumber(file.entry.mode) || String(info.size) !== file.entry.size) invalid();
+      }
+      for (const entry of manifest.entries) if (entry.kind === "absent") {
+        try { lstatSync(path.join(destination, relative(entry))); invalid(); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      }
+      return { kind: "isolated-source-files-restore", sourceFilesManifest: fixedReference, target: target.identity,
+        entries: manifest.entries.map(entry => observations.get(key(entry))!) };
+    };
   } catch (error) {
     failed = true;
     if (error instanceof RestoreDirectoryFailure) {
@@ -315,6 +404,18 @@ export async function restoreSourceFiles(store: ArtifactStore, reference: Artifa
   finally {
     for (const handle of [...handles].reverse()) {
       try { await close(handle); }
+      catch (error) { closeErrors.push(error); if (!failed) { failed = true; firstError = error; failureStage = "close"; } }
+    }
+    if (!failed) {
+      stage = "verify";
+      try { result = finalize!(); }
+      catch (error) { failed = true; firstError = error; failureStage = stage; }
+    }
+    // No await after the final fact check. A raw close failure is still a failure,
+    // and cleanup never retries a descriptor whose numeric FD may be reused.
+    for (const fd of [...witnesses].reverse()) {
+      witnesses.delete(fd);
+      try { closeSync(fd); }
       catch (error) { closeErrors.push(error); if (!failed) { failed = true; firstError = error; failureStage = "close"; } }
     }
   }

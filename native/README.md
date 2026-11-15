@@ -46,7 +46,9 @@ node --test --test-concurrency=1 tests/maintenance-postgres-public-directory.tes
 
 所有创建均相对于已持有且核实 dev/inode 的父目录 FD，逐次只接受一个不含斜杠、NUL、`.` 或 `..` 的叶名称。Linux 使用 `/proc/self/fd/N/leaf`；Darwin 使用 `mkdirat`/`openat`，先复制父目录 FD 再排入工作队列，完成后关闭借用 FD。Darwin 只通过末端 `/dev/fd/N` 接收新开文件或目录 FD，不把它当目录子路径。恢复时即使原父目录路径被单向替换为符号链接，实际 mkdir/create 仍落在原已固定目录；路径绑定复查失败时保留本次残留并报告失败，不向新指向的外部目录写入。
 
-同 host 的 Fs 已知源根、absent 根既存祖先及每项源身份在目标创建前与实际目标祖先比较，不能因源目录改名就将其变成可写的 attempt。源文件内容不加 UTF-8/JSON 限制；目录只比较类型、完整成员和数值权限，不比较异文件系统的原 st_size。恢复文件的只读 FD 保留到目录同步之后，再核对精确字节、摘要、身份与权限；目录最终模式仍与 manifest 比较。输入受 16 MiB manifest、4096 entries、256 个目录和 512 个目标文件/目录句柄的本地预算限制，超限在创建恢复目标前失败。
+同 host 的 Fs 已知源根、absent 根既存祖先及每项源身份在目标创建前与实际目标祖先比较，不能因源目录改名就将其变成可写的 attempt。创建前完整枚举 `plans`、`journals`、`snapshots` 的实际目录后代，将其 dev/inode 与 attempt 祖先比较，拒绝预置的后代 bind alias；不只比较三个顶层路径。保护域检查最多读取 16384 项、深入 64 层，遇到链接、重复物理目录、非私有目录、无法完整读取或检查期间变化即失败，不能将不完整枚举当作不重叠证明。
+
+源文件内容不加 UTF-8/JSON 限制；目录只比较类型、完整成员和数值权限，不比较异文件系统的原 st_size。恢复文件的只读 FD 保留到目录同步之后，再核对精确字节、摘要、身份与权限；目录最终模式仍与 manifest 比较。chmod 前另留只读末端 FD，支持 mode 000。所有异步读回、同步及 FileHandle 关闭实际结束后，在同一同步末段复验这些 FD 的身份、权限、大小、mtime/ctime、目录成员变更事实、固定路径和明确 absence，随后同步关闭末端 FD；任何关闭失败仍阻止成功。这给出了本次恢复操作完成时的有界事实检查，不声称抵御敌对进程任意并发改写或保证返回后永久不变。输入受 16 MiB manifest、4096 entries、256 个目录及 512 个描述符的本地预算限制；每个非 absent 条目计两个 FD，另预留 10 个用于目标根、固定祖先与瞬时 acquisition，超限在创建恢复目标前失败。
 
 以下两份测试在 Linux 执行真实生产路径及相同 C 源码的便携 ABI 控制；在 Darwin 执行安装得到的实际组件。便携 C 控制不替代 Darwin 的末端 FD 接收、APFS 同步或同候选 macOS CI 结果。
 

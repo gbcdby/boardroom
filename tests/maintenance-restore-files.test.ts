@@ -1,18 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, readFile, stat, readdir, rm, chmod, open, symlink, link, rename } from "node:fs/promises";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { mkdtemp, mkdir, writeFile, readFile, stat, readdir, rm, chmod, open, opendir, symlink, link, rename, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { parseSourceFiles } from "../src/server/storage/maintenance/parse.ts";
-import { restoreSourceFiles, SourceFilesRestoreFailure } from "../src/server/storage/maintenance/restore-files.ts";
+import { assertRestoreArtifactSeparation, restoreSourceFiles, SourceFilesRestoreFailure } from "../src/server/storage/maintenance/restore-files.ts";
 import type { SourceFileEntry, SourceRef } from "../src/server/storage/maintenance/types.ts";
 
 const platformTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
 const bytes = Buffer.from([0, 255, 128, 13, 10, 65, 0]);
 
 async function fixture(configAbsent = false) {
-  const directory = await mkdtemp(path.join(tmpdir(), "br-restore-files-"));
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "br-restore-files-")));
   const original = path.join(directory, "original"), sessions = path.join(original, "sessions"), config = path.join(original, "config");
   await mkdir(original, { mode: 0o700 });
   await mkdir(sessions, { mode: 0o750 }); await chmod(sessions, 0o750);
@@ -296,12 +298,12 @@ platformTest("#152 materialization bounds directory handles before creating a ta
   } finally { await f.close(); }
 });
 
-platformTest("#152 retained file handles have a pre-materialization total budget", async () => {
+platformTest("#152 retained file handles and final witnesses share a pre-materialization budget", async () => {
   const f = await fixture();
   try {
     const value = structuredClone({ ...f.manifest, entries: [...f.manifest.entries] });
     const original = value.entries.find((entry): entry is Extract<SourceFileEntry, {kind: "file"}> => entry.kind === "file" && entry.sourceRelativePath === "zero")!;
-    for (let index = 0; index < 512; index++) value.entries.push({ ...original, sourceRelativePath: `extra-${index}`,
+    for (let index = 0; index < 246; index++) value.entries.push({ ...original, sourceRelativePath: `extra-${index}`,
       identity: { ...original.identity, path: path.join(f.sessions, `extra-${index}`) } });
     const reference = await f.store.putJson("source-files", value);
     await assert.rejects(restoreSourceFiles(f.store, reference, f.destination), (error: unknown) => {
@@ -411,4 +413,124 @@ platformTest("#152 STD-RF-002 a renamed source inode cannot be adopted as a rest
     });
     assert.deepEqual((await readdir(f.attempt)).sort(), before);
   } finally { await f.close(); }
+});
+
+platformTest("#152 RF-001 final async read and close cannot leave stale directory or absence facts", async t => {
+  for (const phase of ["read", "close"] as const) for (const changed of ["directory-mode", "absent"] as const) {
+    await t.test(`${phase}/${changed}`, async t => {
+      const f = await fixture(changed === "absent");
+      try {
+        const prototype = await fileHandlePrototype(f.directory), actualRead = prototype.read;
+        const counts = new Map<object, number>(); let installed = false, injected = false;
+        const mutate = async () => {
+          injected = true;
+          if (changed === "absent") await writeFile(path.join(f.destination, "config"), "late-unexpected", { mode: 0o600 });
+          else await chmod(path.join(f.destination, "managed-sessions", "deep"), 0o600);
+        };
+        t.mock.method(prototype, "read", async function (this: {close(): Promise<void>}, ...args: any[]) {
+          const result = await actualRead.apply(this, args);
+          if (args[3] === 0n) {
+            const count = (counts.get(this) ?? 0) + 1; counts.set(this, count);
+            if (!installed && count === 2) {
+              installed = true;
+              if (phase === "read") await mutate();
+              else {
+                const actualClose = this.close.bind(this);
+                t.mock.method(this, "close", async () => { await actualClose(); await mutate(); });
+              }
+            }
+          }
+          return result;
+        });
+        await assert.rejects(restoreSourceFiles(f.store, f.reference, f.destination), SourceFilesRestoreFailure);
+        assert.equal(injected, true);
+      } finally {
+        t.mock.restoreAll(); await chmod(path.join(f.destination, "managed-sessions", "deep"), 0o700).catch(() => {}); await f.close();
+      }
+    });
+  }
+});
+
+platformTest("#152 STD-RF-003 protected descendant identities cannot become writable attempts", async () => {
+  const f = await fixture();
+  try {
+    const actualIdentity = async (file: string) => { const info = await stat(file, { bigint: true });
+      return { path: file, device: String(info.dev), inode: String(info.ino) }; };
+    await assertRestoreArtifactSeparation(f.store, [await actualIdentity(f.attempt)]);
+    // These are real protected inodes. The guard consumes the same inode facts
+    // that a pre-existing bind alias exposes, without requiring mount privileges.
+    const payloadDirectory = path.dirname(f.store.pathFor(f.reference));
+    const nested = path.join(f.store.root, "journals", "protected", "nested");
+    await mkdir(nested, { recursive: true, mode: 0o700 });
+    for (const directory of [payloadDirectory, nested])
+      await assert.rejects(assertRestoreArtifactSeparation(f.store, [await actualIdentity(directory)]), { code: "snapshot_invalid" });
+    await assert.rejects(stat(f.destination), { code: "ENOENT" });
+  } finally { await f.close(); }
+});
+
+platformTest("#152 incomplete protected directory inspection cannot create a restore target", async t => {
+  for (const scenario of ["symlink", "permissions", "depth"] as const) await t.test(scenario, async () => {
+    const f = await fixture();
+    try {
+      const protectedRoot = path.join(f.store.root, "journals"); await mkdir(protectedRoot, { mode: 0o700 });
+      if (scenario === "symlink") await symlink(f.original, path.join(protectedRoot, "unresolved"), "dir");
+      if (scenario === "permissions") await chmod(protectedRoot, 0o500);
+      if (scenario === "depth") await mkdir(path.join(protectedRoot, ...Array.from({ length: 65 }, () => "d")), { recursive: true, mode: 0o700 });
+      await assert.rejects(restoreSourceFiles(f.store, f.reference, f.destination), (error: unknown) => {
+        assert.ok(error instanceof SourceFilesRestoreFailure); assert.equal(error.partialTarget, null); return true;
+      });
+      await assert.rejects(stat(f.destination), { code: "ENOENT" });
+    } finally { await chmod(path.join(f.store.root, "journals"), 0o700).catch(() => {}); await f.close(); }
+  });
+});
+
+platformTest("#152 final witness close errors reject success and preserve an earlier write error", async t => {
+  for (const primary of [false, true]) await t.test(primary ? "write-then-close" : "close-only", async t => {
+    const f = await fixture(), writeFailure = new Error("controlled-primary-write"), closeFailure = new Error("controlled-witness-close");
+    const rawOpen = fs.openSync, rawClose = fs.closeSync, owned = new Set<number>(); let injected = false;
+    try {
+      t.mock.method(fs, "openSync", (...args: Parameters<typeof fs.openSync>) => {
+        const fd = rawOpen(...args);
+        if (/^\/(proc\/self\/fd|dev\/fd)\/[0-9]+$/.test(String(args[0]))) owned.add(fd);
+        return fd;
+      });
+      t.mock.method(fs, "closeSync", (fd: number) => {
+        const witness = owned.delete(fd); rawClose(fd);
+        if (witness && !injected) { injected = true; throw closeFailure; }
+      });
+      syncBuiltinESMExports();
+      if (primary) t.mock.method(await fileHandlePrototype(f.directory), "write", () => { throw writeFailure; });
+      await assert.rejects(restoreSourceFiles(f.store, f.reference, f.destination), (error: unknown) => {
+        assert.ok(error instanceof SourceFilesRestoreFailure);
+        assert.equal(error.cause, primary ? writeFailure : closeFailure);
+        assert.equal(error.stage, primary ? "materialize" : "close");
+        assert.deepEqual(error.closeErrors, [closeFailure]); return true;
+      });
+      assert.equal(injected, true); assert.equal(owned.size, 0);
+      assert.deepEqual(await readFile(f.config), bytes);
+    } finally { t.mock.restoreAll(); syncBuiltinESMExports(); for (const fd of owned) rawClose(fd); await f.close(); }
+  });
+});
+
+platformTest("#152 protected inventory close failures retain the first enumeration error", async t => {
+  for (const primary of [false, true]) await t.test(primary ? "read-then-close" : "close-only", async t => {
+    const f = await fixture(), readFailure = new Error("controlled-inventory-read"), closeFailure = new Error("controlled-inventory-close");
+    try {
+      const stream = await opendir(f.store.root), prototype = Object.getPrototypeOf(stream), close = prototype.close;
+      await stream.close(); let injected = false;
+      if (primary) t.mock.method(prototype, "read", async () => { throw readFailure; });
+      t.mock.method(prototype, "close", function (this: unknown, callback?: (error: unknown) => void) {
+        // Dir builds a promisified method at construction. Keep the callback
+        // form intact, and invoke the original callback form without recursion.
+        if (callback) return close.call(this, (error: unknown) => { injected = true; callback(error ?? closeFailure); });
+        return new Promise((_, reject) => close.call(this, (error: unknown) => { injected = true; reject(error ?? closeFailure); }));
+      });
+      await assert.rejects(restoreSourceFiles(f.store, f.reference, f.destination), (error: unknown) => {
+        assert.ok(error instanceof SourceFilesRestoreFailure); assert.equal(error.cause, primary ? readFailure : closeFailure);
+        assert.equal(error.stage, primary ? "target" : "close"); assert.equal(error.partialTarget, null);
+        assert.deepEqual(error.closeErrors, [closeFailure]); return true;
+      });
+      assert.equal(injected, true); await assert.rejects(stat(f.destination), { code: "ENOENT" });
+    } finally { t.mock.restoreAll(); await f.close(); }
+  });
 });
