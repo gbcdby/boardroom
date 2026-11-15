@@ -18,7 +18,7 @@ import f0b
 import f2
 import f3
 from supervise import OwnedChild, bounded_read, result_state
-from transport import Artifacts, OutputLimit, Pump, QMP
+from transport import Artifacts, OutputLimit, Pump, QMP, stdio_argv
 
 _spec = importlib.util.spec_from_file_location("f3_builder", Path(__file__).with_name("f3-build.py"))
 builder = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(builder)
@@ -26,6 +26,7 @@ builder = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(build
 
 def validate(bundle_path, digest):
     binding, raw = build.file_binding(bundle_path, f2.MIB, digest); bundle = f0b._json(raw)
+    if bundle.get("kind") == builder.NEW_INPUT_KIND: builder.require_private_source()
     if bundle.get("state") != "FIXED_F3_BUNDLE_NOT_BOOTED": raise ValueError("fixed offline F3 bundle required")
     run_id = bundle["request"]["run_id"]
     if bundle["proposal"] != f3.plan(json.dumps({"run_id": run_id}).encode()): raise ValueError("F3 proposal changed")
@@ -34,11 +35,27 @@ def validate(bundle_path, digest):
         raise ValueError("fixed mkfs contract changed")
     keys = {"qemu", "kernel", "bios", "busybox", "notes", "gate", "helper", "brd", "config", "initramfs"}
     if set(bundle["inputs"]) != keys or set(bundle["e2fs"]) != set(f2.PAYLOAD_FILES): raise ValueError("fixed input set changed")
-    _, base = builder.verify_base(bundle["base_bundle"]["path"], bundle["base_bundle"]["sha256"])
-    for key in ("qemu", "kernel", "bios", "busybox", "notes", "gate"):
-        if bundle["inputs"][key]["sha256"] != base["inputs"][key]["sha256"]: raise ValueError("provider/gate input changed")
-    if any(bundle[name] != base[name] for name in ("libraries", "qemu_data", "runtime_environment")):
-        raise ValueError("provider runtime closure changed")
+    if bundle.get("kind") == builder.NEW_INPUT_KIND:
+        f0._fields(bundle, ("kind", "state", "qualification", "guest_execution", "request", "proposal", "source", "inputs",
+                           "e2fs", "commands", "input_closure", "libraries", "qemu_data", "runtime_environment", "compiler",
+                           "archive", "mkfs_argv", "mkfs_environment", "elapsed_seconds", "runtime_cwd"))
+        if bundle["qualification"] != "UNSUPPORTED" or bundle["guest_execution"] != "NOT_RUN":
+            raise ValueError("offline input cannot assert a runtime qualification")
+        closure, _, _ = builder.verify_input_closure(bundle["request"])
+        if closure != bundle["input_closure"]: raise ValueError("fixed F3 input closure changed")
+        if any(bundle["inputs"][key] != value for key, value in closure["core"].items()):
+            raise ValueError("actual provider input route/bytes changed")
+        if bundle["e2fs"] != closure["payload"] or any(bundle[name] != closure[name] for name in ("libraries", "qemu_data", "runtime_environment")):
+            raise ValueError("new input family was mixed with another runtime closure")
+        if builder.runtime_cwd(Path(bundle_path).parent / "runtime-cwd") != bundle["runtime_cwd"]:
+            raise ValueError("fixed runtime cwd changed")
+    else:
+        if "input_kind" in bundle["request"]: raise ValueError("new input family cannot be relabelled as a legacy bundle")
+        _, base = builder.verify_base(bundle["base_bundle"]["path"], bundle["base_bundle"]["sha256"])
+        for key in ("qemu", "kernel", "bios", "busybox", "notes", "gate"):
+            if bundle["inputs"][key]["sha256"] != base["inputs"][key]["sha256"]: raise ValueError("provider/gate input changed")
+        if any(bundle[name] != base[name] for name in ("libraries", "qemu_data", "runtime_environment")):
+            raise ValueError("provider runtime closure changed")
     inputs = {name: build.file_binding(item["path"], 64 * f2.MIB, item["sha256"])[1] for name, item in bundle["inputs"].items()}
     if hashlib.sha256(inputs["brd"]).hexdigest() != f2.BRD_SHA: raise ValueError("module changed")
     f2.config_bytes(inputs["config"])
@@ -62,15 +79,50 @@ finish_artifacts = _old.finish_artifacts
 create_claim = _old.create_claim
 
 
+def runtime_preflight(bundle_path, bundle, output, argv=None, owned=None):
+    """A source-pinned input contract, never a caller approval or actual loading receipt."""
+    builder.require_private_source()
+    if bundle.get("kind") != builder.NEW_INPUT_KIND: raise ValueError("unknown runtime input family")
+    if bundle["source"] != builder.source_bindings(): raise ValueError("private source identity changed")
+    closure, _, _ = builder.verify_input_closure(bundle["request"])
+    if closure != bundle["input_closure"] or closure["runtime_inputs"]["status"] != "FIXED_PRECONDITIONS_NOT_RUNTIME_EVIDENCE":
+        raise ValueError("runtime_use_NOT_ESTABLISHED")
+    cwd_path = Path(bundle_path).parent / "runtime-cwd"
+    cwd = builder.runtime_cwd(cwd_path)
+    if cwd != bundle["runtime_cwd"] or str(Path.cwd()) != cwd["path"]:
+        raise ValueError("runner must use the exact fixed empty cwd")
+    actual = os.stat(".")
+    if (actual.st_dev, actual.st_ino) != (cwd["device"], cwd["inode"]):
+        raise ValueError("actual runtime cwd identity changed")
+    claim = Path(bundle_path).parent / "EXECUTION-ATTEMPT.json"
+    if any(path.resolve().is_relative_to(cwd_path) for path in (Path(output), claim)):
+        raise ValueError("output and claim must remain outside the empty runtime cwd")
+    assets = {name: bundle["inputs"][name]["path"] for name in ("qemu", "kernel", "bios", "initramfs")}
+    assets["qemu_data"] = bundle["qemu_data"]["path"]
+    expected = f0.command_preview(json.dumps({"run_id": bundle["request"]["run_id"], "target_count": 1}).encode(), assets)["argv"]
+    if expected[-1] != f0b.CMDLINE or argv is not None and argv != expected:
+        raise ValueError("fixed runtime argv changed")
+    if bundle["runtime_environment"] != closure["runtime_environment"]:
+        raise ValueError("fixed four-key runtime environment changed")
+    if owned is not None and owned.argv != stdio_argv(expected, owned.serial_identity["inherited_write_fd"]):
+        raise ValueError("actual owned stdio argv changed")
+    return {"cwd": cwd, "catalog": closure["catalog"], "schema": closure["schema"],
+            "status": "FIXED_PRECONDITIONS_NOT_RUNTIME_EVIDENCE"}
+
+
 def execute(bundle_path, digest, output):
     started = time.monotonic()
     binding, bundle, inputs = validate(bundle_path, digest)
     run_id = bundle["request"]["run_id"]; out = Path(f0._asset_path(str(Path(output).absolute())))
+    new_inputs = bundle.get("kind") == builder.NEW_INPUT_KIND
+    runtime = runtime_preflight(bundle_path, bundle, out) if new_inputs else None
+    if new_inputs and time.monotonic() - started > 60: raise TimeoutError("preflight deadline")
     artifacts = Artifacts(out)
     result = {"kind": "private-f3-source-preservation-run", "bundle": binding, "proposal": bundle["proposal"], "state": "NOT_STARTED",
               "qualification": "UNSUPPORTED", "production_bound": False, "commit_barrier": False, "content_probes": 1, "attempts": 1, "guest_attempts": 0, "guest_starts": 0,
               "original_error": None, "secondary_errors": [], "cleanup": {"verified": False}, "normal_poweroff_observed": False,
               "host": {"uname": list(os.uname()), "uid": os.getuid(), "gid": os.getgid()}}
+    if new_inputs: result.update(runtime_preflight=runtime, runtime_checks=["before-claim"])
     owned = None; pump = None; qmp = None; capture = None; tail = b""; finished = False
     stage_started = None; stage = "boot"; boot_started = None; complete_seen_at = None
 
@@ -115,10 +167,16 @@ def execute(bundle_path, digest, output):
         assets["qemu_data"] = bundle["qemu_data"]["path"]
         argv = f0.command_preview(json.dumps({"run_id": run_id, "target_count": 1}).encode(), assets)["argv"]
         if argv[-1] != f0b.CMDLINE: raise ValueError("fixed boot inputs changed")
+        if new_inputs:
+            runtime_preflight(bundle_path, bundle, out, argv); result["runtime_checks"].append("before-gate")
+            if time.monotonic() - started > 60: raise TimeoutError("preflight deadline")
         result["guest_attempts"] = 1; boot_started = time.monotonic()
         owned = OwnedChild(bundle["inputs"]["gate"]["path"], bundle["inputs"]["gate"]["sha256"], assets["qemu"],
                            bundle["inputs"]["qemu"]["sha256"], argv, bundle["runtime_environment"])
         result.update(argv=owned.argv, gate_argv=owned.gate_argv, serial_pipe=owned.serial_identity)
+        if new_inputs:
+            runtime_preflight(bundle_path, bundle, out, argv, owned); result["runtime_checks"].append("before-ack")
+            if time.monotonic() - started > 60: raise TimeoutError("preflight deadline")
         pump = Pump(owned, artifacts, observe_serial); owned.release(bundle["inputs"]["qemu"]["sha256"])
         result["guest_starts"] = 1; qmp = QMP(pump)
         while True:
@@ -154,6 +212,10 @@ def execute(bundle_path, digest, output):
                     artifacts.put(name, raw, 4 * f2.MIB)
                 result["capture"] = capture
         except BaseException as error: record_error(error, "cleanup-or-capture")
+        if new_inputs:
+            try:
+                runtime_preflight(bundle_path, bundle, out); result["runtime_checks"].append("after-cleanup")
+            except BaseException as error: record_error(error, "runtime-input-final-check")
         result["elapsed_seconds"] = time.monotonic() - started
         result["lifecycle_state"] = result_state(capture, None, result["cleanup"])
         result["state"] = "F3_SOURCE_PRESERVATION_OBSERVED" if (result["original_error"] is None and capture is not None

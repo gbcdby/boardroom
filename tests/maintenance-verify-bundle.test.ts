@@ -16,7 +16,10 @@ const nativeTest = ["linux", "darwin"].includes(process.platform) ? test : test.
 const pgTest = process.env.AGENT_STUDIO_PG_TEST_URL ? test : test.skip;
 const artifacts = async (store: ArtifactStore) => (await readdir(store.root, { recursive: true })).sort();
 const noVerification = async (store: ArtifactStore) => assert.ok(!(await artifacts(store)).some(name => name.endsWith("/verification.json")));
-type Target = { kind: string; database: { kind: string; path?: string; device?: string; inode?: string };
+type Target = { kind: string; database: { kind?: string; path?: string; device?: string; inode?: string;
+  formatVersion?: number; engine?: string; verificationTargetIdentity?: { databaseName: string; databaseOid: string; systemIdentifier: string };
+  schemaManifestDigest?: string; fullDataManifestDigest?: string; frozenBusinessManifestDigest?: string;
+  capturedControlManifestDigest?: string; exactFullDataAndControlMatched?: boolean };
   sourceFiles: { kind: string; target: { path: string }; entries: { sourceRoot: string; relativePath: string; kind: string; mode: string | null }[] } };
 
 for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeTest : pgTest)(
@@ -43,7 +46,16 @@ for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeT
             assert.equal(cells.filter(cell => cell.bytes === "6475706C6963617465").length, 2);
           } finally { db.close(); }
         } else {
-          assert.equal(target.database.kind, "postgres-restore-verification");
+          assert.equal(target.database.formatVersion, 1); assert.equal(target.database.engine, "postgres");
+          assert.equal(target.database.verificationTargetIdentity?.databaseName, f.targetName);
+          assert.notEqual(target.database.verificationTargetIdentity?.databaseName, f.database);
+          assert.match(target.database.verificationTargetIdentity!.databaseOid, /^[0-9]+$/);
+          assert.match(target.database.verificationTargetIdentity!.systemIdentifier, /^[0-9]+$/);
+          assert.equal(target.database.exactFullDataAndControlMatched, true);
+          assert.equal(target.database.schemaManifestDigest, closed.manifests.schemaManifestDigest);
+          assert.equal(target.database.fullDataManifestDigest, closed.manifests.fullDataManifestDigest);
+          assert.equal(target.database.frozenBusinessManifestDigest, closed.manifests.frozenBusinessManifestDigest);
+          assert.equal(target.database.capturedControlManifestDigest, closed.manifests.capturedControlManifestDigest);
           assert.equal((await f.readTarget("SELECT COUNT(*)::int AS n FROM enter_observation WHERE value='duplicate'"))[0].n, 2);
           const control = (await f.readTarget("SELECT admission,journal_digest,journal_sequence FROM storage_maintenance"))[0];
           assert.equal(control.admission, "sealed"); assert.equal(control.journal_digest, f.capture.reference.sha256);
