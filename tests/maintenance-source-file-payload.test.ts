@@ -41,6 +41,105 @@ nativeTest("#152 payload: bounded chunks, exact bytes and same-owner publication
   } finally { await f.close(); }
 });
 
+nativeTest("#152 payload: short native writes and a reused producer buffer preserve exact bytes", async t => {
+  const f = await fixture(), originalOpen = promises.open; let writes = 0;
+  try {
+    t.mock.method(promises, "open", async (...args: Parameters<typeof promises.open>) => {
+      const handle = await Reflect.apply(originalOpen, promises, args);
+      if (typeof args[0] === "string" && args[0].includes("/stream-") && args[0].endsWith(".tmp")) {
+        const originalWrite = handle.write.bind(handle);
+        Object.defineProperty(handle, "write", { configurable: true,
+          value: async (buffer: Uint8Array, offset: number, length: number, position: number | null) => {
+            writes++;
+            return originalWrite(buffer, offset, Math.min(length, 7), position);
+          } });
+      }
+      return handle;
+    });
+    syncBuiltinESMExports();
+    async function* chunks() {
+      const reused = Buffer.alloc(23, 0x34);
+      yield reused;
+      reused.fill(0x56);
+      yield reused;
+    }
+    const expected = Buffer.concat([Buffer.alloc(23, 0x34), Buffer.alloc(23, 0x56)]);
+    const ref = await f.store.putSourceFilePayload(chunks(), BigInt(expected.length));
+    assert.ok(writes >= 8, "both chunks must actually handle partial native writes");
+    assert.equal(ref.sha256, sha256(expected));
+    assert.deepEqual(await f.store.readBytes(ref), expected);
+    assert.equal(f.store.publicationOutcomes().records.at(-1)!.handleClosed, true);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
+});
+
+nativeTest("#152 payload: changing the current root/source guard before rename forbids publication", async () => {
+  const f = await fixture(); let current = true;
+  const bytes = Buffer.from([1, 2, 3, 4]), digest = sha256(bytes);
+  try {
+    const guarded = await ArtifactStore.open(f.store.root, source, {
+      assertCurrent: async () => { if (!current) throw new MaintenanceFailure("source_changed"); },
+      after: point => { if (point === "file_synced") current = false; }
+    });
+    await assert.rejects(guarded.putSourceFilePayload((async function* () { yield bytes; })(), BigInt(bytes.length)),
+      error => error instanceof MaintenanceFailure && error.code === "source_changed");
+    await assert.rejects(lstat(f.store.pathFor({
+      ref: `snapshots/${digest}/source-file-payload.bin`, sha256: digest, bytes: String(bytes.length)
+    })), { code: "ENOENT" });
+    const outcome = f.store.publicationOutcomes().records.at(-1)!;
+    assert.equal(outcome.handleClosed, true);
+    assert.equal(outcome.failureObserved, true);
+    assert.equal(outcome.pendingCleanup, false);
+  } finally { await f.close(); }
+});
+
+nativeTest("#152 payload: an existing matching name is verified, never accepted when corrupted", async () => {
+  const f = await fixture(), bytes = Buffer.from([11, 22, 33, 44]);
+  try {
+    const chunks = async function* () { yield bytes; };
+    const ref = await f.store.putSourceFilePayload(chunks(), BigInt(bytes.length));
+    const second = await f.store.putSourceFilePayload(chunks(), BigInt(bytes.length));
+    assert.deepEqual(second, ref);
+    await promises.writeFile(f.store.pathFor(ref), Buffer.from([11, 22, 33, 45]));
+    await assert.rejects(f.store.putSourceFilePayload(chunks(), BigInt(bytes.length)),
+      error => error instanceof MaintenanceFailure && error.code === "snapshot_invalid");
+    assert.deepEqual(await promises.readFile(f.store.pathFor(ref)), Buffer.from([11, 22, 33, 45]));
+    const outcome = f.store.publicationOutcomes().records.at(-1)!;
+    assert.equal(outcome.handleClosed, true);
+    assert.equal(outcome.failureObserved, true);
+    assert.equal(outcome.pendingCleanup, false);
+  } finally { await f.close(); }
+});
+
+nativeTest("#152 payload: a close-after failure retires its owner but cannot publish success", async t => {
+  const f = await fixture(), originalOpen = promises.open, secondary = new Error("close-after");
+  let injected = false;
+  try {
+    t.mock.method(promises, "open", async (...args: Parameters<typeof promises.open>) => {
+      const handle = await Reflect.apply(originalOpen, promises, args);
+      if (!injected && typeof args[0] === "string" && args[0].includes("/stream-") && args[0].endsWith(".tmp")) {
+        injected = true;
+        const originalClose = handle.close.bind(handle);
+        handle.close = async () => { await originalClose(); throw secondary; };
+      }
+      return handle;
+    });
+    syncBuiltinESMExports();
+    const bytes = Buffer.from([8, 9, 10]);
+    const chunks = async function* () { yield bytes; };
+    const outcome = await rejected(f.store.putSourceFilePayload(chunks(), BigInt(bytes.length)));
+    assert.equal(outcome.failed, true); assert.strictEqual(outcome.error, secondary);
+    const record = f.store.publicationOutcomes().records.at(-1)!;
+    assert.equal(record.closeFailureObserved, true);
+    assert.equal(record.handleClosed, true);
+    assert.equal(record.pendingCleanup, false);
+    await assert.rejects(lstat(f.store.pathFor({
+      ref: `snapshots/${sha256(bytes)}/source-file-payload.bin`, sha256: sha256(bytes), bytes: String(bytes.length)
+    })), { code: "ENOENT" });
+    const ref = await f.store.putSourceFilePayload(chunks(), BigInt(bytes.length));
+    assert.deepEqual(await f.store.readBytes(ref), bytes);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
+});
+
 nativeTest("#152 payload: empty source completes with the empty SHA-256 and no implicit chunk", async () => {
   const f = await fixture();
   try {
