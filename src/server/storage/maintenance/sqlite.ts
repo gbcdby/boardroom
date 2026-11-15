@@ -19,6 +19,8 @@ import { readSourceClientAudit, withSourceClientFacts, type SourceFactsAccess } 
 import { BootstrapAuditFactory, type SessionAuditCollection } from "./native-audit.ts";
 import type { EventFacts } from "./control-candidate/schema.ts";
 import { decodeSqliteSourceRows } from "./source-facts.ts";
+import { assertControlSqlAnchorAllowed, assertControlSqlCommit, bindControlSql, finishControlSqlCallback, noteControlSql, validateControlSqlCommit } from "./control-sql.ts";
+import { writeSqliteControlSql } from "./control-sql-write.ts";
 import type { AnchorChange, Blocker, ControlRootIdentity, DatabaseManifests, Json, MaintenanceAdapter, OperationMutex, SourceClientsObservation, SourceLock, SourceObservation } from "./types.ts";
 
 function same(a: unknown, b: unknown): boolean { return canonicalJson(a) === canonicalJson(b); }
@@ -276,7 +278,8 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     const mutex = this.mutex;
     if (!mutex || this.currentLock) throw new MaintenanceFailure(this.currentLock ? "maintenance_busy" : "maintenance_lost");
     await mutex.assertHeld();
-    const db = this.openSource(false); let active = true, factsInvalidated = false, factsUsed = false;
+    const db = this.openSource(false); let active = true, factsInvalidated = false, factsUsed = false, controlSqlUsed = false;
+    let trackedLock: SourceLock | undefined;
     try {
       this.beginSourceWrite(db); this.currentLock = db;
       try { assertSqliteGuardCoverage(db); } catch { throw new MaintenanceFailure("schema_guard_incomplete"); }
@@ -316,23 +319,40 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
           if (!factory) { factory = new BootstrapAuditFactory(this, mutex); this.auditFactories.set(mutex, factory); }
           return readSourceClientAudit(factsAccess, plan, factory.bind(this, mutex, lock, factsAccess.assertUnchangedLock), lock);
         },
-        anchor: async change => { await assertHeld(); factsInvalidated = true; this.anchor(db, change, mutex); },
+        anchor: async change => {
+          assertControlSqlAnchorAllowed(lock); await assertHeld(); assertControlSqlAnchorAllowed(lock);
+          factsInvalidated = true; this.anchor(db, change, mutex);
+        },
         backup: async destination => {
           await assertHeld();
           if (kind !== "snapshot") throw new MaintenanceFailure("maintenance_lost");
           const result = await this.backup(db, mutex, destination); await assertHeld(); return result;
         },
       };
-      const result = await callback(lock); await assertHeld(); db.exec("COMMIT"); this.fullSyncSource(); return result;
+      trackedLock = lock;
+      bindControlSql(lock, { adapter: this, root: mutex.root, control: kind === "control", assertHeld,
+        invalidateFacts: () => { factsInvalidated = true; controlSqlUsed = true; },
+        observe: () => lock.observeSourceClients(), manifests: () => lock.observe(),
+        write: async plan => writeSqliteControlSql(db, plan), sourceHandleClosed: () => !db.open, mutexHandleClosed: () => !mutex.db.open });
+      const result = await callback(lock), pending = finishControlSqlCallback(lock); if (pending) await pending;
+      await assertHeld(); await validateControlSqlCommit(lock); assertControlSqlCommit(lock); noteControlSql(lock, "committing");
+      db.exec("COMMIT"); this.fullSyncSource(); noteControlSql(lock, "committed"); return result;
     } catch (error) {
-      if (db.inTransaction) db.exec("ROLLBACK");
+      noteControlSql(trackedLock, "failure", error);
+      const pending = finishControlSqlCallback(trackedLock); if (pending) await pending;
+      try { if (db.inTransaction) db.exec("ROLLBACK"); }
+      catch (rollbackError) { noteControlSql(trackedLock, "rollback-failure", rollbackError); throw rollbackError; }
       if (error instanceof MaintenanceFailure && error.code === "maintenance_lost") this.auditFactories.get(mutex)?.close();
       if (error instanceof MaintenanceFailure) throw error;
       if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(String((error as { code?: string }).code))) throw new MaintenanceFailure("maintenance_busy");
       throw error;
     } finally {
       active = false; this.currentLock = null;
-      if (factsUsed) this.closeFactsSource(db); else this.closeSource(db);
+      try { if (factsUsed && !controlSqlUsed) this.closeFactsSource(db); else this.closeSource(db); }
+      catch (error) {
+        if (factsUsed) this.auditFactories.get(mutex)?.close();
+        noteControlSql(trackedLock, "close-failure", error); throw error;
+      }
     }
   }
   private anchor(db: Database.Database, change: AnchorChange, mutex: MutexLease): void {
