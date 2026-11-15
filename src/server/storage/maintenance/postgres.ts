@@ -370,6 +370,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     const session = await connect(sourceConnection, true);
     const observing = writerObservation.hasSubscribers, inspectionId = observing ? ++inspectionSequence : 0;
     let stage = "source-identity";
+    let inspectionError: MaintenanceFailure | undefined;
     try {
       const identity = await readIdentity(session, sourceConnection, true);
       if (!same(current.sourceIdentity, stablePostgresSourceIdentity(identity,
@@ -479,9 +480,19 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         note({ kind: "inspection-error", phase, inspectionId, stage,
           code: typeof code === "string" ? code.slice(0, 64) : null, truncated: typeof code === "string" && code.length > 64 });
       }
-      throw safeError(error, "source_writer_unknown");
+      inspectionError = safeError(error, "source_writer_unknown"); throw inspectionError;
     }
-    finally { if (sourceFacts) await endFactsSession(session); else await endSession(session); }
+    finally {
+      if (sourceFacts) await endFactsSession(session);
+      else {
+        try { await endSession(session, true); }
+        catch (error) {
+          const closeError = safeError(error, "maintenance_lost", "inspection-close");
+          if (inspectionError) throw new AggregateError([inspectionError, closeError], "maintenance resource cleanup failed", { cause: inspectionError });
+          throw closeError;
+        }
+      }
+    }
   }
   async function withPassfile<T>(connection: PostgresConnection, directory: string,
     callback: (environment: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {

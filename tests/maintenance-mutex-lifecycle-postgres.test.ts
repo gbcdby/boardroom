@@ -99,6 +99,41 @@ test("#152 PostgreSQL adapter close attempts every owned session and shares conc
   } finally { phase = "done"; finish?.(); await adapter.close(); t.mock.restoreAll(); }
 });
 
+test("#152 PostgreSQL private ordinary inspection preserves safe first and close failures", async t => {
+  const text = await readFile(new URL("../src/server/storage/maintenance/postgres.ts", import.meta.url), "utf8");
+  const source = ts.createSourceFile("postgres.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const names = ["safeError", "endSession", "inspectWriters"], found = new Map<string, string>();
+  function visit(node: ts.Node) {
+    if (ts.isFunctionDeclaration(node) && node.name && names.includes(node.name.text)) found.set(node.name.text, node.getText(source));
+    ts.forEachChild(node, visit);
+  }
+  visit(source); assert.equal(found.size, names.length);
+  const body = ts.transpileModule(names.map(name => found.get(name)).join("\n"), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  for (const phase of ["first", "undefined", "alone"] as const) await t.test(phase, async () => {
+    const first = phase === "undefined" ? undefined : new MaintenanceFailure("source_changed", "inspection-first");
+    let ends = 0;
+    const session = { ending: false, ended: false, client: {
+      async end() { ends++; throw new Error("mutex-sensitive-inspection-end"); }, async query() { return { rows: [] }; },
+    } }, sessions = new Set([session]);
+    const invoke = new Function("MaintenanceFailure", "sessions", "session", "first", "failFirst", "writerObservation",
+      "const sourceConnection={}; const observationRows=32; let inspectionSequence=0; function note(){} function sessionMetadata(){return {};}" +
+      "async function connect(){return session;} async function readIdentity(){if(failFirst)throw first; return {databaseOid:'1'};}" +
+      "function same(){return true;} function stablePostgresSourceIdentity(){return {};}\n" + body + "\nreturn inspectWriters;")(
+      MaintenanceFailure, sessions, session, first, phase !== "alone", { hasSubscribers: false }) as (current: unknown) => Promise<unknown>;
+    await assert.rejects(invoke({ sourceIdentity: {}, state: { databaseInstanceId: "fixture" }, clients: [] }), error => {
+      assert.doesNotMatch(inspect(error), /mutex-sensitive/);
+      if (phase === "alone") { assert.ok(error instanceof MaintenanceFailure); assert.equal(error.code, "maintenance_lost"); }
+      else {
+        assert.ok(error instanceof AggregateError); assert.equal(error.errors.length, 2); assert.equal(error.cause, error.errors[0]);
+        if (phase === "first") assert.equal(error.errors[0], first); else assert.equal(error.errors[0].code, "source_writer_unknown");
+        assert.ok(error.errors[1] instanceof MaintenanceFailure); assert.equal(error.errors[1].code, "maintenance_lost");
+      }
+      return true;
+    });
+    assert.equal(ends, 1); assert.equal(sessions.has(session), true); assert.equal(session.ended, false);
+  });
+});
+
 pgTest("#152 PostgreSQL real mutex end failures retain ownership and second-controller exclusion", async t => {
   for (const phase of ["before", "after", "undefined", "sync"] as const) await t.test(phase, async child => {
     const f = await postgresAuditFixture(), end = Client.prototype.end;
@@ -207,4 +242,41 @@ pgTest("#152 PostgreSQL real adapter close rejects an unended mutex and retries 
     const next = await other.acquireMutex(f.store.identity, (await other.observe()).state); await next.assertHeld(); await next.release();
     assert.deepEqual((await other.observe()).state, before, "teardown changes no maintenance row or business transaction");
   } finally { t.mock.restoreAll(); await other.close(); if (owned) await invokeEnd(end, owned); await f.close(); }
+});
+
+pgTest("#152 PostgreSQL real ordinary writer inspection rejects sole and combined temporary end failures", async t => {
+  for (const withPrimary of [false, true]) await t.test(withPrimary ? "first-and-end" : "end-only", async child => {
+    const f = await postgresAuditFixture(), current = await f.adapter.observe(), query = Client.prototype.query, end = Client.prototype.end;
+    const primary = new MaintenanceFailure("source_changed", "inspection-first");
+    let owned: Client | undefined, completed = false, ended = false;
+    try {
+      child.mock.method(Client.prototype, "query", function (this: Client, ...args: unknown[]) {
+        const sql = sqlText(args[0]);
+        if (database(this) === f.database && sql.includes("FROM pg_catalog.pg_stat_activity a WHERE datid=")) {
+          owned = this; if (withPrimary) throw primary;
+        }
+        return invokeQuery(query, this, args).then(result => {
+          if (this === owned && sql.startsWith("SELECT 1 FROM pg_catalog.pg_prepared_xacts")) completed = true;
+          return result;
+        });
+      });
+      child.mock.method(Client.prototype, "end", function (this: Client) {
+        if (this === owned) return Promise.reject(new Error("mutex-sensitive-inspection-end"));
+        return invokeEnd(end, this);
+      });
+      await assert.rejects(f.adapter.inspectWriters(current), error => {
+        assert.doesNotMatch(inspect(error), /mutex-sensitive/);
+        if (withPrimary) {
+          assert.ok(error instanceof AggregateError); assert.equal(error.errors[0], primary); assert.equal(error.cause, primary);
+          assert.ok(error.errors[1] instanceof MaintenanceFailure); assert.equal(error.errors[1].code, "maintenance_lost");
+        } else { assert.ok(error instanceof MaintenanceFailure); assert.equal(error.code, "maintenance_lost"); }
+        return true;
+      });
+      assert.ok(owned); assert.equal(completed, !withPrimary);
+      child.mock.restoreAll();
+      child.mock.method(Client.prototype, "end", function (this: Client) { if (this === owned) ended = true; return invokeEnd(end, this); });
+      await f.adapter.close(); assert.equal(ended, true);
+      assert.equal((await f.admin.query("SELECT count(*)::text AS n FROM pg_stat_activity WHERE datname=$1 AND application_name LIKE 'boardroom-maintenance:%'", [f.database])).rows[0].n, "0");
+    } finally { child.mock.restoreAll(); if (owned) await invokeEnd(end, owned); await f.close(); }
+  });
 });

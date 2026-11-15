@@ -225,8 +225,50 @@ test("#152 SQLite adapter standalone descriptor failure never masquerades as suc
       assert.equal(failed, true); assert.notEqual(sourceFd, undefined);
       if (phase === "before") fs.fstatSync(sourceFd!); else assert.throws(() => fs.fstatSync(sourceFd!), { code: "EBADF" });
       await assert.rejects(f.adapter.observe(), /maintenance_lost/);
-      child.mock.restoreAll(); syncBuiltinESMExports(); await f.adapter.close();
+      child.mock.restoreAll(); syncBuiltinESMExports();
+      if (phase === "before") {
+        await assert.rejects(f.adapter.close(), /source-close-unknown/);
+        fs.fstatSync(sourceFd!);
+        // Only this test knows that its injection preceded the real close. Production cannot prove that.
+        close(sourceFd!);
+      }
+      await f.adapter.close();
       assert.throws(() => fs.fstatSync(sourceFd!), { code: "EBADF" });
-    } finally { child.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
+    } finally {
+      child.mock.restoreAll(); syncBuiltinESMExports();
+      if (phase === "before" && sourceFd !== undefined) { try { close(sourceFd); } catch {} }
+      await f.close();
+    }
   });
+});
+
+test("#152 SQLite unknown source close never closes a reopened same-inode descriptor", async t => {
+  const f = await fixture(), close = fs.closeSync, open = fs.openSync;
+  const primary = new Error("controlled response failure after native close");
+  let replacement: number | undefined, injected = false;
+  try {
+    t.mock.method(fs, "closeSync", (fd: number) => {
+      const info = fs.fstatSync(fd, { bigint: true });
+      if (!injected && String(info.dev) === f.descriptor.identity.device && String(info.ino) === f.descriptor.identity.inode) {
+        injected = true; close(fd);
+        replacement = open(f.file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        assert.equal(replacement, fd, "the real kernel reused the numeric fd for a new owner");
+        throw primary;
+      }
+      close(fd);
+    });
+    syncBuiltinESMExports();
+    await assert.rejects(f.adapter.close(), error => error === primary);
+    assert.equal(injected, true); assert.notEqual(replacement, undefined);
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    await assert.rejects(f.adapter.close(), /source-close-unknown/);
+    const info = fs.fstatSync(replacement!, { bigint: true });
+    assert.equal(String(info.dev), f.descriptor.identity.device); assert.equal(String(info.ino), f.descriptor.identity.inode);
+    close(replacement!); replacement = undefined;
+    await f.adapter.close();
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    if (replacement !== undefined) { try { close(replacement); } catch {} }
+    await f.close();
+  }
 });

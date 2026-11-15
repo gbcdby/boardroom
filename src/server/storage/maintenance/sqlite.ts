@@ -83,6 +83,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   private closed = false;
   private closing = false;
   private sourceFdClosed = false;
+  private sourceFdCloseUnknown = false;
   constructor(source: SqliteDatabaseDescriptor) {
     if (!source.identity) throw new MaintenanceFailure("source_missing");
     this.source = source;
@@ -214,6 +215,25 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     } catch (error) { errors.push(error); }
     try { await this.closeBindFile(handle); } catch (error) { errors.push(error); }
     throwResourceFailures(errors);
+  }
+  private closeSourceDescriptor(): void {
+    if (this.sourceFdClosed) return;
+    const observedClosed = () => {
+      try {
+        const info = fstatSync(this.sourceFd, { bigint: true });
+        return String(info.dev) !== this.source.identity!.device || String(info.ino) !== this.source.identity!.inode;
+      } catch (error) { if ((error as NodeJS.ErrnoException)?.code === "EBADF") return true; throw error; }
+    };
+    if (observedClosed()) { this.sourceFdClosed = true; return; }
+    // A close error can follow the real close and fd reuse, including a new open of the same inode.
+    // Preserve uncertainty instead of treating file identity as ownership of the original description.
+    if (this.sourceFdCloseUnknown) throw new MaintenanceFailure("maintenance_lost", "source-close-unknown");
+    this.sourceFdCloseUnknown = true;
+    try { closeSync(this.sourceFd); this.sourceFdClosed = true; }
+    catch (error) {
+      try { if (observedClosed()) this.sourceFdClosed = true; } catch { /* Still unknown; retain the original close error. */ }
+      throw error;
+    }
   }
   private closeFactsSource(db: Database.Database): void {
     try { this.closeSource(db); }
@@ -613,18 +633,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     for (const handle of this.bindFiles.keys()) {
       try { await this.closeBindFile(handle); } catch (error) { appendResourceFailure(errors, error); }
     }
-    if (!this.sourceFdClosed) {
-      try {
-        const info = fstatSync(this.sourceFd, { bigint: true });
-        if (String(info.dev) === this.source.identity!.device && String(info.ino) === this.source.identity!.inode) closeSync(this.sourceFd);
-        this.sourceFdClosed = true;
-      }
-      catch (error) {
-        errors.push(error);
-        try { fstatSync(this.sourceFd); }
-        catch (observed) { if ((observed as NodeJS.ErrnoException)?.code === "EBADF") this.sourceFdClosed = true; }
-      }
-    }
+    try { this.closeSourceDescriptor(); } catch (error) { appendResourceFailure(errors, error); }
     if (this.sourceFdClosed && !this.sourceConnections.size && !this.mutexConnections.size && !this.bindFiles.size && !this.mutex) {
       this.closed = true; this.ownFds.clear();
     }
