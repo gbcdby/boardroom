@@ -1,0 +1,66 @@
+{
+  "format_version": 1,
+  "kind": "private-f3-input-contract-v1",
+  "input_kind": "FIXED_F3_INPUT_CLOSURE_NOT_BOOTED",
+  "catalog_filename": "F3-INPUTS.private.json",
+  "catalog_limit": 65536,
+  "counts": {
+    "core": 7,
+    "payload": 8,
+    "libraries": 50,
+    "modules": 12
+  },
+  "shapes": {
+    "catalog": [
+      "format_version",
+      "kind",
+      "provenance",
+      "core",
+      "payload",
+      "payload_aliases",
+      "libraries",
+      "provider_libraries",
+      "provider_executables",
+      "firmware",
+      "modules",
+      "runtime_use",
+      "runtime"
+    ],
+    "file": [
+      "root",
+      "path",
+      "bytes",
+      "sha256"
+    ],
+    "library": [
+      "requested",
+      "resolved",
+      "links",
+      "bytes",
+      "sha256",
+      "origin",
+      "old_comparison"
+    ],
+    "directory": [
+      "path",
+      "entries"
+    ],
+    "firmware": [
+      "path",
+      "entries",
+      "targets"
+    ],
+    "modules": [
+      "path",
+      "role",
+      "entries"
+    ],
+    "runtime": [
+      "loader",
+      "cache",
+      "search_profile",
+      "kernel_protocol",
+      "boot_rom"
+    ]
+  }
+}
