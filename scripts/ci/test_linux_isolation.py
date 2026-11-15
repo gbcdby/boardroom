@@ -109,11 +109,57 @@ class WholeSuiteBudgetContracts(unittest.TestCase):
         self.assertIsNotNone(match, 'The full-suite step needs its own bounded transport envelope')
         step_seconds = int(match.group(1)) * 60
         outer = self.configured('frontend', 'full-suite')
+        # The unchanged runner can wait after TERM, after KILL, then in finally.
         # Existing source/dependency archive bounds are 30s/90s outside supervise.
-        self.assertGreater(step_seconds, 30 + 90 + outer['timeout'] + outer['grace'])
+        self.assertGreater(step_seconds, 30 + 90 + outer['timeout'] + 2 * outer['grace'] + 5)
         self.assertGreaterEqual(job_minutes * 60 - step_seconds, 600)
         self.assertIn('timeout-minutes: 15', workflow.split('  database-tests:', 1)[0])
         self.assertIn('timeout-minutes: 15', workflow.split('  managed-web-browser:', 1)[1])
+
+    def test_workflow_covers_actual_double_wait_and_finally_reap_paths(self):
+        import re
+        workflow = (Path(ci.__file__).resolve().parents[2] / '.github/workflows/database-ci.yml').read_text()
+        suite_step = workflow.split('      - name: 全量测试（启用 PostgreSQL 门控用例）\n', 1)[1].split('\n      - name:', 1)[0]
+        step_seconds = int(re.search(r'^        timeout-minutes: (\d+)$', suite_step, re.M).group(1)) * 60
+        budget = self.configured('frontend', 'full-suite')
+        for finally_reap in (False, True):
+            with self.subTest(finally_reap=finally_reap):
+                clock, signals, waits = [0.0], [], []
+                child = SimpleNamespace(pid=24680, returncode=None)
+                child.poll = lambda: child.returncode
+
+                def wait(timeout):
+                    waits.append(timeout)
+                    if len(waits) == 1 or (len(waits) == 2 and finally_reap):
+                        clock[0] += timeout
+                        raise subprocess.TimeoutExpired('virtual-child', timeout)
+                    clock[0] += 5 if finally_reap else 30
+                    child.returncode = -signal.SIGKILL
+                    return child.returncode
+
+                def signal_group(pid, number):
+                    self.assertEqual(pid, child.pid)
+                    signals.append(number)
+
+                child.wait = wait
+                with mock.patch.object(ci.subprocess, 'Popen', return_value=child), \
+                     mock.patch.object(ci.time, 'monotonic', side_effect=lambda: clock[0]), \
+                     mock.patch.object(ci.time, 'sleep', side_effect=lambda _: clock.__setitem__(0, clock[0] + 1)), \
+                     mock.patch.object(ci.signal, 'signal'), mock.patch.object(ci.os, 'killpg', side_effect=signal_group):
+                    if finally_reap:
+                        with self.assertRaises(subprocess.TimeoutExpired):
+                            ci.run_command(['virtual-child'], Path('/virtual'), {}, **budget)
+                    else:
+                        result = ci.run_command(['virtual-child'], Path('/virtual'), {}, **budget)
+                        self.assertTrue(result['timed_out'])
+                        self.assertTrue(result['reaped'])
+                        self.assertEqual(result['returncode'], -signal.SIGKILL)
+                self.assertEqual(waits, [35, 35, 5] if finally_reap else [35, 35])
+                self.assertEqual(signals, [signal.SIGTERM, signal.SIGKILL, signal.SIGKILL]
+                                 if finally_reap else [signal.SIGTERM, signal.SIGKILL])
+                self.assertEqual(clock[0], budget['timeout'] + (75 if finally_reap else 65))
+                self.assertEqual(child.returncode, -signal.SIGKILL)
+                self.assertGreater(step_seconds, 30 + 90 + clock[0])
 
 
 class LauncherContracts(unittest.TestCase):
