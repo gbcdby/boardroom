@@ -2,6 +2,9 @@ import { accessSync, closeSync, constants, fstatSync, lstatSync, openSync, readS
 import { readdir, readlink, stat } from "node:fs/promises";
 import { release } from "node:os";
 import type { Blocker } from "./types.ts";
+import type { EventFacts } from "./control-candidate/schema.ts";
+type LinuxAudit = Extract<EventFacts["sessions"], { kind: "sqlite-linux-session-audit-v1" }>;
+export interface LinuxSourceProcessAudit { sourceFiles: LinuxAudit["sourceFiles"][number][]; matches: LinuxAudit["matches"] }
 
 const MAP_LIMIT = 8 * 1024 * 1024;
 const METADATA_LIMIT = 2 * 1024 * 1024;
@@ -67,7 +70,7 @@ export function linuxMappingIdentity(fdinfo: string, mountinfo: string): string 
   return `${BigInt(device[1]!)}:${BigInt(device[2]!)}:${BigInt(inode[1]!)}`;
 }
 
-export function linuxSourceMappingIdentities(files: readonly string[]): readonly LinuxSourceMappingIdentity[] {
+export function linuxSourceMappingIdentities(files: readonly string[], audit?: LinuxSourceProcessAudit["sourceFiles"]): readonly LinuxSourceMappingIdentity[] {
   const mounts = procText("/proc/self/mountinfo", METADATA_LIMIT), result: LinuxSourceMappingIdentity[] = [];
   for (const [index, file] of files.entries()) {
     let fd: number;
@@ -75,7 +78,13 @@ export function linuxSourceMappingIdentities(files: readonly string[]): readonly
     // the inode, including SQLite WAL/SHM locks held through another handle.
     // O_PATH supplies only metadata and its close preserves those native locks.
     try { fd = openSync(file, O_PATH | constants.O_NOFOLLOW); }
-    catch (error) { if (index !== 0 && (error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+    catch (error) {
+      if (index !== 0 && (error as NodeJS.ErrnoException).code === "ENOENT") {
+        if (audit) audit.push({ role: index === 1 ? "wal" : "shm", path: file, presence: "absent" });
+        continue;
+      }
+      throw error;
+    }
     try {
       // O_PATH itself bypasses read permission. Preserve the prior refusal on
       // unreadable sources, checking the pinned object rather than a new open.
@@ -87,6 +96,11 @@ export function linuxSourceMappingIdentities(files: readonly string[]): readonly
       if (!named.isFile() || named.nlink !== 1n || named.dev !== native.dev || named.ino !== native.ino) unavailable();
       if (result.some(source => source.mappedIdentity === mappedIdentity)) unavailable();
       result.push({ file, identity: `${native.dev}:${native.ino}`, mappedIdentity });
+      if (audit) {
+        const [mappedMajor, mappedMinor, mappedInode] = mappedIdentity.split(":");
+        audit.push({ role: index === 0 ? "main" : index === 1 ? "wal" : "shm", path: file, presence: "present",
+          device: String(native.dev), inode: String(native.ino), mappedMajor: mappedMajor!, mappedMinor: mappedMinor!, mappedInode: mappedInode! });
+      }
     } finally { closeSync(fd); }
   }
   return result;
@@ -121,11 +135,12 @@ export function linuxMappingIdentityAvailable(kernelRelease: string): boolean {
   return !!match && (Number(match[1]) > 6 || (Number(match[1]) === 6 && Number(match[2]) >= 8));
 }
 
-export async function inspectLinuxSourceProcesses(files: readonly string[], sessions: string, ownHandles: ReadonlyMap<string, string>): Promise<Blocker[]> {
+export async function inspectLinuxSourceProcesses(files: readonly string[], sessions: string, ownHandles: ReadonlyMap<string, string>,
+  audit?: LinuxSourceProcessAudit): Promise<Blocker[]> {
   const blockers: Blocker[] = [], uid = process.getuid!();
   const unknown = (pid: string) => blockers.push({ code: "source_writer_unknown", subjectRef: `unreadable-process:${pid}` });
   let sources: readonly LinuxSourceMappingIdentity[] | undefined;
-  try { if (!linuxMappingIdentityAvailable(release())) unavailable(); sources = linuxSourceMappingIdentities(files); }
+  try { if (!linuxMappingIdentityAvailable(release())) unavailable(); sources = linuxSourceMappingIdentities(files, audit?.sourceFiles); }
   catch { blockers.push({ code: "source_writer_unknown", subjectRef: "os-inventory-unavailable" }); }
   let pids: string[];
   try { pids = (await readdir("/proc")).filter(entry => /^[1-9][0-9]*$/.test(entry)); }
@@ -144,14 +159,25 @@ export async function inspectLinuxSourceProcesses(files: readonly string[], sess
           const file = `${directory}/fd/${fd}`, target = (await readlink(file)).replace(/ \(deleted\)$/, "");
           if (!files.includes(target) && target !== sessions && !target.startsWith(`${sessions}/`)) continue;
           const info = await stat(file, { bigint: true });
+          if (audit) audit.matches.push({ pid: Number(pid), startTicks: before.startTicks, key: `fd:${fd}`,
+            device: String(info.dev), inode: String(info.ino), sourceRole: target === files[0] ? "main"
+              : target === files[1] ? "wal" : target === files[2] ? "shm" : "managed-sessions" });
           if (Number(pid) === process.pid && ownHandles.get(`fd:${fd}`) === `${info.dev}:${info.ino}`) continue;
           blockers.push({ code: "source_writer_unknown", subjectRef: `os-process:${pid}` });
         } catch (error) { if (!["ENOENT", "ESRCH", "EBADF"].includes(String((error as NodeJS.ErrnoException).code))) unknown(pid); }
       }
       const mapped = sources === undefined ? undefined : linuxMappedSourceHandles(directory, sources);
-      for (const [key, identity] of mapped?.handles ?? [])
+      for (const [key, identity] of mapped?.handles ?? []) {
+        if (audit) {
+          const matches = sources!.filter(source => source.identity === identity);
+          if (matches.length !== 1) unavailable();
+          const [device, inode] = identity.split(":");
+          audit.matches.push({ pid: Number(pid), startTicks: before.startTicks, key, device: device!, inode: inode!,
+            sourceRole: matches[0]!.file === files[0] ? "main" : matches[0]!.file === files[1] ? "wal" : "shm" });
+        }
         if (Number(pid) !== process.pid || ownHandles.get(key) !== identity)
           blockers.push({ code: "source_writer_unknown", subjectRef: `os-process:${pid}` });
+      }
       const after = processIdentity(directory);
       if (after.pid !== before.pid || after.startTicks !== before.startTicks || fstatSync(processFd).uid !== uid) unavailable();
       // An empty maps read while a userspace process is alive is not proof of absence (e.g. exec/main-thread races).

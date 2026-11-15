@@ -4,7 +4,8 @@ import { hostname } from "node:os";
 import { inspectOwnedProcess } from "../../runtime/hosts/process-identity.ts";
 import type { OwnedProcessIdentity } from "../../runtime/hosts/types.ts";
 import { verifyStorageDrainReceipt, type StorageDrainReceipt } from "../source-client.ts";
-import { canonicalJson } from "./canonical.ts";
+import { canonicalJson, digestJson } from "./canonical.ts";
+import type { EventFacts, ProcessCheck } from "./control-candidate/schema.ts";
 import { darwinProcessObservation } from "./darwin.ts";
 import { MaintenanceFailure } from "./error.ts";
 import type { SourceClientFact, SourceClientProcessFact, SourceClientsObservation, SourceRuntimeFact } from "./types.ts";
@@ -58,7 +59,8 @@ function procIdentity(text: string, expectedPid: number) {
   if (text.length > 8192 || end < 0 || Number(prefix?.[1]) !== expectedPid || !/^[0-9]{1,24}$/.test(fields[19] ?? "")) return unknownWriter();
   return fields[19]!;
 }
-async function registeredProcess(host: Record<string, unknown>, identity: Record<string, unknown>): Promise<SourceClientProcessFact> {
+export async function inspectRegisteredSourceProcess(host: Record<string, unknown>, identity: Record<string, unknown>):
+  Promise<{ readonly fact: SourceClientProcessFact; readonly check: ProcessCheck }> {
   if (!exactKeys(host, ["version", "hostname", "platform"]) || host.version !== 1 || host.hostname !== hostname()
     || host.platform !== process.platform || identity.version !== 1 || identity.platform !== process.platform
     || !Number.isSafeInteger(identity.pid) || Number(identity.pid) < 1 || typeof identity.instanceId !== "string" || !identity.instanceId) return unknownWriter();
@@ -71,9 +73,10 @@ async function registeredProcess(host: Record<string, unknown>, identity: Record
     const actual = darwinProcessObservation(pid);
     // A registration containing only hostname cannot prove an older boot belonged to this host.
     if (actual.bootSessionUuid !== identity.bootSessionUuid) return unknownWriter();
-    if (actual.status === "absent") return { status: "exited", reason: "process_absent" };
-    return actual.startSeconds === identity.startSeconds && actual.startMicroseconds === identity.startMicroseconds
-      ? { status: "present", reason: "identity_matches" } : { status: "exited", reason: "identity_replaced" };
+    if (actual.status === "absent") return { fact: { status: "exited", reason: "process_absent" }, check: { kind: "darwin-absent", result: actual } };
+    return { fact: actual.startSeconds === identity.startSeconds && actual.startMicroseconds === identity.startMicroseconds
+      ? { status: "present", reason: "identity_matches" } : { status: "exited", reason: "identity_replaced" },
+      check: { kind: "darwin-present", result: actual } };
   }
   if (process.platform !== "linux" || !exactKeys(identity, ["version", "platform", "pid", "instanceId", "verification", "kernelBootId", "pidNamespace", "startTicks"])
     || identity.verification !== "linux_proc_identity_v1" || typeof identity.kernelBootId !== "string"
@@ -82,26 +85,38 @@ async function registeredProcess(host: Record<string, unknown>, identity: Record
     || typeof identity.startTicks !== "string" || !/^[0-9]{1,24}$/.test(identity.startTicks)) return unknownWriter();
   let handle;
   try {
-    if ((await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim() !== identity.kernelBootId
-      || await readlink("/proc/self/ns/pid") !== identity.pidNamespace) return unknownWriter();
+    const kernelBootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+    if (kernelBootId !== identity.kernelBootId) return unknownWriter();
+    const pidNamespace = await readlink("/proc/self/ns/pid");
+    if (pidNamespace !== identity.pidNamespace) return unknownWriter();
+    const observerUid = process.getuid?.();
+    if (observerUid === undefined) return unknownWriter();
+    const absent = (stage: "proc-open" | "proc-stat", errno: "ENOENT" | "ESRCH") => ({
+      fact: { status: "exited" as const, reason: "process_absent" as const },
+      check: { kind: "linux-absent" as const, observerUid, kernelBootId, pidNamespace, pid, stage, errno } });
     try { handle = await open(`/proc/${pid}`, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); }
     catch (error) {
-      if (["ENOENT", "ESRCH"].includes(String((error as NodeJS.ErrnoException).code))) return { status: "exited", reason: "process_absent" };
+      if (["ENOENT", "ESRCH"].includes(String((error as NodeJS.ErrnoException).code))) return absent("proc-open", (error as NodeJS.ErrnoException).code as "ENOENT" | "ESRCH");
       throw error;
     }
-    if ((await handle.stat()).uid !== process.getuid?.()) return unknownWriter();
+    const uidBefore = (await handle.stat()).uid;
+    if (uidBefore !== observerUid) return unknownWriter();
     const directory = `/proc/self/fd/${handle.fd}`;
     let before: string;
     try { before = procIdentity(await readFile(`${directory}/stat`, "utf8"), pid); }
     catch (error) {
-      if (["ENOENT", "ESRCH"].includes(String((error as NodeJS.ErrnoException).code))) return { status: "exited", reason: "process_absent" };
+      if (["ENOENT", "ESRCH"].includes(String((error as NodeJS.ErrnoException).code))) return absent("proc-stat", (error as NodeJS.ErrnoException).code as "ENOENT" | "ESRCH");
       throw error;
     }
-    if (before !== identity.startTicks) return { status: "exited", reason: "identity_replaced" };
+    if (before !== identity.startTicks) return { fact: { status: "exited", reason: "identity_replaced" },
+      check: { kind: "linux-replaced", observerUid, kernelBootId, pidNamespace, pid, observedUid: uidBefore, observedStartTicks: before } };
     if (await readlink(`${directory}/ns/pid`) !== identity.pidNamespace) return unknownWriter();
     const after = procIdentity(await readFile(`${directory}/stat`, "utf8"), pid);
-    if (before !== after || (await handle.stat()).uid !== process.getuid?.()) return unknownWriter();
-    return { status: "present", reason: "identity_matches" };
+    if (before !== after) return unknownWriter();
+    const uidAfter = (await handle.stat()).uid;
+    if (uidAfter !== observerUid) return unknownWriter();
+    return { fact: { status: "present", reason: "identity_matches" },
+      check: { kind: "linux-matched", observerUid, kernelBootId, pidNamespace, pid, uidBefore, uidAfter, startTicksBefore: before, startTicksAfter: after } };
   } catch { return unknownWriter(); }
   finally { try { await handle?.close(); } catch { unknownWriter(); } }
 }
@@ -142,16 +157,18 @@ function envelopeFor(row: Record<string, unknown>, sourceKind: SourceClientsObse
 }
 
 export async function sourceClientFacts(observation: SourceClientsObservation, rows: readonly Record<string, unknown>[],
-  receiptGeneration: number, validateSource: (value: unknown, observation: SourceClientsObservation) => void): Promise<SourceClientFact[]> {
+  receiptGeneration: number, validateSource: (value: unknown, observation: SourceClientsObservation) => void,
+  audit?: EventFacts["clients"]): Promise<SourceClientFact[]> {
   const result: SourceClientFact[] = [];
   if (rows.length !== observation.rows.length) throw new MaintenanceFailure("source_changed");
-  for (const row of rows) {
+  for (const [index, row] of rows.entries()) {
     const envelope = envelopeFor(row, observation.source.kind);
     if (row.database_instance_id !== observation.source.databaseInstanceId) throw new MaintenanceFailure("source_changed");
     if (counter(row.registered_epoch) >= observation.state.fenceEpoch) return unknownWriter();
     validateSource(envelope.sourceIdentity, observation);
     const host = json(row.host_identity_json), processIdentity = json(row.process_identity_json);
-    const process = await registeredProcess(host, processIdentity);
+    const inspectedProcess = await inspectRegisteredSourceProcess(host, processIdentity), process = inspectedProcess.fact;
+    const ownedExits: NonNullable<Extract<EventFacts["clients"][number], { kind: "ordinary-client" }>["receipt"]>["ownedExits"] = [];
     const current = row.drain_epoch === observation.state.fenceEpoch
       || row.registered_epoch === observation.state.fenceEpoch - 1 && row.ended_at === null;
     let receipt: StorageDrainReceipt | null = null;
@@ -170,10 +187,21 @@ export async function sourceClientFacts(observation: SourceClientsObservation, r
         const inspected = await inspectOwnedProcess(exit.processIdentity);
         if (inspected.status === "unknown") return unknownWriter();
         if (inspected.status !== "wrapper_exited") throw new MaintenanceFailure("drain_incomplete");
+        if (audit) ownedExits.push({ fence: exit.fence, processIdentity: exit.processIdentity,
+          inspection: inspected as (typeof ownedExits)[number]["inspection"] });
       }
     }
     if (!receipt && (process.status !== "exited" || row.ended_at === null || row.drain_state !== "none")) return unknownWriter();
     result.push({ clientId: String(row.client_id), classification: current ? "current-client" : "historical-client", receipt, process });
+    if (audit) {
+      const raw = observation.rows[index]!;
+      audit.push({ kind: row.build_id === "boardroom-native-management-v1" ? "native-management-client" : "ordinary-client",
+        subject: [...raw.client_id], rowDigest: digestJson({ formatVersion: 1, kind: "source-client-row", source: observation.source,
+          textEncoding: observation.textEncoding, row: raw }),
+        host: host as EventFacts["actor"]["host"], process: processIdentity as EventFacts["actor"]["process"], processCheck: inspectedProcess.check,
+        classification: current ? "current-client" : "historical-client",
+        receipt: receipt ? { digest: String(row.drain_receipt_digest), kind: current ? "current" : "historical", ownedExits } : null });
+    }
   }
   return result;
 }
@@ -182,7 +210,8 @@ export interface SourceRuntimeRows {
   readonly runners: readonly Record<string, unknown>[];
   readonly owners: readonly Record<string, unknown>[];
 }
-export async function sourceRuntimeFacts(snapshot: SourceRuntimeRows, clients: readonly SourceClientFact[]): Promise<SourceRuntimeFact[]> {
+export async function sourceRuntimeFacts(snapshot: SourceRuntimeRows, clients: readonly SourceClientFact[],
+  audit?: EventFacts["runtime"]): Promise<SourceRuntimeFact[]> {
   const rows = snapshot.runners, owners = new Map<string, Record<string, unknown>>();
   for (const row of snapshot.owners) {
     if (typeof row.member_id !== "string" || !row.member_id || owners.has(row.member_id)) return unknownWriter();
@@ -196,6 +225,8 @@ export async function sourceRuntimeFacts(snapshot: SourceRuntimeRows, clients: r
       if (!runner || counter(runner.generation) !== counter(row.generation) || runner.lease_owner !== row.lease_owner) return unknownWriter();
     }
     owners.set(row.member_id, row);
+    if (audit) audit.owners.push({ memberId: row.member_id, bindingId: row.binding_id as string | null,
+      generation: counter(row.generation), leaseOwner: row.lease_owner as string | null, leaseExpiresAt: row.lease_expires_at as string | null });
   }
   const result: SourceRuntimeFact[] = [], seen = new Set<string>();
   for (const row of rows) {
@@ -207,6 +238,8 @@ export async function sourceRuntimeFacts(snapshot: SourceRuntimeRows, clients: r
     if (generation === 0 && (row.lease_owner !== null || row.process_identity_json !== null || counter(row.exit_confirmed) !== 1)) return unknownWriter();
     const exits = clients.flatMap(client => client.receipt?.ownedExits ?? []).filter(exit => exit.fence.bindingId === row.binding_id
       && exit.fence.memberId === row.member_id && exit.fence.generation === generation);
+    let processIdentity: EventFacts["runtime"]["runners"][number]["processIdentity"] = null;
+    let inspection: EventFacts["runtime"]["runners"][number]["inspection"] = null;
     if (row.process_identity_json !== null) {
       const identity = json(row.process_identity_json) as unknown as OwnedProcessIdentity;
       if (!exactKeys(factsObject(identity), ["version", "launcherProtocol", "pid", "kernelBootId", "pidNamespace", "startTicks"])) return unknownWriter();
@@ -215,16 +248,25 @@ export async function sourceRuntimeFacts(snapshot: SourceRuntimeRows, clients: r
       const inspected = await inspectOwnedProcess(identity);
       if (inspected.status === "unknown") return unknownWriter();
       if (inspected.status !== "wrapper_exited") throw new MaintenanceFailure("source_writer_active");
+      processIdentity = identity; inspection = inspected as NonNullable<EventFacts["runtime"]["runners"][number]["inspection"]>;
     } else {
       if (row.lease_owner !== null || counter(row.exit_confirmed) !== 1) return unknownWriter();
       if (generation !== 0 && exits.length === 0) return unknownWriter();
     }
     result.push({ bindingId: row.binding_id, memberId: row.member_id, generation, status: generation === 0 ? "not-owned" : "exited" });
+    if (audit) audit.runners.push({ bindingId: row.binding_id, memberId: row.member_id, generation,
+      leaseOwner: row.lease_owner as string | null, exitConfirmed: Number(row.exit_confirmed) as 0 | 1, processIdentity, inspection });
   }
   // Current receipts must bind their current actual runner; historical receipts retain their old fences.
   for (const client of clients) if (client.classification === "current-client") for (const exit of client.receipt?.ownedExits ?? []) {
     if (!result.some(row => row.bindingId === exit.fence.bindingId && row.memberId === exit.fence.memberId && row.generation === exit.fence.generation))
       return unknownWriter();
   }
-  return result.sort((a, b) => a.bindingId < b.bindingId ? -1 : a.bindingId > b.bindingId ? 1 : 0);
+  result.sort((a, b) => a.bindingId < b.bindingId ? -1 : a.bindingId > b.bindingId ? 1 : 0);
+  if (audit) {
+    audit.runners.sort((a, b) => a.bindingId < b.bindingId ? -1 : a.bindingId > b.bindingId ? 1 : 0);
+    audit.owners.sort((a, b) => a.memberId < b.memberId ? -1 : a.memberId > b.memberId ? 1 : 0);
+    audit.results.push(...result);
+  }
+  return result;
 }

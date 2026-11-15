@@ -336,6 +336,8 @@ export interface SourceLock {
   observe(): Promise<SourceObservation>;
   observeSourceClients(): Promise<SourceClientsObservation>;
   withSourceClientFacts<T>(plan: PersistedPlanRef, consume: (window: SourceClientFactsWindow) => Promise<T>): Promise<T>;
+  /** Complete private native audit data; never a capture/control/Fs permit. */
+  readSourceClientAudit(plan: PersistedPlanRef): Promise<import("./native-audit.ts").SourceClientAudit>;
   anchor(change: AnchorChange): Promise<void>;
   /** Uses an independent snapshot reader; the lock remains held throughout the callback. */
   backup(destination: string): Promise<{ readonly manifests: DatabaseManifests; readonly toolchain: Json }>;

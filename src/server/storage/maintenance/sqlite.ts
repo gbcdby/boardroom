@@ -15,7 +15,9 @@ import { inspectLinuxSourceProcesses, linuxMappedSourceHandles, linuxSourceMappi
 import { fullSyncDarwinDatabaseHandle, syncMaintenanceHandle } from "./platform.ts";
 import { readSqliteManifests } from "./sqlite-manifests.ts";
 import { readSqliteSourceClients } from "./sqlite-source-clients.ts";
-import { withSourceClientFacts } from "./source-writers.ts";
+import { readSourceClientAudit, withSourceClientFacts, type SourceFactsAccess } from "./source-writers.ts";
+import { BootstrapAuditFactory, type SessionAuditCollection } from "./native-audit.ts";
+import type { EventFacts } from "./control-candidate/schema.ts";
 import { decodeSqliteSourceRows } from "./source-facts.ts";
 import type { AnchorChange, Blocker, ControlRootIdentity, DatabaseManifests, Json, MaintenanceAdapter, OperationMutex, SourceClientsObservation, SourceLock, SourceObservation } from "./types.ts";
 
@@ -55,6 +57,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   private readonly sourceFd: number;
   private readonly sourceDirectories: ReturnType<typeof directoryChain>;
   private readonly ownFds = new Map<string, string>();
+  private readonly auditFactories = new WeakMap<object, BootstrapAuditFactory>();
   private readonly darwinConnections = new Set<Database.Database>();
   private mutex: MutexLease | null = null;
   private currentLock: Database.Database | null = null;
@@ -140,7 +143,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   private closeSource(db: Database.Database): void { this.darwinConnections.delete(db); db.close(); this.purgeClosedFds(); }
   private closeFactsSource(db: Database.Database): void {
     try { this.closeSource(db); }
-    catch { throw new MaintenanceFailure("maintenance_lost", "source-client-facts"); }
+    catch { if (this.mutex) this.auditFactories.get(this.mutex)?.close(); throw new MaintenanceFailure("maintenance_lost", "source-client-facts"); }
   }
   private beginSourceWrite(db: Database.Database): void {
     if (!["linux", "darwin"].includes(process.platform)) { db.exec("BEGIN IMMEDIATE"); return; }
@@ -253,7 +256,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
         if (!lease.active || !lease.db.open || !lease.db.inTransaction || !same(lease.identity, { kind: "sqlite-operation-mutex", ...fileIdentity(mutexFile) }))
           throw new MaintenanceFailure("maintenance_lost");
       },
-      release: async () => { if (!lease.active) return; lease.active = false; if (lease.db.inTransaction) lease.db.exec("ROLLBACK"); lease.db.close(); if (this.mutex === lease) this.mutex = null; },
+      release: async () => { if (!lease.active) return; this.auditFactories.get(lease)?.close(); lease.active = false; if (lease.db.inTransaction) lease.db.exec("ROLLBACK"); lease.db.close(); if (this.mutex === lease) this.mutex = null; },
     };
     this.mutex = lease; await lease.assertHeld(); return lease;
   }
@@ -275,6 +278,18 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
         await mutex.assertHeld();
         if (!active || !db.open || !db.inTransaction || this.currentLock !== db) throw new MaintenanceFailure("maintenance_lost");
       };
+      const factsAccess: SourceFactsAccess = { root: mutex.root, mutexIdentity: mutex.identity,
+          assertUnchangedLock: async () => { await assertHeld(); if (factsInvalidated) throw new MaintenanceFailure("maintenance_lost"); },
+          observe: () => lock.observeSourceClients(),
+          decodedRows: async observation => decodeSqliteSourceRows(observation),
+          validateSource: (value, observation) => { if (!same(value, observation.sourceIdentity)) throw new MaintenanceFailure("source_changed"); },
+          inspectWriters: async (_observation, _rows, audit) => this.inspectCurrentWriters(true, audit),
+          runtimeRows: async () => ({
+            runners: db.prepare(`SELECT b.id AS binding_id,b.member_id,r.generation,r.lease_owner,r.exit_confirmed,
+              r.process_identity_json,r.state FROM agent_runtime_bindings b LEFT JOIN agent_runner_states r ON r.binding_id=b.id`).all() as Record<string, unknown>[],
+            owners: db.prepare("SELECT member_id,binding_id,generation,lease_owner,lease_expires_at FROM agent_runtime_members").all() as Record<string, unknown>[],
+          }),
+        };
       const lock: SourceLock = {
         assertHeld,
         observe: async () => { await assertHeld(); return this.observation(db); },
@@ -287,18 +302,13 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
             throw new MaintenanceFailure("snapshot_invalid", "source-clients");
           }
         },
-        withSourceClientFacts: (plan, consume) => { factsUsed = true; return withSourceClientFacts({ root: mutex.root, mutexIdentity: mutex.identity,
-          assertUnchangedLock: async () => { await assertHeld(); if (factsInvalidated) throw new MaintenanceFailure("maintenance_lost"); },
-          observe: () => lock.observeSourceClients(),
-          decodedRows: async observation => decodeSqliteSourceRows(observation),
-          validateSource: (value, observation) => { if (!same(value, observation.sourceIdentity)) throw new MaintenanceFailure("source_changed"); },
-          inspectWriters: async () => this.inspectCurrentWriters(true),
-          runtimeRows: async () => ({
-            runners: db.prepare(`SELECT b.id AS binding_id,b.member_id,r.generation,r.lease_owner,r.exit_confirmed,
-              r.process_identity_json,r.state FROM agent_runtime_bindings b LEFT JOIN agent_runner_states r ON r.binding_id=b.id`).all() as Record<string, unknown>[],
-            owners: db.prepare("SELECT member_id,binding_id,generation,lease_owner,lease_expires_at FROM agent_runtime_members").all() as Record<string, unknown>[],
-          }),
-        }, plan, consume); },
+        withSourceClientFacts: (plan, consume) => { factsUsed = true; return withSourceClientFacts(factsAccess, plan, consume); },
+        readSourceClientAudit: plan => {
+          factsUsed = true;
+          let factory = this.auditFactories.get(mutex);
+          if (!factory) { factory = new BootstrapAuditFactory(this, mutex); this.auditFactories.set(mutex, factory); }
+          return readSourceClientAudit(factsAccess, plan, factory.bind(this, mutex, lock, factsAccess.assertUnchangedLock), lock);
+        },
         anchor: async change => { await assertHeld(); factsInvalidated = true; this.anchor(db, change, mutex); },
         backup: async destination => {
           await assertHeld();
@@ -309,6 +319,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       const result = await callback(lock); await assertHeld(); db.exec("COMMIT"); this.fullSyncSource(); return result;
     } catch (error) {
       if (db.inTransaction) db.exec("ROLLBACK");
+      if (error instanceof MaintenanceFailure && error.code === "maintenance_lost") this.auditFactories.get(mutex)?.close();
       if (error instanceof MaintenanceFailure) throw error;
       if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(String((error as { code?: string }).code))) throw new MaintenanceFailure("maintenance_busy");
       throw error;
@@ -402,7 +413,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   async inspectWriters(_observation: SourceObservation): Promise<readonly Blocker[]> {
     return this.inspectCurrentWriters();
   }
-  private async inspectCurrentWriters(strictClose = false): Promise<readonly Blocker[]> {
+  private async inspectCurrentWriters(strictClose = false, audit?: SessionAuditCollection): Promise<readonly Blocker[]> {
     this.assertSource();
     if (!["linux", "darwin"].includes(process.platform) || process.getuid === undefined) return [{ code: "source_writer_unknown", subjectRef: "os-inventory-unavailable" }];
     this.purgeClosedFds(); const blockers: Blocker[] = [];
@@ -410,13 +421,42 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     const sessions = path.join(this.source.dataDir, "managed", "sessions");
     if (process.platform === "darwin") {
       try {
-        for (const item of darwinSourceInventory({ files: sourcePaths, trees: [sessions] }, false).items) {
+        const nativeAudit: import("./darwin.ts").DarwinSourceAudit | undefined = audit ? {} : undefined;
+        const ownedResources = audit ? [...this.ownFds].map(([key, value]) => {
+          const [device, inode] = value.split(":"); return { key, device: device!, inode: inode! };
+        }).sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0) : undefined;
+        const inventory = darwinSourceInventory({ files: sourcePaths, trees: [sessions] }, false, nativeAudit);
+        for (const item of inventory.items) {
           if (item.kind === "unreadable") blockers.push({ code: "source_writer_unknown", subjectRef: `unreadable-process:${item.pid}` });
           else if (item.pid !== process.pid || this.ownFds.get(item.key) !== `${item.device}:${item.inode}`)
             blockers.push({ code: "source_writer_unknown", subjectRef: `os-process:${item.pid}` });
         }
+        if (audit && nativeAudit?.sourceFiles && blockers.length === 0) {
+          const items = inventory.items as Extract<EventFacts["sessions"], { kind: "sqlite-darwin-session-audit-v1" }>["inventory"]["items"];
+          items.sort((a, b) => a.pid - b.pid || (BigInt(a.startSeconds) < BigInt(b.startSeconds) ? -1 : BigInt(a.startSeconds) > BigInt(b.startSeconds) ? 1 : 0)
+            || (BigInt(a.startMicroseconds) < BigInt(b.startMicroseconds) ? -1 : BigInt(a.startMicroseconds) > BigInt(b.startMicroseconds) ? 1 : 0)
+            || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+          const sourceFiles = nativeAudit.sourceFiles.map((file, i) => ({ ...file, role: (["main", "wal", "shm"] as const)[i]! }));
+          audit.value = { kind: "sqlite-darwin-session-audit-v1", observer: { host: audit.actor.host, process: audit.actor.process }, uid: process.getuid!(),
+            sourceFiles: sourceFiles as Extract<EventFacts["sessions"], { kind: "sqlite-darwin-session-audit-v1" }>["sourceFiles"], sessionsTree: sessions,
+            ownedResources: ownedResources!, inventory: { version: 1, scope: "current-uid", items } };
+        }
       } catch { blockers.push({ code: "source_writer_unknown", subjectRef: "os-inventory-unavailable" }); }
-    } else blockers.push(...await inspectLinuxSourceProcesses(sourcePaths, sessions, this.ownFds));
+    } else {
+      const nativeAudit = audit ? { sourceFiles: [] as Extract<EventFacts["sessions"], { kind: "sqlite-linux-session-audit-v1" }>["sourceFiles"][number][],
+        matches: [] as Extract<EventFacts["sessions"], { kind: "sqlite-linux-session-audit-v1" }>["matches"] } : undefined;
+      const ownedResources = audit ? [...this.ownFds].map(([key, value]) => {
+        const [device, inode] = value.split(":"); return { key, device: device!, inode: inode! };
+      }).sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0) : undefined;
+      blockers.push(...await inspectLinuxSourceProcesses(sourcePaths, sessions, this.ownFds, nativeAudit));
+      if (audit && nativeAudit && blockers.length === 0) {
+        nativeAudit.matches.sort((a, b) => a.pid - b.pid || (BigInt(a.startTicks) < BigInt(b.startTicks) ? -1 : BigInt(a.startTicks) > BigInt(b.startTicks) ? 1 : 0)
+          || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+        audit.value = { kind: "sqlite-linux-session-audit-v1", observer: { host: audit.actor.host, process: audit.actor.process },
+          uid: process.getuid!(), sourceFiles: nativeAudit.sourceFiles as Extract<EventFacts["sessions"], { kind: "sqlite-linux-session-audit-v1" }>["sourceFiles"],
+          sessionsTree: sessions, ownedResources: ownedResources!, matches: nativeAudit.matches };
+      }
+    }
     const db = this.openSource(true);
     try {
       for (const row of db.prepare("SELECT binding_id,process_identity_json FROM agent_runner_states WHERE exit_confirmed=0").all() as { binding_id: string; process_identity_json: string | null }[]) {

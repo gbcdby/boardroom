@@ -14,14 +14,20 @@ const handle = z.object({ kind: z.literal("handle"), pid: z.number().int().posit
   device: numberText, inode: numberText, links: numberText }).strict();
 const unreadable = z.object({ kind: z.literal("unreadable"), pid: z.number().int().positive(), reason: z.string().regex(/^[a-z-]+$/) }).strict();
 const inventory = z.object({ version: z.literal(1), scope: z.enum(["parent", "current-uid"]), items: z.array(z.discriminatedUnion("kind", [handle, unreadable])) }).strict();
+const sourceFile = z.discriminatedUnion("presence", [
+  z.object({ path: z.string().max(4096), presence: z.literal("absent") }).strict(),
+  z.object({ path: z.string().max(4096), presence: z.literal("present"), device: numberText, inode: numberText }).strict(),
+]);
+const auditInventory = inventory.extend({ sourceFiles: z.array(sourceFile) }).strict();
 const filesystem = z.object({ version: z.literal(1), filesystemType: z.literal("apfs"), local: z.literal(true), ownershipEnforced: z.literal(true), acl: z.literal("none"), fullfsync: z.boolean(),
   kind: z.enum(["file", "directory"]), device: numberText, inode: numberText }).strict();
 export type DarwinSourceHandle = z.infer<typeof handle>;
 export type DarwinSourceInventory = z.infer<typeof inventory>;
 export interface DarwinSourceScope { readonly files: readonly string[]; readonly trees?: readonly string[] }
+export interface DarwinSourceAudit { sourceFiles?: z.infer<typeof sourceFile>[] }
 
 /** The executable is fixed by this package; callers cannot supply a command, shell or executable. */
-function native(command: "host" | "filesystem" | "fullsync" | "parent-handles" | "source-users" | "process", arguments_: readonly string[] = [], fd?: number): unknown {
+function native(command: "host" | "filesystem" | "fullsync" | "parent-handles" | "source-users" | "source-audit-users" | "process", arguments_: readonly string[] = [], fd?: number): unknown {
   assertDarwinMaintenanceAvailable();
   const result = spawnSync(binary, [command, ...arguments_], { encoding: "utf8", timeout: 15_000, maxBuffer: 4 * 1024 * 1024,
     stdio: fd === undefined ? ["ignore", "pipe", "pipe"] : ["ignore", "pipe", "pipe", fd] });
@@ -87,7 +93,7 @@ export function darwinFileSystem(fd: number, fullSync = false): z.infer<typeof f
     return parsed.data;
   } catch { throw new MaintenanceFailure("unsupported_durability"); }
 }
-export function darwinSourceInventory(scope: DarwinSourceScope, parentOnly: boolean): DarwinSourceInventory {
+export function darwinSourceInventory(scope: DarwinSourceScope, parentOnly: boolean, audit?: DarwinSourceAudit): DarwinSourceInventory {
   const arguments_: string[] = [];
   for (const [kind, values] of [["f", scope.files], ["d", scope.trees ?? []]] as const) for (const file of values) {
     if (!path.isAbsolute(file) || path.resolve(file) !== file || file === "/" || file.includes("\0")) throw new MaintenanceFailure("source_changed");
@@ -95,10 +101,16 @@ export function darwinSourceInventory(scope: DarwinSourceScope, parentOnly: bool
   }
   if (!arguments_.length || arguments_.length > 16) throw new MaintenanceFailure("source_changed");
   try {
-    const parsed = inventory.safeParse(native(parentOnly ? "parent-handles" : "source-users", arguments_));
+    if (audit && parentOnly) throw new Error();
+    const parsed = (audit ? auditInventory : inventory).safeParse(native(parentOnly ? "parent-handles" : audit ? "source-audit-users" : "source-users", arguments_));
     if (!parsed.success || parsed.data.scope !== (parentOnly ? "parent" : "current-uid")
       || parentOnly && parsed.data.items.some(item => item.pid !== process.pid)) throw new Error();
-    return parsed.data;
+    if (audit) {
+      const files = (parsed.data as z.infer<typeof auditInventory>).sourceFiles;
+      if (files.length !== scope.files.length || files.some((file, i) => file.path !== scope.files[i])) throw new Error();
+      audit.sourceFiles = files;
+    }
+    return { version: parsed.data.version, scope: parsed.data.scope, items: parsed.data.items };
   } catch { throw new MaintenanceFailure("source_writer_unknown"); }
 }
 export function darwinSourceHandles(files: readonly string[]): Map<string, string> {

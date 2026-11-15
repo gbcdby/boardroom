@@ -17,7 +17,10 @@ import { parsePostgresConnection, postgresDatabaseArgument, postgresToolVersions
 import { postgresFileDigest, restorePostgresPublic } from "./postgres-public-restore.ts";
 import { readPublicRestoreCatalogBinding, type PublicRestoreCatalogBinding } from "./postgres-public-toc.ts";
 import { decodePostgresSourceRows, readPostgresSourceClients } from "./postgres-source-clients.ts";
-import { withSourceClientFacts } from "./source-writers.ts";
+import { readSourceClientAudit, withSourceClientFacts, type SourceFactsAccess } from "./source-writers.ts";
+import { BootstrapAuditFactory, type SessionAuditCollection } from "./native-audit.ts";
+import type { EventFacts } from "./control-candidate/schema.ts";
+type PostgresAudit = Extract<EventFacts["sessions"], { kind: "postgres-session-audit-v1" }>;
 import type { AnchorChange, Blocker, BlockerCode, ControlRootIdentity, DatabaseManifests, Json,
   MaintenanceAdapter, OperationMutex, SourceClientsObservation, SourceLock, SourceObservation } from "./types.ts";
 
@@ -25,6 +28,7 @@ interface Session {
   readonly client: Client;
   readonly source: boolean;
   readonly critical: boolean;
+  readonly role: PostgresAudit["ownedSessions"][number]["role"];
   pid: number;
   backendStart: string;
   ending: boolean;
@@ -116,6 +120,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   const sourceConnection = parsePostgresConnection(source);
   const verificationConnection = verification ? parsePostgresConnection(verification) : undefined;
   const sessions = new Set<Session>();
+  const auditFactories = new WeakMap<HeldMutex, BootstrapAuditFactory>();
   const abort = new AbortController();
   let closed = false, lost = false, mutex: HeldMutex | undefined, lockActive = false;
   let firstSourceIdentity: Json | undefined, mutexTimer: ReturnType<typeof setInterval> | undefined;
@@ -136,7 +141,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   const sessionMetadata = (session: Session) => Object.freeze({ pid: session.pid,
     backendStart: session.backendStart.slice(0, 128), source: session.source, critical: session.critical,
     ending: session.ending, ended: session.ended, truncated: session.backendStart.length > 128 });
-  const invalidate = () => { lost = true; abort.abort(); };
+  const invalidate = () => { if (mutex) auditFactories.get(mutex)?.close(); lost = true; abort.abort(); };
   function assertOpen(): void {
     if (closed || lost) throw new MaintenanceFailure("maintenance_lost");
   }
@@ -154,11 +159,12 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     try { confirmed = await endSession(session); } catch { /* Synchronous native close is also uncertain. */ }
     if (!confirmed) { invalidate(); throw new MaintenanceFailure("maintenance_lost", "source-client-facts"); }
   }
-  async function connect(connection: PostgresConnection, sourceSession: boolean, critical = false): Promise<Session> {
+  async function connect(connection: PostgresConnection, sourceSession: boolean, critical = false,
+    role: Session["role"] = "inspection"): Promise<Session> {
     assertOpen();
     const client = new Client({ ...connection.clientConfig,
       application_name: `boardroom-maintenance:${randomUUID()}` });
-    const session: Session = { client, source: sourceSession, critical, pid: 0, backendStart: "", ending: false, ended: false };
+    const session: Session = { client, source: sourceSession, critical, role, pid: 0, backendStart: "", ending: false, ended: false };
     client.on("error", () => { if (critical && !session.ending) invalidate(); });
     client.on("end", () => { session.ended = true; if (critical && !session.ending) invalidate(); });
     try {
@@ -275,7 +281,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     assertOpen();
     if (mutex && !mutex.released) throw new MaintenanceFailure("maintenance_busy");
     if (root.hostIdentityDigest !== await maintenanceHostIdentityDigest()) throw new MaintenanceFailure("control_root_mismatch");
-    const session = await connect(sourceConnection, true, true);
+    const session = await connect(sourceConnection, true, true, "operation-mutex");
     let acquired = false;
     try {
       const actual = await readIdentity(session, sourceConnection, true);
@@ -321,7 +327,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         async release() {
           if (held.released) return;
           if (lockActive) throw new MaintenanceFailure("maintenance_busy");
-          held.released = true; clearInterval(mutexTimer); mutexTimer = undefined;
+          auditFactories.get(held)?.close(); held.released = true; clearInterval(mutexTimer); mutexTimer = undefined;
           await endSession(session);
           if (mutex === held) mutex = undefined;
         },
@@ -331,7 +337,8 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       await endSession(session); throw safeError(error, "maintenance_lost");
     }
   }
-  async function inspectWriters(current: Pick<SourceObservation, "sourceIdentity" | "state" | "clients">, phase: WriterPhase = "external", sourceFacts = false): Promise<readonly Blocker[]> {
+  async function inspectWriters(current: Pick<SourceObservation, "sourceIdentity" | "state" | "clients">, phase: WriterPhase = "external", sourceFacts = false,
+    audit?: SessionAuditCollection): Promise<readonly Blocker[]> {
     const session = await connect(sourceConnection, true);
     const observing = writerObservation.hasSubscribers, inspectionId = observing ? ++inspectionSequence : 0;
     let stage = "source-identity";
@@ -340,28 +347,42 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       if (!same(current.sourceIdentity, stablePostgresSourceIdentity(identity,
         sourceConnection.descriptorDigest, current.state.databaseInstanceId))) throw new MaintenanceFailure("source_changed");
       const registered = new Set<string>(), registrationPids: number[] = [], registrationStarts: string[] = [];
-      for (const client of current.clients) {
+      const registrationAudit: PostgresAudit["registeredSessions"] = [];
+      for (const [clientIndex, client] of current.clients.entries()) {
         if (typeof client.db_sessions_json !== "string") continue;
         try {
-          const envelope = JSON.parse(client.db_sessions_json) as { sessions?: { observedBackends?: { pid?: unknown; backend_start?: unknown }[] }[] };
-          for (const entry of envelope.sessions ?? []) for (const backend of entry.observedBackends ?? []) {
+          const envelope = JSON.parse(client.db_sessions_json) as { sessions?: { owner?: unknown; observedBackends?: { pid?: unknown; backend_start?: unknown }[] }[] };
+          for (const [sessionIndex, entry] of (envelope.sessions ?? []).entries()) for (const [backendIndex, backend] of (entry.observedBackends ?? []).entries()) {
             if (Number.isSafeInteger(backend.pid) && typeof backend.backend_start === "string") {
               registered.add(`${backend.pid}:${backend.backend_start}`);
               registrationPids.push(backend.pid as number); registrationStarts.push(backend.backend_start);
+              if (audit) {
+                const raw = audit.observation.rows[clientIndex];
+                if (!raw || !["local-driver", "client-control"].includes(String(entry.owner))) throw new MaintenanceFailure("source_writer_unknown");
+                registrationAudit.push({ subject: [...raw.client_id], sessionIndex, backendIndex,
+                  owner: entry.owner as "local-driver" | "client-control", pid: backend.pid as number,
+                  originalBackendStart: backend.backend_start, normalizedBackendStart: "" });
+              }
             }
           }
-        } catch { /* An invalid registration cannot exempt any real backend. */ }
+        } catch (error) { if (audit) throw error; /* An invalid registration cannot exempt any real backend. */ }
       }
       if (sourceFacts && registrationPids.length) {
         // Native timestamps can be recorded under a different session TimeZone.
         // Compare the actual instants without losing PostgreSQL microseconds to JS Date.
-        const normalized = (await session.client.query(`SELECT pid,started::timestamptz::text AS backend_start
+        const normalized = (await session.client.query(`SELECT pid,started::timestamptz::text AS backend_start${audit ? ",started AS original_backend_start" : ""}
           FROM unnest($1::integer[],$2::text[]) AS registrations(pid,started)`, [registrationPids, registrationStarts])).rows;
         if (normalized.length !== registrationPids.length) throw new MaintenanceFailure("source_writer_unknown");
         registered.clear();
-        for (const backend of normalized) {
+        for (const [index, backend] of normalized.entries()) {
           if (!Number.isSafeInteger(backend.pid) || typeof backend.backend_start !== "string") throw new MaintenanceFailure("source_writer_unknown");
           registered.add(`${backend.pid}:${backend.backend_start}`);
+          if (audit) {
+            const entry = registrationAudit[index];
+            if (!entry || entry.pid !== backend.pid || entry.originalBackendStart !== backend.original_backend_start)
+              throw new MaintenanceFailure("source_writer_unknown");
+            entry.normalizedBackendStart = backend.backend_start;
+          }
         }
       }
       stage = "activity-query";
@@ -369,6 +390,9 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         EXISTS(SELECT 1 FROM pg_catalog.pg_locks l WHERE l.pid=a.pid AND l.granted
           AND l.mode IN ('RowExclusiveLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock')) AS write_lock
         FROM pg_catalog.pg_stat_activity a WHERE datid=$1::oid ORDER BY pid`, [identity.databaseOid])).rows;
+      const auditOwned = audit ? [...sessions].filter(candidate => candidate.source && !candidate.ended)
+        .map(candidate => ({ pid: candidate.pid, backendStart: candidate.backendStart, role: candidate.role }))
+        .sort((a, b) => a.pid - b.pid || a.backendStart.localeCompare(b.backendStart)) : undefined;
       const activityAtMilliseconds = observing ? performance.now() : undefined;
       const ownSessionCount = sessions.size;
       let truncated = actual.length > observationRows || ownSessionCount > observationRows;
@@ -401,7 +425,8 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       }
       // A prepared transaction survives its backend and can later commit; pg_stat_activity alone misses it.
       stage = "prepared-query";
-      const prepared = (await session.client.query("SELECT 1 FROM pg_catalog.pg_prepared_xacts WHERE database=current_database() LIMIT 1")).rows.length > 0;
+      const preparedRows = (await session.client.query("SELECT 1 FROM pg_catalog.pg_prepared_xacts WHERE database=current_database() LIMIT 1")).rows.length;
+      const prepared = preparedRows > 0;
       if (prepared)
         blockers.push({ code: "source_writer_unknown", subjectRef: "postgres-prepared-transaction" });
       if (observing) note({ kind: "inspection", phase, inspectionId, databaseOid: identity.databaseOid,
@@ -409,6 +434,16 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         registeredCount: registered.size, ownSessionCount, ownSessions, rows: Object.freeze(rows), prepared,
         blockerCount: blockers.length, blockers: Object.freeze(blockers.slice(0, observationRows).map(blocker => Object.freeze({
           code: blocker.code, subjectRef: blocker.subjectRef }))), truncated: truncated || blockers.length > observationRows });
+      if (audit && blockers.length === 0) {
+        if (identity.schemaOid === null) throw new MaintenanceFailure("source_writer_unknown");
+        registrationAudit.sort((a, b) => (a.subject[1] < b.subject[1] ? -1 : a.subject[1] > b.subject[1] ? 1 : 0)
+          || a.sessionIndex - b.sessionIndex || a.backendIndex - b.backendIndex);
+        audit.value = { kind: "postgres-session-audit-v1", databaseOid: identity.databaseOid, schemaOid: identity.schemaOid,
+          descriptorDigest: sourceConnection.descriptorDigest, ownedSessions: auditOwned!,
+          activity: actual.map(backend => ({ pid: backend.pid, backendStart: backend.backend_start,
+            backendType: backend.backend_type, state: backend.state, writeLock: backend.write_lock })),
+          registeredSessions: registrationAudit, preparedQueryRows: preparedRows as 0 };
+      }
       return blockers;
     } catch (error) {
       if (observing) {
@@ -431,13 +466,14 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   }
   async function withSourceLock<T>(kind: "control" | "snapshot", callback: (lock: SourceLock) => Promise<T>): Promise<T> {
     await assertMutex();
+    const heldMutex = mutex!;
     if (lockActive) throw new MaintenanceFailure("maintenance_busy");
     lockActive = true;
     let session: Session | undefined, active = false, transactionId = "", changed = false, backupUsed = false, factsInvalidated = false, factsUsed = false;
     let tables: readonly PostgresTable[] = [], lockedSchemaDigest: string | undefined;
     let frozenCapture: DatabaseManifests | undefined;
     try {
-      session = await connect(sourceConnection, true, true);
+      session = await connect(sourceConnection, true, true, "source-control");
       // This inventory precedes BEGIN. The snapshot's first SELECT must occur only after LOCK.
       tables = await listPostgresTables(session.client, sourceConnection.schema);
       await session.client.query(kind === "snapshot" ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ WRITE" : "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE");
@@ -458,6 +494,30 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         if (actual?.id !== transactionId || actual.count !== String(tables.length)) { invalidate(); throw new MaintenanceFailure("maintenance_lost"); }
       };
       if (kind === "snapshot") assertSnapshotLock = assertHeld;
+      const factsAccess: SourceFactsAccess = { root: heldMutex.root, mutexIdentity: heldMutex.identity,
+          assertUnchangedLock: async () => { await assertHeld(); if (factsInvalidated) throw new MaintenanceFailure("maintenance_lost"); },
+          observe: () => lock.observeSourceClients(),
+          decodedRows: observation => decodePostgresSourceRows(locked.client, observation),
+          validateSource(value, observation) {
+            const actual = object(observation.sourceIdentity);
+            const expected = { kind: "postgres", database_oid: actual.databaseOid, schema_oid: actual.schemaOid,
+              database_name: actual.databaseName, schema_name: actual.schemaName, configurationDigest: sha256(source.connectionString) };
+            if (!same(value, expected)) throw new MaintenanceFailure("source_changed");
+          },
+          inspectWriters: async (observation, rows, audit) => inspectWriters({ ...observation, clients: rows as readonly Readonly<Record<string, Json>>[] }, "external", true, audit),
+          runtimeRows: async () => {
+            try {
+              return {
+                runners: (await locked.client.query(`SELECT b.id AS binding_id,b.member_id,r.generation,r.lease_owner,r.exit_confirmed,
+                  r.process_identity_json,r.state FROM agent_runtime_bindings b LEFT JOIN agent_runner_states r ON r.binding_id=b.id`)).rows,
+                owners: (await locked.client.query("SELECT member_id,binding_id,generation,lease_owner,lease_expires_at FROM agent_runtime_members")).rows,
+              };
+            } catch (error) {
+              if (lost || locked.ended) throw new MaintenanceFailure("maintenance_lost", "source-client-facts");
+              throw safeError(error, "source_writer_unknown", "source-client-facts");
+            }
+          },
+        };
       const lock: SourceLock = {
         async observe() {
           await assertHeld(); const result = await observation(locked);
@@ -474,30 +534,13 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
             await assertHeld(); return result;
           } catch (error) { throw safeError(error, "snapshot_invalid", "source-clients"); }
         },
-        withSourceClientFacts: (plan, consume) => { factsUsed = true; return withSourceClientFacts({ root: mutex!.root, mutexIdentity: mutex!.identity,
-          assertUnchangedLock: async () => { await assertHeld(); if (factsInvalidated) throw new MaintenanceFailure("maintenance_lost"); },
-          observe: () => lock.observeSourceClients(),
-          decodedRows: observation => decodePostgresSourceRows(locked.client, observation),
-          validateSource(value, observation) {
-            const actual = object(observation.sourceIdentity);
-            const expected = { kind: "postgres", database_oid: actual.databaseOid, schema_oid: actual.schemaOid,
-              database_name: actual.databaseName, schema_name: actual.schemaName, configurationDigest: sha256(source.connectionString) };
-            if (!same(value, expected)) throw new MaintenanceFailure("source_changed");
-          },
-          inspectWriters: async (observation, rows) => inspectWriters({ ...observation, clients: rows as readonly Readonly<Record<string, Json>>[] }, "external", true),
-          runtimeRows: async () => {
-            try {
-              return {
-                runners: (await locked.client.query(`SELECT b.id AS binding_id,b.member_id,r.generation,r.lease_owner,r.exit_confirmed,
-                  r.process_identity_json,r.state FROM agent_runtime_bindings b LEFT JOIN agent_runner_states r ON r.binding_id=b.id`)).rows,
-                owners: (await locked.client.query("SELECT member_id,binding_id,generation,lease_owner,lease_expires_at FROM agent_runtime_members")).rows,
-              };
-            } catch (error) {
-              if (lost || locked.ended) throw new MaintenanceFailure("maintenance_lost", "source-client-facts");
-              throw safeError(error, "source_writer_unknown", "source-client-facts");
-            }
-          },
-        }, plan, consume); },
+        withSourceClientFacts: (plan, consume) => { factsUsed = true; return withSourceClientFacts(factsAccess, plan, consume); },
+        readSourceClientAudit: plan => {
+          factsUsed = true;
+          let factory = auditFactories.get(heldMutex);
+          if (!factory) { factory = new BootstrapAuditFactory(adapter, heldMutex); auditFactories.set(heldMutex, factory); }
+          return readSourceClientAudit(factsAccess, plan, factory.bind(adapter, heldMutex, lock, factsAccess.assertUnchangedLock), lock);
+        },
         async anchor(change) {
           await assertHeld(); factsInvalidated = true; assertAnchor(change, mutex!);
           const current = await readPostgresMaintenanceState(locked.client, { required: true });
@@ -809,12 +852,13 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       }
     } finally { if (cleanup) await cleanup.end().catch(() => {}); }
   }
-  return { dialect: "postgres", observe, observeSourceClients, acquireMutex, withSourceLock, inspectWriters, verifyDatabase,
+  const adapter: MaintenanceAdapter = { dialect: "postgres", observe, observeSourceClients, acquireMutex, withSourceLock, inspectWriters, verifyDatabase,
     async close() {
-      if (closed) return; closed = true; clearInterval(mutexTimer); abort.abort();
+      if (closed) return; if (mutex) auditFactories.get(mutex)?.close(); closed = true; clearInterval(mutexTimer); abort.abort();
       await waitForPostgresTools(abort.signal);
       await Promise.allSettled([...activeVerifications]);
       await Promise.all([...sessions].map(endSession)); mutex = undefined;
     },
   };
+  return adapter;
 }
