@@ -252,12 +252,19 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     catch (error) { db?.close(); return failure(error); }
     const lease: MutexLease = { root, identity: mutexIdentity!, db: db!, active: true,
       assertHeld: async () => {
-        this.assertSource(); await store.assertRoot();
-        if (!lease.active || !lease.db.open || !lease.db.inTransaction || !same(lease.identity, { kind: "sqlite-operation-mutex", ...fileIdentity(mutexFile) }))
-          throw new MaintenanceFailure("maintenance_lost");
+        try {
+          this.assertSource(); await store.assertRoot();
+          if (!lease.active || !lease.db.open || !lease.db.inTransaction || !same(lease.identity, { kind: "sqlite-operation-mutex", ...fileIdentity(mutexFile) }))
+            throw new MaintenanceFailure("maintenance_lost");
+        } catch (error) {
+          if (error instanceof MaintenanceFailure && error.code === "maintenance_lost") this.auditFactories.get(lease)?.close();
+          throw error;
+        }
       },
       release: async () => { if (!lease.active) return; this.auditFactories.get(lease)?.close(); lease.active = false; if (lease.db.inTransaction) lease.db.exec("ROLLBACK"); lease.db.close(); if (this.mutex === lease) this.mutex = null; },
     };
+    // Establish the private lifetime before any public lease check; native identity remains audit-only.
+    this.auditFactories.set(lease, new BootstrapAuditFactory(this, lease));
     this.mutex = lease; await lease.assertHeld(); return lease;
   }
   private checkMutexSchema(db: Database.Database): void {
