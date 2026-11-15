@@ -408,14 +408,20 @@ static const unsigned char F2_EXPECTED_CONFIG[] = {1};
 #define ioctl test_ioctl
 #include "f2-guest.c"
 #include <stdarg.h>
-static int mode, next_fd=700, closed[1024], ack_count, root_operations, fork_count, pipe_count, reboot_count;
+static int mode, next_fd=700, closed[1024], ack_count, root_operations, fork_count, pipe_count, reboot_count, read_count;
 int test_pipe2(int fds[2], int flags) { (void)flags; ++pipe_count; if(mode==4){errno=EMFILE;return -1;} fds[0]=next_fd++;fds[1]=next_fd++;return 0; }
 pid_t test_fork(void) { ++fork_count; if(mode==3||mode==5){errno=EAGAIN;return -1;}return 1234; }
 int test_close(int fd) { if(fd<700||fd>=1024)abort();++closed[fd];if(fd==700&&mode==1){errno=EBADF;return -1;}return 0; }
 int test_open(const char *path, int flags, ...) { (void)flags; ++root_operations;if(mode<5)abort();if(strcmp(path,"/usr/sbin/mke2fs")&&strcmp(path,"/dev/null"))abort();return next_fd++; }
 int test_fstat(int fd, struct stat *s) { if(fd!=700)abort();memset(s,0,sizeof(*s));s->st_mode=S_IFREG|0555;s->st_size=146000;s->st_nlink=1;return 0; }
 long test_syscall(long number, ...) { if(number!=SYS_pidfd_open)abort();if(mode==2){errno=EIO;return -1;}return next_fd++; }
-ssize_t test_read(int fd, void *data, size_t size) { (void)fd;if(mode<5)abort();memset(data,0,size);return 0; }
+ssize_t test_read(int fd, void *data, size_t size) {
+    (void)fd;if(mode<5)abort();
+    if(read_count<0){errno=EIO;return -1;}
+    if((size_t)read_count>size)abort();
+    if(read_count>0)memset(data,'D',(size_t)read_count);
+    return read_count;
+}
 ssize_t test_write(int fd, const void *data, size_t size) { (void)fd;if(size!=1||*(const char*)data!='G')abort();++ack_count;return 1; }
 pid_t test_waitpid(pid_t pid, int *status, int flags) { (void)flags;if(pid!=1234)abort();*status=mode>=5?0:256;return pid; }
 pid_t test_getpid(void) { return 1; }
@@ -434,6 +440,13 @@ int main(int argc,char**argv){
     if(argc!=2)return 64;
     mode=atoi(argv[1]);strcpy(run_id,"9ac818aa-3fe1-4f28-8b5e-119430876bdd");
     (void)collect_p1;(void)metadata;(void)load_uuid;
+    if(mode==7){
+        char buffer[4]={'X','X','X','X'};
+        read_count=2;if(test_read(700,buffer,sizeof(buffer))!=2||memcmp(buffer,"DDXX",4))return 84;
+        read_count=0;if(test_read(700,buffer,sizeof(buffer))!=0||memcmp(buffer,"DDXX",4))return 85;
+        read_count=-1;if(test_read(700,buffer,sizeof(buffer))!=-1||errno!=EIO||memcmp(buffer,"DDXX",4))return 86;
+        puts("READ_CONTRACT positive_range_only eof_unchanged error_unchanged");return 0;
+    }
     int rc;
     if(mode<5){rc=bootstrap_f2();if(rc!=1||root_operations||reboot_count!=1)return 80;}
     else {struct child_result child=format_child();rc=child_ok(child)?0:1;if(mode==5?(rc!=1):(rc!=0))return 81;}
@@ -470,6 +483,11 @@ int main(int argc,char**argv){
                 result = subprocess.run([str(self.binary), str(mode)], stdin=subprocess.DEVNULL, capture_output=True, timeout=3)
                 self.assertEqual(result.returncode, 0, result.stdout.decode()+result.stderr.decode())
                 self.assertLess(len(result.stdout), 16384)
+
+    def test_virtual_read_writes_only_successful_range_and_preserves_eof_error_buffers(self):
+        result = subprocess.run([str(self.binary), "7"], stdin=subprocess.DEVNULL, capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stdout.decode()+result.stderr.decode())
+        self.assertEqual(result.stdout, b"READ_CONTRACT positive_range_only eof_unchanged error_unchanged\n")
 
 
 if __name__ == "__main__": unittest.main()
