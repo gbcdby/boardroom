@@ -149,7 +149,7 @@ for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeT
         const journal = await f.store.putJson("journal", invalid);
         await lock.anchor({ expected: state, admission: "sealed", fenceEpoch: state.fenceEpoch,
           ownerGeneration: invalid.ownerGeneration, activeMigrationId: state.activeMigrationId,
-          planDigest: state.planDigest, controlRootIdentity: f.store.identity, mutexIdentity: f.mutex.identity,
+          planDigest: state.planDigest, controlRootIdentity: { ...f.store.identity }, mutexIdentity: f.mutex.identity,
           journal, journalSequence: invalid.sequence });
       });
       const verify = f.adapter.verifyDatabase.bind(f.adapter);
