@@ -25,6 +25,10 @@ import tempfile
 import time
 
 ENTRIES = ('sqlite', 'full-suite')
+# CI231 reached 2041 passing top-level tests before the old outer 900s limit.
+# Keep the full-suite budget separate from supervisor setup and final receipts.
+FULL_SUITE_SECONDS = 1200
+FULL_SUITE_SUPERVISOR_SECONDS = FULL_SUITE_SECONDS + 120
 CAP_FIELDS = ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')
 PG_URL = 'postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci'
 SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
@@ -728,7 +732,8 @@ def supervise(stage, cleanup_only=False):
             argv = ['/usr/bin/setpriv', '--reuid=' + str(uid), '--regid=' + str(uid), '--clear-groups',
                     '--inh-caps=-all', '--ambient-caps=-all', '--bounding-set=-all', '--no-new-privs',
                     '/usr/bin/python3', '-I', str(stage / 'launcher.py'), '--child', str(stage)]
-            report['execution'] = run_command(argv, stage, {'PATH': SYSTEM_PATH})
+            report['execution'] = run_command(argv, stage, {'PATH': SYSTEM_PATH},
+                                              timeout=FULL_SUITE_SECONDS if request['entry'] == 'full-suite' else 900)
             execution = report['execution']
             report['command_exit'] = 124 if execution['timed_out'] else execution['returncode']
             if execution['signal'] and report['command_exit'] == 0:
@@ -865,7 +870,8 @@ def frontend(entry):
         request['protected_sha256'] = {name: digest(source / name) for name in PROTECTED}
         write_json(stage / 'request.json', request)
         completed = run_command(['sudo', '-n', '--', '/usr/bin/python3', '-I', str(Path(__file__).resolve()),
-                                 '--supervise', str(stage)], source, {'PATH': os.environ['PATH']}, timeout=900, grace=35)
+                                 '--supervise', str(stage)], source, {'PATH': os.environ['PATH']},
+                                timeout=FULL_SUITE_SUPERVISOR_SECONDS if entry == 'full-suite' else 900, grace=35)
         if not (stage / 'result.json').exists():
             raise IsolationError(f'No supervisor receipt; entry exit {completed["returncode"]}; preserve marker for always cleanup')
         write_json(source / '.agent-output/linux-ci-isolation' / entry / 'launcher-transport.json', completed)

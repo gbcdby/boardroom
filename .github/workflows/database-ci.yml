@@ -76,10 +76,10 @@ jobs:
   database-tests:
     name: Node 24 · SQLite / PostgreSQL
     runs-on: ubuntu-24.04
-    # CI171 used 287s preparing and 626s in a still-progressing full suite before
-    # the old job limit. Keep the existing 900s child allowance, plus bounded
-    # preparation and post-suite SDK/restart/cleanup time; no product limit changes.
-    timeout-minutes: 25
+    # CI231's outer 900s expired while the full suite still progressed.
+    # Allow the bounded 26-minute suite transport plus preparation and post-suite
+    # SDK/restart/cleanup time. Individual tests, diagnostics and guest limits stay fixed.
+    timeout-minutes: 36
     outputs:
       browser_dependencies_id: ${{ steps.browser_dependencies.outputs.artifact-id }}
 
@@ -118,6 +118,9 @@ jobs:
             exit 1
           fi
 
+      - name: Linux 全量时间窗纯控制
+        run: python3 -B scripts/ci/test_linux_isolation.py WholeSuiteBudgetContracts -v
+
       - name: M02 有效选项纯解析拒绝控制
         run: python3 tests/fs-effective-options.test.py
 
@@ -129,6 +132,9 @@ jobs:
 
       - name: whole-brd F0B/F1 离线输入与回收边界
         run: python3 -B tests/whole-brd-f0b.test.py
+
+      - name: whole-brd F2 纯输入、阶段与失败回收控制
+        run: python3 -B tests/whole-brd-f2.test.py
 
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -193,6 +199,8 @@ jobs:
         run: python3 scripts/ci/linux_isolation.py sqlite
 
       - name: 全量测试（启用 PostgreSQL 门控用例）
+        # Archives + outer deadline + both reap waits + final reap: 1515s.
+        timeout-minutes: 26
         env:
           AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
         run: python3 scripts/ci/linux_isolation.py full-suite

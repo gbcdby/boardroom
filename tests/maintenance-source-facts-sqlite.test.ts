@@ -441,15 +441,19 @@ test("A11A invalidates facts after an attempted anchor and requires a fresh nati
 test("A11A proves an actually reaped native-management process from its real close receipt", async () => {
   const f = await fixture(false, "UTF-8", true);
   try {
-    await f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference, async window => {
+    await withSqliteSourceInventoryDiagnostics(f.adapter, phase => f.adapter.withSourceLock("control",
+      lock => lock.withSourceClientFacts(f.reference, async window => {
+      phase("native-receipt-consume");
       assert.equal(window.clients.length, 1);
       const client = window.clients[0]!;
       assert.equal(client.receipt?.buildId, "boardroom-native-management-v1");
       assert.deepEqual(client.receipt?.nativeTransactions, { committed: 0, rolledBack: 0, notAdmitted: 0 });
       assert.deepEqual(client.process, { status: "exited", reason: "process_absent" });
       assert.equal(client.classification, "current-client");
+      phase("native-receipt-explicit-current");
       await window.assertCurrent();
-    }));
+      phase("native-receipt-consume-return");
+    })));
   } finally { await f.close(); }
 });
 

@@ -22,7 +22,11 @@ static struct rlimit actual[5];
 static void stop(const char *phase) {
     char message[128];
     int length = snprintf(message, sizeof(message), "thread-exit fixture failed: %s\n", phase);
-    if (length > 0 && (size_t)length < sizeof(message)) (void)write(STDERR_FILENO, message, (size_t)length);
+    if (length > 0 && (size_t)length < sizeof(message)) {
+        ssize_t written = write(STDERR_FILENO, message, (size_t)length);
+        /* A failed diagnostic write retains the original fatal result. */
+        if (written != (ssize_t)length) _exit(70);
+    }
     _exit(70);
 }
 static void send_event(const char *phase) {
