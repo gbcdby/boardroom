@@ -400,6 +400,8 @@ def prepare_input_closure(request, output):
         record["input_closure"] = closure; record["inputs"] = dict(closure["core"])
         record["e2fs"] = closure["payload"]
         for name in ("libraries", "qemu_data", "runtime_environment"): record[name] = closure[name]
+        cwd = out / "runtime-cwd"; cwd.mkdir(mode=0o700, exist_ok=False)
+        record["runtime_cwd"] = runtime_cwd(cwd)
         compiler = str(Path("/usr/bin/cc").resolve(strict=True))
         record["compiler"], _ = build.file_binding(compiler, 16 * f2.MIB)
         header = out / "fixed-inputs.h"; header.write_bytes(fixed_header(data["notes"], data["config"]))
@@ -432,6 +434,7 @@ def prepare_input_closure(request, output):
         record["archive"] = f3.inspect_payload(archive, request["run_id"])
         record["mkfs_argv"] = f2.mkfs_argv(request["run_id"]); record["mkfs_environment"] = dict(f2.MKFS_ENV)
         if verify_input_closure(request)[0] != closure: raise ValueError("inputs changed during offline build")
+        if runtime_cwd(cwd) != record["runtime_cwd"]: raise ValueError("runtime cwd changed during offline build")
         if source_bindings() != record["source"]: raise ValueError("source changed during offline build")
         if time.monotonic() - started > 60: raise TimeoutError("offline preparation stage deadline")
         record["state"] = "FIXED_F3_BUNDLE_NOT_BOOTED"
