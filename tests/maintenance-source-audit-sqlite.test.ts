@@ -103,7 +103,10 @@ test("A12-B preserves original SQLite encodings and refuses unknown controller r
   for (const encoding of ["UTF-16le", "UTF-16be"] as const) await t.test(encoding, async () => {
     const f = await sqliteAuditFixture(true, encoding);
     try {
-      const packet = await f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference));
+      const packet = await withSqliteSourceInventoryDiagnostics(f.adapter, phase => {
+        phase(encoding === "UTF-16le" ? "audit-utf16le-first" : "audit-utf16be-first");
+        return f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference));
+      });
       assert.equal(packet.observation.textEncoding.name, encoding);
       assert.deepEqual(packet.facts.clients[0]!.subject, packet.observation.rows[0]!.client_id);
       const db = new Database(f.file);
