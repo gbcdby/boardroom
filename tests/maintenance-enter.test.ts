@@ -94,12 +94,26 @@ for (const kind of ["sqlite", "postgres"] as const) {
       await assert.rejects(enterMaintenance(f.options, f.request), { code: "ENOENT" }); await rename(`${planPath}.missing`, planPath);
       const config = await readFile(f.configFile); await writeFile(f.configFile, Buffer.concat([config, Buffer.from(" ")]));
       await assert.rejects(enterMaintenance(f.options, f.request), { code: "plan_stale" }); await writeFile(f.configFile, config);
-      await f.exec("CREATE VIEW changed_enter_schema AS SELECT value FROM enter_observation");
-      await assert.rejects(enterMaintenance(f.options, f.request), { code: "plan_stale" }); await f.exec("DROP VIEW changed_enter_schema");
+      await f.exec("CREATE INDEX changed_enter_schema ON enter_observation(value)");
+      await assert.rejects(enterMaintenance(f.options, f.request), { code: "plan_stale" }); await f.exec("DROP INDEX changed_enter_schema");
       await mkdir(f.options.targetRoot);
       await assert.rejects(enterMaintenance(f.options, f.request), { code: "plan_stale" }); await rm(f.options.targetRoot, { recursive: true });
       await assert.rejects(enterMaintenance({ ...f.options, originalCwd: f.dataDir }, f.request), { code: "plan_stale" });
       await assert.rejects(enterMaintenance({ ...f.options, expectedSourceId: "another-source" }, f.request), { code: "source_changed" });
+      assert.deepEqual((await f.observe()).state, f.initial.state);
+    } finally { await f.close(); }
+  });
+  if (kind === "postgres") nativeTest("#152 internal enter postgres: unsupported view keeps the original closed-profile rejection and source state", async () => {
+    const f = await enterFixture(kind);
+    try {
+      const state = await f.query("SELECT * FROM storage_maintenance"), clients = await f.query("SELECT * FROM storage_source_clients ORDER BY client_id");
+      const business = await f.query("SELECT * FROM enter_observation");
+      await f.exec("CREATE VIEW unsupported_enter_schema AS SELECT value FROM enter_observation");
+      await assert.rejects(enterMaintenance(f.options, f.request), { code: "schema_guard_incomplete" });
+      assert.deepEqual(await f.query("SELECT * FROM storage_maintenance"), state);
+      assert.deepEqual(await f.query("SELECT * FROM storage_source_clients ORDER BY client_id"), clients);
+      assert.deepEqual(await f.query("SELECT * FROM enter_observation"), business);
+      await f.exec("DROP VIEW unsupported_enter_schema");
       assert.deepEqual((await f.observe()).state, f.initial.state);
     } finally { await f.close(); }
   });
