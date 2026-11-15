@@ -4,13 +4,18 @@ import { copyFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { sqliteAuditFixture } from "./fixtures/maintenance-source-audit.ts";
 import type { OperationMutex } from "../src/server/storage/maintenance/types.ts";
+import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
 
 test("A12-B SQLite observed mutex loss cannot revive an invocation's bootstrap actor", async t => {
   for (const entry of ["source-lock", "direct-mutex", "before-first-audit"] as const) await t.test(entry, async () => {
     const f = await sqliteAuditFixture(false);
     const mutexPath = path.join(f.store.identity.path, "mutex.sqlite"), saved = mutexPath + ".original";
     let displaced = false, nextMutex: OperationMutex | undefined;
-    const read = () => f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference));
+    let reads = 0;
+    const read = () => withSqliteSourceInventoryDiagnostics(f.adapter, async phase => {
+      phase(`audit-lifecycle-${entry}-${++reads}`);
+      return f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference));
+    });
     try {
       const first = entry === "before-first-audit" ? undefined : await read();
       const original = await stat(mutexPath, { bigint: true });
