@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import { verificationBundleFixture } from "./fixtures/maintenance-verify-bundle.ts";
 import { verifyRestoreBundle } from "../src/server/storage/maintenance/verify-bundle.ts";
 import { restorePointDigest, verifyRestoreBundleClosure } from "../src/server/storage/maintenance/journal.ts";
+import { digestJson } from "../src/server/storage/maintenance/canonical.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { parsePublication, parseVerification } from "../src/server/storage/maintenance/parse.ts";
 import { readSqliteManifests } from "../src/server/storage/maintenance/sqlite-manifests.ts";
@@ -184,3 +185,52 @@ for (const afterWrite of [false, true]) nativeTest(`#152 V: publication ${afterW
     });
   } finally { t.mock.restoreAll(); await f.close(); }
 });
+
+/**
+ * A byte-valid historical B/U is not a live V permit. The original capture is
+ * still in the durable same-source chain, but the source has moved to a later
+ * control head. Both cases use actual SQLite/PG journal SQL, not a mocked
+ * observation or invented source identity.
+ */
+for (const kind of ["sqlite", "postgres"] as const) for (const event of ["observation", "takeover"] as const)
+  (kind === "sqlite" ? nativeTest : pgTest)(
+    `#152 V ${kind}: stale B/U cannot restore after a native ${event} anchor`, async t => {
+      const f = await verificationBundleFixture(kind);
+      let restores = 0;
+      try {
+        const saved = await f.run(lock => f.publish(lock));
+        await f.adapter.withSourceLock("control", async lock => {
+          const observed = await lock.observe();
+          const record = {
+            ...f.capture.record, event, previous: f.capture.reference, frozen: null, sourceClients: null,
+            sequence: observed.state.journalSequence + 1,
+            ownerGeneration: observed.state.ownerGeneration + (event === "takeover" ? 1 : 0),
+            requestId: `stale-verification-${kind}-${event}`,
+            requestDigest: digestJson({ operation: "stale-verification-control", kind, event }),
+          };
+          const reference = await f.store.putJson("journal", record);
+          await lock.anchor({
+            expected: observed.state, admission: "sealed", fenceEpoch: observed.state.fenceEpoch,
+            ownerGeneration: record.ownerGeneration, activeMigrationId: observed.state.activeMigrationId,
+            planDigest: observed.state.planDigest, controlRootIdentity: { ...f.store.identity },
+            mutexIdentity: f.mutex.identity, journal: reference, journalSequence: record.sequence,
+          });
+        });
+        const before = await artifacts(f.store);
+        const original = f.adapter.verifyDatabase.bind(f.adapter);
+        t.mock.method(f.adapter, "verifyDatabase", async (...args: Parameters<typeof original>) => {
+          restores++;
+          return original(...args);
+        });
+        await f.run(async lock => {
+          await assert.rejects(
+            verifyRestoreBundle(f.store, f.adapter, lock, saved.bundle, saved.publication),
+            error => error instanceof MaintenanceFailure && error.code === "maintenance_lost",
+          );
+        });
+        assert.equal(restores, 0, "rejected stale captures must not start a native restore");
+        assert.deepEqual(await artifacts(f.store), before, "rejection must not publish a V or attempt");
+        await noVerification(f.store);
+      } finally { t.mock.restoreAll(); await f.close(); }
+    },
+  );
