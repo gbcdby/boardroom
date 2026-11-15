@@ -79,6 +79,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   private readonly darwinConnections = new Set<Database.Database>();
   private readonly sourceConnections = new Set<Database.Database>();
   private readonly mutexConnections = new Set<Database.Database>();
+  private readonly verificationConnections = new Set<Database.Database>();
   private readonly bindFiles = new Map<FileHandle, { fd: number; identity?: string }>();
   private mutex: MutexLease | null = null;
   private currentLock: Database.Database | null = null;
@@ -215,6 +216,14 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       try { db.close(); } catch (error) { errors.push(error); }
     }
     if (!db.open) this.mutexConnections.delete(db);
+    throwResourceFailures(errors);
+  }
+  private finishVerification(db: Database.Database, errors: unknown[]): void {
+    if (db.open) {
+      try { if (db.inTransaction) db.exec("ROLLBACK"); } catch (error) { errors.push(error); }
+      try { db.close(); } catch (error) { errors.push(error); }
+    }
+    if (!db.open) this.verificationConnections.delete(db);
     throwResourceFailures(errors);
   }
   private async closeBindFile(handle: FileHandle): Promise<void> {
@@ -540,6 +549,8 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       || realpathSync(path.dirname(destination)) !== path.dirname(destination)) throw new MaintenanceFailure("snapshot_invalid");
     const handle = await open(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); await handle.close();
     const reader = this.openSource(true);
+    const errors: unknown[] = [];
+    let result: { manifests: DatabaseManifests; toolchain: Json } | undefined;
     try {
       reader.exec("BEGIN"); const observation = this.observation(reader);
       if (observation.state.admission !== "sealed" || !same(observation.state, readSqliteMaintenanceState(control, true))) throw new MaintenanceFailure("maintenance_lost");
@@ -562,14 +573,18 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       try { if ((await stat(destination + "-wal")).size !== 0) throw new MaintenanceFailure("snapshot_invalid"); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       await mutex.assertHeld(); this.assertSource();
-      return { manifests, toolchain: { kind: "sqlite-backup", node: process.version,
+      result = { manifests, toolchain: { kind: "sqlite-backup", node: process.version,
         sqlite: String((control.prepare("SELECT sqlite_version() AS version").get() as { version: string }).version),
         independentReader: true, committedWalIncluded: true } };
-    } catch (error) { return failure(error); }
-    finally { if (reader.inTransaction) reader.exec("ROLLBACK"); this.closeSource(reader); }
+    } catch (error) {
+      try { failure(error); } catch (mapped) { errors.push(mapped); }
+    }
+    this.finishSource(reader, errors);
+    return result!;
   }
   async verifyDatabase(databaseFile: string, expected: DatabaseManifests, restoreDirectory: string): Promise<Json> {
     if (!this.mutex?.active || !this.currentLock) throw new MaintenanceFailure("maintenance_lost");
+    if (this.verificationConnections.size) throw new MaintenanceFailure("maintenance_lost", "verification-close-unknown");
     await this.mutex.assertHeld();
     if (!restoreDirectory.startsWith(`${this.mutex.root.path}/attempts/`) || realpathSync(path.dirname(restoreDirectory)) !== path.dirname(restoreDirectory))
       throw new MaintenanceFailure("snapshot_invalid");
@@ -579,16 +594,21 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     const identity = fileIdentity(restored);
     if (identity.device === this.source.identity!.device && identity.inode === this.source.identity!.inode) throw new MaintenanceFailure("snapshot_invalid");
     const db = new Database(restored, { readonly: true, fileMustExist: true });
+    this.verificationConnections.add(db);
+    const errors: unknown[] = []; let result: Json | undefined;
     try {
       db.pragma("query_only=ON"); db.exec("BEGIN");
       const integrity = db.pragma("integrity_check") as { integrity_check: string }[];
       if (integrity.length !== 1 || integrity[0]!.integrity_check !== "ok" || (db.pragma("foreign_key_check") as unknown[]).length
         || !same(readSqliteManifests(db), expected)) throw new MaintenanceFailure("snapshot_invalid");
       db.exec("COMMIT");
-      return { kind: "sqlite-restore-verification", ...identity, fullDataManifestDigest: expected.fullDataManifestDigest,
+      result = { kind: "sqlite-restore-verification", ...identity, fullDataManifestDigest: expected.fullDataManifestDigest,
         capturedControlManifestDigest: expected.capturedControlManifestDigest, integrityCheck: "ok", foreignKeyViolations: 0 };
-    } catch (error) { return failure(error); }
-    finally { if (db.inTransaction) db.exec("ROLLBACK"); db.close(); }
+    } catch (error) {
+      try { failure(error); } catch (mapped) { errors.push(mapped); }
+    }
+    this.finishVerification(db, errors);
+    return result!;
   }
   async inspectWriters(_observation: SourceObservation): Promise<readonly Blocker[]> {
     return this.inspectCurrentWriters();
@@ -663,8 +683,11 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     for (const handle of this.bindFiles.keys()) {
       try { await this.closeBindFile(handle); } catch (error) { appendResourceFailure(errors, error); }
     }
+    for (const db of this.verificationConnections) {
+      try { this.finishVerification(db, []); } catch (error) { appendResourceFailure(errors, error); }
+    }
     try { this.closeSourceDescriptor(); } catch (error) { appendResourceFailure(errors, error); }
-    if (this.sourceFdClosed && !this.sourceConnections.size && !this.mutexConnections.size && !this.bindFiles.size && !this.mutex) {
+    if (this.sourceFdClosed && !this.sourceConnections.size && !this.mutexConnections.size && !this.verificationConnections.size && !this.bindFiles.size && !this.mutex) {
       this.closed = true; this.ownFds.clear();
     }
     throwResourceFailures(errors);
