@@ -38,6 +38,15 @@ async function finishThreadExitOwner(owner: ThreadExitOwner, remaining: () => nu
   const errors: string[] = [], signals: string[] = [];
   for (const [phase, grace] of [["release", 3000], ["SIGTERM", 2000], ["SIGKILL", 2000]] as const) {
     if (owner.reaped()) break;
+    if (remaining() <= 0) {
+      errors.push("deadline");
+      try { if (await owner.signal("SIGKILL")) signals.push("SIGKILL"); else errors.push("SIGKILL-not-sent"); }
+      catch { errors.push("SIGKILL"); }
+      // No new grace period is granted after the deadline. Still request the
+      // owned child's reap observation; failure stays explicit, never success.
+      try { await owner.wait(0); } catch { errors.push("SIGKILL-wait"); }
+      break;
+    }
     try {
       if (phase === "release") await owner.release();
       else if (!owner.reaped()) {
@@ -45,10 +54,25 @@ async function finishThreadExitOwner(owner: ThreadExitOwner, remaining: () => nu
       }
     } catch { errors.push(phase); }
     const milliseconds = Math.max(0, Math.min(grace, remaining()));
-    if (!milliseconds) { errors.push("deadline"); break; }
     try { if (await owner.wait(milliseconds)) break; } catch { errors.push(`${phase}-wait`); }
   }
   return { reaped: owner.reaped(), errors, signals };
+}
+
+type ThreadExitScheduler = (work: () => void, milliseconds: number) => () => void;
+function threadExitWatchdog(cleanup: () => Promise<void>, remaining: () => number, expire: () => void,
+  schedule: ThreadExitScheduler = (work, milliseconds) => { const timer = setTimeout(work, milliseconds); return () => clearTimeout(timer); }) {
+  let expired = false, pending: Promise<void> | undefined, cancel = () => {};
+  const finish = () => {
+    cancel();
+    // Register before invoking cleanup so watchdog/finally share one operation.
+    return pending ??= Promise.resolve().then(cleanup);
+  };
+  cancel = schedule(() => {
+    expired = true; expire();
+    void finish().catch(() => {}); // finally observes this same rejection.
+  }, Math.max(0, Math.floor(remaining() - 7000)));
+  return { expired: () => expired, finish };
 }
 
 function threadIncarnation(text: string, pid: number) {
@@ -96,6 +120,7 @@ linuxTest("#152 a joined leader and live worker retain one original inventory ob
     node: process.version, kernel: kernelRelease(), platform: process.platform, architecture: process.arch,
     uid: process.getuid!(), gid: process.getgid!(), qualification: "no historical CI207 root-cause or provider qualification claim" };
   let f: Awaited<ReturnType<typeof fixture>> | undefined, child: ReturnType<typeof spawn> | undefined;
+  let watchdog: ReturnType<typeof threadExitWatchdog> | undefined;
   let releasePipe: Duplex | undefined, identity: ReturnType<typeof threadIncarnation> | undefined;
   let closed = false, exited = false, exitResult: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let resolveClosed: () => void = () => {}; const done = new Promise<void>(resolve => { resolveClosed = resolve; });
@@ -122,6 +147,44 @@ linuxTest("#152 a joined leader and live worker retain one original inventory ob
     }
     if (transportError) throw transportError;
     return parseThreadExitEvent(lines.shift()!, phase, child!.pid!, process.getuid!(), process.getgid!());
+  };
+  const finishOwned = async () => {
+    if (!child) return;
+    const owned = child;
+    record.cleanup = await finishThreadExitOwner({ reaped: () => closed,
+      async release() { owned.stdin?.end(); if (releasePipe && !releasePipe.destroyed) releasePipe.end("Q"); }, wait: waitClosed,
+      async signal(signal) {
+        if (closed || owned.exitCode !== null || owned.signalCode !== null) return false;
+        if (identity) {
+          const current = threadIncarnation(await readFile(`/proc/${owned.pid}/stat`, "utf8"), owned.pid!);
+          assert.equal(current.startTicks, identity.startTicks, "signal must address the owned incarnation");
+        }
+        const sent = owned.kill(signal); if (sent) signalHistory.push(signal); return sent;
+      },
+    }, remaining);
+    for (const stream of [owned.stdin, releasePipe, owned.stdout, owned.stderr]) {
+      try { stream?.destroy(); } catch { cleanupErrors.push("transport-close"); }
+    }
+    record.transportClosed = [owned.stdin, releasePipe, owned.stdout, owned.stderr].every(stream => !stream || stream.destroyed);
+    if (closed && exitResult?.code === 0) {
+      try {
+        assert.equal(lines.length, 1); assert.equal(pending, "");
+        record.done = parseThreadExitEvent(lines[0]!, "DONE", owned.pid!, process.getuid!(), process.getgid!());
+      } catch { cleanupErrors.push("done-handshake"); }
+    }
+    if (closed && identity) {
+      try { record.ownedIncarnationGone = threadIncarnation(await readFile(`/proc/${owned.pid}/stat`, "utf8"), owned.pid!).startTicks !== identity.startTicks; }
+      catch (error) { record.ownedIncarnationGone = (error as NodeJS.ErrnoException).code === "ENOENT"; }
+    }
+    if (watchdog?.expired()) {
+      // The original scanner/observer may still be pending. Preserve the owned
+      // resource outcome independently; do not close its fixture or restore it.
+      const receipt = { deadlineExceeded: true, elapsedMs: performance.now() - started, cleanup: record.cleanup,
+        exit: exitResult ?? null, transportClosed: record.transportClosed, ownedIncarnationGone: record.ownedIncarnationGone,
+        cleanupErrors, originalOperationMayStillBePending: true };
+      try { await writeFile(path.join(directory, "WATCHDOG.json"), JSON.stringify(receipt) + "\n", { flag: "wx", mode: 0o600 }); }
+      catch { cleanupErrors.push("watchdog-evidence-write"); }
+    }
   };
   try {
     assert.ok(process.getuid!() > 0, "ordinary UID required");
@@ -178,6 +241,10 @@ linuxTest("#152 a joined leader and live worker retain one original inventory ob
       if (stderrBytes > 4096) { transportError = new Error("owned helper stderr limit"); notify?.(); return; }
       stderr.push(Buffer.from(value));
     });
+    watchdog = threadExitWatchdog(finishOwned, remaining, () => {
+      record.deadlineExceeded = true;
+      transportError ??= new Error("owned fixture deadline reserves seven seconds for cleanup"); notify?.();
+    });
     const ready = await nextEvent("READY"); record.ready = ready;
     identity = threadIncarnation(await readFile(`/proc/${child.pid}/stat`, "utf8"), child.pid!);
     record.initialIdentity = identity;
@@ -197,6 +264,7 @@ linuxTest("#152 a joined leader and live worker retain one original inventory ob
       assert.equal(exited, false, "worker remains owned and alive during the original scan");
       return result;
     }, path.join(directory, "inventory"), child.pid);
+    assert.equal(watchdog.expired(), false, "late scanner completion cannot turn a deadline failure into success");
     const reports = await readdir(path.join(directory, "inventory")); assert.equal(reports.length, 1);
     const reportBytes = await readFile(path.join(directory, "inventory", reports[0]!, "report.json"));
     assert.ok(reportBytes.length <= 1024 * 1024);
@@ -222,36 +290,13 @@ linuxTest("#152 a joined leader and live worker retain one original inventory ob
       assert.equal(inputFacts[1].confirmedIncompleteInput, false, "live worker with confirmed incomplete original input was reported clear");
       assert.equal(inputFacts[1].completeInput, true, "clear result lacks sufficient same-call input evidence");
     }
+    assert.equal(watchdog.expired(), false, "owned fixture deadline exceeded");
   } catch (error) {
     record.originalError = error instanceof Error ? { name: error.name, message: error.message } : { name: "non-Error" };
     throw error;
   } finally {
-    if (child) {
-      const owned = child;
-      record.cleanup = await finishThreadExitOwner({ reaped: () => closed,
-        async release() { owned.stdin?.end(); if (releasePipe && !releasePipe.destroyed) releasePipe.end("Q"); }, wait: waitClosed,
-        async signal(signal) {
-          if (closed || owned.exitCode !== null || owned.signalCode !== null) return false;
-          if (identity) {
-            const current = threadIncarnation(await readFile(`/proc/${owned.pid}/stat`, "utf8"), owned.pid!);
-            assert.equal(current.startTicks, identity.startTicks, "signal must address the owned incarnation");
-          }
-          const sent = owned.kill(signal); if (sent) signalHistory.push(signal); return sent;
-        },
-      }, remaining);
-      owned.stdin?.destroy(); releasePipe?.destroy(); owned.stdout?.destroy(); owned.stderr?.destroy();
-      record.transportClosed = [owned.stdin, releasePipe, owned.stdout, owned.stderr].every(stream => !stream || stream.destroyed);
-      if (closed && exitResult?.code === 0) {
-        try {
-          assert.equal(lines.length, 1); assert.equal(pending, "");
-          record.done = parseThreadExitEvent(lines[0]!, "DONE", owned.pid!, process.getuid!(), process.getgid!());
-        } catch { cleanupErrors.push("done-handshake"); }
-      }
-      if (closed && identity) {
-        try { record.ownedIncarnationGone = threadIncarnation(await readFile(`/proc/${owned.pid}/stat`, "utf8"), owned.pid!).startTicks !== identity.startTicks; }
-        catch (error) { record.ownedIncarnationGone = (error as NodeJS.ErrnoException).code === "ENOENT"; }
-      }
-    }
+    try { await (watchdog ? watchdog.finish() : finishOwned()); }
+    catch { cleanupErrors.push("owned-cleanup-rejected"); }
     for (const timer of timers) clearTimeout(timer); timers.clear(); notify = undefined;
     if (f && (!child || closed)) try { await f.close(); } catch { cleanupErrors.push("fixture-close"); }
     if (child && !closed) cleanupErrors.push("owned-child-not-reaped");
@@ -270,6 +315,7 @@ linuxTest("#152 a joined leader and live worker retain one original inventory ob
       elapsedMs: record.elapsedMs, exit: record.exit, cleanup: record.cleanup, cleanupErrors }));
   }
   assert.equal(record.transportClosed, true); assert.equal(record.ownedIncarnationGone, true);
+  assert.equal(watchdog?.expired(), false);
   assert.deepEqual(record.cleanup, { reaped: true, errors: [], signals: [] });
   assert.ok(stdoutBytes <= 4096); assert.ok(stderrBytes <= 4096);
   assert.deepEqual(exitResult, { code: 0, signal: null }); assert.deepEqual(signalHistory, []);
@@ -312,6 +358,75 @@ test("#152 thread-exit cleanup escalates only for the owned unreaped child", asy
     async signal() { throw new Error("identity unavailable"); } }, () => 30_000);
   assert.equal(result.reaped, false); assert.equal(waits, 3);
   assert.deepEqual(result.errors, ["release", "SIGTERM", "SIGKILL"]);
+});
+
+test("#152 thread-exit expired cleanup still signals and observes only its owned child", async () => {
+  for (const budget of [0, -1]) {
+    const events: string[] = []; let reaped = false;
+    const result = await finishThreadExitOwner({ reaped: () => reaped,
+      async release() { events.push("release"); },
+      async signal(signal) { events.push(signal); return true; },
+      async wait(milliseconds) { events.push(`wait:${milliseconds}`); reaped = true; return true; },
+    }, () => budget);
+    assert.deepEqual(events, ["SIGKILL", "wait:0"]);
+    assert.deepEqual(result, { reaped: true, signals: ["SIGKILL"], errors: ["deadline"] });
+  }
+  const already = await finishThreadExitOwner({ reaped: () => true,
+    async release() { assert.fail("reaped child release"); }, async signal() { assert.fail("reaped child signal"); },
+    async wait() { assert.fail("reaped child wait"); },
+  }, () => 0);
+  assert.deepEqual(already, { reaped: true, errors: [], signals: [] });
+});
+
+test("#152 thread-exit watchdog cleans while the original scanner remains pending and finally shares its result", async () => {
+  for (const later of ["returns", "never-returns"] as const) {
+    let fire: () => void = () => assert.fail("watchdog not registered"), scheduled = -1, cancellations = 0;
+    let reaped = false, cleanupCalls = 0, expired = false, operationFinished = false, observerRestored = false, fixtureCloses = 0;
+    let resolveScan: (value: number) => void = () => {};
+    const scan = new Promise<number>(resolve => { resolveScan = resolve; });
+    const operation = (async () => { try { const value = await scan; operationFinished = true; return value; }
+      finally { observerRestored = true; } })();
+    const events: string[] = [];
+    const watchdog = threadExitWatchdog(async () => {
+      cleanupCalls++;
+      await finishThreadExitOwner({ reaped: () => reaped,
+        async release() { events.push("release"); },
+        async signal(signal) { events.push(signal); return true; },
+        async wait(milliseconds) { events.push(`wait:${milliseconds}`); if (events.includes("SIGKILL")) reaped = true; return reaped; },
+      }, () => 7000);
+    }, () => 30_000, () => { expired = true; }, (work, milliseconds) => {
+      fire = work; scheduled = milliseconds; return () => { cancellations++; };
+    });
+    assert.equal(scheduled, 23_000); fire();
+    const first = watchdog.finish(), concurrentFinally = watchdog.finish();
+    assert.equal(first, concurrentFinally); await Promise.all([first, concurrentFinally]);
+    assert.equal(cleanupCalls, 1); assert.equal(reaped, true); assert.equal(expired, true); assert.ok(cancellations >= 1);
+    assert.deepEqual(events, ["release", "wait:3000", "SIGTERM", "wait:2000", "SIGKILL", "wait:2000"]);
+    assert.equal(operationFinished, false); assert.equal(observerRestored, false); assert.equal(fixtureCloses, 0);
+    if (later === "returns") {
+      resolveScan(0); assert.equal(await operation, 0); await watchdog.finish(); fixtureCloses++;
+      assert.equal(observerRestored, true); assert.equal(fixtureCloses, 1); assert.equal(cleanupCalls, 1);
+      assert.throws(() => assert.equal(watchdog.expired(), false), "later normal return cannot erase timeout");
+    }
+  }
+});
+
+test("#152 thread-exit watchdog leaves an already reaped child untouched and preserves cleanup failure", async () => {
+  for (const rejects of [false, true]) {
+    let fire: () => void = () => {}, calls = 0; const original = new Error("cleanup fault");
+    const watchdog = threadExitWatchdog(async () => {
+      calls++;
+      const result = await finishThreadExitOwner({ reaped: () => true,
+        async release() { assert.fail("reaped release"); }, async signal() { assert.fail("reaped signal"); },
+        async wait() { assert.fail("reaped wait"); },
+      }, () => 7000);
+      assert.deepEqual(result, { reaped: true, errors: [], signals: [] });
+      if (rejects) throw original;
+    }, () => 30_000, () => {}, work => { fire = work; return () => {}; });
+    fire(); const done = watchdog.finish();
+    if (rejects) await assert.rejects(done, error => error === original); else await done;
+    assert.equal(calls, 1); assert.equal(watchdog.expired(), true); assert.equal(watchdog.finish(), done);
+  }
 });
 
 test("#152 thread-exit evidence distinguishes complete, incomplete and missing original inputs", () => {
