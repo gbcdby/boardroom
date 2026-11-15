@@ -73,6 +73,80 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  browser-dependencies:
+    name: 浏览器同候选依赖准备
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    outputs:
+      browser_dependencies_id: ${{ steps.browser_dependencies.outputs.artifact-id }}
+    steps:
+      - name: 检出本次验证候选
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: 准备 Node.js 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: 按锁文件安装依赖
+        run: npm ci
+
+      - name: 核对准备阶段原生依赖可加载
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import Database from 'better-sqlite3';
+          const db = new Database(':memory:');
+          assert.equal(db.prepare('SELECT 1 AS value').get().value, 1);
+          db.close();
+          JS
+
+      - name: 打包同候选浏览器服务依赖
+        run: |
+          mkdir -p .agent-output/browser-dependencies
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          import { createHash } from 'node:crypto';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const manifest = {
+            candidate: process.env.GITHUB_SHA,
+            node: process.version,
+            abi: process.versions.modules,
+            platform: process.platform,
+            arch: process.arch,
+            libc: process.report.getReport().header.glibcVersionRuntime,
+            lockSha256: createHash('sha256').update(readFileSync('package-lock.json')).digest('hex'),
+          };
+          writeFileSync('.agent-output/browser-dependencies/environment.json', JSON.stringify(manifest, null, 2));
+          assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim(), manifest.candidate);
+          const producer = {schema:1, runId:Number(process.env.GITHUB_RUN_ID),
+            attempt:Number(process.env.GITHUB_RUN_ATTEMPT), candidate:manifest.candidate,
+            tree:execFileSync('git', ['rev-parse', 'HEAD^{tree}'], {encoding:'utf8'}).trim()};
+          assert.match(producer.candidate, /^[0-9a-f]{40}$/);
+          assert.match(producer.tree, /^[0-9a-f]{40}$/);
+          assert.ok(Number.isSafeInteger(producer.runId) && producer.runId > 0);
+          assert.ok(Number.isSafeInteger(producer.attempt) && producer.attempt > 0);
+          writeFileSync('.agent-output/browser-dependencies/producer.json', JSON.stringify(producer, null, 2));
+          JS
+          # tar 保留原生模块、可执行位和 .bin 符号链接；来源为本 job 已完成的 npm ci。
+          tar -czf .agent-output/browser-dependencies/node_modules.tar.gz node_modules
+          (cd .agent-output/browser-dependencies && sha256sum node_modules.tar.gz environment.json producer.json > SHA256SUMS)
+
+      - name: 交接同候选原生依赖
+        id: browser_dependencies
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: browser-dependencies-${{ github.run_attempt }}
+          path: .agent-output/browser-dependencies/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
   database-tests:
     name: Node 24 · SQLite / PostgreSQL
     runs-on: ubuntu-24.04
@@ -80,8 +154,6 @@ jobs:
     # Allow the bounded 26-minute suite transport plus preparation and post-suite
     # SDK/restart/cleanup time. Individual tests, diagnostics and guest limits stay fixed.
     timeout-minutes: 36
-    outputs:
-      browser_dependencies_id: ${{ steps.browser_dependencies.outputs.artifact-id }}
 
     services:
       postgres:
@@ -340,51 +412,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: 打包本候选已验证的浏览器服务依赖
-        run: |
-          mkdir -p .agent-output/browser-dependencies
-          node --input-type=module <<'JS'
-          import assert from 'node:assert/strict';
-          import { execFileSync } from 'node:child_process';
-          import { createHash } from 'node:crypto';
-          import { readFileSync, writeFileSync } from 'node:fs';
-          const manifest = {
-            candidate: process.env.GITHUB_SHA,
-            node: process.version,
-            abi: process.versions.modules,
-            platform: process.platform,
-            arch: process.arch,
-            libc: process.report.getReport().header.glibcVersionRuntime,
-            lockSha256: createHash('sha256').update(readFileSync('package-lock.json')).digest('hex'),
-          };
-          writeFileSync('.agent-output/browser-dependencies/environment.json', JSON.stringify(manifest, null, 2));
-          assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim(), manifest.candidate);
-          const producer = {schema:1, runId:Number(process.env.GITHUB_RUN_ID),
-            attempt:Number(process.env.GITHUB_RUN_ATTEMPT), candidate:manifest.candidate,
-            tree:execFileSync('git', ['rev-parse', 'HEAD^{tree}'], {encoding:'utf8'}).trim()};
-          assert.match(producer.candidate, /^[0-9a-f]{40}$/);
-          assert.match(producer.tree, /^[0-9a-f]{40}$/);
-          assert.ok(Number.isSafeInteger(producer.runId) && producer.runId > 0);
-          assert.ok(Number.isSafeInteger(producer.attempt) && producer.attempt > 0);
-          writeFileSync('.agent-output/browser-dependencies/producer.json', JSON.stringify(producer, null, 2));
-          JS
-          # tar 保留原生模块、可执行位和 .bin 符号链接；来源为本 job 已完成的 npm ci。
-          tar -czf .agent-output/browser-dependencies/node_modules.tar.gz node_modules
-          (cd .agent-output/browser-dependencies && sha256sum node_modules.tar.gz environment.json producer.json > SHA256SUMS)
-
-      - name: 交接同候选原生依赖
-        id: browser_dependencies
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: browser-dependencies-${{ github.run_attempt }}
-          path: .agent-output/browser-dependencies/
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 1
-
   managed-web-browser:
     name: Chromium · 工作台与托管 Agent 页面
-    needs: database-tests
+    needs: browser-dependencies
+    # 准备失败时仍进入原 Chromium 检查，由首步明确失败；取消仍停止。
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # 与下方 Python 包版本一致；资源隐藏验收另在本 job 安装固定 Openbox。
@@ -409,6 +441,20 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
+      - name: 核对依赖准备成功且产物身份存在
+        env:
+          DEPENDENCIES_RESULT: ${{ needs.browser-dependencies.result }}
+          BROWSER_DEPENDENCIES_ID: ${{ needs.browser-dependencies.outputs.browser_dependencies_id }}
+        run: |
+          if [ "$DEPENDENCIES_RESULT" != success ]; then
+            echo "::error::浏览器依赖准备未成功，Chromium 验收不能跳过。"
+            exit 1
+          fi
+          if ! [[ "$BROWSER_DEPENDENCIES_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::浏览器依赖产物 ID 缺失或无效。"
+            exit 1
+          fi
+
       - name: 检出本次验证候选
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -432,13 +478,13 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           # 只重跑失败的 browser 时仍引用成功 producer 的实际产物。
-          artifact-ids: ${{ needs.database-tests.outputs.browser_dependencies_id }}
+          artifact-ids: ${{ needs.browser-dependencies.outputs.browser_dependencies_id }}
           path: .agent-output/browser-dependencies
           digest-mismatch: error
 
       - name: 核对依赖身份并构建真实 WebUI
         env:
-          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.database-tests.outputs.browser_dependencies_id }}
+          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.browser-dependencies.outputs.browser_dependencies_id }}
         run: |
           (cd .agent-output/browser-dependencies && sha256sum --check SHA256SUMS)
           node --input-type=module <<'JS'
@@ -515,7 +561,7 @@ jobs:
       - name: 提交后资源刷新、断线对账与草稿真实浏览器验证
         if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         env:
-          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.database-tests.outputs.browser_dependencies_id }}
+          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.browser-dependencies.outputs.browser_dependencies_id }}
         run: |
           mkdir -p .agent-output/resource-web-e2e/native-desktop
           # 仅本次 browser 容器；不改其他脚本、job、时限或现有桌面。
@@ -529,13 +575,13 @@ jobs:
       - name: Decision 五秒对账、显式选择与隐藏恢复真实浏览器验证
         if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         env:
-          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.database-tests.outputs.browser_dependencies_id }}
+          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.browser-dependencies.outputs.browser_dependencies_id }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-decision-web.py --native-desktop --runtime-binding .agent-output/resource-web-e2e/runtime-binding.json --artifacts .agent-output/decision-web-e2e
 
       - name: MCP 全局连接、目录与失败恢复真实浏览器验证
         if: ${{ !cancelled() && steps.browser_ready.outcome == 'success' }}
         env:
-          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.database-tests.outputs.browser_dependencies_id }}
+          RESOURCE_BROWSER_ARTIFACT_ID: ${{ needs.browser-dependencies.outputs.browser_dependencies_id }}
         run: .agent-output/browser-venv/bin/python scripts/e2e-mcp-catalog-web.py --native-desktop --runtime-binding .agent-output/resource-web-e2e/runtime-binding.json --artifacts .agent-output/mcp-catalog-web-e2e
 
       - name: 记忆编辑、冲突与历史真实浏览器验证

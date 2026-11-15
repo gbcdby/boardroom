@@ -1,12 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { closeSync, fstatSync, openSync } from "node:fs";
+import { mkdtemp, open, readFile, rm, type FileHandle } from "node:fs/promises";
+import path from "node:path";
 import ts from "typescript";
 import { inspect } from "node:util";
 import { Client, type QueryResult } from "pg";
 import { postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgres.ts";
 import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
+import * as controlSql from "../src/server/storage/maintenance/control-sql.ts";
+import type { SourceLock } from "../src/server/storage/maintenance/types.ts";
 
 // The native cases require the private CI PostgreSQL service. Pure end controls below are not PostgreSQL evidence.
 const pgTest = process.env.AGENT_STUDIO_PG_TEST_URL ? test : test.skip;
@@ -30,6 +35,244 @@ async function isolatedEnd() {
     sessions, { hasSubscribers: false }, () => {}, () => ({})) as (session: unknown, confirmed?: boolean) => Promise<boolean>;
   return { sessions, end };
 }
+
+/** Executes the exact production lock/close bodies with controlled PostgreSQL calls.
+ * This checks the ordinary observe -> fresh-schema -> source-COMMIT path, not a native server. */
+async function isolatedFreshSchema(phase: "sync" | "async" | "undefined" | "success" | "query" | "query-close" | "query-undefined-close" | "mismatch-close") {
+  const text = await readFile(new URL("../src/server/storage/maintenance/postgres.ts", import.meta.url), "utf8");
+  const source = ts.createSourceFile("postgres.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const names = ["safeError", "throwResourceFailures", "endSession", "withSourceLock"];
+  const found = new Map<string, ts.FunctionDeclaration>(); let closeBody: string | undefined;
+  function visit(node: ts.Node) {
+    if (ts.isFunctionDeclaration(node) && node.name && names.includes(node.name.text)) found.set(node.name.text, node);
+    if (ts.isVariableDeclaration(node) && node.name.getText(source) === "adapter" && node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
+      const close = node.initializer.properties.find(item => ts.isMethodDeclaration(item) && item.name.getText(source) === "close");
+      if (close && ts.isMethodDeclaration(close)) closeBody = close.body!.getText(source);
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(source); assert.equal(found.size, names.length); assert.ok(closeBody);
+  const body = ts.transpileModule(names.map(name => found.get(name)!.getText(source)).join("\n")
+    + "\nasync function closeAdapter()" + closeBody, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  return new Function("MaintenanceFailure", "phase", "mechanism", `
+    const sessions=new Set(), sql=[], sourceConnection={schema:'app'}, auditFactories=new WeakMap();
+    const activeVerifications=new Set(), verificationInputs=new Map(), abort=new AbortController();
+    const writerObservation={hasSubscribers:false}, note=()=>{}, sessionMetadata=()=>({});
+    let lockActive=false, assertSnapshotLock, publicBackup, closed=false, closingStarted=false, closeAttempt, mutexTimer;
+    let permitEnd=phase==='success'||phase==='query', callbacks=0, freshEnds=0, sourceEnds=0, lastLock;
+    const queryFailure=phase.startsWith('query'), combined=phase.endsWith('close');
+    const first=phase==='undefined' ? undefined : combined && phase!=='query-undefined-close' ? new Error('postgres://fresh-cleanup-sensitive@host/private-database')
+      : new MaintenanceFailure('maintenance_lost','fresh-schema-end');
+    const primary=phase==='query-undefined-close' ? undefined : new MaintenanceFailure('source_changed','fresh-schema-query');
+    function client(label) { return {async query(query) {
+      sql.push(label+':'+query);
+      if(query.includes('pg_current_xact_id_if_assigned')) return {rows:[{id:'tx',count:'1'}]};
+      if(query.includes('pg_current_xact_id()')) return {rows:[{id:'tx'}]};
+      return {rows:[],command:query==='COMMIT'?'COMMIT':''};
+    }, end() {
+      if(label==='fresh') { freshEnds++; if(!permitEnd) {
+        if(phase==='sync') throw first; return Promise.reject(first);
+      }} else if(label==='source') sourceEnds++;
+      return Promise.resolve();
+    }}; }
+    const owned={ending:false,ended:false,client:client('source')}, fresh={ending:false,ended:false,client:client('fresh')};
+    let mutex={root:{},identity:{},released:false,session:{ending:false,ended:false,client:client('mutex')}};
+    sessions.add(mutex.session); const adapter={};
+    async function connect(_connection,_readonly,_critical,role) { const item=role==='source-control'?owned:fresh; sessions.add(item); return item; }
+    const assertMutex=async()=>{}, invalidate=()=>{}, quote=value=>value, same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+    const listPostgresTables=async()=>[{name:'test_table',oid:'1'}], checkedReader=value=>value;
+    const observation=async()=>({manifests:{schemaManifestDigest:'schema'}});
+    const readPostgresCatalog=async()=>{if(queryFailure)throw primary;return {schema:{mismatch:phase==='mismatch-close'}};};
+    const digestJson=value=>value.mismatch?'different':'schema';
+    const {bindControlSql,finishControlSqlCallback,validateControlSqlCommit,assertControlSqlCommit,noteControlSql}=mechanism;
+    const waitForPostgresTools=async()=>{};
+    async function endFactsSession(){throw new Error('ordinary control must not use facts cleanup');}
+    ${body}
+    return {sessions,fresh,first,primary,sql,run:()=>withSourceLock('control',async lock=>{lastLock=lock;callbacks++;await lock.observe();return 'result';}),
+      close:closeAdapter,allowEnd:()=>{permitEnd=true;},facts:()=>({callbacks,freshEnds,sourceEnds}),outcome:()=>mechanism.controlSqlOutcome(lastLock)};
+  `)(MaintenanceFailure, phase, controlSql) as {
+    sessions: Set<unknown>; fresh: { ended: boolean }; first: unknown; primary: unknown; sql: string[];
+    run(): Promise<unknown>; close(): Promise<void>; allowEnd(): void;
+    facts(): { callbacks: number; freshEnds: number; sourceEnds: number };
+    outcome(): ReturnType<typeof controlSql.controlSqlOutcome>;
+  };
+}
+
+test("#152 PostgreSQL exact ordinary fresh-schema close must precede source COMMIT", async t => {
+  for (const phase of ["sync", "async", "undefined", "success"] as const) await t.test(phase, async () => {
+    const f = await isolatedFreshSchema(phase);
+    try {
+      if (phase === "success") assert.equal(await f.run(), "result");
+      else await assert.rejects(f.run(), error => {
+        if (phase === "undefined") { assert.ok(error instanceof MaintenanceFailure); assert.equal(error.code, "snapshot_invalid"); }
+        else assert.equal(error, f.first);
+        return true;
+      });
+      assert.equal(f.sql.filter(sql => sql === "source:COMMIT").length, phase === "success" ? 1 : 0);
+      assert.equal(f.sql.filter(sql => sql === "source:ROLLBACK").length, phase === "success" ? 0 : 1);
+      assert.equal(f.sessions.has(f.fresh), phase !== "success"); assert.equal(f.fresh.ended, phase === "success");
+      assert.deepEqual(f.facts(), { callbacks: 1, freshEnds: 1, sourceEnds: 1 });
+      assert.equal(f.outcome().status, "unknown"); assert.equal(f.outcome().closeFailureObserved, phase !== "success");
+      const before = [...f.sql]; f.allowEnd(); await f.close();
+      assert.equal(f.sessions.size, 0); assert.equal(f.fresh.ended, true);
+      assert.deepEqual(f.sql, before, "explicit owner cleanup cannot replay source SQL");
+      assert.deepEqual(f.facts(), { callbacks: 1, freshEnds: phase === "success" ? 1 : 2, sourceEnds: 1 });
+    } finally { f.allowEnd(); await f.close(); }
+  });
+});
+
+test("#152 PostgreSQL exact ordinary fresh-schema query failures retain primary and safe cleanup facts", async t => {
+  for (const phase of ["query", "query-close", "query-undefined-close", "mismatch-close"] as const) await t.test(phase, async () => {
+    const f = await isolatedFreshSchema(phase);
+    try {
+      await assert.rejects(f.run(), error => {
+        if (phase === "query-undefined-close") { assert.ok(error instanceof MaintenanceFailure); assert.equal(error.code, "snapshot_invalid"); }
+        else if (phase === "mismatch-close") { assert.ok(error instanceof MaintenanceFailure); assert.equal(error.code, "source_changed"); }
+        else assert.equal(error, f.primary);
+        assert.doesNotMatch(inspect(error), /fresh-cleanup-sensitive|private-database/); return true;
+      });
+      const outcome = f.outcome();
+      assert.equal(outcome.status, "unknown"); assert.equal(outcome.failureObserved, true);
+      assert.equal(outcome.commitStarted, false); assert.equal(outcome.commitReturned, false);
+      assert.equal(outcome.closeFailureObserved, phase !== "query");
+      for (const field of ["originalError", "closeError", "afterValidated", "finalValidated"]) assert.equal(Object.hasOwn(outcome, field), false);
+      assert.doesNotMatch(inspect(outcome), /fresh-cleanup-sensitive|private-database/);
+      assert.equal(f.sql.filter(sql => sql === "source:COMMIT").length, 0);
+      assert.equal(f.sql.filter(sql => sql === "source:ROLLBACK").length, 1);
+      assert.equal(f.sessions.has(f.fresh), phase !== "query");
+      const before = [...f.sql]; f.allowEnd(); await f.close();
+      assert.equal(f.sessions.size, 0); assert.deepEqual(f.sql, before);
+      assert.deepEqual(f.facts(), { callbacks: 1, freshEnds: phase === "query" ? 1 : 2, sourceEnds: 1 });
+    } finally { f.allowEnd(); await f.close(); }
+  });
+});
+
+/** Exact production catch/finally and whole-adapter cleanup, with only the native restore body
+ * replaced by controlled results. Real FileHandles below are not native PostgreSQL evidence. */
+async function isolatedVerification(controls: { input: FileHandle; end(): Promise<void>; failPrimary?: boolean; first?: unknown }) {
+  const text = await readFile(new URL("../src/server/storage/maintenance/postgres.ts", import.meta.url), "utf8");
+  const source = ts.createSourceFile("postgres.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const names = ["safeError", "throwResourceFailures", "endSession", "closeVerificationInput", "verifyDatabaseOperation"];
+  const found = new Map<string, ts.FunctionDeclaration>(); let closeBody: string | undefined;
+  function visit(node: ts.Node) {
+    if (ts.isFunctionDeclaration(node) && node.name && names.includes(node.name.text)) found.set(node.name.text, node);
+    if (ts.isVariableDeclaration(node) && node.name.getText(source) === "adapter" && node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
+      const close = node.initializer.properties.find(item => ts.isMethodDeclaration(item) && item.name.getText(source) === "close");
+      if (close && ts.isMethodDeclaration(close)) closeBody = close.body!.getText(source);
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(source); assert.ok(closeBody);
+  const operation = found.get("verifyDatabaseOperation")!, nativeTry = operation.body!.statements.find(ts.isTryStatement)!;
+  assert.ok(nativeTry.catchClause && nativeTry.finallyBlock);
+  const original = operation.getText(source), offset = operation.getStart(source);
+  const nativeStub = `{
+    input = controls.input; const owner = {fd:input.fd}; verificationInputs.set(input, owner);
+    const info = await input.stat({bigint:true}); owner.identity = String(info.dev)+':'+String(info.ino);
+    if (controls.failPrimary) throw controls.first;
+    result = {kind:'controlled-restore-result'};
+  }`;
+  const operationControl = original.slice(0, nativeTry.tryBlock.getStart(source) - offset) + nativeStub + original.slice(nativeTry.tryBlock.end - offset);
+  const body = ts.transpileModule(names.filter(name => name !== "verifyDatabaseOperation").flatMap(name => {
+    const declaration = found.get(name); return declaration ? [declaration.getText(source)] : [];
+  }).join("\n") + "\n" + operationControl + "\nasync function closeAdapter()" + closeBody,
+  { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const session = { ending: false, ended: false, client: { end: controls.end } }, sessions = new Set([session]);
+  const owners = new Map<FileHandle, { fd: number; identity?: string }>();
+  const invoke = new Function("MaintenanceFailure", "fstatSync", "controls", "targetSession", "sessions", "verificationInputs", `
+    const sourceConnection={schema:'app'}, verificationConnection={schema:'app'}, expected={schema:{profile:'boardroom-pg16-closed-schema-v1'}};
+    const writerObservation={hasSubscribers:false}, activeVerifications=new Set(), auditFactories=new WeakMap(), abort=new AbortController();
+    let closed=false, closingStarted=false, closeAttempt, mutex, mutexTimer;
+    function note(){} function sessionMetadata(){return {};} function randomUUID(){return 'control';}
+    async function assertMutex(){} async function assertSnapshotLock(){} async function privateDirectory(){}
+    async function connect(){return targetSession;} async function waitForPostgresTools(){}
+    function object(value){return value;} function buildDatabaseManifests(){return expected;}
+    function same(a,b){return JSON.stringify(a)===JSON.stringify(b);} function checkedReader(value){return value;}
+    ${body}
+    return {run:()=>verifyDatabaseOperation('unused-input',expected,'unused-restore'),close:closeAdapter};
+  `)(MaintenanceFailure, fstatSync, controls, session, sessions, owners) as { run(): Promise<unknown>; close(): Promise<void> };
+  return { ...invoke, session, sessions, owners };
+}
+
+test("#152 PostgreSQL exact verification cleanup preserves first errors and attempts every owned resource", async t => {
+  for (const phase of ["success", "target-sync", "target-async", "target-undefined", "primary-and-close", "input-and-target", "all-errors"] as const) {
+    await t.test(phase, async child => {
+      const directory = await mkdtemp(path.join(process.cwd(), "verification-close-control-"));
+      const input = await open(path.join(directory, "private-input"), "wx+", 0o600), realClose = input.close.bind(input);
+      const first = phase === "all-errors" ? undefined : new MaintenanceFailure("source_changed", "verification-first");
+      const order: string[] = []; let released = false;
+      const canary = new Error("postgres://verification-private-canary@host/private-db");
+      const badInput = phase === "input-and-target" || phase === "all-errors";
+      child.mock.method(input, "close", async () => {
+        order.push("input"); if (badInput && !released) throw canary; await realClose();
+      });
+      const f = await isolatedVerification({ input, failPrimary: phase === "primary-and-close" || phase === "all-errors", first,
+        end() {
+          order.push("target"); if (released || phase === "success") return Promise.resolve();
+          if (phase === "target-async") return Promise.reject(canary);
+          throw phase === "target-undefined" ? undefined : canary;
+        } });
+      try {
+        if (phase === "success") assert.deepEqual(await f.run(), { kind: "controlled-restore-result" });
+        else await assert.rejects(f.run(), error => {
+          assert.doesNotMatch(inspect(error), /verification-private-canary|private-db|postgres:\/\//);
+          const failures = error instanceof AggregateError ? error.errors : [error];
+          const expectedCount = phase === "all-errors" ? 3 : ["primary-and-close", "input-and-target"].includes(phase) ? 2 : 1;
+          assert.equal(failures.length, expectedCount);
+          if (expectedCount > 1) {
+            assert.ok(error instanceof AggregateError); assert.equal(Object.hasOwn(error, "cause"), true); assert.equal(error.cause, failures[0]);
+          }
+          if (phase === "primary-and-close") assert.equal(failures[0], first);
+          if (phase === "all-errors") assert.equal(failures[0].message, "storage_maintenance: restore_verification_unavailable (source)");
+          if (badInput) assert.equal(failures.at(-2)!.message, "storage_maintenance: maintenance_lost (verification-input-close)");
+          assert.equal(failures.at(-1)!.message, "storage_maintenance: maintenance_lost (verification-target-close)");
+          return true;
+        });
+        assert.deepEqual(order, ["input", "target"], "input failure cannot skip the target end attempt");
+        assert.equal(f.owners.size, badInput ? 1 : 0); assert.equal(f.sessions.size, phase === "success" ? 0 : 1);
+        if (badInput) assert.ok((await input.stat()).isFile(), "the actual open input retains its FileHandle owner");
+        released = true; await f.close();
+        assert.equal(f.owners.size, 0); assert.equal(f.sessions.size, 0); assert.equal(input.fd, -1);
+        await assert.rejects(input.stat(), { code: "EBADF" });
+        assert.deepEqual(order, phase === "success" ? ["input", "target"] : badInput
+          ? ["input", "target", "input", "target"] : ["input", "target", "target"]);
+      } finally { released = true; child.mock.restoreAll(); await f.close(); if (input.fd !== -1) await realClose(); await rm(directory, { recursive: true }); }
+    });
+  }
+});
+
+test("#152 PostgreSQL verification input close response failure never closes a reused same-inode descriptor", async t => {
+  const directory = await mkdtemp(path.join(process.cwd(), "verification-close-reuse-")), file = path.join(directory, "input");
+  const input = await open(file, "wx+", 0o600), fd = input.fd, realClose = input.close.bind(input);
+  let replacement: number | undefined;
+  const f = await isolatedVerification({ input, end: async () => {} });
+  t.mock.method(input, "close", async () => {
+    await realClose(); replacement = openSync(file, "r"); assert.equal(replacement, fd); throw undefined;
+  });
+  try {
+    await assert.rejects(f.run(), error => error instanceof MaintenanceFailure
+      && error.message === "storage_maintenance: maintenance_lost (verification-input-close)");
+    assert.equal(f.sessions.size, 0); assert.equal(f.owners.size, 1);
+    await assert.rejects(f.close(), /verification-input-close-unknown/);
+    assert.equal(f.owners.size, 1); assert.ok(fstatSync(replacement!).isFile());
+    closeSync(replacement!); replacement = undefined;
+    await f.close(); assert.equal(f.owners.size, 0);
+  } finally { t.mock.restoreAll(); if (replacement !== undefined) closeSync(replacement); if (input.fd !== -1) await realClose(); await f.close(); await rm(directory, { recursive: true }); }
+});
+
+test("#152 PostgreSQL verification input close-after error rejects while confirmed closure retires its owner", async t => {
+  const directory = await mkdtemp(path.join(process.cwd(), "verification-close-after-"));
+  const input = await open(path.join(directory, "input"), "wx+", 0o600), realClose = input.close.bind(input);
+  let targetEnds = 0;
+  const f = await isolatedVerification({ input, end: async () => { targetEnds++; } });
+  t.mock.method(input, "close", async () => { await realClose(); throw undefined; });
+  try {
+    await assert.rejects(f.run(), error => error instanceof MaintenanceFailure
+      && error.message === "storage_maintenance: maintenance_lost (verification-input-close)");
+    assert.equal(targetEnds, 1); assert.equal(input.fd, -1); assert.equal(f.owners.size, 0); assert.equal(f.sessions.size, 0);
+    await f.close(); assert.equal(targetEnds, 1);
+  } finally { t.mock.restoreAll(); if (input.fd !== -1) await realClose(); await f.close(); await rm(directory, { recursive: true }); }
+});
 
 test("#152 PostgreSQL private end control never retires an unconfirmed owned session", async t => {
   for (const phase of ["sync", "reject", "undefined"] as const) await t.test(phase, async () => {
@@ -131,6 +374,64 @@ test("#152 PostgreSQL private ordinary inspection preserves safe first and close
       return true;
     });
     assert.equal(ends, 1); assert.equal(sessions.has(session), true); assert.equal(session.ended, false);
+  });
+});
+
+pgTest("#152 PostgreSQL real ordinary fresh-schema end failure rolls back before source COMMIT", async t => {
+  for (const phase of ["sync-before", "async-after", "query-only", "query-and-close", "query-undefined-and-close"] as const) await t.test(phase, async child => {
+    const f = await postgresAuditFixture(), query = Client.prototype.query, end = Client.prototype.end;
+    const reader = await f.connect("fresh-schema-independent"), before = (await reader.query("SELECT row_to_json(m) AS state FROM storage_maintenance m")).rows;
+    const secret = new Error("postgres://fresh-schema-sensitive-password@host/private-database");
+    const queryFailure = phase.startsWith("query"), closeFailure = phase !== "query-only";
+    const primary = phase === "query-undefined-and-close" ? undefined : new MaintenanceFailure("source_changed", "fresh-schema-query");
+    const closeError = phase === "query-undefined-and-close" ? new MaintenanceFailure("maintenance_lost", "fresh-schema-close") : secret;
+    let owned: Client | undefined, fresh: Client | undefined, held: SourceLock | undefined, fault = true, callbacks = 0, freshEnds = 0, sourceRollbacks = 0;
+    const sourceSql: string[] = [];
+    try {
+      child.mock.method(Client.prototype, "query", function (this: Client, ...args: unknown[]) {
+        const sql = sqlText(args[0]);
+        if (database(this) === f.database) {
+          if (sql === "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE") owned = this;
+          if (sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY") fresh = this;
+        }
+        if (this === owned) sourceSql.push(sql);
+        if (this === fresh && queryFailure && sql !== "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY") throw primary;
+        return invokeQuery(query, this, args).then(result => {
+          if (this === owned && sql === "ROLLBACK" && result.command === "ROLLBACK") sourceRollbacks++;
+          return result;
+        });
+      });
+      child.mock.method(Client.prototype, "end", function (this: Client) {
+        if (this !== fresh) return invokeEnd(end, this);
+        freshEnds++;
+        if (!fault || !closeFailure) return invokeEnd(end, this);
+        if (phase === "sync-before") throw secret;
+        if (queryFailure) return Promise.reject(closeError);
+        return invokeEnd(end, this).then(() => { throw secret; });
+      });
+      await assert.rejects(f.adapter.withSourceLock("control", async lock => {
+        held = lock; callbacks++; await lock.observe();
+      }), error => {
+        if (queryFailure && primary !== undefined) assert.equal(error, primary);
+        else { assert.ok(error instanceof MaintenanceFailure); assert.equal(error.code, "snapshot_invalid"); }
+        assert.doesNotMatch(inspect(error), /fresh-schema-sensitive|private-database/); return true;
+      });
+      assert.ok(owned); assert.ok(fresh); assert.notEqual(owned, fresh);
+      assert.equal(callbacks, 1); assert.equal(freshEnds, 1); assert.equal(sourceRollbacks, 1);
+      assert.equal(sourceSql.filter(sql => sql === "COMMIT").length, 0, "temporary close failure must prevent the source COMMIT dispatch");
+      const freshPid = (fresh as unknown as { processID: number }).processID;
+      const backendCount = async () => (await f.admin.query("SELECT count(*)::text AS count FROM pg_stat_activity WHERE pid=$1 AND datname=$2", [freshPid, f.database])).rows[0].count;
+      assert.equal(await backendCount(), closeFailure && phase !== "async-after" ? "1" : "0");
+      assert.ok(held); const outcome = controlSql.controlSqlOutcome(held);
+      assert.equal(outcome.status, "unknown"); assert.equal(outcome.failureObserved, true);
+      assert.equal(outcome.closeFailureObserved, closeFailure); assert.equal(outcome.commitStarted, false);
+      for (const field of ["originalError", "closeError"]) assert.equal(Object.hasOwn(outcome, field), false);
+      assert.deepEqual((await reader.query("SELECT row_to_json(m) AS state FROM storage_maintenance m")).rows, before);
+      const queriesBeforeCleanup = [...sourceSql]; fault = false; await f.adapter.close();
+      assert.equal(freshEnds, closeFailure ? 2 : 1, "only an unconfirmed fresh-session owner requires explicit cleanup");
+      assert.equal(await backendCount(), "0"); assert.equal(callbacks, 1);
+      assert.deepEqual(sourceSql, queriesBeforeCleanup, "cleanup must not replay the source transaction");
+    } finally { fault = false; child.mock.restoreAll(); await f.close(); }
   });
 });
 
@@ -279,4 +580,73 @@ pgTest("#152 PostgreSQL real ordinary writer inspection rejects sole and combine
       assert.equal((await f.admin.query("SELECT count(*)::text AS n FROM pg_stat_activity WHERE datname=$1 AND application_name LIKE 'boardroom-maintenance:%'", [f.database])).rows[0].n, "0");
     } finally { child.mock.restoreAll(); if (owned) await invokeEnd(end, owned); await f.close(); }
   });
+});
+
+pgTest("#152 PostgreSQL real restored target cannot succeed after sync or async end failure", async t => {
+  const f = await postgresAuditFixture(), end = Client.prototype.end;
+  try {
+    // Physical verification fixture only: this native sealed anchor is not an Fs/Jq
+    // qualification claim and is never consumed by the finite journal closure reader.
+    await f.adapter.withSourceLock("control", async lock => {
+      const current = await lock.observe(), prior = await f.store.readJson(f.head, "journal") as Record<string, unknown>;
+      const captured = await f.store.putJson("journal", { ...prior, sequence: 2, previous: f.head,
+        phase: "quiesced", event: "capture", requestId: "verification-close-fixture" });
+      await lock.anchor({ expected: current.state, admission: "sealed", fenceEpoch: current.state.fenceEpoch,
+        ownerGeneration: current.state.ownerGeneration, activeMigrationId: f.plan.migrationId, planDigest: f.reference.planDigest,
+        controlRootIdentity: f.store.identity as never, mutexIdentity: f.mutex.identity, journal: captured, journalSequence: 2 });
+    });
+    await f.mutex.release(); await f.adapter.close();
+    for (const phase of ["sync-before", "async-after"] as const) await t.test(phase, async child => {
+      const targetName = `br_verify_close_${randomUUID().replaceAll("-", "")}`;
+      const targetUrl = new URL(process.env.AGENT_STUDIO_PG_TEST_URL!); targetUrl.pathname = `/${targetName}`;
+      await f.admin.query(`CREATE DATABASE "${targetName}" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'`);
+      const adapter = await createPostgresMaintenanceAdapter(f.descriptor, { kind: "postgres", connectionString: targetUrl.toString() });
+      let owned: Client | undefined, ends = 0, cleanup = 0;
+      try {
+        const initial = await adapter.observe(), mutex = await adapter.acquireMutex(f.store.identity, initial.state);
+        const attempt = await f.store.createAttempt(initial.state.ownerGeneration), file = path.join(attempt, "snapshot.dump");
+        await adapter.withSourceLock("snapshot", async lock => {
+          const backup = await lock.backup(file);
+          child.mock.method(Client.prototype, "end", function (this: Client) {
+            if (database(this) !== targetName) return invokeEnd(end, this);
+            owned = this; ends++;
+            const canary = new Error("postgres://verification-private-canary@host/private-db");
+            if (phase === "sync-before") throw canary;
+            return invokeEnd(end, this).then(() => { throw canary; });
+          });
+          await assert.rejects(adapter.verifyDatabase(file, backup.manifests, attempt), error => {
+            assert.ok(error instanceof MaintenanceFailure);
+            assert.equal(error.message, "storage_maintenance: maintenance_lost (verification-target-close)");
+            assert.doesNotMatch(inspect(error), /verification-private-canary|private-db|postgres:\/\//); return true;
+          });
+          assert.ok(owned); assert.equal(ends, 1); child.mock.restoreAll();
+        });
+        const pid = (owned as unknown as { processID: number }).processID;
+        assert.ok(Number.isSafeInteger(pid) && pid > 0);
+        assert.equal((await f.admin.query("SELECT count(*)::text AS count FROM pg_stat_activity WHERE pid=$1", [pid])).rows[0].count,
+          phase === "sync-before" ? "1" : "0");
+        child.mock.method(Client.prototype, "end", function (this: Client) {
+          if (this === owned) cleanup++; return invokeEnd(end, this);
+        });
+        await mutex.release(); await adapter.close(); assert.equal(cleanup, 1);
+        assert.equal((await f.admin.query("SELECT count(*)::text AS count FROM pg_stat_activity WHERE datname=$1", [targetName])).rows[0].count, "0");
+        child.mock.restoreAll();
+        const restored = new Client({ connectionString: targetUrl.toString() }); await restored.connect();
+        try {
+          const state = (await restored.query("SELECT admission,journal_digest,journal_sequence FROM storage_maintenance")).rows[0];
+          assert.equal(state.admission, "sealed"); assert.equal(state.journal_digest, initial.state.journalDigest);
+          assert.equal(String(state.journal_sequence), String(initial.state.journalSequence));
+        } finally { await restored.end(); }
+        const reader = await f.connect("verification-close-independent");
+        try {
+          const state = (await reader.query("SELECT admission,journal_digest,journal_sequence FROM storage_maintenance")).rows[0];
+          assert.equal(state.admission, initial.state.admission); assert.equal(state.journal_digest, initial.state.journalDigest);
+          assert.equal(String(state.journal_sequence), String(initial.state.journalSequence));
+        } finally { await f.closeClient(reader); }
+      } finally {
+        child.mock.restoreAll(); await adapter.close();
+        await f.admin.query(`DROP DATABASE "${targetName}"`);
+      }
+    });
+  } finally { await f.close(); }
 });
