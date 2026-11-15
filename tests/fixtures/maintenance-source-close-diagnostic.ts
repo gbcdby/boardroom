@@ -7,9 +7,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 type Call = (...args: unknown[]) => unknown;
+type ConnectionState = { open: boolean | null; inTransaction: boolean | null };
 type Capture = { kind: string; fd: number; parts: Buffer[]; observedBytes: number; capturedBytes: number;
   reads: number; eof: boolean; closed: boolean; truncated: boolean };
 type Frame = { index: number; phase: string; nativeCloseCalls: number; nativeCloseReturned: boolean;
+  beforeNativeState: ConnectionState | null; afterNativeState: ConnectionState | null;
   events: object[]; droppedEvents: number; observationErrors: number; captures: Capture[];
   descriptors: Map<number, Capture>; sourceDescriptors: Map<number, string>; capturedBytes: number; error?: object };
 const root = fileURLToPath(new URL("../../", import.meta.url));
@@ -34,6 +36,14 @@ function safeError(error: unknown) {
 function observe(frame: Frame, work: () => void) {
   // Diagnostic failures cannot replace the original operation's return or exception.
   try { work(); } catch { frame.observationErrors++; }
+}
+function connectionState(frame: Frame, db: object): ConnectionState {
+  const state: ConnectionState = { open: null, inTransaction: null };
+  for (const key of ["open", "inTransaction"] as const) observe(frame, () => {
+    const value = (db as Record<typeof key, unknown>)[key];
+    if (typeof value === "boolean") state[key] = value;
+  });
+  return state;
 }
 
 /** Observe the original private close boundary once. No DB/proc reread, retry, altered result or production hook. */
@@ -123,14 +133,18 @@ export async function withSqliteSourceCloseDiagnostics<T>(
       if (db?.name !== sourceFile) return Reflect.apply(originalCloseSource, this, args);
       const priorClose = Object.getOwnPropertyDescriptor(db, "close"), original = db.close;
       const frame: Frame = { index: ++closeCount, phase: "before-native-close", nativeCloseCalls: 0, nativeCloseReturned: false,
+        beforeNativeState: null, afterNativeState: null,
         events: [], droppedEvents: 0, observationErrors: 0, captures: [], descriptors: new Map(), sourceDescriptors: new Map(), capturedBytes: 0 };
       const parentFrame = active; active = frame; let nativeHookInstalled = false;
       try {
         observe(frame, () => {
           Object.defineProperty(db, "close", { configurable: true, writable: true, value: function(this: unknown, ...closeArgs: unknown[]) {
             frame.phase = "native-close"; frame.nativeCloseCalls++;
-            const value = Reflect.apply(original, this, closeArgs);
-            frame.nativeCloseReturned = true; frame.phase = "post-close-inventory"; return value;
+            observe(frame, () => { frame.beforeNativeState = connectionState(frame, db); });
+            try {
+              const value = Reflect.apply(original, this, closeArgs);
+              frame.nativeCloseReturned = true; frame.phase = "post-close-inventory"; return value;
+            } finally { observe(frame, () => { frame.afterNativeState = connectionState(frame, db); }); }
           } });
           nativeHookInstalled = true;
         });
@@ -165,14 +179,15 @@ export async function withSqliteSourceCloseDiagnostics<T>(
           captures.push({ ...metadata, file, sha256: hash(bytes) });
         }
         rows.push({ index: frame.index, phase: frame.phase, nativeCloseCalls: frame.nativeCloseCalls,
-          nativeCloseReturned: frame.nativeCloseReturned, error: frame.error, events: frame.events,
+          nativeCloseReturned: frame.nativeCloseReturned, beforeNativeState: frame.beforeNativeState,
+          afterNativeState: frame.afterNativeState, error: frame.error, events: frame.events,
           droppedEvents: frame.droppedEvents, observationErrors: frame.observationErrors, captures });
       }
       const sources = ["src/server/storage/maintenance/sqlite.ts", "src/server/storage/maintenance/linux-mappings.ts",
         "tests/maintenance-source-facts-sqlite.test.ts", "tests/fixtures/maintenance-source-close-diagnostic.ts"];
       const sourceSha256 = Object.fromEntries(await Promise.all(sources.map(async name => [name, hash(await readFile(path.join(root, name)))])));
       const report = { mode, setupComplete, restorationErrors, originalOperationThrew: threw, closeCount, droppedFailures, limits,
-        provenance: "Original close/fs calls and their original returned self proc bytes only; no reread/retry/source DB open.",
+        provenance: "Original close/fs calls, their original returned self proc bytes and bounded connection properties around the same close; no SQL/proc reread/retry/source DB open.",
         pid: process.pid, uid: process.getuid?.() ?? null, platform: process.platform, node: process.version, kernel: release(),
         candidate: /^[0-9a-f]{40}$/.test(process.env.GITHUB_SHA ?? "") ? process.env.GITHUB_SHA : null,
         sourceSha256, failures: rows };
