@@ -40,6 +40,22 @@ node --test --test-concurrency=1 tests/maintenance-postgres-public-directory.tes
 
 原生适配的目标验证环境为 macOS arm64 / 本地 APFS。具体支持结论必须以同候选 macOS CI 的实际系统、Node/libuv、SQLite 版本及测试记录为准。网络盘、Windows、未知写者或未证明安全停止的模型宿主仍阻塞维护。本地敌对管理员能够替换文件或拆除数据库防护，继续适用 #152 r3 的明确排除边界。
 
+## 隔离文件副本恢复目录接缝
+
+`maintenance-restore-directory.c` 与 `restore-directory.ts` 仅服务于 #152 已持久 Fs/payload 的隔离文件副本恢复。Darwin 安装单独构建 `maintenance-restore-directory-<arch>.node`，失败只阻塞此组件，不删除或放宽既有 observer、SQLite 或 public 组件。构建复用同一组有校验摘要的 Node-API 8 headers，运行时核固定包内路径、当前 owner、0700、普通文件与单链接。
+
+所有创建均相对于已持有且核实 dev/inode 的父目录 FD，逐次只接受一个不含斜杠、NUL、`.` 或 `..` 的叶名称。Linux 使用 `/proc/self/fd/N/leaf`；Darwin 使用 `mkdirat`/`openat`，先复制父目录 FD 再排入工作队列，完成后关闭借用 FD。Darwin 只通过末端 `/dev/fd/N` 接收新开文件或目录 FD，不把它当目录子路径。恢复时即使原父目录路径被单向替换为符号链接，实际 mkdir/create 仍落在原已固定目录；路径绑定复查失败时保留本次残留并报告失败，不向新指向的外部目录写入。
+
+同 host 的 Fs 已知源根、absent 根既存祖先及每项源身份在目标创建前与实际目标祖先比较，不能因源目录改名就将其变成可写的 attempt。源文件内容不加 UTF-8/JSON 限制；目录只比较类型、完整成员和数值权限，不比较异文件系统的原 st_size。恢复文件的只读 FD 保留到目录同步之后，再核对精确字节、摘要、身份与权限；目录最终模式仍与 manifest 比较。输入受 16 MiB manifest、4096 entries、256 个目录和 512 个目标文件/目录句柄的本地预算限制，超限在创建恢复目标前失败。
+
+以下两份测试在 Linux 执行真实生产路径及相同 C 源码的便携 ABI 控制；在 Darwin 执行安装得到的实际组件。便携 C 控制不替代 Darwin 的末端 FD 接收、APFS 同步或同候选 macOS CI 结果。
+
+```sh
+node --test tests/maintenance-restore-directory.test.ts tests/maintenance-restore-files.test.ts
+```
+
+本组件不采集 live 源，不赋予 Fs/provider 资格，不改变 public 接缝的 `.public-*` 白名单，不生成完整 V/R/Jr 或释放任何 S4 命名产物。失败保留首错、关闭错误及本次已创建目标；不自动清理或覆盖其他目录。
+
 `powerLossTested` 始终为 `false`。能力回执记录实际系统调用成功、原子名称发布和子进程故障恢复；CI 中的 SIGKILL 不被表述为物理断电实验。维护协调器还必须保持数据库锚点、当前代际和完整恢复链的独立核验。
 
 ## 一手依据
