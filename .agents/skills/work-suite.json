@@ -1,6 +1,6 @@
 {
   "schema_version": "work-suite/v1",
-  "suite_version": "0.6.0",
+  "suite_version": "0.6.1",
   "result_contract": "work-result/v1",
   "independent_formal_skill": "worker-tla",
   "runtime_guarantees": "Defined by actual project tools, not this registry.",
@@ -595,11 +595,11 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "2793f8ab794149fc2888944d744b6442fffd4e719ba4a5443a085b3963a59181"
+          "sha256": "c1ed63b6df0f3485d38de4d4bd6a9e6a4077163766e1e38e6cae4ce2e443ea12"
         },
         {
           "path": "agents/openai.yaml",
-          "sha256": "4e83c77c30b547cc50c3c775fd954a692848f496149ba41337d93ae2f34ea349"
+          "sha256": "2dbfa4d937e371e2531180e623f395467020ba7fff2c55e3416d3d745426fe23"
         },
         {
           "path": "assets/icon.svg",
@@ -639,7 +639,7 @@
         },
         {
           "path": "assets/project-template/guidelines/consistency.md",
-          "sha256": "e761cfd805bdefc8e660b105cb37a71c73d569869f3b6427107ba508b0be1d5b"
+          "sha256": "96532c977a75422999be38592b1f68f0bea31a246be58a02a7592f7993c0c42c"
         },
         {
           "path": "assets/project-template/guidelines/environments.md",
@@ -655,7 +655,7 @@
         },
         {
           "path": "assets/project-template/guidelines/ui-visual.md",
-          "sha256": "77dab5e9799cad705836ca6d1763f2c41dc7b3726798a6b90644f9d1eac1eeff"
+          "sha256": "2765abf58ee0ab3e35a0cddf8ba94a3108ceb4327c12f0c3583e258618b70530"
         },
         {
           "path": "assets/project-template/project.json",
@@ -675,7 +675,7 @@
         },
         {
           "path": "assets/validation-template/design-decision.md",
-          "sha256": "d9c7ed3cea1e1932ceee21094493711ecf4268df5138c418afc064ab83d18ca3"
+          "sha256": "31ee18dbc9c9ef96c57754d4bea8704f5846a5d04be9b0951ee836ba19b6c80b"
         },
         {
           "path": "assets/validation-template/style-review.md",
@@ -692,6 +692,14 @@
         {
           "path": "references/color-systems.md",
           "sha256": "8ed27e28f1057917e0e8760ba350239eb17d73a58cfe0de0e5f4bbd493badf5f"
+        },
+        {
+          "path": "references/component-system.md",
+          "sha256": "0dbb2e64d40792b083d5a5e778b890cba04a784b99c766b13b1ff71d1acd3b2b"
+        },
+        {
+          "path": "references/design-archive.md",
+          "sha256": "e1292718baca56d590e0999dc831a3a96d14c02a8b29e94e53e223fec64c524d"
         },
         {
           "path": "references/evaluation-lab.md",
@@ -711,11 +719,11 @@
         },
         {
           "path": "references/interface-design.md",
-          "sha256": "ecdaf81e68775fd289fe3b153891853ff3a3b5184423e1ee887e011eecacca53"
+          "sha256": "3a1e21659899bb7b5fdc38b1a5f63ee0aec95b1ad876cf9000e2f95aa632541e"
         },
         {
           "path": "references/interface-validation.md",
-          "sha256": "9fb4862bbf09d119705ac3fe4cb34e33e2d12231b67c6c8dba9077c946789a5f"
+          "sha256": "8a3e783dc22de744be2fe1c457cf0ea3e8a191aec1cbaed6b20531f7ce0d2a6c"
         },
         {
           "path": "references/iteration.md",
@@ -723,11 +731,11 @@
         },
         {
           "path": "references/project-layout.md",
-          "sha256": "6a81a884a47837ec515c8bd45148a79a5be7f46d3735c83834e8fabf3ddda391"
+          "sha256": "b35cbbbbcc67dc2f3cfb6e7c4ddd024238c79d8b30b123d568a6383c4f21d51f"
         },
         {
           "path": "references/project-learning.md",
-          "sha256": "c30fef95f54452ac3952e14494bbee4abdf876974f739c6786161a497895e786"
+          "sha256": "5ac96067d4b3011fb0e0e488d04d34db6db29ba3a3bf131cf21eeefed8fed8ae"
         },
         {
           "path": "references/reference-analysis.md",
