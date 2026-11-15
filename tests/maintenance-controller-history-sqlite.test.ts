@@ -5,6 +5,7 @@ import Database from "better-sqlite3";
 import { sqliteAuditFixture } from "./fixtures/maintenance-source-audit.ts";
 import { historicalControllerProcess, historicalControllerRow } from "./fixtures/maintenance-controller-history.ts";
 import { canonicalJson } from "../src/server/storage/maintenance/canonical.ts";
+import { inspectRegisteredSourceProcess } from "../src/server/storage/maintenance/source-facts.ts";
 
 async function fixture(encoding: "UTF-8" | "UTF-16le" | "UTF-16be" = "UTF-8") {
   const actor = await historicalControllerProcess();
@@ -90,6 +91,28 @@ test("A12-B historical SQLite controller never substitutes ended time or empty o
     await f.actor.exit();
     const packet = await read();
     assert.equal(packet.facts.clients.find(value => value.kind === "maintenance-controller")!.classification, "exited-actor");
+  } finally { await f.close(); }
+});
+
+test("A12-B historical SQLite controller keeps same-value native decimals live and preserves their raw text", async () => {
+  const f = await fixture();
+  try {
+    const identity = f.actor.identity;
+    const alias = identity.platform === "linux" ? { ...identity, startTicks: `0${identity.startTicks}` }
+      : { ...identity, startSeconds: `0${identity.startSeconds}` };
+    replaceRow(f, { ...f.row, process_identity_json: canonicalJson(alias) });
+    const before = await f.adapter.withSourceLock("control", lock => lock.observeSourceClients());
+    assert.equal((await inspectRegisteredSourceProcess(f.actor.host, alias)).fact.status, "present");
+    await assert.rejects(f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference)), { code: "source_writer_unknown" });
+    assert.deepEqual(await f.adapter.withSourceLock("control", lock => lock.observeSourceClients()), before);
+    assert.equal((await inspectRegisteredSourceProcess(f.actor.host, identity)).fact.status, "present");
+    await f.actor.exit();
+    const packet = await f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference));
+    const old = packet.facts.clients.find(value => value.kind === "maintenance-controller")!;
+    assert.equal(old.classification, "exited-actor");
+    assert.equal(old.processCheck.kind, process.platform === "linux" ? "linux-absent" : "darwin-absent");
+    assert.deepEqual(old.process, alias, "the observed input text is retained rather than normalized");
+    assert.deepEqual(packet.observation, before, "the full raw roster is unchanged after actual exit");
   } finally { await f.close(); }
 });
 

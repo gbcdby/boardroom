@@ -75,7 +75,7 @@ export async function inspectRegisteredSourceProcess(host: Record<string, unknow
     // A registration containing only hostname cannot prove an older boot belonged to this host.
     if (actual.bootSessionUuid !== identity.bootSessionUuid) return unknownWriter();
     if (actual.status === "absent") return { fact: { status: "exited", reason: "process_absent" }, check: { kind: "darwin-absent", result: actual } };
-    return { fact: actual.startSeconds === identity.startSeconds && actual.startMicroseconds === identity.startMicroseconds
+    return { fact: BigInt(actual.startSeconds) === BigInt(identity.startSeconds) && BigInt(actual.startMicroseconds) === BigInt(identity.startMicroseconds)
       ? { status: "present", reason: "identity_matches" } : { status: "exited", reason: "identity_replaced" },
       check: { kind: "darwin-present", result: actual } };
   }
@@ -109,7 +109,7 @@ export async function inspectRegisteredSourceProcess(host: Record<string, unknow
       if (["ENOENT", "ESRCH"].includes(String((error as NodeJS.ErrnoException).code))) return absent("proc-stat", (error as NodeJS.ErrnoException).code as "ENOENT" | "ESRCH");
       throw error;
     }
-    if (before !== identity.startTicks) return { fact: { status: "exited", reason: "identity_replaced" },
+    if (BigInt(before) !== BigInt(identity.startTicks)) return { fact: { status: "exited", reason: "identity_replaced" },
       check: { kind: "linux-replaced", observerUid, kernelBootId, pidNamespace, pid, observedUid: uidBefore, observedStartTicks: before } };
     if (await readlink(`${directory}/ns/pid`) !== identity.pidNamespace) return unknownWriter();
     const after = procIdentity(await readFile(`${directory}/stat`, "utf8"), pid);
