@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import promises, { mkdtemp, rm, readdir } from "node:fs/promises";
+import promises, { mkdtemp, rm } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
@@ -44,7 +44,7 @@ nativeTest("#152 payload: bounded chunks, exact bytes and same-owner publication
 nativeTest("#152 payload: empty source completes with the empty SHA-256 and no implicit chunk", async () => {
   const f = await fixture();
   try {
-    async function* empty(): AsyncIterable<Uint8Array> {}
+    async function* empty() {}
     const ref = await f.store.putSourceFilePayload(empty(), 0n);
     assert.equal(ref.sha256, sha256(Buffer.alloc(0)));
     assert.equal(ref.bytes, "0"); assert.deepEqual(await f.store.readBytes(ref), Buffer.alloc(0));
