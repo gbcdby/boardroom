@@ -4,7 +4,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import fsPromises, { type FileHandle } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
-import { mkdtemp, realpath, rm, stat } from "node:fs/promises";
+import { mkdtemp, realpath, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
@@ -32,6 +32,181 @@ function businessValues(file: string) {
   const db = new Database(file, { readonly: true, fileMustExist: true });
   try { return db.prepare("SELECT value FROM lifecycle_values").all(); } finally { db.close(); }
 }
+
+test("#152 SQLite rejected constructor closes its just-opened source descriptor", async t => {
+  const f = await fixture(), open = fs.openSync, fstat = fs.fstatSync, close = fs.closeSync;
+  await f.adapter.close();
+  let owned: number | undefined, injected = false, closeCalls = 0;
+  try {
+    t.mock.method(fs, "openSync", (...args: Parameters<typeof fs.openSync>) => {
+      const fd = open(...args); if (args[0] === f.file) owned = fd; return fd;
+    });
+    t.mock.method(fs, "fstatSync", (...args: Parameters<typeof fs.fstatSync>) => {
+      if (args[0] === owned && !injected) { injected = true; throw Object.assign(new Error("private identity-read canary"), { code: "EIO" }); }
+      return fstat(...args);
+    });
+    t.mock.method(fs, "closeSync", (fd: number) => { if (fd === owned) closeCalls++; close(fd); });
+    syncBuiltinESMExports();
+    await assert.rejects(createSqliteMaintenanceAdapter(f.descriptor), { code: "source_changed" });
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    assert.equal(injected, true); assert.notEqual(owned, undefined); assert.equal(closeCalls, 1);
+    assert.throws(() => fstat(owned!), { code: "EBADF" });
+    assert.deepEqual(businessValues(f.file), [{ value: "original" }]);
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    if (owned !== undefined) { try { fstat(owned); close(owned); } catch {} }
+    await f.close();
+  }
+});
+
+test("#152 SQLite constructor cleanup preserves classification and never retries an unknown close", async t => {
+  for (const phase of ["before", "after", "reused", "unknown-reused"] as const) await t.test(phase, async child => {
+    const f = await fixture(), open = fs.openSync, fstat = fs.fstatSync, close = fs.closeSync;
+    await f.adapter.close();
+    const unrelated = path.join(f.directory, "other-fd-owner"); fs.writeFileSync(unrelated, "independent owner");
+    const cleanup = phase === "before" ? undefined : new Error("controlled constructor close response");
+    let owned: number | undefined, replacement: number | undefined, injected = false, closeCalls = 0;
+    try {
+      child.mock.method(fs, "openSync", (...args: Parameters<typeof fs.openSync>) => {
+        const fd = open(...args); if (args[0] === f.file) owned = fd; return fd;
+      });
+      child.mock.method(fs, "fstatSync", (...args: Parameters<typeof fs.fstatSync>) => {
+        if (args[0] === owned && !injected) {
+          injected = true;
+          if (phase === "reused") return Object.assign(fstat(...args), { nlink: 2n });
+          throw new Error("private constructor identity-read canary");
+        }
+        return fstat(...args);
+      });
+      child.mock.method(fs, "closeSync", (fd: number) => {
+        if (fd !== owned) { close(fd); return; }
+        closeCalls++;
+        if (phase !== "before") close(fd);
+        if (phase === "reused" || phase === "unknown-reused") {
+          replacement = open(phase === "reused" ? f.file : unrelated, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+          assert.equal(replacement, fd, "the native fd number now belongs to a different open description");
+        }
+        throw cleanup;
+      });
+      syncBuiltinESMExports();
+      await assert.rejects(createSqliteMaintenanceAdapter(f.descriptor), error => {
+        assert.ok(error instanceof AggregateError); assert.equal(error.errors.length, 2);
+        assert.ok(error.errors[0] instanceof MaintenanceFailure); assert.equal(error.errors[0].code, "source_changed");
+        assert.equal(error.cause, error.errors[0]); assert.equal(error.errors[1], cleanup);
+        assert.equal(error.errors[0].message.includes("canary"), false); return true;
+      });
+      child.mock.restoreAll(); syncBuiltinESMExports();
+      assert.equal(injected, true); assert.notEqual(owned, undefined); assert.equal(closeCalls, 1);
+      if (phase === "after") {
+        assert.throws(() => fstat(owned!), { code: "EBADF" });
+        const recovered = await createSqliteMaintenanceAdapter(f.descriptor); await recovered.close();
+      }
+      else {
+        await assert.rejects(createSqliteMaintenanceAdapter(f.descriptor), { code: "maintenance_lost" });
+        const info = fstat(owned!, { bigint: true });
+        assert.equal(String(info.dev), f.descriptor.identity.device);
+        if (phase === "unknown-reused") assert.notEqual(String(info.ino), f.descriptor.identity.inode);
+        else assert.equal(String(info.ino), f.descriptor.identity.inode);
+      }
+      assert.deepEqual(businessValues(f.file), [{ value: "original" }]);
+    } finally {
+      child.mock.restoreAll(); syncBuiltinESMExports();
+      // Only this fixture knows whether its injection preceded close or created a new owner.
+      const remaining = phase === "before" ? owned : replacement;
+      if (remaining !== undefined) { try { close(remaining); } catch {} }
+      await f.close();
+    }
+  });
+});
+
+test("#152 SQLite failed initialization retains an unreachable caller handle's private owner", async t => {
+  for (const phase of ["identity", "observation"] as const) await t.test(phase, async child => {
+    const f = await fixture(), independent = await fixture(), open = fs.openSync, fstat = fs.fstatSync, close = fs.closeSync;
+    const prepare = Database.prototype.prepare; await f.adapter.close();
+    let owned: number | undefined, opened = 0, closeCalls = 0, injected = false, moved = false;
+    const unexpected: Awaited<ReturnType<typeof createSqliteMaintenanceAdapter>>[] = [];
+    const alias = path.join(f.directory, "renamed-source.db");
+    try {
+      child.mock.method(fs, "openSync", (...args: Parameters<typeof fs.openSync>) => {
+        const fd = open(...args); if (args[0] === f.file || args[0] === alias) { opened++; owned ??= fd; } return fd;
+      });
+      child.mock.method(fs, "fstatSync", (...args: Parameters<typeof fs.fstatSync>) => {
+        if (phase === "identity" && args[0] === owned && !injected) { injected = true; throw new Error("private first identity read"); }
+        return fstat(...args);
+      });
+      child.mock.method(Database.prototype, "prepare", function (this: Database.Database, sql: string) {
+        if (phase === "observation" && this.name === f.file && this.readonly && !injected) {
+          injected = true; throw new MaintenanceFailure("source_changed", "initial-observation");
+        }
+        return prepare.call(this, sql);
+      });
+      child.mock.method(fs, "closeSync", (fd: number) => {
+        if (fd === owned) { closeCalls++; throw undefined; } close(fd);
+      });
+      syncBuiltinESMExports();
+      await assert.rejects(createSqliteMaintenanceAdapter(f.descriptor), error => {
+        assert.ok(error instanceof AggregateError); assert.equal(error.errors[0].code, phase === "identity" ? "source_changed" : "migration_incomplete");
+        assert.equal(error.errors[1], undefined); return true;
+      });
+      assert.equal(injected, true); assert(opened >= 1); assert.equal(closeCalls, 1); fstat(owned!);
+      const originalOpens = opened;
+      const rejectedCreate = async (descriptor: typeof f.descriptor) => {
+        let failed = false;
+        try { unexpected.push(await createSqliteMaintenanceAdapter(descriptor)); } catch (error) {
+          failed = true; assert.ok(error instanceof MaintenanceFailure); assert.equal(error.code, "maintenance_lost");
+        }
+        assert.equal(failed, true, "the prior private owner must remain reachable after factory rejection");
+      };
+      await rejectedCreate(f.descriptor);
+      await rename(f.file, alias); moved = true;
+      await rejectedCreate({ ...f.descriptor, sourcePath: alias, sqlitePath: alias });
+      assert.equal(opened, originalOpens, "a renamed source with the same bound inode cannot bypass the pending owner");
+      assert.equal(closeCalls, 1, "an unconfirmed close is never retried by numeric descriptor");
+      const other = await createSqliteMaintenanceAdapter(independent.descriptor); await other.close();
+      await rename(alias, f.file); moved = false;
+      child.mock.restoreAll(); syncBuiltinESMExports();
+      close(owned!); // This test alone knows its injection preceded the native close.
+      assert.throws(() => fstat(owned!), { code: "EBADF" }); owned = undefined;
+      const recovered = await createSqliteMaintenanceAdapter(f.descriptor); await recovered.close();
+      assert.deepEqual(businessValues(f.file), [{ value: "original" }]);
+    } finally {
+      child.mock.restoreAll(); syncBuiltinESMExports();
+      if (moved) await rename(alias, f.file);
+      for (const adapter of unexpected) await adapter.close();
+      if (owned !== undefined) { try { close(owned); } catch {} }
+      await independent.close(); await f.close();
+    }
+  });
+});
+
+test("#152 SQLite actually closed source owners retire before the Darwin identity assertion", async t => {
+  const f = await fixture(), lease = await f.adapter.acquireMutex(f.store.identity, f.initial.state);
+  const close = Database.prototype.close, failure = new Error("controlled source close-before");
+  let held: Database.Database | undefined;
+  try {
+    t.mock.method(Database.prototype, "close", function (this: Database.Database) {
+      if (this.name === f.file && !this.readonly) { held = this; throw failure; }
+      return close.call(this);
+    });
+    await assert.rejects(f.adapter.withSourceLock("control", lock => lock.observeSourceClients()), error => error === failure);
+    assert.ok(held); assert.equal(held.open, true);
+    t.mock.restoreAll(); close.call(held); assert.equal(held.open, false);
+    // On Linux this is an explicit private branch control using the real closed Database,
+    // not a claim that Darwin native inventory or durability ran on this host.
+    if (process.platform === "linux") {
+      const internal = f.adapter as unknown as { darwinConnections: Set<Database.Database>; assertSource(): void };
+      internal.darwinConnections.add(held);
+      const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      try { Object.defineProperty(process, "platform", { ...platform, value: "darwin" }); internal.assertSource(); }
+      finally { Object.defineProperty(process, "platform", platform); }
+      assert.equal(internal.darwinConnections.has(held), false);
+    }
+    await lease.release();
+    const observed = await f.adapter.observe();
+    const next = await f.adapter.acquireMutex(f.store.identity, observed.state); await next.release();
+    assert.deepEqual(businessValues(f.file), [{ value: "original" }]);
+  } finally { t.mock.restoreAll(); if (held?.open) close.call(held); await f.close(); }
+});
 
 test("#152 SQLite mutex release closes the real lock even when ROLLBACK dispatch fails", async t => {
   const f = await fixture(), lease = await f.adapter.acquireMutex(f.store.identity, f.initial.state);

@@ -68,10 +68,12 @@ function configureDurableSqlite(db: Database.Database): void {
 }
 
 class SqliteMaintenanceAdapter implements MaintenanceAdapter {
+  private static readonly pendingInitializations = new Set<SqliteMaintenanceAdapter>();
   readonly dialect = "sqlite" as const;
   private readonly source: SqliteDatabaseDescriptor;
-  private readonly sourceFd: number;
-  private readonly sourceDirectories: ReturnType<typeof directoryChain>;
+  private sourceFd: number | undefined;
+  private sourceFdIdentity: string | undefined;
+  private sourceDirectories: ReturnType<typeof directoryChain> = [];
   private readonly ownFds = new Map<string, string>();
   private readonly auditFactories = new WeakMap<object, BootstrapAuditFactory>();
   private readonly darwinConnections = new Set<Database.Database>();
@@ -84,16 +86,39 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   private closing = false;
   private sourceFdClosed = false;
   private sourceFdCloseUnknown = false;
-  constructor(source: SqliteDatabaseDescriptor) {
+  private constructor(source: SqliteDatabaseDescriptor) {
     if (!source.identity) throw new MaintenanceFailure("source_missing");
-    this.source = source;
+    this.source = { ...source, identity: { ...source.identity } };
+  }
+  static async create(source: SqliteDatabaseDescriptor): Promise<MaintenanceAdapter> {
+    const adapter = new SqliteMaintenanceAdapter(source);
+    for (const pending of this.pendingInitializations) {
+      if (path.resolve(pending.source.sqlitePath) !== path.resolve(adapter.source.sqlitePath)
+        && (pending.source.identity!.device !== adapter.source.identity!.device || pending.source.identity!.inode !== adapter.source.identity!.inode)) continue;
+      // Re-enter only through the retained owner. A previous unknown numeric close is not retried.
+      await pending.close();
+      if (!pending.closed) throw new MaintenanceFailure("maintenance_lost", "initialization-close-unknown");
+      this.pendingInitializations.delete(pending);
+    }
+    try { adapter.initializeSource(); await adapter.observe(); return adapter; }
+    catch (error) {
+      const errors = [error];
+      this.pendingInitializations.add(adapter);
+      try { await adapter.close(); } catch (closeError) { appendResourceFailure(errors, closeError); }
+      if (adapter.closed) this.pendingInitializations.delete(adapter);
+      throwResourceFailures(errors); throw error;
+    }
+  }
+  private initializeSource(): void {
+    const source = this.source;
     try {
       assertSqliteSourceUnchanged(source);
       this.sourceDirectories = directoryChain(source.sqlitePath);
       this.sourceFd = openSync(source.sqlitePath, constants.O_RDONLY | constants.O_NOFOLLOW);
       const info = fstatSync(this.sourceFd, { bigint: true });
-      if (String(info.dev) !== source.identity.device || String(info.ino) !== source.identity.inode || info.nlink !== 1n) {
-        closeSync(this.sourceFd); throw new MaintenanceFailure("source_changed");
+      this.sourceFdIdentity = `${info.dev}:${info.ino}`;
+      if (String(info.dev) !== source.identity!.device || String(info.ino) !== source.identity!.inode || info.nlink !== 1n) {
+        throw new MaintenanceFailure("source_changed");
       }
       this.ownFds.set(`fd:${this.sourceFd}`, `${info.dev}:${info.ino}`);
     } catch { throw new MaintenanceFailure("source_changed"); }
@@ -102,7 +127,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     if (this.closed || this.closing) throw new MaintenanceFailure("maintenance_lost");
     try {
       assertSqliteSourceUnchanged(this.source);
-      const info = fstatSync(this.sourceFd, { bigint: true });
+      const info = fstatSync(this.sourceFd!, { bigint: true });
       if (info.nlink !== 1n || String(info.dev) !== this.source.identity!.device || String(info.ino) !== this.source.identity!.inode
         || !same(directoryChain(this.source.sqlitePath), this.sourceDirectories)) throw new Error("changed");
       for (const suffix of ["-wal", "-shm"]) {
@@ -110,7 +135,10 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       }
       if (process.platform === "darwin") {
-        for (const database of this.darwinConnections) assertDarwinSqliteSource(database);
+        for (const database of this.darwinConnections) {
+          if (!database.open) { this.darwinConnections.delete(database); this.sourceConnections.delete(database); continue; }
+          assertDarwinSqliteSource(database);
+        }
         const current = new Set([`${info.dev}:${info.ino}`]);
         for (const suffix of ["-wal", "-shm"]) {
           try { const identity = fileIdentity(this.source.sqlitePath + suffix); current.add(`${identity.device}:${identity.inode}`); }
@@ -218,18 +246,20 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   }
   private closeSourceDescriptor(): void {
     if (this.sourceFdClosed) return;
+    const fd = this.sourceFd;
+    if (fd === undefined) { this.sourceFdClosed = true; return; }
     const observedClosed = () => {
       try {
-        const info = fstatSync(this.sourceFd, { bigint: true });
-        return String(info.dev) !== this.source.identity!.device || String(info.ino) !== this.source.identity!.inode;
+        const info = fstatSync(fd, { bigint: true });
+        return this.sourceFdIdentity !== undefined && `${info.dev}:${info.ino}` !== this.sourceFdIdentity;
       } catch (error) { if ((error as NodeJS.ErrnoException)?.code === "EBADF") return true; throw error; }
     };
-    if (observedClosed()) { this.sourceFdClosed = true; return; }
+    if ((this.sourceFdCloseUnknown || this.sourceFdIdentity !== undefined) && observedClosed()) { this.sourceFdClosed = true; return; }
     // A close error can follow the real close and fd reuse, including a new open of the same inode.
     // Preserve uncertainty instead of treating file identity as ownership of the original description.
     if (this.sourceFdCloseUnknown) throw new MaintenanceFailure("maintenance_lost", "source-close-unknown");
     this.sourceFdCloseUnknown = true;
-    try { closeSync(this.sourceFd); this.sourceFdClosed = true; }
+    try { closeSync(fd); this.sourceFdClosed = true; }
     catch (error) {
       try { if (observedClosed()) this.sourceFdClosed = true; } catch { /* Still unknown; retain the original close error. */ }
       throw error;
@@ -642,11 +672,5 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
 }
 
 export async function createSqliteMaintenanceAdapter(source: SqliteDatabaseDescriptor): Promise<MaintenanceAdapter> {
-  const adapter = new SqliteMaintenanceAdapter(source);
-  try { await adapter.observe(); return adapter; }
-  catch (error) {
-    const errors = [error];
-    try { await adapter.close(); } catch (closeError) { appendResourceFailure(errors, closeError); }
-    throwResourceFailures(errors); throw error;
-  }
+  return SqliteMaintenanceAdapter.create(source);
 }
