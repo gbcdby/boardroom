@@ -147,7 +147,7 @@ export async function withSqliteSourceCloseDiagnostics<T>(
       }
     } });
     setupComplete = true;
-  } catch { restore(); process.stderr.write("SQLite source-close diagnostics unavailable; original operation is unchanged.\n"); }
+  } catch { restore(); }
   try { result = await operation(); }
   catch (error) { threw = true; originalError = error; }
   finally { if (setupComplete) restore(); }
@@ -177,9 +177,9 @@ export async function withSqliteSourceCloseDiagnostics<T>(
         candidate: /^[0-9a-f]{40}$/.test(process.env.GITHUB_SHA ?? "") ? process.env.GITHUB_SHA : null,
         sourceSha256, failures: rows };
       await writeFile(path.join(directory, "report.json"), JSON.stringify(report, null, 2) + "\n", { mode: 0o600, flag: "wx" });
-      process.stderr.write(`SQLite source-close diagnostics: ${directory}\n`);
-    } catch { process.stderr.write("SQLite source-close diagnostic capture failed; original result is unchanged.\n"); }
+    } catch { /* Artifact capture is best-effort; preserve the original operation's outcome. */ }
   }
+  // Do not report through stderr: its own synchronous or asynchronous failure can affect the original operation.
   if (threw) throw originalError;
   return result as T;
 }

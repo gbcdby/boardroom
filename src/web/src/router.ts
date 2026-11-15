@@ -13,6 +13,7 @@ import TasksView from "./views/TasksView.vue";
 import TaskDetailView from "./views/TaskDetailView.vue";
 import MemoryView from "./views/MemoryView.vue";
 import SettingsView from "./views/SettingsView.vue";
+import McpCatalogView from "./views/McpCatalogView.vue";
 import { useCurrentProject } from "./composables/useCurrentProject.ts";
 import { createTaskListScrollBehavior } from "./composables/useTaskListViewState.ts";
 
@@ -44,6 +45,7 @@ export const router = createRouter({
     { path: "/audit", name: "audit", component: AuditView, meta: { projectSection: "audit" } },
     { path: "/runtimes", name: "runtimes", redirect: to => ({ path: "/collaboration/connections", query: to.query, hash: to.hash }) },
     { path: "/collaboration/connections", name: "connections", component: RuntimesView, meta: { title: "连接与实例" } },
+    { path: "/collaboration/mcp", name: "mcp-catalog", component: McpCatalogView, meta: { title: "MCP 目录" } },
     { path: "/chat", name: "chat", component: ChatView, meta: { projectSection: "chat" } },
     { path: "/status", name: "status", component: StatusBoardView, meta: { projectSection: "status" } },
     { path: "/tasks", name: "tasks", component: TasksView, meta: { projectSection: "tasks" } },

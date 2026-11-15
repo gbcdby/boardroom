@@ -22,6 +22,7 @@ import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { verifyJournalChain } from "../src/server/storage/maintenance/journal.ts";
 import { buildSourceClientsRoster, sourceClientsDigest } from "../src/server/storage/maintenance/source-clients.ts";
 import { registerStorageSourceClient, storageReceiptDigest, type StorageClientLifecycle } from "../src/server/storage/source-client.ts";
+import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
 import type { JournalRecordV2, OperationMutex, SourceClientFactsWindow, SourceFilesManifest } from "../src/server/storage/maintenance/types.ts";
 import { withSqliteSourceCloseDiagnostics } from "./fixtures/maintenance-source-close-diagnostic.ts";
 
@@ -439,16 +440,20 @@ test("A11A uses only the actually anchored first capture for old receipt generat
         activeMigrationId: f.plan.migrationId, planDigest: f.reference.planDigest, controlRootIdentity: f.store.identity as never,
         mutexIdentity: f.mutex.identity, journal: takeover, journalSequence: 3 });
     });
-    await f.adapter.withSourceLock("snapshot", lock => lock.withSourceClientFacts(f.reference, async window => {
-      assert.equal(window.observation.state.ownerGeneration, 2);
-      assert.equal(window.origin.kind, "captured-generation");
-      assert.equal(window.origin.receiptGeneration, 1);
-      assert.deepEqual(window.origin.capture, capture.head);
-      assert.deepEqual(window.origin.head, takeover);
-      assert.deepEqual(window.origin.chain.nodes.map(node => node.reference), [f.head, capture.head, takeover]);
-      assert.equal(window.clients[0]!.receipt!.ownerGeneration, 1);
-      await window.assertCurrent();
-    }));
+    await withSqliteSourceInventoryDiagnostics(f.adapter, phase => f.adapter.withSourceLock("snapshot",
+      lock => lock.withSourceClientFacts(f.reference, async window => {
+        phase("consume");
+        assert.equal(window.observation.state.ownerGeneration, 2);
+        assert.equal(window.origin.kind, "captured-generation");
+        assert.equal(window.origin.receiptGeneration, 1);
+        assert.deepEqual(window.origin.capture, capture.head);
+        assert.deepEqual(window.origin.head, takeover);
+        assert.deepEqual(window.origin.chain.nodes.map(node => node.reference), [f.head, capture.head, takeover]);
+        assert.equal(window.clients[0]!.receipt!.ownerGeneration, 1);
+        phase("consume-explicit-assert-current");
+        await window.assertCurrent();
+        phase("consume-return");
+      })));
     const db = new Database(f.file, { fileMustExist: true, timeout: 0 });
     try { db.prepare("UPDATE storage_source_clients SET last_observed_at=?").run("2026-11-15T12:00:00.000Z"); } finally { db.close(); }
     await assert.rejects(f.adapter.withSourceLock("snapshot", lock => lock.withSourceClientFacts(f.reference,
