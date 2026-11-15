@@ -25,6 +25,7 @@ import { registerStorageSourceClient, storageReceiptDigest, type StorageClientLi
 import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
 import type { JournalRecordV2, OperationMutex, SourceClientFactsWindow, SourceFilesManifest } from "../src/server/storage/maintenance/types.ts";
 import { withSqliteSourceCloseDiagnostics } from "./fixtures/maintenance-source-close-diagnostic.ts";
+import { historicalControllerProcess, historicalControllerRow } from "./fixtures/maintenance-controller-history.ts";
 
 async function fixture(withClient = false, encoding: "UTF-8" | "UTF-16le" | "UTF-16be" = "UTF-8", nativeChild = false,
   setup?: (driver: SqliteDriver, directory: string) => Promise<Partial<StorageClientLifecycle>>, initialGeneration = 1) {
@@ -155,6 +156,31 @@ async function anchorStructuralCapture(f: Awaited<ReturnType<typeof fixture>>) {
     return { head, record };
   });
 }
+
+test("A12-B historical controller stays excluded after an anchored structural capture", async () => {
+  const actor = await historicalControllerProcess();
+  const f = await fixture(false, "UTF-8", false, undefined, 2);
+  try {
+    const row = historicalControllerRow(f.plan.source, actor), db = new Database(f.file);
+    try {
+      const names = Object.keys(row);
+      db.prepare(`INSERT INTO storage_source_clients (${names.join(",")}) VALUES (${names.map(() => "?").join(",")})`).run(...Object.values(row));
+    } finally { db.close(); }
+    await actor.exit();
+    const captured = await anchorStructuralCapture(f); // Structural fixture only; no Fs qualification or trusted capture producer.
+    await f.adapter.withSourceLock("control", async lock => {
+      const raw = await lock.observeSourceClients();
+      assert.equal(raw.rows.length, 1);
+      assert.deepEqual(raw.rows, captured.record.sourceClients!.rows, "the original captured equality gate must pass first");
+      assert.deepEqual(raw.textEncoding, captured.record.sourceClients!.textEncoding);
+    });
+    await assert.rejects(f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference)), { code: "source_writer_unknown" });
+    const changed = new Database(f.file);
+    try { changed.prepare("UPDATE storage_source_clients SET last_observed_at='changed after capture' WHERE client_id=?").run(row.client_id); }
+    finally { changed.close(); }
+    await assert.rejects(f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference)), { code: "source_changed" });
+  } finally { await actor.close(); await f.close(); }
+});
 
 test("A11A SQLite facts use the actual planned anchor and expire when their callback exits", async () => {
   const f = await fixture(); let escaped: SourceClientFactsWindow | undefined;

@@ -128,17 +128,17 @@ export function processDisposition(process: RegisteredProcess, check: ProcessChe
     requireCandidate(check.pid === process.pid && check.kernelBootId === process.kernelBootId && check.pidNamespace === process.pidNamespace);
     if (check.kind === "linux-matched") {
       requireCandidate(check.uidBefore === check.observerUid && check.uidAfter === check.observerUid
-        && check.startTicksBefore === process.startTicks && check.startTicksAfter === process.startTicks);
+        && BigInt(check.startTicksBefore) === BigInt(process.startTicks) && BigInt(check.startTicksAfter) === BigInt(process.startTicks));
       return "matched";
     }
-    if (check.kind === "linux-replaced") requireCandidate(check.observedUid === check.observerUid && check.observedStartTicks !== process.startTicks);
+    if (check.kind === "linux-replaced") requireCandidate(check.observedUid === check.observerUid && BigInt(check.observedStartTicks) !== BigInt(process.startTicks));
     return "exited";
   }
   requireCandidate(check.kind === "darwin-present" || check.kind === "darwin-absent");
   requireCandidate(check.result.pid === process.pid && check.result.bootSessionUuid === process.bootSessionUuid);
   if (check.kind === "darwin-absent") return "exited";
   requireCandidate(check.result.uid === process.uid);
-  return check.result.startSeconds === process.startSeconds && check.result.startMicroseconds === process.startMicroseconds ? "matched" : "exited";
+  return BigInt(check.result.startSeconds) === BigInt(process.startSeconds) && BigInt(check.result.startMicroseconds) === BigInt(process.startMicroseconds) ? "matched" : "exited";
 }
 
 function sameNativeIncarnation(left: RegisteredProcess, right: RegisteredProcess): boolean {

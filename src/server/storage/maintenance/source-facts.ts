@@ -6,9 +6,10 @@ import type { OwnedProcessIdentity } from "../../runtime/hosts/types.ts";
 import { verifyStorageDrainReceipt, type StorageDrainReceipt } from "../source-client.ts";
 import { canonicalJson, digestJson } from "./canonical.ts";
 import type { EventFacts, ProcessCheck } from "./control-candidate/schema.ts";
+import { validateHistoricalControllerProfile } from "./control-candidate/rows.ts";
 import { darwinProcessObservation } from "./darwin.ts";
 import { MaintenanceFailure } from "./error.ts";
-import type { SourceClientFact, SourceClientProcessFact, SourceClientsObservation, SourceRuntimeFact } from "./types.ts";
+import type { JournalRecord, SourceClientFact, SourceClientProcessFact, SourceClientsObservation, SourceRuntimeFact } from "./types.ts";
 
 export function unknownWriter(): never { throw new MaintenanceFailure("source_writer_unknown"); }
 export function factsObject(value: unknown): Record<string, unknown> {
@@ -74,7 +75,7 @@ export async function inspectRegisteredSourceProcess(host: Record<string, unknow
     // A registration containing only hostname cannot prove an older boot belonged to this host.
     if (actual.bootSessionUuid !== identity.bootSessionUuid) return unknownWriter();
     if (actual.status === "absent") return { fact: { status: "exited", reason: "process_absent" }, check: { kind: "darwin-absent", result: actual } };
-    return { fact: actual.startSeconds === identity.startSeconds && actual.startMicroseconds === identity.startMicroseconds
+    return { fact: BigInt(actual.startSeconds) === BigInt(identity.startSeconds) && BigInt(actual.startMicroseconds) === BigInt(identity.startMicroseconds)
       ? { status: "present", reason: "identity_matches" } : { status: "exited", reason: "identity_replaced" },
       check: { kind: "darwin-present", result: actual } };
   }
@@ -108,7 +109,7 @@ export async function inspectRegisteredSourceProcess(host: Record<string, unknow
       if (["ENOENT", "ESRCH"].includes(String((error as NodeJS.ErrnoException).code))) return absent("proc-stat", (error as NodeJS.ErrnoException).code as "ENOENT" | "ESRCH");
       throw error;
     }
-    if (before !== identity.startTicks) return { fact: { status: "exited", reason: "identity_replaced" },
+    if (BigInt(before) !== BigInt(identity.startTicks)) return { fact: { status: "exited", reason: "identity_replaced" },
       check: { kind: "linux-replaced", observerUid, kernelBootId, pidNamespace, pid, observedUid: uidBefore, observedStartTicks: before } };
     if (await readlink(`${directory}/ns/pid`) !== identity.pidNamespace) return unknownWriter();
     const after = procIdentity(await readFile(`${directory}/stat`, "utf8"), pid);
@@ -158,10 +159,27 @@ function envelopeFor(row: Record<string, unknown>, sourceKind: SourceClientsObse
 
 export async function sourceClientFacts(observation: SourceClientsObservation, rows: readonly Record<string, unknown>[],
   receiptGeneration: number, validateSource: (value: unknown, observation: SourceClientsObservation) => void,
-  audit?: EventFacts["clients"]): Promise<SourceClientFact[]> {
+  audit?: EventFacts["clients"], historicalControllerHead?: JournalRecord): Promise<SourceClientFact[]> {
   const result: SourceClientFact[] = [];
   if (rows.length !== observation.rows.length) throw new MaintenanceFailure("source_changed");
   for (const [index, row] of rows.entries()) {
+    if (row.entrypoint === "maintenance-controller" || row.build_id === "boardroom-maintenance-control-v1") {
+      // Only the actual private audit path supplies its already verified no-capture planned head.
+      if (!audit || !historicalControllerHead || historicalControllerHead.phase !== "planned" || observation.state.admission !== "draining"
+        || historicalControllerHead.fenceEpoch !== observation.state.fenceEpoch
+        || canonicalJson(historicalControllerHead.source) !== canonicalJson(observation.source)) return unknownWriter();
+      const raw = observation.rows[index]!, host = json(row.host_identity_json), identity = json(row.process_identity_json);
+      try { validateHistoricalControllerProfile(raw, row, observation.source, observation.state.fenceEpoch, { host, process: identity }); }
+      catch { return unknownWriter(); }
+      const inspected = await inspectRegisteredSourceProcess(host, identity);
+      if (inspected.fact.status !== "exited") return unknownWriter();
+      result.push({ clientId: String(row.client_id), classification: "historical-controller", receipt: null, process: inspected.fact });
+      audit.push({ kind: "maintenance-controller", classification: "exited-actor", registration: "R0-historical",
+        subject: [...raw.client_id], rowDigest: digestJson({ formatVersion: 1, kind: "source-client-row", source: observation.source,
+          textEncoding: observation.textEncoding, row: raw }),
+        host: host as EventFacts["actor"]["host"], process: identity as EventFacts["actor"]["process"], processCheck: inspected.check });
+      continue;
+    }
     const envelope = envelopeFor(row, observation.source.kind);
     if (row.database_instance_id !== observation.source.databaseInstanceId) throw new MaintenanceFailure("source_changed");
     if (counter(row.registered_epoch) >= observation.state.fenceEpoch) return unknownWriter();
