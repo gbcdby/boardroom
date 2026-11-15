@@ -32,6 +32,22 @@ export async function verifyRestoreBundle(store: ArtifactStore, adapter: Mainten
   requireValue(same(initial.source, closure.bundle.capture.source) && same(initial.sourceIdentity, closure.chain.plan.sourceIdentity)
     && adapter.dialect === initial.source.kind, "source_changed");
   requireValue(initial.state.controlRootJson === canonicalJson(store.identity) && initial.state.mutexIdentityJson !== null, "control_root_mismatch");
+  // V consumes D's actual snapshot lock/window, not an arbitrary sealed snapshot
+  // from an older control generation. The complete B/U closure proves its own
+  // historical capture but does not by itself authorize this live source.
+  const capture = closure.bundle.capture, captured = closure.chain.nodes.at(-1)!;
+  requireValue(captured.record.event === "capture" && captured.record.frozen !== null, "journal_invalid");
+  requireValue(initial.state.databaseInstanceId === capture.source.databaseInstanceId
+    && initial.state.activeMigrationId === capture.migrationId && initial.state.planDigest === capture.planDigest
+    && initial.state.fenceEpoch === capture.fenceEpoch && initial.state.ownerGeneration === capture.ownerGeneration
+    && initial.state.journalRecordRef === capture.journal.ref
+    && initial.state.journalDigest === capture.journal.sha256
+    && initial.state.journalSequence === capture.journalSequence, "maintenance_lost");
+  // Includes the sealed control row, all clients, full typed data and schema.
+  // Comparing only frozen digests would miss a later legitimate journal head
+  // or drift in a field not included in those digests.
+  requireValue(initial.state.guardManifestDigest === captured.record.frozen.guardManifestDigest
+    && same(initial.manifests, closure.manifests), "source_changed");
   const assertCurrent = async () => {
     await lock.assertHeld();
     const current = await lock.observe();
