@@ -11,7 +11,7 @@ import type { SourceLock } from "../src/server/storage/maintenance/types.ts";
 import { BootstrapAuditFactory } from "../src/server/storage/maintenance/native-audit.ts";
 import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
 
-test("A12-B retains actual ordinary-client audit and private bootstrap identity without control writes", async () => {
+test("A12-B retains actual ordinary-client audit and private bootstrap identity without control writes", async t => {
   const f = await sqliteAuditFixture();
   try {
     await f.adapter.withSourceLock("control", async lock => {
@@ -46,7 +46,18 @@ test("A12-B retains actual ordinary-client audit and private bootstrap identity 
         if (facts.actor.process.platform !== "linux") assert.fail("native process platform");
         assert.equal(facts.actor.process.kernelBootId, (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim());
         assert.equal(facts.actor.process.pidNamespace, await readlink("/proc/self/ns/pid"));
-      } else assert(facts.sessions.inventory.items.some(item => item.pid === process.pid && item.device === String(actualFile.dev) && item.inode === String(actualFile.ino)));
+      } else {
+        assert(facts.sessions.inventory.items.some(item => item.pid === process.pid && item.device === String(actualFile.dev) && item.inode === String(actualFile.ino)));
+        const mappings = facts.sessions.inventory.items.filter(item => item.key.startsWith("map:"));
+        assert(mappings.length > 0, "the real Darwin WAL source must provide a nonempty mapping audit");
+        for (const item of mappings) {
+          const [, begin, size] = item.key.split(":");
+          assert(BigInt(size!) > 0n && BigInt(begin!) + BigInt(size!) <= (1n << 64n) - 1n);
+          assert.equal(item.fd, -1);
+          assert(facts.sessions.ownedResources.some(owned => owned.key === item.key && owned.device === item.device && owned.inode === item.inode));
+        }
+        t.diagnostic(JSON.stringify({ darwinAuditMappings: mappings.map(({ key, fd, device, inode }) => ({ key, fd, device, inode })) }));
+      }
       assert.equal("authorized" in packet, false);
       assert.equal("register" in packet, false);
       assert(Object.isFrozen(packet.facts.clients));
