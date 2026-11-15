@@ -158,7 +158,7 @@ class NativeBlockControls(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory(prefix="brdf3-codec-")
         cls.root = Path(cls.temporary.name)
         header = cls.root/"fixed.h"
-        header.write_text("#define F2_FIXED_INPUTS 1\nstatic const unsigned char F2_EXPECTED_NOTES[]={0};\nstatic const unsigned char F2_EXPECTED_CONFIG[]={0};\n")
+        header.write_text("#define F2_FIXED_INPUTS 1\nstatic const unsigned char F2_EXPECTED_NOTES[]={0};\nstatic const unsigned char F2_EXPECTED_CONFIG[]={0};\n#define F3_FIXED_INPUTS 1\n" + "static const unsigned char F3_EXPECTED_PAYLOAD[]={" + ",".join(str(n) for n in f3.PAYLOAD) + "};\n")
         wrapper = cls.root/"block-control.c"
         wrapper.write_text('#define F3_PURE_TEST 1\n#include "'+str(ROOT/"scripts/qualification/whole-brd/f3-guest.c")+'"\n'
             'int main(int argc,char **argv){if(argc!=2)return 64;strcpy(run_id,"'+RUN+'");'
