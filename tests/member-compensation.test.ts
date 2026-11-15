@@ -14,6 +14,76 @@ import { createAuditCompensationService } from "../src/server/audit-compensation
 import type { Task } from "../src/shared/tasks.ts";
 import type { MemorySummaryRequest } from "../src/shared/memory.ts";
 
+/** 仅观察这次失败已有的 cause；诊断失败也必须原样重抛。 */
+function diagnoseInitialAdd(error: unknown, emit: (line: string) => void): never {
+  try {
+    const data = (value: object, key: string): unknown => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return descriptor && "value" in descriptor ? descriptor.value : undefined;
+    };
+    let cursor: unknown = error, sqlstate = "unknown", reason = "unknown";
+    const seen = new Set<object>();
+    for (let depth = 0; depth < 3; depth++) {
+      if (cursor === null || (typeof cursor !== "object" && typeof cursor !== "function") || seen.has(cursor)) break;
+      seen.add(cursor);
+      const code = data(cursor, "code");
+      if (code === "55P03" || code === "57014") {
+        sqlstate = code;
+        const message = data(cursor, "message");
+        if (code === "55P03" && message === "canceling statement due to lock timeout") reason = "lock_timeout";
+        if (code === "57014" && message === "canceling statement due to statement timeout") reason = "statement_timeout";
+        if (code === "57014" && message === "canceling statement due to user request") reason = "cancel_other";
+        break;
+      }
+      if (depth < 2) cursor = data(cursor, "cause");
+    }
+    const line = JSON.stringify({ kind: "member-add-failure/v1", phase: "initial-add-member", sqlstate, reason });
+    if (Buffer.byteLength(line) <= 2048) emit(line);
+  } catch { /* 观察不能取代测试原异常。 */ }
+  throw error;
+}
+
+function captureInitialAddFailure(error: unknown, emit?: (line: string) => void) {
+  const lines: string[] = []; let threw = false, observed: unknown;
+  try { diagnoseInitialAdd(error, line => { lines.push(line); emit?.(line); }); }
+  catch (value) { threw = true; observed = value; }
+  assert.equal(threw, true); assert.equal(observed, error);
+  return lines;
+}
+test("成员初次添加诊断：同次 cause 分类有界且不输出敏感原件", () => {
+  for (const [code, message, reason] of [
+    ["55P03", "canceling statement due to lock timeout", "lock_timeout"],
+    ["57014", "canceling statement due to statement timeout", "statement_timeout"],
+    ["57014", "canceling statement due to user request", "cancel_other"],
+    ["57014", "CANARY-SECRET".repeat(200000), "unknown"],
+  ] as const) {
+    const error = Object.freeze(new Error("CANARY-SECRET", { cause: { cause: { code, message, detail: "CANARY-SECRET" } } }));
+    const lines = captureInitialAddFailure(error);
+    assert.equal(lines.length, 1); assert.ok(Buffer.byteLength(lines[0]!) <= 2048);
+    assert.doesNotMatch(lines[0]!, /CANARY|message|stack|detail/);
+    assert.deepEqual(JSON.parse(lines[0]!), { kind: "member-add-failure/v1", phase: "initial-add-member", sqlstate: code, reason });
+  }
+});
+test("成员初次添加诊断：只读三层自有数据属性，不调用 getter 或继承值", () => {
+  let reads = 0;
+  const getters = Object.defineProperties({}, Object.fromEntries(["code", "message", "cause"].map(key => [key, { get() { reads++; throw new Error("CANARY-GETTER"); } }])));
+  const leaf = { code: "55P03", message: "canceling statement due to lock timeout" };
+  const cycle: { cause?: unknown } = {}; cycle.cause = cycle;
+  for (const error of [getters, Object.create(leaf), { cause: { cause: { cause: leaf } } }, cycle]) {
+    const result = JSON.parse(captureInitialAddFailure(error)[0]!);
+    assert.equal(result.sqlstate, "unknown"); assert.equal(result.reason, "unknown");
+  }
+  assert.equal(reads, 0);
+  const hostile = new Proxy({}, { getOwnPropertyDescriptor() { throw new Error("CANARY-PROXY"); } });
+  assert.deepEqual(captureInitialAddFailure(hostile), []);
+});
+test("成员初次添加诊断：诊断自身失败仍抛原对象及 falsy 原值", () => {
+  for (const error of [undefined, null, false, 0, "", Symbol("original"), Object.freeze(new Error("CANARY-ORIGINAL"))]) {
+    const lines = captureInitialAddFailure(error, () => { throw new Error("CANARY-EMITTER"); });
+    assert.equal(lines.length, 1); assert.doesNotMatch(lines[0]!, /CANARY|original/);
+  }
+});
+
 const pgUrl = process.env["AGENT_STUDIO_PG_TEST_URL"] ?? process.env["AGENT_STUDIO_PG_CONNECTION_STRING"];
 const access = { actor: ownerActor() }, at = "2026-11-11T12:00:00.000Z";
 async function withDb(engine: "sqlite" | "postgres", body: (repos: RepositorySet, db: DbDriver) => Promise<void>) {
@@ -118,10 +188,12 @@ for (const engine of ["sqlite", "postgres"] as const) {
     assert.equal(await repos.members.get(m.id), null);
     assert.equal((await repos.tasks.getSettings(p.id)).defaultReviewerMemberId, null);
   }));
-  test(`${engine} 空成员 add 五次翻转与显式 readd 使用同身份新代际，旧潜在关系不默认复活`, { skip }, async () => withDb(engine, async (repos) => {
+  test(`${engine} 空成员 add 五次翻转与显式 readd 使用同身份新代际，旧潜在关系不默认复活`, { skip }, async (t) => withDb(engine, async (repos) => {
     const p = await repos.projects.create({ name: "新增周期" }), a = await repos.agents.create({ displayName: "周期Agent", hostType: "fixture" });
     const service = createOrgMutationService({ repos }), compensation = createAuditCompensationService({ repos });
-    const added = await service.addMember(access, { projectId: p.id, agentId: a.id, kind: 'agent', displayName: '周期Agent' });
+    let added: Awaited<ReturnType<typeof service.addMember>>;
+    try { added = await service.addMember(access, { projectId: p.id, agentId: a.id, kind: 'agent', displayName: '周期Agent' }); }
+    catch (error) { diagnoseInitialAdd(error, line => t.diagnostic(line)); }
     let current = (await repos.audit.get(p.id, added.auditId))!;
     for (let i = 0; i < 5; i++) {
       current = await compensation.revoke(access, p.id, current.id);
