@@ -189,6 +189,8 @@ for (const kind of ["sqlite", "postgres"] as const) {
       const query = Client.prototype.query, end = Client.prototype.end;
       const failure = point === "close-undefined" ? undefined : new MaintenanceFailure("maintenance_lost", point);
       let sqliteWriter: Database.Database | undefined, pgWriter: Client | undefined, anchors = 0, injected = 0, rejected = false, rejection: unknown;
+      const repeatedPgClose = kind === "postgres" && ["source-close", "close-undefined"].includes(point);
+      let sourceEndCalls = 0, sourceEndReturned = 0, resumedOwnerCloses = 0, repeatedAnchors = 0;
       try {
         if (kind === "sqlite") {
           child.mock.method(Database.prototype, "prepare", function (this: Database.Database, sql: string) {
@@ -223,13 +225,46 @@ for (const kind of ["sqlite", "postgres"] as const) {
             return result;
           } as typeof query);
           child.mock.method(Client.prototype, "end", async function (this: Client) {
+            if (this === pgWriter) sourceEndCalls++;
             await Reflect.apply(end, this, []);
+            if (this === pgWriter) sourceEndReturned++;
             if (this === pgWriter && ["source-close", "close-undefined"].includes(point)) { injected++; throw failure; }
           } as typeof end);
         }
         try { await enterMaintenance(f.options, f.request); } catch (error) { rejected = true; rejection = error; }
-        assert.equal(rejected, true); assert.equal(rejection, failure); assert.equal(anchors, 1); assert(injected >= 1);
+        assert.equal(rejected, true); assert.equal(anchors, 1); assert(injected >= 1);
+        if (repeatedPgClose) {
+          // The persistent injection rejects both source-lock close and the necessary
+          // whole-adapter close. Their distinct failures must retain the original first value.
+          assert(rejection instanceof AggregateError); assert.equal(Object.hasOwn(rejection, "cause"), true);
+          assert.equal(rejection.cause, failure); assert.equal(rejection.errors.length, 2);
+          assert.equal(Object.hasOwn(rejection.errors, 0), true); assert.equal(rejection.errors[0], failure);
+          const cleanup = rejection.errors[1]; assert(cleanup instanceof MaintenanceFailure);
+          assert.equal(cleanup.code, "maintenance_lost");
+          if (point === "source-close") {
+            assert.equal(cleanup, failure);
+            assert.equal(cleanup.message, "storage_maintenance: maintenance_lost (source-close)");
+          } else assert.equal(cleanup.message, "storage_maintenance: maintenance_lost (session-close)");
+          assert.equal(Object.hasOwn(cleanup, "cause"), false);
+          assert.equal(sourceEndCalls, 2); assert.equal(sourceEndReturned, 2); assert.equal(injected, 2);
+        } else assert.equal(rejection, failure);
         child.mock.restoreAll();
+        if (repeatedPgClose) {
+          // Remove the fault, then observe the retained original owner completing its
+          // explicit cleanup before a new controller reads the already committed head.
+          child.mock.method(Client.prototype, "end", async function (this: Client) {
+            await Reflect.apply(end, this, []); if (this === pgWriter) resumedOwnerCloses++;
+          } as typeof end);
+          child.mock.method(Client.prototype, "query", async function (this: Client, ...args: unknown[]) {
+            const sql = typeof args[0] === "string" ? args[0] : (args[0] as { text?: string } | null)?.text ?? "";
+            const database = (this as unknown as { connectionParameters: { database: string } }).connectionParameters.database;
+            if (database === f.database && sql.startsWith("UPDATE storage_maintenance SET admission=")) repeatedAnchors++;
+            return await Reflect.apply(query, this, args);
+          } as typeof query);
+          const pid = (pgWriter as unknown as { processID: number }).processID;
+          assert(Number.isSafeInteger(pid) && pid > 0);
+          assert.equal((await f.query(`SELECT count(*)::text AS count FROM pg_stat_activity WHERE pid=${pid}`))[0]!.count, "0");
+        }
         const committed = ["commit-after", "source-close", "close-undefined"].includes(point);
         const actual = await f.observe();
         assert.equal(actual.state.admission, committed ? "draining" : "open");
@@ -240,6 +275,7 @@ for (const kind of ["sqlite", "postgres"] as const) {
         assert.equal(recovered.state.ownerGeneration, f.initial.state.ownerGeneration + 1);
         assert.equal(recovered.state.journalSequence, 1);
         if (committed) assert.deepEqual(recovered.state, actual.state, "committed-but-unknown is read, never applied again");
+        if (repeatedPgClose) { assert.equal(resumedOwnerCloses, 1); assert.equal(repeatedAnchors, 0); }
       } finally { child.mock.restoreAll(); await f.close(); }
     });
   });
