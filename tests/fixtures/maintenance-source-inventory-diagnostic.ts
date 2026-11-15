@@ -88,7 +88,7 @@ function stageHint(proc: Proc): string {
 
 /** Test-only passive observer. Original native calls, promises, return values and exceptions are forwarded once. */
 export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
-  operation: (phase: (value: string) => void) => Promise<T>, outputRoot = defaultOutput): Promise<T> {
+  operation: (phase: (value: string) => void) => Promise<T>, outputRoot = defaultOutput, ownedPid?: number): Promise<T> {
   if (process.platform !== "linux") return operation(() => {});
   const target = adapter as { inspectCurrentWriters: Call }, prior = Object.getOwnPropertyDescriptor(target, "inspectCurrentWriters");
   const originalInspect = target.inspectCurrentWriters;
@@ -99,6 +99,31 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
   let phase = "before-consume", inspectionCalls = 0, failedInspections = 0, droppedFailures = 0, restorationErrors = 0;
   let setupComplete = false, threw = false, originalError: unknown, result: T | undefined;
   const failures: object[] = [];
+  const observedPid = Number.isSafeInteger(ownedPid) && ownedPid! > 0 ? ownedPid : undefined;
+  const observations: ({ evidenceState: "OBSERVED" | "UNOBSERVED" } & Record<string, unknown>)[] = []; let droppedObservations = 0;
+  const recordObservation = (frame: Frame, value: unknown, originalThrew = false) => {
+    if (observedPid === undefined) return;
+    if (observations.length === limits.inspections) { droppedObservations++; return; }
+    const identity = { inspection: frame.index, phase: frame.phase, pid: observedPid };
+    try {
+      const proc = frame.processes.get(observedPid), reasons: string[] = [];
+      const result = originalThrew ? "THREW" : Array.isArray(value) ? value.length ? "BLOCKERS" : "CLEAR" : "OTHER";
+      const unfinished = [...frame.descriptors.values()].filter(capture => capture.proc === proc)
+        .map(capture => ({ subject: capture.subject, ...finishRead({ ...capture, statBytes: [...capture.statBytes] }, false) }));
+      if (!proc) reasons.push("target-not-observed");
+      if (frame.observationErrors || proc?.observationErrors) reasons.push("observer-error");
+      if (frame.droppedProcesses || proc?.droppedErrors || proc?.droppedSummaries
+        || [...(proc?.stats ?? []), ...unfinished].some(summary => summary.identitySummaryTruncated)) reasons.push("observer-truncated");
+      if (result === "OTHER") reasons.push("unclassified-result");
+      observations.push({ ...identity, result, evidenceState: reasons.length ? "UNOBSERVED" : "OBSERVED", reasons,
+        returnedBlockerCount: Array.isArray(value) ? value.length : null,
+        observationErrors: frame.observationErrors, droppedProcesses: frame.droppedProcesses,
+        frame: proc ? { ...proc, unfinished, stageHint: stageHint(proc) } : null });
+    } catch {
+      observations.push({ ...identity, result: originalThrew ? "THREW" : "OTHER", evidenceState: "UNOBSERVED",
+        reasons: ["observer-error"], frame: null });
+    }
+  };
   const restore = () => {
     for (const name of syncNames) try { mutable[name] = syncOriginal[name]; } catch { restorationErrors++; }
     for (const name of asyncNames) try { asyncMutable[name] = asyncOriginal[name]; } catch { restorationErrors++; }
@@ -108,6 +133,7 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
   };
   const finish = (frame: Frame, value: unknown) => observe(frame, undefined, () => {
     frame.finished = true;
+    recordObservation(frame, value);
     const pids = Array.isArray(value) ? [...new Set(value.flatMap(item => {
       if (item?.code !== "source_writer_unknown" || typeof item.subjectRef !== "string") return [];
       const match = /^unreadable-process:([1-9][0-9]*)$/.exec(item.subjectRef); return match ? [Number(match[1])] : [];
@@ -187,10 +213,10 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
         droppedProcesses: 0, observationErrors: 0, finished: false };
       let value: unknown;
       try { value = context.run(frame, () => Reflect.apply(originalInspect, this, args)); }
-      catch (error) { frame.finished = true; throw error; }
+      catch (error) { frame.finished = true; recordObservation(frame, undefined, true); throw error; }
       observe(frame, undefined, () => {
         if (value && typeof (value as Promise<unknown>).then === "function")
-          (value as Promise<unknown>).then(result => finish(frame, result), () => { frame.finished = true; });
+          (value as Promise<unknown>).then(result => finish(frame, result), () => { frame.finished = true; recordObservation(frame, undefined, true); });
         else finish(frame, value);
       });
       return value;
@@ -200,13 +226,19 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
   try { result = await operation(value => { phase = /^[a-z0-9-]{1,64}$/.test(value) ? value : "other"; }); }
   catch (error) { threw = true; originalError = error; }
   finally { if (setupComplete) restore(); }
-  if (failures.length) try {
+  if (failures.length || observedPid !== undefined) try {
     await mkdir(outputRoot, { recursive: true, mode: 0o700 });
     const directory = await mkdtemp(path.join(outputRoot, "inspection-"));
     await writeFile(path.join(directory, "report.json"), JSON.stringify({ setupComplete, restorationErrors, inspectionCalls,
       originalOperationThrew: threw, droppedFailures, limits, pid: process.pid, uid: process.getuid?.() ?? null,
+      ...(observedPid === undefined ? {} : { ownedPid: observedPid, observations, droppedObservations,
+        requestEvidenceState: setupComplete && observations.length > 0 && !droppedObservations
+          && observations.every(item => item.evidenceState === "OBSERVED") ? "OBSERVED" : "UNOBSERVED",
+        observationScope: "Original selected-PID summaries, including clear results; OBSERVED describes collection, never source-view qualification." }),
       node: process.version, candidate: /^[a-f0-9]{40}$/.test(process.env.GITHUB_SHA ?? "") ? process.env.GITHUB_SHA : null,
-      provenance: "Original calls and returned bytes only. Failed PID summaries only; no proc/source reread, dump, retry or qualification change.",
+      provenance: observedPid === undefined
+        ? "Original calls and returned bytes only. Failed PID summaries only; no proc/source reread, dump, retry or qualification change."
+        : "Original calls and returned bytes only. Failed PID and opt-in owned PID summaries; no proc/source reread, dump, retry or qualification change.",
       stageHintScope: "Derived interval/input hints, not a caught internal parser exception or a root-cause conclusion.", failures }, null, 2) + "\n", { mode: 0o600, flag: "wx" });
   } catch { /* Artifact capture is best-effort; preserve the original operation's outcome. */ }
   // Do not report through stderr: its own synchronous or asynchronous failure can affect the original operation.

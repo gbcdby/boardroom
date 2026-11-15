@@ -731,7 +731,7 @@ test("A11A SQLite uses both real lock modes without DML or new source artifacts"
   } finally { await f.close(); }
 });
 
-test("A11A SQLite rejects and sanitizes a real-handle close completion fault", async t => {
+test("A11A SQLite rejects and sanitizes a real-handle close completion fault", { timeout: 15_000 }, async t => {
   const f = await fixture(true); const original = Database.prototype.close; let attempted = false, consumed = false;
   const output = path.join(f.directory, "close-diagnostic");
   try {
@@ -751,10 +751,71 @@ test("A11A SQLite rejects and sanitizes a real-handle close completion fault", a
     assert.equal(report.failures[0].phase, "native-close");
     assert.equal(report.failures[0].nativeCloseCalls, 1);
     assert.equal(report.failures[0].nativeCloseReturned, false);
+    assert.equal(report.failures[0].beforeNativeState.open, true);
+    assert.equal(report.failures[0].afterNativeState.open, false);
     assert.equal(report.originalOperationThrew, true);
     assert.equal(report.restorationErrors, 0);
     assert(!bytes.includes("private-sqlite-facts-close-canary"));
+    assert.ok(Buffer.byteLength(bytes) <= 256 * 1024);
+    t.diagnostic(JSON.stringify({ control: "native-completed-then-threw", nativeCloseReturned: false,
+      beforeNativeState: report.failures[0].beforeNativeState, afterNativeState: report.failures[0].afterNativeState }));
   } finally { t.mock.restoreAll(); await f.close(); }
+});
+
+test("A11A close diagnostics distinguish an actual native refusal after consume from fixture cleanup", { timeout: 15_000 }, async t => {
+  const f = await fixture(), original = Database.prototype.close;
+  const output = path.join(f.directory, "close-refusal-diagnostic");
+  let selected: Database.Database | undefined, iterator: IterableIterator<unknown> | undefined;
+  let escaped: SourceClientFactsWindow | undefined, consumeReturned = false, selectedCalls = 0;
+  let nativeError: unknown, productOpen: boolean | null = null, fixtureClosed: boolean | null = null;
+  const events: string[] = [], cleanupErrors: string[] = [];
+  try {
+    const before = await f.adapter.observe();
+    t.mock.method(Database.prototype, "close", function(this: Database.Database) {
+      if (consumeReturned && !selected && this.name === f.file && this.readonly && !this.inTransaction) {
+        selected = this; events.push("final-fresh-close");
+        // Only the fixture introduces this live iterator; normal production facts use .all().
+        iterator = this.prepare("SELECT 1 AS value UNION ALL SELECT 2").iterate();
+        assert.equal(iterator.next().done, false);
+        selectedCalls++;
+        try { return Reflect.apply(original, this, []); }
+        catch (error) { nativeError = error; throw error; }
+      }
+      return Reflect.apply(original, this, []);
+    });
+    await assert.rejects(withSqliteSourceCloseDiagnostics("control", f.file, f.adapter,
+      () => f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference, window => {
+        escaped = window; consumeReturned = true; events.push("consume-return"); return Promise.resolve("observed-only");
+      })), output), { code: "maintenance_lost" });
+    const retained = selected as Database.Database | undefined;
+    assert.ok(retained); productOpen = retained.open;
+    assert.equal(selectedCalls, 1); assert.equal(productOpen, true); assert.ok(nativeError instanceof TypeError);
+    assert.deepEqual(events, ["consume-return", "final-fresh-close"]);
+    await assert.rejects(escaped!.assertCurrent(), { code: "maintenance_lost" });
+    const files = await readdir(output); assert.equal(files.length, 1);
+    const bytes = await readFile(path.join(output, files[0]!, "report.json"), "utf8");
+    assert.ok(Buffer.byteLength(bytes) <= 256 * 1024);
+    const report = JSON.parse(bytes), failure = report.failures[0];
+    assert.equal(report.failures.length, 1); assert.equal(failure.phase, "native-close");
+    assert.equal(failure.nativeCloseCalls, 1); assert.equal(failure.nativeCloseReturned, false);
+    assert.deepEqual(failure.beforeNativeState, { open: true, inTransaction: false });
+    assert.deepEqual(failure.afterNativeState, { open: true, inTransaction: false });
+    assert.equal(failure.error.name, "TypeError"); assert.equal(report.restorationErrors, 0);
+    const after = await f.adapter.observe();
+    assert.deepEqual(after.manifests, before.manifests); assert.deepEqual(after.state, before.state);
+    assert.deepEqual(after.clients, before.clients);
+  } finally {
+    t.mock.restoreAll();
+    try { iterator?.return?.(); } catch { cleanupErrors.push("fixture-iterator-return"); }
+    try { if (selected?.open) Reflect.apply(original, selected, []); fixtureClosed = selected ? !selected.open : null; }
+    catch { cleanupErrors.push("fixture-retained-connection-close"); }
+    try { await f.close(); } catch { cleanupErrors.push("fixture-close"); }
+    t.diagnostic(JSON.stringify({ control: "actual-native-refusal-with-test-owned-iterator", events, selectedCalls,
+      consumeReturned, nativeErrorName: nativeError instanceof Error ? nativeError.name : null,
+      productCloseOpen: productOpen, fixtureFinalClosed: fixtureClosed, cleanupErrors,
+      qualification: "diagnostic-control-only; fixture cleanup is not product cleanup; historical CI203 cause remains unknown" }));
+  }
+  assert.equal(fixtureClosed, true); assert.deepEqual(cleanupErrors, []);
 });
 
 test("A11A close diagnostics preserve post-close syscall and semantic failures", async t => {

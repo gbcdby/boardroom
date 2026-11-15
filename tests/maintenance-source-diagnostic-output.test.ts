@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import promises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -61,5 +64,122 @@ for (const kind of ["inventory", "source-close"] as const) {
         assert.equal(report.failures.length, 1);
       }
     });
+  });
+}
+
+for (const state of ["closed-before-throw", "open-after-throw", "getter-failure"] as const) {
+  test(`#152 close diagnostics distinguish connection state without replacing the original ${state}`, { timeout: 15_000 }, async t => {
+    const directory = await mkdtemp(path.join(tmpdir(), "br-close-state-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const output = path.join(directory, "diagnostics"), sourceFile = path.join(directory, "source.sqlite");
+    const originalError = Object.assign(new Error("original native close sentinel"), { code: "EBUSY" });
+    const observationError = new Error("private state getter sentinel");
+    let open = true, nativeCalls = 0, boundaryCalls = 0, getterCalls = 0;
+    const db = {
+      name: sourceFile,
+      get open() { getterCalls++; if (state === "getter-failure") throw observationError; return open; },
+      get inTransaction() { return false; },
+      close() { nativeCalls++; if (state === "closed-before-throw") open = false; throw originalError; },
+    };
+    const originalClose = db.close;
+    const adapter = { closeSource(source: typeof db) { boundaryCalls++; source.close(); } };
+    const boundary = adapter.closeSource;
+    await assert.rejects(withSqliteSourceCloseDiagnostics("control", sourceFile, adapter,
+      async () => { adapter.closeSource(db); }, output), error => error === originalError);
+    assert.equal(nativeCalls, 1); assert.equal(boundaryCalls, 1); assert.equal(getterCalls, 2);
+    assert.strictEqual(db.close, originalClose); assert.strictEqual(adapter.closeSource, boundary);
+    const entries = await readdir(output); assert.equal(entries.length, 1);
+    const bytes = await readFile(path.join(output, entries[0]!, "report.json"), "utf8");
+    assert.ok(Buffer.byteLength(bytes) <= 256 * 1024);
+    const report = JSON.parse(bytes), failure = report.failures[0];
+    assert.equal(report.failures.length, 1); assert.equal(report.originalOperationThrew, true);
+    assert.equal(failure.nativeCloseCalls, 1); assert.equal(failure.nativeCloseReturned, false);
+    assert.deepEqual(failure.beforeNativeState, { open: state === "getter-failure" ? null : true, inTransaction: false });
+    assert.deepEqual(failure.afterNativeState, { open: state === "getter-failure" ? null : state !== "closed-before-throw", inTransaction: false });
+    assert.equal(failure.observationErrors, state === "getter-failure" ? 2 : 0);
+    assert.equal(report.restorationErrors, 0);
+    assert.ok(!bytes.includes("private state getter sentinel"));
+  });
+}
+
+for (const scenario of ["clear", "blocker", "capture-failure", "truncated", "unobserved", "bounded", "output-failure", "original-throw"] as const) {
+  test(`#152 owned PID inventory observations preserve the original ${scenario} outcome`, { timeout: 15_000 }, async t => {
+    if (process.platform !== "linux") { t.skip("Linux inventory observer"); return; }
+    const directory = await mkdtemp(path.join(tmpdir(), "br-owned-observation-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const output = path.join(directory, "diagnostics"), pid = 42001, calls: string[] = [];
+    const originalError = Object.assign(new Error("original inventory failure"), { code: "EIO" });
+    const blockers = scenario === "blocker" ? [{ code: "source_writer_unknown", subjectRef: `unreadable-process:${pid}` }] : [];
+    const fields = Array<string>(20).fill("0"); fields[0] = "S"; fields[17] = "2"; fields[19] = "9001";
+    const statBytes = Buffer.from(`${pid} (owned-fixture) ${fields.join(" ")}${scenario === "truncated" ? " ".repeat(8193) : ""}\n`);
+    const mapsBytes = Buffer.from("1000-2000 r--p 00000000 00:00 0\n");
+    const descriptors = new Map<number, { bytes: Buffer; read: boolean }>(); let nextFd = 40;
+    let inspections = 0, originalPending: Promise<typeof blockers> | undefined;
+    const adapter = { inspectCurrentWriters() {
+      inspections++;
+      if (scenario !== "unobserved") {
+        const pin = fs.openSync(`/proc/${pid}`, fs.constants.O_RDONLY);
+        fs.fstatSync(pin); void promises.readdir(`/proc/self/fd/${pin}/fd`);
+        for (const subject of ["stat", "maps", "stat"]) {
+          const fd = fs.openSync(`/proc/self/fd/${pin}/${subject}`, fs.constants.O_RDONLY), bytes = Buffer.alloc(16 * 1024);
+          assert.ok(fs.readSync(fd, bytes, 0, bytes.length, null) > 0);
+          assert.equal(fs.readSync(fd, bytes, 0, bytes.length, null), 0); fs.closeSync(fd);
+        }
+        fs.fstatSync(pin); fs.closeSync(pin);
+      }
+      originalPending = scenario === "original-throw" ? Promise.reject(originalError) : Promise.resolve(blockers);
+      return originalPending;
+    } };
+    const boundary = adapter.inspectCurrentWriters;
+    try {
+      if (scenario === "output-failure") await writeFile(output, "not a directory");
+      t.mock.method(fs, "openSync", ((file: fs.PathLike) => { calls.push("open"); const fd = nextFd++;
+        descriptors.set(fd, { bytes: String(file).endsWith("/stat") ? statBytes : mapsBytes, read: false }); return fd;
+      }) as typeof fs.openSync);
+      t.mock.method(fs, "readSync", ((fd: number, buffer: Buffer, offset: number) => { calls.push("read");
+        const entry = descriptors.get(fd)!; if (entry.read) return 0; entry.read = true; return entry.bytes.copy(buffer, offset);
+      }) as typeof fs.readSync);
+      t.mock.method(fs, "closeSync", ((fd: number) => { calls.push("close"); descriptors.delete(fd); }) as typeof fs.closeSync);
+      t.mock.method(fs, "fstatSync", (() => { calls.push("fstat"); return { get uid() {
+        if (scenario === "capture-failure") throw new Error("private observer getter fault"); return 1000;
+      } }; }) as unknown as typeof fs.fstatSync);
+      t.mock.method(promises, "readdir", (() => { calls.push("readdir"); return Promise.resolve([]); }) as typeof promises.readdir);
+      syncBuiltinESMExports();
+      const operation = withSqliteSourceInventoryDiagnostics(adapter, async phase => {
+        for (const label of scenario === "bounded" ? ["baseline", "leader-joined", "excess"] : ["baseline", "leader-joined"]) {
+          phase(label); const pending = adapter.inspectCurrentWriters();
+          assert.strictEqual(pending, originalPending);
+          assert.strictEqual(await pending, blockers);
+        }
+        if (scenario === "output-failure") throw originalError;
+        return blockers;
+      }, output, pid);
+      if (scenario === "original-throw" || scenario === "output-failure") await assert.rejects(operation, error => error === originalError);
+      else assert.strictEqual(await operation, blockers);
+    } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+    try {
+      assert.strictEqual(adapter.inspectCurrentWriters, boundary);
+      assert.equal(inspections, scenario === "original-throw" ? 1 : scenario === "bounded" ? 3 : 2);
+      if (scenario === "unobserved") assert.deepEqual(calls, []);
+      else for (const [name, count] of [["open", 4], ["read", 6], ["close", 4], ["fstat", 2], ["readdir", 1]] as const)
+        assert.equal(calls.filter(item => item === name).length, count * inspections);
+      if (scenario === "output-failure") return;
+      const names = await readdir(output); assert.equal(names.length, 1);
+      const report = JSON.parse(await readFile(path.join(output, names[0]!, "report.json"), "utf8"));
+      assert.equal(report.observations.length, Math.min(inspections, 2)); assert.equal(report.droppedObservations, scenario === "bounded" ? 1 : 0);
+      assert.equal(report.requestEvidenceState, ["capture-failure", "truncated", "unobserved", "bounded"].includes(scenario) ? "UNOBSERVED" : "OBSERVED");
+      assert.deepEqual(report.observations.map((item: { inspection: number }) => item.inspection), inspections === 1 ? [1] : [1, 2]);
+      assert.deepEqual(report.observations.map((item: { phase: string }) => item.phase), inspections === 1 ? ["baseline"] : ["baseline", "leader-joined"]);
+      for (const item of report.observations) {
+        assert.equal(item.pid, pid);
+        assert.equal(item.result, scenario === "original-throw" ? "THREW" : scenario === "blocker" ? "BLOCKERS" : "CLEAR");
+        assert.equal(item.evidenceState, ["capture-failure", "truncated", "unobserved"].includes(scenario) ? "UNOBSERVED" : "OBSERVED");
+        if (scenario !== "unobserved") {
+          assert.equal(item.frame.stats.length, 2); assert.equal(item.frame.maps.length, 1);
+          assert.equal(item.frame.maps[0].bytes, mapsBytes.length); assert.equal(item.frame.maps[0].eof, true);
+        }
+      }
+      assert.equal(report.failures.length, scenario === "blocker" ? 2 : 0);
+    } finally { await rm(directory, { recursive: true, force: true }); }
   });
 }
