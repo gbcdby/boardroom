@@ -50,6 +50,9 @@ interface HeldMutex {
   readonly high: number;
   readonly low: number;
   released: boolean;
+  retiring: boolean;
+  heartbeat?: Promise<MaintenanceFailure | undefined> | undefined;
+  releaseAttempt?: Promise<void> | undefined;
 }
 const stateColumns: Readonly<Record<keyof StorageMaintenanceState, string>> = {
   databaseInstanceId: "database_instance_id", admission: "admission", fenceEpoch: "fence_epoch",
@@ -357,23 +360,44 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       } else if (locked.controlRootJson !== rootJson || locked.mutexIdentityJson !== identityJson)
         throw new MaintenanceFailure("control_root_mismatch");
       if ((await session.client.query("COMMIT")).command !== "COMMIT") throw new MaintenanceFailure("maintenance_lost");
-      const held: HeldMutex = { session, root, identity, sourceIdentity: actual, marker: expected.databaseInstanceId, high, low, released: false };
+      const held: HeldMutex = { session, root, identity, sourceIdentity: actual, marker: expected.databaseInstanceId, high, low, released: false, retiring: false };
       mutex = held;
-      let heartbeatRunning = false;
-      mutexTimer = setInterval(() => {
-        if (heartbeatRunning || held.released || closed) return;
-        heartbeatRunning = true;
-        void assertMutex(held).catch(invalidate).finally(() => { heartbeatRunning = false; });
-      }, 1_000); mutexTimer.unref();
+      const heartbeatTimer = setInterval(() => {
+        if (held.heartbeat || held.retiring || held.released || closed) return;
+        const pending = assertMutex(held).then(() => undefined, error => {
+          invalidate(); return safeError(error, "maintenance_lost", "mutex-heartbeat");
+        });
+        held.heartbeat = pending;
+        // A failed monitor remains available to release; success can admit the next tick.
+        void pending.then(error => { if (!error && held.heartbeat === pending) held.heartbeat = undefined; });
+      }, 1_000); mutexTimer = heartbeatTimer; heartbeatTimer.unref();
       return { identity,
         assertHeld: () => assertMutex(held),
         async release() {
           if (held.released) return;
+          if (held.releaseAttempt) return held.releaseAttempt;
           if (lockActive) throw new MaintenanceFailure("maintenance_busy");
-          auditFactories.get(held)?.close(); clearInterval(mutexTimer); mutexTimer = undefined;
-          try { await endSession(session, true); } catch (error) { throw safeError(error, "maintenance_lost", "mutex-close"); }
-          held.released = true;
-          if (mutex === held) mutex = undefined;
+          held.retiring = true;
+          auditFactories.get(held)?.close(); clearInterval(heartbeatTimer);
+          if (mutexTimer === heartbeatTimer) mutexTimer = undefined;
+          const attempt = (async () => {
+            const errors: MaintenanceFailure[] = [];
+            const pending = held.heartbeat;
+            if (pending) {
+              // Both real heartbeat queries retain the existing client query_timeout.
+              // Ending their connection first would itself manufacture a lock-loss error.
+              const error = await pending;
+              if (held.heartbeat === pending) held.heartbeat = undefined;
+              if (error) errors.push(error);
+            }
+            let confirmed = false;
+            try { await endSession(session, true); confirmed = true; }
+            catch (error) { errors.push(safeError(error, "maintenance_lost", "mutex-close")); }
+            if (confirmed) { held.released = true; if (mutex === held) mutex = undefined; }
+            throwResourceFailures(errors);
+          })();
+          held.releaseAttempt = attempt;
+          try { await attempt; } finally { if (held.releaseAttempt === attempt) held.releaseAttempt = undefined; }
         },
       };
     } catch (error) {
