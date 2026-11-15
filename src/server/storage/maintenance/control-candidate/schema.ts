@@ -112,9 +112,12 @@ export type ControlProof = z.infer<typeof controlProofSchema>;
 export type SuccessorProof = Extract<ControlProof, { kind: "control-successor" | "legacy-first-capture-bridge" }>;
 export type MaintenanceInvariant = z.infer<typeof invariantSchema>;
 
-function resourceKeyRange(key: string): void {
+function resourceKeyRange(key: string, platform: "linux" | "darwin"): void {
   if (key.startsWith("map:")) {
-    const parts = key.split(":"); requireCandidate(BigInt(parts[1]!) < BigInt(parts[2]!));
+    const parts = key.split(":"), first = BigInt(parts[1]!), second = BigInt(parts[2]!);
+    // Preserve each native key: Darwin emits begin/size; Linux emits start/end.
+    if (platform === "darwin") requireCandidate(second > 0n && first + second <= (1n << 64n) - 1n);
+    else requireCandidate(first < second);
   }
 }
 
@@ -189,12 +192,12 @@ export function checkFactsShape(facts: EventFacts, sourceRef: SourceRef): void {
   }
   requireCandidate(sourceRef.kind === "sqlite" && equal(sessions.observer, { host: actor.host, process: actor.process }));
   ordered(sessions.ownedResources, (a, b) => compareText(a.key, b.key));
-  for (const item of sessions.ownedResources) resourceKeyRange(item.key);
+  for (const item of sessions.ownedResources) resourceKeyRange(item.key, sessions.kind === "sqlite-linux-session-audit-v1" ? "linux" : "darwin");
   if (sessions.kind === "sqlite-linux-session-audit-v1") {
     requireCandidate(actor.process.platform === "linux" && actor.processCheck.kind === "linux-matched" && sessions.uid === actor.processCheck.observerUid);
     ordered(sessions.matches, (a, b) => compareNumber(a.pid, b.pid) || compareNumber(BigInt(a.startTicks), BigInt(b.startTicks)) || compareText(a.key, b.key));
     for (const item of sessions.matches) {
-      resourceKeyRange(item.key);
+      resourceKeyRange(item.key, "linux");
       requireCandidate(item.pid === actor.process.pid && item.startTicks === actor.process.startTicks
         && sessions.ownedResources.some(owned => owned.key === item.key && owned.device === item.device && owned.inode === item.inode));
     }
@@ -203,7 +206,7 @@ export function checkFactsShape(facts: EventFacts, sourceRef: SourceRef): void {
     ordered(sessions.inventory.items, (a, b) => compareNumber(a.pid, b.pid) || compareNumber(BigInt(a.startSeconds), BigInt(b.startSeconds))
       || compareNumber(BigInt(a.startMicroseconds), BigInt(b.startMicroseconds)) || compareText(a.key, b.key));
     for (const item of sessions.inventory.items) {
-      resourceKeyRange(item.key);
+      resourceKeyRange(item.key, "darwin");
       requireCandidate(item.pid === actor.process.pid && item.startSeconds === actor.process.startSeconds
         && item.startMicroseconds === actor.process.startMicroseconds && item.links === "1"
         && (item.key.startsWith("fd:") ? item.key === `fd:${item.fd}` : item.fd === -1)

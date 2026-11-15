@@ -206,7 +206,7 @@ static void scan_process(pid_t pid) {
     if (errno != ESRCH) unreadable(pid, "process-recheck");
   } else if (!same_process(&before, &after)) unreadable(pid, "process-identity-changed");
 }
-static int inventory(bool parent_only) {
+static int inventory(bool parent_only, bool audit) {
   printf("{\"version\":1,\"scope\":\"%s\",\"items\":[", parent_only ? "parent" : "current-uid");
   if (parent_only) scan_process(getppid());
   else {
@@ -227,7 +227,24 @@ static int inventory(bool parent_only) {
     }
     if (!complete) { errno = EAGAIN; return fail(); }
   }
-  puts("]}"); return 0;
+  putchar(']');
+  if (audit) {
+    /* Retain the identities from the original read_scopes calls. No new open/stat. */
+    printf(",\"sourceFiles\":[");
+    bool separator = false;
+    for (int i = 0; i < scope_count; i++) {
+      const struct scope *scope = &scopes[i];
+      if (scope->tree) continue;
+      if (separator) putchar(',');
+      separator = true;
+      printf("{\"path\":"); json_string(scope->path);
+      if (scope->exists) printf(",\"presence\":\"present\",\"device\":\"%" PRIu32 "\",\"inode\":\"%" PRIu64 "\"}",
+        (uint32_t)scope->device, (uint64_t)scope->inode);
+      else printf(",\"presence\":\"absent\"}");
+    }
+    putchar(']');
+  }
+  puts("}"); return 0;
 }
 static int file_operation(bool flush) {
   /* Only inherited fd 3. Never reopen a pathname or accept an arbitrary fd number. */
@@ -273,9 +290,9 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "fullsync") == 0) return file_operation(true);
   if (argc == 2 && strcmp(argv[1], "filesystem") == 0) return file_operation(false);
   if (argc == 3 && strcmp(argv[1], "process") == 0) return process_identity(argv[2]);
-  if (argc >= 3 && (strcmp(argv[1], "parent-handles") == 0 || strcmp(argv[1], "source-users") == 0)) {
+  if (argc >= 3 && (strcmp(argv[1], "parent-handles") == 0 || strcmp(argv[1], "source-users") == 0 || strcmp(argv[1], "source-audit-users") == 0)) {
     if (read_scopes(argc - 2, argv + 2) != 0) return fail();
-    return inventory(strcmp(argv[1], "parent-handles") == 0);
+    return inventory(strcmp(argv[1], "parent-handles") == 0, strcmp(argv[1], "source-audit-users") == 0);
   }
   errno = EINVAL; return fail();
 }

@@ -622,6 +622,30 @@ test("A11A keeps an older receipt generation historical across a real runtime re
       }));
       if (secondExits) await read();
       else { await assert.rejects(read(), { code: "drain_incomplete" }); assert.equal((await inspectOwnedProcess(second.identity)).status, "observed_alive"); }
+      // A12-B consumes the same real two-generation lifecycle; it must retain each original native inspection.
+      const audit = () => f!.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(reference));
+      if (secondExits) {
+        const packet = await audit();
+        const historical = packet.facts.clients.find(client => Buffer.from(client.subject[1], "hex").toString("utf8") === oldReceipt.clientId)!;
+        assert.equal(historical.kind, "ordinary-client"); assert.equal(historical.classification, "historical-client");
+        assert.equal(historical.receipt!.ownedExits[0]!.fence.generation, 1);
+        assert.equal(historical.receipt!.ownedExits[0]!.inspection.status, "wrapper_exited");
+        assert.equal(packet.facts.runtime.runners[0]!.generation, 2);
+        assert.equal(packet.facts.runtime.runners[0]!.processIdentity, null);
+        assert.equal(packet.facts.runtime.runners[0]!.inspection, null, "markExit cleared the row; a receipt must not invent a runtime inspection");
+        const current = packet.facts.clients.find(client => Buffer.from(client.subject[1], "hex").toString("utf8") === currentReceipt.clientId)!;
+        assert.equal(current.kind, "ordinary-client");
+        assert.equal(current.receipt!.ownedExits[0]!.inspection.status, "wrapper_exited");
+        assert.deepEqual(packet.facts.runtime.results, [{ bindingId, memberId, generation: 2, status: "exited" }]);
+        // Controlled retained runtime row, using the genuinely exited second wrapper's original identity.
+        const retained = new Database(f.file);
+        try { retained.prepare("UPDATE agent_runner_states SET process_identity_json=?,exit_confirmed=0 WHERE binding_id=?")
+          .run(JSON.stringify(second.identity), bindingId); } finally { retained.close(); }
+        const retainedAudit = await audit();
+        assert.deepEqual(retainedAudit.facts.runtime.runners[0]!.processIdentity, second.identity);
+        assert.equal(retainedAudit.facts.runtime.runners[0]!.inspection!.status, "wrapper_exited");
+        assert.equal(retainedAudit.facts.runtime.runners[0]!.exitConfirmed, 0);
+      } else await assert.rejects(audit(), { code: "drain_incomplete" });
     } finally {
       for (const wrapper of wrappers) await wrapper.close();
       await secondClient?.close(); if (!secondClient) await secondDriver?.close(); await f?.close();

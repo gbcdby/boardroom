@@ -1,4 +1,6 @@
-import { canonicalJson } from "./canonical.ts";
+import { canonicalJson, digestJson } from "./canonical.ts";
+import { checkFactsShape, eventFactsSchema, type EventFacts } from "./control-candidate/schema.ts";
+import type { BootstrapAuditLease, SessionAuditCollection, SourceClientAudit } from "./native-audit.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { ArtifactStore } from "./objects.ts";
 import { loadPersistedPlan } from "./plan.ts";
@@ -22,12 +24,13 @@ export interface SourceFactsAccess {
   observe(): Promise<SourceClientsObservation>;
   decodedRows(observation: SourceClientsObservation): Promise<readonly Record<string, unknown>[]>;
   validateSource(value: unknown, observation: SourceClientsObservation): void;
-  inspectWriters(observation: SourceClientsObservation, rows: readonly Record<string, unknown>[]): Promise<readonly Blocker[]>;
+  inspectWriters(observation: SourceClientsObservation, rows: readonly Record<string, unknown>[], audit?: SessionAuditCollection): Promise<readonly Blocker[]>;
   runtimeRows(): Promise<SourceRuntimeRows>;
 }
 
 export async function withSourceClientFacts<T>(access: SourceFactsAccess, input: PersistedPlanRef,
-  consume: (window: SourceClientFactsWindow) => Promise<T>): Promise<T> {
+  consume: (window: SourceClientFactsWindow) => Promise<T>,
+  native?: { readonly lease: BootstrapAuditLease; readonly lock: object }): Promise<T> {
   const reference = freeze({ ...input, immutablePlan: { ...input.immutablePlan } });
   let active = true;
   const assertActive = async () => {
@@ -37,6 +40,11 @@ export async function withSourceClientFacts<T>(access: SourceFactsAccess, input:
   const collect = async () => {
     await assertActive();
     const observation = await access.observe(), state = observation.state;
+    const actor = native ? await native.lease.observe(native.lock) : undefined;
+    const observedAt = actor ? new Date().toISOString() : undefined;
+    const clientAudit: EventFacts["clients"] | undefined = actor ? [] : undefined;
+    const runtimeAudit: EventFacts["runtime"] | undefined = actor ? { runners: [], owners: [], results: [] } : undefined;
+    const sessionAudit: SessionAuditCollection | undefined = actor ? { actor, observation } : undefined;
     if (state.admission === "open") throw new MaintenanceFailure("phase_conflict");
     if (state.controlRootJson !== canonicalJson(access.root) || state.mutexIdentityJson !== canonicalJson(access.mutexIdentity)
       || reference.controlRoot !== access.root.path) throw new MaintenanceFailure("control_root_mismatch");
@@ -82,15 +90,28 @@ export async function withSourceClientFacts<T>(access: SourceFactsAccess, input:
         throw new MaintenanceFailure("source_changed");
     }
     const rows = await access.decodedRows(observation);
-    const clients = await sourceClientFacts(observation, rows, receiptGeneration, access.validateSource);
+    const clients = await sourceClientFacts(observation, rows, receiptGeneration, access.validateSource, clientAudit);
     const runtimeRows = await access.runtimeRows();
-    const runtime = await sourceRuntimeFacts(runtimeRows, clients);
-    const blockers = await access.inspectWriters(observation, rows);
+    const runtime = await sourceRuntimeFacts(runtimeRows, clients, runtimeAudit);
+    const blockers = await access.inspectWriters(observation, rows, sessionAudit);
     if (blockers.length) throw new MaintenanceFailure(blockers[0]!.code, blockers[0]!.subjectRef);
     await assertActive();
     const after = await access.observe();
     if (!same(observation, after)) throw new MaintenanceFailure("source_changed");
-    return freeze({ observation, origin: { kind: first ? "captured-generation" as const : "current-generation" as const,
+    let nativeAudit: EventFacts | undefined;
+    if (actor) {
+      clientAudit!.sort((a, b) => a.subject[1] < b.subject[1] ? -1 : a.subject[1] > b.subject[1] ? 1 : 0);
+      const parsed = eventFactsSchema.safeParse({ formatVersion: 1, kind: "source-control-event-facts",
+        collector: "boardroom-source-control-facts-v1", observedAt, actor, beforeCount: String(observation.rows.length),
+        beforeRowsDigest: digestJson({ formatVersion: 1, kind: "source-clients-live-rows", source: observation.source,
+          textEncoding: observation.textEncoding, rows: observation.rows }),
+        clients: clientAudit, runtime: runtimeAudit, sessions: sessionAudit?.value });
+      if (!parsed.success) throw new MaintenanceFailure("source_writer_unknown", "source-client-audit");
+      try { checkFactsShape(parsed.data, observation.source); }
+      catch { throw new MaintenanceFailure("source_writer_unknown", "source-client-audit"); }
+      nativeAudit = parsed.data;
+    }
+    return freeze({ observation, ...(nativeAudit ? { nativeAudit } : {}), origin: { kind: first ? "captured-generation" as const : "current-generation" as const,
       head, capture: first?.reference ?? null, receiptGeneration, chain }, clients, runtime,
       scope: ["source-client-roster", "exact-db-anchor", "registered-processes", "database-sessions", "runtime-owners", "adapter-writer-inventory"] });
   };
@@ -104,4 +125,18 @@ export async function withSourceClientFacts<T>(access: SourceFactsAccess, input:
     await window.assertCurrent();
     return result;
   } finally { active = false; }
+}
+
+/** No data escapes this entry until the original final fresh/close checks finish. */
+export async function readSourceClientAudit(access: SourceFactsAccess, plan: PersistedPlanRef,
+  lease: BootstrapAuditLease, lock: object): Promise<SourceClientAudit> {
+  try {
+    return await withSourceClientFacts(access, plan, async window => {
+      const facts = (window as SourceClientFactsWindow & { readonly nativeAudit: EventFacts }).nativeAudit;
+      return freeze({ kind: "untrusted-source-client-audit" as const, observation: window.observation, origin: window.origin, facts });
+    }, { lease, lock });
+  } catch (error) {
+    if (error instanceof MaintenanceFailure && error.code === "maintenance_lost") lease.invalidate();
+    throw error;
+  } finally { lease.close(); }
 }
