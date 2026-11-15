@@ -84,10 +84,26 @@ interface Attempt {
 }
 const bindings = new WeakMap<object, ControlSqlAccess>();
 const attempts = new WeakMap<object, Attempt>();
+// Ordinary locks have no control-SQL Attempt. Retain only bounded phase facts,
+// never raw errors or an authorization/validation claim for those locks.
+type OrdinaryLifecycle = Pick<Attempt, "committing" | "committed" | "failed" | "rollbackFailed" | "closeFailed">;
+const ordinaryLifecycles = new WeakMap<object, OrdinaryLifecycle>();
 const callbackClosed = new WeakSet<object>();
 export function bindControlSql(lock: SourceLock, access: ControlSqlAccess): void { bindings.set(lock, Object.freeze(access)); }
 export function noteControlSql(lock: SourceLock | undefined, stage: "committing" | "committed" | "failure" | "rollback-failure" | "close-failure", error?: unknown): void {
-  const attempt = lock && attempts.get(lock); if (!attempt) return;
+  const attempt = lock && attempts.get(lock);
+  if (!attempt) {
+    if (!lock || !bindings.has(lock)) return;
+    const lifecycle = ordinaryLifecycles.get(lock) ?? {
+      committing: false, committed: false, failed: false, rollbackFailed: false, closeFailed: false };
+    if (stage === "committing") lifecycle.committing = true;
+    else if (stage === "committed") lifecycle.committed = true;
+    else if (stage === "failure") lifecycle.failed = true;
+    else if (stage === "rollback-failure") lifecycle.rollbackFailed = true;
+    else lifecycle.closeFailed = true;
+    ordinaryLifecycles.set(lock, lifecycle);
+    return;
+  }
   if (stage === "committing") attempt.committing = true;
   else if (stage === "committed") attempt.committed = true;
   else if (stage === "failure") { if (!attempt.failed) attempt.failure = error; attempt.failed = true; }
@@ -189,7 +205,15 @@ export interface ControlSqlOutcome {
 /** This reports the actual outer lifecycle. A transaction-local view alone is never committed. */
 export function controlSqlOutcome(lock: SourceLock): Readonly<ControlSqlOutcome> {
   const access = bindings.get(lock), attempt = attempts.get(lock);
-  if (!access || !attempt) return Object.freeze({ kind: "untrusted-control-outcome" as const, status: "unknown" as const });
+  if (!access) return Object.freeze({ kind: "untrusted-control-outcome" as const, status: "unknown" as const });
+  if (!attempt) {
+    const lifecycle = ordinaryLifecycles.get(lock);
+    if (!lifecycle) return Object.freeze({ kind: "untrusted-control-outcome" as const, status: "unknown" as const });
+    return Object.freeze({ kind: "untrusted-control-outcome" as const, status: "unknown" as const,
+      localSourceHandleClosed: access.sourceHandleClosed(), localMutexHandleClosed: access.mutexHandleClosed(),
+      commitStarted: lifecycle.committing, commitReturned: lifecycle.committed, failureObserved: lifecycle.failed,
+      rollbackFailureObserved: lifecycle.rollbackFailed, closeFailureObserved: lifecycle.closeFailed });
+  }
   const sourceClosed = access.sourceHandleClosed(), mutexClosed = access.mutexHandleClosed();
   return Object.freeze({ kind: "untrusted-control-outcome" as const,
     status: attempt.finalValidated && attempt.committed && sourceClosed && !attempt.failed && !attempt.rollbackFailed && !attempt.closeFailed

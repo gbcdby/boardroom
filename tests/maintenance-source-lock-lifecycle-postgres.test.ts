@@ -34,6 +34,18 @@ async function independentlyRead(f: Awaited<ReturnType<typeof fixture>>) {
     clients: (await client.query("SELECT * FROM storage_source_clients ORDER BY client_id")).rows }; }
   finally { await f.closeClient(client); }
 }
+function assertOrdinaryOutcome(lock: SourceLock, expected: {
+  commitStarted: boolean; commitReturned: boolean; failureObserved: boolean;
+  rollbackFailureObserved: boolean; closeFailureObserved: boolean;
+}, sourceClosed = true) {
+  const outcome = controlSqlOutcome(lock);
+  assert.deepEqual(outcome, { kind: "untrusted-control-outcome", status: "unknown",
+    localSourceHandleClosed: sourceClosed, localMutexHandleClosed: false, ...expected });
+  assert.equal(Object.isFrozen(outcome), true);
+  assert.doesNotMatch(JSON.stringify(outcome), /ordinary-sensitive/);
+  return outcome;
+}
+
 async function ordinaryAnchor(f: Awaited<ReturnType<typeof fixture>>, lock: SourceLock) {
   const state = (await lock.observeSourceClients()).state;
   await lock.anchor({ expected: state, admission: state.admission, fenceEpoch: state.fenceEpoch,
@@ -45,8 +57,8 @@ async function ordinaryAnchor(f: Awaited<ReturnType<typeof fixture>>, lock: Sour
 pgTest("#152 PostgreSQL ordinary anchor requires confirmed end after its single real COMMIT", async t => {
   for (const phase of ["success", "end-before", "end-after", "end-undefined"] as const) await t.test(phase, async child => {
     const f = await fixture(), query = Client.prototype.query, end = Client.prototype.end;
-    const failure = phase === "end-undefined" ? undefined : new Error("ordinary-end-failure");
-    let writer: Client | undefined, injected = false, cleanupReachedOwnedSession = false, commits = 0, rollbacks = 0;
+    const failure = phase === "end-undefined" ? undefined : Object.assign(new Error("ordinary-sensitive-end"), { privateDetail: "ordinary-sensitive-value" });
+    let writer: Client | undefined, captured: SourceLock | undefined, injected = false, cleanupReachedOwnedSession = false, commits = 0, rollbacks = 0;
     let rejected = false, rejection: unknown, value: unknown;
     try {
       child.mock.method(Client.prototype, "query", (async function (this: Client, ...args: unknown[]) {
@@ -65,12 +77,15 @@ pgTest("#152 PostgreSQL ordinary anchor requires confirmed end after its single 
         if (this === writer && injected) cleanupReachedOwnedSession = true;
         return invokeEnd(end, this);
       }) as typeof end);
-      try { value = await f.adapter.withSourceLock("control", async lock => { await ordinaryAnchor(f, lock); return "committed"; }); }
+      try { value = await f.adapter.withSourceLock("control", async lock => { captured = lock; await ordinaryAnchor(f, lock); return "committed"; }); }
       catch (error) { rejected = true; rejection = error; }
       assert.ok(writer); assert.equal(commits, 1); assert.equal(rollbacks, 0, "an end failure after COMMIT must not trigger rollback or a retry");
       assert.equal(rejected, phase !== "success");
       if (phase === "success") assert.equal(value, "committed");
       else { assert.equal(injected, true); assert.equal(rejection, failure); }
+      assert.ok(captured);
+      assertOrdinaryOutcome(captured, { commitStarted: true, commitReturned: true, failureObserved: false,
+        rollbackFailureObserved: false, closeFailureObserved: phase !== "success" }, phase !== "end-before");
       const actual = await independentlyRead(f);
       assert.equal(actual.maintenance[0].journal_record_ref, f.v.zeroRef.ref); assert.deepEqual(actual.clients, []);
       if (phase === "end-before") {
@@ -87,12 +102,13 @@ pgTest("#152 PostgreSQL ordinary anchor requires confirmed end after its single 
 });
 
 pgTest("#152 PostgreSQL first callback failure survives rollback/end errors and keeps safe mapping", async t => {
-  for (const scenario of ["ordinary", "mechanism", "undefined", "busy", "rollback-dispatch"] as const) await t.test(scenario, async child => {
+  for (const scenario of ["ordinary", "ordinary-rollback", "ordinary-close", "ordinary-undefined", "mechanism", "undefined", "busy", "rollback-dispatch"] as const) await t.test(scenario, async child => {
     const f = await fixture(), before = await independentlyRead(f), query = Client.prototype.query, end = Client.prototype.end;
     const mechanism = scenario === "mechanism" || scenario === "undefined" || scenario === "rollback-dispatch";
-    const primary = scenario === "undefined" ? undefined : scenario === "busy" ? Object.assign(new Error("native-lock-not-available"), { code: "55P03" })
+    const primary = scenario === "undefined" || scenario === "ordinary-undefined" ? undefined : scenario === "busy" ? Object.assign(new Error("native-lock-not-available"), { code: "55P03" })
       : new MaintenanceFailure("phase_conflict", "callback-first");
-    const rollbackFailure = new Error("callback-rollback"), closeFailure = new Error("callback-end");
+    const rollbackFailure = Object.assign(new Error("ordinary-sensitive-rollback"), { privateDetail: "ordinary-sensitive-rollback" }),
+      closeFailure = Object.assign(new Error("ordinary-sensitive-end"), { privateDetail: "ordinary-sensitive-end" });
     let writer: Client | undefined, captured: SourceLock | undefined, rollbackAttempted = false, rolledBack = false, ended = false;
     let rejected = false, rejection: unknown;
     try {
@@ -106,13 +122,13 @@ pgTest("#152 PostgreSQL first callback failure survives rollback/end errors and 
           if (scenario === "rollback-dispatch") throw rollbackFailure;
         }
         return invokeQuery(query, this, args).then(result => {
-          if (this === writer && sql === "ROLLBACK") { rolledBack = true; throw rollbackFailure; }
+          if (this === writer && sql === "ROLLBACK") { rolledBack = true; if (scenario !== "ordinary-close") throw rollbackFailure; }
           return result;
         });
       }) as typeof query);
       child.mock.method(Client.prototype, "end", (async function (this: Client) {
         await invokeEnd(end, this);
-        if (this === writer) { ended = true; throw closeFailure; }
+        if (this === writer) { ended = true; if (scenario !== "ordinary-rollback") throw closeFailure; }
       }) as typeof end);
       try {
         await f.adapter.withSourceLock("control", async lock => {
@@ -123,28 +139,29 @@ pgTest("#152 PostgreSQL first callback failure survives rollback/end errors and 
       } catch (error) { rejected = true; rejection = error; }
       assert.equal(rejected, true); assert.equal(rollbackAttempted, true);
       assert.equal(rolledBack, scenario !== "rollback-dispatch"); assert.equal(ended, true);
-      if (scenario === "undefined" || scenario === "busy") {
+      if (scenario === "undefined" || scenario === "ordinary-undefined" || scenario === "busy") {
         assert.ok(rejection instanceof MaintenanceFailure); assert.equal(rejection.code, scenario === "busy" ? "maintenance_busy" : "snapshot_invalid");
       } else assert.equal(rejection, primary);
       if (mechanism) {
         const outcome = controlSqlOutcome(captured!);
         assert.equal(outcome.status, "unknown"); assert.equal(outcome.failureObserved, true); assert.equal(outcome.originalError, primary);
         assert.equal(outcome.rollbackError, rollbackFailure); assert.equal(outcome.closeError, closeFailure);
-      }
+      } else assertOrdinaryOutcome(captured!, { commitStarted: false, commitReturned: false, failureObserved: true,
+        rollbackFailureObserved: scenario !== "ordinary-close", closeFailureObserved: scenario !== "ordinary-rollback" });
       assert.deepEqual(await independentlyRead(f), before, "another connection sees neither the rolled-back row nor anchor");
     } finally { child.mock.restoreAll(); if (writer) await invokeEnd(end, writer); await f.close(); }
   });
 });
 
 pgTest("#152 PostgreSQL COMMIT first failure is retained while an independent connection determines what committed", async t => {
-  for (const phase of ["before", "after"] as const) await t.test(phase, async child => {
+  for (const mode of ["ordinary", "mechanism"] as const) for (const phase of ["before", "after"] as const) await t.test(mode + "-" + phase, async child => {
     const f = await fixture(), before = await independentlyRead(f), query = Client.prototype.query, end = Client.prototype.end;
     const primary = new MaintenanceFailure("snapshot_invalid", `commit-${phase}`), rollbackFailure = new Error("commit-rollback"), closeFailure = new Error("commit-end");
     let writer: Client | undefined, captured: SourceLock | undefined, commits = 0;
     try {
       child.mock.method(Client.prototype, "query", (async function (this: Client, ...args: unknown[]) {
         const sql = sqlText(args[0]);
-        if (database(this) === f.database && sql.startsWith("UPDATE storage_maintenance SET owner_generation=")) writer = this;
+        if (database(this) === f.database && sql.startsWith(mode === "mechanism" ? "UPDATE storage_maintenance SET owner_generation=" : "UPDATE storage_maintenance SET admission=")) writer = this;
         if (this === writer && sql === "COMMIT") { commits++; if (phase === "before") throw primary; }
         const result = await invokeQuery(query, this, args);
         if (this === writer && sql === "COMMIT") throw primary;
@@ -155,15 +172,20 @@ pgTest("#152 PostgreSQL COMMIT first failure is retained while an independent co
         await invokeEnd(end, this); if (this === writer) throw closeFailure;
       }) as typeof end);
       await assert.rejects(f.adapter.withSourceLock("control", async lock => {
-        captured = lock; await applyUntrustedControlSql(lock, f.v.input(f.v.insertedRef));
+        captured = lock;
+        if (mode === "mechanism") await applyUntrustedControlSql(lock, f.v.input(f.v.insertedRef)); else await ordinaryAnchor(f, lock);
       }), error => error === primary);
       assert.equal(commits, 1);
       const outcome = controlSqlOutcome(captured!);
-      assert.equal(outcome.status, "unknown"); assert.equal(outcome.originalError, primary);
-      assert.equal(outcome.rollbackError, rollbackFailure); assert.equal(outcome.closeError, closeFailure);
+      if (mode === "mechanism") {
+        assert.equal(outcome.status, "unknown"); assert.equal(outcome.originalError, primary);
+        assert.equal(outcome.rollbackError, rollbackFailure); assert.equal(outcome.closeError, closeFailure);
+      } else assertOrdinaryOutcome(captured!, { commitStarted: true, commitReturned: false, failureObserved: true,
+        rollbackFailureObserved: true, closeFailureObserved: true });
       const actual = await independentlyRead(f);
       if (phase === "before") assert.deepEqual(actual, before);
-      else { assert.equal(actual.maintenance[0].journal_record_ref, f.v.insertedRef.ref); assert.equal(actual.clients.length, 1); }
+      else { assert.equal(actual.maintenance[0].journal_record_ref, mode === "mechanism" ? f.v.insertedRef.ref : f.v.zeroRef.ref);
+        assert.equal(actual.clients.length, mode === "mechanism" ? 1 : 0); }
     } finally { child.mock.restoreAll(); if (writer) await invokeEnd(end, writer); await f.close(); }
   });
 });

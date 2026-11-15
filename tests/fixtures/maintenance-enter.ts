@@ -1,22 +1,25 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { Client } from "pg";
 import { PostgresDriver } from "../../src/server/db/drivers/postgres.ts";
+import { SqliteDriver } from "../../src/server/db/drivers/sqlite.ts";
 import { runMigrations } from "../../src/server/db/migrate.ts";
 import { migrations } from "../../src/server/db/migrations/index.ts";
 import { resolveBoardroomEnvironment } from "../../src/server/environment.ts";
 import { createSqliteMaintenanceAdapter } from "../../src/server/storage/maintenance/sqlite.ts";
 import { createPostgresMaintenanceAdapter } from "../../src/server/storage/maintenance/postgres.ts";
 import { planMigration, persistMigrationPlan } from "../../src/server/storage/maintenance/plan.ts";
+import { registerStorageSourceClient } from "../../src/server/storage/source-client.ts";
 import type { ContinueRequest, MaintenanceServiceOptions } from "../../src/server/storage/maintenance/types.ts";
 
 /** Only bootstraps a private source and persists P; never seeds a journal, phase, or DB anchor. */
 export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite") {
-  const directory = await realpath(await mkdtemp(path.join(tmpdir(), "br-enter-")));
+  // Use the checkout filesystem for durable positive fixtures. Some Linux runners mount /tmp
+  // as tmpfs, which is intentionally outside the production filesystem support policy.
+  const directory = await realpath(await mkdtemp(path.join(path.dirname(process.cwd()), "br-enter-")));
   const dataDir = path.join(directory, "data"); await mkdir(dataDir);
   const file = path.join(dataDir, "agent-studio.db"), configFile = path.join(directory, "config.json");
   let admin: Client | undefined, database: string | undefined, sourceUrl: string | undefined;
@@ -67,6 +70,23 @@ export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite") {
     const environment = await resolveBoardroomEnvironment({ cwd: directory, homeDir: directory,
       env: { AGENT_STUDIO_CONFIG: configFile, BOARDROOM_HOME: path.join(directory, "home") } });
     const descriptor = environment.databaseDescriptor;
+    // Real persisted user intent, without starting any runner. Enter may gate work but cannot
+    // rewrite desired state, reset requests, or interpret this row as an owned-exit fact.
+    await exec(`INSERT INTO agents(id,display_name,host_type,created_at,updated_at) VALUES('enter-agent','Agent','codex','2026-11-15','2026-11-15');
+      INSERT INTO projects(id,name,created_at,updated_at) VALUES('enter-project','Project','2026-11-15','2026-11-15');
+      INSERT INTO members(id,project_id,agent_id,kind,display_name,created_at,updated_at) VALUES('enter-member','enter-project','enter-agent','agent','Member','2026-11-15','2026-11-15');
+      INSERT INTO groups(id,project_id,name,created_at,updated_at) VALUES('enter-group','enter-project','Group','2026-11-15','2026-11-15');
+      INSERT INTO agent_runtimes(id,agent_id,defaults_json,created_at,updated_at) VALUES('enter-runtime','enter-agent','{}','2026-11-15','2026-11-15');
+      INSERT INTO agent_runtime_bindings(id,runtime_id,project_id,group_id,member_id,desired_state,intent_revision,reset_session_requested,created_at,updated_at)
+        VALUES('enter-binding','enter-runtime','enter-project','enter-group','enter-member','running',7,1,'2026-11-15','2026-11-15');`);
+    const clientId = randomUUID();
+    const driver = descriptor.kind === "sqlite" ? new SqliteDriver({ dataDir, sqlitePath: file, sqliteSource: descriptor })
+      : new PostgresDriver({ connectionString: (() => { const url = new URL(descriptor.connectionString); url.searchParams.set("application_name", `boardroom-source:${clientId}`); return url.toString(); })() });
+    try {
+      await driver.connect();
+      const registered = await registerStorageSourceClient({ db: driver, database: descriptor, entrypoint: "owned-background", clientId });
+      await registered.close(); // A real historical registration; never a claim of source quiescence.
+    } finally { await driver.close(); }
     const createAdapter = () => descriptor.kind === "sqlite" ? createSqliteMaintenanceAdapter(descriptor) : createPostgresMaintenanceAdapter(descriptor, undefined);
     const options: MaintenanceServiceOptions = { environment, originalCwd: directory, expectedSourceId: environment.inventory.selectedSourceId!,
       controlRoot: path.join(dataDir, "control"), targetRoot: path.join(directory, "target") };

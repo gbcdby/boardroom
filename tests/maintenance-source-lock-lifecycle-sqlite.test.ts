@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { sqliteAuditFixture } from "./fixtures/maintenance-source-audit.ts";
 import { controlSeedColumns, controlSqlVector } from "./fixtures/maintenance-control-sql.ts";
-import { applyUntrustedControlSql, controlSqlOutcome } from "../src/server/storage/maintenance/control-sql.ts";
+import { applyUntrustedControlSql, controlSqlOutcome, noteControlSql } from "../src/server/storage/maintenance/control-sql.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import type { SourceLock } from "../src/server/storage/maintenance/types.ts";
 
@@ -62,6 +62,18 @@ test("#152 SQLite source-lock preserves callback first failure and both cleanup 
   } finally { t.mock.restoreAll(); await f.close(); }
 });
 
+function assertOrdinaryOutcome(lock: SourceLock, expected: {
+  commitStarted: boolean; commitReturned: boolean; failureObserved: boolean;
+  rollbackFailureObserved: boolean; closeFailureObserved: boolean;
+}, sourceClosed = true) {
+  const outcome = controlSqlOutcome(lock);
+  assert.deepEqual(outcome, { kind: "untrusted-control-outcome", status: "unknown",
+    localSourceHandleClosed: sourceClosed, localMutexHandleClosed: false, ...expected });
+  assert.equal(Object.isFrozen(outcome), true);
+  assert.doesNotMatch(JSON.stringify(outcome), /ordinary-sensitive/);
+  return outcome;
+}
+
 async function ordinaryAnchor(f: Awaited<ReturnType<typeof fixture>>, lock: SourceLock) {
   const state = (await lock.observeSourceClients()).state;
   await lock.anchor({ expected: state, admission: state.admission, fenceEpoch: state.fenceEpoch,
@@ -73,19 +85,22 @@ async function ordinaryAnchor(f: Awaited<ReturnType<typeof fixture>>, lock: Sour
 test("#152 SQLite ordinary anchor retains successful commits and rejects standalone close failures", async t => {
   for (const scenario of ["success", "close-error", "close-undefined"] as const) await t.test(scenario, async child => {
     const f = await fixture(), close = Database.prototype.close;
-    const failure = scenario === "close-undefined" ? undefined : new Error("ordinary-close");
-    let injected = false, rejected = false, rejection: unknown, value: unknown;
+    const failure = scenario === "close-undefined" ? undefined : Object.assign(new Error("ordinary-sensitive-close"), { privateDetail: "ordinary-sensitive-value" });
+    let captured: SourceLock | undefined, injected = false, rejected = false, rejection: unknown, value: unknown;
     try {
       if (scenario !== "success") child.mock.method(Database.prototype, "close", function (this: Database.Database) {
         const target = this.name === f.file && !this.readonly, result = close.call(this);
         if (target) { injected = true; throw failure; }
         return result;
       });
-      try { value = await f.adapter.withSourceLock("control", async lock => { await ordinaryAnchor(f, lock); return "committed"; }); }
+      try { value = await f.adapter.withSourceLock("control", async lock => { captured = lock; await ordinaryAnchor(f, lock); return "committed"; }); }
       catch (error) { rejected = true; rejection = error; }
       assert.equal(rejected, scenario !== "success");
       if (scenario === "success") assert.equal(value, "committed");
       else { assert.equal(injected, true); assert.equal(rejection, failure); }
+      assert.ok(captured);
+      assertOrdinaryOutcome(captured, { commitStarted: true, commitReturned: true, failureObserved: false,
+        rollbackFailureObserved: false, closeFailureObserved: scenario !== "success" });
       const actual = independentlyRead(f.file);
       assert.equal((actual.maintenance[0] as {journal_record_ref: string}).journal_record_ref, f.v.zeroRef.ref);
       assert.deepEqual(actual.clients, [], "a post-COMMIT close error does not undo or repeat an ordinary anchor");
@@ -98,8 +113,8 @@ test("#152 SQLite callback error priority applies without a mechanism and does n
     const f = await fixture(), before = independentlyRead(f.file), exec = Database.prototype.exec, close = Database.prototype.close;
     const primary = scenario === "undefined" ? undefined : scenario === "busy" ? Object.assign(new Error("native-busy"), { code: "SQLITE_BUSY" })
       : new MaintenanceFailure("phase_conflict", "ordinary-first");
-    const secondary = new Error("ordinary-cleanup");
-    let writer: Database.Database | undefined, rollbacks = 0, closes = 0, rejected = false, rejection: unknown;
+    const secondary = Object.assign(new Error("ordinary-sensitive-cleanup"), { privateDetail: "ordinary-sensitive-value" });
+    let writer: Database.Database | undefined, captured: SourceLock | undefined, rollbacks = 0, closes = 0, rejected = false, rejection: unknown;
     try {
       child.mock.method(Database.prototype, "exec", function (this: Database.Database, sql: string) {
         if (this.name === f.file && !this.readonly && sql === "BEGIN IMMEDIATE") writer = this;
@@ -112,18 +127,21 @@ test("#152 SQLite callback error priority applies without a mechanism and does n
         if (this === writer) { closes++; if (scenario !== "rollback") throw secondary; }
         return result;
       });
-      try { await f.adapter.withSourceLock("control", async lock => { await ordinaryAnchor(f, lock); throw primary; }); }
+      try { await f.adapter.withSourceLock("control", async lock => { captured = lock; await ordinaryAnchor(f, lock); throw primary; }); }
       catch (error) { rejected = true; rejection = error; }
       assert.equal(rejected, true); assert.equal(rollbacks, 1); assert.equal(closes, 1);
       if (scenario === "busy") { assert.ok(rejection instanceof MaintenanceFailure); assert.equal(rejection.code, "maintenance_busy"); }
       else assert.equal(rejection, primary);
+      assert.ok(captured);
+      assertOrdinaryOutcome(captured, { commitStarted: false, commitReturned: false, failureObserved: true,
+        rollbackFailureObserved: scenario !== "close", closeFailureObserved: scenario !== "rollback" });
       assert.deepEqual(independentlyRead(f.file), before);
     } finally { child.mock.restoreAll(); await f.close(); }
   });
 });
 
 test("#152 SQLite COMMIT first failure survives cleanup and independent reads distinguish actual commit", async t => {
-  for (const phase of ["before", "after"] as const) await t.test(phase, async child => {
+  for (const mode of ["ordinary", "mechanism"] as const) for (const phase of ["before", "after"] as const) await t.test(mode + "-" + phase, async child => {
     const f = await fixture(), before = independentlyRead(f.file), exec = Database.prototype.exec, close = Database.prototype.close;
     const primary = new MaintenanceFailure("snapshot_invalid", `commit-${phase}`);
     const rollbackFailure = new Error("commit-rollback"), closeFailure = new Error("commit-close");
@@ -141,18 +159,33 @@ test("#152 SQLite COMMIT first failure survives cleanup and independent reads di
         const result = close.call(this); if (this === writer) throw closeFailure; return result;
       });
       await assert.rejects(f.adapter.withSourceLock("control", async lock => {
-        captured = lock; await applyUntrustedControlSql(lock, f.v.input(f.v.insertedRef));
+        captured = lock;
+        if (mode === "mechanism") await applyUntrustedControlSql(lock, f.v.input(f.v.insertedRef)); else await ordinaryAnchor(f, lock);
       }), error => error === primary);
       assert.equal(commits, 1); assert.equal(rollbacks, phase === "before" ? 1 : 0);
       const outcome = controlSqlOutcome(captured!);
-      assert.equal(outcome.status, "unknown"); assert.equal(outcome.originalError, primary); assert.equal(outcome.closeError, closeFailure);
-      assert.equal(outcome.rollbackFailureObserved, phase === "before");
-      if (phase === "before") { assert.equal(outcome.rollbackError, rollbackFailure); assert.deepEqual(independentlyRead(f.file), before); }
+      if (mode === "mechanism") {
+        assert.equal(outcome.status, "unknown"); assert.equal(outcome.originalError, primary); assert.equal(outcome.closeError, closeFailure);
+        assert.equal(outcome.rollbackFailureObserved, phase === "before");
+        if (phase === "before") assert.equal(outcome.rollbackError, rollbackFailure);
+      } else assertOrdinaryOutcome(captured!, { commitStarted: true, commitReturned: false, failureObserved: true,
+        rollbackFailureObserved: phase === "before", closeFailureObserved: true });
+      if (phase === "before") assert.deepEqual(independentlyRead(f.file), before);
       else {
         const actual = independentlyRead(f.file);
-        assert.equal((actual.maintenance[0] as {journal_record_ref: string}).journal_record_ref, f.v.insertedRef.ref);
-        assert.equal(actual.clients.length, 1, "an ambiguous COMMIT response is not evidence of rollback");
+        assert.equal((actual.maintenance[0] as {journal_record_ref: string}).journal_record_ref, mode === "mechanism" ? f.v.insertedRef.ref : f.v.zeroRef.ref);
+        assert.equal(actual.clients.length, mode === "mechanism" ? 1 : 0, "an ambiguous COMMIT response is not evidence of rollback");
       }
     } finally { child.mock.restoreAll(); await f.close(); }
   });
+});
+
+
+test("#152 lifecycle notes on unbound values cannot create ordinary or control authority", () => {
+  const unbound = Object.freeze({}) as SourceLock;
+  for (const stage of ["committing", "committed", "failure", "rollback-failure", "close-failure"] as const) {
+    noteControlSql(undefined, stage, new Error("ordinary-sensitive"));
+    noteControlSql(unbound, stage, new Error("ordinary-sensitive"));
+  }
+  assert.deepEqual(controlSqlOutcome(unbound), { kind: "untrusted-control-outcome", status: "unknown" });
 });
