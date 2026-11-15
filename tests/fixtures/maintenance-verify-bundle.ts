@@ -56,7 +56,7 @@ export async function verificationBundleFixture(kind: "sqlite" | "postgres" = "s
         await lock.anchor({ expected: state, admission: event === "cancelled" ? "open" : "sealed",
           fenceEpoch: record.fenceEpoch, ownerGeneration: record.ownerGeneration,
           activeMigrationId: event === "cancelled" ? null : record.migrationId,
-          planDigest: event === "cancelled" ? null : record.plan.sha256, controlRootIdentity: f.store.identity,
+          planDigest: event === "cancelled" ? null : record.plan.sha256, controlRootIdentity: { ...f.store.identity },
           mutexIdentity: mutex.identity, journal, journalSequence: record.sequence });
         return journal;
       });
@@ -77,7 +77,7 @@ export async function verificationBundleFixture(kind: "sqlite" | "postgres" = "s
         await verifyJournalChain(f.store, journal);
         await lock.anchor({ expected: state, admission: "draining", fenceEpoch: enter.fenceEpoch,
           ownerGeneration: enter.ownerGeneration, activeMigrationId: enter.migrationId,
-          planDigest: plan.sha256, controlRootIdentity: f.store.identity, mutexIdentity: mutex.identity,
+          planDigest: plan.sha256, controlRootIdentity: { ...f.store.identity }, mutexIdentity: mutex.identity,
           journal, journalSequence: 1 });
       });
       const journal = await adapter.withSourceLock("control", async lock => {
@@ -99,7 +99,7 @@ export async function verificationBundleFixture(kind: "sqlite" | "postgres" = "s
         await verifyJournalChain(f.store, reference);
         await lock.anchor({ expected: state, admission: "sealed", fenceEpoch: state.fenceEpoch,
           ownerGeneration: state.ownerGeneration, activeMigrationId: capture.migrationId, planDigest: plan.sha256,
-          controlRootIdentity: f.store.identity, mutexIdentity: mutex.identity, journal: reference, journalSequence: 2 });
+          controlRootIdentity: { ...f.store.identity }, mutexIdentity: mutex.identity, journal: reference, journalSequence: 2 });
         return reference;
       });
       return journal;
