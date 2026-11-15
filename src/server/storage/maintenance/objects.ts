@@ -1,5 +1,5 @@
 import { constants, createReadStream, fstatSync } from "node:fs";
-import { lstat, mkdir, open, readFile, realpath, rename } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { hostname } from "node:os";
@@ -28,7 +28,7 @@ const uid = () => process.getuid?.();
 const id = (file: string, value: { dev: bigint; ino: bigint }): PathIdentity => ({ path: file, device: String(value.dev), inode: String(value.ino) });
 
 interface PublicationOutcome {
-  invocation: number; artifact: ArtifactRef; failureObserved: boolean; closeFailureObserved: boolean;
+  invocation: number; artifact: ArtifactRef | null; failureObserved: boolean; closeFailureObserved: boolean;
   cleanupFailureObserved: boolean; handleOpened: boolean; handleClosed: boolean; operationFinished: boolean;
 }
 interface PublicationOwner { handle: FileHandle; fd: number; identity?: string; outcome: PublicationOutcome }
@@ -55,7 +55,7 @@ function assertNoPendingPublication(state: PublicationState): void {
   if (state.cleanup || [...state.owners.values()].some(owner => !state.active.has(owner.outcome.invocation)))
     throw new MaintenanceFailure("snapshot_invalid", "publication-cleanup-required");
 }
-function beginPublication(state: PublicationState, artifact: ArtifactRef): PublicationOutcome {
+function beginPublication(state: PublicationState, artifact: ArtifactRef | null): PublicationOutcome {
   assertNoPendingPublication(state);
   if (state.next === Number.MAX_SAFE_INTEGER) throw new MaintenanceFailure("snapshot_invalid", "publication-sequence-budget");
   if (state.records.length === publicationLimits.records) {
@@ -64,7 +64,7 @@ function beginPublication(state: PublicationState, artifact: ArtifactRef): Publi
     if (index < 0) throw new MaintenanceFailure("snapshot_invalid", "publication-owner-budget");
     state.records.splice(index, 1); state.discarded++;
   }
-  const record: PublicationOutcome = { invocation: ++state.next, artifact: { ...artifact }, failureObserved: false,
+  const record: PublicationOutcome = { invocation: ++state.next, artifact: artifact ? { ...artifact } : null, failureObserved: false,
     closeFailureObserved: false, cleanupFailureObserved: false, handleOpened: false, handleClosed: false, operationFinished: false };
   state.records.push(record); state.active.add(record.invocation); return record;
 }
@@ -185,7 +185,7 @@ export class ArtifactStore {
     const state = publications.get(this.#publicationRootKey);
     return Object.freeze({ epoch: state?.epoch ?? null, discarded: state?.discarded ?? 0,
       limits: publicationLimits, records: Object.freeze((state?.records ?? []).map(record => Object.freeze({ ...record,
-        artifact: Object.freeze({ ...record.artifact }), pendingCleanup: !!state && !state.active.has(record.invocation)
+        artifact: record.artifact ? Object.freeze({ ...record.artifact }) : null, pendingCleanup: !!state && !state.active.has(record.invocation)
           && [...state.owners.values()].some(owner => owner.outcome === record) }))) });
   }
   /** Explicit cleanup of this validated root's original publication handles only.
@@ -254,6 +254,127 @@ export class ArtifactStore {
   async putBytes(kind: "source-file-payload" | "database-snapshot", bytes: Uint8Array): Promise<ArtifactRef> {
     return this.publish(this.reference(kind, bytes), bytes);
   }
+
+  /** Streams untrusted source-file bytes into one owned private temp file.
+   * The digest is not known until EOF and the same open file is reread and
+   * synchronized.  A published payload alone never qualifies a source Fs.
+   */
+  async putSourceFilePayload(chunks: AsyncIterable<Uint8Array>, expectedBytes: bigint,
+    options: { signal?: AbortSignal } = {}): Promise<ArtifactRef> {
+    if (typeof expectedBytes !== "bigint" || expectedBytes < 0n || expectedBytes > BigInt(Number.MAX_SAFE_INTEGER)
+      || !chunks || typeof chunks[Symbol.asyncIterator] !== "function")
+      throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-input");
+    assertMaintenancePlatform();
+    await this.assertCurrent();
+    if (canonicalJson(this.identity) !== this.#publicationRootKey) throw new MaintenanceFailure("control_root_mismatch");
+    const state = publicationState(this.#publicationRootKey);
+    const outcome = beginPublication(state, null);
+    const checkCancel = () => {
+      if (options.signal?.aborted) throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-cancelled");
+    };
+    try {
+      const attempt = "attempts/0-" + randomUUID();
+      await this.mkdirPrivate(attempt);
+      const temp = path.join(this.root, attempt, "stream-" + randomUUID() + ".tmp");
+      const handle = await open(temp, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      const owner: PublicationOwner = { handle, fd: handle.fd, outcome };
+      state.owners.set(handle, owner);
+      outcome.handleOpened = true;
+
+      let failed = false, first: unknown, closeFailed = false, closeError: unknown;
+      let iterator: AsyncIterator<Uint8Array> | undefined, ended = false;
+      let total = 0n, digest: string | undefined;
+      try {
+        const info = fstatSync(handle.fd, { bigint: true });
+        owner.identity = String(info.dev) + ":" + String(info.ino);
+        iterator = chunks[Symbol.asyncIterator]();
+        if (!iterator || typeof iterator.next !== "function")
+          throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-iterator");
+        const hash = createHash("sha256");
+        while (true) {
+          checkCancel();
+          const step = await iterator.next();
+          checkCancel();
+          if (step.done) { ended = true; break; }
+          if (!(step.value instanceof Uint8Array) || step.value.byteLength === 0
+            || step.value.byteLength > 64 * 1024)
+            throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-chunk");
+          // Never hold a caller-owned buffer across asynchronous writes.
+          const owned = Buffer.from(step.value);
+          if (total + BigInt(owned.byteLength) > expectedBytes)
+            throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-overflow");
+          let written = 0;
+          while (written < owned.length) {
+            checkCancel();
+            const result = await handle.write(owned, written, owned.length - written, Number(total) + written);
+            if (!Number.isSafeInteger(result.bytesWritten) || result.bytesWritten <= 0
+              || result.bytesWritten > owned.length - written)
+              throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-short-write");
+            written += result.bytesWritten;
+          }
+          hash.update(owned);
+          total += BigInt(owned.length);
+        }
+        if (total !== expectedBytes) throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-length");
+        digest = hash.digest("hex");
+        const reference: ArtifactRef = { ref: "snapshots/" + digest + "/source-file-payload.bin",
+          sha256: digest, bytes: String(total) };
+        outcome.artifact = { ...reference };
+
+        // Re-read the very same open owner; a path reopen is not byte identity.
+        const stat = await handle.stat({ bigint: true });
+        if (!stat.isFile() || stat.nlink !== 1n || stat.size !== total || (stat.mode & 0o777n) !== 0o600n)
+          throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-identity");
+        const actualHash = createHash("sha256"), buffer = Buffer.allocUnsafe(64 * 1024);
+        let at = 0n;
+        while (at < total) {
+          checkCancel();
+          const size = Number(total - at > BigInt(buffer.length) ? BigInt(buffer.length) : total - at);
+          const result = await handle.read(buffer, 0, size, Number(at));
+          if (!Number.isSafeInteger(result.bytesRead) || result.bytesRead <= 0 || result.bytesRead > size)
+            throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-reread");
+          actualHash.update(buffer.subarray(0, result.bytesRead));
+          at += BigInt(result.bytesRead);
+        }
+        if (actualHash.digest("hex") !== digest) throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-digest");
+        await this.options.after?.("temp_written");
+        await syncMaintenanceHandle(handle);
+        await this.options.after?.("file_synced");
+      } catch (error) { failed = true; first = error; outcome.failureObserved = true; }
+      // This settles the source iterator before retiring the owner, even if the
+      // first thrown value was undefined. Return failure is only secondary.
+      if (!ended && iterator?.return) {
+        try { await iterator.return(); }
+        catch (error) { if (!failed) { failed = true; first = error; outcome.failureObserved = true; } }
+      }
+      try { await closePublicationOwner(state, owner); }
+      catch (error) { closeFailed = true; closeError = error; outcome.closeFailureObserved = true; }
+      if (failed) throw first;
+      if (closeFailed) throw closeError;
+      if (!digest || !outcome.artifact) throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-digest");
+      assertNoPendingPublication(state);
+      const ref = outcome.artifact;
+      await this.mkdirPrivate("snapshots/" + digest);
+      const target = this.pathFor(ref);
+      try {
+        await lstat(target);
+        await this.confirmDurable(ref);
+        await unlink(temp); await syncDirectory(path.dirname(temp));
+        await this.verifyFile(ref);
+        assertNoPendingPublication(state);
+        return ref;
+      } catch (error) { if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error; }
+      await this.assertCurrent();
+      await rename(temp, target); await this.options.after?.("renamed");
+      await syncDirectory(path.dirname(target)); await syncDirectory(path.dirname(temp));
+      await this.options.after?.("directory_synced");
+      await this.verifyFile(ref);
+      assertNoPendingPublication(state);
+      return ref;
+    } catch (error) { if (!outcome.closeFailureObserved) outcome.failureObserved = true; throw error; }
+    finally { state.active.delete(outcome.invocation); outcome.operationFinished = true; }
+  }
+
   /** Import only an already closed regular file inside our unique attempt subtree. */
   async importDatabase(file: string): Promise<ArtifactRef> {
     assertMaintenancePlatform(); await this.assertCurrent();
