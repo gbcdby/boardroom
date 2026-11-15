@@ -415,7 +415,7 @@ int test_close(int fd) { if(fd<700||fd>=1024)abort();++closed[fd];if(fd==700&&mo
 int test_open(const char *path, int flags, ...) { (void)flags; ++root_operations;if(mode<5)abort();if(strcmp(path,"/usr/sbin/mke2fs")&&strcmp(path,"/dev/null"))abort();return next_fd++; }
 int test_fstat(int fd, struct stat *s) { if(fd!=700)abort();memset(s,0,sizeof(*s));s->st_mode=S_IFREG|0555;s->st_size=146000;s->st_nlink=1;return 0; }
 long test_syscall(long number, ...) { if(number!=SYS_pidfd_open)abort();if(mode==2){errno=EIO;return -1;}return next_fd++; }
-ssize_t test_read(int fd, void *data, size_t size) { (void)fd;(void)data;(void)size;if(mode<5)abort();return 0; }
+ssize_t test_read(int fd, void *data, size_t size) { (void)fd;if(mode<5)abort();memset(data,0,size);return 0; }
 ssize_t test_write(int fd, const void *data, size_t size) { (void)fd;if(size!=1||*(const char*)data!='G')abort();++ack_count;return 1; }
 pid_t test_waitpid(pid_t pid, int *status, int flags) { (void)flags;if(pid!=1234)abort();*status=mode>=5?0:256;return pid; }
 pid_t test_getpid(void) { return 1; }
