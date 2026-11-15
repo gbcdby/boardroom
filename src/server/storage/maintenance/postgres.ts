@@ -692,12 +692,23 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       }
       if (lockedSchemaDigest) {
         const fresh = await connect(sourceConnection, true);
+        let freshFailed = false;
         try {
           await fresh.client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
           const catalog = await readPostgresCatalog(fresh.client, sourceConnection.schema);
           if (digestJson(catalog.schema) !== lockedSchemaDigest) throw new MaintenanceFailure("source_changed");
           await fresh.client.query("COMMIT");
-        } finally { if (factsUsed) await endFactsSession(fresh); else await endSession(fresh); }
+        } catch (error) { freshFailed = true; throw error; }
+        finally {
+          if (factsUsed) await endFactsSession(fresh);
+          else {
+            try { await endSession(fresh, true); }
+            catch (error) {
+              noteControlSql(trackedLock, "close-failure", safeError(error, "maintenance_lost", "fresh-schema-close"));
+              if (!freshFailed) throw error;
+            }
+          }
+        }
       }
       await validateControlSqlCommit(lock); assertControlSqlCommit(lock); noteControlSql(lock, "committing");
       if ((await session.client.query("COMMIT")).command !== "COMMIT") throw new MaintenanceFailure("maintenance_lost");
