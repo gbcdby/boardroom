@@ -278,7 +278,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     const mutex = this.mutex;
     if (!mutex || this.currentLock) throw new MaintenanceFailure(this.currentLock ? "maintenance_busy" : "maintenance_lost");
     await mutex.assertHeld();
-    const db = this.openSource(false); let active = true, factsInvalidated = false, factsUsed = false, controlSqlUsed = false;
+    const db = this.openSource(false); let active = true, factsInvalidated = false, factsUsed = false, controlSqlUsed = false, failed = false;
     let trackedLock: SourceLock | undefined;
     try {
       this.beginSourceWrite(db); this.currentLock = db;
@@ -338,20 +338,22 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       await assertHeld(); await validateControlSqlCommit(lock); assertControlSqlCommit(lock); noteControlSql(lock, "committing");
       db.exec("COMMIT"); this.fullSyncSource(); noteControlSql(lock, "committed"); return result;
     } catch (error) {
+      // Cleanup observations cannot replace the callback/COMMIT failure, including throw undefined.
+      failed = true;
       noteControlSql(trackedLock, "failure", error);
       const pending = finishControlSqlCallback(trackedLock); if (pending) await pending;
       try { if (db.inTransaction) db.exec("ROLLBACK"); }
-      catch (rollbackError) { noteControlSql(trackedLock, "rollback-failure", rollbackError); throw rollbackError; }
+      catch (rollbackError) { noteControlSql(trackedLock, "rollback-failure", rollbackError); }
       if (error instanceof MaintenanceFailure && error.code === "maintenance_lost") this.auditFactories.get(mutex)?.close();
       if (error instanceof MaintenanceFailure) throw error;
-      if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(String((error as { code?: string }).code))) throw new MaintenanceFailure("maintenance_busy");
+      if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(String((error as { code?: string } | null)?.code))) throw new MaintenanceFailure("maintenance_busy");
       throw error;
     } finally {
       active = false; this.currentLock = null;
       try { if (factsUsed && !controlSqlUsed) this.closeFactsSource(db); else this.closeSource(db); }
       catch (error) {
         if (factsUsed) this.auditFactories.get(mutex)?.close();
-        noteControlSql(trackedLock, "close-failure", error); throw error;
+        noteControlSql(trackedLock, "close-failure", error); if (!failed) throw error;
       }
     }
   }
