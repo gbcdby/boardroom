@@ -321,9 +321,11 @@ def synthetic_effects():
     source=synthetic_inode_image()
     uuid=bytes.fromhex(f3.plan(raw_json({"run_id":RUN}))["filesystem_uuid"].replace("-",""))
     template=bytearray(source.range(1024,1024));template[104:120]=uuid
-    def sb(mounted,path,kbytes,wtime):
+    struct.pack_into("<H",template,54,0xffff)
+    def sb(mounted,path,kbytes,wtime,mount_count,mtime):
         raw=bytearray(template);struct.pack_into("<I",raw,96,710 if mounted else 706)
         raw[136:200]=path.encode().ljust(64,b"\0");struct.pack_into("<Q",raw,0x178,kbytes)
+        struct.pack_into("<H",raw,52,mount_count);struct.pack_into("<I",raw,44,mtime)
         struct.pack_into("<I",raw,48,wtime);struct.pack_into("<I",raw,1020,d.crc32c(raw[:1020]));return bytes(raw)
     def checksum(raw,offset,seed):
         struct.pack_into(">I",raw,offset,0);struct.pack_into(">I",raw,offset,d.crc32c(raw,seed));return bytes(raw)
@@ -333,7 +335,7 @@ def synthetic_effects():
     original=checksum(head,0xfc,0xffffffff)+bytes(4*1024*1024-1024)
     altered=bytearray(original);head=bytearray(original[:1024]);struct.pack_into(">I",head,0x18,8);struct.pack_into(">I",head,0x58,17)
     altered[:1024]=checksum(head,0xfc,0xffffffff)
-    sample=sb(True,"/mnt/brd",4,100);payload=bytes(1024)+sample+bytes(2048)
+    sample=sb(True,"/mnt/brd",4,101,3,101);payload=bytes(1024)+sample+bytes(2048)
     seed=d.crc32c(uuid);tx=6
     descriptor=bytearray(BLOCK);struct.pack_into(">3I",descriptor,0,0xc03b3998,1,tx)
     struct.pack_into(">4I",descriptor,12,0,8,0,d.crc32c(payload,d.crc32c(struct.pack(">I",tx),seed)))
@@ -341,13 +343,13 @@ def synthetic_effects():
     for index,block in ((14,checksum(descriptor,4092,seed)),(15,payload),(16,checksum(commit,16,seed))):
         altered[index*BLOCK:(index+1)*BLOCK]=block
     snapshots,views={},{}
-    specifications=(("control-before",True,"/mnt/f3-prepare",0,90,10,20,original),
-                    ("control-after",False,"/mnt/f3-prepare",4,100,40,50,original),
-                    ("read-before",True,"/mnt/f3-prepare",4,100,70,80,original),
-                    ("read-after",False,"/mnt/brd",20,102,100,110,bytes(altered)))
-    for phase,mounted,point,kbytes,wtime,begin,end,raw_journal in specifications:
+    specifications=(("control-before",True,"/mnt/f3-prepare",0,90,2,90,10,20,original),
+                    ("control-after",False,"/mnt/f3-prepare",4,100,2,90,40,50,original),
+                    ("read-before",True,"/mnt/f3-prepare",4,101,3,101,70,80,original),
+                    ("read-after",False,"/mnt/brd",20,102,3,101,100,110,bytes(altered)))
+    for phase,mounted,point,kbytes,wtime,count,mtime,begin,end,raw_journal in specifications:
         blocks={index:source.block(index) for index in (1,4,4096)}
-        blocks[0]=bytes(1024)+sb(mounted,point,kbytes,wtime)+bytes(2048)
+        blocks[0]=bytes(1024)+sb(mounted,point,kbytes,wtime,count,mtime)+bytes(2048)
         for index in range(1024):
             raw=raw_journal[index*BLOCK:(index+1)*BLOCK]
             if raw!=ZERO:blocks[2048+index]=raw
@@ -360,12 +362,47 @@ def synthetic_effects():
         values=[0]*17;values[6]=sectors
         raw=(" ".join(str(n) for n in values)+"\n").encode()
         return raw_json({"monotonic_ns":str(mono),"realtime_ns":str(real*1000000000),"raw_hex":raw.hex()})
-    records={"control":{"before":stats(1,90,0),"after":stats(30,101,16),"base":sb(False,"/mnt/f3-prepare",0,90)},
-             "read":{"before":stats(60,101,16),"after":stats(90,103,56),"base":sb(False,"/mnt/f3-prepare",4,100)}}
+    records={"control":{"before":stats(1,90,0),"mounted":stats(5,90,8),"after":stats(30,101,16),
+                        "base":sb(False,"/mnt/f3-prepare",0,89,1,80)},
+             "read":{"before":stats(60,101,16),"mounted":stats(65,101,24),"after":stats(90,103,56),
+                     "base":sb(False,"/mnt/f3-prepare",4,100,2,90)}}
     return snapshots,views,records
 
 
 class FullEffectsControls(unittest.TestCase):
+    def test_cross_round_block_zero_cannot_cancel_unknown_bytes(self):
+        _,d,_=f3._sp()
+        for offset in (2500,1024+120):
+            snapshots,views,records=synthetic_effects()
+            for key in ("control-before","control-after"):
+                image=snapshots[key];blocks=dict(image.nonzero);raw=bytearray(image.block(0));raw[offset]^=1
+                if offset<2048:struct.pack_into("<I",raw,1024+1020,d.crc32c(raw[1024:1024+1020]))
+                blocks[0]=bytes(raw);rows=synthetic_snapshot(blocks,key)
+                for row,info in ((rows[0],image.before),(rows[-1],image.after)):
+                    data=raw_json(dict(info));row.update(bytes=len(data),data_hex=data.hex())
+                snapshots[key]=f3.decode_snapshot(rows,RUN,key)
+            with self.subTest(offset=offset),self.assertRaises(ValueError):
+                f3.device_effects(snapshots,views,records,RUN)
+
+    def test_each_mount_base_and_real_mount_accounting_are_required(self):
+        _,d,_=f3._sp()
+        for phase,case in ((p,c) for p in ("control","read") for c in
+                           ("volume-name","mount-count","mount-time","mount-sectors","mount-kbytes")):
+            snapshots,views,records=synthetic_effects()
+            if case in ("volume-name","mount-count","mount-kbytes"):
+                raw=bytearray(records[phase]["base"])
+                offset={"volume-name":120,"mount-count":52,"mount-kbytes":0x178}[case]
+                raw[offset]^=1;struct.pack_into("<I",raw,1020,d.crc32c(raw[:1020]));records[phase]["base"]=bytes(raw)
+            else:
+                value=json.loads(records[phase]["mounted"])
+                if case=="mount-time":value["realtime_ns"]="89000000000"
+                else:
+                    fields=bytes.fromhex(value["raw_hex"]).decode().split();fields[6]=str(int(fields[6])+8)
+                    value["raw_hex"]=(" ".join(fields)+"\n").encode().hex()
+                records[phase]["mounted"]=raw_json(value)
+            with self.subTest(phase=phase,case=case),self.assertRaises(ValueError):
+                f3.device_effects(snapshots,views,records,RUN)
+
     def test_checksums_exact_diagnostic_unmount_and_complete_four_device_observations(self):
         snapshots,views,records=synthetic_effects()
         result=f3.device_effects(snapshots,views,records,RUN)
@@ -373,6 +410,12 @@ class FullEffectsControls(unittest.TestCase):
         self.assertEqual(result["effects"]["read"]["changed_device_blocks"],[0,2048,2062,2063,2064])
         self.assertEqual(result["effects"]["read"]["diagnostic"]["transaction_id"],6)
         self.assertEqual(result["effects"]["read"]["harness_unmount"]["observed_kbytes"],20)
+        for phase,count in (("control",2),("read",3)):
+            mount=result["effects"][phase]["harness_mount"]
+            self.assertEqual(mount["mount_count_after"],count)
+            self.assertEqual(mount["write_sectors"],8);self.assertFalse(mount["provider_action"])
+            self.assertEqual(mount["inputs_sha256"]["base"],hashlib.sha256(records[phase]["base"]).hexdigest())
+        self.assertEqual(records["read"]["base"],snapshots["control-after"].range(1024,1024))
         self.assertFalse(result["effects"]["read"]["diagnostic"]["production_supported"])
         self.assertEqual(len([name for name in result["artifacts"] if name.endswith("-journal.bin")]),4)
         self.assertLess(sum(map(len,result["artifacts"].values())),64*1024*1024)
@@ -446,6 +489,7 @@ def synthetic_serial():
     for phase,pid,joined in (("control",5,25),("read",6,85)):
         add("round-begin",phase);add("block-stat-before",phase,records[phase]["before"])
         add("mount-base",phase,records[phase]["base"]);add("mount",phase,b"/mnt/brd")
+        add("block-stat-mounted",phase,records[phase]["mounted"])
         if phase=="control":
             legacy("metadata-start")
             output.extend(("BRDF2",row) for row in ordinary)

@@ -142,7 +142,7 @@ static int f3_raw_superblock(const char *phase) {
     return error ? error : ce ? ce : emitted;
 }
 
-static int f3_statistics(const char *phase, bool before) {
+static int f3_statistics(const char *phase, const char *event_name) {
     struct observation o = read_file("/sys/block/ram0/stat", 4096);
     int error = o.error ? o.error : o.close_error ? o.close_error : !o.eof ? EIO : 0;
     char text[10000]; size_t at = 0;
@@ -152,7 +152,7 @@ static int f3_statistics(const char *phase, bool before) {
     at = (size_t)n; static const char hex[] = "0123456789abcdef";
     for (size_t i = 0; i < o.length; ++i) { text[at++] = hex[bytes[i] >> 4]; text[at++] = hex[bytes[i] & 15]; }
     memcpy(text + at, "\"}", 2); at += 2;
-    int emitted = f3_event(before ? "block-stat-before" : "block-stat-after", phase, error, o.close_error, text, at);
+    int emitted = f3_event(event_name, phase, error, o.close_error, text, at);
     return error ? error : emitted;
 }
 
@@ -343,9 +343,10 @@ static int f3_round(const char *phase, bool reading, bool *mounted, bool *childr
     const char *before = reading ? "read-before" : "control-before";
     const char *after = reading ? "read-after" : "control-after";
     int error = f3_event("round-begin",phase,0,0,"",0);
-    if (!error) error = f3_statistics(phase,true);
+    if (!error) error = f3_statistics(phase,"block-stat-before");
     if (!error) error = f3_raw_superblock(phase);
     if (!error) error = f3_mount_at("/mnt/brd",phase,mounted);
+    if (!error) error = f3_statistics(phase,"block-stat-mounted");
     if (!error && !reading) {
         struct child_result child = ordinary_child("metadata");
         *children_done = child.pid <= 0 || child.reaped;
@@ -357,7 +358,7 @@ static int f3_round(const char *phase, bool reading, bool *mounted, bool *childr
     if (!error) error = f3_native(phase,reading,children_done);
     if (!error) error = f3_source_view(after);
     if (!error) error = f3_unmount_at("/mnt/brd",phase,mounted);
-    if (!error) error = f3_statistics(phase,false);
+    if (!error) error = f3_statistics(phase,"block-stat-after");
     if (!error) error = f3_snapshot(after);
     int emitted = f3_event("round-end",phase,error,0,"",0);
     return error ? error : emitted;

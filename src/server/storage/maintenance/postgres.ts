@@ -147,14 +147,17 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   function assertOpen(): void {
     if (closed || lost) throw new MaintenanceFailure("maintenance_lost");
   }
-  async function endSession(session: Session): Promise<boolean> {
+  async function endSession(session: Session, requireConfirmed = false): Promise<boolean> {
     session.ending = true;
     if (writerObservation.hasSubscribers) note({ kind: "session-end-start", session: sessionMetadata(session) });
-    let outcome = "fulfilled";
-    await session.client.end().catch(() => { outcome = "rejected"; });
-    session.ended = true; sessions.delete(session);
-    if (writerObservation.hasSubscribers) note({ kind: "session-end-complete", outcome, session: sessionMetadata(session) });
-    return outcome === "fulfilled";
+    let failed = false, closeError: unknown;
+    await session.client.end().catch(error => { failed = true; closeError = error; });
+    // Source-lock completion must retain an unconfirmed owned session and reject, even for throw undefined.
+    // Other existing best-effort callers keep their prior retirement behavior.
+    if (!failed || !requireConfirmed) { session.ended = true; sessions.delete(session); }
+    if (writerObservation.hasSubscribers) note({ kind: "session-end-complete", outcome: failed ? "rejected" : "fulfilled", session: sessionMetadata(session) });
+    if (failed && requireConfirmed) throw closeError;
+    return !failed;
   }
   async function endFactsSession(session: Session): Promise<void> {
     let confirmed = false;
@@ -471,7 +474,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     const heldMutex = mutex!;
     if (lockActive) throw new MaintenanceFailure("maintenance_busy");
     lockActive = true;
-    let session: Session | undefined, active = false, transactionId = "", changed = false, backupUsed = false, factsInvalidated = false, factsUsed = false, controlSqlUsed = false;
+    let session: Session | undefined, active = false, transactionId = "", changed = false, backupUsed = false, factsInvalidated = false, factsUsed = false, controlSqlUsed = false, failed = false;
     let trackedLock: SourceLock | undefined;
     let tables: readonly PostgresTable[] = [], lockedSchemaDigest: string | undefined;
     let frozenCapture: DatabaseManifests | undefined;
@@ -646,19 +649,23 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       if ((await session.client.query("COMMIT")).command !== "COMMIT") throw new MaintenanceFailure("maintenance_lost");
       noteControlSql(lock, "committed"); active = false; return result;
     } catch (error) {
+      failed = true;
       noteControlSql(trackedLock, "failure", error);
       const pending = finishControlSqlCallback(trackedLock); if (pending) await pending;
-      if (session) await session.client.query("ROLLBACK").catch(failure => { noteControlSql(trackedLock, "rollback-failure", failure); });
+      if (session) {
+        try { await session.client.query("ROLLBACK"); }
+        catch (failure) { noteControlSql(trackedLock, "rollback-failure", failure); }
+      }
       throw safeError(error, "snapshot_invalid");
     } finally {
       active = false; lockActive = false; assertSnapshotLock = undefined; publicBackup = undefined;
       if (session) {
         try {
           if (controlSqlUsed) { session.ending = true; await session.client.end(); session.ended = true; sessions.delete(session); }
-          else if (factsUsed) await endFactsSession(session); else await endSession(session);
+          else if (factsUsed) await endFactsSession(session); else await endSession(session, true);
         } catch (error) {
           if (factsUsed) invalidate();
-          noteControlSql(trackedLock, "close-failure", error); throw error;
+          noteControlSql(trackedLock, "close-failure", error); if (!failed) throw error;
         }
       }
     }
@@ -883,7 +890,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       if (closed) return; if (mutex) auditFactories.get(mutex)?.close(); closed = true; clearInterval(mutexTimer); abort.abort();
       await waitForPostgresTools(abort.signal);
       await Promise.allSettled([...activeVerifications]);
-      await Promise.all([...sessions].map(endSession)); mutex = undefined;
+      await Promise.all([...sessions].map(session => endSession(session))); mutex = undefined;
     },
   };
   return adapter;

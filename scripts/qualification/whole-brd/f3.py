@@ -392,6 +392,39 @@ def block_statistics(raw):
             "write_sectors": fields[6], "raw_sha256": hashlib.sha256(raw_stat).hexdigest()}
 
 
+def harness_mount(base, mounted, start, end):
+    """Fixed clean harness mount only; this is not the provider's SB allowance.
+
+    Linux 028ef9c96e96197026887c0f092424679298aae8 ext4_setup_super
+    increments s_mnt_count, sets mtime/recovery, then ext4_commit_super writes
+    one 4KiB SB. The preceding preparation mount already fixed max_mnt_count.
+    No journal replay, allocation update or extra write is accepted here.
+    """
+    _, d, _ = _sp()
+    d.ext4_superblock(base, unmounted=True); d.ext4_superblock(mounted)
+    count = struct.unpack_from("<H", base, 52)[0]
+    need(struct.unpack_from("<H", base, 54)[0] != 0, "unprepared maximum mount count")
+    need(struct.unpack_from("<H", mounted, 52)[0] == ((count+1) & 0xffff),
+         "mount count is not the single harness mount")
+    need(d.le32(mounted,96) == (d.le32(base,96) | 4), "mount may set only needs_recovery")
+    need(start["monotonic_ns"] < end["monotonic_ns"]
+         and start["realtime_ns"] <= end["realtime_ns"], "mount observation clock order")
+    need(end["write_sectors"] == start["write_sectors"]+8,
+         "mount is not exactly one 4KiB superblock write")
+    need(mounted[0x178:0x180] == base[0x178:0x180], "mount write accounting changed before its only SB write")
+    for offset, high in ((44,0x274),(48,0x275)):
+        seconds = d.le32(mounted,offset) | mounted[high] << 32
+        need(start["realtime_ns"]//1000000000 <= seconds <= end["realtime_ns"]//1000000000,
+             "mount timestamp outside the actual mount interval")
+    allowed = set(range(44,54)) | {0x274,0x275} | set(range(96,100)) | set(range(1020,1024))
+    changed = [i for i,(a,b) in enumerate(zip(base,mounted)) if a!=b]
+    need(set(changed) <= allowed, "unapproved harness mount SB mutation")
+    return {"status":"CLASSIFIED","scope":"explicit-harness-clean-mount", "provider_action":False,
+            "mount_count_before":count,"mount_count_after":(count+1)&0xffff,
+            "write_sectors":8,"changed_offsets":changed,
+            "inputs_sha256":{"base":hashlib.sha256(base).hexdigest(),"mounted":hashlib.sha256(mounted).hexdigest()}}
+
+
 def device_effects(snapshots, views, mount_records, run_id):
     """Full measured blocks; only the existing exact SP diagnostic policy is reused."""
     _, d, _ = _sp()
@@ -423,6 +456,11 @@ def device_effects(snapshots, views, mount_records, run_id):
     first = snapshots["control-before"]
     need(all(image.hashes[index] == first.hashes[index] for image in snapshots.values()
              for index in range(BLOCKS) if index not in excluded), "application/allocation block changed across rounds")
+    need(all(image.block(0)[:1024] == first.block(0)[:1024]
+             and image.block(0)[2048:] == first.block(0)[2048:] for image in snapshots.values()),
+         "unknown block0 mutation across harness stages")
+    need(mount_records["read"]["base"] == snapshots["control-after"].range(1024,1024),
+         "read mount base differs from the complete prior unmounted observation")
     raw_artifacts["journal-map.json"] = encoded({"inode":8,"blocks":list(blocks),"device_binding":stable_binding})
     effects = {}
     for phase in ("control", "read"):
@@ -436,9 +474,15 @@ def device_effects(snapshots, views, mount_records, run_id):
              "unknown block0 mutation outside superblock")
         sb_before, sb_after = before.range(1024,1024), after.range(1024,1024)
         record = mount_records[phase]
-        start, end = block_statistics(record["before"]), block_statistics(record["after"])
-        need(start["monotonic_ns"] < int(before.before["at_ns"]) < int(before.after["at_ns"]) <
+        f0._fields(record,("before","mounted","after","base"))
+        start, mounted, end = (block_statistics(record[key]) for key in ("before","mounted","after"))
+        mount = harness_mount(record["base"],sb_before,start,mounted)
+        need(mounted["monotonic_ns"] < int(before.before["at_ns"]) < int(before.after["at_ns"]) <
              end["monotonic_ns"] < int(after.before["at_ns"]), "statistics/full snapshot order")
+        if phase=="read":
+            previous = block_statistics(mount_records["control"]["after"])
+            need(int(snapshots["control-after"].after["at_ns"]) < start["monotonic_ns"]
+                 and previous["write_sectors"] == start["write_sectors"], "unobserved write between harness rounds")
         sample = None
         if phase == "read":
             head = d.be32(a,0x58)
@@ -455,8 +499,10 @@ def device_effects(snapshots, views, mount_records, run_id):
              "before_hex":before.block(index).hex(),"after_hex":after.block(index).hex()} for index in changed]}
         raw_artifacts[phase+"-changed-blocks.json"] = encoded(delta)
         raw_artifacts[phase+"-mount-base.sb"] = record["base"]
+        raw_artifacts[phase+"-block-statistics.json"] = encoded({key:f0b._json(record[key]) for key in ("before","mounted","after")})
         effects[phase] = {"status":"CLASSIFIED","changed_device_blocks":changed,
-            "journal_changed_logical_blocks":journal_changed,"diagnostic":diagnostic,"harness_unmount":lifecycle,
+            "journal_changed_logical_blocks":journal_changed,"diagnostic":diagnostic,
+            "harness_mount":mount,"harness_unmount":lifecycle,
             "full_device_block_hashes":BLOCKS,"atomic_live_snapshot":False}
     need(sum(map(len,raw_artifacts.values())) <= LIMITS["evidence_bytes"], "decoded evidence budget")
     return {"effects":effects,"baseline_payload":source_payload(first,reference),"artifacts":raw_artifacts}
@@ -585,8 +631,9 @@ def decode_serial(raw, run_id, expected_notes):
         start=take("block-stat-before",phase);base=take("mount-base",phase)
         mounted=take("mount",phase)
         need(mounted["raw"]==b"/mnt/brd","whole-source mountpoint")
+        mounted_stats=take("block-stat-mounted",phase)
         if phase=="control":
-            need(cursor<len(frames) and mounted["position"]<child_starts[0]["position"]<child_ends[0]["position"]<frames[cursor]["position"],
+            need(cursor<len(frames) and mounted_stats["position"]<child_starts[0]["position"]<child_ends[0]["position"]<frames[cursor]["position"],
                  "same-boot metadata outside the control mount/baseline interval")
         for suffix in ("before","after"):
             key=phase+"-"+suffix
@@ -601,7 +648,7 @@ def decode_serial(raw, run_id, expected_notes):
                 views[key]=source_view(selected,run_id,key)
                 need(take("unmount",phase)["raw"]==b"/mnt/brd","explicit post-Tcut harness unmount")
                 end=take("block-stat-after",phase)
-                mount_records[phase]={"before":start["raw"],"after":end["raw"],"base":base["raw"]}
+                mount_records[phase]={"before":start["raw"],"mounted":mounted_stats["raw"],"after":end["raw"],"base":base["raw"]}
             selected=[]
             while cursor<len(frames) and frames[cursor]["event"].startswith("snapshot-"):
                 row=frames[cursor];selected.append({k:row[k] for k in FRAME_FIELDS});cursor+=1
