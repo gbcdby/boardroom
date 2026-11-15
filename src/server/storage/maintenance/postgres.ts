@@ -20,6 +20,8 @@ import { decodePostgresSourceRows, readPostgresSourceClients } from "./postgres-
 import { readSourceClientAudit, withSourceClientFacts, type SourceFactsAccess } from "./source-writers.ts";
 import { BootstrapAuditFactory, type SessionAuditCollection } from "./native-audit.ts";
 import type { EventFacts } from "./control-candidate/schema.ts";
+import { assertControlSqlAnchorAllowed, assertControlSqlCommit, bindControlSql, finishControlSqlCallback, noteControlSql, validateControlSqlCommit } from "./control-sql.ts";
+import { writePostgresControlSql } from "./control-sql-write.ts";
 type PostgresAudit = Extract<EventFacts["sessions"], { kind: "postgres-session-audit-v1" }>;
 import type { AnchorChange, Blocker, BlockerCode, ControlRootIdentity, DatabaseManifests, Json,
   MaintenanceAdapter, OperationMutex, SourceClientsObservation, SourceLock, SourceObservation } from "./types.ts";
@@ -469,7 +471,8 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     const heldMutex = mutex!;
     if (lockActive) throw new MaintenanceFailure("maintenance_busy");
     lockActive = true;
-    let session: Session | undefined, active = false, transactionId = "", changed = false, backupUsed = false, factsInvalidated = false, factsUsed = false;
+    let session: Session | undefined, active = false, transactionId = "", changed = false, backupUsed = false, factsInvalidated = false, factsUsed = false, controlSqlUsed = false;
+    let trackedLock: SourceLock | undefined;
     let tables: readonly PostgresTable[] = [], lockedSchemaDigest: string | undefined;
     let frozenCapture: DatabaseManifests | undefined;
     try {
@@ -542,10 +545,12 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           return readSourceClientAudit(factsAccess, plan, factory.bind(adapter, heldMutex, lock, factsAccess.assertUnchangedLock), lock);
         },
         async anchor(change) {
+          assertControlSqlAnchorAllowed(lock);
           await assertHeld(); factsInvalidated = true; assertAnchor(change, mutex!);
           const current = await readPostgresMaintenanceState(locked.client, { required: true });
           if (!same(current, change.expected)) throw new MaintenanceFailure("source_changed");
           const expectedCas = cas(change.expected, 12);
+          assertControlSqlAnchorAllowed(lock);
           const result = await locked.client.query(`UPDATE storage_maintenance SET admission=$1,fence_epoch=$2,owner_generation=$3,
             active_migration_id=$4,plan_digest=$5,control_root_json=$6,mutex_identity_json=$7,journal_record_ref=$8,
             journal_digest=$9,journal_sequence=$10 WHERE singleton=$11 AND ${expectedCas.clause}`,
@@ -610,7 +615,17 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         },
         assertHeld,
       };
+      trackedLock = lock;
+      // Capture the concrete owned streams. Local close prevents new commands, but server lock release
+      // is only established when a fresh real operation mutex AND source transaction lock are granted.
+      const streamOf = (client: Client) => (client as unknown as { connection?: { stream?: { readonly closed?: boolean } } }).connection?.stream;
+      const sourceStream = streamOf(locked.client), mutexStream = streamOf(heldMutex.session.client);
+      bindControlSql(lock, { adapter, root: heldMutex.root, control: kind === "control", assertHeld,
+        invalidateFacts: () => { factsInvalidated = true; controlSqlUsed = true; changed = true; },
+        observe: () => lock.observeSourceClients(), manifests: () => lock.observe(), write: plan => writePostgresControlSql(locked.client, plan),
+        sourceHandleClosed: () => sourceStream?.closed === true, mutexHandleClosed: () => mutexStream?.closed === true });
       const result = await callback(lock);
+      const pending = finishControlSqlCallback(lock); if (pending) await pending;
       await assertHeld();
       if (frozenCapture) {
         const final = await observation(locked);
@@ -627,14 +642,25 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           await fresh.client.query("COMMIT");
         } finally { if (factsUsed) await endFactsSession(fresh); else await endSession(fresh); }
       }
+      await validateControlSqlCommit(lock); assertControlSqlCommit(lock); noteControlSql(lock, "committing");
       if ((await session.client.query("COMMIT")).command !== "COMMIT") throw new MaintenanceFailure("maintenance_lost");
-      active = false; return result;
+      noteControlSql(lock, "committed"); active = false; return result;
     } catch (error) {
-      if (session) await session.client.query("ROLLBACK").catch(() => {});
+      noteControlSql(trackedLock, "failure", error);
+      const pending = finishControlSqlCallback(trackedLock); if (pending) await pending;
+      if (session) await session.client.query("ROLLBACK").catch(failure => { noteControlSql(trackedLock, "rollback-failure", failure); });
       throw safeError(error, "snapshot_invalid");
     } finally {
       active = false; lockActive = false; assertSnapshotLock = undefined; publicBackup = undefined;
-      if (session) { if (factsUsed) await endFactsSession(session); else await endSession(session); }
+      if (session) {
+        try {
+          if (controlSqlUsed) { session.ending = true; await session.client.end(); session.ended = true; sessions.delete(session); }
+          else if (factsUsed) await endFactsSession(session); else await endSession(session);
+        } catch (error) {
+          if (factsUsed) invalidate();
+          noteControlSql(trackedLock, "close-failure", error); throw error;
+        }
+      }
     }
   }
   function verifyDatabase(databaseFile: string, expected: DatabaseManifests, restoreDirectory: string): Promise<Json> {

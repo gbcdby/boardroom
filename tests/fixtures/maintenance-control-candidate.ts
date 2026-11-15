@@ -1,17 +1,18 @@
 import { canonicalJson, digestJson, sha256 } from "../../src/server/storage/maintenance/canonical.ts";
-import type { ArtifactRef, ObjectKind, SourceClientRawRow, SourceClientsRosterV1 } from "../../src/server/storage/maintenance/types.ts";
+import type { ArtifactRef, ControlRootIdentity, Json, ObjectKind, SourceClientRawRow, SourceClientsRosterV1 } from "../../src/server/storage/maintenance/types.ts";
 import { buildDatabaseManifests, digestRowMultiset } from "../../src/server/storage/maintenance/manifests.ts";
 
 /** Pure synthetic content vectors only. These bytes are never native/restore/qualification evidence. */
-export function controlVector(options: { backend?: "sqlite" | "postgres"; platform?: "linux" | "darwin"; encoding?: string; initialVersion?: 1 | 2 | 3 } = {}) {
+export function controlVector(options: { backend?: "sqlite" | "postgres"; platform?: "linux" | "darwin"; encoding?: string; initialVersion?: 1 | 2 | 3;
+  mechanism?: { sourceIdentity: Json; databaseInstanceId: string; root: ControlRootIdentity; mutex: Json; schemaManifestDigest: string; guardManifestDigest: string } } = {}) {
   const backend = options.backend ?? "sqlite", platform = options.platform ?? "linux";
   const hash = (character: string) => character.repeat(64);
-  const sourceIdentity = backend === "sqlite"
+  const sourceIdentity = options.mechanism?.sourceIdentity ?? (backend === "sqlite"
     ? { kind: "sqlite", sourcePath: "/a12/source.sqlite", sqlitePath: "/a12/source.sqlite", device: "1", inode: "2" }
-    : { formatVersion: 1, kind: "postgres", systemIdentifier: "1000", databaseOid: "100", databaseName: "fixture", schemaOid: "101", schemaName: "public", serverAddress: null, serverPort: null, descriptorDigest: hash("a"), databaseInstanceId: "1".repeat(32) };
-  const source = { kind: backend, databaseInstanceId: "1".repeat(32), identityDigest: digestJson(sourceIdentity) };
-  const root = { path: "/a12/control", device: "1", inode: "3", hostIdentityDigest: hash("b") };
-  const mutex = { kind: "fixture-only-mutex", sourceIdentityDigest: source.identityDigest };
+    : { formatVersion: 1, kind: "postgres", systemIdentifier: "1000", databaseOid: "100", databaseName: "fixture", schemaOid: "101", schemaName: "public", serverAddress: null, serverPort: null, descriptorDigest: hash("a"), databaseInstanceId: "1".repeat(32) });
+  const source = { kind: backend, databaseInstanceId: options.mechanism?.databaseInstanceId ?? "1".repeat(32), identityDigest: digestJson(sourceIdentity) };
+  const root = options.mechanism?.root ?? { path: "/a12/control", device: "1", inode: "3", hostIdentityDigest: hash("b") };
+  const mutex = options.mechanism?.mutex ?? { kind: "fixture-only-mutex", sourceIdentityDigest: source.identityDigest };
   const planned = (path: string) => ({ path, existingAncestor: { path: "/a12", device: "1", inode: "1" }, absentSegments: [path.split("/").at(-1)!] });
   const roots = [{ label: "config", path: "/a12/config", expected: planned("/a12/config") }, { label: "managed-sessions", path: "/a12/managed/sessions", expected: { ...planned("/a12/managed/sessions"), absentSegments: ["managed", "sessions"] } }];
   const objects: { reference: ArtifactRef; bytes: Buffer }[] = [];
@@ -25,8 +26,8 @@ export function controlVector(options: { backend?: "sqlite" | "postgres"; platfo
     return reference;
   };
   const plan = { formatVersion: 1, kind: "plan", migrationId: "a12", source, sourceIdentity, originalCwd: "/a12", originalConfigPath: "/a12/config",
-    configDigest: hash("c"), effectiveConfigDigest: hash("d"), schemaManifestDigest: digestJson({ fixture: "schema" }), guardManifestDigest: hash("e"),
-    controlRoot: planned(root.path), targetRoot: planned("/a12/target"), fileRoots: roots,
+    configDigest: hash("c"), effectiveConfigDigest: hash("d"), schemaManifestDigest: options.mechanism?.schemaManifestDigest ?? digestJson({ fixture: "schema" }), guardManifestDigest: options.mechanism?.guardManifestDigest ?? hash("e"),
+    controlRoot: options.mechanism ? { path: root.path, existingAncestor: { path: root.path, device: root.device, inode: root.inode }, absentSegments: [] } : planned(root.path), targetRoot: planned("/a12/target"), fileRoots: roots,
     preview: { observedAt: "2026-11-15T00:00:00.000Z", dataDigest: hash("f"), tableCounts: {}, clientInventory: [] }, requiredCapabilities: [], blockers: [] };
   const planRef = pack("plan", plan);
   const files = { formatVersion: 2, kind: "source-files", source, roots,
@@ -50,10 +51,14 @@ export function controlVector(options: { backend?: "sqlite" | "postgres"; platfo
   const processCheck = platform === "linux"
     ? { kind: "linux-matched", observerUid: 1000, kernelBootId: process.kernelBootId, pidNamespace: process.pidNamespace, pid: process.pid, uidBefore: 1000, uidAfter: 1000, startTicksBefore: "100", startTicksAfter: "100" }
     : { kind: "darwin-present", result: { version: 1, pid: 123, bootSessionUuid: process.bootSessionUuid, status: "present", uid: 1000, startSeconds: "10", startMicroseconds: "20" } };
-  const sourceFiles = [{ role: "main", path: "/a12/source.sqlite", presence: "present", device: "1", inode: "2", ...(platform === "linux" ? { mappedMajor: "0", mappedMinor: "1", mappedInode: "2" } : {}) },
-    { role: "wal", path: "/a12/source.sqlite-wal", presence: "absent" }, { role: "shm", path: "/a12/source.sqlite-shm", presence: "absent" }];
+  const nativeSource = sourceIdentity as Record<string, Json>;
+  const sqlPath = backend === "sqlite" ? String(nativeSource.sqlitePath) : "/a12/source.sqlite";
+  const device = backend === "sqlite" ? String(nativeSource.device) : "1", inode = backend === "sqlite" ? String(nativeSource.inode) : "2", dev = BigInt(device);
+  const sourceFiles = [{ role: "main", path: sqlPath, presence: "present", device, inode, ...(platform === "linux" ? {
+    mappedMajor: String((dev >> 8n & 0xfffn) | (dev >> 32n & 0xfffff000n)), mappedMinor: String((dev & 0xffn) | (dev >> 12n & 0xffffff00n)), mappedInode: inode } : {}) },
+    { role: "wal", path: `${sqlPath}-wal`, presence: "absent" }, { role: "shm", path: `${sqlPath}-shm`, presence: "absent" }];
   const sessions = backend === "postgres"
-    ? { kind: "postgres-session-audit-v1", databaseOid: "100", schemaOid: "101", descriptorDigest: hash("a"), ownedSessions: [], activity: [], registeredSessions: [], preparedQueryRows: 0 }
+    ? { kind: "postgres-session-audit-v1", databaseOid: String(nativeSource.databaseOid), schemaOid: String(nativeSource.schemaOid), descriptorDigest: String(nativeSource.descriptorDigest), ownedSessions: [], activity: [], registeredSessions: [], preparedQueryRows: 0 }
     : { kind: platform === "linux" ? "sqlite-linux-session-audit-v1" : "sqlite-darwin-session-audit-v1", observer: { host, process }, uid: 1000, sourceFiles, sessionsTree: "/a12/managed/sessions", ownedResources: [], ...(platform === "linux" ? { matches: [] } : { inventory: { version: 1, scope: "current-uid", items: [] } }) };
   const facts = { formatVersion: 1, kind: "source-control-event-facts", collector: "boardroom-source-control-facts-v1", observedAt: "2026-11-15T00:00:00.000Z",
     actor: { actorId, clientId: null, host, process, processCheck }, beforeCount: "0", beforeRowsDigest: rowsDigest([]), clients: [],
