@@ -13,6 +13,7 @@ import f0
 
 MIB = 1024 * 1024
 SCOPE = "https://github.com/gbcdby/boardroom/issues/152#issuecomment-6890398295"
+TRANSPORT_SCOPE = "https://github.com/gbcdby/boardroom/issues/152#issuecomment-6891835320"
 CMDLINE = "console=ttyS0,115200n8 rdinit=/init loglevel=4 panic=0 bdev_allow_write_mounted=0"
 LIMITS = {
     "guest_memory_bytes": 512 * MIB, "vcpus": 1,
@@ -49,6 +50,7 @@ def plan(raw: bytes) -> dict:
     f0._fields(value, ("run_id",))
     run_id = str(f0._uuid(value["run_id"]))
     return {"kind": "whole-brd-f0bf1-inputs", "scope": SCOPE, "run_id": run_id,
+            "transport_scope": TRANSPORT_SCOPE, "transport": "owned-stdio-qmp-serial-pipe-fdset-v1",
             "fixture_targets": 0, "ambient_block_objects": "MUST_OBSERVE_NOT_ASSUME_EMPTY",
             "qualification": "UNSUPPORTED", "guest_execution": "NOT_RUN",
             "policy": "UNKNOWN", "limits": dict(LIMITS), "cmdline": CMDLINE}
