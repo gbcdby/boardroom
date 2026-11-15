@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import promises, { mkdtemp, rm } from "node:fs/promises";
+import promises, { lstat, mkdtemp, rm } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
@@ -106,6 +106,26 @@ nativeTest("#152 payload: cancellation settles iterator before publication", asy
     assert.equal(released, 1);
     const outcome = f.store.publicationOutcomes().records.at(-1)!;
     assert.equal(outcome.artifact, null); assert.equal(outcome.handleClosed, true);
+  } finally { await f.close(); }
+});
+
+
+nativeTest("#152 payload: cancellation after sync still prevents immutable name publication", async () => {
+  const f = await fixture(), abort = new AbortController();
+  const bytes = Buffer.from([0x10, 0x20, 0x30, 0x40]);
+  const digest = sha256(bytes);
+  const reference = { ref: "snapshots/" + digest + "/source-file-payload.bin", sha256: digest, bytes: String(bytes.length) };
+  try {
+    const guarded = await ArtifactStore.open(f.store.root, source, {
+      after(point) { if (point === "file_synced") abort.abort(); }
+    });
+    const chunks = (async function* () { yield bytes; })();
+    await assert.rejects(guarded.putSourceFilePayload(chunks, BigInt(bytes.length), { signal: abort.signal }),
+      error => error instanceof MaintenanceFailure && error.code === "snapshot_invalid");
+    await assert.rejects(lstat(f.store.pathFor(reference)), { code: "ENOENT" });
+    const result = f.store.publicationOutcomes().records.at(-1)!;
+    assert.equal(result.operationFinished, true); assert.equal(result.handleClosed, true);
+    assert.equal(result.failureObserved, true); assert.equal(result.pendingCleanup, false);
   } finally { await f.close(); }
 });
 
