@@ -60,6 +60,10 @@ watch([context.currentProjectId,()=>props.taskId,context.generation],()=>{
   void resource.setScope(projectId&&props.taskId?{projectId,taskId:props.taskId,key:`${projectId}:${props.taskId}:${context.generation.value}:decisions`}:null);
 },{immediate:true});
 watch(()=>props.roundId,()=>{emit('current',current.value);});
+// A confirmed command elsewhere on this page invalidates reads started before
+// that command. Re-read the server; its receipt is not the current Decision.
+async function reloadCurrent():Promise<void>{await resource.committed(()=>null);}
+defineExpose({reloadCurrent});
 </script>
 <template>
   <section class="decision-panel" data-testid="decision-panel">

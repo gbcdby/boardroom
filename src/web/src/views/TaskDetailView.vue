@@ -35,6 +35,7 @@ const reason = ref("");
 const reasonRevision = ref<number | null>(null);
 const decisionReason = ref("");
 const currentDecision = ref<LiveDecisionView | null>(null);
+const decisionPanel = ref<InstanceType<typeof DecisionPanel> | null>(null);
 const decisionBase = ref<{ taskRevision: number; roundId: string; roundRevision: number; head: ReviewHeadRef | null; decisionRef: DecisionRef | null } | null>(null);
 const decisionUnknown = ref(false);
 const decisionRefreshed = ref(false);
@@ -207,8 +208,11 @@ async function decide(retry = false): Promise<void> {
       : decisionResultMessage(result);
     if (result.state !== "refreshed") { decisionReason.value = ""; frozenDecision.value = null; }
     if (result.state === "applied") toast.success(notice.value);
-    await resource.committed(snapshot => snapshot && result.task.revision >= snapshot.detail.task.revision
-      ? { ...snapshot, detail: { ...snapshot.detail, task: result.task } } : snapshot);
+    await Promise.all([
+      resource.committed(snapshot => snapshot && result.task.revision >= snapshot.detail.task.revision
+        ? { ...snapshot, detail: { ...snapshot.detail, task: result.task } } : snapshot),
+      decisionPanel.value?.reloadCurrent(),
+    ]);
   } catch (err) {
     if (!isCurrent(projectId, id, generation, scope)) return;
     // A rejected retry may mean that the current actor can no longer read the
@@ -233,7 +237,9 @@ async function reloadLatest(): Promise<void> {
   const projectId = currentProjectId.value, id = taskId.value, generation = context.generation.value, scope = scopeVersion;
   if (!projectId || !id) return;
   latestReadSucceeded.value = false;
-  error.value = null; await load();
+  // An explicit reload must not wait for a response requested before the
+  // conflict. Keep the draft/base, cancel that read, then fetch authority anew.
+  error.value = null; await resource.committed();
   if (!isCurrent(projectId, id, generation, scope)) return;
   if (latestReadSucceeded.value && !displayError.value) { conflict.value = false; notice.value = editing.value ? `已载入最新版本；草稿仍基于版本 ${baseRevision.value}。请核对后明确采用最新版本。` : "已载入最新版本。"; }
 }
@@ -293,7 +299,7 @@ onBeforeUnmount(() => { disposed = true; });
           <div class="review-axes"><section v-for="axis in ['spec', 'standards']" :key="axis" class="review-axis" :data-testid="`task-report-${axis}`"><h3>{{ axis === 'spec' ? '需求轴' : '标准轴' }}</h3><template v-for="report in reportsOf(round).filter((report) => report.axis === axis)" :key="report.id"><span class="badge" :class="report.verdict === 'pass' ? 'ok' : 'warning-text'">{{ report.verdict === 'pass' ? '通过' : '需要修改' }}</span><p class="task-body">{{ report.body }}</p><details><summary>来源与执行证据</summary><ul><li v-for="source in report.sources" :key="source" class="small">{{ source }}</li></ul><p class="muted small">以下执行记录由 reviewer 声明，平台未据此验证真实宿主。</p><pre class="task-evidence">{{ JSON.stringify(report.evidence, null, 2) }}</pre></details></template><p v-if="!reportsOf(round).some((report) => report.axis === axis)" class="muted small">尚无此轴报告。</p></section></div>
           <details v-if="round.candidate" class="candidate-evidence"><summary>固定候选与采集记录</summary><dl class="task-meta"><div><dt>基准</dt><dd><code>{{ round.candidate.baseCommit }}</code></dd></div><div><dt>候选</dt><dd><code>{{ round.candidate.candidateCommit }}</code></dd></div><div><dt>Diff 摘要</dt><dd><code>{{ round.candidate.diffSha256 }}</code></dd></div></dl><h3>目标快照</h3><p class="task-body">{{ round.specSnapshot.body }}</p><template v-if="round.specSnapshot.acceptanceText !== undefined"><h3>验收快照</h3><p class="task-body">{{ round.specSnapshot.acceptanceText }}</p><p class="muted small">{{ round.specSnapshot.acceptanceSource === 'legacy_task_body' ? '来源：旧任务正文快照' : '来源：明确填写' }}</p></template><h3>提交记录</h3><ul><li v-for="commit in round.candidate.commits" :key="commit.sha"><code>{{ commit.sha }}</code> {{ commit.subject }}</li></ul><h3>代码差异</h3><pre class="task-evidence" tabindex="0" aria-label="评审代码差异">{{ round.candidate.diff }}</pre><details><summary>Git 采集命令</summary><pre class="task-evidence">{{ JSON.stringify(round.candidate.commands, null, 2) }}</pre></details></details>
         </details>
-        <DecisionPanel :task-id="task.id" :round-id="task.currentReviewRoundId" :round-state="activeRound?.state ?? null" :blocked="!!busy || decisionUnknown" @current="receiveDecision" @locked="choiceLocked = $event" @committed="resource.committed()" />
+        <DecisionPanel ref="decisionPanel" :task-id="task.id" :round-id="task.currentReviewRoundId" :round-state="activeRound?.state ?? null" :blocked="!!busy || decisionUnknown" @current="receiveDecision" @locked="choiceLocked = $event" @committed="resource.committed()" />
         <form v-if="canOverride || !!decisionReason || decisionUnknown" class="override-form" @submit.prevent="decide()">
           <h3>{{ canOverride ? '管理者覆盖裁决' : '未提交的裁决草稿' }}</h3>
           <p class="muted small">以当前网页的管理者身份提出并确认此任务结论。两轴报告和原裁决会保留；是否已应用以回执为准。拒绝或退回上方提案不会改变任务结论。</p>

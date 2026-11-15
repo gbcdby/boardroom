@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createMcpCore } from '../src/server/mcp/core.ts';
 import { createLogger } from '../src/server/logger.ts';
 import { newId } from '../src/server/db/ids.ts';
-import type { DbRow } from '../src/server/db/driver.ts';
+import type { DbDriver, DbRow } from '../src/server/db/driver.ts';
 import type { MessageReadScope, RepositorySet } from '../src/server/db/repositories.ts';
 import { WriteFailedError } from '../src/server/db/errors.ts';
 import { ownerActor } from '../src/server/authz/actors.ts';
@@ -13,6 +14,83 @@ import { closeMemoryRuntime } from '../src/server/memory/runtime.ts';
 import { memoryFixture, pgUnavailable } from './helpers/memory-fixture.ts';
 
 const logger = createLogger({ level: 'error', write() {} });
+type ReadCounts = { reads: number; bodyRows: number };
+
+/** 按本次调用的异步来源计量；join 已排入的真实后台任务不属于 wait。 */
+async function measureWaitReads<T>(repos: RepositorySet, run: () => Promise<T>) {
+  const origin = new AsyncLocalStorage<true>();
+  const query = repos.context.query, one = repos.context.one;
+  const counts = { mcp: { reads: 0, bodyRows: 0 }, background: { reads: 0, bodyRows: 0 } };
+  const bucket = () => origin.getStore() ? counts.mcp : counts.background;
+  const observe = (target: ReadCounts, value: unknown) => {
+    for (const row of Array.isArray(value) ? value : value ? [value] : []) {
+      if (typeof row === 'object' && row !== null && 'body' in row && 'mentions' in row) target.bodyRows++;
+    }
+  };
+  repos.context.query = async <R extends DbRow = DbRow>(sql: string, params?: readonly unknown[]) => {
+    const target = bucket(); target.reads++;
+    const result = await query<R>(sql, params); observe(target, result); return result;
+  };
+  repos.context.one = async <R extends DbRow = DbRow>(sql: string, params?: readonly unknown[]) => {
+    const target = bucket(); target.reads++;
+    const result = await one<R>(sql, params); observe(target, result); return result;
+  };
+  try {
+    const result = await origin.run(true, run);
+    // 后台可继续工作；固定返回时点的副本，不能让后续诊断 await 改写样本。
+    return { result, mcp: { ...counts.mcp }, background: { ...counts.background } };
+  } finally { repos.context.query = query; repos.context.one = one; origin.disable(); }
+}
+
+function assertWaitReadBudget(counts: ReadCounts): void {
+  assert.ok(counts.reads < 250, `完整257条积压不能逐消息重复一套查询，实际${counts.reads}条读取`);
+  assert.equal(counts.bodyRows, 257, '最终权限重验只需标识，不能把每条正文再加载一遍');
+}
+
+/** 仅测试调度：原投递事务真正提交后，允许 join 的原后台页完成，再进入最终兑现。 */
+function overlapMemoryPage(repos: RepositorySet, db: DbDriver) {
+  const wait = new AsyncLocalStorage<true>();
+  const run = repos.mutations.run, mark = repos.deliveries.markMcpDeliveredBatch;
+  const page = repos.memory.unobservedDeliveries, checkpoint = repos.memory.updateScanCheckpointCas;
+  let releaseCommitted!: () => void, releasePage!: () => void;
+  const committed = new Promise<void>(resolve => { releaseCommitted = resolve; });
+  const finished = new Promise<void>(resolve => { releasePage = resolve; });
+  const bounded = (gate: Promise<void>) => new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('真实后台页重叠控制未到达约定边界')), 3000);
+    void gate.then(() => { clearTimeout(timer); resolve(); }, error => { clearTimeout(timer); reject(error); });
+  });
+  let deliveryCompleted = false, pausedAfterCommit = false, pageRows = 0, checkpointCompleted = false;
+  repos.deliveries.markMcpDeliveredBatch = async (...args) => { await mark(...args); deliveryCompleted = true; };
+  repos.mutations.run = async (scope, body) => {
+    const fromWait = wait.getStore();
+    if (!fromWait && !pausedAfterCommit) await bounded(committed);
+    const result = await run(scope, body);
+    if (fromWait && deliveryCompleted && !pausedAfterCommit && !db.currentTransactionContext()) {
+      pausedAfterCommit = true; releaseCommitted(); await bounded(finished);
+    }
+    return result;
+  };
+  repos.memory.unobservedDeliveries = async (...args) => {
+    const result = await page(...args); pageRows = result.rows.length; return result;
+  };
+  repos.memory.updateScanCheckpointCas = async (...args) => {
+    const result = await checkpoint(...args);
+    if (args[0].scope.kind === 'message_threshold' && pageRows === 50) {
+      checkpointCompleted = true; releasePage();
+    }
+    return result;
+  };
+  return {
+    run: <T>(body: () => Promise<T>) => wait.run(true, body),
+    facts: () => ({ pausedAfterCommit, pageRows, checkpointCompleted }),
+    restore() {
+      releaseCommitted(); releasePage(); wait.disable();
+      repos.mutations.run = run; repos.deliveries.markMcpDeliveredBatch = mark;
+      repos.memory.unobservedDeliveries = page; repos.memory.updateScanCheckpointCas = checkpoint;
+    },
+  };
+}
+
 async function people(repos: RepositorySet, name = '批量接收者') {
   const project = await repos.projects.create({ name: '#154 批量投递' });
   const sender = await repos.members.create({ projectId: project.id, kind: 'human', displayName: '人' });
@@ -38,6 +116,41 @@ async function seed(repos: RepositorySet, p: Awaited<ReturnType<typeof people>>,
     }
   }));
   return ids;
+}
+
+for (const repeatInMcp of [false, true]) {
+  test(`sqlite #154 来源计量：真实后台页重叠${repeatInMcp ? '仍能检出MCP逐条重读' : '不污染MCP预算'}`, { timeout: 10000 }, async t => memoryFixture(async (repos, db) => {
+    const p = await people(repos), ids = await seed(repos, p, 257);
+    const core = createMcpCore({ repos, db, logger, memberKey: 'batch-origin-control' });
+    await core.join('receiver', { projectId: p.project.id, groupId: p.group.id, displayName: p.agent.displayName, hostType: 'other' });
+    const overlap = overlapMemoryPage(repos, db), visibleIds = repos.messages.listVisibleIdsForMember;
+    let repeatedReads = 0;
+    if (repeatInMcp) repos.messages.listVisibleIdsForMember = async (...args) => {
+      // 模拟 MCP 最终复核自身退回 N+1：真正读库，同一种 messages.get 不能被 SQL 形状排除。
+      if (overlap.facts().pausedAfterCommit && args[2]?.requireActive) {
+        for (const id of args[1]) { await repos.messages.get(id); repeatedReads++; }
+      }
+      return visibleIds(...args);
+    };
+    try {
+      const measured = await measureWaitReads(repos, () => overlap.run(() => core.waitForMessages('receiver', { timeoutMs: 1000 })));
+      const { result } = measured;
+      assert.equal(result.status, 'message'); assert.deepEqual(result.messages.map(m => m.id), ids); assert.equal(result.cursor, 'c_257');
+      assert.deepEqual(overlap.facts(), { pausedAfterCommit: true, pageRows: 50, checkpointCompleted: true });
+      assert.equal(measured.background.bodyRows, 100, '后台真实50条页各get和visible读取一次正文');
+      assert.ok(measured.background.reads > 0, '后台实际SQL没有被停止或伪造');
+      t.diagnostic(JSON.stringify({ messages: result.messages.length, mcp: measured.mcp, background: measured.background }));
+      if (repeatInMcp) {
+        assert.equal(repeatedReads, 257, '仅在本次MCP最终复核中注入一轮真实逐条读取');
+        assert.ok(measured.mcp.reads >= 250, 'MCP自身257次重复读取必须突破原查询门槛');
+        assert.equal(measured.mcp.bodyRows, 514, 'MCP自身每条重读仍须完整计入');
+        assert.throws(() => assertWaitReadBudget(measured.mcp), { code: 'ERR_ASSERTION' });
+      } else assertWaitReadBudget(measured.mcp);
+    } finally {
+      repos.messages.listVisibleIdsForMember = visibleIds; overlap.restore();
+      await core.close(); await closeMemoryRuntime(db);
+    }
+  }, 'sqlite'));
 }
 
 for (const engine of ['sqlite', 'postgres'] as const) {
@@ -87,27 +200,14 @@ for (const engine of ['sqlite', 'postgres'] as const) {
     const p = await people(repos), ids = await seed(repos, p, 257);
     const core = createMcpCore({ repos, db, logger, memberKey: 'batch-count' });
     await core.join('receiver', { projectId: p.project.id, groupId: p.group.id, displayName: p.agent.displayName, hostType: 'other' });
-    const query = repos.context.query, one = repos.context.one;
-    let reads = 0, bodyRows = 0;
-    const observe = (value: unknown) => {
-      for (const row of Array.isArray(value) ? value : value ? [value] : []) {
-        if (typeof row === 'object' && row !== null && 'body' in row && 'mentions' in row) bodyRows++;
-      }
-    };
-    repos.context.query = async <T extends DbRow = DbRow>(sql: string, params?: readonly unknown[]) => {
-      reads++; const result = await query<T>(sql, params); observe(result); return result;
-    };
-    repos.context.one = async <T extends DbRow = DbRow>(sql: string, params?: readonly unknown[]) => {
-      reads++; const result = await one<T>(sql, params); observe(result); return result;
-    };
     try {
-      const result = await core.waitForMessages('receiver', { timeoutMs: 1000 });
+      const measured = await measureWaitReads(repos, () => core.waitForMessages('receiver', { timeoutMs: 1000 }));
+      const { result } = measured;
       assert.equal(result.status, 'message'); assert.deepEqual(result.messages.map(m => m.id), ids); assert.equal(result.cursor, 'c_257');
-      t.diagnostic(JSON.stringify({ messages: result.messages.length, reads, bodyRows }));
-      assert.ok(reads < 250, `完整257条积压不能逐消息重复一套查询，实际${reads}条读取`);
-      assert.equal(bodyRows, 257, '最终权限重验只需标识，不能把每条正文再加载一遍');
+      t.diagnostic(JSON.stringify({ messages: result.messages.length, ...measured.mcp, background: measured.background }));
+      assertWaitReadBudget(measured.mcp);
     } finally {
-      repos.context.query = query; repos.context.one = one; await core.close(); await closeMemoryRuntime(db);
+      await core.close(); await closeMemoryRuntime(db);
     }
   }, engine));
 
