@@ -351,20 +351,24 @@ export class ArtifactStore {
       catch (error) { closeFailed = true; closeError = error; outcome.closeFailureObserved = true; }
       if (failed) throw first;
       if (closeFailed) throw closeError;
+      checkCancel();
       if (!digest || !outcome.artifact) throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-digest");
       assertNoPendingPublication(state);
       const ref = outcome.artifact;
       await this.mkdirPrivate("snapshots/" + digest);
+      checkCancel();
       const target = this.pathFor(ref);
       try {
         await lstat(target);
         await this.confirmDurable(ref);
+        checkCancel();
         await unlink(temp); await syncDirectory(path.dirname(temp));
         await this.verifyFile(ref);
         assertNoPendingPublication(state);
         return ref;
       } catch (error) { if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error; }
       await this.assertCurrent();
+      checkCancel();
       await rename(temp, target); await this.options.after?.("renamed");
       await syncDirectory(path.dirname(target)); await syncDirectory(path.dirname(temp));
       await this.options.after?.("directory_synced");
