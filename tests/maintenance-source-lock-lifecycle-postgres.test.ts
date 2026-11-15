@@ -87,21 +87,28 @@ pgTest("#152 PostgreSQL ordinary anchor requires confirmed end after its single 
 });
 
 pgTest("#152 PostgreSQL first callback failure survives rollback/end errors and keeps safe mapping", async t => {
-  for (const scenario of ["ordinary", "mechanism", "undefined", "busy"] as const) await t.test(scenario, async child => {
+  for (const scenario of ["ordinary", "mechanism", "undefined", "busy", "rollback-dispatch"] as const) await t.test(scenario, async child => {
     const f = await fixture(), before = await independentlyRead(f), query = Client.prototype.query, end = Client.prototype.end;
-    const mechanism = scenario === "mechanism" || scenario === "undefined";
+    const mechanism = scenario === "mechanism" || scenario === "undefined" || scenario === "rollback-dispatch";
     const primary = scenario === "undefined" ? undefined : scenario === "busy" ? Object.assign(new Error("native-lock-not-available"), { code: "55P03" })
       : new MaintenanceFailure("phase_conflict", "callback-first");
     const rollbackFailure = new Error("callback-rollback"), closeFailure = new Error("callback-end");
-    let writer: Client | undefined, captured: SourceLock | undefined, rolledBack = false, ended = false;
+    let writer: Client | undefined, captured: SourceLock | undefined, rollbackAttempted = false, rolledBack = false, ended = false;
     let rejected = false, rejection: unknown;
     try {
-      child.mock.method(Client.prototype, "query", (async function (this: Client, ...args: unknown[]) {
+      child.mock.method(Client.prototype, "query", (function (this: Client, ...args: unknown[]) {
         const sql = sqlText(args[0]);
         if (database(this) === f.database && sql.startsWith(mechanism ? "UPDATE storage_maintenance SET owner_generation=" : "UPDATE storage_maintenance SET admission=")) writer = this;
-        const result = await invokeQuery(query, this, args);
-        if (this === writer && sql === "ROLLBACK") { rolledBack = true; throw rollbackFailure; }
-        return result;
+        if (this === writer && sql === "ROLLBACK") {
+          rollbackAttempted = true;
+          // A dispatch failure occurs before a promise exists. The confirmed real
+          // connection close below must release this still-open transaction.
+          if (scenario === "rollback-dispatch") throw rollbackFailure;
+        }
+        return invokeQuery(query, this, args).then(result => {
+          if (this === writer && sql === "ROLLBACK") { rolledBack = true; throw rollbackFailure; }
+          return result;
+        });
       }) as typeof query);
       child.mock.method(Client.prototype, "end", (async function (this: Client) {
         await invokeEnd(end, this);
@@ -114,7 +121,8 @@ pgTest("#152 PostgreSQL first callback failure survives rollback/end errors and 
           throw primary;
         });
       } catch (error) { rejected = true; rejection = error; }
-      assert.equal(rejected, true); assert.equal(rolledBack, true); assert.equal(ended, true);
+      assert.equal(rejected, true); assert.equal(rollbackAttempted, true);
+      assert.equal(rolledBack, scenario !== "rollback-dispatch"); assert.equal(ended, true);
       if (scenario === "undefined" || scenario === "busy") {
         assert.ok(rejection instanceof MaintenanceFailure); assert.equal(rejection.code, scenario === "busy" ? "maintenance_busy" : "snapshot_invalid");
       } else assert.equal(rejection, primary);

@@ -652,7 +652,10 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       failed = true;
       noteControlSql(trackedLock, "failure", error);
       const pending = finishControlSqlCallback(trackedLock); if (pending) await pending;
-      if (session) await session.client.query("ROLLBACK").catch(failure => { noteControlSql(trackedLock, "rollback-failure", failure); });
+      if (session) {
+        try { await session.client.query("ROLLBACK"); }
+        catch (failure) { noteControlSql(trackedLock, "rollback-failure", failure); }
+      }
       throw safeError(error, "snapshot_invalid");
     } finally {
       active = false; lockActive = false; assertSnapshotLock = undefined; publicBackup = undefined;
