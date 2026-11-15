@@ -25,6 +25,97 @@ ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
 
 
+class WholeSuiteBudgetContracts(unittest.TestCase):
+    def configured(self, owner, entry):
+        # Read the real invocation without creating accounts or launching a suite.
+        source = ast.parse(Path(ci.__file__).read_text())
+        function = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == owner)
+        calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == 'run_command']
+        self.assertEqual(len(calls), 1)
+        values = dict(zip(('timeout', 'grace'), ci.run_command.__defaults__))
+        for item in calls[0].keywords:
+            if item.arg in values:
+                values[item.arg] = eval(compile(ast.Expression(item.value), '<fixed-budget>', 'eval'),
+                                        vars(ci), {'entry': entry, 'request': {'entry': entry}})
+        return values
+
+    def virtual_command(self, duration, budget, exit_code=0):
+        clock, signals = [0.0], []
+        child = SimpleNamespace(pid=24680, returncode=None)
+
+        def poll():
+            if child.returncode is None and clock[0] >= duration:
+                child.returncode = exit_code
+            return child.returncode
+
+        def wait(timeout):
+            if poll() is None:
+                raise subprocess.TimeoutExpired('virtual-child', timeout)
+            return child.returncode
+
+        def signal_group(pid, number):
+            self.assertEqual(pid, child.pid)
+            signals.append(number)
+            child.returncode = -number
+
+        child.poll, child.wait = poll, wait
+        with mock.patch.object(ci.subprocess, 'Popen', return_value=child), \
+             mock.patch.object(ci.time, 'monotonic', side_effect=lambda: clock[0]), \
+             mock.patch.object(ci.time, 'sleep', side_effect=lambda _: clock.__setitem__(0, clock[0] + 1)), \
+             mock.patch.object(ci.signal, 'signal'), mock.patch.object(ci.os, 'killpg', side_effect=signal_group):
+            result = ci.run_command(['virtual-child'], Path('/virtual'), {}, **budget)
+        return result, signals
+
+    def test_progressing_full_suite_can_finish_beyond_the_old_900_seconds(self):
+        result, signals = self.virtual_command(1000, self.configured('supervise', 'full-suite'))
+        self.assertFalse(result['timed_out'])
+        self.assertEqual(result['returncode'], 0)
+        self.assertTrue(result['reaped'])
+        self.assertEqual(signals, [])
+
+    def test_outer_allows_inner_deadline_preparation_and_original_failure_receipt(self):
+        inner = self.configured('supervise', 'full-suite')
+        outer = self.configured('frontend', 'full-suite')
+        # 30s preparation + the whole inner budget/grace + 45s owned receipt/cleanup.
+        result, signals = self.virtual_command(30 + inner['timeout'] + inner['grace'] + 45, outer, 124)
+        self.assertFalse(result['timed_out'])
+        self.assertEqual(result['returncode'], 124)
+        self.assertTrue(result['reaped'])
+        self.assertEqual(signals, [])
+
+    def test_full_suite_exhaustion_remains_bounded_and_reaped(self):
+        budget = self.configured('supervise', 'full-suite')
+        result, signals = self.virtual_command(budget['timeout'] + 100, budget)
+        self.assertTrue(result['timed_out'])
+        self.assertEqual(result['returncode'], -signal.SIGTERM)
+        self.assertTrue(result['reaped'])
+        self.assertEqual(signals, [signal.SIGTERM])
+
+    def test_other_entry_and_existing_reap_graces_are_unchanged(self):
+        self.assertEqual(self.configured('supervise', 'sqlite'), {'timeout': 900, 'grace': 5})
+        self.assertEqual(self.configured('frontend', 'sqlite'), {'timeout': 900, 'grace': 35})
+        self.assertEqual(self.configured('supervise', 'full-suite')['grace'], 5)
+        self.assertEqual(self.configured('frontend', 'full-suite')['grace'], 35)
+        self.assertIn('timeout --signal=TERM --kill-after=10s 30s node', ci.command_for('sqlite'))
+
+    def test_workflow_leaves_time_for_transport_and_post_suite_steps(self):
+        import re
+        workflow = (Path(ci.__file__).resolve().parents[2] / '.github/workflows/database-ci.yml').read_text()
+        linux = workflow.split('  database-tests:\n', 1)[1].split('\n  managed-web-browser:', 1)[0]
+        job_minutes = int(re.search(r'^    timeout-minutes: (\d+)$', linux, re.M).group(1))
+        suite_step = linux.split('      - name: 全量测试（启用 PostgreSQL 门控用例）\n', 1)[1].split('\n      - name:', 1)[0]
+        match = re.search(r'^        timeout-minutes: (\d+)$', suite_step, re.M)
+        self.assertIsNotNone(match, 'The full-suite step needs its own bounded transport envelope')
+        step_seconds = int(match.group(1)) * 60
+        outer = self.configured('frontend', 'full-suite')
+        # Existing source/dependency archive bounds are 30s/90s outside supervise.
+        self.assertGreater(step_seconds, 30 + 90 + outer['timeout'] + outer['grace'])
+        self.assertGreaterEqual(job_minutes * 60 - step_seconds, 600)
+        self.assertIn('timeout-minutes: 15', workflow.split('  database-tests:', 1)[0])
+        self.assertIn('timeout-minutes: 15', workflow.split('  managed-web-browser:', 1)[1])
+
+
 class LauncherContracts(unittest.TestCase):
     def request(self, entry='sqlite'):
         return {'entry': entry, 'node_dir': '/opt/node/bin', 'head': 'a' * 40,

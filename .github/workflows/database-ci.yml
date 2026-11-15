@@ -76,10 +76,10 @@ jobs:
   database-tests:
     name: Node 24 · SQLite / PostgreSQL
     runs-on: ubuntu-24.04
-    # CI171 used 287s preparing and 626s in a still-progressing full suite before
-    # the old job limit. Keep the existing 900s child allowance, plus bounded
-    # preparation and post-suite SDK/restart/cleanup time; no product limit changes.
-    timeout-minutes: 25
+    # CI231's outer 900s expired while the full suite still progressed.
+    # Allow the bounded 25-minute suite transport plus preparation and post-suite
+    # SDK/restart/cleanup time. Individual tests, diagnostics and guest limits stay fixed.
+    timeout-minutes: 35
     outputs:
       browser_dependencies_id: ${{ steps.browser_dependencies.outputs.artifact-id }}
 
@@ -117,6 +117,9 @@ jobs:
             echo "::error::.agent-output 仅存本地过程材料；需要归档的资料请整理到 docs/ 后提交。"
             exit 1
           fi
+
+      - name: Linux 全量时间窗纯控制
+        run: python3 -B scripts/ci/test_linux_isolation.py WholeSuiteBudgetContracts -v
 
       - name: M02 有效选项纯解析拒绝控制
         run: python3 tests/fs-effective-options.test.py
@@ -193,6 +196,7 @@ jobs:
         run: python3 scripts/ci/linux_isolation.py sqlite
 
       - name: 全量测试（启用 PostgreSQL 门控用例）
+        timeout-minutes: 25
         env:
           AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
         run: python3 scripts/ci/linux_isolation.py full-suite
