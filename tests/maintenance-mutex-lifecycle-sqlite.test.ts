@@ -135,7 +135,7 @@ test("#152 SQLite failed initialization retains an unreachable caller handle's p
         return fstat(...args);
       });
       child.mock.method(Database.prototype, "prepare", function (this: Database.Database, sql: string) {
-        if (phase === "observation" && this.name === f.file && this.readonly && !injected) {
+        if (phase === "observation" && this.name === f.file && this.readonly && sql === "SELECT * FROM storage_maintenance" && !injected) {
           injected = true; throw new MaintenanceFailure("source_changed", "initial-observation");
         }
         return prepare.call(this, sql);
