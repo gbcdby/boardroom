@@ -131,6 +131,40 @@ for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeT
     } finally { t.mock.restoreAll(); await f.close(); }
   });
 
+for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeTest : pgTest)(
+  `#152 V ${kind}: illegal same-migration successor is not a capture continuation`, async t => {
+    const f = await verificationBundleFixture(kind);
+    let restores = 0;
+    try {
+      const refs = await f.run(lock => f.publish(lock));
+      await f.adapter.withSourceLock("control", async lock => {
+        const current = await lock.observe(), state = current.state;
+        assert(state.journalRecordRef && state.journalDigest);
+        // The native CAS admits a +1 generation, but the journal protocol requires
+        // that this increment be caused by 'takeover', never 'observation'.
+        const invalid = { ...f.capture.record, previous: f.capture.reference,
+          sequence: state.journalSequence + 1, event: "observation" as const, phase: "quiesced" as const,
+          ownerGeneration: state.ownerGeneration + 1, sourceClients: null, frozen: null,
+          requestId: "v-illegal-successor", snapshot: null };
+        const journal = await f.store.putJson("journal", invalid);
+        await lock.anchor({ expected: state, admission: "sealed", fenceEpoch: state.fenceEpoch,
+          ownerGeneration: invalid.ownerGeneration, activeMigrationId: state.activeMigrationId,
+          planDigest: state.planDigest, controlRootIdentity: f.store.identity, mutexIdentity: f.mutex.identity,
+          journal, journalSequence: invalid.sequence });
+      });
+      const verify = f.adapter.verifyDatabase.bind(f.adapter);
+      t.mock.method(f.adapter, "verifyDatabase", async (...args: Parameters<typeof verify>) => {
+        restores++; return verify(...args);
+      });
+      const before = await artifacts(f.store);
+      await f.run(async lock => {
+        await assert.rejects(verifyRestoreBundle(f.store, f.adapter, lock, refs.bundle, refs.publication),
+          error => error instanceof MaintenanceFailure && error.code === "journal_invalid");
+      });
+      assert.equal(restores, 0); assert.deepEqual(await artifacts(f.store), before); await noVerification(f.store);
+    } finally { t.mock.restoreAll(); await f.close(); }
+  });
+
 nativeTest("#152 V: wrong role, hash and U binding reject before actual restore or new attempts", async t => {
   for (const fault of ["role", "hash", "publication"] as const) await t.test(fault, async () => {
     const f = await verificationBundleFixture(); let calls = 0;
