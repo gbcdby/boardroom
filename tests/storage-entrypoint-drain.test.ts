@@ -91,7 +91,7 @@ test("#152 真实HTTP/独立stdio/reader共同停新、断连和关闭；取消�
         { scope: "project-agent", code: "memory_reader_timeout" },
       ], "只有真实首次500ms读取预算耗尽允许降级，进程/IPC/绑定错误必须失败");
       await until(
-        () => stdio.stderr.split("\\n").some(line => {
+        () => stdio.stderr.split("\n").some(line => {
           try {
             const event = JSON.parse(line) as { msg?: string; code?: string };
             return event.msg === "memory_reader_unavailable" && event.code === "memory_reader_timeout";
