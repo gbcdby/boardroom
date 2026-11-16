@@ -119,7 +119,7 @@ for (const kind of ["sqlite", "postgres"] as const) {
         // for this client_id has been issued by the mutex owner or journal.
         const identity = await row();
         const sqlText = (value: Json | undefined) => {
-          assert.equal(typeof value, "string");
+          if (typeof value !== "string") throw new Error("expected native identity JSON text");
           return value.replaceAll("'", "''");
         };
         await f.exec(
