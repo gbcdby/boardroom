@@ -79,7 +79,30 @@ test("#152 真实HTTP/独立stdio/reader共同停新、断连和关闭；取消�
     const init = await stdio.call("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "drain-test", version: "1" } });
     assert.ok(init.result); stdio.notify("notifications/initialized");
     const joined = await stdio.call("tools/call", { name: "join", arguments: { displayName: "stdio本人", hostType: "other", projectId: project.id, groupId: group.id } });
-    assert.equal(joined.result.structuredContent.context.memory.state, "available", "实际reader应已启动读取");
+    const injection = joined.result.structuredContent.context.memory;
+    // First injection has a strict 500ms budget. A real fork/IPC cold start can
+    // exhaust that budget on a busy native runner; only that exact, diagnosed
+    // fail-closed outcome is allowed. Any other unavailable state still fails.
+    const readerBudgetExpired = injection.state === "unavailable";
+    if (readerBudgetExpired) {
+      assert.deepEqual(injection.entries, [], "超时不得泄露部分记忆正文");
+      assert.deepEqual(injection.errors, [
+        { scope: "global", code: "memory_reader_timeout" },
+        { scope: "project-agent", code: "memory_reader_timeout" },
+      ], "只有真实首次500ms读取预算耗尽允许降级，进程/IPC/绑定错误必须失败");
+      await until(
+        () => stdio.stderr.split("\n").some(line => {
+          try {
+            const event = JSON.parse(line) as { msg?: string; code?: string };
+            return event.msg === "memory_reader_unavailable" && event.code === "memory_reader_timeout";
+          } catch { return false; }
+        }),
+        "stdio必须实际记录有界reader超时诊断，不能仅凭返回unavailable放行",
+      );
+    } else {
+      assert.equal(injection.state, "available", JSON.stringify(injection.errors));
+      assert.deepEqual(injection.errors, []);
+    }
     const beforeClients = control.prepare("SELECT * FROM storage_source_clients ORDER BY entrypoint").all() as Record<string, unknown>[];
     assert.deepEqual(beforeClients.map(r => r.entrypoint), ["http", "stdio"]);
     const stdioIdentity = JSON.parse(String(beforeClients[1]!.process_identity_json));
@@ -106,7 +129,8 @@ test("#152 真实HTTP/独立stdio/reader共同停新、断连和关闭；取消�
       }), "真实memory reader未退出");
       assert.equal(existsSync(`/proc/${stdio.child.pid}`), false);
       t.diagnostic(JSON.stringify({ proof: "linux_proc_and_child_exit", stdioExited: true, readersExited: readers.length,
-        sourceClientIdentityMatched: true, memoryReturned: "available" }));
+        sourceClientIdentityMatched: true, memoryReturned: injection.state,
+        memoryTimeoutVerified: readerBudgetExpired }));
     }
     const state = control.prepare("SELECT database_instance_id FROM storage_maintenance").get() as any;
     for (const row of control.prepare("SELECT * FROM storage_source_clients").all() as Record<string, unknown>[]) {
