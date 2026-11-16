@@ -61,9 +61,16 @@ export async function compatibleSourceClientWindow(before: readonly Row[], curre
     if (!same(prior.last_observed_at, live.last_observed_at)
       && (!timestamp(prior.last_observed_at) || !timestamp(live.last_observed_at)
         || Date.parse(live.last_observed_at) < Date.parse(prior.last_observed_at))) return false;
+    // An end event cannot be retroactively placed before the last captured
+    // observation or the original registration. A later journal observation
+    // cannot make an earlier, unobserved termination legitimate.
     if (!same(prior.ended_at, live.ended_at)
       && (prior.ended_at !== null || !timestamp(live.ended_at)
-        || !timestamp(live.last_observed_at) || Date.parse(live.ended_at) > Date.parse(live.last_observed_at))) return false;
+        || !timestamp(prior.registered_at) || !timestamp(prior.last_observed_at)
+        || !timestamp(live.last_observed_at)
+        || Date.parse(live.ended_at) < Date.parse(prior.registered_at)
+        || Date.parse(live.ended_at) < Date.parse(prior.last_observed_at)
+        || Date.parse(live.ended_at) > Date.parse(live.last_observed_at))) return false;
   }
   for (const [id, row] of now) {
     if (old.has(id)) continue;

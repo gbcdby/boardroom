@@ -39,6 +39,11 @@ test("#152 V: journal-backed maintenance registration and monotonic observations
   assert.equal(await check([], [old], false), false);
   assert.equal(await check([], [old]), true);
   assert.equal(await check([old], [{ ...old, last_observed_at: later, ended_at: later }]), true);
+  const observed = { ...old, last_observed_at: later };
+  assert.equal(await check([observed], [{ ...observed, last_observed_at: "2026-11-16T01:00:02.000Z", ended_at: at }]), false,
+    "a late observation must not authorize a retroactively backdated termination");
+  assert.equal(await check([old], [{ ...old, last_observed_at: later, ended_at: "2026-11-15T23:59:59.000Z" }]), false,
+    "termination cannot predate the initial registration");
   assert.equal(await check([old], [{ ...old, last_observed_at: later }], false), false);
   assert.equal(await check([old], []), false);
   assert.equal(await check([], [old, old]), false);
