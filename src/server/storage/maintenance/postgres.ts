@@ -144,7 +144,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   let publicBackup: { readonly sha256: string; readonly manifestDigest: string;
     readonly binding: PublicRestoreCatalogBinding; readonly owner: HeldMutex;
     readonly capture: SourceObservation } | undefined;
-  const samePublicBackupWindow = (backup: NonNullable<typeof publicBackup>, live: SourceObservation): boolean => {
+  const samePublicBackupWindow = async (backup: NonNullable<typeof publicBackup>, live: SourceObservation): Promise<boolean> => {
     const before = backup.capture, a = before.state, b = live.state;
     return backup.owner === mutex && !backup.owner.released && !backup.owner.retiring
       && b.admission === "sealed" && a.admission === "sealed"
@@ -155,7 +155,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       && same(live.source, before.source) && same(live.sourceIdentity, before.sourceIdentity)
       && live.manifests.schemaManifestDigest === before.manifests.schemaManifestDigest
       && live.manifests.frozenBusinessManifestDigest === before.manifests.frozenBusinessManifestDigest
-      && compatibleSourceClientWindow(before.manifests.controlRows.storage_source_clients,
+      && await compatibleSourceClientWindow(before.manifests.controlRows.storage_source_clients,
          live.manifests.controlRows.storage_source_clients, {
            // Preliminary native backup filter; V independently verifies the exact journal chain.
            journalAdvanced: b.journalSequence > a.journalSequence && b.ownerGeneration >= a.ownerGeneration,
@@ -763,7 +763,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       // The native control transaction sees its own updates. Retain the original
       // archive only across the same sealed source, fence, plan and frozen data;
       // V still validates the complete actual journal path separately.
-      if (publicBackup && kind === "control" && !samePublicBackupWindow(publicBackup, await observation(locked)))
+      if (publicBackup && kind === "control" && !(await samePublicBackupWindow(publicBackup, await observation(locked))))
         publicBackup = undefined;
       await validateControlSqlCommit(lock); assertControlSqlCommit(lock); noteControlSql(lock, "committing");
       if ((await session.client.query("COMMIT")).command !== "COMMIT") throw new MaintenanceFailure("maintenance_lost");
@@ -868,7 +868,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       if (isPublic) {
         const backup = publicBackup;
         if (!backup || backup.manifestDigest !== digestJson(expected)
-          || !samePublicBackupWindow(backup, await observe())) throw new MaintenanceFailure("snapshot_invalid");
+          || !(await samePublicBackupWindow(backup, await observe()))) throw new MaintenanceFailure("snapshot_invalid");
         const assertCurrent = async () => {
           await assertMutex(mutex, checkSuccess); if (!assertSnapshotLock) throw new MaintenanceFailure("maintenance_lost"); await assertSnapshotLock(checkSuccess);
           const live = await readIdentity(target, verificationConnection, false, checkSuccess);

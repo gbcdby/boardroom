@@ -47,7 +47,7 @@ async function assertLiveCapture(store: ArtifactStore, observed: SourceObservati
   requireValue(frozen !== null && state.guardManifestDigest === frozen.guardManifestDigest
     && observed.manifests.schemaManifestDigest === frozen.schemaManifestDigest
     && observed.manifests.frozenBusinessManifestDigest === frozen.frozenBusinessManifestDigest
-    && compatibleSourceClientWindow(closed.manifests.controlRows.storage_source_clients,
+    && await compatibleSourceClientWindow(closed.manifests.controlRows.storage_source_clients,
       observed.manifests.controlRows.storage_source_clients, {
         journalAdvanced: liveChain.nodes.slice(captureIndex + 1).some(node =>
           node.record.event === "observation" || node.record.event === "takeover"),

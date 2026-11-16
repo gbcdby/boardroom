@@ -1,4 +1,6 @@
 import { canonicalJson } from "./canonical.ts";
+import { registeredProcess } from "./control-candidate/schema.ts";
+import { inspectRegisteredSourceProcess } from "./source-facts.ts";
 import type { Json } from "./types.ts";
 
 type Row = Readonly<Record<string, Json>>;
@@ -23,11 +25,26 @@ function emptySessions(value: Json | undefined): boolean {
   } catch { return false; }
 }
 
+/** A new controller is not proven by its entrypoint label or JSON syntax.
+ * Match the registered native process incarnation under the current host; unknown
+ * or retired owners cannot acquire a new client row by journal text alone. */
+async function authenticControllerIdentity(row: Row): Promise<boolean> {
+  if (typeof row.host_identity_json !== "string" || typeof row.process_identity_json !== "string") return false;
+  try {
+    const host: unknown = JSON.parse(row.host_identity_json);
+    const identity: unknown = JSON.parse(row.process_identity_json);
+    if (!host || typeof host !== "object" || Array.isArray(host)
+      || !registeredProcess.safeParse(identity).success) return false;
+    const evidence = await inspectRegisteredSourceProcess(host as Record<string, unknown>, identity as Record<string, unknown>);
+    return evidence.fact.status === "present" && evidence.fact.reason === "identity_matches";
+  } catch { return false; }
+}
+
 /** Only the live source-client controls may drift from the exact archived image.
  * Caller separately proves the native mutex, anchored journal capture prefix,
  * valid observation/takeover successors and frozen source schema/business. */
-export function compatibleSourceClientWindow(before: readonly Row[], current: readonly Row[],
-  options: { journalAdvanced: boolean; fenceEpoch: number; databaseInstanceId: string }): boolean {
+export async function compatibleSourceClientWindow(before: readonly Row[], current: readonly Row[],
+  options: { journalAdvanced: boolean; fenceEpoch: number; databaseInstanceId: string }): Promise<boolean> {
   if (same(before, current)) return true;
   if (!options.journalAdvanced) return false;
   const old = new Map<string, Row>(), now = new Map<string, Row>();
@@ -60,12 +77,7 @@ export function compatibleSourceClientWindow(before: readonly Row[], current: re
       || !timestamp(row.registered_at) || !timestamp(row.last_observed_at)
       || Date.parse(row.last_observed_at) < Date.parse(row.registered_at)
       || typeof row.host_identity_json !== "string" || typeof row.process_identity_json !== "string") return false;
-    try {
-      for (const key of ["host_identity_json", "process_identity_json"] as const) {
-        const identity: unknown = JSON.parse(row[key] as string);
-        if (!identity || typeof identity !== "object" || Array.isArray(identity)) return false;
-      }
-    } catch { return false; }
+    if (!await authenticControllerIdentity(row)) return false;
   }
   return true;
 }
