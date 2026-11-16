@@ -867,8 +867,10 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       let restoredWith: Json;
       if (isPublic) {
         const backup = publicBackup;
-        if (!backup || backup.manifestDigest !== digestJson(expected)
-          || !(await samePublicBackupWindow(backup, await observe()))) throw new MaintenanceFailure("snapshot_invalid");
+        // Invalid archive authority is distinct from a live source whose controls
+        // have changed since the native backup. Preserve both fail-closed gates.
+        if (!backup || backup.manifestDigest !== digestJson(expected)) throw new MaintenanceFailure("snapshot_invalid");
+        if (!(await samePublicBackupWindow(backup, await observe()))) throw new MaintenanceFailure("source_changed");
         const assertCurrent = async () => {
           await assertMutex(mutex, checkSuccess); if (!assertSnapshotLock) throw new MaintenanceFailure("maintenance_lost"); await assertSnapshotLock(checkSuccess);
           const live = await readIdentity(target, verificationConnection, false, checkSuccess);
