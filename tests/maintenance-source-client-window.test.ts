@@ -104,3 +104,43 @@ for (const kind of ["sqlite", "postgres"] as const) {
       } finally { await f.close(); }
     });
 }
+
+
+for (const kind of ["sqlite", "postgres"] as const) {
+  const enabled = kind === "sqlite" ? ["linux", "darwin"].includes(process.platform) : Boolean(process.env.AGENT_STUDIO_PG_TEST_URL);
+  (enabled ? test : test.skip)(
+    "#152 V " + kind + ": real SQLite/PostgreSQL V rejects borrowed live native identity after unrelated journal observation",
+    async () => {
+      const f = await verificationBundleFixture(kind);
+      try {
+        const refs = await f.run(lock => f.publish(lock));
+        // This is a real source-DB write, not just a helper comparator call.  The
+        // process is genuinely alive, but no maintenance-controller registration
+        // for this client_id has been issued by the mutex owner or journal.
+        const identity = await row();
+        const sqlText = (value: Json | undefined) => {
+          assert.equal(typeof value, "string");
+          return value.replaceAll("'", "''");
+        };
+        await f.exec(
+          "INSERT INTO storage_source_clients " +
+          "(client_id,database_instance_id,entrypoint,build_id,protocol_version," +
+          "host_identity_json,process_identity_json,db_sessions_json,registered_epoch,observed_epoch," +
+          "drain_epoch,drain_state,drain_receipt_digest,registered_at,last_observed_at,ended_at) " +
+          "VALUES ('borrowed-native-controller',(SELECT database_instance_id FROM storage_maintenance)," +
+          "'maintenance-controller','test-build',1,'" + sqlText(identity.host_identity_json) +
+          "','" + sqlText(identity.process_identity_json) + "','[]'," +
+          "(SELECT fence_epoch FROM storage_maintenance),(SELECT fence_epoch FROM storage_maintenance)," +
+          "NULL,'none',NULL,'" + at + "','" + later + "',NULL)"
+        );
+        // An unrelated valid anchor advance is not row-level provenance.
+        await f.advance("observation");
+        await f.run(lock => assert.rejects(
+          verifyRestoreBundle(f.store, f.adapter, lock, refs.bundle, refs.publication),
+          error => error instanceof MaintenanceFailure && error.code === "source_changed",
+          "a real native PID alone cannot authorize an unregistered source-client row"
+        ));
+      } finally { await f.close(); }
+    }
+  );
+}
