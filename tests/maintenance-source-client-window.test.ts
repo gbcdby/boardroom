@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Client } from "pg";
 import { compatibleSourceClientWindow } from "../src/server/storage/maintenance/source-client-window.ts";
 import { verifyRestoreBundle } from "../src/server/storage/maintenance/verify-bundle.ts";
 import { verificationBundleFixture } from "./fixtures/maintenance-verify-bundle.ts";
@@ -59,14 +58,7 @@ for (const kind of ["sqlite", "postgres"] as const) {
           (business ? "stdio" : "maintenance-controller") +
           "','test-build',1,'{}','{}','[]',(SELECT fence_epoch FROM storage_maintenance)," +
           "(SELECT fence_epoch FROM storage_maintenance),NULL,'none',NULL,'" + at + "','" + later + "',NULL)";
-        if (kind === "sqlite") f.writer!.exec(sql);
-        else {
-          const url = new URL(process.env.AGENT_STUDIO_PG_TEST_URL!);
-          url.pathname = "/" + f.targetName;
-          const client = new Client({ connectionString: url.toString() });
-          await client.connect();
-          try { await client.query(sql); } finally { await client.end(); }
-        }
+        await f.exec(sql); // Enter fixture owns the real source DB, never its isolated PG restore target.
         await f.advance("observation");
         if (business) await f.run(async lock => assert.rejects(
           verifyRestoreBundle(f.store, f.adapter, lock, refs.bundle, refs.publication),
