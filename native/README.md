@@ -67,3 +67,16 @@ node --test tests/maintenance-restore-directory.test.ts tests/maintenance-restor
 - [macOS 26 XNU 的 fcntl 实现](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/kern/kern_descrip.c)、[proc_info 实现](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/kern/proc_info.c)及 [libproc 公共接口](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/libsyscall/wrappers/libproc/libproc.h)：对应 vnode 同步、进程/FD/映射枚举和身份观察。
 - [Apple 的 ACL 条目接口实现](https://github.com/apple-oss-distributions/Libc/blob/Libc-1725.0.11/posix1e/acl_entry.c)及 [FD ACL 接口实现](https://github.com/apple-oss-distributions/Libc/blob/Libc-1725.0.11/posix1e/acl_file.c)：Darwin 的条目成功值为 0，空集为 -1/EINVAL；与 Linux 的约定不同。
 - [SQLite 文件控制接口](https://sqlite.org/c3ref/c_fcntl_begin_atomic_write.html)：`SQLITE_FCNTL_HAS_MOVED` 核对当前连接打开的文件是否仍为原路径，避免以“出现新 FD”误判 SQLite 的合法句柄复用。
+
+
+## Linux 原生源文件只读 FD 基础（P0，尚不授予 Fs 资格）
+
+\`native/maintenance-source-files.c\` 和 \`source-file-native.ts\` 提供 #152/P 的**最小内核基础**：Node-API 8 私有 \`napi_wrap\` owner、真实 \`openat2\`、同一 FD 的 \`fstat\`/\`fstatfs\`、有界 \`pread\`/\`getdents64\` 与单次关闭。不会把裸 fd 暴露给 JS，也不通过 \`/proc\` 二次打开源文件。根路径不允许符号链接；打开已固定根的子对象使用 \`RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV\`，实际目录根可以独立处在其自己的文件系统上。长度、offset、目录枚举预算和 UTF-8 均失败关闭；关闭未知不等同成功，不按旧 fd 数字重试。
+
+Linux \`npm ci\` 运行 \`scripts/build-maintenance-platform.mjs\` 时单独编译 \`maintenance-source-files-<arch>.node\`；不改 Darwin 的 observer/SQLite/public/restore 组件构建或 \`--required\` 边界。产物位于被 Git 忽略的 \`build/maintenance-platform\`，实际装载检查 owner、单链接、0700 和固定真实路径。仅在支持 \`openat2\`/Node-API 8 的真实 Linux 环境中使用；缺失、未知和未验证平台显式拒绝。验证命令：
+
+\`\`\`sh
+node --test tests/maintenance-source-file-native.test.ts
+\`\`\`
+
+**严禁将 P0 当作真实 Fs/Jq 产物或生产来源认证。** 它尚未实现完整 \`statx\` mask/原始 ABI、UUID/FID、inode flags、xattr、健康/config 闭包、qualified registry、active source-root 上下文或独立 source-preservation 资格；\`accepted_provider_profiles=[]\`、\`qualified_kernel_builds=[]\` 保持不变。此阶段不接入 public maintenance、S/C 采集或准许激活 \`~/.boardroom\`；只有 P 的完整 raw getter/matcher 与 S/C 当前真实来源闭包、原生正反实测及独立双轴通过后才可考虑逐项解除阻塞。

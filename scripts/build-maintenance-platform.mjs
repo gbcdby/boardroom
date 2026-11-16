@@ -102,3 +102,43 @@ if (process.platform !== "darwin") {
     if (required) { process.stderr.write(restoreDiagnostics); process.exitCode = 1; }
   }
 }
+
+
+/* #152 P0 is Linux-only and independent of the Darwin observer/public/restore
+ * components. A missing native tool never grants Fs/source qualification.
+ * --required retains the existing Darwin-only contract on non-Darwin hosts. */
+if (process.platform === "linux") {
+  const root = fileURLToPath(new URL("../", import.meta.url));
+  const directory = path.join(root, "build", "maintenance-platform");
+  const target = path.join(directory, "maintenance-source-files-" + process.arch + ".node");
+  const temporary = target + "." + randomUUID() + ".tmp";
+  let diagnostics = "Linux source-file read-only bridge unavailable\n";
+  try {
+    if (Number(process.versions.napi) < 8) throw new Error("Node-API 8 is required");
+    const headers = path.join(root, "native", "node-api", "v24.22.1");
+    const sources = JSON.parse(readFileSync(path.join(headers, "SOURCES.json"), "utf8"));
+    const names = ["node_api.h", "node_api_types.h", "js_native_api.h", "js_native_api_types.h", "LICENSE"];
+    if (sources.upstreamVersion !== "v24.22.1" || sources.napiVersion !== 8 ||
+      !Array.isArray(sources.files) || sources.files.length !== 5) throw new Error("Unverified Node-API source");
+    for (const name of names) {
+      const matches = sources.files.filter(file => file.name === name);
+      if (matches.length !== 1 || createHash("sha256").update(readFileSync(path.join(headers, name))).digest("hex") !== matches[0].sha256)
+        throw new Error("Node-API source hash mismatch");
+    }
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const result = spawnSync("/usr/bin/cc", [
+      "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-fPIC", "-shared",
+      "-DNAPI_VERSION=8", "-DNODE_GYP_MODULE_NAME=boardroom_source_files",
+      "-I", headers, path.join(root, "native", "maintenance-source-files.c"), "-o", temporary
+    ], { encoding: "utf8", timeout: 60_000 });
+    diagnostics = result.stderr || diagnostics;
+    if (result.status !== 0 || result.error) throw new Error("Linux source-file native build failed");
+    chmodSync(temporary, 0o700); renameSync(temporary, target);
+  } catch {
+    for (const file of [temporary, target]) {
+      try { rmSync(file, { force: true }); } catch { /* Not a verified capability. */ }
+    }
+    process.stderr.write("Linux 原生源文件只读组件未构建；Fs 生产采集仍不可用。\n");
+    process.stderr.write(diagnostics);
+  }
+}
