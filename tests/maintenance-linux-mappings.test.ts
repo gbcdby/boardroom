@@ -15,7 +15,7 @@ import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createSqliteMaintenanceAdapter } from "../src/server/storage/maintenance/sqlite.ts";
 import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
-import { confirmedLinuxZombieExit, linuxMappingIdentity, linuxMappingIdentityAvailable, linuxSourceMappingIdentities, parseLinuxMappings } from "../src/server/storage/maintenance/linux-mappings.ts";
+import { confirmedLinuxZombieExit, confirmedLinuxZombieFdDenial, linuxMappingIdentity, linuxMappingIdentityAvailable, linuxSourceMappingIdentities, parseLinuxMappings } from "../src/server/storage/maintenance/linux-mappings.ts";
 
 const linuxTest = process.platform === "linux" ? test : test.skip;
 
@@ -32,6 +32,30 @@ test("#152 scanner only accepts exact same-identity one-thread zombie evidence",
   assert.equal(confirmedLinuxZombieExit(dead, dead, 46279, 46280, 46279), false);
   assert.equal(confirmedLinuxZombieExit(dead, dead, 46280, 46279, 46279), false);
 });
+test("#152 only a pinned fd/scandir EACCES plus two identical zombie identities can be retired", () => {
+  const pinned = "/proc/self/fd/37", zombie = { pid: "14046", startTicks: "80530", state: "Z", threads: "1" };
+  const original = { code: "EACCES", syscall: "scandir", path: `${pinned}/fd` };
+  const accepts = (fault: typeof original, before = zombie, after = zombie,
+    beforeUid = 45245, afterUid = 45245, expectedUid = 45245) =>
+    confirmedLinuxZombieFdDenial(fault, pinned, before, after, beforeUid, afterUid, expectedUid);
+  assert.equal(accepts(original), true, "a same-pinned, twice confirmed, one-thread zombie has no live FD table");
+  for (const fault of [
+    { ...original, code: "EPERM" }, { ...original, code: "ENOENT" },
+    { ...original, syscall: "readlink" }, { ...original, syscall: "open" },
+    { ...original, path: `${pinned}/maps` }, { ...original, path: "/proc/14046/fd" },
+    { ...original, path: "/proc/self/fd/38/fd" },
+  ]) assert.equal(accepts(fault), false, JSON.stringify(fault));
+  assert.equal(accepts(original, { ...zombie, state: "S" }), false);
+  assert.equal(accepts(original, zombie, { ...zombie, state: "R" }), false);
+  assert.equal(accepts(original, { ...zombie, threads: "2" }), false);
+  assert.equal(accepts(original, zombie, { ...zombie, threads: "2" }), false);
+  assert.equal(accepts(original, zombie, { ...zombie, startTicks: "80531" }), false);
+  assert.equal(accepts(original, zombie, { ...zombie, pid: "14047" }), false);
+  assert.equal(accepts(original, zombie, zombie, 45246), false);
+  assert.equal(accepts(original, zombie, zombie, 45245, 45246), false);
+  assert.equal(accepts(original, zombie, zombie, 45245, 45245, 45246), false);
+});
+
 const fixtureScript = fileURLToPath(new URL("./fixtures/maintenance-linux-mapped-user.py", import.meta.url));
 const row = "1000-2000 rw-s 00000000 0a:01 9007199254740993 /a path (deleted)\n";
 
