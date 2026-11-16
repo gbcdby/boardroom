@@ -1,6 +1,7 @@
 import path from "node:path";
 import { canonicalJson } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
+import { compatibleSourceClientWindow } from "./source-client-window.ts";
 import { captureReference, verifyJournalChain, verifyRestoreBundleClosure } from "./journal.ts";
 import { ArtifactStore } from "./objects.ts";
 import { parseVerification } from "./parse.ts";
@@ -46,7 +47,12 @@ async function assertLiveCapture(store: ArtifactStore, observed: SourceObservati
   requireValue(frozen !== null && state.guardManifestDigest === frozen.guardManifestDigest
     && observed.manifests.schemaManifestDigest === frozen.schemaManifestDigest
     && observed.manifests.frozenBusinessManifestDigest === frozen.frozenBusinessManifestDigest
-    && same(observed.manifests.controlRows.storage_source_clients, closed.manifests.controlRows.storage_source_clients),
+    && compatibleSourceClientWindow(closed.manifests.controlRows.storage_source_clients,
+      observed.manifests.controlRows.storage_source_clients, {
+        journalAdvanced: liveChain.nodes.slice(captureIndex + 1).some(node =>
+          node.record.event === "observation" || node.record.event === "takeover"),
+        fenceEpoch: capture.fenceEpoch, databaseInstanceId: capture.source.databaseInstanceId,
+      }),
     "source_changed");
   const prior = closed.manifests.controlRows.storage_maintenance[0];
   const live = observed.manifests.controlRows.storage_maintenance[0];

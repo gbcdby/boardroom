@@ -7,6 +7,7 @@ import { Client } from "pg";
 import { parseStorageMaintenanceState, readPostgresMaintenanceState, type StorageMaintenanceState } from "../admission.ts";
 import { canonicalJson, digestJson, sha256 } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
+import { compatibleSourceClientWindow } from "./source-client-window.ts";
 import { maintenanceHostIdentityDigest } from "./host.ts";
 import { buildDatabaseManifests } from "./manifests.ts";
 import { listPostgresTables, quotePostgresIdentifier as quote, readPostgresCatalog, readPostgresEnvironment, readPostgresManifests,
@@ -154,7 +155,12 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       && same(live.source, before.source) && same(live.sourceIdentity, before.sourceIdentity)
       && live.manifests.schemaManifestDigest === before.manifests.schemaManifestDigest
       && live.manifests.frozenBusinessManifestDigest === before.manifests.frozenBusinessManifestDigest
-      && same(live.manifests.controlRows.storage_source_clients, before.manifests.controlRows.storage_source_clients);
+      && compatibleSourceClientWindow(before.manifests.controlRows.storage_source_clients,
+         live.manifests.controlRows.storage_source_clients, {
+           // Preliminary native backup filter; V independently verifies the exact journal chain.
+           journalAdvanced: b.journalSequence > a.journalSequence && b.ownerGeneration >= a.ownerGeneration,
+           fenceEpoch: a.fenceEpoch, databaseInstanceId: a.databaseInstanceId,
+         });
   };
   const activeVerifications = new Set<Promise<Json>>();
   const verificationInputs = new Map<FileHandle, { fd: number; identity?: string }>();
