@@ -137,7 +137,25 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   let firstSourceIdentity: Json | undefined, mutexTimer: ReturnType<typeof setInterval> | undefined;
   let firstServerIdentity: PostgresDatabaseIdentity | undefined;
   let assertSnapshotLock: ((check?: () => void) => Promise<void>) | undefined;
-  let publicBackup: { readonly sha256: string; readonly manifestDigest: string; readonly binding: PublicRestoreCatalogBinding } | undefined;
+  // Public pg_restore authority comes from this adapter's actual native backup,
+  // not from a persisted B/U. Legitimate journal control successors can commit
+  // between source locks while the original operation mutex remains held.
+  let publicBackup: { readonly sha256: string; readonly manifestDigest: string;
+    readonly binding: PublicRestoreCatalogBinding; readonly owner: HeldMutex;
+    readonly capture: SourceObservation } | undefined;
+  const samePublicBackupWindow = (backup: NonNullable<typeof publicBackup>, live: SourceObservation): boolean => {
+    const before = backup.capture, a = before.state, b = live.state;
+    return backup.owner === mutex && !backup.owner.released && !backup.owner.retiring
+      && b.admission === "sealed" && a.admission === "sealed"
+      && b.databaseInstanceId === a.databaseInstanceId && b.activeMigrationId === a.activeMigrationId
+      && b.planDigest === a.planDigest && b.fenceEpoch === a.fenceEpoch
+      && b.controlRootJson === a.controlRootJson && b.mutexIdentityJson === a.mutexIdentityJson
+      && b.guardManifestDigest === a.guardManifestDigest
+      && same(live.source, before.source) && same(live.sourceIdentity, before.sourceIdentity)
+      && live.manifests.schemaManifestDigest === before.manifests.schemaManifestDigest
+      && live.manifests.frozenBusinessManifestDigest === before.manifests.frozenBusinessManifestDigest
+      && same(live.manifests.controlRows.storage_source_clients, before.manifests.controlRows.storage_source_clients);
+  };
   const activeVerifications = new Set<Promise<Json>>();
   const verificationInputs = new Map<FileHandle, { fd: number; identity?: string }>();
   let inspectionSequence = 0;
@@ -153,7 +171,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   const sessionMetadata = (session: Session) => Object.freeze({ pid: session.pid,
     backendStart: session.backendStart.slice(0, 128), source: session.source, critical: session.critical,
     ending: session.ending, ended: session.ended, truncated: session.backendStart.length > 128 });
-  const invalidate = () => { if (mutex) auditFactories.get(mutex)?.close(); lost = true; abort.abort(); };
+  const invalidate = () => { publicBackup = undefined; if (mutex) auditFactories.get(mutex)?.close(); lost = true; abort.abort(); };
   function assertOpen(): void {
     if (closed || closingStarted || lost) throw new MaintenanceFailure("maintenance_lost");
   }
@@ -326,6 +344,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   async function acquireMutex(root: ControlRootIdentity, expected: StorageMaintenanceState): Promise<OperationMutex> {
     assertOpen();
     if (mutex && !mutex.released) throw new MaintenanceFailure("maintenance_busy");
+    publicBackup = undefined; // Never inherit a previous native mutex's backup authority.
     if (root.hostIdentityDigest !== await maintenanceHostIdentityDigest()) throw new MaintenanceFailure("control_root_mismatch");
     const session = await connect(sourceConnection, true, true, "operation-mutex");
     let acquired = false;
@@ -378,6 +397,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           if (held.releaseAttempt) return held.releaseAttempt;
           if (lockActive) throw new MaintenanceFailure("maintenance_busy");
           held.retiring = true;
+          publicBackup = undefined; // Invalid immediately, even if physical close is unknown.
           auditFactories.get(held)?.close(); clearInterval(heartbeatTimer);
           if (mutexTimer === heartbeatTimer) mutexTimer = undefined;
           const attempt = (async () => {
@@ -686,7 +706,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           const identity = await readIdentity(locked, sourceConnection, true);
           frozenCapture = capture.manifests;
           if (publicBinding && publicArchiveDigest) publicBackup = { sha256: publicArchiveDigest,
-            manifestDigest: digestJson(capture.manifests), binding: publicBinding };
+            manifestDigest: digestJson(capture.manifests), binding: publicBinding, owner: heldMutex, capture };
           return { manifests: capture.manifests, toolchain: { formatVersion: 1, engine: "postgres", format: "custom",
             pgDump: versions.pgDump, pgRestore: versions.pgRestore, serverVersion: identity.serverVersion,
             scope: object(capture.manifests.schema).scope!, sourceIdentityDigest: capture.source.identityDigest,
@@ -734,6 +754,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           }
         }
       }
+      // The native control transaction sees its own updates. Retain the original
+      // archive only across the same sealed source, fence, plan and frozen data;
+      // V still validates the complete actual journal path separately.
+      if (publicBackup && kind === "control" && !samePublicBackupWindow(publicBackup, await observation(locked)))
+        publicBackup = undefined;
       await validateControlSqlCommit(lock); assertControlSqlCommit(lock); noteControlSql(lock, "committing");
       if ((await session.client.query("COMMIT")).command !== "COMMIT") throw new MaintenanceFailure("maintenance_lost");
       noteControlSql(lock, "committed"); active = false; return result;
@@ -747,13 +772,15 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       }
       throw safeError(error, "snapshot_invalid");
     } finally {
-      active = false; lockActive = false; assertSnapshotLock = undefined; publicBackup = undefined;
+      active = false; lockActive = false; assertSnapshotLock = undefined;
+      if (failed || lost) publicBackup = undefined;
       if (session) {
         try {
           if (controlSqlUsed) { session.ending = true; await session.client.end(); session.ended = true; sessions.delete(session); }
           else if (factsUsed) await endFactsSession(session); else await endSession(session, true);
         } catch (error) {
           if (factsUsed) invalidate();
+          publicBackup = undefined;
           noteControlSql(trackedLock, "close-failure", error); if (!failed) throw error;
         }
       }
@@ -834,7 +861,8 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       let restoredWith: Json;
       if (isPublic) {
         const backup = publicBackup;
-        if (!backup || backup.manifestDigest !== digestJson(expected)) throw new MaintenanceFailure("snapshot_invalid");
+        if (!backup || backup.manifestDigest !== digestJson(expected)
+          || !samePublicBackupWindow(backup, await observe())) throw new MaintenanceFailure("snapshot_invalid");
         const assertCurrent = async () => {
           await assertMutex(mutex, checkSuccess); if (!assertSnapshotLock) throw new MaintenanceFailure("maintenance_lost"); await assertSnapshotLock(checkSuccess);
           const live = await readIdentity(target, verificationConnection, false, checkSuccess);
@@ -989,7 +1017,8 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     async close() {
       if (closed) return;
       if (closeAttempt) return closeAttempt;
-      closingStarted = true; if (mutex) auditFactories.get(mutex)?.close(); clearInterval(mutexTimer); abort.abort();
+      closingStarted = true; publicBackup = undefined;
+      if (mutex) auditFactories.get(mutex)?.close(); clearInterval(mutexTimer); abort.abort();
       const attempt = (async () => {
         const errors: MaintenanceFailure[] = [];
         try { await waitForPostgresTools(abort.signal); } catch (error) { errors.push(safeError(error, "maintenance_lost", "tool-close")); }

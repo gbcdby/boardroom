@@ -78,6 +78,93 @@ for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeT
     } finally { await f.close(); }
   });
 
+for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeTest : pgTest)(
+  `#152 V ${kind}: current native anchor accepts exact capture plus legal observation/takeover successors`, async () => {
+    const f = await verificationBundleFixture(kind);
+    try {
+      const refs = await f.run(lock => f.publish(lock));
+      const original = (await f.adapter.observe()).state;
+      await f.advance("observation");
+      await f.advance("takeover");
+      await f.advance("observation");
+      const current = (await f.adapter.observe()).state;
+      assert.equal(current.fenceEpoch, original.fenceEpoch);
+      assert.equal(current.ownerGeneration, original.ownerGeneration + 1);
+      assert.equal(current.journalSequence, original.journalSequence + 3);
+      const verification = await f.run(lock => verifyRestoreBundle(f.store, f.adapter, lock, refs.bundle, refs.publication));
+      const value = parseVerification(await f.store.readJson(verification, "verification"));
+      assert.equal(value.exactFullDataAndControlMatched, true);
+      assert.equal(value.sourceFilePayloadsMatched, true);
+      assert.equal(value.schemaAndScopeMatched, true);
+      assert.notEqual(current.journalRecordRef, f.capture.reference.ref);
+      assert.equal((await f.adapter.observe()).state.journalDigest, current.journalDigest);
+    } finally { await f.close(); }
+  });
+
+for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeTest : pgTest)(
+  `#152 V ${kind}: original B/U cannot authorize a new sealed migration on the same physical source`, async t => {
+    const f = await verificationBundleFixture(kind);
+    let restored = 0;
+    try {
+      const refs = await f.run(lock => f.publish(lock));
+      const original = await f.adapter.observe();
+      const replacement = await f.newSealedEpoch();
+      const now = await f.adapter.observe();
+      assert.deepEqual(now.source, original.source);
+      assert.deepEqual(now.sourceIdentity, original.sourceIdentity);
+      assert.equal(now.state.admission, "sealed");
+      assert.ok(now.state.fenceEpoch > original.state.fenceEpoch);
+      assert.notEqual(now.state.activeMigrationId, original.state.activeMigrationId);
+      assert.equal(now.state.journalRecordRef, replacement.ref);
+      const verify = f.adapter.verifyDatabase.bind(f.adapter);
+      t.mock.method(f.adapter, "verifyDatabase", async (...args: Parameters<typeof verify>) => {
+        restored++; return verify(...args);
+      });
+      const before = await artifacts(f.store);
+      await f.run(async lock => {
+        await assert.rejects(verifyRestoreBundle(f.store, f.adapter, lock, refs.bundle, refs.publication),
+          error => error instanceof MaintenanceFailure && error.code === "maintenance_lost");
+      });
+      assert.equal(restored, 0);
+      assert.deepEqual(await artifacts(f.store), before);
+      await noVerification(f.store);
+    } finally { t.mock.restoreAll(); await f.close(); }
+  });
+
+for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeTest : pgTest)(
+  `#152 V ${kind}: illegal same-migration successor is not a capture continuation`, async t => {
+    const f = await verificationBundleFixture(kind);
+    let restores = 0;
+    try {
+      const refs = await f.run(lock => f.publish(lock));
+      await f.adapter.withSourceLock("control", async lock => {
+        const current = await lock.observe(), state = current.state;
+        assert(state.journalRecordRef && state.journalDigest);
+        // The native CAS admits a +1 generation, but the journal protocol requires
+        // that this increment be caused by 'takeover', never 'observation'.
+        const invalid = { ...f.capture.record, previous: f.capture.reference,
+          sequence: state.journalSequence + 1, event: "observation" as const, phase: "quiesced" as const,
+          ownerGeneration: state.ownerGeneration + 1, sourceClients: null, frozen: null,
+          requestId: "v-illegal-successor", snapshot: null };
+        const journal = await f.store.putJson("journal", invalid);
+        await lock.anchor({ expected: state, admission: "sealed", fenceEpoch: state.fenceEpoch,
+          ownerGeneration: invalid.ownerGeneration, activeMigrationId: state.activeMigrationId,
+          planDigest: state.planDigest, controlRootIdentity: { ...f.store.identity }, mutexIdentity: f.mutex.identity,
+          journal, journalSequence: invalid.sequence });
+      });
+      const verify = f.adapter.verifyDatabase.bind(f.adapter);
+      t.mock.method(f.adapter, "verifyDatabase", async (...args: Parameters<typeof verify>) => {
+        restores++; return verify(...args);
+      });
+      const before = await artifacts(f.store);
+      await f.run(async lock => {
+        await assert.rejects(verifyRestoreBundle(f.store, f.adapter, lock, refs.bundle, refs.publication),
+          error => error instanceof MaintenanceFailure && error.code === "journal_invalid");
+      });
+      assert.equal(restores, 0); assert.deepEqual(await artifacts(f.store), before); await noVerification(f.store);
+    } finally { t.mock.restoreAll(); await f.close(); }
+  });
+
 nativeTest("#152 V: wrong role, hash and U binding reject before actual restore or new attempts", async t => {
   for (const fault of ["role", "hash", "publication"] as const) await t.test(fault, async () => {
     const f = await verificationBundleFixture(); let calls = 0;
