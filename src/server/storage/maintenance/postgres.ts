@@ -163,9 +163,10 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       && live.manifests.frozenBusinessManifestDigest === before.manifests.frozenBusinessManifestDigest
       && await compatibleSourceClientWindow(before.manifests.controlRows.storage_source_clients,
          live.manifests.controlRows.storage_source_clients, {
-           // Preliminary native backup filter; V independently verifies the exact journal chain.
+           // Preliminary native backup filter only: weak mode is explicitly not
+           // journal row-level authority; V rechecks with strict control proof.
            journalAdvanced: b.journalSequence > a.journalSequence && b.ownerGeneration >= a.ownerGeneration,
-           fenceEpoch: a.fenceEpoch, databaseInstanceId: a.databaseInstanceId,
+           mode: "weak", fenceEpoch: a.fenceEpoch, databaseInstanceId: a.databaseInstanceId,
            source: before.source, migrationId, planDigest, currentSequence: b.journalSequence,
          });
   };

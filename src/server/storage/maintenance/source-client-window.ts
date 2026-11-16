@@ -4,6 +4,7 @@ import { inspectRegisteredSourceProcess } from "./source-facts.ts";
 import type { ArtifactRef, Json, SourceRef } from "./types.ts";
 
 type Row = Readonly<Record<string, Json>>;
+type ProofRow = Readonly<Record<string, Json>>;
 const same = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
 const columns = [
   "client_id", "database_instance_id", "entrypoint", "build_id", "protocol_version",
@@ -36,7 +37,26 @@ export interface SourceClientJournalAnchor {
   readonly ownerGeneration: number;
   readonly sequence: number;
 }
-export interface CompatibleSourceClientWindowOptions {
+export interface SourceClientRegistrationProof {
+  readonly journal: ArtifactRef;
+  readonly sequence: number;
+  readonly clientId: string;
+  readonly after: ProofRow;
+  readonly actorId: string;
+}
+export interface SourceClientObservationProof {
+  readonly journal: ArtifactRef;
+  readonly sequence: number;
+  readonly clientId: string;
+  readonly before: ProofRow;
+  readonly after: ProofRow;
+  readonly effect: "observed" | "ended-observed";
+}
+export interface SourceClientJournalProof {
+  readonly registrations: readonly SourceClientRegistrationProof[];
+  readonly observations: readonly SourceClientObservationProof[];
+}
+interface CommonOptions {
   readonly journalAdvanced: boolean;
   readonly fenceEpoch: number;
   readonly databaseInstanceId: string;
@@ -48,10 +68,16 @@ export interface CompatibleSourceClientWindowOptions {
   readonly inspectProcess?: (host: Record<string, unknown>, identity: Record<string, unknown>) =>
     Promise<ControllerProcessEvidence | NativeControllerProcessEvidence>;
 }
+export type CompatibleSourceClientWindowOptions = CommonOptions & (
+  | { readonly mode: "strict"; readonly proof: SourceClientJournalProof }
+  | { readonly mode: "weak"; readonly proof?: undefined }
+);
 
-/** The registration envelope is inside the row, but only a current journal node
- * can prove which mutex generation admitted it. A live native PID alone is not proof. */
-function hasRegisteredControllerProof(row: Row, options: CompatibleSourceClientWindowOptions): boolean {
+/** The envelope is only self-describing; strict mode additionally binds it to a
+ * journal-anchored registration change and its actor. Weak mode is an explicitly
+ * non-final prefilter and must never be used to authorize a live restore. */
+function hasRegisteredControllerProof(row: Row, options: CompatibleSourceClientWindowOptions,
+  registration?: SourceClientRegistrationProof): boolean {
   if (typeof row.db_sessions_json !== "string") return false;
   let parsed: unknown;
   try { parsed = JSON.parse(row.db_sessions_json); } catch { return false; }
@@ -68,11 +94,62 @@ function hasRegisteredControllerProof(row: Row, options: CompatibleSourceClientW
   const target = Number(creation.targetSequence);
   if (!Number.isSafeInteger(target) || target <= 1 || target > options.currentSequence) return false;
   if (creation.previousAnchor.ref !== `journals/${options.migrationId}/${target - 1}-${creation.previousAnchor.sha256}.json`) return false;
+  if (registration) {
+    if (target !== registration.sequence || registration.clientId !== row.client_id) return false;
+    const anchor = options.anchors?.find(item => item.sequence === target);
+    return !!anchor && same(anchor.reference, registration.journal)
+      && anchor.migrationId === options.migrationId && anchor.planDigest === options.planDigest
+      && anchor.fenceEpoch === options.fenceEpoch && anchor.ownerGeneration === Number(creation.ownerGeneration)
+      && same(anchor.previous, creation.previousAnchor);
+  }
+  if (options.mode === "strict") return false;
   if (!options.anchors) return true;
   const node = options.anchors.find(item => item.sequence === target);
-  return !!node && same(node.previous, creation.previousAnchor) && node.migrationId === creation.migrationId
+  return !!node && same(node.previous, creation.previousAnchor) && node.migrationId === options.migrationId
     && node.planDigest === creation.plan.sha256 && node.fenceEpoch === options.fenceEpoch
     && node.ownerGeneration === Number(creation.ownerGeneration);
+}
+
+function actorBound(row: Row, registration: SourceClientRegistrationProof): boolean {
+  if (!same(registration.after, row)
+    || !same(registration.after.host_identity_json, row.host_identity_json)
+    || !same(registration.after.process_identity_json, row.process_identity_json)) return false;
+  if (typeof row.process_identity_json !== "string") return false;
+  try {
+    const process: unknown = JSON.parse(row.process_identity_json);
+    return object(process)?.instanceId === registration.actorId;
+  } catch { return false; }
+}
+
+function anchored(options: CompatibleSourceClientWindowOptions, journal: ArtifactRef, sequence: number): boolean {
+  return !!options.anchors?.some(item => item.sequence === sequence && same(item.reference, journal));
+}
+
+/** Follow client-observation changes from a proven row to the live row. The
+ * sequence must advance and every step must be anchored to a live journal node. */
+function observationEffect(options: CompatibleSourceClientWindowOptions, clientId: string,
+  from: ProofRow, to: ProofRow): "observed" | "ended-observed" | null {
+  if (options.mode !== "strict") return null;
+  let current = from, last = 0, ended = false;
+  const used = new Set<number>();
+  for (;;) {
+    if (same(current, to)) return ended ? "ended-observed" : "observed";
+    const next = options.proof.observations
+      .filter(item => item.clientId === clientId && item.sequence > last
+        && !used.has(item.sequence) && same(item.before, current))
+      .sort((a, b) => a.sequence - b.sequence)[0];
+    if (!next || !anchored(options, next.journal, next.sequence)) return null;
+    used.add(next.sequence);
+    last = next.sequence;
+    ended = ended || next.effect === "ended-observed";
+    current = next.after;
+  }
+}
+
+function registrationFor(options: CompatibleSourceClientWindowOptions, row: Row): SourceClientRegistrationProof | undefined {
+  return options.mode === "strict"
+    ? options.proof.registrations.find(item => item.clientId === row.client_id)
+    : undefined;
 }
 
 async function controllerIdentity(row: Row, options: CompatibleSourceClientWindowOptions, allowExited: boolean): Promise<boolean> {
@@ -92,8 +169,8 @@ async function controllerIdentity(row: Row, options: CompatibleSourceClientWindo
 }
 
 /** Only the live source-client controls may drift from the exact archived image.
- * Caller separately proves the native mutex, anchored journal capture prefix,
- * valid observation/takeover successors and frozen source schema/business. */
+ * Strict callers must supply journal registration/observation proof for every row
+ * that changes; weak callers are an explicitly non-final native-backup prefilter. */
 export async function compatibleSourceClientWindow(before: readonly Row[], current: readonly Row[],
   options: CompatibleSourceClientWindowOptions): Promise<boolean> {
   if (same(before, current)) return true;
@@ -115,14 +192,22 @@ export async function compatibleSourceClientWindow(before: readonly Row[], curre
     // An end event cannot be retroactively placed before the last captured
     // observation or the original registration. A later journal observation
     // cannot make an earlier, unobserved termination legitimate.
-    if (!same(prior.ended_at, live.ended_at)
+    const ending = !same(prior.ended_at, live.ended_at);
+    if (ending
       && (prior.ended_at !== null || !timestamp(live.ended_at)
         || !timestamp(prior.registered_at) || !timestamp(prior.last_observed_at)
         || !timestamp(live.last_observed_at)
         || Date.parse(live.ended_at) < Date.parse(prior.registered_at)
         || Date.parse(live.ended_at) < Date.parse(prior.last_observed_at)
         || Date.parse(live.ended_at) > Date.parse(live.last_observed_at))) return false;
-    if (!same(prior.ended_at, live.ended_at) && live.ended_at !== null
+    if (same(prior, live)) continue;
+    if (options.mode === "strict") {
+      const effect = observationEffect(options, id, prior, live);
+      if (!effect) return false;
+      if (ending && live.ended_at !== null) {
+        if (effect !== "ended-observed" || !await controllerIdentity(live, options, true)) return false;
+      } else if (effect !== "observed") return false;
+    } else if (ending && live.ended_at !== null
       && (!hasRegisteredControllerProof(live, options) || !await controllerIdentity(live, options, true))) return false;
   }
   for (const [id, row] of now) {
@@ -141,7 +226,13 @@ export async function compatibleSourceClientWindow(before: readonly Row[], curre
     if (ended && (!timestamp(row.ended_at)
       || Date.parse(row.ended_at) < Date.parse(row.registered_at)
       || Date.parse(row.ended_at) > Date.parse(row.last_observed_at))) return false;
-    if (!hasRegisteredControllerProof(row, options)) return false;
+    const registration = registrationFor(options, row);
+    if (options.mode === "strict") {
+      if (!registration || !actorBound(row, registration)
+        || !hasRegisteredControllerProof(row, options, registration)) return false;
+      if (!same(row.ended_at, registration.after.ended_at)
+        && observationEffect(options, id, registration.after, row) !== "ended-observed") return false;
+    } else if (!hasRegisteredControllerProof(row, options)) return false;
     if (!await controllerIdentity(row, options, ended)) return false;
   }
   return true;

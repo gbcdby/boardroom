@@ -4,12 +4,14 @@ import { readFile, readlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import test from "node:test";
 import { canonicalJson } from "../src/server/storage/maintenance/canonical.ts";
-import { compatibleSourceClientWindow, type CompatibleSourceClientWindowOptions } from "../src/server/storage/maintenance/source-client-window.ts";
+import { compatibleSourceClientWindow, type SourceClientJournalAnchor, type SourceClientJournalProof,
+  type SourceClientObservationProof, type SourceClientRegistrationProof } from "../src/server/storage/maintenance/source-client-window.ts";
 import { verifyRestoreBundle } from "../src/server/storage/maintenance/verify-bundle.ts";
 import { verificationBundleFixture } from "./fixtures/maintenance-verify-bundle.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import type { ArtifactRef, Json, SourceRef } from "../src/server/storage/maintenance/types.ts";
 
+type Row = Readonly<Record<string, Json>>;
 const at = "2026-11-16T01:00:00.000Z", later = "2026-11-16T01:00:01.000Z";
 const source: SourceRef = { kind: "sqlite", databaseInstanceId: "marker", identityDigest: "a".repeat(64) };
 const migrationId = "migration-window-test";
@@ -20,8 +22,13 @@ const previousAnchor: ArtifactRef = {
 const targetAnchor: ArtifactRef = {
   ref: `journals/${migrationId}/7-${"d".repeat(64)}.json`, sha256: "d".repeat(64), bytes: "123",
 };
-const journalAnchor = { reference: targetAnchor, previous: previousAnchor, migrationId, planDigest,
+const endedAnchorRef: ArtifactRef = {
+  ref: `journals/${migrationId}/8-${"e".repeat(64)}.json`, sha256: "e".repeat(64), bytes: "123",
+};
+const journalAnchor: SourceClientJournalAnchor = { reference: targetAnchor, previous: previousAnchor, migrationId, planDigest,
   fenceEpoch: 7, ownerGeneration: 3, sequence: 7 };
+const endedAnchor: SourceClientJournalAnchor = { reference: endedAnchorRef, previous: targetAnchor, migrationId, planDigest,
+  fenceEpoch: 7, ownerGeneration: 3, sequence: 8 };
 const registration = {
   formatVersion: 1, kind: "maintenance-controller-registration", source,
   sourceIdentityDigest: source.identityDigest,
@@ -61,20 +68,34 @@ const exitedProcess = async (host: Record<string, unknown>, identity: Record<str
   host.hostname === hostname() && identity.pid === process.pid
     ? { status: "exited", reason: "process_absent" } as const
     : { status: "exited", reason: "identity_replaced" } as const;
-const row = async (entrypoint = "maintenance-controller"): Promise<Readonly<Record<string, Json>>> => ({
+const row = async (entrypoint = "maintenance-controller"): Promise<Row> => ({
   client_id: "ctl", database_instance_id: "marker", entrypoint, build_id: "boardroom-maintenance-control-v1",
   protocol_version: 1, host_identity_json: canonicalJson(liveHost),
   process_identity_json: canonicalJson(nativeIdentity()), db_sessions_json: canonicalJson(registration),
   registered_epoch: "7", observed_epoch: "7", drain_epoch: null, drain_state: "none",
   drain_receipt_digest: null, registered_at: at, last_observed_at: at, ended_at: null,
 });
-const baseOptions: CompatibleSourceClientWindowOptions = {
-  journalAdvanced: true, fenceEpoch: 7, databaseInstanceId: "marker", source, migrationId, planDigest,
-  currentSequence: 7, anchors: [journalAnchor], inspectProcess: presentProcess,
+const registrationProof = (after: Row, clientId = "ctl"): SourceClientRegistrationProof =>
+  ({ journal: targetAnchor, sequence: 7, clientId, after, actorId: "test-instance" });
+const observationProof = (before: Row, after: Row, effect: SourceClientObservationProof["effect"]): SourceClientObservationProof =>
+  ({ journal: endedAnchorRef, sequence: 8, clientId: String(after.client_id), before, after, effect });
+type CheckOverrides = {
+  readonly proof?: SourceClientJournalProof;
+  readonly inspectProcess?: (host: Record<string, unknown>, identity: Record<string, unknown>) =>
+    Promise<{ readonly status: string; readonly reason: string }>;
 };
-const check = (previous: readonly Readonly<Record<string, Json>>[], live: readonly Readonly<Record<string, Json>>[],
-  journalAdvanced = true, overrides: Partial<CompatibleSourceClientWindowOptions> = {}) =>
-  compatibleSourceClientWindow(previous, live, { ...baseOptions, journalAdvanced, ...overrides });
+const check = (previous: readonly Row[], live: readonly Row[],
+  journalAdvanced = true, overrides: CheckOverrides = {}) => {
+  const proof = overrides.proof ?? {
+    registrations: live.filter(item => item.client_id === "ctl").map(item => registrationProof(item)),
+    observations: [],
+  };
+  return compatibleSourceClientWindow(previous, live, {
+    mode: "strict", journalAdvanced, fenceEpoch: 7, databaseInstanceId: "marker", source, migrationId, planDigest,
+    currentSequence: 8, anchors: [journalAnchor, endedAnchor], proof,
+    inspectProcess: overrides.inspectProcess ?? presentProcess,
+  });
+};
 
 async function fixtureRegistrationEnvelope(f: Awaited<ReturnType<typeof verificationBundleFixture>>): Promise<string> {
   const observed = await f.run(lock => lock.observe());
@@ -94,14 +115,22 @@ async function fixtureRegistrationEnvelope(f: Awaited<ReturnType<typeof verifica
 
 test("#152 V: journal-backed maintenance registration and monotonic observations are narrowly admitted", async () => {
   const old = await row();
+  const ended = { ...old, last_observed_at: later, ended_at: later };
+  const endedProof: SourceClientJournalProof = {
+    registrations: [], observations: [observationProof(old, ended, "ended-observed")],
+  };
   assert.equal(await check([], []), true);
   assert.equal(await check([], [old], false), false);
   assert.equal(await check([], [old]), true);
-  assert.equal(await check([old], [{ ...old, last_observed_at: later, ended_at: later }], true, { inspectProcess: exitedProcess }), true);
+  assert.equal(await check([old], [ended], true, { proof: endedProof, inspectProcess: exitedProcess }), true);
   const observed = { ...old, last_observed_at: later };
-  assert.equal(await check([observed], [{ ...observed, last_observed_at: "2026-11-16T01:00:02.000Z", ended_at: at }], true, { inspectProcess: exitedProcess }), false,
+  const backdated = { ...observed, last_observed_at: "2026-11-16T01:00:02.000Z", ended_at: at };
+  assert.equal(await check([observed], [backdated], true,
+    { proof: { registrations: [], observations: [observationProof(observed, backdated, "ended-observed")] }, inspectProcess: exitedProcess }), false,
     "a late observation must not authorize a retroactively backdated termination");
-  assert.equal(await check([old], [{ ...old, last_observed_at: later, ended_at: "2026-11-15T23:59:59.000Z" }], true, { inspectProcess: exitedProcess }), false,
+  const predated = { ...old, last_observed_at: later, ended_at: "2026-11-15T23:59:59.000Z" };
+  assert.equal(await check([old], [predated], true,
+    { proof: { registrations: [], observations: [observationProof(old, predated, "ended-observed")] }, inspectProcess: exitedProcess }), false,
     "termination cannot predate the initial registration");
   assert.equal(await check([old], [{ ...old, last_observed_at: later }], false), false);
   assert.equal(await check([old], []), false);
@@ -127,22 +156,22 @@ test("#152 V: business admission, session, epoch, identity, drain and receipt dr
 });
 
 
-test("#152 V: unrelated journal progress and a borrowed live PID cannot grant controller registration", async () => {
-  // A caller can copy a real process identity from the host without ever
-  // registering that client_id as a native maintenance controller. A process
-  // being alive is not registration provenance, even after a journal advance.
+test("#152 V: a copied envelope with a borrowed live PID has no journal registration proof", async () => {
   const identity = await row();
-  const unregistered = { ...identity, client_id: "borrowed-real-pid", db_sessions_json: "[]" };
-  assert.equal(await check([], [unregistered]), false,
-    "a borrowed native identity without a registration envelope must not be authorized");
+  const borrowed = { ...identity, client_id: "borrowed-real-pid" };
+  assert.equal(await check([], [borrowed]), false,
+    "a live PID and copied envelope cannot authorize a client_id absent from registration changes");
 });
 
 test("#152 V: a registered controller that exited can be a legal successor", async () => {
   const old = await row();
   const ended = { ...old, last_observed_at: later, ended_at: later };
-  assert.equal(await check([old], [ended], true, { inspectProcess: exitedProcess }), true,
+  const proof: SourceClientJournalProof = {
+    registrations: [], observations: [observationProof(old, ended, "ended-observed")],
+  };
+  assert.equal(await check([old], [ended], true, { proof, inspectProcess: exitedProcess }), true,
     "a registered controller whose native process exited may be observed as ended");
-  assert.equal(await check([old], [ended]), false,
+  assert.equal(await check([old], [ended], true, { proof }), false,
     "a still-present controller cannot be reported as ended");
 });
 
@@ -150,13 +179,14 @@ test("#152 V: a registered controller that exited can be a legal successor", asy
 for (const kind of ["sqlite", "postgres"] as const) {
   const enabled = kind === "sqlite" ? ["linux", "darwin"].includes(process.platform) : Boolean(process.env.AGENT_STUDIO_PG_TEST_URL);
   for (const business of [false, true]) (enabled ? test : test.skip)(
-    "#152 V " + kind + ": real DB and journal " + (business ? "reject new ordinary writer" : "accept maintenance-only coordinator"),
+    "#152 V " + kind + ": real DB rejects copied registration envelope " +
+      (business ? "for an ordinary writer" : "with a borrowed live PID"),
     async () => {
       const f = await verificationBundleFixture(kind);
       try {
         const refs = await f.run(lock => f.publish(lock));
         const dbSessions = await fixtureRegistrationEnvelope(f);
-        const identity = await realNativeIdentity();
+        const native = await realNativeIdentity();
         const sqlText = (value: Json | undefined) => {
           if (typeof value !== "string") throw new Error("expected SQL text");
           return value.replaceAll("'", "''");
@@ -165,20 +195,18 @@ for (const kind of ["sqlite", "postgres"] as const) {
           "(client_id,database_instance_id,entrypoint,build_id,protocol_version," +
           "host_identity_json,process_identity_json,db_sessions_json,registered_epoch,observed_epoch," +
           "drain_epoch,drain_state,drain_receipt_digest,registered_at,last_observed_at,ended_at) " +
-          "VALUES ('control-successor',(SELECT database_instance_id FROM storage_maintenance),'" +
+          "VALUES ('" + (business ? "ordinary-copied-envelope" : "borrowed-native-controller") +
+          "',(SELECT database_instance_id FROM storage_maintenance),'" +
           (business ? "stdio" : "maintenance-controller") +
           "','boardroom-maintenance-control-v1',1,'" + sqlText(canonicalJson(liveHost)) +
-          "','" + sqlText(canonicalJson(identity)) + "','" + sqlText(dbSessions) + "',(SELECT fence_epoch FROM storage_maintenance)," +
+          "','" + sqlText(canonicalJson(native)) + "','" + sqlText(dbSessions) + "',(SELECT fence_epoch FROM storage_maintenance)," +
           "(SELECT fence_epoch FROM storage_maintenance),NULL,'none',NULL,'" + at + "','" + later + "',NULL)";
-        await f.exec(sql); // Enter fixture owns the real source DB, never its isolated PG restore target.
+        await f.exec(sql);
         await f.advance("observation");
-        if (business) await f.run(async lock => assert.rejects(
+        await f.run(lock => assert.rejects(
           verifyRestoreBundle(f.store, f.adapter, lock, refs.bundle, refs.publication),
-          error => error instanceof MaintenanceFailure && error.code === "source_changed"));
-        else {
-          const actual = await f.run(lock => verifyRestoreBundle(f.store, f.adapter, lock, refs.bundle, refs.publication));
-          assert.equal(f.store.kindFor(actual), "verification");
-        }
+          error => error instanceof MaintenanceFailure && error.code === "source_changed",
+          "self-consistent envelope plus unrelated observation is not registration authority"));
       } finally { await f.close(); }
     });
 }
@@ -187,14 +215,12 @@ for (const kind of ["sqlite", "postgres"] as const) {
 for (const kind of ["sqlite", "postgres"] as const) {
   const enabled = kind === "sqlite" ? ["linux", "darwin"].includes(process.platform) : Boolean(process.env.AGENT_STUDIO_PG_TEST_URL);
   (enabled ? test : test.skip)(
-    "#152 V " + kind + ": real SQLite/PostgreSQL V rejects borrowed live native identity after unrelated journal observation",
+    "#152 V " + kind + ": V rejects copied envelope and borrowed live native identity after unrelated journal observation",
     async () => {
       const f = await verificationBundleFixture(kind);
       try {
         const refs = await f.run(lock => f.publish(lock));
-        // This is a real source-DB write, not just a helper comparator call.  The
-        // process is genuinely alive, but no maintenance-controller registration
-        // for this client_id has been issued by the mutex owner or journal.
+        const dbSessions = await fixtureRegistrationEnvelope(f);
         const identity = await row();
         const native = await realNativeIdentity();
         const sqlText = (value: Json | undefined) => {
@@ -206,18 +232,17 @@ for (const kind of ["sqlite", "postgres"] as const) {
           "(client_id,database_instance_id,entrypoint,build_id,protocol_version," +
           "host_identity_json,process_identity_json,db_sessions_json,registered_epoch,observed_epoch," +
           "drain_epoch,drain_state,drain_receipt_digest,registered_at,last_observed_at,ended_at) " +
-          "VALUES ('borrowed-native-controller',(SELECT database_instance_id FROM storage_maintenance)," +
+          "VALUES ('borrowed-copied-controller',(SELECT database_instance_id FROM storage_maintenance)," +
           "'maintenance-controller','boardroom-maintenance-control-v1',1,'" + sqlText(identity.host_identity_json) +
-          "','" + sqlText(canonicalJson(native)) + "','[]'," +
+          "','" + sqlText(canonicalJson(native)) + "','" + sqlText(dbSessions) + "'," +
           "(SELECT fence_epoch FROM storage_maintenance),(SELECT fence_epoch FROM storage_maintenance)," +
           "NULL,'none',NULL,'" + at + "','" + later + "',NULL)"
         );
-        // An unrelated valid anchor advance is not row-level provenance.
         await f.advance("observation");
         await f.run(lock => assert.rejects(
           verifyRestoreBundle(f.store, f.adapter, lock, refs.bundle, refs.publication),
           error => error instanceof MaintenanceFailure && error.code === "source_changed",
-          "a real native PID alone cannot authorize an unregistered source-client row"
+          "a real native PID plus copied envelope cannot authorize an unregistered source-client row"
         ));
       } finally { await f.close(); }
     }
@@ -246,9 +271,9 @@ postgresWindowTest("#152 V PostgreSQL: an invalidated native backup cannot be re
       quote(canonicalJson(native)) + "','[]',(SELECT fence_epoch FROM storage_maintenance)," +
       "(SELECT fence_epoch FROM storage_maintenance),NULL,'none',NULL,'" + at + "','" + later + "',NULL)"
     );
-    await f.advance("observation"); // A genuine anchor CAS does not bless the untrusted client.
+    await f.advance("observation");
     await f.exec("DELETE FROM storage_source_clients WHERE client_id='transient-untrusted'");
-    await f.advance("observation"); // Matching source rows must not unpoison the old archive authority.
+    await f.advance("observation");
     await f.run(lock => assert.rejects(
       verifyRestoreBundle(f.store, f.adapter, lock, refs.bundle, refs.publication),
       error => error instanceof MaintenanceFailure && error.code === "source_changed",
