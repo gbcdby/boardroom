@@ -598,6 +598,34 @@ for (const mode of ["shared-writer", "private-reader", "fd-reader"]) linuxTest(`
   } finally { await user?.stop(); await f.close(); }
 });
 
+linuxTest("#152 a living process with identical fd/scandir EACCES still blocks as unknown", async t => {
+  const f = await fixture(), user = await startUser(f.file, "idle");
+  const original = promises.readdir; let injected = 0;
+  try {
+    t.mock.method(promises, "readdir", (async (file: fs.PathLike, ...args: unknown[]) => {
+      const name = String(file), match = /^\/proc\/self\/fd\/([0-9]+)\/fd$/.exec(name);
+      if (match) {
+        let target = "";
+        try { target = fs.readlinkSync(`/proc/self/fd/${match[1]}`); } catch { /* A missing pin is not our child. */ }
+        if (target === `/proc/${user.child.pid}`) {
+          injected++;
+          throw Object.assign(new Error("bounded test-only fd denial"), { code: "EACCES", syscall: "scandir", path: name });
+        }
+      }
+      return Reflect.apply(original, promises, [file, ...args]);
+    }) as typeof promises.readdir);
+    syncBuiltinESMExports();
+    const blockers = await f.adapter.inspectWriters(await f.adapter.observe());
+    assert.ok(injected > 0, "a real live pinned proc directory was exercised");
+    assert.ok(blockers.some(value => value.code === "source_writer_unknown"
+      && value.subjectRef === `unreadable-process:${user.child.pid}`));
+    assert.equal(user.child.exitCode, null, "EACCES must not be used to infer a living child's exit");
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    await user.stop(); await f.close();
+  }
+});
+
 linuxTest("#152 per-process maps access, partial/empty data and observation limits never produce a clear inventory", async t => {
   const f = await fixture(); const user = await startUser(f.file, "idle");
   try {
