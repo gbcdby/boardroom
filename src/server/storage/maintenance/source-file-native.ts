@@ -72,9 +72,13 @@ function checkedObservation(value: unknown, kind: SourceFileMetadata["kind"]): S
 }
 class OwnedSourceFile implements SourceFileHandle {
   readonly kind: SourceFileMetadata["kind"];
+  private readonly owner: object;
+  private readonly scope: SourceScope;
   private closed = false;
-  constructor(private readonly owner: object, kind: SourceFileMetadata["kind"], private readonly scope: SourceScope) {
+  constructor(owner: object, kind: SourceFileMetadata["kind"], scope: SourceScope) {
+    this.owner = owner;
     this.kind = kind;
+    this.scope = scope;
     scope.opened.add(this);
   }
   private assertActive(): void {
