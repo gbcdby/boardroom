@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/openat2.h>
+#include <linux/stat.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,6 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -170,6 +172,70 @@ static napi_value observe(napi_env env, napi_callback_info info) {
     return throw_code(env, "ERR_SOURCE_RESULT", "Could not encode source observation");
   return object;
 }
+
+/* P1: these are facts about the already-owned FD, never a pathname lookup or
+ * an admission/profile decision. Unsupported optional statx fields stay null. */
+static napi_value observe_statx(napi_env env, napi_callback_info info) {
+  size_t count = 1; napi_value args[1]; source_owner *owner;
+  if (napi_get_cb_info(env, info, &count, args, NULL, NULL) != napi_ok || count != 1 ||
+      !get_owner(env, args[0], &owner))
+    return throw_code(env, "ERR_SOURCE_HANDLE", "Source handle closed or unknown");
+  struct stat before, after;
+  struct statx facts = {0};
+  if (fstat(owner->fd, &before) != 0) return os_error(env, "statx-before-fstat");
+  if (!valid_opened(owner->fd, owner->directory))
+    return throw_code(env, "ERR_SOURCE_IDENTITY", "Source entry changed before statx");
+  if (syscall(SYS_statx, owner->fd, "", AT_EMPTY_PATH | AT_STATX_SYNC_AS_STAT,
+              STATX_BASIC_STATS | STATX_BTIME | STATX_MNT_ID, &facts) != 0)
+    return os_error(env, "statx-owned-fd");
+  if (fstat(owner->fd, &after) != 0) return os_error(env, "statx-after-fstat");
+  if (!valid_opened(owner->fd, owner->directory) ||
+      before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+      before.st_mode != after.st_mode || before.st_uid != after.st_uid ||
+      before.st_nlink != after.st_nlink || before.st_size != after.st_size ||
+      before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+      before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
+      before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
+      before.st_ctim.tv_nsec != after.st_ctim.tv_nsec ||
+      (facts.stx_mask & STATX_BASIC_STATS) != STATX_BASIC_STATS ||
+      facts.stx_ino != (uint64_t)before.st_ino ||
+      facts.stx_dev_major != major(before.st_dev) ||
+      facts.stx_dev_minor != minor(before.st_dev) ||
+      facts.stx_uid != before.st_uid ||
+      facts.stx_mode != before.st_mode ||
+      facts.stx_nlink != before.st_nlink ||
+      facts.stx_size != (uint64_t)before.st_size)
+    return throw_code(env, "ERR_SOURCE_IDENTITY", "Source FD statx and fstat disagree");
+  napi_value object, kind, mount_id, birthtime;
+  if (napi_create_object(env, &object) != napi_ok ||
+      napi_create_string_utf8(env, owner->directory ? "directory" : "file", NAPI_AUTO_LENGTH, &kind) != napi_ok ||
+      napi_set_named_property(env, object, "kind", kind) != napi_ok ||
+      !set_big(env, object, "mask", (uint64_t)facts.stx_mask) ||
+      !set_big(env, object, "devMajor", (uint64_t)facts.stx_dev_major) ||
+      !set_big(env, object, "devMinor", (uint64_t)facts.stx_dev_minor) ||
+      !set_big(env, object, "ino", (uint64_t)facts.stx_ino) ||
+      !set_big(env, object, "attributes", facts.stx_attributes) ||
+      !set_big(env, object, "attributesMask", facts.stx_attributes_mask))
+    return throw_code(env, "ERR_SOURCE_RESULT", "Cannot encode source statx");
+  if ((facts.stx_mask & STATX_MNT_ID) != 0) {
+    if (napi_create_bigint_uint64(env, facts.stx_mnt_id, &mount_id) != napi_ok)
+      return throw_code(env, "ERR_SOURCE_RESULT", "Cannot encode mount ID");
+  } else if (napi_get_null(env, &mount_id) != napi_ok)
+    return throw_code(env, "ERR_SOURCE_RESULT", "Cannot encode absent mount ID");
+  if ((facts.stx_mask & STATX_BTIME) != 0) {
+    int64_t birth_ns;
+    if (facts.stx_btime.tv_nsec >= 1000000000u ||
+        !time_ns((struct timespec){ .tv_sec = facts.stx_btime.tv_sec, .tv_nsec = facts.stx_btime.tv_nsec }, &birth_ns) ||
+        napi_create_bigint_int64(env, birth_ns, &birthtime) != napi_ok)
+      return throw_code(env, "ERR_SOURCE_OVERFLOW", "Invalid source birthtime");
+  } else if (napi_get_null(env, &birthtime) != napi_ok)
+    return throw_code(env, "ERR_SOURCE_RESULT", "Cannot encode absent source birthtime");
+  if (napi_set_named_property(env, object, "mountId", mount_id) != napi_ok ||
+      napi_set_named_property(env, object, "birthtimeNs", birthtime) != napi_ok)
+    return throw_code(env, "ERR_SOURCE_RESULT", "Cannot return source statx");
+  return object;
+}
+
 static napi_value read_at(napi_env env, napi_callback_info info) {
   size_t count = 3; napi_value args[3]; source_owner *owner;
   int64_t offset; bool exact; uint32_t length;
@@ -238,6 +304,7 @@ static napi_value init(napi_env env, napi_value exports) {
     { "openRoot", NULL, open_root, NULL, NULL, NULL, napi_default, NULL },
     { "openChild", NULL, open_child, NULL, NULL, NULL, napi_default, NULL },
     { "observe", NULL, observe, NULL, NULL, NULL, napi_default, NULL },
+    { "observeStatx", NULL, observe_statx, NULL, NULL, NULL, napi_default, NULL },
     { "readAt", NULL, read_at, NULL, NULL, NULL, napi_default, NULL },
     { "readDirectory", NULL, read_directory, NULL, NULL, NULL, napi_default, NULL },
     { "close", NULL, close_owner, NULL, NULL, NULL, napi_default, NULL },
