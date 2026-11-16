@@ -17,6 +17,7 @@ type NativeBinding = {
   openRoot(path: string): object;
   openChild(parent: object, leaf: string, kind: "file" | "directory"): object;
   observe(owner: object): { kind: string; dev: bigint; ino: bigint; size: bigint };
+  observeStatx(owner: object): unknown;
   readAt(owner: object, offset: bigint, length: number): Buffer;
   readDirectory(owner: object): string[];
   close(owner: object): void;
@@ -28,7 +29,7 @@ linuxTest("#152 P0 Linux source FD builds against fixed checked Node-API 8 heade
   assert.equal(build.error, undefined, "native bridge compilation must actually run");
   assert.equal(build.status, 0, build.stderr.slice(0, 1000));
   const native = createRequire(import.meta.url)(sourceFileNativePath) as NativeBinding;
-  for (const name of ["openRoot", "openChild", "observe", "readAt", "readDirectory", "close"] as const)
+  for (const name of ["openRoot", "openChild", "observe", "observeStatx", "readAt", "readDirectory", "close"] as const)
     assert.equal(typeof native[name], "function");
 });
 
@@ -43,20 +44,34 @@ linuxTest("#152 P0 pinned native file owner never changes FD across two real rea
       const base = observeSourceFile(handle);
       assert.equal(base.kind, "directory");
       assert.ok(base.dev > 0n && base.ino > 0n);
+      const rootStatx = handle.observeStatx();
+      assert.equal(rootStatx.kind, "directory");
+      assert.equal(rootStatx.ino, base.ino);
+      assert.equal(rootStatx.mask & 0x7ffn, 0x7ffn);
+      assert.equal(rootStatx.mountId === null || rootStatx.mountId > 0n, true);
+      assert.equal(rootStatx.birthtimeNs === null || typeof rootStatx.birthtimeNs === "bigint", true);
       assert.deepEqual(handle.readDirectory(), ["file.bin", "nested"]);
       assert.deepEqual(handle.readDirectory(), ["file.bin", "nested"], "enumeration is repeatable");
       const file = handle.openChild("file.bin", "file");
       const initial = file.observe();
       assert.equal(initial.kind, "file");
       assert.equal(initial.size, BigInt(bytes.length));
+      const pinnedFacts = file.observeStatx();
+      assert.equal(pinnedFacts.kind, "file");
+      assert.equal(pinnedFacts.ino, initial.ino);
+      assert.equal(pinnedFacts.mask & 0x7ffn, 0x7ffn);
+      assert.equal(pinnedFacts.attributes & ~pinnedFacts.attributesMask, 0n,
+        "unadvertised statx attribute bits must not be interpreted as facts");
       assert.deepEqual(file.readAt(0n, 6), bytes);
       assert.deepEqual(file.readAt(2n, 3), bytes.subarray(2, 5));
       assert.deepEqual(file.readAt(6n, 1), Buffer.alloc(0));
       assert.deepEqual(file.observe(), initial, "same live object and unchanged typed metadata");
+      assert.deepEqual(file.observeStatx(), pinnedFacts, "statx uses the same stable owned FD");
       assert.throws(() => file.readAt(-1n, 1), { code: "source_changed" });
       assert.throws(() => file.readAt(0n, 65537), { code: "source_changed" });
       file.close();
       assert.throws(() => file.readAt(0n, 1), { code: "maintenance_lost" });
+      assert.throws(() => file.observeStatx(), { code: "maintenance_lost" });
       assert.throws(() => file.close(), { code: "maintenance_lost" });
       const nested = handle.openChild("nested", "directory");
       assert.deepEqual(nested.readDirectory(), []);
@@ -92,6 +107,7 @@ linuxTest("#152 P0 real native openat2 rejects symlink, hardlink, leaf escape an
     native.close(raw);
     assert.throws(() => native.openChild(raw, "ordinary", "file"));
     assert.throws(() => native.observe(raw));
+    assert.throws(() => native.observeStatx(raw));
     assert.throws(() => native.close(raw));
   } finally { await rm(tmp, { recursive: true, force: true }); }
 });

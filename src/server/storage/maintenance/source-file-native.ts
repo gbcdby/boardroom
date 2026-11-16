@@ -17,10 +17,27 @@ export interface SourceFileMetadata {
   readonly mtimeNs: bigint;
   readonly ctimeNs: bigint;
 }
+
+/** P1 raw Linux statx(AT_EMPTY_PATH) facts from the identical owned FD.
+ * Null means the kernel omitted that mask bit, never an inferred value.
+ * No FID, filesystem UUID, source health, or provider eligibility is issued. */
+export interface SourceFileStatxObservation {
+  readonly kind: "file" | "directory";
+  readonly mask: bigint;
+  readonly devMajor: bigint;
+  readonly devMinor: bigint;
+  readonly ino: bigint;
+  readonly mountId: bigint | null;
+  readonly birthtimeNs: bigint | null;
+  readonly attributes: bigint;
+  readonly attributesMask: bigint;
+}
+
 interface NativeSourceBinding {
   openRoot(path: string): object;
   openChild(parent: object, leaf: string, kind: SourceFileMetadata["kind"]): object;
   observe(owner: object): unknown;
+  observeStatx(owner: object): unknown;
   readAt(owner: object, offset: bigint, length: number): unknown;
   readDirectory(owner: object): unknown;
   close(owner: object): void;
@@ -28,6 +45,7 @@ interface NativeSourceBinding {
 export interface SourceFileHandle {
   readonly kind: SourceFileMetadata["kind"];
   observe(): SourceFileMetadata;
+  observeStatx(): SourceFileStatxObservation;
   openChild(leaf: string, kind: SourceFileMetadata["kind"]): SourceFileHandle;
   readAt(offset: bigint, length: number): Buffer;
   readDirectory(): readonly string[];
@@ -57,7 +75,7 @@ function binding(): NativeSourceBinding {
   let native: NativeSourceBinding;
   try { native = createRequire(import.meta.url)(sourceFileNativePath) as NativeSourceBinding; }
   catch { throw unavailable(); }
-  for (const method of ["openRoot", "openChild", "observe", "readAt", "readDirectory", "close"] as const) {
+  for (const method of ["openRoot", "openChild", "observe", "observeStatx", "readAt", "readDirectory", "close"] as const) {
     if (typeof native[method] !== "function") throw unavailable();
   }
   cached = native;
@@ -70,6 +88,20 @@ function checkedObservation(value: unknown, kind: SourceFileMetadata["kind"]): S
   if (!fields.every(name => typeof candidate[name] === "bigint")) throw sourceChanged();
   return value as SourceFileMetadata;
 }
+function checkedStatx(value: unknown, kind: SourceFileMetadata["kind"]): SourceFileStatxObservation {
+  if (!value || typeof value !== "object" || (value as { kind?: unknown }).kind !== kind) throw sourceChanged();
+  const item = value as Partial<SourceFileStatxObservation>;
+  for (const key of ["mask", "devMajor", "devMinor", "ino", "attributes", "attributesMask"] as const) {
+    if (typeof item[key] !== "bigint") throw sourceChanged();
+  }
+  if ((item.mask! & 0x7ffn) !== 0x7ffn || item.ino! <= 0n
+    || (item.mountId !== null && typeof item.mountId !== "bigint")
+    || (item.birthtimeNs !== null && typeof item.birthtimeNs !== "bigint")
+    || ((item.mask! & 0x1000n) !== 0n) !== (item.mountId !== null)
+    || ((item.mask! & 0x800n) !== 0n) !== (item.birthtimeNs !== null)) throw sourceChanged();
+  return item as SourceFileStatxObservation;
+}
+
 class OwnedSourceFile implements SourceFileHandle {
   readonly kind: SourceFileMetadata["kind"];
   private readonly owner: object;
@@ -87,6 +119,10 @@ class OwnedSourceFile implements SourceFileHandle {
   observe(): SourceFileMetadata {
     this.assertActive();
     return checkedObservation(this.scope.binding.observe(this.owner), this.kind);
+  }
+  observeStatx(): SourceFileStatxObservation {
+    this.assertActive();
+    return checkedStatx(this.scope.binding.observeStatx(this.owner), this.kind);
   }
   openChild(leaf: string, kind: SourceFileMetadata["kind"]): SourceFileHandle {
     this.assertActive();
