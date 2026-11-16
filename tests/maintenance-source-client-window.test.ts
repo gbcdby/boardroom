@@ -149,3 +149,35 @@ for (const kind of ["sqlite", "postgres"] as const) {
     }
   );
 }
+
+
+const postgresWindowTest = process.env.AGENT_STUDIO_PG_TEST_URL ? test : test.skip;
+postgresWindowTest("#152 V PostgreSQL: an invalidated native backup cannot be revived by reverting source rows", async () => {
+  const f = await verificationBundleFixture("postgres");
+  try {
+    const refs = await f.run(lock => f.publish(lock));
+    const identity = await row();
+    const quote = (value: Json | undefined) => {
+      if (typeof value !== "string") throw new Error("missing native identity");
+      return value.replaceAll("'", "''");
+    };
+    await f.exec(
+      "INSERT INTO storage_source_clients " +
+      "(client_id,database_instance_id,entrypoint,build_id,protocol_version," +
+      "host_identity_json,process_identity_json,db_sessions_json,registered_epoch,observed_epoch," +
+      "drain_epoch,drain_state,drain_receipt_digest,registered_at,last_observed_at,ended_at) " +
+      "VALUES ('transient-untrusted',(SELECT database_instance_id FROM storage_maintenance)," +
+      "'stdio','test-build',1,'" + quote(identity.host_identity_json) + "','" +
+      quote(identity.process_identity_json) + "','[]',(SELECT fence_epoch FROM storage_maintenance)," +
+      "(SELECT fence_epoch FROM storage_maintenance),NULL,'none',NULL,'" + at + "','" + later + "',NULL)"
+    );
+    await f.advance("observation"); // A genuine anchor CAS does not bless the untrusted client.
+    await f.exec("DELETE FROM storage_source_clients WHERE client_id='transient-untrusted'");
+    await f.advance("observation"); // Matching source rows must not unpoison the old archive authority.
+    await f.run(lock => assert.rejects(
+      verifyRestoreBundle(f.store, f.adapter, lock, refs.bundle, refs.publication),
+      error => error instanceof MaintenanceFailure && error.code === "source_changed",
+      "native PostgreSQL restore must retain the prior source-drift evidence"
+    ));
+  } finally { await f.close(); }
+});
