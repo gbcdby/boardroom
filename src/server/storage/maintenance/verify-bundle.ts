@@ -52,6 +52,13 @@ async function assertLiveCapture(store: ArtifactStore, observed: SourceObservati
         journalAdvanced: liveChain.nodes.slice(captureIndex + 1).some(node =>
           node.record.event === "observation" || node.record.event === "takeover"),
         fenceEpoch: capture.fenceEpoch, databaseInstanceId: capture.source.databaseInstanceId,
+        source: capture.source, migrationId: capture.migrationId, planDigest: capture.planDigest,
+        currentSequence: head.record.sequence,
+        anchors: liveChain.nodes.slice(captureIndex + 1).map(node => ({
+          reference: node.reference, previous: node.record.previous, migrationId: node.record.migrationId,
+          planDigest: node.record.plan.sha256, fenceEpoch: node.record.fenceEpoch,
+          ownerGeneration: node.record.ownerGeneration, sequence: node.record.sequence,
+        })),
       }),
     "source_changed");
   const prior = closed.manifests.controlRows.storage_maintenance[0];

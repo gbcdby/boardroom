@@ -150,6 +150,8 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   let publicBackupSourceChanged = false;
   const samePublicBackupWindow = async (backup: NonNullable<typeof publicBackup>, live: SourceObservation): Promise<boolean> => {
     const before = backup.capture, a = before.state, b = live.state;
+    const migrationId = a.activeMigrationId, planDigest = a.planDigest;
+    if (!migrationId || !planDigest) return false;
     return backup.owner === mutex && !backup.owner.released && !backup.owner.retiring
       && b.admission === "sealed" && a.admission === "sealed"
       && b.databaseInstanceId === a.databaseInstanceId && b.activeMigrationId === a.activeMigrationId
@@ -164,6 +166,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
            // Preliminary native backup filter; V independently verifies the exact journal chain.
            journalAdvanced: b.journalSequence > a.journalSequence && b.ownerGeneration >= a.ownerGeneration,
            fenceEpoch: a.fenceEpoch, databaseInstanceId: a.databaseInstanceId,
+           source: before.source, migrationId, planDigest, currentSequence: b.journalSequence,
          });
   };
   const activeVerifications = new Set<Promise<Json>>();
