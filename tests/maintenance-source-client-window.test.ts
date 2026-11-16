@@ -62,6 +62,18 @@ test("#152 V: business admission, session, epoch, identity, drain and receipt dr
   assert.equal(await check([], [{ ...original, host_identity_json: JSON.stringify({ version: 1, hostname: "forged", platform: process.platform }) }]), false);
 });
 
+
+test("#152 V: unrelated journal progress and a borrowed live PID cannot grant controller registration", async () => {
+  // A caller can copy a real process identity from the host without ever
+  // registering that client_id as a native maintenance controller. A process
+  // being alive is not registration provenance, even after a journal advance.
+  const identity = await row();
+  const unregistered = { ...identity, client_id: "borrowed-real-pid" };
+  assert.equal(await check([], [unregistered]), false,
+    "a borrowed native identity must not authorize a new client row");
+});
+
+
 for (const kind of ["sqlite", "postgres"] as const) {
   const enabled = kind === "sqlite" ? ["linux", "darwin"].includes(process.platform) : Boolean(process.env.AGENT_STUDIO_PG_TEST_URL);
   for (const business of [false, true]) (enabled ? test : test.skip)(
