@@ -9,10 +9,10 @@ const columns = [
   "registered_epoch", "observed_epoch", "drain_epoch", "drain_state",
   "drain_receipt_digest", "registered_at", "last_observed_at", "ended_at",
 ].sort();
-const timestamp = (value: Json): value is string => typeof value === "string"
+const timestamp = (value: Json | undefined): value is string => typeof value === "string"
   && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z$/.test(value)
   && Number.isFinite(Date.parse(value));
-function emptySessions(value: Json): boolean {
+function emptySessions(value: Json | undefined): boolean {
   if (typeof value !== "string") return false;
   try {
     const parsed: unknown = JSON.parse(value);
