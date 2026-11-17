@@ -257,7 +257,13 @@ nativeTest("#152 C2 sqlite: actual T COMMIT before/after and Q close failures ne
         return value;
       });
       const outcome = await rejected(f.captureSnapshot(f.options, f.request));
-      assert.equal(outcome.failed, true); assert(errorLeaves(outcome.error).includes(failure)); assert(injected >= 1);
+      assert.equal(outcome.failed, true); assert(injected >= 1);
+      // The existing facts-source close boundary deliberately exposes this
+      // safe error instead of the native close value. C2 must preserve that
+      // failure and the actual committed anchor, not fabricate rollback.
+      if (point === "source-close") assert(errorLeaves(outcome.error).some(error => error instanceof MaintenanceFailure
+        && error.code === "maintenance_lost" && error.message === "storage_maintenance: maintenance_lost (source-client-facts)"));
+      else assert(errorLeaves(outcome.error).includes(failure));
       child.mock.restoreAll(); delete f.recovery.onLock;
       const actual = await f.observe(), expectedSequence = point === "commit-before" ? 2 : point === "commit-after" ? 3 : 4;
       assert.equal(actual.state.journalSequence, expectedSequence); assert.equal(actual.state.admission, "sealed");
@@ -448,7 +454,10 @@ nativeTest("#152 C2 sqlite: production empty registry rejects both planned and s
     { code: "backup_capability_unavailable" });
     assert.deepEqual(await f.observe(), sealed);
     assert.equal((await readdir(path.join(f.reference.controlRoot, "journals", f.plan.migrationId))).length, 2);
-    await assert.rejects(readdir(path.join(f.reference.controlRoot, "snapshots")), { code: "ENOENT" });
+    // The earlier real C1 capture legitimately stores Fs/payloads under
+    // snapshots/. No database attempt, bundle or verification was produced.
+    assert.deepEqual((await readdir(f.reference.controlRoot, { recursive: true })).filter(name =>
+      /(^|\/)(database-snapshot\.bin|database\.sqlite|database\.dump|restore-bundle\.json|publication\.json|verification\.json|receipt\.json)$/.test(name)), []);
   } finally { await f.close(); }
 });
 

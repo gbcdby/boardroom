@@ -125,7 +125,12 @@ nativeTest("#152 C2 postgres: T COMMIT before/after and Q source close failures 
         if (this === target && point === "source-close") { injected++; throw failure; }
       } as typeof end);
       const outcome = await rejected(f.captureSnapshot(f.options, f.request));
-      assert.equal(outcome.failed, true); assert(errorLeaves(outcome.error).includes(failure)); assert(injected >= 1);
+      assert.equal(outcome.failed, true); assert(injected >= 1);
+      // Keep the existing endFactsSession safe-error contract distinct from
+      // the exact original COMMIT failures and D body/cleanup errors.
+      if (point === "source-close") assert(errorLeaves(outcome.error).some(error => error instanceof MaintenanceFailure
+        && error.code === "maintenance_lost" && error.message === "storage_maintenance: maintenance_lost (source-client-facts)"));
+      else assert(errorLeaves(outcome.error).includes(failure));
       child.mock.restoreAll(); delete f.recovery.onLock;
       const observed = await f.observe(), expectedSequence = point === "commit-before" ? 2 : point === "commit-after" ? 3 : 4;
       assert.equal(observed.state.admission, "sealed"); assert.equal(observed.state.journalSequence, expectedSequence);
@@ -243,6 +248,7 @@ nativeTest("#152 C2 postgres: production empty registry rejects planned and seal
     await assert.rejects(captureSnapshotMaintenance(f.options, request), { code: "backup_capability_unavailable" });
     assert.deepEqual(await f.observe(), sealed);
     assert.equal((await readdir(path.join(f.reference.controlRoot, "journals", f.plan.migrationId))).length, 2);
-    await assert.rejects(readdir(path.join(f.reference.controlRoot, "snapshots")), { code: "ENOENT" });
+    assert.deepEqual((await readdir(f.reference.controlRoot, { recursive: true })).filter(name =>
+      /(^|\/)(database-snapshot\.bin|database\.sqlite|database\.dump|restore-bundle\.json|publication\.json|verification\.json|receipt\.json)$/.test(name)), []);
   } finally { await f.close(); }
 });
