@@ -439,7 +439,7 @@ def prepare_input_closure(request, output):
               "inputs": {}, "e2fs": {}, "commands": []}
     original_error = None
     try:
-        record["source"] = source_bindings(request.get("profile"))
+        record["source"] = source_bindings(DM_PROFILE) if "profile" in request else source_bindings()
         closure, data, files = verify_input_closure(request)
         record["input_closure"] = closure; record["inputs"] = dict(closure["core"])
         record["e2fs"] = closure["payload"]
@@ -473,7 +473,7 @@ def prepare_input_closure(request, output):
         record["mkfs_environment"] = dict(f2.MKFS_ENV)
         if verify_input_closure(request)[0] != closure: raise ValueError("inputs changed during offline build")
         if runtime_cwd(cwd) != record["runtime_cwd"]: raise ValueError("runtime cwd changed during offline build")
-        if source_bindings(request.get("profile")) != record["source"]: raise ValueError("source changed during offline build")
+        if (source_bindings(DM_PROFILE) if "profile" in request else source_bindings()) != record["source"]: raise ValueError("source changed during offline build")
         if time.monotonic() - started > 60: raise TimeoutError("offline preparation stage deadline")
         record["state"] = "FIXED_F3_BUNDLE_NOT_BOOTED"
     except BaseException as error:

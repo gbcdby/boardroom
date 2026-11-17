@@ -31,7 +31,7 @@ def validate(bundle_path, digest):
     run_id = bundle["request"]["run_id"]
     module = builder.profile_module(bundle["request"])
     if bundle["proposal"] != module.plan(json.dumps({"run_id": run_id}).encode()): raise ValueError("F3 proposal changed")
-    if bundle["source"] != builder.source_bindings(bundle["request"].get("profile")): raise ValueError("execution sources differ from frozen bundle")
+    if bundle["source"] != (builder.source_bindings(builder.DM_PROFILE) if "profile" in bundle["request"] else builder.source_bindings()): raise ValueError("execution sources differ from frozen bundle")
     if bundle["mkfs_argv"] != (f2 if module is f3 else module).mkfs_argv(run_id) or bundle["mkfs_environment"] != f2.MKFS_ENV:
         raise ValueError("fixed mkfs contract changed")
     keys = {"qemu", "kernel", "bios", "busybox", "notes", "gate", "helper", "brd", "config", "initramfs"}
@@ -85,7 +85,7 @@ def runtime_preflight(bundle_path, bundle, output, argv=None, owned=None):
     builder.require_private_source()
     if bundle.get("kind") != builder.NEW_INPUT_KIND: raise ValueError("unknown runtime input family")
     builder.profile_module(bundle["request"])
-    if bundle["source"] != builder.source_bindings(bundle["request"].get("profile")): raise ValueError("private source identity changed")
+    if bundle["source"] != (builder.source_bindings(builder.DM_PROFILE) if "profile" in bundle["request"] else builder.source_bindings()): raise ValueError("private source identity changed")
     closure, _, _ = builder.verify_input_closure(bundle["request"])
     if closure != bundle["input_closure"] or closure["runtime_inputs"]["status"] != "FIXED_PRECONDITIONS_NOT_RUNTIME_EVIDENCE":
         raise ValueError("runtime_use_NOT_ESTABLISHED")
