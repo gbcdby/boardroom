@@ -8,6 +8,7 @@ import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { verifyRestoreBundleClosure } from "../src/server/storage/maintenance/journal.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import { sourceClientsDigest } from "../src/server/storage/maintenance/source-clients.ts";
+import { readSqliteMaintenanceState } from "../src/server/storage/admission.ts";
 import type { ArtifactRef, SourceLock } from "../src/server/storage/maintenance/types.ts";
 
 const nativeTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
@@ -154,12 +155,15 @@ nativeTest("#152 snapshot B/U: actual native reader close failure preserves the 
       if (this.name === f.file && this.readonly) { closes++; throw failure; }
       return result;
     });
-    await f.run(async lock => {
+    await assert.rejects(f.run(async lock => {
       try { await publish(f.store, lock); } catch (error) { rejected = true; assert.equal(error, failure); }
-    });
+    }), error => error instanceof MaintenanceFailure && error.code === "maintenance_lost");
     assert.equal(rejected, true); assert.equal(closes, 1);
     assert.ok(!(await names(f.store)).some(name => /\/(restore-bundle|publication)\.json$/.test(name)));
-    t.mock.restoreAll(); assert.deepEqual((await f.adapter.observe()).state, f.sealed.state);
+    t.mock.restoreAll(); await f.mutex.release(); await f.adapter.close();
+    const fresh = new Database(f.file, { readonly: true, fileMustExist: true });
+    try { assert.deepEqual(readSqliteMaintenanceState(fresh, true), f.sealed.state); }
+    finally { fresh.close(); }
   } finally { t.mock.restoreAll(); await f.close(); }
 });
 

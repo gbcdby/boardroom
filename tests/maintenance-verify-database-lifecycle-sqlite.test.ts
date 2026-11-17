@@ -8,6 +8,7 @@ import { migrations } from "../src/server/db/migrations/index.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { createSqliteMaintenanceAdapter } from "../src/server/storage/maintenance/sqlite.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
+import { readSqliteMaintenanceState } from "../src/server/storage/admission.ts";
 import type { AnchorChange, ArtifactRef, SourceLock } from "../src/server/storage/maintenance/types.ts";
 
 const platformTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
@@ -158,17 +159,24 @@ platformTest("SQLite verification: three failures keep ordering and explicit cle
   } finally { t.mock.restoreAll(); if (restored?.open) close.call(restored); await f.close(); }
 });
 
+function freshBackupSourceState(directory: string) {
+  const reader = new Database(path.join(directory, "agent-studio.db"), { readonly: true, fileMustExist: true });
+  try { return readSqliteMaintenanceState(reader, true); }
+  finally { reader.close(); }
+}
+
 for (const timing of ["before", "after"] as const) {
   platformTest(`SQLite backup: rollback and close-${timing} preserve primary and the actual reader owner`, async t => {
     const f = await fixture(), exec = Database.prototype.exec, close = Database.prototype.close;
     const primary = new MaintenanceFailure("snapshot_invalid", "backup-primary");
     const secondary = Object.freeze(new Error("backup-close"));
-    let reader: Database.Database | undefined, closes = 0;
+    let reader: Database.Database | undefined, closes = 0, rollbacks = 0;
     try {
-      await f.adapter.withSourceLock("snapshot", async lock => {
+      const sealed = (await f.adapter.observe()).state; assert.equal(sealed.admission, "sealed");
+      const outer = await rejection(f.adapter.withSourceLock("snapshot", async lock => {
         t.mock.method(Database.prototype, "backup", function(this: Database.Database) { reader = this; throw primary; });
         t.mock.method(Database.prototype, "exec", function(this: Database.Database, sql: string) {
-          if (this === reader && sql === "ROLLBACK") throw undefined;
+          if (this === reader && sql === "ROLLBACK") { rollbacks++; throw undefined; }
           return exec.call(this, sql);
         });
         t.mock.method(Database.prototype, "close", function(this: Database.Database) {
@@ -176,31 +184,39 @@ for (const timing of ["before", "after"] as const) {
           return close.call(this);
         });
         const error = await rejection(lock.backup(path.join(f.attempt, "failed-backup.sqlite")));
-        assert(error instanceof AggregateError); assert.equal(error.cause, primary);
-        assert.deepEqual(error.errors, [primary, undefined, secondary]);
-        assert.equal(closes, 1); assert.equal(reader?.open, timing === "before");
-      });
+        assert.strictEqual(error, primary);
+        assert.equal(closes, 1); assert.equal(rollbacks, 1); assert.equal(reader?.open, timing === "before");
+      }));
+      assert(outer instanceof MaintenanceFailure); assert.equal(outer.code, "maintenance_lost");
       await f.mutex.release();
+      const error = await rejection(f.adapter.close());
+      assert(error instanceof AggregateError);
+      assert.deepEqual(error.errors, timing === "before" ? [undefined, secondary, undefined, secondary] : [undefined, secondary]);
+      assert.strictEqual(error.errors[1], secondary);
       if (timing === "before") {
-        const error = await rejection(f.adapter.close());
-        assert(error instanceof AggregateError); assert.deepEqual(error.errors, [undefined, secondary]);
-        assert.equal(closes, 2); assert.equal(reader?.open, true);
-      }
+        assert.strictEqual(error.errors[3], secondary);
+        assert.equal(closes, 2); assert.equal(rollbacks, 2); assert.equal(reader?.open, true);
+      } else { assert.equal(closes, 1); assert.equal(rollbacks, 1); assert.equal(reader?.open, false); }
       t.mock.restoreAll(); await f.adapter.close(); assert.equal(reader?.open, false);
+      assert.deepEqual(freshBackupSourceState(f.directory), sealed);
     } finally { t.mock.restoreAll(); if (reader?.open) close.call(reader); await f.close(); }
   });
 }
 
-platformTest("SQLite backup: throw undefined keeps the original safe failure and still closes once", async t => {
+platformTest("SQLite backup: throw undefined keeps the exact original failure and still closes once", async t => {
   const f = await fixture(), close = Database.prototype.close;
-  let reader: Database.Database | undefined, closes = 0;
+  let reader: Database.Database | undefined, closes = 0, backupThrew = false;
   try {
-    await f.adapter.withSourceLock("snapshot", async lock => {
-      t.mock.method(Database.prototype, "backup", function(this: Database.Database) { reader = this; throw undefined; });
+    const sealed = (await f.adapter.observe()).state; assert.equal(sealed.admission, "sealed");
+    const outer = await rejection(f.adapter.withSourceLock("snapshot", async lock => {
+      t.mock.method(Database.prototype, "backup", function(this: Database.Database) { reader = this; backupThrew = true; throw undefined; });
       t.mock.method(Database.prototype, "close", function(this: Database.Database) { if (this === reader) closes++; return close.call(this); });
       const error = await rejection(lock.backup(path.join(f.attempt, "failed-backup.sqlite")));
-      assert(error instanceof MaintenanceFailure); assert.equal(error.code, "snapshot_invalid");
+      assert.equal(backupThrew, true); assert.strictEqual(error, undefined);
       assert.equal(closes, 1); assert.equal(reader?.open, false);
-    });
+    }));
+    assert(outer instanceof MaintenanceFailure); assert.equal(outer.code, "maintenance_lost");
+    t.mock.restoreAll(); await f.mutex.release(); await f.adapter.close();
+    assert.deepEqual(freshBackupSourceState(f.directory), sealed);
   } finally { t.mock.restoreAll(); await f.close(); }
 });
