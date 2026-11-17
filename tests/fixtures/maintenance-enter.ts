@@ -17,14 +17,16 @@ import type { ContinueRequest, MaintenanceServiceOptions } from "../../src/serve
 
 /** Only bootstraps a private source and persists P; never seeds a journal, phase, or DB anchor. */
 export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite",
-  fixtureOptions: { sqliteEncoding?: "UTF-8" | "UTF-16le" | "UTF-16be" } = {}) {
+  fixtureOptions: { sqliteEncoding?: "UTF-8" | "UTF-16le" | "UTF-16be"; directory?: string; sessions?: boolean; drainClient?: boolean } = {}) {
   // Use the checkout filesystem for durable positive fixtures. Some Linux runners mount /tmp
   // as tmpfs, which is intentionally outside the production filesystem support policy.
-  const directory = await realpath(await mkdtemp(path.join(path.dirname(process.cwd()), "br-enter-")));
+  const directory = await realpath(fixtureOptions.directory ?? await mkdtemp(path.join(path.dirname(process.cwd()), "br-enter-")));
   const dataDir = path.join(directory, "data"); await mkdir(dataDir);
   const file = path.join(dataDir, "agent-studio.db"), configFile = path.join(directory, "config.json");
   let admin: Client | undefined, database: string | undefined, sourceUrl: string | undefined;
   const clients = new Set<Client>();
+  let sourceClient: Awaited<ReturnType<typeof registerStorageSourceClient>> | undefined;
+  let sourceDriver: SqliteDriver | PostgresDriver | undefined;
   const connect = async () => {
     assert(sourceUrl); const client = new Client({ connectionString: sourceUrl });
     client.on("error", () => {}); clients.add(client); await client.connect(); return client;
@@ -45,6 +47,7 @@ export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite",
   };
   const close = async () => {
     try {
+      await sourceClient?.close(); await sourceDriver?.close();
       for (const client of clients) await client.end(); clients.clear();
       if (admin && database) {
         assert.equal((await admin.query("SELECT count(*)::text AS count FROM pg_stat_activity WHERE datname=$1", [database])).rows[0].count, "0");
@@ -79,6 +82,11 @@ export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite",
     const environment = await resolveBoardroomEnvironment({ cwd: directory, homeDir: directory,
       env: { AGENT_STUDIO_CONFIG: configFile, BOARDROOM_HOME: path.join(directory, "home") } });
     const descriptor = environment.databaseDescriptor;
+    if (fixtureOptions.sessions) {
+      const sessions = path.join(environment.runtimeRoot, "sessions");
+      await mkdir(path.join(sessions, "nested"), { recursive: true, mode: 0o700 });
+      await writeFile(path.join(sessions, "nested", "capture-binary"), Buffer.from([0, 0xff, 0x80, 1, 10]), { mode: 0o600 });
+    }
     // Real persisted user intent, without starting any runner. Enter may gate work but cannot
     // rewrite desired state, reset requests, or interpret this row as an owned-exit fact.
     await exec(`INSERT INTO agents(id,display_name,host_type,created_at,updated_at) VALUES('enter-agent','Agent','codex','2026-11-15','2026-11-15');
@@ -89,13 +97,24 @@ export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite",
       INSERT INTO agent_runtime_bindings(id,runtime_id,project_id,group_id,member_id,desired_state,intent_revision,reset_session_requested,created_at,updated_at)
         VALUES('enter-binding','enter-runtime','enter-project','enter-group','enter-member','running',7,1,'2026-11-15','2026-11-15');`);
     const clientId = randomUUID();
+    if (fixtureOptions.drainClient) {
+      // The production binding creator inserts these default generation-zero
+      // rows together. No process has ever been launched or owned by this fixture.
+      await exec("INSERT INTO agent_runner_states(binding_id,updated_at) VALUES('enter-binding','2026-11-15'); "
+        + "INSERT INTO agent_runtime_members(member_id,runtime_id,project_id,updated_at) VALUES('enter-member','enter-runtime','enter-project','2026-11-15')");
+    }
     const driver = descriptor.kind === "sqlite" ? new SqliteDriver({ dataDir, sqlitePath: file, sqliteSource: descriptor })
       : new PostgresDriver({ connectionString: (() => { const url = new URL(descriptor.connectionString); url.searchParams.set("application_name", `boardroom-source:${clientId}`); return url.toString(); })() });
     try {
       await driver.connect();
       const registered = await registerStorageSourceClient({ db: driver, database: descriptor, entrypoint: "owned-background", clientId });
-      await registered.close(); // A real historical registration; never a claim of source quiescence.
-    } finally { await driver.close(); }
+      if (fixtureOptions.drainClient) {
+        sourceClient = registered; sourceDriver = driver;
+        await registered.bind({ stopNewWork() {}, async disconnectSessions() {}, async closeMemory() {},
+          async stopOwnedRuntime() { return { ownedExits: [], unknownOwners: [] }; },
+          async observeOwnedExit() { throw new Error("fixture owns no child"); } });
+      } else await registered.close(); // A real historical registration; never a claim of source quiescence.
+    } finally { if (!sourceDriver) await driver.close(); }
     const createAdapter = () => descriptor.kind === "sqlite" ? createSqliteMaintenanceAdapter(descriptor) : createPostgresMaintenanceAdapter(descriptor, undefined);
     const options: MaintenanceServiceOptions = { environment, originalCwd: directory, expectedSourceId: environment.inventory.selectedSourceId!,
       controlRoot: path.join(dataDir, "control"), targetRoot: path.join(directory, "target") };
@@ -107,7 +126,7 @@ export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite",
       const request: ContinueRequest = { plan: reference, expectedSource: plan.source, expectedPhase: null, expectedJournalDigest: null, requestId: "first-enter" };
       const observe = async () => { const a = await createAdapter(); try { return await a.observe(); } finally { await a.close(); } };
       return { kind, directory, dataDir, file, configFile, database, descriptor, options, plan, reference, request, initial,
-        createAdapter, observe, query, exec, connect, closeClient, close };
+        createAdapter, observe, query, exec, connect, closeClient, sourceClient, close };
     } finally { await adapter.close(); }
   } catch (error) { await close(); throw error; }
 }
