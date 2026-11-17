@@ -630,7 +630,15 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
         || realpathSync(path.dirname(destination)) !== path.dirname(destination)) throw new MaintenanceFailure("snapshot_invalid");
       const created = await this.openBackupFile(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, files);
       await this.closeBackupFile(created);
-      reader = this.openSource(true);
+      try { reader = this.openSource(true); }
+      catch (error) {
+        // openSource owns acquisition cleanup. Its private envelope separates the
+        // original initialization failure from each independent cleanup event.
+        if (error instanceof ResourceCleanupFailure) {
+          this.backupCleanupErrors.push(...error.errors.slice(1)); throw error.errors[0];
+        }
+        throw error;
+      }
       reader.exec("BEGIN"); const observation = this.observation(reader);
       if (observation.state.admission !== "sealed" || !same(observation.state, readSqliteMaintenanceState(control, true))) throw new MaintenanceFailure("maintenance_lost");
       const manifests = observation.manifests;

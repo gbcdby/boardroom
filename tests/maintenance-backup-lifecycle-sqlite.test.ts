@@ -214,6 +214,37 @@ for (const [after, undefinedCleanup] of [[false, false], [true, false], [true, t
   }
 });
 
+const readerSharedFailure = new Error("same value from independent reader initialization and close stages");
+for (const [label, primary, secondary] of [
+  ["distinct errors", new Error("reader initialization first"), new Error("reader close after initialization failure")],
+  ["two undefined values", undefined, undefined],
+  ["same error object", readerSharedFailure, readerSharedFailure],
+] as const) nativeTest(`D-AC03/04 SQLite reader acquisition separates its original first and independent cleanup: ${label}`, async t => {
+  const f = await sqliteBackupFixture(), pragma = Database.prototype.pragma, close = Database.prototype.close;
+  let initializationFailures = 0, readerCloses = 0;
+  try {
+    t.mock.method(Database.prototype, "pragma", function(this: Database.Database, ...args: Parameters<typeof pragma>) {
+      if (this.name === f.file && this.readonly && args[0] === "query_only=ON") { initializationFailures++; throw primary; }
+      return Reflect.apply(pragma, this, args);
+    });
+    t.mock.method(Database.prototype, "close", function(this: Database.Database) {
+      const result = close.call(this);
+      if (this.name === f.file && this.readonly) { readerCloses++; throw secondary; }
+      return result;
+    });
+    let inner: Awaited<ReturnType<typeof rejected>> | undefined;
+    const outer = await rejected(f.adapter.withSourceLock("snapshot", async lock => {
+      inner = await rejected(lock.backup(f.destination)); if (inner.failed) throw inner.error;
+    }));
+    const cleanup = await rejected(f.adapter.close());
+    assert.equal(initializationFailures, 1); assert.equal(readerCloses, 1);
+    assert.equal(inner?.failed, true); assert.strictEqual(inner?.error, primary, "the acquired reader's exact initialization failure remains D's first error");
+    assert.equal(outer.failed, true); assert.equal(cleanup.failed, true);
+    const errors = errorLeaves(cleanup.error); assert.equal(errors.length, 1); assert.strictEqual(errors[0], secondary);
+    await f.adapter.close(); assert.equal(readerCloses, 1);
+  } finally { t.mock.restoreAll(); assert.equal((await f.dispose()).failed, false); }
+});
+
 nativeTest("D-AC12 SQLite registers the whole D call before its first original held check can await", async t => {
   const f = await sqliteBackupFixture(), held = f.mutex.assertHeld.bind(f.mutex);
   let release!: () => void, enter!: () => void, blocked = false, windowComplete = false;

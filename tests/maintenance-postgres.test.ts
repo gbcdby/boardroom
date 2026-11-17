@@ -11,6 +11,7 @@ import { PostgresDriver } from "../src/server/db/drivers/postgres.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { migrationSql } from "../src/server/db/migrate.ts";
 import { extendPostgresStorageGuards } from "../src/server/storage/schema-guards.ts";
+import { readPostgresMaintenanceState } from "../src/server/storage/admission.ts";
 import { maintenanceHostIdentityDigest } from "../src/server/storage/maintenance/host.ts";
 import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";
 import { encodePostgresCell, readPostgresMigrationFunctionBodies } from "../src/server/storage/maintenance/postgres-manifests.ts";
@@ -803,19 +804,32 @@ async function wrappedAdapter(f: Fixture, script: string): Promise<MaintenanceAd
 pgTest("#152 PG missing/failed native dump stays sealed and never leaks tool stderr", async t => {
   const f = await fixture(t, "pg-dump-capability", false);
   let adapter: MaintenanceAdapter | undefined;
+  const readSourceState = async () => {
+    const reader = await f.connectSource();
+    try {
+      await reader.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      const state = await readPostgresMaintenanceState(reader, { required: true });
+      await reader.query("COMMIT"); return state;
+    } finally { await reader.end(); }
+  };
   try {
     const oldPath = process.env.PATH;
     try { process.env.PATH = f.directory; adapter = await createPostgresMaintenanceAdapter(f.source, f.target); }
     finally { if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath; }
     let mutex = await acquire(adapter, f); await seal(adapter, f, mutex);
+    const beforeMissing = (await adapter.observe()).state; assert.equal(beforeMissing.admission, "sealed");
     await assert.rejects(adapter.withSourceLock("snapshot", lock => lock.backup(join(f.directory, "missing.dump"))), /backup_capability_unavailable/);
-    assert.equal((await adapter.observe()).state.admission, "sealed");
+    await assert.rejects(adapter.observe(), { code: "maintenance_lost" });
     await mutex.release(); await adapter.close();
+    assert.deepEqual(await readSourceState(), beforeMissing);
     adapter = await wrappedAdapter(f, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'pg_dump (PostgreSQL) 16.0\\n'; exit 0; fi\nprintf 'secret-test-canary postgres://user:password@fixture' >&2\nexit 1\n");
     mutex = await acquire(adapter, f);
+    const beforeFailed = (await adapter.observe()).state; assert.equal(beforeFailed.admission, "sealed");
     await assert.rejects(adapter.withSourceLock("snapshot", lock => lock.backup(join(f.directory, "failed.dump"))),
       (error: unknown) => /backup_capability_unavailable/.test(String(error)) && !/secret-test-canary|password|postgres:\/\//.test(String(error)));
-    assert.equal((await adapter.observe()).state.admission, "sealed"); await mutex.release();
+    await assert.rejects(adapter.observe(), { code: "maintenance_lost" });
+    await mutex.release(); await adapter.close();
+    assert.deepEqual(await readSourceState(), beforeFailed);
   } finally { await adapter?.close(); await f.close(); }
 });
 

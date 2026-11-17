@@ -42,9 +42,16 @@ async function isolatedFreshSchema(phase: "sync" | "async" | "undefined" | "succ
   const text = await readFile(new URL("../src/server/storage/maintenance/postgres.ts", import.meta.url), "utf8");
   const source = ts.createSourceFile("postgres.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const names = ["safeError", "throwResourceFailures", "endSession", "withSourceLock"];
+  const stateNames = ["backupTasks", "backupFiles", "backupPassfiles", "backupCleanupErrors"];
+  const initialState = new Map<string, ts.VariableStatement>();
   const found = new Map<string, ts.FunctionDeclaration>(); let closeBody: string | undefined;
   function visit(node: ts.Node) {
     if (ts.isFunctionDeclaration(node) && node.name && names.includes(node.name.text)) found.set(node.name.text, node);
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && stateNames.includes(node.name.text)) {
+      const statement = node.parent.parent;
+      assert.ok(ts.isVariableStatement(statement)); assert.equal(statement.declarationList.declarations.length, 1);
+      assert.equal(initialState.has(node.name.text), false); initialState.set(node.name.text, statement);
+    }
     if (ts.isVariableDeclaration(node) && node.name.getText(source) === "adapter" && node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
       const close = node.initializer.properties.find(item => ts.isMethodDeclaration(item) && item.name.getText(source) === "close");
       if (close && ts.isMethodDeclaration(close)) closeBody = close.body!.getText(source);
@@ -52,7 +59,10 @@ async function isolatedFreshSchema(phase: "sync" | "async" | "undefined" | "succ
     ts.forEachChild(node, visit);
   }
   visit(source); assert.equal(found.size, names.length); assert.ok(closeBody);
-  const body = ts.transpileModule(names.map(name => found.get(name)!.getText(source)).join("\n")
+  assert.equal(initialState.size, stateNames.length);
+  // These controls never call D: retain the exact production initial collections.
+  const body = ts.transpileModule(stateNames.map(name => initialState.get(name)!.getText(source)).join("\n") + "\n"
+    + names.map(name => found.get(name)!.getText(source)).join("\n")
     + "\nasync function closeAdapter()" + closeBody, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
   return new Function("MaintenanceFailure", "phase", "mechanism", `
     const sessions=new Set(), sql=[], sourceConnection={schema:'app'}, auditFactories=new WeakMap();
@@ -170,16 +180,23 @@ async function isolatedVerification(controls: { input: FileHandle; end(): Promis
   const text = await readFile(new URL("../src/server/storage/maintenance/postgres.ts", import.meta.url), "utf8");
   const source = ts.createSourceFile("postgres.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const names = ["safeError", "throwResourceFailures", "endSession", "closeVerificationInput", "verifyDatabaseOperation"];
+  const stateNames = ["backupTasks", "backupFiles", "backupPassfiles", "backupCleanupErrors"];
+  const initialState = new Map<string, ts.VariableStatement>();
   const found = new Map<string, ts.FunctionDeclaration>(); let closeBody: string | undefined;
   function visit(node: ts.Node) {
     if (ts.isFunctionDeclaration(node) && node.name && names.includes(node.name.text)) found.set(node.name.text, node);
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && stateNames.includes(node.name.text)) {
+      const statement = node.parent.parent;
+      assert.ok(ts.isVariableStatement(statement)); assert.equal(statement.declarationList.declarations.length, 1);
+      assert.equal(initialState.has(node.name.text), false); initialState.set(node.name.text, statement);
+    }
     if (ts.isVariableDeclaration(node) && node.name.getText(source) === "adapter" && node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
       const close = node.initializer.properties.find(item => ts.isMethodDeclaration(item) && item.name.getText(source) === "close");
       if (close && ts.isMethodDeclaration(close)) closeBody = close.body!.getText(source);
     }
     ts.forEachChild(node, visit);
   }
-  visit(source); assert.ok(closeBody);
+  visit(source); assert.ok(closeBody); assert.equal(initialState.size, stateNames.length);
   const operation = found.get("verifyDatabaseOperation")!, nativeTry = operation.body!.statements.find(ts.isTryStatement)!;
   assert.ok(nativeTry.catchClause && nativeTry.finallyBlock);
   const original = operation.getText(source), offset = operation.getStart(source);
@@ -190,7 +207,8 @@ async function isolatedVerification(controls: { input: FileHandle; end(): Promis
     result = {kind:'controlled-restore-result'};
   }`;
   const operationControl = original.slice(0, nativeTry.tryBlock.getStart(source) - offset) + nativeStub + original.slice(nativeTry.tryBlock.end - offset);
-  const body = ts.transpileModule(names.filter(name => name !== "verifyDatabaseOperation").flatMap(name => {
+  const body = ts.transpileModule(stateNames.map(name => initialState.get(name)!.getText(source)).join("\n") + "\n"
+    + names.filter(name => name !== "verifyDatabaseOperation").flatMap(name => {
     const declaration = found.get(name); return declaration ? [declaration.getText(source)] : [];
   }).join("\n") + "\n" + operationControl + "\nasync function closeAdapter()" + closeBody,
   { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
