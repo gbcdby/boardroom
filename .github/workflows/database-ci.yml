@@ -209,7 +209,9 @@ jobs:
         run: python3 -B tests/whole-brd-f2.test.py
 
       - name: whole-brd F3 全块读取与封闭观察纯控制
-        run: python3 -B tests/whole-brd-f3.test.py
+        run: |
+          python3 -B tests/whole-brd-f3.test.py
+          python3 -B tests/whole-brd-f3-dm.test.py
 
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

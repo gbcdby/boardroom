@@ -29,9 +29,10 @@ def validate(bundle_path, digest):
     if bundle.get("kind") == builder.NEW_INPUT_KIND: builder.require_private_source()
     if bundle.get("state") != "FIXED_F3_BUNDLE_NOT_BOOTED": raise ValueError("fixed offline F3 bundle required")
     run_id = bundle["request"]["run_id"]
-    if bundle["proposal"] != f3.plan(json.dumps({"run_id": run_id}).encode()): raise ValueError("F3 proposal changed")
-    if bundle["source"] != builder.source_bindings(): raise ValueError("execution sources differ from frozen bundle")
-    if bundle["mkfs_argv"] != f2.mkfs_argv(run_id) or bundle["mkfs_environment"] != f2.MKFS_ENV:
+    module = builder.profile_module(bundle["request"])
+    if bundle["proposal"] != module.plan(json.dumps({"run_id": run_id}).encode()): raise ValueError("F3 proposal changed")
+    if bundle["source"] != (builder.source_bindings(builder.DM_PROFILE) if "profile" in bundle["request"] else builder.source_bindings()): raise ValueError("execution sources differ from frozen bundle")
+    if bundle["mkfs_argv"] != (f2 if module is f3 else module).mkfs_argv(run_id) or bundle["mkfs_environment"] != f2.MKFS_ENV:
         raise ValueError("fixed mkfs contract changed")
     keys = {"qemu", "kernel", "bios", "busybox", "notes", "gate", "helper", "brd", "config", "initramfs"}
     if set(bundle["inputs"]) != keys or set(bundle["e2fs"]) != set(f2.PAYLOAD_FILES): raise ValueError("fixed input set changed")
@@ -60,7 +61,7 @@ def validate(bundle_path, digest):
     if hashlib.sha256(inputs["brd"]).hexdigest() != f2.BRD_SHA: raise ValueError("module changed")
     f2.config_bytes(inputs["config"])
     build.static_elf(inputs["gate"]); build.static_elf(inputs["helper"])
-    archive = f3.inspect_payload(inputs["initramfs"], run_id)
+    archive = module.inspect_payload(inputs["initramfs"], run_id)
     if archive != bundle["archive"]: raise ValueError("fixed F3 archive changed")
     member_hashes = {row["name"]: row["sha256"] for row in archive["members"]}
     for name, member in (("busybox", "bin/busybox"), ("helper", "bin/brd-f2"), ("notes", "run/notes"),
@@ -83,7 +84,8 @@ def runtime_preflight(bundle_path, bundle, output, argv=None, owned=None):
     """A source-pinned input contract, never a caller approval or actual loading receipt."""
     builder.require_private_source()
     if bundle.get("kind") != builder.NEW_INPUT_KIND: raise ValueError("unknown runtime input family")
-    if bundle["source"] != builder.source_bindings(): raise ValueError("private source identity changed")
+    builder.profile_module(bundle["request"])
+    if bundle["source"] != (builder.source_bindings(builder.DM_PROFILE) if "profile" in bundle["request"] else builder.source_bindings()): raise ValueError("private source identity changed")
     closure, _, _ = builder.verify_input_closure(bundle["request"])
     if closure != bundle["input_closure"] or closure["runtime_inputs"]["status"] != "FIXED_PRECONDITIONS_NOT_RUNTIME_EVIDENCE":
         raise ValueError("runtime_use_NOT_ESTABLISHED")
@@ -114,6 +116,7 @@ def execute(bundle_path, digest, output):
     started = time.monotonic()
     binding, bundle, inputs = validate(bundle_path, digest)
     run_id = bundle["request"]["run_id"]; out = Path(f0._asset_path(str(Path(output).absolute())))
+    module = builder.profile_module(bundle["request"]); expected_state = builder.observed_state(bundle["request"])
     new_inputs = bundle.get("kind") == builder.NEW_INPUT_KIND
     runtime = runtime_preflight(bundle_path, bundle, out) if new_inputs else None
     if new_inputs and time.monotonic() - started > 60: raise TimeoutError("preflight deadline")
@@ -123,6 +126,7 @@ def execute(bundle_path, digest, output):
               "original_error": None, "secondary_errors": [], "cleanup": {"verified": False}, "normal_poweroff_observed": False,
               "host": {"uname": list(os.uname()), "uid": os.getuid(), "gid": os.getgid()}}
     if new_inputs: result.update(runtime_preflight=runtime, runtime_checks=["before-claim"])
+    if module is not f3: result.update(kind="private-f3-dm-source-preservation-run", profile=builder.DM_PROFILE)
     owned = None; pump = None; qmp = None; capture = None; tail = b""; finished = False
     stage_started = None; stage = "boot"; boot_started = None; complete_seen_at = None
 
@@ -207,7 +211,7 @@ def execute(bundle_path, digest, output):
             if qmp is not None: result["qmp_receipts"] = qmp.receipts
             if pump is not None:
                 result.update(pipe_errors=pump.errors, pipe_eof=sorted(pump.eof), pipe_read_bytes=dict(pump.read_counts))
-                capture = f3.decode_serial(bytes(pump.serial), run_id, inputs["notes"])
+                capture = module.decode_serial(bytes(pump.serial), run_id, inputs["notes"])
                 for name, raw in capture.pop("raw_artifacts").items():
                     artifacts.put(name, raw, 4 * f2.MIB)
                 result["capture"] = capture
@@ -218,8 +222,8 @@ def execute(bundle_path, digest, output):
             except BaseException as error: record_error(error, "runtime-input-final-check")
         result["elapsed_seconds"] = time.monotonic() - started
         result["lifecycle_state"] = result_state(capture, None, result["cleanup"])
-        result["state"] = "F3_SOURCE_PRESERVATION_OBSERVED" if (result["original_error"] is None and capture is not None
-            and result["lifecycle_state"] == "F3_SOURCE_PRESERVATION_OBSERVED" and result["normal_poweroff_observed"] is True
+        result["state"] = expected_state if (result["original_error"] is None and capture is not None
+            and result["lifecycle_state"] == expected_state and result["normal_poweroff_observed"] is True
             and result["elapsed_seconds"] <= 300) else "FAILED_NO_RETRY"
         finish_artifacts(artifacts, result, record_error)
     return result
@@ -231,4 +235,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     result = execute(args.bundle, args.bundle_sha256, args.output)
     print(json.dumps({key: result[key] for key in ("state", "qualification", "original_error", "secondary_errors", "final_artifact_errors")}))
-    raise SystemExit(0 if result["state"] == "F3_SOURCE_PRESERVATION_OBSERVED" else 1)
+    expected_state = "F3_DM_SOURCE_PRESERVATION_OBSERVED" if result.get("profile") == builder.DM_PROFILE else "F3_SOURCE_PRESERVATION_OBSERVED"
+    raise SystemExit(0 if result["state"] == expected_state else 1)
