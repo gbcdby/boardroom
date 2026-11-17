@@ -3,6 +3,9 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { captureFixture } from "./maintenance-capture.ts";
+import type { PostgresDriver } from "../../src/server/db/drivers/postgres.ts";
+import { checksumOf, migrationSql } from "../../src/server/db/migrate.ts";
+import { migrations } from "../../src/server/db/migrations/index.ts";
 import { ArtifactStore } from "../../src/server/storage/maintenance/objects.ts";
 import { verifyJournalChain } from "../../src/server/storage/maintenance/journal.ts";
 import { parseJournal } from "../../src/server/storage/maintenance/parse.ts";
@@ -16,7 +19,23 @@ export interface RecoveryEvent {
   readonly kind?: "control" | "snapshot";
 }
 type RecoveryOptions = NonNullable<Parameters<typeof captureFixture>[1]>
-  & { readonly postgresEncoding?: "UTF8" | "LATIN1" | "SQL_ASCII" };
+  & { readonly postgresEncoding?: "UTF8" | "LATIN1" | "SQL_ASCII";
+    /** Observe only successful real acquisitions by this fixture invocation. */
+    readonly onTemporaryDirectory?: (directory: string) => void };
+
+/** Private fixture initialization only. The original SQL contains UTF8 comments;
+ * transmit its exact bytes as in the existing non-UTF8 source-audit fixtures.
+ * This bootstrap driver is closed by enterFixture's original finally. Every
+ * later source/client/maintenance connection keeps the production UTF8 setting. */
+export async function migrateRecoveryPostgres(driver: PostgresDriver, encoding: "LATIN1" | "SQL_ASCII"): Promise<void> {
+  if (encoding === "LATIN1") await driver.query("SET client_encoding='SQL_ASCII'");
+  assert.equal((await driver.query("SHOW server_encoding"))[0]!.server_encoding, encoding);
+  assert.equal((await driver.query("SHOW client_encoding"))[0]!.client_encoding, encoding === "LATIN1" ? "SQL_ASCII" : "UTF8");
+  await driver.migrate(migrations);
+  const ledger = await driver.query("SELECT version::text AS version,name,checksum FROM schema_migrations ORDER BY schema_migrations.version");
+  assert.deepEqual(ledger, migrations.map(migration => ({ version: String(migration.version), name: migration.name,
+    checksum: checksumOf(migrationSql(migration, "postgres")) })));
+}
 
 function relocateFixture(code: string, original: URL): string {
   return code.replace(/^((?:import|export) [^\n]*? from )"(\.[^"\n]+)"/gm,
@@ -33,16 +52,20 @@ export async function recoveryFixture(kind: "sqlite" | "postgres" = "sqlite",
   let created: Awaited<ReturnType<typeof captureFixture>> | undefined;
   try {
     let fixtureFactory = captureFixture, delegates = new URL("./maintenance-capture.ts", import.meta.url).href;
-    const { postgresEncoding, ...baseOptions } = options;
+    const { postgresEncoding, onTemporaryDirectory, ...baseOptions } = options;
     if (kind === "postgres" && postgresEncoding && postgresEncoding !== "UTF8") {
       assert(["LATIN1", "SQL_ASCII"].includes(postgresEncoding));
-      // Only this fixed test input's CREATE DATABASE encoding changes. Real
-      // registration/drain/native raw readers and every C/D implementation stay
-      // intact; no server catalog mutation or byte decoder substitutes for PG.
+      // Fixed database encoding and the private bootstrap session only. The
+      // complete original migration bytes/checksums, later UTF8 connections,
+      // registration/drain/native raw readers and C/D implementations stay intact.
       inputDirectory = await mkdtemp(path.join(process.cwd(), ".agent-output-c2-input-"));
+      onTemporaryDirectory?.(inputDirectory);
       const entry = new URL("./maintenance-enter.ts", import.meta.url), capture = new URL("./maintenance-capture.ts", import.meta.url);
       let entryCode = await readFile(entry, "utf8");
       assert.equal(entryCode.split("ENCODING 'UTF8'").length, 2);
+      assert.equal(entryCode.split("await driver.migrate(migrations);").length, 2);
+      entryCode = 'import { migrateRecoveryPostgres } from ' + JSON.stringify(import.meta.url) + ';\n' + entryCode
+        .replace("await driver.migrate(migrations);", "await migrateRecoveryPostgres(driver, " + JSON.stringify(postgresEncoding) + ");");
       entryCode = relocateFixture(entryCode.replace("ENCODING 'UTF8'", "ENCODING '" + postgresEncoding + "'"), entry);
       const entryPath = path.join(inputDirectory, "maintenance-enter.ts"); await writeFile(entryPath, entryCode, { mode: 0o600 });
       const captureCode = relocateFixture((await readFile(capture, "utf8"))
@@ -53,6 +76,7 @@ export async function recoveryFixture(kind: "sqlite" | "postgres" = "sqlite",
     }
     const f = await fixtureFactory(kind, baseOptions); created = f;
     directory = await mkdtemp(path.join(process.cwd(), ".agent-output-c2-copy-"));
+    onTemporaryDirectory?.(directory);
     const source = fileURLToPath(new URL("../../src/server/storage/maintenance/capture.ts", import.meta.url));
     const code = (await readFile(source, "utf8"))
       .replaceAll('from "./source-files.ts"', "from " + JSON.stringify(delegates))

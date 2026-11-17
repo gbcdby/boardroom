@@ -4,10 +4,13 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { readFile, readdir } from "node:fs/promises";
+import { lstat, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { Client } from "pg";
 import type { QueryResult } from "pg";
+import { PostgresDriver } from "../src/server/db/drivers/postgres.ts";
+import { checksumOf, migrationSql, MigrationError } from "../src/server/db/migrate.ts";
+import { migrations } from "../src/server/db/migrations/index.ts";
 import { recoveryFixture } from "./fixtures/maintenance-capture-recovery.ts";
 import { errorLeaves, rejected } from "./fixtures/maintenance-backup-lifecycle.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
@@ -219,6 +222,10 @@ for (const encoding of ["LATIN1", "SQL_ASCII"] as const) nativeTest(
     const f = await recoveryFixture("postgres", { postgresEncoding: encoding });
     try {
       assert.equal((await f.query("SHOW server_encoding"))[0]!.server_encoding, encoding);
+      assert.equal((await f.query("SHOW client_encoding"))[0]!.client_encoding, "UTF8", "fixture bootstrap encoding does not escape into a later source session");
+      assert.deepEqual(await f.query("SELECT version::text AS version,name,checksum FROM schema_migrations ORDER BY schema_migrations.version"),
+        migrations.map(migration => ({ version: String(migration.version), name: migration.name,
+          checksum: checksumOf(migrationSql(migration, "postgres")) })), "the source retains every original migration and checksum");
       const before = await f.observe(), result = await f.captureSnapshot(f.options, f.request);
       assert("kind" in result && result.kind === "unverified-bundle");
       const store = await ArtifactStore.open(f.reference.controlRoot, f.plan.source);
@@ -234,6 +241,57 @@ for (const encoding of ["LATIN1", "SQL_ASCII"] as const) nativeTest(
       assert.deepEqual((await f.observe()).clients, before.clients);
     } finally { await f.close(); }
   });
+
+nativeTest("#152 C2 postgres: failed bootstrap preserves its first value and closes every owned session before rejecting", async t => {
+  for (const mode of ["native-encoding-error", "error", "undefined"] as const) await t.test(mode, async t => {
+    const migrate = PostgresDriver.prototype.migrate, connect = Client.prototype.connect;
+    const owned = new Set<Client>(), ended = new Set<Client>();
+    const original = mode === "error" ? new Error("controlled C2 bootstrap failure") : undefined;
+    let observedFirst: unknown, firstOccurred = false, database: string | undefined;
+    const ownedDirectories: string[] = [];
+    try {
+      t.mock.method(Client.prototype, "connect", function(this: Client, ...args: unknown[]) {
+        owned.add(this); this.once("end", () => { ended.add(this); });
+        return Reflect.apply(connect, this, args);
+      } as typeof connect);
+      t.mock.method(PostgresDriver.prototype, "migrate", async function(this: PostgresDriver, ...args: Parameters<typeof migrate>) {
+        database = String((await this.query("SELECT current_database() AS database"))[0]!.database);
+        assert.match(database, /^br_enter_[a-f0-9]{32}$/);
+        try {
+          // Real PostgreSQL repeats the original CI failure, without editing any
+          // migration SQL. The other two branches distinguish Error/undefined.
+          if (mode === "native-encoding-error") {
+            await this.query("SET client_encoding='UTF8'");
+            return await Reflect.apply(migrate, this, args);
+          }
+          throw original;
+        } catch (error) { firstOccurred = true; observedFirst = error; throw error; }
+      });
+      const result = await rejected(recoveryFixture("postgres", { postgresEncoding: "LATIN1",
+        onTemporaryDirectory: directory => { ownedDirectories.push(directory); } }));
+      assert(firstOccurred && result.failed, "the intended real bootstrap boundary was reached");
+      assert.equal(result.error, observedFirst, "cleanup must preserve the exact first thrown value");
+      if (mode === "native-encoding-error") {
+        assert(observedFirst instanceof MigrationError);
+        assert.match(observedFirst.message, /LATIN1/);
+      } else assert.equal(observedFirst, original);
+      assert(owned.size >= 2, "actual administrator and bootstrap pool connections were opened");
+      assert.deepEqual(ended, owned, "every original pg Client emitted end before the fixture rejected");
+    } finally { t.mock.restoreAll(); }
+    assert(database);
+    const verifier = new Client({ connectionString: process.env.AGENT_STUDIO_PG_TEST_URL });
+    verifier.on("error", () => {});
+    try {
+      await verifier.connect();
+      assert.equal((await verifier.query("SELECT count(*)::text AS count FROM pg_database WHERE datname=$1", [database])).rows[0].count, "0");
+      assert.equal((await verifier.query("SELECT count(*)::text AS count FROM pg_stat_activity WHERE datname=$1", [database])).rows[0].count, "0");
+    } finally { await verifier.end(); }
+    assert(ownedDirectories.length > 0, "this fixture must have acquired real temporary inputs");
+    assert.equal(new Set(ownedDirectories).size, ownedDirectories.length);
+    for (const directory of ownedDirectories) await assert.rejects(lstat(directory), { code: "ENOENT" },
+      "each directory acquired by this invocation is removed on initialization failure");
+  });
+});
 
 nativeTest("#152 C2 postgres: production empty registry rejects planned and sealed starts without D or successor Jq", async () => {
   const f = await recoveryFixture("postgres");
