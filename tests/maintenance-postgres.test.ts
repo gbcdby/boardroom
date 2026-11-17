@@ -14,6 +14,7 @@ import { extendPostgresStorageGuards } from "../src/server/storage/schema-guards
 import { readPostgresMaintenanceState } from "../src/server/storage/admission.ts";
 import { maintenanceHostIdentityDigest } from "../src/server/storage/maintenance/host.ts";
 import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";
+import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import { encodePostgresCell, readPostgresMigrationFunctionBodies } from "../src/server/storage/maintenance/postgres-manifests.ts";
 import { buildDatabaseManifests, digestRowMultiset } from "../src/server/storage/maintenance/manifests.ts";
 import { parsePostgresConnection, postgresDatabaseArgument, runPostgresTool, waitForPostgresTools } from "../src/server/storage/maintenance/postgres-tools.ts";
@@ -846,7 +847,7 @@ pgTest("#152 PG exporter loss cancels its dump and sequence drift invalidates an
       if (beforeReal === undefined) delete process.env.BOARDROOM_TEST_REAL_DUMP; else process.env.BOARDROOM_TEST_REAL_DUMP = beforeReal;
       if (beforeStarted === undefined) delete process.env.BOARDROOM_TEST_DUMP_STARTED; else process.env.BOARDROOM_TEST_DUMP_STARTED = beforeStarted;
     }
-    const calls = scenario === "exporter" ? observePostgresCalls(f.observation) : undefined;
+    const calls = observePostgresCalls(f.observation);
     if (calls) { try { t.after(() => calls.close()); } catch { calls.close(); } }
     const call: PostgresCall = calls?.run ?? ((_stage, operation) => operation());
     try {
@@ -879,7 +880,19 @@ pgTest("#152 PG exporter loss cancels its dump and sequence drift invalidates an
       const check = await call("check-connect", () => f.connectSource());
       try { assert.equal((await call("check-query", () => check.query("SELECT admission FROM storage_maintenance"))).rows[0].admission, "sealed"); }
       finally { await call("check-close", () => check.end()); }
-      if (scenario === "sequence") await mutex.release();
+      if (scenario === "sequence") {
+        // The expected sequence failure already invalidated this adapter. If its
+        // real heartbeat observes that loss before release, release must retain
+        // that exact failure while still closing the original mutex session.
+        await assert.rejects(mutex.assertHeld(), { code: "maintenance_lost" });
+        try { await call("mutex-release", () => mutex.release()); }
+        catch (error) {
+          assert(error instanceof MaintenanceFailure);
+          assert.equal(error.code, "maintenance_lost");
+          assert.equal(error.message, "storage_maintenance: maintenance_lost (source)");
+          t.diagnostic("sequence drift: original mutex heartbeat reported source loss during release");
+        }
+      }
     } finally { await call("adapter-close", () => adapter.close()); await call("fixture-close", () => f.close()); }
   }
 });

@@ -174,7 +174,16 @@ class LauncherContracts(unittest.TestCase):
             "timeout --signal=TERM --kill-after=10s 30s node --test --test-reporter=tap "
             "--test-name-pattern='unknown source file users' tests/maintenance-sqlite.test.ts "
             "2>&1 | tee .agent-output/maintenance-native-diagnostics/sqlite-source-users.tap")
-        self.assertEqual(ci.command_for('full-suite'), 'npm test')
+        self.assertEqual(ci.command_for('full-suite'),
+            "mkdir -p .agent-output/linux-ci-isolation/full-suite\n"
+            "node -e 'console.log(JSON.stringify({node:process.version, "
+            "availableParallelism:require(\"node:os\").availableParallelism(), configuredConcurrency:4}))' "
+            "| tee .agent-output/linux-ci-isolation/full-suite/test-scheduler.json\n"
+            "npm run test:ci:linux 2>&1 | tee .agent-output/linux-ci-isolation/full-suite/full-suite.tap")
+        package = json.loads((Path(ci.__file__).resolve().parents[2] / 'package.json').read_text())
+        self.assertEqual(package['scripts']['test'], 'node --test "tests/**/*.test.ts"')
+        self.assertEqual(package['scripts']['test:ci:linux'],
+                         'node --test --test-concurrency=4 "tests/**/*.test.ts"')
         for entry in ('sqlite', 'full-suite'):
             env = ci.child_environment(self.request(entry), Path('/owned/stage'))
             self.assertEqual(env['GITHUB_WORKSPACE'], '/owned/stage/work/workspace')
@@ -185,6 +194,9 @@ class LauncherContracts(unittest.TestCase):
             self.assertNotIn('RUNNER_TRACKING_ID', env)
             self.assertNotIn('AGENT_STUDIO_PG_RESTART_BIN', env)
             self.assertEqual(env.get('AGENT_STUDIO_PG_TEST_URL'), ci.PG_URL if entry == 'full-suite' else None)
+            # The scheduling flag belongs to the original CLI only, not every
+            # ordinary Node child or nested test runner via inherited NODE_OPTIONS.
+            self.assertEqual(env.get('NODE_OPTIONS'), '--test-reporter=tap' if entry == 'full-suite' else None)
 
     def test_identity_requires_actual_nonroot_caps_groups_and_namespace(self):
         value = {'uid': [42001] * 4, 'gid': [42001] * 4, 'groups': [], 'no_new_privs': 1,

@@ -50,7 +50,17 @@ export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite",
       await sourceClient?.close(); await sourceDriver?.close();
       for (const client of clients) await client.end(); clients.clear();
       if (admin && database) {
-        assert.equal((await admin.query("SELECT count(*)::text AS count FROM pg_stat_activity WHERE datname=$1", [database])).rows[0].count, "0");
+        // pg-pool removes an idle client before its real end callback completes;
+        // pool.end() alone is not proof that the server backend has exited.
+        // Observe this private database becoming empty; never force a DROP or
+        // interpret expiry as closure. This also lets the original end fire.
+        let remaining: string | undefined;
+        for (let attempt = 0; attempt < 200; attempt++) {
+          remaining = (await admin.query("SELECT count(*)::text AS count FROM pg_stat_activity WHERE datname=$1", [database])).rows[0].count;
+          if (remaining === "0") break;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        assert.equal(remaining, "0", "every owned backend must actually exit before DROP");
         await admin.query(`DROP DATABASE "${database}"`);
       }
     } finally { await admin?.end(); await rm(directory, { recursive: true, force: true }); }

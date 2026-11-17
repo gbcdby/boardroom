@@ -51,8 +51,13 @@ def command_for(entry):
                 "--test-name-pattern='unknown source file users' tests/maintenance-sqlite.test.ts "
                 "2>&1 | tee .agent-output/maintenance-native-diagnostics/sqlite-source-users.tap")
     if entry == 'full-suite':
+        # Keep the original native discovery/process isolation, but use all four
+        # standard Linux runner CPUs. A flag appended after npm's test glob is ignored.
         return ("mkdir -p .agent-output/linux-ci-isolation/full-suite\n"
-                "npm test 2>&1 | tee .agent-output/linux-ci-isolation/full-suite/full-suite.tap")
+                "node -e 'console.log(JSON.stringify({node:process.version, "
+                "availableParallelism:require(\"node:os\").availableParallelism(), configuredConcurrency:4}))' "
+                "| tee .agent-output/linux-ci-isolation/full-suite/test-scheduler.json\n"
+                "npm run test:ci:linux 2>&1 | tee .agent-output/linux-ci-isolation/full-suite/full-suite.tap")
     raise IsolationError('Unknown fixed CI entry')
 
 

@@ -9,6 +9,8 @@ import path from "node:path";
 import { createDbDriver } from "../src/server/db/driver.ts";
 import { createRepositories } from "../src/server/db/repositories.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
+import { loadConfig } from "../src/server/config.ts";
+import { databaseForConnectedReader } from "../src/server/environment.ts";
 import { createMemoryReaderObservation, safeMemoryObservation, safeMemoryStderr, safeObservationError, withCleanup } from "./helpers/memory-reader-observer.ts";
 
 test("真实 stdio 启动共用记忆 reader；stdin EOF 等待资源退出且不创建 session-end 请求", { timeout: 15000 }, async t => {
@@ -35,10 +37,14 @@ test("真实 stdio 启动共用记忆 reader；stdin EOF 等待资源退出且�
     const repos = createRepositories(db);
     const project = await repos.projects.create({ name: "stdio 生命周期" });
     const group = await repos.groups.create({ projectId: project.id, name: "协议群" });
+    const childEnvironment = { PATH: process.env["PATH"], AGENT_STUDIO_DATA_DIR: dir,
+      AGENT_STUDIO_DB_DRIVER: "sqlite", AGENT_STUDIO_LOG_LEVEL: "warn" };
+    const environment = (await loadConfig({ cwd: dir, env: childEnvironment })).environment!;
+    const database = databaseForConnectedReader(environment.databaseDescriptor);
     observation = await createMemoryReaderObservation(dir, "owned-stdio");
     note("stdio-spawn-requested");
     const owned = spawn(process.execPath, ["--import", observation.preload, path.resolve("src/server/mcp/stdio.ts")], {
-      cwd: dir, env: { PATH: process.env["PATH"], AGENT_STUDIO_DATA_DIR: dir, AGENT_STUDIO_DB_DRIVER: "sqlite", AGENT_STUDIO_LOG_LEVEL: "warn" },
+      cwd: dir, env: childEnvironment,
       stdio: ["pipe", "pipe", "pipe"],
     });
     child = owned; const exited = once(owned, "exit"); exit = exited;
@@ -88,19 +94,25 @@ test("真实 stdio 启动共用记忆 reader；stdin EOF 等待资源退出且�
     atJoin = { fixtureId, requestId: 2, ok: typeof joined.ok === "boolean" ? joined.ok : null,
       memory: safeMemoryObservation(joined.context?.memory), reader: await snapshot(), stderr: safeMemoryStderr(stderr) };
     assert.equal(joined.ok, true, JSON.stringify(atJoin));
-    assert.equal(joined.context.memory.state, "available", JSON.stringify(atJoin));
-    note("stdin-end", { childPid: owned.pid ?? null });
-    owned.stdin.end();
-    const watchdog = setTimeout(() => {
-      note("stdio-kill-requested", { childPid: owned.pid ?? null, signal: "SIGKILL", reason: "eof-watchdog" });
-      owned.kill("SIGKILL");
-    }, 4000);
-    const [code, signal] = await exited;
-    clearTimeout(watchdog);
-    assert.equal(code, 0, JSON.stringify({ fixtureId, signal, stderr: safeMemoryStderr(stderr) }));
-    assert.equal(signal, null);
-    assert.equal((await repos.mcpSessions.listByProject(project.id))[0]?.state, "disconnected");
-    assert.deepEqual(await repos.memory.listRequests(project.id, joined.agentId), []);
+    // 冷启动仍受生产500ms预算约束；只接受原reader的真实deadline降级。
+    // 共享观察器同时检查同一源/owner/绑定，未知或迟到错误不能混作预算降级。
+    const memoryState = await observation.assertInjection(joined.context.memory, [], database);
+    note("memory-contract", { state: memoryState });
+    await observation.closeAndAudit(database, async () => {
+      note("stdin-end", { childPid: owned.pid ?? null });
+      owned.stdin.end();
+      const watchdog = setTimeout(() => {
+        note("stdio-kill-requested", { childPid: owned.pid ?? null, signal: "SIGKILL", reason: "eof-watchdog" });
+        owned.kill("SIGKILL");
+      }, 4000);
+      try {
+        const [code, signal] = await exited;
+        assert.equal(code, 0, JSON.stringify({ fixtureId, signal, stderr: safeMemoryStderr(stderr) }));
+        assert.equal(signal, null);
+        assert.equal((await repos.mcpSessions.listByProject(project.id))[0]?.state, "disconnected");
+        assert.deepEqual(await repos.memory.listRequests(project.id, joined.agentId), []);
+      } finally { clearTimeout(watchdog); }
+    });
   }, async () => {
     if (child && child.exitCode === null && child.signalCode === null) {
       note("stdio-kill-requested", { childPid: child.pid ?? null, signal: "SIGKILL", reason: "failed-test-cleanup" });
