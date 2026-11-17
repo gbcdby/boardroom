@@ -16,7 +16,8 @@ import { registerStorageSourceClient } from "../../src/server/storage/source-cli
 import type { ContinueRequest, MaintenanceServiceOptions } from "../../src/server/storage/maintenance/types.ts";
 
 /** Only bootstraps a private source and persists P; never seeds a journal, phase, or DB anchor. */
-export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite") {
+export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite",
+  fixtureOptions: { sqliteEncoding?: "UTF-8" | "UTF-16le" | "UTF-16be" } = {}) {
   // Use the checkout filesystem for durable positive fixtures. Some Linux runners mount /tmp
   // as tmpfs, which is intentionally outside the production filesystem support policy.
   const directory = await realpath(await mkdtemp(path.join(path.dirname(process.cwd()), "br-enter-")));
@@ -54,7 +55,15 @@ export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite") {
   try {
     if (kind === "sqlite") {
       const db = new Database(file);
-      try { db.exec("CREATE TABLE enter_observation(value TEXT); INSERT INTO enter_observation VALUES('original business bytes')"); runMigrations(db, migrations); db.pragma("journal_mode=WAL"); }
+      try {
+        // SQLite fixes its database encoding at the first table. A fixed test
+        // profile exercises real raw bytes without changing existing fixtures.
+        const encoding = fixtureOptions.sqliteEncoding ?? "UTF-8";
+        assert(["UTF-8", "UTF-16le", "UTF-16be"].includes(encoding));
+        db.pragma(`encoding='${encoding}'`);
+        db.exec("CREATE TABLE enter_observation(value TEXT); INSERT INTO enter_observation VALUES('original business bytes')");
+        runMigrations(db, migrations); db.pragma("journal_mode=WAL");
+      }
       finally { db.close(); }
     } else {
       assert(process.env.AGENT_STUDIO_PG_TEST_URL, "explicit private PostgreSQL test URL required");

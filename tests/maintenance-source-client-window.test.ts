@@ -4,6 +4,7 @@ import { readFile, readlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import test from "node:test";
 import { canonicalJson } from "../src/server/storage/maintenance/canonical.ts";
+import { sameSourceClientCell, sameSourceClientRow } from "../src/server/storage/maintenance/source-client-equality.ts";
 import { compatibleSourceClientWindow, type SourceClientJournalAnchor, type SourceClientJournalProof,
   type SourceClientObservationProof, type SourceClientRegistrationProof } from "../src/server/storage/maintenance/source-client-window.ts";
 import { verifyRestoreBundle } from "../src/server/storage/maintenance/verify-bundle.ts";
@@ -81,6 +82,8 @@ const observationProof = (before: Row, after: Row, effect: SourceClientObservati
   ({ journal: endedAnchorRef, sequence: 8, clientId: String(after.client_id), before, after, effect });
 type CheckOverrides = {
   readonly proof?: SourceClientJournalProof;
+  readonly anchors?: readonly SourceClientJournalAnchor[];
+  readonly currentSequence?: number;
   readonly inspectProcess?: (host: Record<string, unknown>, identity: Record<string, unknown>) =>
     Promise<{ readonly status: string; readonly reason: string }>;
 };
@@ -92,7 +95,7 @@ const check = (previous: readonly Row[], live: readonly Row[],
   };
   return compatibleSourceClientWindow(previous, live, {
     mode: "strict", journalAdvanced, fenceEpoch: 7, databaseInstanceId: "marker", source, migrationId, planDigest,
-    currentSequence: 8, anchors: [journalAnchor, endedAnchor], proof,
+    currentSequence: overrides.currentSequence ?? 8, anchors: overrides.anchors ?? [journalAnchor, endedAnchor], proof,
     inspectProcess: overrides.inspectProcess ?? presentProcess,
   });
 };
@@ -173,6 +176,123 @@ test("#152 V: a registered controller that exited can be a legal successor", asy
     "a registered controller whose native process exited may be observed as ended");
   assert.equal(await check([old], [ended], true, { proof }), false,
     "a still-present controller cannot be reported as ended");
+});
+
+test("#248 window: registration binds its original row before a later observation", async () => {
+  const original = await row(), observed = { ...original, last_observed_at: later };
+  const proof: SourceClientJournalProof = { registrations: [registrationProof(original)],
+    observations: [observationProof(original, observed, "observed")] };
+  assert.equal(await check([], [observed], true, { proof }), true);
+  assert.equal(await check([], [observed], true, { proof: { ...proof, observations: [] } }), false);
+});
+
+test("#248 equality: only schema integer columns admit exact canonical number/string equivalence", async () => {
+  for (const column of ["registered_epoch", "observed_epoch", "drain_epoch"] as const) {
+    for (const value of [0, 1, 7, Number.MAX_SAFE_INTEGER]) {
+      assert.equal(sameSourceClientCell(column, value, String(value)), true);
+      assert.equal(sameSourceClientCell(column, String(value), value), true);
+    }
+    assert.equal(sameSourceClientCell(column, "9223372036854775807", "9223372036854775807"), true);
+    for (const invalid of [undefined, -0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN,
+      "", "01", "+1", " 1", "1 ", "1.0", "1e0", "-1", "9223372036854775808", true, [], {}])
+      assert.equal(sameSourceClientCell(column, invalid, invalid), false, `${column}: ${String(invalid)}`);
+  }
+  assert.equal(sameSourceClientCell("protocol_version", 1, "1"), true);
+  for (const version of [0, 2, "01", "2"]) assert.equal(sameSourceClientCell("protocol_version", version, version), false);
+  for (const column of ["drain_epoch", "ended_at", "drain_receipt_digest"] as const)
+    assert.equal(sameSourceClientCell(column, null, null), true);
+  for (const column of ["client_id", "last_observed_at", "registered_epoch", "protocol_version"] as const)
+    assert.equal(sameSourceClientCell(column, null, null), false);
+  assert.equal(sameSourceClientCell("client_id", "7", 7), false);
+  assert.equal(sameSourceClientCell("ended_at", null, "null"), false);
+  assert.equal(sameSourceClientCell("client_id", "é", "e\u0301"), false, "text receives no normalization");
+  const original = await row(), represented = { ...original, protocol_version: "1", registered_epoch: 7, observed_epoch: 7 };
+  assert.equal(sameSourceClientRow(original, represented), true);
+  assert.equal(sameSourceClientRow({ ...original, registered_epoch: "07" }, { ...original, registered_epoch: "07" }), false);
+  assert.equal(sameSourceClientRow(original, { ...represented, extra: null }), false);
+  const missing = { ...represented } as Record<string, Json>; delete missing.ended_at;
+  assert.equal(sameSourceClientRow(original, missing), false);
+  assert.equal(await check([original], [represented], false, { proof: { registrations: [], observations: [] } }), true);
+});
+
+test("#248 window: newly registered controller reaches an ended row through every anchored step", async () => {
+  const original = await row(), observed = { ...original, last_observed_at: later };
+  const ended = { ...observed, last_observed_at: "2026-11-16T01:00:02.000Z", ended_at: "2026-11-16T01:00:02.000Z" };
+  const finalRef: ArtifactRef = { ref: `journals/${migrationId}/9-${"f".repeat(64)}.json`, sha256: "f".repeat(64), bytes: "123" };
+  const finalAnchor: SourceClientJournalAnchor = { ...endedAnchor, sequence: 9, reference: finalRef, previous: endedAnchorRef };
+  const proof: SourceClientJournalProof = { registrations: [registrationProof(original)], observations: [
+    observationProof(original, observed, "observed"),
+    { ...observationProof(observed, ended, "ended-observed"), journal: finalRef, sequence: 9 },
+  ] };
+  const options = { proof, anchors: [journalAnchor, endedAnchor, finalAnchor], currentSequence: 9, inspectProcess: exitedProcess };
+  assert.equal(await check([], [ended], true, options), true);
+  assert.equal(await check([], [ended], true, { ...options, inspectProcess: presentProcess }), false);
+});
+
+test("#248 window: complete ordered anchored observations reject gaps, branches and changed authority", async t => {
+  const original = await row(), observed = { ...original, last_observed_at: later };
+  const ended = { ...observed, last_observed_at: "2026-11-16T01:00:02.000Z", ended_at: "2026-11-16T01:00:02.000Z" };
+  const finalRef: ArtifactRef = { ref: `journals/${migrationId}/9-${"f".repeat(64)}.json`, sha256: "f".repeat(64), bytes: "123" };
+  const finalAnchor: SourceClientJournalAnchor = { ...endedAnchor, sequence: 9, reference: finalRef, previous: endedAnchorRef };
+  const registered = registrationProof(original), first = observationProof(original, observed, "observed");
+  const last: SourceClientObservationProof = { ...observationProof(observed, ended, "ended-observed"), journal: finalRef, sequence: 9 };
+  const proof: SourceClientJournalProof = { registrations: [registered], observations: [first, last] };
+  const options = { proof, anchors: [journalAnchor, endedAnchor, finalAnchor], currentSequence: 9, inspectProcess: exitedProcess };
+  const altered: [string, CheckOverrides][] = [
+    ["missing first", { ...options, proof: { ...proof, observations: [last] } }],
+    ["missing last", { ...options, proof: { ...proof, observations: [first] } }],
+    ["reordered", { ...options, proof: { ...proof, observations: [last, first] } }],
+    ["duplicate", { ...options, proof: { ...proof, observations: [first, first, last] } }],
+    ["branch", { ...options, proof: { ...proof, observations: [first, { ...last, before: original }] } }],
+    ["registration-time observation", { ...options, proof: { ...proof, observations: [{ ...first, sequence: 7, journal: targetAnchor }, last] } }],
+    ["future observation", { ...options, proof: { ...proof, observations: [first, { ...last, sequence: 10 }] } }],
+    ["unanchored observation", { ...options, proof: { ...proof, observations: [first, { ...last, journal: targetAnchor }] } }],
+    ["duplicate registration", { ...options, proof: { ...proof, registrations: [registered, registered] } }],
+    ["wrong actor", { ...options, proof: { ...proof, registrations: [{ ...registered, actorId: "other-instance" }] } }],
+    ["wrong initial identity", { ...options, proof: { ...proof, registrations: [{ ...registered,
+      after: { ...original, process_identity_json: canonicalJson({ ...nativeIdentity(), instanceId: "other-instance" }) } }] } }],
+    ["registration already observed", { ...options, proof: { ...proof, registrations: [{ ...registered, after: observed }] } }],
+    ["registration already ended", { ...options, proof: { registrations: [{ ...registered, after: ended }], observations: [] } }],
+    ["wrong effect", { ...options, proof: { ...proof, observations: [{ ...first, effect: "ended-observed" }, last] } }],
+    ["unrelated subject", { ...options, proof: { ...proof, observations: [first, { ...last, clientId: "unregistered-client" }] } }],
+    ["missing anchor", { ...options, anchors: [journalAnchor, finalAnchor] }],
+    ["forked anchor", { ...options, anchors: [journalAnchor, endedAnchor, { ...finalAnchor, previous: previousAnchor }] }],
+    ["cross-fence anchor", { ...options, anchors: [journalAnchor, endedAnchor, { ...finalAnchor, fenceEpoch: 8 }] }],
+    ["unknown native", { ...options, inspectProcess: async () => ({ status: "unknown", reason: "unreadable" }) }],
+    ["replaced native identity", { ...options, inspectProcess: async () => ({ status: "exited", reason: "identity_replaced" }) }],
+  ];
+  const wrongBusiness = { ...observed, build_id: "unapproved-build" };
+  altered.push(["interior business change", { ...options, proof: { ...proof,
+    observations: [{ ...first, after: wrongBusiness }, { ...last, before: wrongBusiness }] } }]);
+  const backwards = { ...observed, last_observed_at: "2026-11-15T23:59:59.000Z" };
+  altered.push(["interior time reversal", { ...options, proof: { ...proof,
+    observations: [{ ...first, after: backwards }, { ...last, before: backwards }] } }]);
+  for (const [name, variant] of altered) await t.test(name, async () => {
+    assert.equal(await check([], [ended], true, variant), false);
+  });
+  const numericOriginal = { ...original, protocol_version: "1", registered_epoch: 7, observed_epoch: 7 };
+  assert.equal(await check([], [ended], true, { ...options, proof: { ...proof,
+    registrations: [{ ...registered, after: numericOriginal }], observations: [{ ...first, before: numericOriginal }, last] } }), true,
+    "native numeric representation changes are not identity changes");
+  const restored = { ...ended, ended_at: null };
+  assert.equal(await check([], [restored], true, { ...options, inspectProcess: presentProcess }), false);
+});
+
+test("#248 window: exact equal malformed rows and proof changes after the supplied final row are rejected", async () => {
+  const original = await row();
+  for (const invalid of [{ ...original, protocol_version: 2 }, { ...original, registered_epoch: "07" },
+    { ...original, ended_at: 0 }, { ...original, extra: null }])
+    assert.equal(await check([invalid], [invalid], false, { proof: { registrations: [], observations: [] } }), false);
+  const observed = { ...original, last_observed_at: later };
+  const proof: SourceClientJournalProof = { registrations: [], observations: [observationProof(original, observed, "observed")] };
+  assert.equal(await check([original], [original], true, { proof }), false, "full proof is consumed even when endpoints match");
+});
+
+test("#248 window: sub-millisecond observation and termination cannot move backwards", async () => {
+  const original = await row(), observed = { ...original, last_observed_at: "2026-11-16T01:00:00.000002Z" };
+  const ended = { ...observed, last_observed_at: "2026-11-16T01:00:00.000003Z", ended_at: "2026-11-16T01:00:00.000001Z" };
+  const proof: SourceClientJournalProof = { registrations: [], observations: [observationProof(observed, ended, "ended-observed")] };
+  assert.equal(await check([observed], [ended], true, { proof, inspectProcess: exitedProcess }), false);
 });
 
 

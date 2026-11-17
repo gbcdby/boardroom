@@ -153,6 +153,12 @@ export interface JournalRecordV2 extends JournalRecordBase {
   readonly frozen: JournalFrozenV2 | null;
 }
 export type JournalRecord = JournalRecordV1 | JournalRecordV2;
+/** Explicit read-only V carrier; the default production writer/reader union stays v1/v2. */
+export interface JournalRecordV3 extends Omit<JournalRecordV2, "formatVersion"> {
+  readonly formatVersion: 3;
+  readonly controlProof: import("./control-candidate/schema.ts").ControlProof | null;
+}
+export type VerificationJournalRecord = JournalRecord | JournalRecordV3;
 export type SourceFileIncarnation =
   | { readonly type: 248; readonly byteCount: 32; readonly hex: string }
   | { readonly type: 1; readonly byteCount: 8; readonly hex: string };

@@ -1,15 +1,16 @@
 import path from "node:path";
 import { canonicalJson } from "./canonical.ts";
 import { decodeRow } from "./control-candidate/rows.ts";
-import { controlProofSchema } from "./control-candidate/schema.ts";
+import { replayVerificationControls } from "./control-candidate/replay-core.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { assertCapturedSourceClientBinding } from "./source-client-binding.ts";
+import { assertVerificationSourceClientBinding } from "./verification-source-client-binding.ts";
 import { compatibleSourceClientWindow, type SourceClientJournalProof, type SourceClientObservationProof, type SourceClientRegistrationProof } from "./source-client-window.ts";
-import { captureReference, verifyJournalChain, verifyRestoreBundleClosure, type JournalNode } from "./journal.ts";
+import { captureReference, verifyVerificationJournalChain, verifyVerificationRestoreBundleClosure, type JournalNode } from "./journal.ts";
 import { ArtifactStore } from "./objects.ts";
 import { parseVerification } from "./parse.ts";
 import { restoreSourceFiles } from "./restore-files.ts";
-import type { ActualRestoreVerification, ArtifactRef, Json, MaintenanceAdapter, SourceLock, SourceObservation } from "./types.ts";
+import type { ActualRestoreVerification, ArtifactRef, Json, MaintenanceAdapter, SourceLock, SourceObservation, VerificationJournalRecord } from "./types.ts";
 
 const same = (left: unknown, right: unknown) => canonicalJson(left) === canonicalJson(right);
 function requireValue(value: unknown, code: "snapshot_invalid" | "source_changed" | "maintenance_lost" | "control_root_mismatch"): asserts value {
@@ -19,15 +20,12 @@ function requireValue(value: unknown, code: "snapshot_invalid" | "source_changed
 /** Extract row-level authority from control-successor journal nodes. A v2
  * observation/takeover node carries no changes, so a new client row cannot be
  * authorized merely by its own envelope or by an unrelated anchor advance. */
-function liveControlProof(nodes: readonly JournalNode[], captureIndex: number): SourceClientJournalProof {
+function liveControlProof(nodes: readonly JournalNode<VerificationJournalRecord>[], captureIndex: number): SourceClientJournalProof {
   const registrations: SourceClientRegistrationProof[] = [];
   const observations: SourceClientObservationProof[] = [];
   for (const node of nodes.slice(captureIndex + 1)) {
-    const raw = (node.record as unknown as { readonly controlProof?: unknown }).controlProof;
-    if (raw === undefined || raw === null) continue;
-    const parsed = controlProofSchema.safeParse(raw);
-    requireValue(parsed.success, "source_changed");
-    const proof = parsed.data;
+    if (node.record.formatVersion !== 3 || node.record.controlProof === null) continue;
+    const proof = node.record.controlProof;
     if (proof.kind === "capture-controls") continue;
     for (const change of proof.changes) {
       if (change.kind === "maintenance-registration") {
@@ -54,7 +52,7 @@ function liveControlProof(nodes: readonly JournalNode[], captureIndex: number): 
  * the quiesced observation/takeover transitions permitted by the journal protocol.
  * Immutable artifacts are never selected by the filesystem's latest-looking name. */
 async function assertLiveCapture(store: ArtifactStore, lock: SourceLock, observed: SourceObservation,
-  closed: Awaited<ReturnType<typeof verifyRestoreBundleClosure>>): Promise<void> {
+  closed: Awaited<ReturnType<typeof verifyVerificationRestoreBundleClosure>>): Promise<void> {
   const capture = closed.bundle.capture, state = observed.state;
   requireValue(state.admission === "sealed" && state.journalRecordRef !== null && state.journalDigest !== null
     && state.activeMigrationId === capture.migrationId && state.planDigest === capture.planDigest
@@ -63,7 +61,7 @@ async function assertLiveCapture(store: ArtifactStore, lock: SourceLock, observe
   requireValue(same(observed.source, capture.source) && same(observed.sourceIdentity, closed.chain.plan.sourceIdentity),
     "source_changed");
   const anchored = await store.readAnchoredJournal({ ref: state.journalRecordRef, sha256: state.journalDigest });
-  const liveChain = await verifyJournalChain(store, anchored), head = liveChain.nodes.at(-1)!;
+  const liveChain = await verifyVerificationJournalChain(store, anchored), head = liveChain.nodes.at(-1)!;
   const captureIndex = liveChain.nodes.findIndex(node => same(node.reference, capture.journal));
   requireValue(captureIndex === closed.chain.nodes.length - 1
     && same(liveChain.nodes.slice(0, captureIndex + 1).map(node => node.reference),
@@ -80,21 +78,30 @@ async function assertLiveCapture(store: ArtifactStore, lock: SourceLock, observe
     "maintenance_lost");
 
   const captured = closed.chain.nodes.at(-1)!.record, frozen = captured.frozen;
-  requireValue(captured.formatVersion === 2 && captured.sourceClients !== null, "source_changed");
-  // Establish the archived baseline before the live window's same-row fast path.
-  await assertCapturedSourceClientBinding(lock, observed, captured.sourceClients, closed.manifests);
+  requireValue(captured.formatVersion !== 1 && captured.sourceClients !== null, "source_changed");
+  let windowBefore = closed.manifests.controlRows.storage_source_clients, windowOrigin = captureIndex;
+  // Validate every v3 proof and bind both capture/head row states before any
+  // same-row fast path. Legacy v2 keeps its existing all-encoding native join.
+  if (captured.formatVersion === 3) {
+    let mutexIdentity: unknown;
+    try { mutexIdentity = JSON.parse(state.mutexIdentityJson!); }
+    catch { requireValue(false, "control_root_mismatch"); }
+    const replay = replayVerificationControls(liveChain.plan, liveChain.nodes, { controlRoot: store.identity, mutexIdentity });
+    windowBefore = await assertVerificationSourceClientBinding(lock, observed, closed.chain.nodes.at(-1)!, closed.manifests, replay);
+    windowOrigin = liveChain.nodes.findIndex(node => same(node.reference, replay.originCapture));
+    requireValue(windowOrigin >= 0 && windowOrigin <= captureIndex, "source_changed");
+  } else await assertCapturedSourceClientBinding(lock, observed, captured.sourceClients, closed.manifests);
   requireValue(frozen !== null && state.guardManifestDigest === frozen.guardManifestDigest
     && observed.manifests.schemaManifestDigest === frozen.schemaManifestDigest
     && observed.manifests.frozenBusinessManifestDigest === frozen.frozenBusinessManifestDigest
-    && await compatibleSourceClientWindow(closed.manifests.controlRows.storage_source_clients,
+    && await compatibleSourceClientWindow(windowBefore,
       observed.manifests.controlRows.storage_source_clients, {
-        journalAdvanced: liveChain.nodes.slice(captureIndex + 1).some(node =>
-          node.record.event === "observation" || node.record.event === "takeover"),
-        mode: "strict", proof: liveControlProof(liveChain.nodes, captureIndex),
+        journalAdvanced: liveChain.nodes.length > windowOrigin + 1,
+        mode: "strict", proof: liveControlProof(liveChain.nodes, windowOrigin),
         fenceEpoch: capture.fenceEpoch, databaseInstanceId: capture.source.databaseInstanceId,
         source: capture.source, migrationId: capture.migrationId, planDigest: capture.planDigest,
         currentSequence: head.record.sequence,
-        anchors: liveChain.nodes.slice(captureIndex + 1).map(node => ({
+        anchors: liveChain.nodes.slice(windowOrigin + 1).map(node => ({
           reference: node.reference, previous: node.record.previous, migrationId: node.record.migrationId,
           planDigest: node.record.plan.sha256, fenceEpoch: node.record.fenceEpoch,
           ownerGeneration: node.record.ownerGeneration, sequence: node.record.sequence,
@@ -131,7 +138,7 @@ export async function verifyRestoreBundle(store: ArtifactStore, adapter: Mainten
   requireValue(store.kindFor(bundleRef) === "restore-bundle" && store.kindFor(publicationRef) === "publication", "snapshot_invalid");
   const fixedBundle = Object.freeze({ ...bundleRef }), fixedPublication = Object.freeze({ ...publicationRef });
   await lock.assertHeld(); await store.assertRoot();
-  const closure = await verifyRestoreBundleClosure(store, fixedBundle, fixedPublication);
+  const closure = await verifyVerificationRestoreBundleClosure(store, fixedBundle, fixedPublication);
   const initial = await lock.observe();
   requireValue(initial.state.admission === "sealed", "maintenance_lost");
   requireValue(same(initial.source, closure.bundle.capture.source) && same(initial.sourceIdentity, closure.chain.plan.sourceIdentity)
@@ -160,7 +167,7 @@ export async function verifyRestoreBundle(store: ArtifactStore, adapter: Mainten
   requireValue(same(files.sourceFilesManifest, closure.bundle.sourceFilesManifest), "snapshot_invalid");
   // Recheck the exact closed byte/reference graph after the two real restorations.
   // These immutable references must not silently select another bundle or payload.
-  await verifyRestoreBundleClosure(guarded, fixedBundle, fixedPublication);
+  await verifyVerificationRestoreBundleClosure(guarded, fixedBundle, fixedPublication);
   await assertCurrent();
   const target: Json = { kind: "isolated-restore-targets", database,
     sourceFiles: { kind: files.kind, sourceFilesManifest: { ...files.sourceFilesManifest }, target: { ...files.target },

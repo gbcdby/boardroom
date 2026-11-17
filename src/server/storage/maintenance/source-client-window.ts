@@ -1,20 +1,23 @@
 import { canonicalJson } from "./canonical.ts";
 import { registeredProcess } from "./control-candidate/schema.ts";
+import { sameSourceClientCell, sameSourceClientRow } from "./source-client-equality.ts";
+import { sourceClientColumns } from "./source-clients-read.ts";
 import { inspectRegisteredSourceProcess } from "./source-facts.ts";
 import type { ArtifactRef, Json, SourceRef } from "./types.ts";
 
 type Row = Readonly<Record<string, Json>>;
 type ProofRow = Readonly<Record<string, Json>>;
 const same = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
-const columns = [
-  "client_id", "database_instance_id", "entrypoint", "build_id", "protocol_version",
-  "host_identity_json", "process_identity_json", "db_sessions_json",
-  "registered_epoch", "observed_epoch", "drain_epoch", "drain_state",
-  "drain_receipt_digest", "registered_at", "last_observed_at", "ended_at",
-].sort();
-const timestamp = (value: Json | undefined): value is string => typeof value === "string"
-  && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z$/.test(value)
-  && Number.isFinite(Date.parse(value));
+const columns = sourceClientColumns.map(column => column.name);
+function timestampValue(value: Json | undefined): bigint | null {
+  if (typeof value !== "string") return null;
+  const parts = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,6}))?Z$/.exec(value);
+  if (!parts) return null;
+  const base = `${parts[1]}.000Z`, millis = Date.parse(base);
+  if (!Number.isFinite(millis) || new Date(millis).toISOString() !== base) return null;
+  return BigInt(millis) * 1000n + BigInt((parts[2] ?? "").padEnd(6, "0"));
+}
+const timestamp = (value: Json | undefined): value is string => timestampValue(value) !== null;
 
 const positive = (value: unknown): value is string => typeof value === "string" && /^[1-9][0-9]*$/.test(value);
 const ref = (value: unknown): value is ArtifactRef => {
@@ -111,39 +114,87 @@ function hasRegisteredControllerProof(row: Row, options: CompatibleSourceClientW
 }
 
 function actorBound(row: Row, registration: SourceClientRegistrationProof): boolean {
-  if (!same(registration.after, row)
-    || !same(registration.after.host_identity_json, row.host_identity_json)
-    || !same(registration.after.process_identity_json, row.process_identity_json)) return false;
-  if (typeof row.process_identity_json !== "string") return false;
+  const original = registration.after;
+  if (!sameSourceClientRow(original, original) || original.client_id !== registration.clientId
+    || original.ended_at !== null || !timestamp(original.registered_at)
+    || original.registered_at !== original.last_observed_at
+    || columns.some(key => key !== "last_observed_at" && key !== "ended_at"
+      && !sameSourceClientCell(key, original[key], row[key]))) return false;
+  if (typeof original.process_identity_json !== "string") return false;
   try {
-    const process: unknown = JSON.parse(row.process_identity_json);
+    const process: unknown = JSON.parse(original.process_identity_json);
     return object(process)?.instanceId === registration.actorId;
   } catch { return false; }
 }
 
 function anchored(options: CompatibleSourceClientWindowOptions, journal: ArtifactRef, sequence: number): boolean {
-  return !!options.anchors?.some(item => item.sequence === sequence && same(item.reference, journal));
+  return Number.isSafeInteger(sequence) && sequence > 0 && sequence <= options.currentSequence
+    && !!options.anchors?.some(item => item.sequence === sequence && same(item.reference, journal));
+}
+
+function validProof(options: CompatibleSourceClientWindowOptions, old: ReadonlyMap<string, Row>, now: ReadonlyMap<string, Row>): boolean {
+  if (options.mode !== "strict") return true;
+  const { registrations, observations } = options.proof;
+  if (!registrations.length && !observations.length) return true;
+  const anchors = options.anchors;
+  if (!anchors?.length || !Number.isSafeInteger(options.currentSequence) || options.currentSequence < 1
+    || anchors.at(-1)!.sequence !== options.currentSequence) return false;
+  for (const [index, anchor] of anchors.entries()) {
+    if (!Number.isSafeInteger(anchor.sequence) || anchor.sequence < 2 || !ref(anchor.reference) || !ref(anchor.previous)
+      || anchor.reference.ref !== `journals/${options.migrationId}/${anchor.sequence}-${anchor.reference.sha256}.json`
+      || anchor.previous.ref !== `journals/${options.migrationId}/${anchor.sequence - 1}-${anchor.previous.sha256}.json`
+      || anchor.migrationId !== options.migrationId || anchor.planDigest !== options.planDigest || anchor.fenceEpoch !== options.fenceEpoch
+      || !Number.isSafeInteger(anchor.ownerGeneration) || anchor.ownerGeneration < 1
+      || index > 0 && (anchor.sequence !== anchors[index-1]!.sequence + 1 || !same(anchor.previous, anchors[index-1]!.reference))) return false;
+  }
+  const clients = new Set<string>(), actors = new Set<string>();
+  let last = 0;
+  for (const registration of registrations) {
+    if (registration.sequence < last || !anchored(options, registration.journal, registration.sequence)
+      || old.has(registration.clientId) || !now.has(registration.clientId) || clients.has(registration.clientId)
+      || !registration.actorId || actors.has(registration.actorId)
+      || !sameSourceClientRow(registration.after, registration.after) || registration.after.client_id !== registration.clientId) return false;
+    clients.add(registration.clientId); actors.add(registration.actorId); last = registration.sequence;
+  }
+  const changes = new Set<string>(); last = 0;
+  for (const observation of observations) {
+    const key = `${observation.sequence}:${observation.clientId}`;
+    if (observation.sequence < last || !anchored(options, observation.journal, observation.sequence) || changes.has(key)
+      || !now.has(observation.clientId) || !(old.has(observation.clientId) || clients.has(observation.clientId))
+      || !sameSourceClientRow(observation.before, observation.before) || !sameSourceClientRow(observation.after, observation.after)
+      || observation.before.client_id !== observation.clientId || observation.after.client_id !== observation.clientId) return false;
+    changes.add(key); last = observation.sequence;
+  }
+  return true;
+}
+
+/** An observation changes only monotonic timestamps; its effect must describe
+ * that exact transition, including an ended state that can never be reopened. */
+function observedStep(before: Row, after: Row, effect: SourceClientObservationProof["effect"]): boolean {
+  if (sameSourceClientRow(before, after) || columns.some(key => key !== "last_observed_at" && key !== "ended_at"
+    && !sameSourceClientCell(key, before[key], after[key])) || !timestamp(before.last_observed_at)
+    || !timestamp(after.last_observed_at) || timestampValue(after.last_observed_at)! < timestampValue(before.last_observed_at)!) return false;
+  if (effect === "observed") return sameSourceClientCell("ended_at", before.ended_at, after.ended_at);
+  return effect === "ended-observed" && before.ended_at === null && timestamp(after.ended_at)
+    && timestamp(before.registered_at) && timestampValue(after.ended_at)! >= timestampValue(before.registered_at)!
+    && timestampValue(after.ended_at)! >= timestampValue(before.last_observed_at)!
+    && timestampValue(after.ended_at)! <= timestampValue(after.last_observed_at)!;
 }
 
 /** Follow client-observation changes from a proven row to the live row. The
  * sequence must advance and every step must be anchored to a live journal node. */
 function observationEffect(options: CompatibleSourceClientWindowOptions, clientId: string,
-  from: ProofRow, to: ProofRow): "observed" | "ended-observed" | null {
+  from: ProofRow, to: ProofRow, minimumSequence = 0): "observed" | "ended-observed" | null {
   if (options.mode !== "strict") return null;
-  let current = from, last = 0, ended = false;
-  const used = new Set<number>();
-  for (;;) {
-    if (same(current, to)) return ended ? "ended-observed" : "observed";
-    const next = options.proof.observations
-      .filter(item => item.clientId === clientId && item.sequence > last
-        && !used.has(item.sequence) && same(item.before, current))
-      .sort((a, b) => a.sequence - b.sequence)[0];
-    if (!next || !anchored(options, next.journal, next.sequence)) return null;
-    used.add(next.sequence);
+  let current = from, last = minimumSequence, ended = false;
+  for (const next of options.proof.observations.filter(item => item.clientId === clientId)) {
+    if (next.sequence <= last || !anchored(options, next.journal, next.sequence)
+      || !sameSourceClientRow(next.before, current) || !observedStep(next.before, next.after, next.effect)) return null;
     last = next.sequence;
     ended = ended || next.effect === "ended-observed";
     current = next.after;
   }
+  return sameSourceClientRow(current, to) ? ended ? "ended-observed" : "observed" : null;
 }
 
 function registrationFor(options: CompatibleSourceClientWindowOptions, row: Row): SourceClientRegistrationProof | undefined {
@@ -173,34 +224,36 @@ async function controllerIdentity(row: Row, options: CompatibleSourceClientWindo
  * that changes; weak callers are an explicitly non-final native-backup prefilter. */
 export async function compatibleSourceClientWindow(before: readonly Row[], current: readonly Row[],
   options: CompatibleSourceClientWindowOptions): Promise<boolean> {
-  if (same(before, current)) return true;
-  if (!options.journalAdvanced) return false;
   const old = new Map<string, Row>(), now = new Map<string, Row>();
   for (const [rows, dest] of [[before, old], [current, now]] as const) for (const row of rows) {
-    if (!same(Object.keys(row).sort(), columns) || typeof row.client_id !== "string" || !row.client_id
+    if (!sameSourceClientRow(row, row) || typeof row.client_id !== "string" || !row.client_id
       || dest.has(row.client_id)) return false;
     dest.set(row.client_id, row);
   }
+  if (!validProof(options, old, now)) return false;
+  const unchanged = old.size === now.size && [...old].every(([id, row]) => now.has(id) && sameSourceClientRow(row, now.get(id)!));
+  if (unchanged && (options.mode !== "strict" || !options.proof.observations.length)) return true;
+  if (!options.journalAdvanced) return false;
   for (const [id, prior] of old) {
     const live = now.get(id);
     if (!live) return false; // Never delete a captured client identity.
     for (const key of columns) if (key !== "last_observed_at" && key !== "ended_at"
-      && !same(prior[key], live[key])) return false;
-    if (!same(prior.last_observed_at, live.last_observed_at)
+      && !sameSourceClientCell(key, prior[key], live[key])) return false;
+    if (!sameSourceClientCell("last_observed_at", prior.last_observed_at, live.last_observed_at)
       && (!timestamp(prior.last_observed_at) || !timestamp(live.last_observed_at)
-        || Date.parse(live.last_observed_at) < Date.parse(prior.last_observed_at))) return false;
+        || timestampValue(live.last_observed_at)! < timestampValue(prior.last_observed_at)!)) return false;
     // An end event cannot be retroactively placed before the last captured
     // observation or the original registration. A later journal observation
     // cannot make an earlier, unobserved termination legitimate.
-    const ending = !same(prior.ended_at, live.ended_at);
+    const ending = !sameSourceClientCell("ended_at", prior.ended_at, live.ended_at);
     if (ending
       && (prior.ended_at !== null || !timestamp(live.ended_at)
         || !timestamp(prior.registered_at) || !timestamp(prior.last_observed_at)
         || !timestamp(live.last_observed_at)
-        || Date.parse(live.ended_at) < Date.parse(prior.registered_at)
-        || Date.parse(live.ended_at) < Date.parse(prior.last_observed_at)
-        || Date.parse(live.ended_at) > Date.parse(live.last_observed_at))) return false;
-    if (same(prior, live)) continue;
+        || timestampValue(live.ended_at)! < timestampValue(prior.registered_at)!
+        || timestampValue(live.ended_at)! < timestampValue(prior.last_observed_at)!
+        || timestampValue(live.ended_at)! > timestampValue(live.last_observed_at)!)) return false;
+    if (sameSourceClientRow(prior, live) && (options.mode !== "strict" || !options.proof.observations.some(item => item.clientId === id))) continue;
     if (options.mode === "strict") {
       const effect = observationEffect(options, id, prior, live);
       if (!effect) return false;
@@ -215,23 +268,23 @@ export async function compatibleSourceClientWindow(before: readonly Row[], curre
     const ended = row.ended_at !== null;
     if (row.entrypoint !== "maintenance-controller" || row.database_instance_id !== options.databaseInstanceId
       || row.build_id !== "boardroom-maintenance-control-v1"
-      || String(row.protocol_version) !== "1"
-      || String(row.registered_epoch) !== String(options.fenceEpoch)
-      || String(row.observed_epoch) !== String(options.fenceEpoch)
+      || !sameSourceClientCell("protocol_version", row.protocol_version, 1)
+      || !sameSourceClientCell("registered_epoch", row.registered_epoch, options.fenceEpoch)
+      || !sameSourceClientCell("observed_epoch", row.observed_epoch, options.fenceEpoch)
       || row.drain_epoch !== null || row.drain_state !== "none"
       || row.drain_receipt_digest !== null
       || !timestamp(row.registered_at) || !timestamp(row.last_observed_at)
-      || Date.parse(row.last_observed_at) < Date.parse(row.registered_at)
+      || timestampValue(row.last_observed_at)! < timestampValue(row.registered_at)!
       || typeof row.host_identity_json !== "string" || typeof row.process_identity_json !== "string") return false;
     if (ended && (!timestamp(row.ended_at)
-      || Date.parse(row.ended_at) < Date.parse(row.registered_at)
-      || Date.parse(row.ended_at) > Date.parse(row.last_observed_at))) return false;
+      || timestampValue(row.ended_at)! < timestampValue(row.registered_at)!
+      || timestampValue(row.ended_at)! > timestampValue(row.last_observed_at)!)) return false;
     const registration = registrationFor(options, row);
     if (options.mode === "strict") {
       if (!registration || !actorBound(row, registration)
-        || !hasRegisteredControllerProof(row, options, registration)) return false;
-      if (!same(row.ended_at, registration.after.ended_at)
-        && observationEffect(options, id, registration.after, row) !== "ended-observed") return false;
+        || !hasRegisteredControllerProof(registration.after, options, registration)) return false;
+      const effect = observationEffect(options, id, registration.after, row, registration.sequence);
+      if (effect !== (ended ? "ended-observed" : "observed")) return false;
     } else if (!hasRegisteredControllerProof(row, options)) return false;
     if (!await controllerIdentity(row, options, ended)) return false;
   }
