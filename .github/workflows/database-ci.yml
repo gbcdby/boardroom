@@ -191,7 +191,7 @@ jobs:
           fi
 
       - name: Linux 全量时间窗纯控制
-        run: python3 -B scripts/ci/test_linux_isolation.py WholeSuiteBudgetContracts -v
+        run: python3 -B scripts/ci/test_linux_isolation.py WholeSuiteBudgetContracts LauncherContracts.test_original_commands_and_explicit_pg_scope -v
 
       - name: M02 有效选项纯解析拒绝控制
         run: python3 tests/fs-effective-options.test.py
