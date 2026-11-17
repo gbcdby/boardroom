@@ -10,7 +10,8 @@ import { readSourceFiles } from "../src/server/storage/maintenance/parse.ts";
 import { buildSourceClientsRoster, sourceClientsDigest } from "../src/server/storage/maintenance/source-clients.ts";
 import { buildDatabaseManifests, digestRowMultiset } from "../src/server/storage/maintenance/manifests.ts";
 import { assertFrozenSourceUnchanged, captureReference, restorePointDigest, verifyJournalChain, verifySnapshotClosure } from "../src/server/storage/maintenance/journal.ts";
-import type { ArtifactRef, DatabaseManifests, JournalRecordV2 as JournalRecord, MigrationPlan, SourceFilesManifest, SourceObservation, SourceClientsRosterV1 } from "../src/server/storage/maintenance/types.ts";
+import * as journal from "../src/server/storage/maintenance/journal.ts";
+import type { ArtifactRef, DatabaseManifests, JournalRecordV2 as JournalRecord, MigrationPlan, RestoreBundleManifest, SourceFilesManifest, SourceObservation, SourceClientsRosterV1 } from "../src/server/storage/maintenance/types.ts";
 
 const platformTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
 const hash = (letter: string) => letter.repeat(64);
@@ -69,15 +70,20 @@ async function fixture(options: { sourceFiles?: (value: SourceFilesManifest) => 
   const database = await store.putBytes("database-snapshot", Buffer.from("structure-only DB fixture; not a real backup"));
   const partial = { capture, sourceFilesManifest: filesRef, database, manifests: manifestsRef,
     schemaManifestDigest: manifests.schemaManifestDigest, frozenBusinessManifestDigest: manifests.frozenBusinessManifestDigest };
-  const bundleBody = { formatVersion: 1, kind: "restore-bundle", capture, sourceFilesManifest: filesRef, restorePointDigest: restorePointDigest(partial), entries: [
+  const bundleBody: RestoreBundleManifest = { formatVersion: 1, kind: "restore-bundle", capture, sourceFilesManifest: filesRef, restorePointDigest: restorePointDigest(partial), entries: [
     { role: "plan", object: planRef }, { role: "journal-prefix", object: enter }, { role: "capture-journal", object: captureRef },
     { role: "source-files-manifest", object: filesRef }, { role: "source-file-payload", object: payload },
     { role: "database-snapshot", object: database }, { role: "database-expected-manifests", object: manifestsRef }, { role: "capability-evidence", object: capability },
   ] };
-  async function finish(options: { omitPayload?: boolean; wrongVerificationBundle?: boolean; capability?: ArtifactRef } = {}) {
-    const bundle = await store.putJson("restore-bundle", { ...bundleBody, entries: options.omitPayload ? bundleBody.entries.filter(item => item.role !== "source-file-payload") : bundleBody.entries });
+  async function publishBundle(options: { omitPayload?: boolean; capability?: ArtifactRef; body?: RestoreBundleManifest } = {}) {
+    const bundle = await store.putJson("restore-bundle", options.body ?? { ...bundleBody,
+      entries: options.omitPayload ? bundleBody.entries.filter(item => item.role !== "source-file-payload") : bundleBody.entries });
     const publication = await store.putJson("publication", { formatVersion: 1, kind: "publication", bundle, capability: options.capability ?? capability,
-      observedOperations: await Promise.all([...bundleBody.entries.map(item => item.object), bundle].map(ref => store.confirmDurable(ref))) });
+      observedOperations: await Promise.all([...(options.body ?? bundleBody).entries.map(item => item.object), bundle].map(ref => store.confirmDurable(ref))) });
+    return { bundle, publication };
+  }
+  async function finish(options: { omitPayload?: boolean; wrongVerificationBundle?: boolean; capability?: ArtifactRef } = {}) {
+    const { bundle, publication } = await publishBundle(options);
     const verification = await store.putJson("verification", { formatVersion: 1, kind: "verification", bundle: options.wrongVerificationBundle ? planRef : bundle, publication,
       verificationTargetIdentity: { kind: "fixture-only" }, exactFullDataAndControlMatched: true, sourceFilePayloadsMatched: true, schemaAndScopeMatched: true });
     const receipt = await store.putJson("receipt", { formatVersion: 1, kind: "receipt", snapshotId: "fixture-snapshot", ...partial,
@@ -86,9 +92,81 @@ async function fixture(options: { sourceFiles?: (value: SourceFilesManifest) => 
     const ready: JournalRecord = { ...body, sequence: 3, previous: captureRef, phase: "snapshot_ready", event: "ready", requestId: "ready", snapshot: receipt };
     return { reference: await store.putJson("journal", ready), record: ready };
   }
-  return { dir, store, source, plan, planRef, body, enter, captured, captureRef, capability, files, filesRef, payload, manifests, control, finish,
+  return { dir, store, source, plan, planRef, body, enter, captured, captureRef, capability, files, filesRef, payload, manifests, control,
+    database, manifestsRef, partial, bundleBody, publishBundle, finish,
     close: () => rm(dir, { recursive: true, force: true }) };
 }
+
+platformTest("#152 B/U closure: exact captured prefix is readable before V, R or ready exists", async () => {
+  const f = await fixture();
+  try {
+    const refs = await f.publishBundle();
+    const verified = await journal.verifyRestoreBundleClosure(f.store, refs.bundle, refs.publication);
+    assert.deepEqual(Object.keys(verified).sort(), ["bundle", "capabilityRef", "chain", "databaseRef", "files", "manifests", "manifestsRef", "publication"]);
+    assert.deepEqual(verified.bundle, f.bundleBody); assert.deepEqual(verified.publication.bundle, refs.bundle);
+    assert.deepEqual(verified.chain.nodes.map(node => node.reference), [f.enter, f.captureRef]);
+    assert.deepEqual(verified.files, f.files); assert.deepEqual(verified.manifests, f.manifests);
+    assert.deepEqual(verified.databaseRef, f.database); assert.deepEqual(verified.manifestsRef, f.manifestsRef);
+    assert.deepEqual(verified.capabilityRef, f.capability);
+    const orphan = await f.store.putJson("journal", { ...f.body, sequence: 3, previous: f.captureRef,
+      phase: "quiesced", event: "observation", requestId: "orphan" });
+    assert.notDeepEqual(orphan, f.captureRef);
+    assert.deepEqual((await journal.verifyRestoreBundleClosure(f.store, refs.bundle, refs.publication)).chain.nodes.at(-1)!.reference, f.captureRef);
+  } finally { await f.close(); }
+});
+
+platformTest("#152 B/U closure: omitted, duplicate and role-confused members never form a finite bundle", async t => {
+  const f = await fixture();
+  try {
+    for (const role of ["plan", "journal-prefix", "capture-journal", "source-files-manifest", "source-file-payload", "database-snapshot", "database-expected-manifests", "capability-evidence"]) {
+      await t.test(`missing ${role}`, async () => {
+        const refs = await f.publishBundle({ body: { ...f.bundleBody, entries: f.bundleBody.entries.filter(entry => entry.role !== role) } });
+        await assert.rejects(journal.verifyRestoreBundleClosure(f.store, refs.bundle, refs.publication), /journal_invalid/);
+      });
+    }
+    for (const entry of [f.bundleBody.entries.find(entry => entry.role === "database-snapshot")!,
+      { role: "database-snapshot" as const, object: f.payload }, { role: "database-expected-manifests" as const, object: f.planRef }]) {
+      const refs = await f.publishBundle({ body: { ...f.bundleBody, entries: [...f.bundleBody.entries, entry] } });
+      await assert.rejects(journal.verifyRestoreBundleClosure(f.store, refs.bundle, refs.publication), /journal_invalid/);
+    }
+  } finally { await f.close(); }
+});
+
+platformTest("#152 B/U closure: capture point, captured controls and completed publication must agree", async () => {
+  const f = await fixture();
+  try {
+    for (const body of [{ ...f.bundleBody, restorePointDigest: hash("f") },
+      { ...f.bundleBody, capture: captureReference({ record: f.body, reference: f.enter }) }]) {
+      const refs = await f.publishBundle({ body });
+      await assert.rejects(journal.verifyRestoreBundleClosure(f.store, refs.bundle, refs.publication), /journal_invalid/);
+    }
+    const changed = buildDatabaseManifests("sqlite", f.manifests.schema, f.manifests.tables,
+      { ...f.manifests.controlRows, storage_maintenance: [{ ...f.control, admission: "draining" }] });
+    const changedRef = await f.store.putJson("database-manifests", changed);
+    const refs = await f.publishBundle({ body: { ...f.bundleBody,
+      restorePointDigest: restorePointDigest({ ...f.partial, manifests: changedRef }),
+      entries: f.bundleBody.entries.map(entry => entry.role === "database-expected-manifests" ? { ...entry, object: changedRef } : entry) } });
+    await assert.rejects(journal.verifyRestoreBundleClosure(f.store, refs.bundle, refs.publication), /journal_invalid/);
+    const valid = await f.publishBundle(), publication = await f.store.readJson(valid.publication, "publication") as Record<string, unknown>;
+    const operations = publication.observedOperations as { artifact: ArtifactRef; completed: string[] }[];
+    for (const altered of [{ ...publication, bundle: f.planRef }, { ...publication, observedOperations: operations.slice(1) },
+      { ...publication, observedOperations: [...operations, operations[0]!] },
+      { ...publication, observedOperations: operations.map((entry, index) => index ? entry : { ...entry, completed: ["file_sync"] }) }]) {
+      await assert.rejects(journal.verifyRestoreBundleClosure(f.store, valid.bundle, await f.store.putJson("publication", altered)), /journal_invalid/);
+    }
+  } finally { await f.close(); }
+});
+
+platformTest("#152 B/U closure: original payload bytes and the entire exact journal prefix remain required", async () => {
+  const f = await fixture();
+  try {
+    const refs = await f.publishBundle(), original = await f.store.readBytes(f.database);
+    await writeFile(f.store.pathFor(f.database), Buffer.alloc(original.length, 0x20));
+    await assert.rejects(journal.verifyRestoreBundleClosure(f.store, refs.bundle, refs.publication), /snapshot_invalid/);
+    await writeFile(f.store.pathFor(f.database), original); await rm(f.store.pathFor(f.enter));
+    await assert.rejects(journal.verifyRestoreBundleClosure(f.store, refs.bundle, refs.publication), /ENOENT/);
+  } finally { await f.close(); }
+});
 
 platformTest("#152 FSI-08: exact anchored Fs v1 is rejected by v2 capture and ready without rewriting bytes", async () => {
   const f = await fixture({ sourceFiles: value => {

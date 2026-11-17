@@ -39,9 +39,19 @@ async function fixture(encoding: "UTF8" | "LATIN1" | "SQL_ASCII" = "UTF8") {
     clients.add(client); await client.connect(); return client;
   };
   const closeClient = async (client: Client) => { await client.end(); clients.delete(client); };
-  const close = async () => {
+  const close = async (allowExpectedNativeLockLoss = false) => {
     try {
-      await sourceClient?.close(); await mutex?.release(); await adapter?.close();
+      await sourceClient?.close();
+      try { await mutex?.release(); }
+      catch (error) {
+        // An intentional real source-backend kill or injected owned close failure can
+        // invalidate the adapter while a 1s mutex heartbeat is pending. The release
+        // still waits for that native query and closes the mutex session; only these
+        // exact, proven test faults may accept its maintenance_lost result. Other
+        // cleanup failures still fail.
+        if (!allowExpectedNativeLockLoss || (error as { code?: unknown })?.code !== "maintenance_lost") throw error;
+      }
+      await adapter?.close();
       for (const client of clients) await client.end(); clients.clear();
       if (created) {
         const sessions = await admin.query("SELECT count(*)::text AS count FROM pg_stat_activity WHERE datname=$1", [database]);
@@ -222,6 +232,7 @@ pgTest("A11A PostgreSQL observes real second backends, tags, prepared transactio
 
 pgTest("A11A PostgreSQL rechecks fresh sessions inside a window and consumes real lock loss", { timeout: 30_000 }, async () => {
   const f = await fixture();
+  let nativeLockLossProven = false;
   try {
     let writer: Client | undefined;
     try {
@@ -237,14 +248,17 @@ pgTest("A11A PostgreSQL rechecks fresh sessions inside a window and consumes rea
       assert.equal((await f.admin.query("SELECT pg_terminate_backend($1,1000) AS stopped", [holders.rows[0].pid])).rows[0].stopped, true);
       await assert.rejects(window.assertCurrent(), { code: "maintenance_lost" });
     })), { code: "maintenance_lost" });
-  } finally { await f.close(); }
+    // This exception is specifically caused by terminating the actual owned
+    // lock backend, not a timeout or an arbitrary failure from the test body.
+    nativeLockLossProven = true;
+  } finally { await f.close(nativeLockLossProven); }
 });
 
 pgTest("A11A PostgreSQL never reports facts success after a native owned close failure", { timeout: 30_000 }, async t => {
   for (const [target, mode] of [["inventory", "rejected-promise"], ["inventory", "synchronous-throw"],
     ["catalog-pin", "rejected-promise"], ["source-lock", "rejected-promise"]] as const) await t.test(`${target}: ${mode}`, async t => {
     const f = await fixture(); const original = Client.prototype.end, query = Client.prototype.query;
-    let attempted = false, consumed = false, selected: Client | undefined;
+    let attempted = false, consumed = false, selected: Client | undefined, closeFaultProven = false;
     try {
       t.mock.method(Client.prototype, "query", function(this: Client, ...args: unknown[]) {
         const sql = typeof args[0] === "string" ? args[0] : (args[0] as { text?: string })?.text ?? "";
@@ -264,7 +278,8 @@ pgTest("A11A PostgreSQL never reports facts success after a native owned close f
       await assert.rejects(f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference,
         async () => { consumed = true; })), error => /maintenance_lost/.test(String(error)) && !String(error).includes("canary"));
       assert.equal(attempted, true); assert.equal(consumed, target !== "inventory");
-    } finally { t.mock.restoreAll(); await f.close(); }
+      closeFaultProven = true;
+    } finally { t.mock.restoreAll(); await f.close(closeFaultProven); }
   });
 });
 

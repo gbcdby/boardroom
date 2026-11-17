@@ -16,6 +16,8 @@ import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import { readPostgresCatalog, readPostgresManifests } from "../src/server/storage/maintenance/postgres-manifests.ts";
 import { parsePostgresConnection } from "../src/server/storage/maintenance/postgres-tools.ts";
 import { buildSourceClientsRoster, parseSourceClientsRoster, sourceClientsDigest } from "../src/server/storage/maintenance/source-clients.ts";
+import { assertCapturedSourceClientBinding } from "../src/server/storage/maintenance/source-client-binding.ts";
+import { buildDatabaseManifests } from "../src/server/storage/maintenance/manifests.ts";
 
 const testUrl = process.env.AGENT_STUDIO_PG_TEST_URL;
 const pgTest = testUrl ? test : test.skip;
@@ -120,6 +122,42 @@ async function seed(client: Client, raw: ReturnType<typeof cells>) {
   });
   await client.query(`INSERT INTO storage_source_clients(${columns.join(",")}) VALUES(${expressions.join(",")})`, parameters);
 }
+
+pgTest("#228 PG UTF8/LATIN1/SQL_ASCII: capture/archive binding uses the actual native encoding in one lock", async t => {
+  for (const encoding of ["UTF8", "LATIN1", "SQL_ASCII"] as const) await t.test(encoding, async () => {
+    const f = await fixture(encoding); let mutex;
+    try {
+      // SQL_ASCII high bytes remain unreadable by the existing Md reader; retain
+      // that separate rejection test. Its supported ASCII rows still bind here.
+      const row = encoding === "SQL_ASCII" ? { ...cells(encoding), client_id: ["text", "636c69656e74"],
+        build_id: ["text", "6275696c64"], host_identity_json: ["text", "7b7d"] } : cells(encoding);
+      await seed(f.writer, row);
+      mutex = await f.adapter.acquireMutex(f.root, (await f.adapter.observe()).state);
+      const planHash = "a".repeat(64), journalHash = "b".repeat(64);
+      // Private data fixture metadata only: no journal artifact, capture permit,
+      // B/U or V is constructed. The test exercises the native data join alone.
+      await f.writer.query(`UPDATE storage_maintenance SET admission='sealed',fence_epoch=1,owner_generation=1,
+        active_migration_id='native-binding-fixture',plan_digest=$1,journal_record_ref=$2,journal_digest=$3,journal_sequence=2`,
+      [planHash, `journals/native-binding-fixture/2-${journalHash}.json`, journalHash]);
+      await f.adapter.withSourceLock("snapshot", async lock => {
+        const observed = await lock.observe(), raw = await lock.observeSourceClients();
+        assert.deepEqual(raw.textEncoding, { backend: "postgres", name: encoding });
+        const roster = buildSourceClientsRoster({ formatVersion: 1, kind: "source-clients-roster", source: raw.source,
+          migrationId: "native-binding-fixture", plan: { ref: `plans/${planHash}.json`, sha256: planHash, bytes: "1" },
+          fenceEpoch: "1", receiptGeneration: "1", textEncoding: raw.textEncoding, rows: raw.rows });
+        await assertCapturedSourceClientBinding(lock, observed, roster, observed.manifests);
+        assert.equal(raw.rows[0]!.registered_epoch[1], "9007199254740993");
+        assert.equal(raw.rows[0]!.observed_epoch[1], "9223372036854775807");
+        const archived = buildDatabaseManifests("postgres", observed.manifests.schema, observed.manifests.tables,
+          { ...observed.manifests.controlRows, storage_source_clients: observed.manifests.controlRows.storage_source_clients
+            .map(value => ({ ...value, build_id: "different-archive-value" })) });
+        await assert.rejects(assertCapturedSourceClientBinding(lock, observed, roster, archived),
+          error => error instanceof MaintenanceFailure && error.code === "source_changed");
+        assert.deepEqual(await lock.observe(), observed);
+      });
+    } finally { await mutex?.release(); await f.close(); }
+  });
+});
 
 pgTest("#152 A10-R04/R08 PG SQL_ASCII non-UTF8 bytes succeed through the actual standalone and SourceLock APIs", async () => {
   const f = await fixture("SQL_ASCII"); let mutex;

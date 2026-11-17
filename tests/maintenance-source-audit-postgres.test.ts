@@ -134,27 +134,75 @@ pgTest("A12-B rejects an actual backend arriving between collection and final fr
   } finally { t.mock.restoreAll(); if (foreign) await f.closeClient(foreign); await f.close(); }
 });
 
-pgTest("A12-B PostgreSQL bootstrap follows the real mutex invocation and native lock loss", async () => {
+pgTest("A12-B PostgreSQL bootstrap follows the real mutex invocation and native lock loss", async t => {
   const f = await postgresAuditFixture(); let escaped: SourceLock | undefined;
+  let tickTimeout: ReturnType<typeof setTimeout> | undefined;
   try {
     const first = await f.adapter.withSourceLock("control", async lock => { escaped = lock; return lock.readSourceClientAudit(f.reference); });
     const second = await f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference));
     assert.deepEqual(second.facts.actor, first.facts.actor);
     await f.mutex.release();
-    const nextMutex = await f.adapter.acquireMutex(f.store.identity, (await f.adapter.observe()).state);
+    const query = Client.prototype.query, end = Client.prototype.end, interval = globalThis.setInterval;
+    let mutexClient: Client | undefined, pendingQueries = 0, mutexQueries = 0, mutexEnds = 0, capturedTimers = 0;
+    let lossObserved = false, observedLostTick!: () => void;
+    const lostTick = new Promise<void>(resolve => { observedLostTick = resolve; });
+    t.mock.method(Client.prototype, "query", function(this: Client, ...args: unknown[]) {
+      const sql = typeof args[0] === "string" ? args[0] : (args[0] as { text?: string })?.text ?? "";
+      if (!mutexClient && sql.startsWith("SELECT pg_catalog.pg_try_advisory_lock(")) mutexClient = this;
+      if (this !== mutexClient) return Reflect.apply(query, this, args);
+      pendingQueries++; mutexQueries++;
+      try {
+        return (Reflect.apply(query, this, args) as Promise<unknown>).then(
+          value => { pendingQueries--; return value; }, error => { pendingQueries--; throw error; });
+      } catch (error) { pendingQueries--; throw error; }
+    });
+    t.mock.method(Client.prototype, "end", function(this: Client, ...args: unknown[]) {
+      if (this === mutexClient) mutexEnds++;
+      return Reflect.apply(end, this, args);
+    });
+    // Capture only the timer created by this acquisition, preserving its real
+    // callback/this/arguments and 1s interval. Never invoke or shorten a tick.
+    const captureInterval = t.mock.method(globalThis, "setInterval", ((callback: (...args: unknown[]) => unknown,
+      milliseconds?: number, ...args: unknown[]) => {
+      assert.equal(milliseconds, 1_000); assert.equal(capturedTimers++, 0);
+      return Reflect.apply(interval, globalThis, [function(this: unknown, ...values: unknown[]) {
+        const idle = pendingQueries === 0;
+        const result = Reflect.apply(callback, this, values);
+        // An older pending query is not evidence of a fresh post-loss check.
+        if (lossObserved && idle) observedLostTick();
+        return result;
+      }, milliseconds, ...args]);
+    }) as typeof setInterval);
+    let nextMutex!: Awaited<ReturnType<typeof f.adapter.acquireMutex>>;
+    try { nextMutex = await f.adapter.acquireMutex(f.store.identity, (await f.adapter.observe()).state); }
+    finally { captureInterval.mock.restore(); }
+    assert.equal(capturedTimers, 1); assert(mutexClient);
     await assert.rejects(async () => escaped!.readSourceClientAudit(f.reference), { code: "maintenance_lost" });
-    let actualStopped = false, newActorId = "";
+    let actualStopped = false, newActorId = "", mutexPid = 0, mutexBackendStart = "";
     await assert.rejects(f.adapter.withSourceLock("control", async lock => {
       const packet = await lock.readSourceClientAudit(f.reference); newActorId = packet.facts.actor.actorId;
       const sessions = packet.facts.sessions; assert.equal(sessions.kind, "postgres-session-audit-v1");
       const holder = sessions.ownedSessions.find(item => item.role === "source-control")!;
+      const mutexHolder = sessions.ownedSessions.find(item => item.role === "operation-mutex")!;
+      mutexPid = mutexHolder.pid; mutexBackendStart = mutexHolder.backendStart;
+      assert.equal((mutexClient as unknown as { processID: number }).processID, mutexPid);
       actualStopped = (await f.admin.query("SELECT pg_terminate_backend($1,1000) AS stopped", [holder.pid])).rows[0].stopped === true;
       return lock.readSourceClientAudit(f.reference);
     }), { code: "maintenance_lost" });
     assert(actualStopped); assert.notEqual(newActorId, first.facts.actor.actorId);
     await assert.rejects(f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference)), { code: "maintenance_lost" });
-    await nextMutex.release();
-  } finally { await f.close(); }
+    lossObserved = true;
+    await Promise.race([lostTick, new Promise<never>((_, reject) => {
+      tickTimeout = setTimeout(() => reject(new Error("the owned natural heartbeat did not observe the lost source")), 20_000);
+    })]);
+    clearTimeout(tickTimeout); tickTimeout = undefined;
+    const queriesBeforeRelease = mutexQueries;
+    await assert.rejects(nextMutex.release(), { code: "maintenance_lost" });
+    assert.equal(mutexEnds, 1); assert.equal(mutexQueries, queriesBeforeRelease, "cleanup cannot replay source SQL");
+    assert.equal((await f.admin.query("SELECT count(*)::int AS count FROM pg_stat_activity WHERE pid=$1 AND backend_start::text=$2 AND datname=$3",
+      [mutexPid, mutexBackendStart, f.database])).rows[0].count, 0);
+    await assert.rejects(f.adapter.observe(), { code: "maintenance_lost" });
+  } finally { clearTimeout(tickTimeout); t.mock.restoreAll(); await f.close(); }
 });
 
 pgTest("A12-B PostgreSQL strict inspection-close failure cannot fulfill the audit", async t => {

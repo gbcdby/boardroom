@@ -4,7 +4,7 @@ import { MaintenanceFailure } from "./error.ts";
 import { buildDatabaseManifests } from "./manifests.ts";
 import { ArtifactStore } from "./objects.ts";
 import { parseBundle, parseCapability, parseJournal, parseManifests, parsePlan, parsePublication, parseReceipt, parseVerification, readSourceFiles } from "./parse.ts";
-import type { ArtifactRef, DatabaseManifests, JournalFrozenV2, JournalRecord, MaintenanceCaptureRef, MigrationPlan, SnapshotReceipt, SourceClientsRosterV1, SourceFilesManifest, SourceObservation } from "./types.ts";
+import type { ArtifactRef, DatabaseManifests, JournalFrozenV2, JournalRecord, MaintenanceCaptureRef, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceClientsRosterV1, SourceFilesManifest, SourceObservation } from "./types.ts";
 
 const equal = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
 function requireValue(condition: unknown): asserts condition { if (!condition) throw new MaintenanceFailure("journal_invalid"); }
@@ -117,6 +117,62 @@ export function captureReference(node: JournalNode): MaintenanceCaptureRef {
     fenceEpoch: node.record.fenceEpoch, journal: node.reference, journalSequence: node.record.sequence, ownerGeneration: node.record.ownerGeneration };
 }
 
+/** Finite B/U byte/reference proof. No V, receipt, ready anchor or source qualification is implied. */
+export async function verifyRestoreBundleClosure(store: ArtifactStore, bundleRef: ArtifactRef, publicationRef: ArtifactRef): Promise<{
+  bundle: RestoreBundleManifest; publication: PublicationEvidence; chain: VerifiedJournalChain; files: SourceFilesManifest;
+  manifests: DatabaseManifests; databaseRef: ArtifactRef; manifestsRef: ArtifactRef; capabilityRef: ArtifactRef;
+}> {
+  const bundle = parseBundle(await store.readJson(bundleRef, "restore-bundle"));
+  const publication = parsePublication(await store.readJson(publicationRef, "publication"));
+  requireValue(equal(publication.bundle, bundleRef));
+  const chain = await verifyJournalChain(store, bundle.capture.journal), captured = chain.nodes.at(-1)!;
+  requireValue(captured.record.event === "capture" && captured.record.frozen && equal(captureReference(captured), bundle.capture));
+  const frozen = captured.record.frozen;
+  requireValue(equal(frozen.sourceFilesManifest, bundle.sourceFilesManifest));
+  const files = await readSourceFiles(store, bundle.sourceFilesManifest); await verifySourceFilesClosure(store, files);
+  requireValue(equal(files.source, bundle.capture.source));
+  const capabilityRef = publication.capability; await verifyCapability(store, capabilityRef);
+  const databases = bundle.entries.filter(entry => entry.role === "database-snapshot");
+  const expectedManifests = bundle.entries.filter(entry => entry.role === "database-expected-manifests");
+  requireValue(databases.length === 1 && expectedManifests.length === 1);
+  const databaseRef = databases[0]!.object, manifestsRef = expectedManifests[0]!.object;
+  const manifests = parseManifests(await store.readJson(manifestsRef, "database-manifests"));
+  requireValue(equal(buildDatabaseManifests(manifests.dialect, manifests.schema, manifests.tables, manifests.controlRows), manifests)
+    && manifests.schemaManifestDigest === frozen.schemaManifestDigest && manifests.frozenBusinessManifestDigest === frozen.frozenBusinessManifestDigest);
+  requireValue(bundle.restorePointDigest === restorePointDigest({ capture: bundle.capture, sourceFilesManifest: bundle.sourceFilesManifest,
+    database: databaseRef, manifests: manifestsRef, schemaManifestDigest: manifests.schemaManifestDigest,
+    frozenBusinessManifestDigest: manifests.frozenBusinessManifestDigest }));
+  requireValue(manifests.dialect === bundle.capture.source.kind && manifests.controlRows.storage_maintenance.length === 1
+    && new Set(manifests.tables.map(table => table.name)).size === manifests.tables.length
+    && ["storage_maintenance", "storage_source_clients"].every(name => manifests.tables.some(table => table.name === name)));
+  const control = manifests.controlRows.storage_maintenance[0]!;
+  requireValue(control.database_instance_id === bundle.capture.source.databaseInstanceId && control.admission === "sealed"
+    && String(control.fence_epoch) === String(bundle.capture.fenceEpoch) && String(control.owner_generation) === String(bundle.capture.ownerGeneration)
+    && control.active_migration_id === bundle.capture.migrationId && control.plan_digest === bundle.capture.planDigest
+    && control.guard_manifest_digest === frozen.guardManifestDigest && String(control.protocol_version) === "1"
+    && control.journal_record_ref === bundle.capture.journal.ref && control.journal_digest === bundle.capture.journal.sha256
+    && String(control.journal_sequence) === String(bundle.capture.journalSequence));
+  const expected = new Map<string, { role: string; object: ArtifactRef }>();
+  const add = (role: string, object: ArtifactRef) => {
+    const prior = expected.get(object.ref); requireValue(!prior || prior.role === role && equal(prior.object, object)); expected.set(object.ref, { role, object });
+  };
+  add("plan", captured.record.plan);
+  for (const node of chain.nodes) { add(node === captured ? "capture-journal" : "journal-prefix", node.reference); for (const evidence of node.record.evidence) add("capability-evidence", evidence); }
+  add("source-files-manifest", bundle.sourceFilesManifest);
+  for (const entry of files.entries) if (entry.payload) add("source-file-payload", entry.payload);
+  add("database-snapshot", databaseRef); add("database-expected-manifests", manifestsRef); add("capability-evidence", capabilityRef);
+  requireValue(bundle.entries.length === expected.size && new Set(bundle.entries.map(entry => entry.object.ref)).size === expected.size);
+  const roleKinds: Record<string, string> = { plan: "plan", "journal-prefix": "journal", "capture-journal": "journal", "source-files-manifest": "source-files",
+    "source-file-payload": "source-file-payload", "database-snapshot": "database-snapshot", "database-expected-manifests": "database-manifests", "capability-evidence": "capability" };
+  for (const entry of bundle.entries) {
+    requireValue(equal(expected.get(entry.object.ref), entry) && store.kindFor(entry.object) === roleKinds[entry.role]); await store.verifyFile(entry.object);
+  }
+  const published = new Map(publication.observedOperations.map(item => [item.artifact.ref, item.artifact]));
+  requireValue(published.size === publication.observedOperations.length && published.size === expected.size + 1 && equal(published.get(bundleRef.ref), bundleRef));
+  for (const entry of expected.values()) requireValue(equal(published.get(entry.object.ref), entry.object));
+  return { bundle, publication, chain, files, manifests, databaseRef, manifestsRef, capabilityRef };
+}
+
 /** Verifies the finite byte/reference closure, not runtime qualification, source provenance or actual restore execution. */
 export async function verifySnapshotClosure(store: ArtifactStore, current: ArtifactRef): Promise<{
   chain: VerifiedJournalChain; receipt: SnapshotReceipt; receiptRef: ArtifactRef; files: SourceFilesManifest; manifests: DatabaseManifests;
@@ -131,51 +187,16 @@ export async function verifySnapshotClosure(store: ArtifactStore, current: Artif
   const captured = chain.nodes[captureIndex]!;
   requireValue(captured.record.event === "capture" && captured.record.frozen && equal(captureReference(captured), receipt.capture));
   requireValue(chain.nodes.slice(captureIndex + 1).every(node => ["ready", "takeover", "observation"].includes(node.record.event)));
-  const frozen = captured.record.frozen;
-  requireValue(equal(frozen.sourceFilesManifest, receipt.sourceFilesManifest) && frozen.schemaManifestDigest === receipt.schemaManifestDigest
-    && frozen.frozenBusinessManifestDigest === receipt.frozenBusinessManifestDigest);
-  const bundle = parseBundle(await store.readJson(receipt.bundle, "restore-bundle"));
-  const publication = parsePublication(await store.readJson(receipt.publication, "publication"));
+  const { bundle, publication, files, manifests, databaseRef, manifestsRef, capabilityRef } =
+    await verifyRestoreBundleClosure(store, receipt.bundle, receipt.publication);
   const verification = parseVerification(await store.readJson(receipt.verification, "verification"));
   requireValue(equal(bundle.capture, receipt.capture) && equal(bundle.sourceFilesManifest, receipt.sourceFilesManifest)
-    && equal(publication.bundle, receipt.bundle) && equal(publication.capability, receipt.capability)
+    && equal(publication.capability, receipt.capability) && equal(capabilityRef, receipt.capability)
+    && equal(databaseRef, receipt.database) && equal(manifestsRef, receipt.manifests)
     && equal(verification.bundle, receipt.bundle) && equal(verification.publication, receipt.publication)
-    && bundle.restorePointDigest === receipt.restorePointDigest && receipt.restorePointDigest === restorePointDigest(receipt));
-  const files = await readSourceFiles(store, receipt.sourceFilesManifest); await verifySourceFilesClosure(store, files);
-  requireValue(equal(files.source, receipt.capture.source));
-  await verifyCapability(store, receipt.capability);
-  const manifests = parseManifests(await store.readJson(receipt.manifests, "database-manifests"));
-  requireValue(equal(buildDatabaseManifests(manifests.dialect, manifests.schema, manifests.tables, manifests.controlRows), manifests)
+    && bundle.restorePointDigest === receipt.restorePointDigest && receipt.restorePointDigest === restorePointDigest(receipt)
     && manifests.schemaManifestDigest === receipt.schemaManifestDigest && manifests.fullDataManifestDigest === receipt.fullDataManifestDigest
     && manifests.frozenBusinessManifestDigest === receipt.frozenBusinessManifestDigest && manifests.capturedControlManifestDigest === receipt.capturedControlManifestDigest);
-  requireValue(manifests.dialect === receipt.capture.source.kind && manifests.controlRows.storage_maintenance.length === 1
-    && new Set(manifests.tables.map(table => table.name)).size === manifests.tables.length
-    && ["storage_maintenance", "storage_source_clients"].every(name => manifests.tables.some(table => table.name === name)));
-  const control = manifests.controlRows.storage_maintenance[0]!;
-  requireValue(control.database_instance_id === receipt.capture.source.databaseInstanceId && control.admission === "sealed"
-    && String(control.fence_epoch) === String(receipt.capture.fenceEpoch) && String(control.owner_generation) === String(receipt.capture.ownerGeneration)
-    && control.active_migration_id === receipt.capture.migrationId && control.plan_digest === receipt.capture.planDigest
-    && control.guard_manifest_digest === frozen.guardManifestDigest && String(control.protocol_version) === "1"
-    && control.journal_record_ref === receipt.capture.journal.ref && control.journal_digest === receipt.capture.journal.sha256
-    && String(control.journal_sequence) === String(receipt.capture.journalSequence));
-  const expected = new Map<string, { role: string; object: ArtifactRef }>();
-  const add = (role: string, object: ArtifactRef) => {
-    const prior = expected.get(object.ref); requireValue(!prior || prior.role === role && equal(prior.object, object)); expected.set(object.ref, { role, object });
-  };
-  add("plan", captured.record.plan);
-  for (const node of chain.nodes.slice(0, captureIndex + 1)) { add(node === captured ? "capture-journal" : "journal-prefix", node.reference); for (const evidence of node.record.evidence) add("capability-evidence", evidence); }
-  add("source-files-manifest", receipt.sourceFilesManifest);
-  for (const entry of files.entries) if (entry.payload) add("source-file-payload", entry.payload);
-  add("database-snapshot", receipt.database); add("database-expected-manifests", receipt.manifests); add("capability-evidence", receipt.capability);
-  requireValue(bundle.entries.length === expected.size && new Set(bundle.entries.map(entry => entry.object.ref)).size === expected.size);
-  const roleKinds: Record<string, string> = { plan: "plan", "journal-prefix": "journal", "capture-journal": "journal", "source-files-manifest": "source-files",
-    "source-file-payload": "source-file-payload", "database-snapshot": "database-snapshot", "database-expected-manifests": "database-manifests", "capability-evidence": "capability" };
-  for (const entry of bundle.entries) {
-    requireValue(equal(expected.get(entry.object.ref), entry) && store.kindFor(entry.object) === roleKinds[entry.role]); await store.verifyFile(entry.object);
-  }
-  const published = new Map(publication.observedOperations.map(item => [item.artifact.ref, item.artifact]));
-  requireValue(published.size === publication.observedOperations.length && published.size === expected.size + 1 && equal(published.get(receipt.bundle.ref), receipt.bundle));
-  for (const entry of expected.values()) requireValue(equal(published.get(entry.object.ref), entry.object));
   return { chain, receipt, receiptRef, files, manifests };
 }
 
