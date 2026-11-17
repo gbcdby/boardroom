@@ -91,3 +91,23 @@ Linux 的此组件须显式执行以下两行，普通 npm ci / postinstall **�
 编译使用仓库随附已逐项校验 SHA256 的 Node 24.22.1 Node-API 8 headers，输出位于已忽略的 build/maintenance-platform/maintenance-source-files-linux-<arch>.node，权限 0700。真实完整 P 仍需十三项健康字段、source-state、完整窗口与固定非空支持资格，严格验证 Linux 内核/挂载/FD 引用与后续 S/C 的原生正反例；未验收前 production_enable 继续 false。
 
 测试中的真实文件/目录、原始 xattr、预算、权限及关闭后拒绝只属于 **Linux 普通 getter/ABI 控制**。独立临时 addon 的固定 syscall 故障注入只检验 unavailable 与 rc/errno 保留，不代表真实权限失败或资格证据。它们不证明 macOS、正式 Profile、源不变窗口、物理断电耐久、迁移 journal、S4 三个命名产物或可用的公共迁移入口。
+
+## Linux P3：真实 owner 上的固定上下文与保守 profile 匹配
+
+P3 保留 P0–P2 原始 getter，并增加独立 `STATX_MNT_ID_UNIQUE` 观察。LEGACY 与 UNIQUE 是不同的 ID 空间，各自与同一 FD 的原始结果绑定，不能通过两个数值相等或互相填充来建立关系。原生 owner、scope、bootstrap 和 profile 状态分别保存在私有 owner 与 WeakMap 中；调用者的同形对象、复制对象、子 owner、已关闭 owner 或已结束 scope 都不能取得根上下文或资格。返回的诊断字段与摘要不具有授权作用。
+
+目录根可继续提供普通原始事实。正式 S 在打开首个子文件内容前必须完成固定 matcher 与 `beforeContent()`；读取结束后须调用 `afterContent()` 并完成 S 自身的 source-state 和窗口核验。P 的窗口摘要绑定本次实际环境，不能被当作永久源身份，也不单独签发 Tcut。
+
+文件根先通过 O_PATH 取得 metadata-only bootstrap，并独立持有真实父目录辅助 owner。它不能读取内容、列目录或调用可读 FD getter。固定异步工厂通过本包 profile 初始化器完成真实同源环境、健康与固定注册表预检后，才可由父目录相对只读 openat2 创建新的 NONBLOCK/NOATIME 内容 owner。新旧 owner 和原路径的身份必须交叉核验；bootstrap 与父辅助的关闭须已确认，才能把新的 owner 交给 S。旧 owner 不更换 FD，失败的 promotion 不能重试；普通原始 native API 控制不等于通过了这项生产预检。
+
+上下文 ABI 只接收固定原生 collector 的完整类型与字段：进程/namespace、uname 与实际 notes、LEGACY/UNIQUE/statmount/mountinfo、原始 tune/options/mb_groups/journal task 与 ioprio、真实设备绑定和有界关系图，以及同源 sysfs 下的十三项健康字段。原件中的每次调用保留实际 rc/errno；未执行用 null，unavailable 不填零，不由调用者提交 proof、回调、成功 bool 或自证 digest。未知字段、错误类型、无法确认 EOF/关闭或不完整枚举均不能升级为成功上下文。
+
+配置、挂载与设备原件在十三项健康读取后进行后验；需要双采样的 fact 保持一个共同原件值和两段完整调用记录，后段 operation 加 `-after`。每段分别具备真实 EOF、完整字节数和关闭成功，不能把两段长度合并后与一个值比较。两段共享每 fact 最多 256 次实际 read/getdents、全局 2 MiB 原始读取和 32768 次调用预算；null 占位不计实际调用。图最多 64 节点、128 边、16 层。资源 trace 逐个核对实际持有、使用与收尾，不能用最后一条 close=0 代表全部资源关闭；未知关闭保留首错与其他辅助错误，不能重新关闭可能已复用的数字 FD。
+
+固定支持表仍为空。完整内核 build/source/config 对照（M01）、完整有效 options 与 journal-task lifetime lease（M02）、普通权限下 backing 与写者覆盖证明（M04）仍是未证义务。相同 PID、零健康值、可读原件、合成解析正控或普通主机 getter 成功都不能解除它们。当前生产 matcher 继续返回 `backup_capability_unavailable`，既不生成 source-preservation 资格，也不启用公共迁移。一次上下文失败会锁定该根/profile 的失败，后续观察不能将它重置为新的正常基线。
+
+P3 测试分别记录真实临时文件 owner/getter 与完整 collector 的组合结果、隔离纯 ABI/profile 机械解析控制、固定链接故障控制。纯解析副本只导出无副作用函数，不修改注册表或注册合成 owner/profile；固定链接测试把原字节 TS 模块放在独立包内，仍使用正常固定 addon 路径，没有生产加载覆盖接口。内容打开故障对实际 NONBLOCK/NOATIME file open 判别，验证完整原生预检后的空表拒绝发生在该打开之前。
+
+必要的原生负控覆盖短读的 256 次边界、无 EOF、全局 2 MiB、伪文件 close 未知、源 metadata 后验变化、目录 closedir 未知和失败子 owner 的身份/关闭双错。用于全局预算的固定伪源只能产生无 EOF 的 unavailable，不能充当真实 sysfs/健康或资格正控。真实运行环境无法打开 `/sys` 或无法绑定其设备/健康目录时，完整原件明确保持 unavailable，不把未知当成正常零值。fatal collector 错误和未知关闭即使被调用者 catch，scope 也会保留失败；首错和真正的 opaque cleanup owner 不因后续清理诊断丢失，已知资源继续收束。
+
+这些本机普通控制不代替 S 的固定组合检查、独立 REQ/STD、同候选 CI 或真实 qualification。对 statmount/mountinfo/process/config/health 的纯机械正控保留全部未证义务，不能签发成功 profile，也不能把 DM 构建或现场实验转成 P3 资格。
