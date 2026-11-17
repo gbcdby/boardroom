@@ -72,10 +72,19 @@ function safeError(error: unknown, fallback: BlockerCode, subjectRef = "source")
   const code = String((error as { code?: unknown } | null)?.code ?? "");
   return new MaintenanceFailure(code === "55P03" ? "maintenance_busy" : ["40001", "40P01"].includes(code) ? "source_changed" : fallback, subjectRef);
 }
-function throwResourceFailures(errors: readonly MaintenanceFailure[]): void {
+function throwResourceFailures(errors: readonly unknown[]): void {
   if (errors.length === 1) throw errors[0];
   if (errors.length > 1) throw new AggregateError(errors, "maintenance resource cleanup failed", { cause: errors[0] });
 }
+interface BackupFileOwner {
+  readonly handle: FileHandle;
+  readonly fd: number;
+  identity?: string;
+  nativeCloseAttempt?: Promise<void>;
+  closeAttempt?: Promise<void>;
+  closed: boolean;
+}
+interface BackupPassfileOwner { readonly path: string; readonly file: BackupFileOwner; cleanupAttempted: boolean }
 function checkedCounter(value: number): boolean { return Number.isSafeInteger(value) && value >= 0; }
 /** Internal readers use promise queries. Bound every actual query dispatch and its
  * real completion; a failed check never leaves a detached query running. */
@@ -172,6 +181,10 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   };
   const activeVerifications = new Set<Promise<Json>>();
   const verificationInputs = new Map<FileHandle, { fd: number; identity?: string }>();
+  const backupFiles = new Set<BackupFileOwner>();
+  const backupPassfiles = new Set<BackupPassfileOwner>();
+  const backupTasks = new Set<Promise<unknown>>();
+  const backupCleanupErrors: unknown[] = [];
   let inspectionSequence = 0;
   const adapterObservationId = ++writerObservationAdapterSequence;
   // The diagnostic projection never owns a business result or changes a query.
@@ -572,6 +585,82 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       }
     }
   }
+  async function openBackupFile(path: string, flags: number, files: BackupFileOwner[],
+    passfiles?: BackupPassfileOwner[]): Promise<BackupFileOwner> {
+    const handle = await open(path, flags, 0o600);
+    const owner: BackupFileOwner = { handle, fd: handle.fd, closed: false };
+    backupFiles.add(owner); files.push(owner);
+    if (passfiles) {
+      const name: BackupPassfileOwner = { path, file: owner, cleanupAttempted: false };
+      backupPassfiles.add(name); passfiles.push(name);
+    }
+    const info = fstatSync(owner.fd, { bigint: true }); owner.identity = `${info.dev}:${info.ino}`;
+    return owner;
+  }
+  function backupFileRetired(owner: BackupFileOwner): boolean {
+    if (owner.handle.fd !== -1) return false;
+    try {
+      const info = fstatSync(owner.fd, { bigint: true });
+      return owner.identity !== undefined && `${info.dev}:${info.ino}` !== owner.identity;
+    } catch (error) { return (error as NodeJS.ErrnoException | null)?.code === "EBADF"; }
+  }
+  async function closeBackupFile(owner: BackupFileOwner): Promise<void> {
+    if (owner.closed) return;
+    if (owner.closeAttempt) {
+      try { await owner.closeAttempt; } catch { /* Original error remains independently reportable. */ }
+      if (owner.closed || backupFileRetired(owner)) { owner.closed = true; backupFiles.delete(owner); return; }
+      throw new MaintenanceFailure("maintenance_lost", "backup-file-close-unknown");
+    }
+    const attempt = (async () => {
+      try {
+        owner.nativeCloseAttempt = owner.handle.close();
+        await owner.nativeCloseAttempt;
+        if (owner.handle.fd !== -1) throw new MaintenanceFailure("maintenance_lost", "backup-file-close-unknown");
+        owner.closed = true; backupFiles.delete(owner);
+      } catch (error) {
+        backupCleanupErrors.push(error);
+        if (backupFileRetired(owner)) { owner.closed = true; backupFiles.delete(owner); }
+        throw error;
+      }
+    })();
+    owner.closeAttempt = attempt; await attempt;
+  }
+  async function cleanupBackupPassfile(owner: BackupPassfileOwner): Promise<void> {
+    owner.cleanupAttempted = true;
+    try {
+      let named;
+      try { named = await lstat(owner.path, { bigint: true }); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") { backupPassfiles.delete(owner); return; }
+        throw error;
+      }
+      if (owner.file.identity === undefined && owner.file.handle.fd !== -1) {
+        const actual = fstatSync(owner.file.fd, { bigint: true }); owner.file.identity = `${actual.dev}:${actual.ino}`;
+      }
+      if (!named.isFile() || named.nlink !== 1n || owner.file.identity === undefined
+        || `${named.dev}:${named.ino}` !== owner.file.identity)
+        throw new MaintenanceFailure("maintenance_lost", "backup-passfile-identity");
+      await unlink(owner.path); backupPassfiles.delete(owner);
+    } catch (error) { backupCleanupErrors.push(error); throw error; }
+  }
+  async function withBackupPassfile<T>(connection: PostgresConnection, directory: string,
+    files: BackupFileOwner[], names: BackupPassfileOwner[], callback: (environment: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
+    let failed = false, first: unknown, result: T | undefined;
+    const from = names.length;
+    try {
+      await privateDirectory(directory);
+      const path = join(directory, `.pgpass-${randomUUID()}`);
+      const passfile = await openBackupFile(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, files, names);
+      await closeBackupFile(passfile);
+      assertOpen(); result = await callback({ ...connection.childEnvironment, PGPASSFILE: path });
+    } catch (error) { failed = true; first = error; }
+    for (const name of names.slice(from)) {
+      try { await cleanupBackupPassfile(name); }
+      catch (error) { if (!failed) { failed = true; first = error; } }
+    }
+    if (failed) throw first;
+    return result!;
+  }
   async function withPassfile<T>(connection: PostgresConnection, directory: string,
     callback: (environment: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
     await privateDirectory(directory);
@@ -675,61 +764,87 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           if (result.rowCount !== 1) throw new MaintenanceFailure("source_changed");
           changed = true;
         },
-        async backup(destination) {
-          await assertHeld();
-          if (kind !== "snapshot" || changed || backupUsed) throw new MaintenanceFailure("phase_conflict");
-          backupUsed = true;
-          const capture = await lock.observe();
-          if (capture.state.admission !== "sealed") throw new MaintenanceFailure("phase_conflict");
-          const writers = await inspectWriters(capture, "backup-before");
-          if (writers.length) throw new MaintenanceFailure(writers[0]!.code);
-          const versions = await postgresToolVersions(sourceConnection.childEnvironment, abort.signal, "backup_capability_unavailable");
-          const publicBinding = sourceConnection.schema === "public"
-            ? await readPublicRestoreCatalogBinding(locked.client, await readIdentity(locked, sourceConnection, true), capture.manifests, versions.pgDump) : undefined;
-          const snapshotId = (await locked.client.query("SELECT pg_catalog.pg_export_snapshot() AS id")).rows[0]?.id;
-          if (typeof snapshotId !== "string" || !/^[0-9A-Fa-f-]+$/.test(snapshotId)) throw new MaintenanceFailure("snapshot_invalid");
-          await privateDirectory(dirname(destination));
-          const output = await open(destination, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-          let monitorBusy = false;
-          let publicArchiveDigest: string | undefined;
-          const monitor = setInterval(() => {
-            if (monitorBusy) return; monitorBusy = true;
-            void assertHeld().catch(invalidate).finally(() => { monitorBusy = false; });
-          }, 500); monitor.unref();
-          try {
-            await withPassfile(sourceConnection, dirname(destination), async environment => {
-              const result = await runPostgresTool("pg_dump", ["--format=custom", `--snapshot=${snapshotId}`,
-                `--schema=${quote(sourceConnection.schema)}`, "--strict-names", "--lock-wait-timeout=5000", "--no-password"],
-              environment, { failure: "backup_capability_unavailable", signal: abort.signal, outputFd: output.fd });
-              if (result.stderrPresent) throw new MaintenanceFailure("backup_capability_unavailable");
-            });
-            await output.sync();
-            const info = await output.stat();
-            const header = Buffer.alloc(5); await output.read(header, 0, 5, 0);
-            if (!info.isFile() || info.size <= 5 || info.nlink !== 1 || (info.mode & 0o077) !== 0 || header.toString("ascii") !== "PGDMP")
-              throw new MaintenanceFailure("snapshot_invalid");
-            if (publicBinding) publicArchiveDigest = await postgresFileDigest(output, () => {
-              if (abort.signal.aborted) throw new MaintenanceFailure("maintenance_lost");
-            });
-          } finally { clearInterval(monitor); await output.close(); }
-          if (writerObservation.hasSubscribers) note({ kind: "backup-file-complete" });
-          await assertHeld();
-          const after = await observe();
-          if (!same(after.manifests, capture.manifests) || !same(after.source, capture.source)) throw new MaintenanceFailure("source_changed");
-          if ((await inspectWriters(after, "backup-after")).length) throw new MaintenanceFailure("source_writer_unknown");
-          const identity = await readIdentity(locked, sourceConnection, true);
-          frozenCapture = capture.manifests;
-          if (publicBinding && publicArchiveDigest) {
-            publicBackup = { sha256: publicArchiveDigest,
-              manifestDigest: digestJson(capture.manifests), binding: publicBinding, owner: heldMutex, capture };
-            publicBackupSourceChanged = false;
-          }
-          return { manifests: capture.manifests, toolchain: { formatVersion: 1, engine: "postgres", format: "custom",
-            pgDump: versions.pgDump, pgRestore: versions.pgRestore, serverVersion: identity.serverVersion,
-            scope: object(capture.manifests.schema).scope!, sourceIdentityDigest: capture.source.identityDigest,
-            exportedSnapshotIdDigest: sha256(snapshotId), fsync: identity.fsync, synchronousCommit: "on",
-            sequenceConsistency: { profile: "single-migration-identity-v1", sealedAndNoOtherBackends: true,
-              beforeAfterTypedStateMatched: true, sequenceIsNotMvccFrozen: true } } };
+        backup(destination) {
+          const task = (async () => {
+            const files: BackupFileOwner[] = [], names: BackupPassfileOwner[] = [];
+            let failed = false, first: unknown;
+            const fail = (error: unknown) => { if (!failed) { failed = true; first = error; } invalidate(); };
+            let monitor: ReturnType<typeof setInterval> | undefined, monitorPending: Promise<void> | undefined;
+            let result: { manifests: DatabaseManifests; toolchain: Json } | undefined;
+            const finish = async () => {
+              clearInterval(monitor);
+              if (monitorPending) await monitorPending;
+              for (const owner of files) if (backupFiles.has(owner) && !owner.closeAttempt) {
+                try { await closeBackupFile(owner); } catch (error) { fail(error); }
+              }
+              for (const name of names) if (backupPassfiles.has(name) && !name.cleanupAttempted) {
+                try { await cleanupBackupPassfile(name); } catch (error) { fail(error); }
+              }
+            };
+            try {
+              await assertHeld();
+              if (kind !== "snapshot" || changed || backupUsed) throw new MaintenanceFailure("phase_conflict");
+              backupUsed = true;
+              const capture = await lock.observe();
+              if (capture.state.admission !== "sealed") throw new MaintenanceFailure("phase_conflict");
+              const writers = await inspectWriters(capture, "backup-before");
+              if (writers.length) throw new MaintenanceFailure(writers[0]!.code);
+              const versions = await postgresToolVersions(sourceConnection.childEnvironment, abort.signal, "backup_capability_unavailable");
+              const publicBinding = sourceConnection.schema === "public"
+                ? await readPublicRestoreCatalogBinding(locked.client, await readIdentity(locked, sourceConnection, true), capture.manifests, versions.pgDump) : undefined;
+              const snapshotId = (await locked.client.query("SELECT pg_catalog.pg_export_snapshot() AS id")).rows[0]?.id;
+              if (typeof snapshotId !== "string" || !/^[0-9A-Fa-f-]+$/.test(snapshotId)) throw new MaintenanceFailure("snapshot_invalid");
+              await privateDirectory(dirname(destination));
+              const output = await openBackupFile(destination, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, files);
+              let publicArchiveDigest: string | undefined;
+              monitor = setInterval(() => {
+                if (monitorPending) return;
+                const pending = assertHeld().catch(fail).finally(() => { if (monitorPending === pending) monitorPending = undefined; });
+                monitorPending = pending;
+              }, 500); monitor.unref();
+              try {
+                await withBackupPassfile(sourceConnection, dirname(destination), files, names, async environment => {
+                  const result = await runPostgresTool("pg_dump", ["--format=custom", `--snapshot=${snapshotId}`,
+                    `--schema=${quote(sourceConnection.schema)}`, "--strict-names", "--lock-wait-timeout=5000", "--no-password"],
+                  environment, { failure: "backup_capability_unavailable", signal: abort.signal, outputFd: output.handle.fd });
+                  if (result.stderrPresent) throw new MaintenanceFailure("backup_capability_unavailable");
+                });
+                assertOpen(); await output.handle.sync();
+                assertOpen(); const info = await output.handle.stat();
+                assertOpen(); const header = Buffer.alloc(5); await output.handle.read(header, 0, 5, 0);
+                if (!info.isFile() || info.size <= 5 || info.nlink !== 1 || (info.mode & 0o077) !== 0 || header.toString("ascii") !== "PGDMP")
+                  throw new MaintenanceFailure("snapshot_invalid");
+                if (publicBinding) publicArchiveDigest = await postgresFileDigest(output.handle, () => {
+                  if (abort.signal.aborted) throw new MaintenanceFailure("maintenance_lost");
+                });
+              } catch (error) { fail(error); }
+              await finish(); if (failed) throw first;
+              if (writerObservation.hasSubscribers) note({ kind: "backup-file-complete" });
+              await assertHeld();
+              const after = await observe();
+              if (!same(after.manifests, capture.manifests) || !same(after.source, capture.source)) throw new MaintenanceFailure("source_changed");
+              if ((await inspectWriters(after, "backup-after")).length) throw new MaintenanceFailure("source_writer_unknown");
+              const identity = await readIdentity(locked, sourceConnection, true);
+              frozenCapture = capture.manifests;
+              if (publicBinding && publicArchiveDigest) {
+                publicBackup = { sha256: publicArchiveDigest,
+                  manifestDigest: digestJson(capture.manifests), binding: publicBinding, owner: heldMutex, capture };
+                publicBackupSourceChanged = false;
+              }
+              result = { manifests: capture.manifests, toolchain: { formatVersion: 1, engine: "postgres", format: "custom",
+                pgDump: versions.pgDump, pgRestore: versions.pgRestore, serverVersion: identity.serverVersion,
+                scope: object(capture.manifests.schema).scope!, sourceIdentityDigest: capture.source.identityDigest,
+                exportedSnapshotIdDigest: sha256(snapshotId), fsync: identity.fsync, synchronousCommit: "on",
+                sequenceConsistency: { profile: "single-migration-identity-v1", sealedAndNoOtherBackends: true,
+                  beforeAfterTypedStateMatched: true, sequenceIsNotMvccFrozen: true } } };
+            } catch (error) { fail(error); }
+            await finish();
+            if (failed) throw first;
+            return result!;
+          })();
+          backupTasks.add(task);
+          void task.then(() => backupTasks.delete(task), () => backupTasks.delete(task));
+          return task;
         },
         assertHeld,
       };
@@ -743,6 +858,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         observe: () => lock.observeSourceClients(), manifests: () => lock.observe(), write: plan => writePostgresControlSql(locked.client, plan),
         sourceHandleClosed: () => sourceStream?.closed === true, mutexHandleClosed: () => mutexStream?.closed === true });
       const result = await callback(lock);
+      if (backupTasks.size) await Promise.allSettled([...backupTasks]);
       const pending = finishControlSqlCallback(lock); if (pending) await pending;
       await assertHeld();
       if (frozenCapture) {
@@ -781,6 +897,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       noteControlSql(lock, "committed"); active = false; return result;
     } catch (error) {
       failed = true;
+      if (backupTasks.size) { invalidate(); await Promise.allSettled([...backupTasks]); }
       noteControlSql(trackedLock, "failure", error);
       const pending = finishControlSqlCallback(trackedLock); if (pending) await pending;
       if (session) {
@@ -1035,13 +1152,26 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   }
   const adapter: MaintenanceAdapter = { dialect: "postgres", observe, observeSourceClients, acquireMutex, withSourceLock, inspectWriters, verifyDatabase,
     async close() {
-      if (closed) return;
       if (closeAttempt) return closeAttempt;
+      if (closed) return;
       closingStarted = true; publicBackup = undefined;
       if (mutex) auditFactories.get(mutex)?.close(); clearInterval(mutexTimer); abort.abort();
       const attempt = (async () => {
-        const errors: MaintenanceFailure[] = [];
+        const errors: unknown[] = [];
         try { await waitForPostgresTools(abort.signal); } catch (error) { errors.push(safeError(error, "maintenance_lost", "tool-close")); }
+        await Promise.allSettled([...backupTasks]);
+        const pendingErrors = backupCleanupErrors.splice(0);
+        for (const owner of [...backupFiles]) {
+          const eventsBefore = backupCleanupErrors.length;
+          try { await closeBackupFile(owner); }
+          catch (error) { if (backupCleanupErrors.length === eventsBefore) errors.push(error); }
+        }
+        for (const owner of [...backupPassfiles]) {
+          const eventsBefore = backupCleanupErrors.length;
+          try { await cleanupBackupPassfile(owner); }
+          catch (error) { if (backupCleanupErrors.length === eventsBefore) errors.push(error); }
+        }
+        errors.unshift(...pendingErrors, ...backupCleanupErrors.splice(0));
         await Promise.allSettled([...activeVerifications]);
         for (const input of [...verificationInputs.keys()]) {
           try { await closeVerificationInput(input); }
@@ -1050,7 +1180,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         const results = await Promise.allSettled([...sessions].map(session => endSession(session, true)));
         for (const result of results) if (result.status === "rejected") errors.push(safeError(result.reason, "maintenance_lost", "session-close"));
         if (mutex && !sessions.has(mutex.session)) { mutex.released = true; mutex = undefined; }
-        if (!errors.length && !sessions.size && !verificationInputs.size) closed = true;
+        if (!errors.length && !sessions.size && !verificationInputs.size && !backupFiles.size && !backupPassfiles.size && !backupTasks.size) closed = true;
         throwResourceFailures(errors);
       })();
       closeAttempt = attempt;
