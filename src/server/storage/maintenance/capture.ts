@@ -1,7 +1,7 @@
 import { z } from "zod";
 import path from "node:path";
 import { canonicalJson, digestJson } from "./canonical.ts";
-import { createControllerOwner, finishControllerOwner, recordControllerFailure, rememberControllerStore } from "./controller-owner.ts";
+import { awaitControllerAdmission, createControllerOwner, finishControllerOwner, recordControllerFailure, rememberControllerStore } from "./controller-owner.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { captureReference, verifyJournalChain, verifySourceFilesClosure } from "./journal.ts";
 import type { JournalNode, VerifiedJournalChain } from "./journal.ts";
@@ -122,15 +122,19 @@ export async function captureMaintenance(options: MaintenanceServiceOptions, val
   const failures: unknown[] = [];
   let mutex: OperationMutex | undefined, sourceLock: SourceLock | undefined, result: MaintenanceResult | undefined;
   try {
+    await awaitControllerAdmission(owner);
     const observed = await observeCapturePlanBindings(plan, options, adapter);
     const initialStore = await ArtifactStore.open(request.plan.controlRoot, request.expectedSource);
     rememberControllerStore(owner, initialStore); await maintenanceFilesystem(initialStore.root);
     if (descriptor.kind === "sqlite") await maintenanceFilesystem(path.dirname(descriptor.sqlitePath));
+    await awaitControllerAdmission(owner);
     mutex = await adapter.acquireMutex(initialStore.identity, observed.state);
+    await awaitControllerAdmission(owner);
     const held = mutex;
     result = await adapter.withSourceLock("control", async lock => {
       sourceLock = lock;
       try {
+        await awaitControllerAdmission(owner);
         await observeCapturePlanBindings(plan, options, adapter);
         const initial = await lock.observe(), raw = await lock.observeSourceClients(), expected = initial.state;
         bindObservation(initial, raw, plan);

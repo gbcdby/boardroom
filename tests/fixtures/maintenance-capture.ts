@@ -12,7 +12,7 @@ import { verifyJournalChain } from "../../src/server/storage/maintenance/journal
 import { digestJson } from "../../src/server/storage/maintenance/canonical.ts";
 import { parseJournal } from "../../src/server/storage/maintenance/parse.ts";
 import type { ContinueRequest, OperationMutex, PersistedPlanRef, SourceLock } from "../../src/server/storage/maintenance/types.ts";
-export { finishControllerOwner, recordControllerFailure, rememberControllerStore } from "../../src/server/storage/maintenance/controller-owner.ts";
+export { awaitControllerAdmission, finishControllerOwner, recordControllerFailure, rememberControllerStore } from "../../src/server/storage/maintenance/controller-owner.ts";
 
 type SourceModule = typeof import("../../src/server/storage/maintenance/source-files.ts");
 interface State {
@@ -92,6 +92,11 @@ export async function captureFixture(kind: "sqlite" | "postgres" = "sqlite",
       .replaceAll('from "./controller-owner.ts"', "from " + JSON.stringify(import.meta.url)), sourceCapture);
     const isolatedCapture = path.join(isolated, "capture.ts"); await writeFile(isolatedCapture, captureCode, { mode: 0o600 });
     const capture = await import(pathToFileURL(isolatedCapture).href) as typeof import("../../src/server/storage/maintenance/capture.ts");
+    const sourceEnter = fileURLToPath(new URL("../../src/server/storage/maintenance/enter.ts", import.meta.url));
+    const enterCode = absoluteImports((await readFile(sourceEnter, "utf8"))
+      .replaceAll('from "./controller-owner.ts"', "from " + JSON.stringify(import.meta.url)), sourceEnter);
+    const isolatedEnter = path.join(isolated, "enter.ts"); await writeFile(isolatedEnter, enterCode, { mode: 0o600 });
+    const enter = await import(pathToFileURL(isolatedEnter).href) as typeof import("../../src/server/storage/maintenance/enter.ts");
     const resetReadTimes = () => {
       const set = (file: string) => {
         const stat = lstatSync(file); if (stat.isDirectory()) for (const name of readdirSync(file)) set(path.join(file, name));
@@ -139,7 +144,7 @@ export async function captureFixture(kind: "sqlite" | "postgres" = "sqlite",
       } finally { try { await mutex?.release(); } finally { await adapter.close(); } }
     };
     return { ...f, entered, request, profile: p, state, resetReadTimes, capture: capture.captureMaintenance,
-      advance,
+      advance, enter: enter.enterMaintenance,
       async close() {
         states.delete(f.reference.controlRoot);
         try { await f.close(); } finally { await p.close(); await rm(dir, { recursive: true, force: true }); }

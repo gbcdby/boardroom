@@ -1,7 +1,7 @@
 import { z } from "zod";
 import path from "node:path";
 import { canonicalJson, digestJson } from "./canonical.ts";
-import { createControllerOwner, finishControllerOwner, recordControllerFailure, rememberControllerStore } from "./controller-owner.ts";
+import { awaitControllerAdmission, createControllerOwner, finishControllerOwner, recordControllerFailure, rememberControllerStore } from "./controller-owner.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { ArtifactStore } from "./objects.ts";
 import { hash, id, ref, source, text } from "./parse-primitives.ts";
@@ -69,6 +69,7 @@ export async function enterMaintenance(options: MaintenanceServiceOptions, value
   let mutex: OperationMutex | undefined, sourceLock: SourceLock | undefined, result: MaintenanceResult | undefined;
   const failures: unknown[] = [];
   try {
+    await awaitControllerAdmission(owner);
     const observed = await revalidatePlan(plan, options, adapter);
     const initialStore = await ArtifactStore.open(request.plan.controlRoot, request.expectedSource);
     rememberControllerStore(owner, initialStore);
@@ -76,10 +77,14 @@ export async function enterMaintenance(options: MaintenanceServiceOptions, value
     // an unsupported filesystem is not qualification; preview/persist alone does not grant it.
     await maintenanceFilesystem(initialStore.root);
     if (descriptor.kind === "sqlite") await maintenanceFilesystem(path.dirname(descriptor.sqlitePath));
+    await awaitControllerAdmission(owner);
     mutex = await adapter.acquireMutex(initialStore.identity, observed.state);
+    await awaitControllerAdmission(owner);
     const heldMutex = mutex;
     result = await adapter.withSourceLock("control", async (lock: SourceLock) => {
       sourceLock = lock;
+      try { await awaitControllerAdmission(owner); }
+      catch (error) { recordControllerFailure(owner, failures, error); throw error; }
       // acquireMutex may have committed the first physical root/mutex binding. Read again under
       // the actual source lock; the earlier observation cannot be used as anchor.expected.
       await revalidatePlan(plan, options, adapter);

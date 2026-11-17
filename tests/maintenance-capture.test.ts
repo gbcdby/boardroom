@@ -23,6 +23,8 @@ import { publishSnapshotBundle } from "../src/server/storage/maintenance/snapsho
 import { verifyRestoreBundle } from "../src/server/storage/maintenance/verify-bundle.ts";
 import { stageSnapshotReady } from "../src/server/storage/maintenance/snapshot-ready.ts";
 import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";
+import { finishControllerOwner } from "../src/server/storage/maintenance/controller-owner.ts";
+import type { ControllerOwner } from "../src/server/storage/maintenance/controller-owner.ts";
 
 // The positive S fixture uses the actual Linux ordinary source-FD bridge. It is
 // explicit engineering evidence, not a Darwin or qualified-profile positive.
@@ -677,6 +679,65 @@ for (const kind of ["sqlite", "postgres"] as const) {
       } finally { child.mock.restoreAll(); await f.close(); }
     });
   });
+
+
+  for (const entry of ["capture", "enter"] as const) for (const point of ["observe", "mutex"] as const)
+    nativeTest("#152 C1 " + kind + ": already-created " + entry + " " + point + " entrant honors later pending resources", async () => {
+      const f = await captureFixture(kind);
+      let committed!: () => void, finishFirst!: () => void, created!: () => void, resumeSecond!: () => void;
+      const atCommit = new Promise<void>(resolve => { committed = resolve; });
+      const firstGate = new Promise<void>(resolve => { finishFirst = resolve; });
+      const atSecond = new Promise<void>(resolve => { created = resolve; });
+      const secondGate = new Promise<void>(resolve => { resumeSecond = resolve; });
+      const failure = new MaintenanceFailure("maintenance_lost", "c1-prior-close-response");
+      let ordinal = 0, firstOwner: ControllerOwner | undefined, closes = 0, anchors = 0;
+      let first: ReturnType<typeof f.capture> | undefined, second: ReturnType<typeof f.capture> | undefined;
+      try {
+        f.state.onLock = lock => { const anchor = lock.anchor; lock.anchor = async change => { anchors++; return anchor(change); }; };
+        f.state.onOwner = owner => {
+          ordinal++;
+          if (ordinal === 1) {
+            firstOwner = owner;
+            const withSourceLock = owner.adapter.withSourceLock.bind(owner.adapter);
+            owner.adapter.withSourceLock = async (kind, consume) => {
+              const result = await withSourceLock(kind, consume); committed(); await firstGate; return result;
+            };
+            const close = owner.adapter.close.bind(owner.adapter);
+            owner.adapter.close = async () => { await close(); closes++; if (closes === 1) throw failure; };
+          } else if (ordinal === 2) {
+            if (point === "observe") {
+              const observe = owner.adapter.observe.bind(owner.adapter);
+              owner.adapter.observe = async () => { created(); await secondGate; return observe(); };
+            } else {
+              const acquire = owner.adapter.acquireMutex.bind(owner.adapter);
+              owner.adapter.acquireMutex = async (...args) => { created(); await secondGate; return acquire(...args); };
+            }
+          }
+        };
+        first = f.capture(f.options, f.request); void first.catch(() => {});
+        await Promise.race([atCommit, first.then(() => { throw new Error("first actual COMMIT boundary missing"); })]);
+        second = entry === "capture" ? f.capture(f.options, f.request) : f.enter(f.options,
+          { ...f.request, expectedPhase: null, expectedJournalDigest: null, requestId: "first-enter" });
+        void second.catch(() => {});
+        await Promise.race([atSecond, second.then(() => { throw new Error("second pre-existing owner boundary missing"); })]);
+        finishFirst(); await assert.rejects(first, error => error === failure); first = undefined;
+        assert.equal(closes, 1);
+        const before = await f.observe(); resumeSecond();
+        const outcome = await second.then(result => ({ result }), error => ({ error })); second = undefined;
+        assert("error" in outcome || closes > 1,
+          "a pre-existing entrant cannot succeed without waiting for or cleaning the original later-pending owner");
+        if ("error" in outcome) throw outcome.error;
+        assert.equal(outcome.result.status, entry === "capture" ? "paused" : "blocked");
+        assert.equal(closes, 2, "the original concrete adapter, not a new empty owner, completes cleanup");
+        assert.deepEqual((await f.observe()).state, before.state); assert.equal(anchors, 1);
+        assert.equal(f.profile.state.handles.size, 0);
+      } finally {
+        finishFirst(); resumeSecond(); await first?.catch(() => {}); await second?.catch(() => {});
+        delete f.state.onOwner;
+        if (firstOwner) await finishControllerOwner(firstOwner, undefined, undefined, [], "c1-test-original-cleanup");
+        await f.close();
+      }
+    });
 
 }
 

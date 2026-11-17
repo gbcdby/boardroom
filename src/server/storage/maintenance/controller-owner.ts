@@ -85,6 +85,20 @@ async function finishPending(owner: ControllerOwner): Promise<void> {
   const attempt = owner.closing ??= Promise.resolve().then(() => cleanup(owner));
   try { await attempt; } finally { if (owner.closing === attempt) delete owner.closing; }
 }
+/** An adapter created earlier has no lasting admission through a later resource
+ * failure. Recheck around the actual mutex handoff and source callback entry.
+ * This only settles original concrete owners; it grants no source/lock proof. */
+export async function awaitControllerAdmission(owner: ControllerOwner): Promise<void> {
+  for (;;) {
+    if (owner.adapterClosed || owner.closing || pending.has(owner))
+      throw new MaintenanceFailure("maintenance_lost", "controller-owner-closing");
+    const previous = [...pending].filter(other => other !== owner && owner.keys.some(key => other.keys.includes(key)));
+    if (!previous.length) return;
+    for (const other of previous) await finishPending(other);
+    // Cleanup awaited real work; another matching owner may have begun closing
+    // during that await. Do not use the earlier empty/closed observation as a lease.
+  }
+}
 /** Creates only from trusted resolver selection. There is no adapter override. */
 export async function createControllerOwner(options: MaintenanceServiceOptions, plan: MigrationPlan): Promise<ControllerOwner> {
   const selected = options.environment.databaseDescriptor;
