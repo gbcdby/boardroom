@@ -361,20 +361,31 @@ test("A11A REQ-001 accepts a legitimate initial generation above one", async t =
   for (const withClient of [false, true]) await t.test(withClient ? "real drained receipt" : "empty roster", async () => {
     const f = await fixture(withClient, "UTF-8", false, undefined, 7);
     try {
-      await f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference, async window => {
-        assert.equal(window.origin.receiptGeneration, 7);
-        assert.equal(window.origin.chain.nodes.length, 1);
-        assert.equal(window.clients.length, withClient ? 1 : 0);
-        if (withClient) assert.deepEqual(window.clients[0]!.receipt, f.receipt);
-        await window.assertCurrent();
-      }));
-      const capture = await anchorStructuralCapture(f);
-      await f.adapter.withSourceLock("snapshot", lock => lock.withSourceClientFacts(f.reference, async window => {
-        assert.equal(window.origin.kind, "captured-generation");
-        assert.equal(window.origin.receiptGeneration, 7);
-        assert.deepEqual(window.origin.capture, capture.head);
-        await window.assertCurrent();
-      }));
+      // Preserve this assertion's original outcome while retaining bounded
+      // original-call evidence if the native writer inventory rejects a PID.
+      await withSqliteSourceInventoryDiagnostics(f.adapter, async phase => {
+        phase("initial-generation-before-capture");
+        await f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference, async window => {
+          assert.equal(window.origin.receiptGeneration, 7);
+          assert.equal(window.origin.chain.nodes.length, 1);
+          assert.equal(window.clients.length, withClient ? 1 : 0);
+          if (withClient) assert.deepEqual(window.clients[0]!.receipt, f.receipt);
+          phase("initial-generation-explicit-current");
+          await window.assertCurrent();
+          phase("initial-generation-final-current");
+        }));
+        phase("initial-generation-capture");
+        const capture = await anchorStructuralCapture(f);
+        phase("post-capture-before-consume");
+        await f.adapter.withSourceLock("snapshot", lock => lock.withSourceClientFacts(f.reference, async window => {
+          assert.equal(window.origin.kind, "captured-generation");
+          assert.equal(window.origin.receiptGeneration, 7);
+          assert.deepEqual(window.origin.capture, capture.head);
+          phase("post-capture-explicit-current");
+          await window.assertCurrent();
+          phase("post-capture-final-current");
+        }));
+      });
     } finally { await f.close(); }
   });
 });

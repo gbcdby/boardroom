@@ -104,6 +104,14 @@ interface Snapshot {
   readonly flags: string;
   readonly xattrsDigest: string;
 }
+interface WindowEvidence {
+  readonly sourceRoot: FileRoot["label"];
+  readonly before: Json;
+  // Null means no complete after observation was retained. Never substitute
+  // the before observation when reading, validation or the budget has failed.
+  after: Json | null;
+}
+interface EntryWindowEvidence extends WindowEvidence { readonly sourceRelativePath: string; }
 function snapshot(handle: SourceFileHandle): Snapshot {
   const basic = handle.observe(), extended = handle.observeExtended(), legacy = handle.observeStatx(), unique = handle.observeStatxUnique();
   const metadata = extended.before;
@@ -148,6 +156,13 @@ function sameMount(anchor: Snapshot, entry: Snapshot): boolean {
   return anchor.metadata.dev === entry.metadata.dev && anchor.legacy.mountId === entry.legacy.mountId
     && anchor.unique.uniqueMountId === entry.unique.uniqueMountId && anchor.uuid === entry.uuid;
 }
+function healthMaterial(health: SourceFileRootObservation["health"]): Json {
+  // P independently validates each fresh collector's calls before returning.
+  // Auxiliary FD numbers and valid read segmentation are per-call diagnostics;
+  // compare every health field's actual bytes and identity, keeping raw calls
+  // separately in the full before/after private evidence.
+  return serial(Object.fromEntries(Object.entries(health).map(([name, { calls: _, ...value }]) => [name, value])));
+}
 function rootObservationMatches(context: SourceFileRootObservation, root: Snapshot): void {
   requireValue(sameMetadata(root.metadata, context.root.before) && sameMetadata(root.metadata, context.root.after)
     && context.root.uuid.status === "observed" && context.root.uuid.value.length === 16n
@@ -170,7 +185,7 @@ interface Scan {
   readonly start: number; readonly forbidden: Set<string>; readonly seen: Set<string>;
   readonly entries: SourceFileEntry[]; readonly bindings: SourceRootBinding[];
   readonly closeErrors: unknown[]; readonly stages: { stage: Stage; at: string }[];
-  readonly rootsEvidence: Json[];
+  readonly rootsEvidence: WindowEvidence[]; readonly entriesEvidence: EntryWindowEvidence[];
   count: number; keptBytes: number; contentBytes: bigint; stage: Stage; tcut: boolean;
   attempt: string | undefined;
 }
@@ -313,7 +328,8 @@ async function initialScan(store: ArtifactStore, lock: SourceLock, mutex: Operat
       && !plan.fileRoots.some(other => other !== root && overlaps(root.path, other.path)), "source_changed");
   }
   const scan: Scan = { store: guarded, lock, mutex, reference, plan, initial, raw, start: performance.now(), forbidden: new Set(), seen: new Set(),
-    entries: [], bindings: [], closeErrors: [], stages: [], rootsEvidence: [], count: 0, keptBytes: 0, contentBytes: 0n, stage: "input", tcut: false, attempt: undefined };
+    entries: [], bindings: [], closeErrors: [], stages: [], rootsEvidence: [], entriesEvidence: [],
+    count: 0, keptBytes: 0, contentBytes: 0n, stage: "input", tcut: false, attempt: undefined };
   try {
     retain(scan, plan.fileRoots); await current(scan); stage(scan, "boundary"); await protectedIdentities(scan);
     scan.attempt = await guarded.createAttempt(state.ownerGeneration);
@@ -348,6 +364,8 @@ async function visit(scan: Scan, root: FileRoot, owner: SourceFileHandle, relati
   parent?: { handle: SourceFileHandle; before: Snapshot; file: string }): Promise<SourceFileEntry> {
   await held(scan); requireValue(depth <= MAX_DEPTH, "backup_capability_unavailable", "source-files-depth");
   scan.count++; budget(scan); const file = path.join(root.path, relative), before = snapshot(owner);
+  const evidence: EntryWindowEvidence = { sourceRoot: root.label, sourceRelativePath: relative, before: serial(before), after: null };
+  retain(scan, evidence); scan.entriesEvidence.push(evidence);
   requireValue(sameMount(anchor, before) && !scan.forbidden.has(keyOf(before.metadata)) && !scan.seen.has(keyOf(before.metadata)));
   scan.seen.add(keyOf(before.metadata)); await assertPath(file, before.metadata);
   if (parent) { requireValue(sameSnapshot(parent.before, snapshot(parent.handle))); await assertPath(parent.file, parent.before.metadata); }
@@ -386,7 +404,9 @@ async function visit(scan: Scan, root: FileRoot, owner: SourceFileHandle, relati
     }
     requireValue(same(members, names(owner))); tuple.members = membership;
   }
-  requireValue(sameSnapshot(before, snapshot(owner))); await assertPath(file, before.metadata);
+  const after = snapshot(owner), afterEvidence = serial(after);
+  retain(scan, afterEvidence); evidence.after = afterEvidence;
+  requireValue(sameSnapshot(before, after)); await assertPath(file, before.metadata);
   if (parent) { requireValue(sameSnapshot(parent.before, snapshot(parent.handle))); await assertPath(parent.file, parent.before.metadata); }
   retain(scan, entry); retain(scan, tuple); scan.entries.push(entry); rows.push({ relative, tuple });
   await held(scan); return entry;
@@ -408,7 +428,10 @@ async function scanRoot(scan: Scan, root: FileRoot, capture: boolean): Promise<v
       const profile = matchSourceFileProfile(anchorOwner);
       requireValue(profile.profile === PROFILE && /^[a-f0-9]{64}$/.test(profile.profileEntryDigest)
         && /^[a-f0-9]{64}$/.test(profile.qualificationDigest), "backup_capability_unavailable");
-      const beforeContext = profile.beforeContent(), anchor = snapshot(anchorOwner);
+      const beforeContext = profile.beforeContent();
+      const evidence: WindowEvidence = { sourceRoot: root.label, before: serial(beforeContext), after: null };
+      retain(scan, evidence); scan.rootsEvidence.push(evidence);
+      const anchor = snapshot(anchorOwner);
       rootObservationMatches(beforeContext, anchor);
       requireValue(same(pathIdentity(anchorPath, anchor.metadata), root.expected.existingAncestor)
         && !scan.forbidden.has(keyOf(anchor.metadata)));
@@ -433,9 +456,10 @@ async function scanRoot(scan: Scan, root: FileRoot, capture: boolean): Promise<v
       await nativeScope(scan, anchorPath, async currentOwner => { requireValue(sameSnapshot(anchor, snapshot(currentOwner))); });
       await assertPath(anchorPath, anchor.metadata);
       stage(scan, "health"); const afterContext = profile.afterContent();
+      const afterEvidence = serial(afterContext); retain(scan, afterEvidence); evidence.after = afterEvidence;
       rootObservationMatches(afterContext, anchor);
       requireValue(same(serial(beforeContext.mount), serial(afterContext.mount))
-        && same(serial(beforeContext.health), serial(afterContext.health)));
+        && same(healthMaterial(beforeContext.health), healthMaterial(afterContext.health)));
       requireValue(same(serial(parentBefore), serial(parent.observe())));
       const parentAfter = await pathFacts(parentPath);
       requireValue(["dev", "ino", "mode", "uid", "gid", "nlink", "size", "atimeNs", "mtimeNs", "ctimeNs"].every(
@@ -451,9 +475,6 @@ async function scanRoot(scan: Scan, root: FileRoot, capture: boolean): Promise<v
           runtimeEnvironmentDigest: afterContext.runtimeEnvironmentDigest, sourceStateDigest,
           blockEffectsObservation: "not-observed-at-runtime" } };
       retain(scan, binding); scan.bindings.push(binding);
-      // The private record keeps full window guards; none are silently omitted
-      // from this scan merely because directory times/mount IDs are not durable identity.
-      scan.rootsEvidence.push({ sourceRoot: root.label, before: serial(beforeContext), after: serial(afterContext) });
       stage(scan, "close");
     });
     requireValue(same(serial(parentBefore), serial(parent.observe())));
@@ -469,9 +490,15 @@ function persistentManifest(manifest: SourceFilesManifest): unknown {
 }
 async function writeAttempt(scan: Scan, successful: boolean): Promise<void> {
   if (!scan.attempt) return;
-  const bytes = Buffer.from(canonicalJson({ formatVersion: 1, kind: "source-files-read-attempt", plan: scan.reference.immutablePlan,
-    stages: scan.stages, roots: scan.rootsEvidence, tcutReached: scan.tcut, outcome: successful ? "pending-close" : "failed",
-    objectsInspected: scan.count, contentBytes: String(scan.contentBytes), closeFailureCount: scan.closeErrors.length }));
+  // Full per-entry window guards and root health stay private. Their retained
+  // bytes share the traversal budget with Fs metadata; the final envelope is
+  // also bounded before a buffer or diagnostic file is created.
+  const encoded = canonicalJson({ formatVersion: 1, kind: "source-files-read-attempt", plan: scan.reference.immutablePlan,
+    stages: scan.stages, roots: scan.rootsEvidence, entries: scan.entriesEvidence,
+    tcutReached: scan.tcut, outcome: successful ? "pending-close" : "failed",
+    objectsInspected: scan.count, contentBytes: String(scan.contentBytes), closeFailureCount: scan.closeErrors.length });
+  requireValue(Buffer.byteLength(encoded) <= MAX_MANIFEST_BYTES, "backup_capability_unavailable", "source-files-budget");
+  const bytes = Buffer.from(encoded);
   await scan.store.assertRoot();
   const directory = await pathFacts(scan.attempt);
   requireValue(directory.isDirectory() && directory.uid === BigInt(process.getuid!()) && (directory.mode & 0o7777n) === 0o700n,

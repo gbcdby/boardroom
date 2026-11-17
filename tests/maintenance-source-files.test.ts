@@ -1,14 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, linkSync, mkdirSync, renameSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, lstatSync, mkdirSync, renameSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import promises, { readFile, readdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { canonicalJson, sha256 } from "../src/server/storage/maintenance/canonical.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
-import type { SourceFileExtendedObservation } from "../src/server/storage/maintenance/source-file-native.ts";
+import type { SourceFileExtendedObservation, SourceFileNativeCall } from "../src/server/storage/maintenance/source-file-native.ts";
+import type { SourceFileRootObservation } from "../src/server/storage/maintenance/source-file-profile.ts";
 import type { ArtifactRef } from "../src/server/storage/maintenance/types.ts";
 import { readSourceFiles } from "../src/server/storage/maintenance/parse.ts";
 import { isolatedSourceFiles, sourceFilesFixture } from "./fixtures/maintenance-source-files.ts";
@@ -25,6 +26,38 @@ async function manifests(store: ArtifactStore): Promise<string[]> {
       for (const leaf of await readdir(path.join(store.root, "snapshots", digest))) if (leaf === "source-files.json") names.push(digest);
   } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   return names;
+}
+interface EntryWindowRecord {
+  readonly sourceRoot: string;
+  readonly sourceRelativePath: string;
+  readonly before: { readonly metadata: Record<string, string>; readonly legacy: { readonly mountId: string };
+    readonly unique: { readonly uniqueMountId: string } };
+  readonly after: EntryWindowRecord["before"] | null;
+}
+interface ReadAttemptRecord {
+  readonly entries: readonly EntryWindowRecord[];
+  readonly roots: readonly { readonly sourceRoot: string; readonly before: HealthWindowRecord; readonly after: HealthWindowRecord | null }[];
+  readonly tcutReached: boolean;
+  readonly outcome: string;
+}
+interface HealthWindowRecord {
+  readonly health: Readonly<Record<string, { readonly bytes: string; readonly device: string; readonly inode: string;
+    readonly mode: string; readonly filesystemType: string;
+    readonly calls: readonly { readonly operation: string; readonly rc: string | null; readonly errno: string | null }[] }>>;
+}
+function successfulKernelReadCalls(bytes: Buffer, fd: bigint, split: boolean): readonly SourceFileNativeCall[] {
+  const call = (operation: string, rc = 0n) => ({ operation, rc, errno: 0n });
+  return [call("open-kernel-read", fd), call("fstat-kernel-before"), call("fstatfs-kernel-before"),
+    ...(split ? [call("read-kernel", 1n), call("read-kernel", BigInt(bytes.length - 1))] : [call("read-kernel", BigInt(bytes.length))]),
+    call("read-kernel"), call("fstatfs-kernel-after"), call("fstat-kernel-after"), call("close-kernel-read")];
+}
+async function readAttempts(store: ArtifactStore): Promise<ReadAttemptRecord[]> {
+  const records: ReadAttemptRecord[] = [];
+  for (const directory of await readdir(path.join(store.root, "attempts"))) {
+    try { records.push(JSON.parse(await readFile(path.join(store.root, "attempts", directory, "source-files-read.json"), "utf8"))); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+  return records;
 }
 linuxTest("#152 S fixture loads the real native owner bridge (no profile qualification)", () => {
   const result = spawnSync(process.execPath, ["scripts/build-maintenance-platform.mjs", "--source-files"],
@@ -45,6 +78,91 @@ linuxTest("#152 S captures exact streamed bytes, full roots and durable canonica
     await copy.module.verifyLiveSourceFiles(f.store, f.lock, f.mutex, f.reference, result.ref);
     assert.equal(f.state.handles.size, 0);
   } finally { await f.close(); await copy.close(); }
+});
+linuxTest("#152 S private entry windows retain nested directory times and child atime in capture and live", async () => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture();
+  try {
+    const captured = await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+    const frozen = await f.store.readBytes(captured.ref), records = await readAttempts(f.store);
+    assert.equal(records.length, 1);
+    const capture = records[0]!;
+    assert.equal(capture.entries.length, captured.manifest.entries.length);
+    for (const relative of ["nested", "nested/binary"]) {
+      const entry = capture.entries.find(value => value.sourceRoot === "managed-sessions" && value.sourceRelativePath === relative)!;
+      const actual = lstatSync(path.join(f.sessions, relative), { bigint: true });
+      assert.ok(entry.after, "the actual after observation is retained separately");
+      for (const field of ["atimeNs", "mtimeNs", "ctimeNs"] as const) {
+        assert.equal(entry.before.metadata[field], String(actual[field]));
+        assert.equal(entry.after.metadata[field], String(actual[field]));
+      }
+      assert.equal(entry.before.legacy.mountId, "71"); assert.equal(entry.after.unique.uniqueMountId, "9001");
+    }
+    assert.equal(canonicalJson(captured.manifest).includes("atimeNs"), false, "window times do not enter persistent Fs identity");
+    const temporary = path.join(f.sessions, "nested", "temporary"); mkdirSync(temporary, { mode: 0o700 }); rmdirSync(temporary);
+    f.state.mountDelta = 70n;
+    await copy.module.verifyLiveSourceFiles(f.store, f.lock, f.mutex, f.reference, captured.ref);
+    const attempts = await readAttempts(f.store);
+    assert.equal(attempts.length, 2);
+    const live = attempts.find(record => record.entries.some(entry => entry.before.legacy.mountId === "141"))!;
+    const before = capture.entries.find(entry => entry.sourceRelativePath === "nested")!;
+    const after = live.entries.find(entry => entry.sourceRelativePath === "nested")!;
+    assert.notEqual(after.before.metadata.ctimeNs, before.before.metadata.ctimeNs, "each window records its own directory time");
+    assert.deepEqual(after.after, after.before);
+    assert.deepEqual(await f.store.readBytes(captured.ref), frozen, "live evidence never rewrites frozen Fs");
+    assert.equal(f.state.handles.size, 0);
+  } finally { await f.close(); await copy.close(); }
+});
+linuxTest("#152 S independent health reads allow fresh auxiliary FDs and valid read segments while retaining their traces", async t => {
+  for (const change of ["auxiliary-fd", "read-segments"] as const) await t.test(change, async () => {
+    const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: false });
+    try {
+      f.state.hook = (operation, _, value) => {
+        if (operation !== "profile:before-result" && operation !== "profile:after-result") return;
+        const after = operation === "profile:after-result", observed = value as SourceFileRootObservation;
+        for (const [index, item] of Object.values(observed.health).entries()) Object.assign(item, {
+          calls: successfulKernelReadCalls(item.bytes, BigInt(100 + index + (after && change === "auxiliary-fd" ? 1 : 0)),
+            after && change === "read-segments"),
+        });
+      };
+      const captured = await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+      await copy.module.verifyLiveSourceFiles(f.store, f.lock, f.mutex, f.reference, captured.ref);
+      const attempts = await readAttempts(f.store); assert.equal(attempts.length, 2);
+      for (const attempt of attempts) {
+        const root = attempt.roots[0]!; assert.ok(root.after);
+        assert.equal(Object.keys(root.before.health).length, 13); assert.equal(Object.keys(root.after.health).length, 13);
+        const before = root.before.health.errors_count!, after = root.after.health.errors_count!;
+        assert.equal(before.bytes, after.bytes); assert.equal(before.inode, after.inode);
+        assert.notDeepEqual(before.calls, after.calls, "raw call evidence is kept independently for each sample");
+        assert.equal(after.calls.at(-1)?.operation, "close-kernel-read"); assert.equal(after.calls.at(-1)?.rc, "0");
+      }
+      assert.equal(f.state.handles.size, 0);
+    } finally { await f.close(); await copy.close(); }
+  });
+});
+linuxTest("#152 S health field bytes and same-source identities remain guarded and getter failures propagate", async t => {
+  for (const field of ["bytes", "device", "inode", "mode", "filesystemType", "field-set", "getter-failure"] as const)
+    await t.test(field, async () => {
+      const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: false });
+      const failure = new MaintenanceFailure("backup_capability_unavailable", "fixture-health-getter");
+      try {
+        f.state.hook = (operation, _, value) => {
+          if (operation === "profile:after" && field === "getter-failure") throw failure;
+          if (operation !== "profile:after-result") return;
+          const health = (value as SourceFileRootObservation).health, item = health.errors_count;
+          if (field === "bytes") item.bytes[0] = 0x31;
+          else if (field === "field-set") Reflect.deleteProperty(health, "last_error_func");
+          else if (field !== "getter-failure") Object.assign(item, { [field]: item[field] + 1n });
+        };
+        const result = await rejected(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference));
+        if (field === "getter-failure") assert.equal(result.error.cause, failure);
+        else assert.equal(result.error.code, "source_changed");
+        const [attempt] = await readAttempts(f.store); assert.ok(attempt);
+        if (field === "getter-failure") assert.equal(attempt.roots[0]!.after, null);
+        else assert.ok(attempt.roots[0]!.after, "an obtained but changed health observation remains evidence");
+        assert.equal(result.error.tcutReached, false); assert.equal(f.state.handles.size, 0);
+        assert.equal((await manifests(f.store)).length, 0);
+      } finally { await f.close(); await copy.close(); }
+    });
 });
 linuxTest("#152 S absent root binds its actual nearest ancestor without inventing an entry handle", async () => {
   const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ sessions: "absent", config: false });
@@ -201,7 +319,55 @@ linuxTest("#152 S preserves a thrown undefined before independent child close fa
     assert.equal(result.error.cause, undefined); assert.ok(result.error.closeErrors.includes(closeError));
     assert.equal(result.error.tcutReached, false); assert.equal(f.state.handles.size, 0);
     assert.equal((await manifests(f.store)).length, 0);
+    const [attempt] = await readAttempts(f.store); assert.ok(attempt);
+    const partial = attempt.entries.find(entry => entry.sourceRelativePath === "nested/binary")!;
+    assert.equal(partial.before.metadata.atimeNs, String(lstatSync(path.join(f.sessions, "nested", "binary"), { bigint: true }).atimeNs));
+    assert.equal(partial.after, null, "a failed read never fabricates the unobserved after snapshot");
+    const root = attempt.roots.find(entry => entry.sourceRoot === "managed-sessions")!;
+    assert.equal(Object.keys(root.before.health).length, 13); assert.equal(root.after, null);
+    assert.equal(attempt.tcutReached, false); assert.equal(attempt.outcome, "failed");
   } finally { await f.close(); await copy.close(); }
+});
+linuxTest("#152 S retains an actual differing after snapshot before rejecting its window", async () => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: false });
+  try {
+    let observations = 0;
+    f.state.hook = (operation, file, value) => {
+      if (operation !== "extended-result" || !file.endsWith("/binary") || ++observations !== 3) return;
+      const observed = value as { before: { atimeNs: bigint }; after: { atimeNs: bigint } };
+      observed.before.atimeNs++; observed.after.atimeNs++;
+    };
+    const result = await rejected(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference));
+    assert.equal(result.error.code, "source_changed"); assert.equal(observations, 3);
+    const [attempt] = await readAttempts(f.store); assert.ok(attempt);
+    const entry = attempt.entries.find(value => value.sourceRelativePath === "nested/binary")!;
+    assert.ok(entry.after);
+    assert.equal(BigInt(entry.after.metadata.atimeNs!), BigInt(entry.before.metadata.atimeNs!) + 1n);
+    assert.equal(attempt.roots[0]!.after, null); assert.equal(attempt.outcome, "failed");
+    assert.equal(result.error.tcutReached, false); assert.equal((await manifests(f.store)).length, 0);
+    assert.equal(f.state.handles.size, 0);
+  } finally { await f.close(); await copy.close(); }
+});
+linuxTest("#152 S diagnostic write and close errors cannot replace an earlier thrown undefined", async t => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture();
+  const originalOpen = promises.open, writeError = new Error("synthetic-diagnostic-write"), closeError = new Error("synthetic-diagnostic-close");
+  try {
+    f.state.hook = (operation, file) => { if (operation === "read" && file.endsWith("/binary")) throw undefined; };
+    t.mock.method(promises, "open", async (...args: Parameters<typeof promises.open>) => {
+      const handle = await Reflect.apply(originalOpen, promises, args);
+      if (typeof args[0] === "string" && args[0].endsWith("/source-files-read.json")) {
+        const close = handle.close.bind(handle);
+        Object.defineProperty(handle, "writeFile", { configurable: true, value: async () => { throw writeError; } });
+        Object.defineProperty(handle, "close", { configurable: true, value: async () => { await close(); throw closeError; } });
+      }
+      return handle;
+    });
+    syncBuiltinESMExports();
+    const result = await rejected(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference));
+    assert.equal(result.error.cause, undefined); assert.ok(result.error.closeErrors.includes(closeError));
+    assert.equal(result.error.tcutReached, false); assert.equal((await manifests(f.store)).length, 0);
+    assert.equal(f.state.handles.size, 0);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); await copy.close(); }
 });
 
 linuxTest("#152 S root close uncertainty is retained independently and prevents Tcut", async () => {
@@ -304,6 +470,23 @@ linuxTest("#152 S long metadata reaches its cumulative limit before retaining th
     const result = await rejected(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference));
     assert.equal(result.error.code, "backup_capability_unavailable");
     assert.ok(f.state.events.filter(event => event.startsWith("read:")).length < 16, "budget rejects during traversal");
+    assert.equal((await manifests(f.store)).length, 0); assert.equal(f.state.handles.size, 0);
+  } finally { await f.close(); await copy.close(); }
+});
+linuxTest("#152 S window diagnostics share the metadata budget and stop before retaining the remaining entries", async () => {
+  const limit = 20_000;
+  const copy = await isolatedSourceFiles({ "const MAX_MANIFEST_BYTES = 16 * 1024 * 1024": "const MAX_MANIFEST_BYTES = " + limit });
+  const f = await sourceFilesFixture({ config: false });
+  try {
+    for (let i = 0; i < 12; i++) writeFileSync(path.join(f.sessions, "budget-" + String(i).padStart(2, "0")), "", { mode: 0o600 });
+    f.resetReadTimes();
+    const result = await rejected(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference));
+    const reads = f.state.events.filter(event => event.startsWith("read:sessions/budget-")).length;
+    assert.ok(reads > 0 && reads < 12, "the accumulated window evidence stops traversal before reading the full tree");
+    assert.equal(result.error.code, "backup_capability_unavailable"); assert.equal(result.error.tcutReached, false);
+    const attempts = await readAttempts(f.store); assert.equal(attempts.length, 1);
+    assert.ok(Buffer.byteLength(canonicalJson(attempts[0])) <= limit, "the complete private JSON envelope is bounded too");
+    assert.ok(attempts[0]!.entries.length > 0 && attempts[0]!.entries.length < 12);
     assert.equal((await manifests(f.store)).length, 0); assert.equal(f.state.handles.size, 0);
   } finally { await f.close(); await copy.close(); }
 });

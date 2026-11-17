@@ -381,11 +381,11 @@ type NativeBinding = {
 const fixedP3Variants = {
   P3_TEST_CONTENT_OPEN_FAILURE: { extra: [], wrappers: [] },
   P3_TEST_CONTENT_CLOSE_FAILURE: { extra: [], wrappers: ["close"] },
-  P3_TEST_SHORT_READS: { extra: [], wrappers: ["read"] },
-  P3_TEST_NO_EOF: { extra: [], wrappers: ["read"] },
-  P3_TEST_BYTE_BUDGET: { extra: [], wrappers: ["read", "fstatfs", "close"] },
+  P3_TEST_SHORT_READS: { extra: [], wrappers: ["read", "__read_chk"] },
+  P3_TEST_NO_EOF: { extra: [], wrappers: ["read", "__read_chk"] },
+  P3_TEST_BYTE_BUDGET: { extra: [], wrappers: ["read", "__read_chk", "fstatfs", "close"] },
   P3_TEST_PSEUDO_CLOSE_FAILURE: { extra: [], wrappers: ["close"] },
-  P3_TEST_SOURCE_CHANGE: { extra: [], wrappers: ["read", "fstat"] },
+  P3_TEST_SOURCE_CHANGE: { extra: [], wrappers: ["read", "__read_chk", "fstat"] },
   P3_TEST_DIRECTORY_CLOSE_FAILURE: { extra: [], wrappers: ["closedir"] },
   P3_TEST_CHILD_IDENTITY_FAILURE: { extra: ["P3_TEST_CONTENT_CLOSE_FAILURE"], wrappers: ["fstat", "close"] },
 } as const;
@@ -393,6 +393,7 @@ async function withFixedP3Package(
   macro: keyof typeof fixedP3Variants,
   consume: (value: { directory: string; api: typeof import("../src/server/storage/maintenance/source-file-native.ts");
     native: NativeBinding }) => Promise<void>,
+  compiler: "default" | "fortified" = "default",
 ) {
   const directory = await mkdtemp(path.join(tmpdir(), "br-p3-fixed-link-"));
   try {
@@ -404,6 +405,7 @@ async function withFixedP3Package(
     const addon = path.join(output, `maintenance-source-files-linux-${process.arch}.node`);
     const variant = fixedP3Variants[macro];
     const build = spawnSync("/usr/bin/cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-DNAPI_VERSION=8",
+      ...(compiler === "fortified" ? ["-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=3"] : []),
       "-DNODE_GYP_MODULE_NAME=boardroom_source_file_fixed_p3", `-D${macro}`, ...variant.extra.map(name => `-D${name}`), "-shared", "-fPIC",
       "-I", path.join(root, "native/node-api/v24.22.1"), path.join(root, "native/maintenance-source-files.c"),
       path.join(root, "tests/fixtures/maintenance-source-file-getter-errors.c"), "-Wl,--wrap=ioctl", "-Wl,--wrap=syscall",
@@ -427,8 +429,11 @@ function rawKernelFacts(raw: SourceFileRootEnvironment): SourceFileContextFact<u
   return values.filter(fact => fact.calls[0]?.operation === "open-kernel-read");
 }
 
+// Hardened compilers may emit __read_chk instead of read. Both builds must
+// exercise the same fixed failure and retain all production bounds.
+for (const compiler of ["default", "fortified"] as const)
 for (const variant of ["P3_TEST_SHORT_READS", "P3_TEST_NO_EOF", "P3_TEST_BYTE_BUDGET"] as const) {
-  linuxTest(`#152 P3 fixed ${variant} retains bounded unavailable facts through the strict TS decoder`, async () => {
+  linuxTest(`#152 P3 fixed ${variant} retains bounded unavailable facts through the strict TS decoder (${compiler})`, async () => {
     await withFixedP3Package(variant, async ({ directory, api }) => {
       const source = path.join(directory, "source"); await mkdir(source, { mode: 0o700 });
       await api.withNativeSourceRoot(source, handle => {
@@ -459,7 +464,7 @@ for (const variant of ["P3_TEST_SHORT_READS", "P3_TEST_NO_EOF", "P3_TEST_BYTE_BU
           }
         }
       });
-    });
+    }, compiler);
   });
 }
 
@@ -494,7 +499,8 @@ linuxTest("#152 P3 fixed pseudo close preserves the first failure and real reuse
   });
 });
 
-linuxTest("#152 P3 fixed source change remains sticky even when the caller catches it and close succeeds", async () => {
+for (const compiler of ["default", "fortified"] as const)
+linuxTest(`#152 P3 fixed source change remains sticky even when the caller catches it and close succeeds (${compiler})`, async () => {
   await withFixedP3Package("P3_TEST_SOURCE_CHANGE", async ({ directory, api, native }) => {
     const source = path.join(directory, "source"); await mkdir(source, { mode: 0o700 }); let first: any;
     await assert.rejects(api.withNativeSourceRoot(source, handle => {
@@ -506,7 +512,7 @@ linuxTest("#152 P3 fixed source change remains sticky even when the caller catch
       assert.throws(() => handle.observe(), { code: "maintenance_lost" });
       return "the caught source failure must not become a successful scope";
     }), (error: unknown) => error instanceof AggregateError && error.errors.length === 1 && error.errors[0] === first && error.cause === first);
-  });
+  }, compiler);
 });
 
 linuxTest("#152 P3 fixed directory close keeps its original error and cannot close a reused duplicate", async () => {

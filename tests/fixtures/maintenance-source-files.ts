@@ -120,7 +120,7 @@ export function matchSourceFileProfile(root: FixtureHandle) {
     state.events.push("profile:" + stage); state.hook("profile:" + stage, file);
     if (state.health !== "0\n") throw new MaintenanceFailure("backup_capability_unavailable", "fixture-health");
     const uniqueStatx = root.observeStatxUnique();
-    return { root: root.observeExtended(), uniqueStatx,
+    const result = { root: root.observeExtended(), uniqueStatx,
       mount: { legacyMountId: 71n + state.mountDelta, uniqueMountId: 9001n + state.mountDelta,
         devMajor: uniqueStatx.devMajor, devMinor: uniqueStatx.devMinor, filesystemType: "ext4" as const,
         root: "/", point: state.directory, attributes: 0n, superblockFlags: 0n, propagation: 0n },
@@ -128,6 +128,7 @@ export function matchSourceFileProfile(root: FixtureHandle) {
         device: 1n, inode: BigInt(i + 1), mode: 0o100444n, filesystemType: 0x62656572n,
         calls: [{ operation: "fixture-read-eof-close", rc: 0n, errno: 0n }] }])),
       runtimeEnvironmentDigest: digest("fixture-window-" + (++state.windows)) };
+    state.hook("profile:" + stage + "-result", file, result); return result;
   };
   return { profile: "linux-native-ext4-fid-fsuuid-source-state-v1" as const, source: root.observe(),
     profileEntryDigest: digest("fixture-profile-only"), qualificationDigest: digest("no-qualification"),
