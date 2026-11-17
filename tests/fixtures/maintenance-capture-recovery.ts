@@ -3,8 +3,11 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { captureFixture } from "./maintenance-capture.ts";
+import { ArtifactStore } from "../../src/server/storage/maintenance/objects.ts";
+import { verifyJournalChain } from "../../src/server/storage/maintenance/journal.ts";
+import { parseJournal } from "../../src/server/storage/maintenance/parse.ts";
 import type { ControllerOwner } from "../../src/server/storage/maintenance/controller-owner.ts";
-import type { SourceLock } from "../../src/server/storage/maintenance/types.ts";
+import type { OperationMutex, SourceLock } from "../../src/server/storage/maintenance/types.ts";
 
 export interface RecoveryEvent {
   readonly event: string;
@@ -99,8 +102,35 @@ export async function recoveryFixture(kind: "sqlite" | "postgres" = "sqlite",
       };
       recovery.onOwner?.(owner);
     };
+    // Appends only a new, generically valid private fixture node. Existing
+    // captures, receipts, Fs and source rows are never rewritten or re-signed.
+    // Keep the inherited advance() unchanged for ordinary other-key steps.
+    const advanceRequest = async (event: "observation" | "takeover",
+      request: { readonly requestId: string; readonly requestDigest: string }) => {
+      const store = await ArtifactStore.open(f.reference.controlRoot, f.plan.source), adapter = await f.createAdapter();
+      let mutex: OperationMutex | undefined;
+      try {
+        mutex = await adapter.acquireMutex(store.identity, (await adapter.observe()).state);
+        const held = mutex;
+        return await adapter.withSourceLock("control", async lock => {
+          const current = (await lock.observe()).state;
+          assert(current.journalRecordRef && current.journalDigest);
+          const previous = await store.readAnchoredJournal({ ref: current.journalRecordRef, sha256: current.journalDigest });
+          const chain = await verifyJournalChain(store, previous), last = chain.nodes.at(-1)!.record;
+          const record = parseJournal({ ...last, previous, event, sequence: last.sequence + 1,
+            requestId: request.requestId, requestDigest: request.requestDigest,
+            ownerGeneration: last.ownerGeneration + (event === "takeover" ? 1 : 0),
+            frozen: null, snapshot: null, ...(last.formatVersion === 2 ? { sourceClients: null } : {}) });
+          const journal = await store.putJson("journal", record); await verifyJournalChain(store, journal);
+          await lock.anchor({ expected: current, admission: current.admission, fenceEpoch: current.fenceEpoch,
+            ownerGeneration: record.ownerGeneration, activeMigrationId: current.activeMigrationId, planDigest: current.planDigest,
+            controlRootIdentity: { ...store.identity }, mutexIdentity: held.identity, journal, journalSequence: record.sequence });
+          return journal;
+        });
+      } finally { try { await mutex?.release(); } finally { await adapter.close(); } }
+    };
     const dir = directory, inputs = inputDirectory;
-    return { ...f, recovery, events, captureSnapshot: module.captureSnapshotMaintenance,
+    return { ...f, recovery, events, advanceRequest, captureSnapshot: module.captureSnapshotMaintenance,
       async close() { try { await f.close(); } finally {
         await rm(dir, { recursive: true, force: true }); if (inputs) await rm(inputs, { recursive: true, force: true });
       } } };

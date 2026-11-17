@@ -136,6 +136,83 @@ nativeTest("#152 C2 sqlite: each committed prefix replays fresh without writes a
   });
 });
 
+nativeTest("#152 C2 sqlite AC06: generic-valid unknown repeated and interleaved steps cannot replay C2 progress", async t => {
+  for (const step of ["unknown", "repeated", "interleaved"] as const) await t.test(step, async child => {
+    const f = await recoveryFixture("sqlite"), failure = new Error("stop after actual C2 prefix commit");
+    const stopped = step === "repeated" ? 2 : 1;
+    try {
+      f.recovery.afterSourceClose = stage => { if (stage === stopped) throw failure; };
+      await assert.rejects(f.captureSnapshot(f.options, f.request), error => error === failure);
+      assert.equal(f.events.filter(event => event.event === "source-end").length, stopped);
+      delete f.recovery.afterSourceClose;
+      const store = await ArtifactStore.open(f.reference.controlRoot, f.plan.source), prefix = await f.observe();
+      assert.equal(prefix.state.journalSequence, stopped + 1);
+      assert.equal(prefix.state.ownerGeneration, stopped === 1 ? 1 : 2);
+      const prefixHead = await store.readAnchoredJournal({ ref: prefix.state.journalRecordRef!, sha256: prefix.state.journalDigest! });
+      const prefixChain = await verifyJournalChain(store, prefixHead);
+      const originalBytes = await Promise.all(prefixChain.nodes.map(node => readFile(store.pathFor(node.reference))));
+      const identity = { requestId: f.request.requestId,
+        requestDigest: digestJson({ operation: "internal-capture-snapshot", request: f.request }) };
+      if (step === "interleaved") await f.advance("observation");
+      const head = await f.advanceRequest(step === "unknown" ? "observation" : "takeover", identity);
+      // All three are legal to the unmodified generic reader. The final head
+      // matches the original C2 key/digest even when another key is interleaved,
+      // so only C2's additional suffix policy can reject the sequence below.
+      const chain = await verifyJournalChain(store, head), last = chain.nodes.at(-1)!;
+      assert.deepEqual(chain.nodes.map(node => node.record.event), step === "unknown"
+        ? ["enter", "capture", "observation"] : step === "repeated"
+          ? ["enter", "capture", "takeover", "takeover"] : ["enter", "capture", "observation", "takeover"]);
+      assert.deepEqual(chain.nodes.map(node => node.record.ownerGeneration), step === "unknown"
+        ? [1, 1, 1] : step === "repeated" ? [1, 1, 2, 3] : [1, 1, 1, 2]);
+      assert.equal(last.record.requestId, identity.requestId); assert.equal(last.record.requestDigest, identity.requestDigest);
+      const matches = chain.nodes.filter(node => node.record.requestId === identity.requestId);
+      assert(matches.every(node => node.record.requestDigest === identity.requestDigest));
+      assert.equal(matches.length, step === "repeated" ? 3 : 2);
+      if (step === "interleaved") assert.notEqual(chain.nodes[2]!.record.requestId, identity.requestId);
+      assert.deepEqual(await Promise.all(prefixChain.nodes.map(node => readFile(store.pathFor(node.reference)))), originalBytes);
+      const observe = async () => {
+        const adapter = await f.createAdapter();
+        try { return { source: await adapter.observe(), raw: await adapter.observeSourceClients() }; }
+        finally { await adapter.close(); }
+      };
+      const before = await observe(), names = (await readdir(store.root, { recursive: true })).sort();
+      assert.equal(before.source.state.journalRecordRef, head.ref);
+      assert.equal(before.source.state.journalDigest, head.sha256);
+      assert.equal(before.source.state.journalSequence, last.record.sequence);
+      assert.equal(before.source.state.ownerGeneration, last.record.ownerGeneration);
+      assert.equal(before.source.manifests.frozenBusinessManifestDigest, prefix.manifests.frozenBusinessManifestDigest);
+      assert.deepEqual(before.source.manifests.controlRows.storage_source_clients, prefix.manifests.controlRows.storage_source_clients);
+      const forbiddenArtifact = /(^|\/)(database-snapshot\.bin|database\.sqlite|database\.dump|restore-bundle\.json|publication\.json|verification\.json|receipt\.json)$/;
+      assert.deepEqual(names.filter(name => forbiddenArtifact.test(name)), []);
+      const calls = { anchor: 0, backup: 0, facts: 0 };
+      f.recovery.onLock = lock => {
+        lock.anchor = async () => { calls.anchor++; throw new Error("invalid C2 suffix cannot anchor"); };
+        lock.backup = async () => { calls.backup++; throw new Error("invalid C2 suffix cannot back up"); };
+        lock.withSourceClientFacts = async () => { calls.facts++; throw new Error("facts cannot endorse an invalid C2 suffix"); };
+      };
+      const forbidden = async () => { throw new Error("invalid C2 suffix cannot create artifacts"); };
+      const publications = [child.mock.method(ArtifactStore.prototype, "putJson", forbidden),
+        child.mock.method(ArtifactStore.prototype, "putBytes", forbidden),
+        child.mock.method(ArtifactStore.prototype, "putSourceFilePayload", forbidden),
+        child.mock.method(ArtifactStore.prototype, "importDatabase", forbidden),
+        child.mock.method(ArtifactStore.prototype, "createAttempt", forbidden)];
+      f.events.length = 0; f.state.events.length = 0;
+      const result = await f.captureSnapshot(f.options, f.request);
+      assert.deepEqual(result, { status: "recovery_required", lastVerifiedPhase: null,
+        blockers: [{ code: "journal_invalid", subjectRef: "db-exact-journal" }] });
+      assert.equal("kind" in result, false, "invalid steps cannot return anchored-progress or an unverified bundle");
+      assert.deepEqual(await observe(), before, "exact head/g/seq, complete raw rows and native manifests remain unchanged");
+      assert.deepEqual((await readdir(store.root, { recursive: true })).sort(), names);
+      assert.deepEqual(await Promise.all(prefixChain.nodes.map(node => readFile(store.pathFor(node.reference)))), originalBytes);
+      assert.deepEqual(calls, { anchor: 0, backup: 0, facts: 0 });
+      assert(publications.every(method => method.mock.callCount() === 0));
+      assert.deepEqual(f.state.events, [], "neither S capture nor S live may endorse an invalid suffix");
+      assert.deepEqual(f.events.filter(event => event.event === "source-begin").map(event => event.kind), ["control"]);
+      assert.equal(f.profile.state.handles.size, 0);
+    } finally { child.mock.restoreAll(); await f.close(); }
+  });
+});
+
 nativeTest("#152 C2 sqlite: strict input, request domains, stale expectations and original planned provenance fail before publication", async t => {
   const f = await recoveryFixture("sqlite");
   try {
