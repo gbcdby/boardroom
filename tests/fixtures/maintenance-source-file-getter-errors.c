@@ -114,6 +114,17 @@ ssize_t __wrap_read(int fd, void *buffer, size_t size) {
   return __real_read(fd, buffer, size);
 #endif
 }
+#ifdef __GLIBC__
+/* Fortified collectors may call __read_chk instead of read. The isolated
+ * addon must wrap both symbols so the fixed fault still reaches that call.
+ * Preserve the original bounds failure before applying any short-read or
+ * synthetic-byte behavior; this is not an unchecked fortified-read alias. */
+ssize_t __real___read_chk(int fd, void *buffer, size_t size, size_t capacity);
+ssize_t __wrap___read_chk(int fd, void *buffer, size_t size, size_t capacity) {
+  if (size > capacity) return __real___read_chk(fd, buffer, size, capacity);
+  return __wrap_read(fd, buffer, size);
+}
+#endif
 #endif
 
 #ifdef P3_TEST_CHILD_IDENTITY_FAILURE
