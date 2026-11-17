@@ -15,9 +15,47 @@ import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { createSqliteMaintenanceAdapter } from "../src/server/storage/maintenance/sqlite.ts";
 import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
-import { linuxMappingIdentity, linuxMappingIdentityAvailable, linuxSourceMappingIdentities, parseLinuxMappings } from "../src/server/storage/maintenance/linux-mappings.ts";
+import { confirmedLinuxZombieExit, confirmedLinuxZombieFdDenial, linuxMappingIdentity, linuxMappingIdentityAvailable, linuxSourceMappingIdentities, parseLinuxMappings } from "../src/server/storage/maintenance/linux-mappings.ts";
 
 const linuxTest = process.platform === "linux" ? test : test.skip;
+
+test("#152 scanner only accepts exact same-identity one-thread zombie evidence", () => {
+  const dead = { pid: "12831", startTicks: "136416", state: "Z", threads: "1" };
+  assert.equal(confirmedLinuxZombieExit(dead, { ...dead }, 46279, 46279, 46279), true);
+  // A child that is still running at entry could have held source FDs or mmaps.
+  assert.equal(confirmedLinuxZombieExit({ ...dead, state: "S" }, dead, 46279, 46279, 46279), false);
+  assert.equal(confirmedLinuxZombieExit(dead, { ...dead, state: "R" }, 46279, 46279, 46279), false);
+  assert.equal(confirmedLinuxZombieExit({ ...dead, threads: "2" }, dead, 46279, 46279, 46279), false);
+  assert.equal(confirmedLinuxZombieExit(dead, { ...dead, threads: "2" }, 46279, 46279, 46279), false);
+  assert.equal(confirmedLinuxZombieExit(dead, { ...dead, pid: "12832" }, 46279, 46279, 46279), false);
+  assert.equal(confirmedLinuxZombieExit(dead, { ...dead, startTicks: "136417" }, 46279, 46279, 46279), false);
+  assert.equal(confirmedLinuxZombieExit(dead, dead, 46279, 46280, 46279), false);
+  assert.equal(confirmedLinuxZombieExit(dead, dead, 46280, 46279, 46279), false);
+});
+test("#152 only a pinned fd/scandir EACCES plus two identical zombie identities can be retired", () => {
+  const pinned = "/proc/self/fd/37", zombie = { pid: "14046", startTicks: "80530", state: "Z", threads: "1" };
+  const original = { code: "EACCES", syscall: "scandir", path: `${pinned}/fd` };
+  const accepts = (fault: typeof original, before = zombie, after = zombie,
+    beforeUid = 45245, afterUid = 45245, expectedUid = 45245) =>
+    confirmedLinuxZombieFdDenial(fault, pinned, before, after, beforeUid, afterUid, expectedUid);
+  assert.equal(accepts(original), true, "a same-pinned, twice confirmed, one-thread zombie has no live FD table");
+  for (const fault of [
+    { ...original, code: "EPERM" }, { ...original, code: "ENOENT" },
+    { ...original, syscall: "readlink" }, { ...original, syscall: "open" },
+    { ...original, path: `${pinned}/maps` }, { ...original, path: "/proc/14046/fd" },
+    { ...original, path: "/proc/self/fd/38/fd" },
+  ]) assert.equal(accepts(fault), false, JSON.stringify(fault));
+  assert.equal(accepts(original, { ...zombie, state: "S" }), false);
+  assert.equal(accepts(original, zombie, { ...zombie, state: "R" }), false);
+  assert.equal(accepts(original, { ...zombie, threads: "2" }), false);
+  assert.equal(accepts(original, zombie, { ...zombie, threads: "2" }), false);
+  assert.equal(accepts(original, zombie, { ...zombie, startTicks: "80531" }), false);
+  assert.equal(accepts(original, zombie, { ...zombie, pid: "14047" }), false);
+  assert.equal(accepts(original, zombie, zombie, 45246), false);
+  assert.equal(accepts(original, zombie, zombie, 45245, 45246), false);
+  assert.equal(accepts(original, zombie, zombie, 45245, 45245, 45246), false);
+});
+
 const fixtureScript = fileURLToPath(new URL("./fixtures/maintenance-linux-mapped-user.py", import.meta.url));
 const row = "1000-2000 rw-s 00000000 0a:01 9007199254740993 /a path (deleted)\n";
 
@@ -558,6 +596,34 @@ for (const mode of ["shared-writer", "private-reader", "fd-reader"]) linuxTest(`
     assert.deepEqual(await user.stop(), { code: 0, signal: null }); user = undefined;
     await assertCompleteInventory(t, f, "RELEASE", ownPid);
   } finally { await user?.stop(); await f.close(); }
+});
+
+linuxTest("#152 a living process with identical fd/scandir EACCES still blocks as unknown", async t => {
+  const f = await fixture(), user = await startUser(f.file, "idle");
+  const original = promises.readdir; let injected = 0;
+  try {
+    t.mock.method(promises, "readdir", (async (file: fs.PathLike, ...args: unknown[]) => {
+      const name = String(file), match = /^\/proc\/self\/fd\/([0-9]+)\/fd$/.exec(name);
+      if (match) {
+        let target = "";
+        try { target = fs.readlinkSync(`/proc/self/fd/${match[1]}`); } catch { /* A missing pin is not our child. */ }
+        if (target === `/proc/${user.child.pid}`) {
+          injected++;
+          throw Object.assign(new Error("bounded test-only fd denial"), { code: "EACCES", syscall: "scandir", path: name });
+        }
+      }
+      return Reflect.apply(original, promises, [file, ...args]);
+    }) as typeof promises.readdir);
+    syncBuiltinESMExports();
+    const blockers = await f.adapter.inspectWriters(await f.adapter.observe());
+    assert.ok(injected > 0, "a real live pinned proc directory was exercised");
+    assert.ok(blockers.some(value => value.code === "source_writer_unknown"
+      && value.subjectRef === `unreadable-process:${user.child.pid}`));
+    assert.equal(user.child.exitCode, null, "EACCES must not be used to infer a living child's exit");
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    await user.stop(); await f.close();
+  }
 });
 
 linuxTest("#152 per-process maps access, partial/empty data and observation limits never produce a clear inventory", async t => {

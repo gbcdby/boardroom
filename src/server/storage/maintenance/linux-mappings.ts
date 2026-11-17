@@ -128,6 +128,38 @@ function processGone(directory: string): boolean {
   catch (error) { return absent(error); }
 }
 
+/** A zombie has no live descriptor table or userspace mappings, but /proc/<pid>
+ * can remain visible until its parent reaps it. Only a stable, one-thread
+ * zombie of the SAME pinned PID/start-time/UID can explain an ENOENT/ESRCH
+ * while reading its fd or maps. A process observed running at either end,
+ * reused PID, unknown UID or remaining threads must stay a source blocker. */
+export function confirmedLinuxZombieExit(
+  before: { readonly pid: string; readonly startTicks: string; readonly state: string; readonly threads: string },
+  after: { readonly pid: string; readonly startTicks: string; readonly state: string; readonly threads: string },
+  beforeUid: number, afterUid: number, expectedUid: number): boolean {
+  return beforeUid === expectedUid && afterUid === expectedUid
+    && before.pid === after.pid && before.startTicks === after.startTicks
+    && before.state === "Z" && after.state === "Z"
+    && before.threads === "1" && after.threads === "1";
+}
+
+/** EACCES is never a generic exit signal. Some kernels deny scandir on a
+ * zombie's proc/<pid>/fd even though all native FDs have already been closed.
+ * Only the exact pinned fd-directory operation plus TWO authentic, unchanged
+ * one-thread zombie observations can justify the same narrow exception.
+ * EACCES from maps, readlink, an unrelated proc path or any living process
+ * remains source_writer_unknown. */
+export function confirmedLinuxZombieFdDenial(
+  error: Pick<NodeJS.ErrnoException, "code" | "syscall" | "path"> | null | undefined,
+  pinnedDirectory: string,
+  before: { readonly pid: string; readonly startTicks: string; readonly state: string; readonly threads: string },
+  after: { readonly pid: string; readonly startTicks: string; readonly state: string; readonly threads: string },
+  beforeUid: number, afterUid: number, expectedUid: number): boolean {
+  return error?.code === "EACCES" && error.syscall === "scandir"
+    && error.path === `${pinnedDirectory}/fd`
+    && confirmedLinuxZombieExit(before, after, beforeUid, afterUid, expectedUid);
+}
+
 // Upstream 6.8 fixed stacked-file maps to use file_user_inode (3efdc78fdc21).
 // Older/vendor kernels without that contract must not claim an empty, complete inventory.
 export function linuxMappingIdentityAvailable(kernelRelease: string): boolean {
@@ -147,12 +179,15 @@ export async function inspectLinuxSourceProcesses(files: readonly string[], sess
   catch { return [...blockers, { code: "source_writer_unknown", subjectRef: "os-inventory-unavailable" }]; }
   for (const pid of pids) {
     let processFd: number | undefined, directory: string | undefined;
+    let observedBefore: ReturnType<typeof processIdentity> | undefined, observedUid: number | undefined;
     try {
       processFd = openSync(`/proc/${pid}`, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-      if (fstatSync(processFd).uid !== uid) continue;
+      observedUid = fstatSync(processFd).uid;
+      if (observedUid !== uid) continue;
       // The open proc directory pins this process identity, not the numeric PID after possible reuse.
       directory = `/proc/self/fd/${processFd}`;
       const before = processIdentity(directory);
+      observedBefore = before;
       if (before.pid !== pid) unavailable();
       for (const fd of await readdir(`${directory}/fd`)) {
         try {
@@ -183,7 +218,29 @@ export async function inspectLinuxSourceProcesses(files: readonly string[], sess
       // An empty maps read while a userspace process is alive is not proof of absence (e.g. exec/main-thread races).
       if (mapped?.empty && !(before.state === "Z" && after.state === "Z" && before.threads === "1" && after.threads === "1")) unavailable();
     } catch (error) {
-      if (!absent(error) || (directory !== undefined && !processGone(directory))) unknown(pid);
+      const missing = absent(error);
+      const fault = error as NodeJS.ErrnoException | null;
+      // Never treat a generic EACCES as exit. Only scandir on THIS pinned
+      // proc FD's /fd directory is eligible for a second native stat check.
+      const pinnedFdDenied = directory !== undefined && fault?.code === "EACCES"
+        && fault.syscall === "scandir" && fault.path === `${directory}/fd`;
+      if (missing || pinnedFdDenied) {
+        // A fully vanished pinned proc identity was already safe to ignore.
+        if (missing && (directory === undefined || processGone(directory))) continue;
+        // Some kernels remove a zombie's fd/maps (ENOENT/ESRCH); others keep
+        // the proc directory but deny scandir(/fd) with EACCES. Both require
+        // two independent genuine stat reads of the SAME pinned PID/start-time,
+        // one thread, Z at both ends, and unchanged FD owner UID.
+        if (directory && observedBefore && observedUid !== undefined && processFd !== undefined) {
+          try {
+            const after = processIdentity(directory), afterUid = fstatSync(processFd).uid;
+            if ((missing && confirmedLinuxZombieExit(observedBefore, after, observedUid, afterUid, uid))
+              || (pinnedFdDenied && confirmedLinuxZombieFdDenial(fault, directory,
+                observedBefore, after, observedUid, afterUid, uid))) continue;
+          } catch { /* Missing or unreadable corroboration remains unknown. */ }
+        }
+      }
+      unknown(pid);
     } finally { if (processFd !== undefined) closeSync(processFd); }
   }
   if (sources !== undefined) {
