@@ -3,13 +3,13 @@ import { canonicalJson, digestJson, parseCanonical } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { buildDatabaseManifests } from "./manifests.ts";
 import { ArtifactStore } from "./objects.ts";
-import { parseBundle, parseCapability, parseJournal, parseManifests, parsePlan, parsePublication, parseReceipt, parseVerification, readSourceFiles } from "./parse.ts";
-import type { ArtifactRef, DatabaseManifests, JournalFrozenV2, JournalRecord, MaintenanceCaptureRef, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceClientsRosterV1, SourceFilesManifest, SourceObservation } from "./types.ts";
+import { parseBundle, parseCapability, parseJournal, parseManifests, parsePlan, parsePublication, parseReceipt, parseVerification, parseVerificationJournal, readSourceFiles } from "./parse.ts";
+import type { ArtifactRef, DatabaseManifests, JournalFrozenV2, JournalRecord, MaintenanceCaptureRef, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceClientsRosterV1, SourceFilesManifest, SourceObservation, VerificationJournalRecord } from "./types.ts";
 
 const equal = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
 function requireValue(condition: unknown): asserts condition { if (!condition) throw new MaintenanceFailure("journal_invalid"); }
-export interface JournalNode { readonly reference: ArtifactRef; readonly record: JournalRecord }
-export interface VerifiedJournalChain { readonly plan: MigrationPlan; readonly nodes: readonly JournalNode[] }
+export interface JournalNode<T extends VerificationJournalRecord = JournalRecord> { readonly reference: ArtifactRef; readonly record: T }
+export interface VerifiedJournalChain<T extends VerificationJournalRecord = JournalRecord> { readonly plan: MigrationPlan; readonly nodes: readonly JournalNode<T>[] }
 async function verifyCapability(store: ArtifactStore, reference: ArtifactRef): Promise<void> {
   const capability = parseCapability(await store.readJson(reference, "capability"));
   requireValue(equal(capability.rootIdentity, store.identity));
@@ -17,14 +17,22 @@ async function verifyCapability(store: ArtifactStore, reference: ArtifactRef): P
 
 /** Starts at an exact DB-anchored ref supplied by the controller; never chooses a file by mtime. */
 export async function verifyJournalChain(store: ArtifactStore, current: ArtifactRef): Promise<VerifiedJournalChain> {
-  const reversed: JournalNode[] = [], seen = new Set<string>(); let reference: ArtifactRef | null = current;
+  return readJournalChain(store, current, parseJournal);
+}
+/** Explicit V-only envelope/closure read; control replay and native binding remain mandatory. */
+export async function verifyVerificationJournalChain(store: ArtifactStore, current: ArtifactRef): Promise<VerifiedJournalChain<VerificationJournalRecord>> {
+  return readJournalChain(store, current, parseVerificationJournal);
+}
+async function readJournalChain<T extends VerificationJournalRecord>(store: ArtifactStore, current: ArtifactRef,
+  parseRecord: (value: unknown) => T): Promise<VerifiedJournalChain<T>> {
+  const reversed: JournalNode<T>[] = [], seen = new Set<string>(); let reference: ArtifactRef | null = current;
   while (reference) {
     requireValue(!seen.has(reference.ref) && reversed.length < 4096); seen.add(reference.ref);
     requireValue(store.kindFor(reference) === "journal");
     const bytes = await store.readBytes(reference), value = parseCanonical(bytes);
     // Check original bytes too: TextDecoder may otherwise discard a UTF-8 BOM.
     requireValue(Buffer.from(canonicalJson(value), "utf8").equals(bytes));
-    const record = parseJournal(value);
+    const record = parseRecord(value);
     requireValue(reference.ref === `journals/${record.migrationId}/${record.sequence}-${reference.sha256}.json`);
     reversed.push({ reference, record }); reference = record.previous;
   }
@@ -49,6 +57,13 @@ export async function verifyJournalChain(store: ArtifactStore, current: Artifact
       // This is the sole version edge; ordinary generation checks below still apply.
       requireValue(record.event === "capture" && firstFrozen === null);
     }
+    if (previous?.formatVersion === 3) requireValue(record.formatVersion === 3);
+    if (record.formatVersion === 3) {
+      requireValue(record.phase !== "snapshot_ready" && !["ready", "cancel_intent", "cancelled"].includes(record.event)
+        && record.controlProof?.kind !== "legacy-first-capture-bridge");
+      if (previous?.formatVersion === 2) requireValue(firstFrozen === null && record.event === "capture");
+      if (record.event === "capture") requireValue(record.controlProof?.kind === (firstFrozen === null ? "capture-controls" : "control-successor"));
+    }
     const digest = requests.get(record.requestId);
     requireValue(digest === undefined || digest === record.requestDigest); requests.set(record.requestId, record.requestDigest);
     if (previous) {
@@ -70,7 +85,7 @@ export async function verifyJournalChain(store: ArtifactStore, current: Artifact
     const evidence = new Set(record.evidence.map(item => item.ref)); requireValue(evidence.size === record.evidence.length);
     for (const artifact of record.evidence) await verifyCapability(store, artifact);
     if (record.frozen) {
-      requireValue(record.formatVersion === 2 && record.sourceClients !== null);
+      requireValue(record.formatVersion !== 1 && record.sourceClients !== null);
       const roster = record.sourceClients;
       requireValue(equal(roster.source, record.source) && equal(roster.plan, record.plan)
         && roster.migrationId === record.migrationId && roster.fenceEpoch === String(record.fenceEpoch)
@@ -112,7 +127,7 @@ export function restorePointDigest(input: Pick<SnapshotReceipt, "capture" | "sou
   return digestJson({ capture: input.capture, sourceFilesManifest: input.sourceFilesManifest, database: input.database,
     manifests: input.manifests, schemaManifestDigest: input.schemaManifestDigest, frozenBusinessManifestDigest: input.frozenBusinessManifestDigest });
 }
-export function captureReference(node: JournalNode): MaintenanceCaptureRef {
+export function captureReference(node: JournalNode<VerificationJournalRecord>): MaintenanceCaptureRef {
   return { migrationId: node.record.migrationId, source: node.record.source, planDigest: node.record.plan.sha256,
     fenceEpoch: node.record.fenceEpoch, journal: node.reference, journalSequence: node.record.sequence, ownerGeneration: node.record.ownerGeneration };
 }
@@ -122,10 +137,17 @@ export async function verifyRestoreBundleClosure(store: ArtifactStore, bundleRef
   bundle: RestoreBundleManifest; publication: PublicationEvidence; chain: VerifiedJournalChain; files: SourceFilesManifest;
   manifests: DatabaseManifests; databaseRef: ArtifactRef; manifestsRef: ArtifactRef; capabilityRef: ArtifactRef;
 }> {
+  return readRestoreBundleClosure(store, bundleRef, publicationRef, verifyJournalChain);
+}
+export async function verifyVerificationRestoreBundleClosure(store: ArtifactStore, bundleRef: ArtifactRef, publicationRef: ArtifactRef) {
+  return readRestoreBundleClosure(store, bundleRef, publicationRef, verifyVerificationJournalChain);
+}
+async function readRestoreBundleClosure<T extends VerificationJournalRecord>(store: ArtifactStore, bundleRef: ArtifactRef, publicationRef: ArtifactRef,
+  readChain: (store: ArtifactStore, current: ArtifactRef) => Promise<VerifiedJournalChain<T>>) {
   const bundle = parseBundle(await store.readJson(bundleRef, "restore-bundle"));
   const publication = parsePublication(await store.readJson(publicationRef, "publication"));
   requireValue(equal(publication.bundle, bundleRef));
-  const chain = await verifyJournalChain(store, bundle.capture.journal), captured = chain.nodes.at(-1)!;
+  const chain = await readChain(store, bundle.capture.journal), captured = chain.nodes.at(-1)!;
   requireValue(captured.record.event === "capture" && captured.record.frozen && equal(captureReference(captured), bundle.capture));
   const frozen = captured.record.frozen;
   requireValue(equal(frozen.sourceFilesManifest, bundle.sourceFilesManifest));

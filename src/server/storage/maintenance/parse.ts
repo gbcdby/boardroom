@@ -4,8 +4,9 @@ import { canonicalJson, parseCanonical } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { counter, hash, id, ref, source, text } from "./parse-primitives.ts";
 import { sourceClientsRosterSchema } from "./source-clients.ts";
+import { checkFactsShape, controlProofSchema } from "./control-candidate/schema.ts";
 import type { ArtifactStore } from "./objects.ts";
-import type { ActualRestoreVerification, ArtifactRef, DatabaseManifests, DurabilityCapability, JournalRecord, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceFilesManifest } from "./types.ts";
+import type { ActualRestoreVerification, ArtifactRef, DatabaseManifests, DurabilityCapability, JournalRecord, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceFilesManifest, VerificationJournalRecord } from "./types.ts";
 
 const blockerCode = z.enum(["source_changed", "source_missing", "plan_stale", "target_conflict", "control_root_mismatch",
   "source_writer_unknown", "source_writer_active", "drain_incomplete", "maintenance_busy", "maintenance_lost", "schema_guard_incomplete",
@@ -90,6 +91,35 @@ export const parsePlan = (value: unknown): MigrationPlan => parse(plan, value);
 export const parseCapability = (value: unknown): DurabilityCapability => parse(capability, value);
 /** Strict structural decoding; legacy capture acceptance is forbidden by the current chain reader. */
 export const parseJournal = (value: unknown): JournalRecord => parse(journal, value);
+/** V opts into the same strict v3 data codec; parsing never grants runtime authority. */
+export function parseVerificationJournal(value: unknown): VerificationJournalRecord {
+  canonicalJson(value);
+  if (value === null || typeof value !== "object" || Array.isArray(value) || !("formatVersion" in value)
+    || value.formatVersion !== 3) return parseJournal(value);
+  const requireValue = (condition: unknown): void => {
+    if (!condition) throw new MaintenanceFailure("journal_invalid", "verification-journal");
+  };
+  const { controlProof, ...body } = value as Record<string, unknown>;
+  requireValue(Object.hasOwn(value, "controlProof"));
+  const record = parseJournal({ ...body, formatVersion: 2 });
+  if (record.formatVersion !== 2) throw new MaintenanceFailure("journal_invalid");
+  requireValue((record.event === "ready") === (record.snapshot !== null) && (record.event === "capture") === (record.frozen !== null));
+  if (["cancel_intent", "cancelled"].includes(record.event)
+    || record.phase === "planned" && (record.event === "enter" || record.event === "observation")) {
+    requireValue(controlProof === null);
+    return { ...record, formatVersion: 3, controlProof: null };
+  }
+  requireValue(record.event === "capture" && record.phase === "quiesced"
+    || record.event === "ready" && record.phase === "snapshot_ready"
+    || (record.event === "observation" || record.event === "takeover") && record.phase !== "planned");
+  const proof = controlProofSchema.safeParse(controlProof);
+  if (!proof.success) throw new MaintenanceFailure("journal_invalid", "verification-journal");
+  if (proof.data.kind === "capture-controls") requireValue(record.event === "capture");
+  if (proof.data.kind === "legacy-first-capture-bridge") requireValue(record.phase === "snapshot_ready" && record.event === "observation"
+    && proof.data.changes.length === 0 && proof.data.beforeRowsDigest === proof.data.afterRowsDigest);
+  checkFactsShape(proof.data.facts, record.source);
+  return { ...record, formatVersion: 3, controlProof: proof.data };
+}
 function requireSourceFiles(condition: unknown): asserts condition {
   if (!condition) throw new MaintenanceFailure("snapshot_invalid");
 }
