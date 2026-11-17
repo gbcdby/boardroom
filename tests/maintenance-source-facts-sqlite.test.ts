@@ -424,10 +424,17 @@ test("A11A distinguishes a controlled old registration identity from the actual 
       identity[key] = String(BigInt(identity[key]) + 1n);
       row.process_identity_json = JSON.stringify(identity); receipt.processIdentityDigest = storageReceiptDigest(identity);
     });
-    await f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference, async window => {
-      assert.deepEqual(window.clients[0]!.process, { status: "exited", reason: "identity_replaced" });
-      await window.assertCurrent();
-    }));
+    await withSqliteSourceInventoryDiagnostics(f.adapter, async phase => {
+      phase("old-registration-before-source-lock");
+      await f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference, async window => {
+        phase("old-registration-facts-callback");
+        assert.deepEqual(window.clients[0]!.process, { status: "exited", reason: "identity_replaced" });
+        phase("old-registration-explicit-current");
+        await window.assertCurrent();
+        phase("old-registration-before-automatic-final");
+      }));
+      phase("old-registration-source-lock-closed");
+    });
   } finally { await f.close(); }
 });
 
