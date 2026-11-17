@@ -189,6 +189,46 @@ nativeTest("#152 payload: source throw undefined survives a second iterator.retu
   } finally { await f.close(); }
 });
 
+nativeTest("#245 payload: a throwing return getter preserves the source error and closes its owner", async t => {
+  for (const first of [undefined, new Error("source-first")]) await t.test(first === undefined ? "undefined first" : "error first", async () => {
+    const f = await fixture(); let reads = 0;
+    try {
+      const sourceChunks: AsyncIterable<Uint8Array> = {
+        [Symbol.asyncIterator]() {
+          const iterator = { next: async () => { throw first; } };
+          Object.defineProperty(iterator, "return", { get() { reads++; throw new Error("secondary-return-getter"); } });
+          return iterator;
+        }
+      };
+      const result = await rejected(f.store.putSourceFilePayload(sourceChunks, 1n));
+      assert.equal(result.failed, true); assert.strictEqual(result.error, first); assert.equal(reads, 1);
+      const outcome = f.store.publicationOutcomes().records.at(-1)!;
+      assert.equal(outcome.failureObserved, true); assert.equal(outcome.handleClosed, true); assert.equal(outcome.pendingCleanup, false);
+    } finally { await f.store.cleanupPublications(); await f.close(); }
+  });
+});
+
+nativeTest("#245 payload: iterator return is obtained once and called on the original iterator", async () => {
+  const f = await fixture(), first = new Error("source-first"); let reads = 0, calls = 0;
+  try {
+    const sourceChunks: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]() {
+        const iterator = { next: async () => { throw first; } };
+        Object.defineProperty(iterator, "return", { get() {
+          reads++;
+          return async function(this: unknown) {
+            assert.strictEqual(this, iterator); calls++; return { done: true as const, value: undefined };
+          };
+        } });
+        return iterator;
+      }
+    };
+    const result = await rejected(f.store.putSourceFilePayload(sourceChunks, 1n));
+    assert.equal(result.failed, true); assert.strictEqual(result.error, first); assert.equal(reads, 1); assert.equal(calls, 1);
+    assert.equal(f.store.publicationOutcomes().records.at(-1)!.handleClosed, true);
+  } finally { await f.store.cleanupPublications(); await f.close(); }
+});
+
 nativeTest("#152 payload: cancellation settles iterator before publication", async () => {
   const f = await fixture(), abort = new AbortController(); let released = 0;
   try {

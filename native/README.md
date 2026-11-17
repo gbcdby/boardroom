@@ -67,3 +67,21 @@ node --test tests/maintenance-restore-directory.test.ts tests/maintenance-restor
 - [macOS 26 XNU 的 fcntl 实现](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/kern/kern_descrip.c)、[proc_info 实现](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/kern/proc_info.c)及 [libproc 公共接口](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/libsyscall/wrappers/libproc/libproc.h)：对应 vnode 同步、进程/FD/映射枚举和身份观察。
 - [Apple 的 ACL 条目接口实现](https://github.com/apple-oss-distributions/Libc/blob/Libc-1725.0.11/posix1e/acl_entry.c)及 [FD ACL 接口实现](https://github.com/apple-oss-distributions/Libc/blob/Libc-1725.0.11/posix1e/acl_file.c)：Darwin 的条目成功值为 0，空集为 -1/EINVAL；与 Linux 的约定不同。
 - [SQLite 文件控制接口](https://sqlite.org/c3ref/c_fcntl_begin_atomic_write.html)：`SQLITE_FCNTL_HAS_MOVED` 核对当前连接打开的文件是否仍为原路径，避免以“出现新 FD”误判 SQLite 的合法句柄复用。
+
+
+## Linux P0：不透明源 FD 只读基础（不具备 Fs 资格）
+
+#152 的源文件原生接缝 P 已固定完整原始 getter、同 FD FID/UUID/健康状态、profile 与 open-at 交付合同。当前 P0 只完成以下最小子能力，不属于完整 P，也不发放可用于迁移的源资格：
+
+- **native/maintenance-source-files.c**：Node-API 8 的私有 napi_wrap owner；只通过 openat2 打开真实只读根和子叶，子项强制 RESOLVE_BENEATH、RESOLVE_NO_XDEV、RESOLVE_NO_SYMLINKS 与 RESOLVE_NO_MAGICLINKS。不导出 FD、任意 syscall 或写入口。observe/readAt/readDirectory 始终使用同一个真实持有的 FD。
+- **source-file-native.ts**：当前 scope 内一次性使用、显式关闭子 owner；失败、子 owner 遗漏或关闭未知都不返回可消费成功。返回的是事实而不是资格标志。生产加载检查 Node-API、实际当前 UID、单链接普通文件和 0700 权限；缺少/编译失败保持 unavailable。
+- **source-file-profile.ts**：当前支持表为空，生产匹配始终拒绝 backup_capability_unavailable；不得从本基础 observe 数据、测试替身或调用者 proof 生成 source-preservation 资格、Fs/Jq/Tcut。
+
+Linux 的此组件须显式执行以下两行，普通 npm ci / postinstall **不会**启用；现有 macOS 构建和保守失败语义不变：
+
+    node scripts/build-maintenance-platform.mjs --source-files
+    node --test tests/maintenance-source-file-native.test.ts
+
+编译使用仓库随附已逐项校验 SHA256 的 Node 24.22.1 Node-API 8 headers，输出位于已忽略的 build/maintenance-platform/maintenance-source-files-linux-<arch>.node，权限 0700。真实完整 P 还必须补齐原始 statx/ABI/mask、同打开对象 FID/UUID、inode flags、xattr 原始值、十三项健康字段、source-state 与固定非空支持资格，严格验证 Linux 内核/挂载/FD 引用与后续 S/C 的原生正反例；未验收前 production_enable 继续 false。
+
+测试中的真实文件读/目录和权限、别名、关闭后拒绝只属于 **Linux P0 ABI 控制**，不证明 macOS、正式 Profile、物理断电耐久、迁移 journal、S4 三个命名产物或可用的公共迁移入口。

@@ -1,7 +1,11 @@
 import path from "node:path";
 import { canonicalJson } from "./canonical.ts";
+import { decodeRow } from "./control-candidate/rows.ts";
+import { controlProofSchema } from "./control-candidate/schema.ts";
 import { MaintenanceFailure } from "./error.ts";
-import { captureReference, verifyJournalChain, verifyRestoreBundleClosure } from "./journal.ts";
+import { assertCapturedSourceClientBinding } from "./source-client-binding.ts";
+import { compatibleSourceClientWindow, type SourceClientJournalProof, type SourceClientObservationProof, type SourceClientRegistrationProof } from "./source-client-window.ts";
+import { captureReference, verifyJournalChain, verifyRestoreBundleClosure, type JournalNode } from "./journal.ts";
 import { ArtifactStore } from "./objects.ts";
 import { parseVerification } from "./parse.ts";
 import { restoreSourceFiles } from "./restore-files.ts";
@@ -12,11 +16,44 @@ function requireValue(value: unknown, code: "snapshot_invalid" | "source_changed
   if (!value) throw new MaintenanceFailure(code, "verify-bundle");
 }
 
+/** Extract row-level authority from control-successor journal nodes. A v2
+ * observation/takeover node carries no changes, so a new client row cannot be
+ * authorized merely by its own envelope or by an unrelated anchor advance. */
+function liveControlProof(nodes: readonly JournalNode[], captureIndex: number): SourceClientJournalProof {
+  const registrations: SourceClientRegistrationProof[] = [];
+  const observations: SourceClientObservationProof[] = [];
+  for (const node of nodes.slice(captureIndex + 1)) {
+    const raw = (node.record as unknown as { readonly controlProof?: unknown }).controlProof;
+    if (raw === undefined || raw === null) continue;
+    const parsed = controlProofSchema.safeParse(raw);
+    requireValue(parsed.success, "source_changed");
+    const proof = parsed.data;
+    if (proof.kind === "capture-controls") continue;
+    for (const change of proof.changes) {
+      if (change.kind === "maintenance-registration") {
+        const after = decodeRow(change.after, proof.textEncoding);
+        if (!after || typeof after.client_id !== "string" || after.client_id === "") requireValue(false, "source_changed");
+        requireValue(proof.facts.actor.clientId === null && change.actorId === proof.facts.actor.actorId
+          && proof.facts.actor.process.instanceId === change.actorId, "source_changed");
+        registrations.push({ journal: node.reference, sequence: node.record.sequence,
+          clientId: after.client_id, after, actorId: change.actorId });
+      } else {
+        const before = decodeRow(change.before, proof.textEncoding), after = decodeRow(change.after, proof.textEncoding);
+        if (!before || !after || typeof after.client_id !== "string" || after.client_id === ""
+          || before.client_id !== after.client_id) requireValue(false, "source_changed");
+        observations.push({ journal: node.reference, sequence: node.record.sequence,
+          clientId: after.client_id, before, after, effect: change.effect });
+      }
+    }
+  }
+  return { registrations, observations };
+}
+
 /** A byte-valid B/U is not authority to restore for a later sealed migration.
  * The native lock's *current* DB anchor must extend B's exact capture through only
  * the quiesced observation/takeover transitions permitted by the journal protocol.
  * Immutable artifacts are never selected by the filesystem's latest-looking name. */
-async function assertLiveCapture(store: ArtifactStore, observed: SourceObservation,
+async function assertLiveCapture(store: ArtifactStore, lock: SourceLock, observed: SourceObservation,
   closed: Awaited<ReturnType<typeof verifyRestoreBundleClosure>>): Promise<void> {
   const capture = closed.bundle.capture, state = observed.state;
   requireValue(state.admission === "sealed" && state.journalRecordRef !== null && state.journalDigest !== null
@@ -42,11 +79,27 @@ async function assertLiveCapture(store: ArtifactStore, observed: SourceObservati
     && head.reference.ref === state.journalRecordRef && head.reference.sha256 === state.journalDigest,
     "maintenance_lost");
 
-  const frozen = closed.chain.nodes.at(-1)!.record.frozen;
+  const captured = closed.chain.nodes.at(-1)!.record, frozen = captured.frozen;
+  requireValue(captured.formatVersion === 2 && captured.sourceClients !== null, "source_changed");
+  // Establish the archived baseline before the live window's same-row fast path.
+  await assertCapturedSourceClientBinding(lock, observed, captured.sourceClients, closed.manifests);
   requireValue(frozen !== null && state.guardManifestDigest === frozen.guardManifestDigest
     && observed.manifests.schemaManifestDigest === frozen.schemaManifestDigest
     && observed.manifests.frozenBusinessManifestDigest === frozen.frozenBusinessManifestDigest
-    && same(observed.manifests.controlRows.storage_source_clients, closed.manifests.controlRows.storage_source_clients),
+    && await compatibleSourceClientWindow(closed.manifests.controlRows.storage_source_clients,
+      observed.manifests.controlRows.storage_source_clients, {
+        journalAdvanced: liveChain.nodes.slice(captureIndex + 1).some(node =>
+          node.record.event === "observation" || node.record.event === "takeover"),
+        mode: "strict", proof: liveControlProof(liveChain.nodes, captureIndex),
+        fenceEpoch: capture.fenceEpoch, databaseInstanceId: capture.source.databaseInstanceId,
+        source: capture.source, migrationId: capture.migrationId, planDigest: capture.planDigest,
+        currentSequence: head.record.sequence,
+        anchors: liveChain.nodes.slice(captureIndex + 1).map(node => ({
+          reference: node.reference, previous: node.record.previous, migrationId: node.record.migrationId,
+          planDigest: node.record.plan.sha256, fenceEpoch: node.record.fenceEpoch,
+          ownerGeneration: node.record.ownerGeneration, sequence: node.record.sequence,
+        })),
+      }),
     "source_changed");
   const prior = closed.manifests.controlRows.storage_maintenance[0];
   const live = observed.manifests.controlRows.storage_maintenance[0];
@@ -84,13 +137,13 @@ export async function verifyRestoreBundle(store: ArtifactStore, adapter: Mainten
   requireValue(same(initial.source, closure.bundle.capture.source) && same(initial.sourceIdentity, closure.chain.plan.sourceIdentity)
     && adapter.dialect === initial.source.kind, "source_changed");
   requireValue(initial.state.controlRootJson === canonicalJson(store.identity) && initial.state.mutexIdentityJson !== null, "control_root_mismatch");
-  await assertLiveCapture(store, initial, closure);
+  await assertLiveCapture(store, lock, initial, closure);
   const assertCurrent = async () => {
     await lock.assertHeld();
     const current = await lock.observe();
     requireValue(same(current.source, initial.source) && same(current.sourceIdentity, initial.sourceIdentity)
       && same(current.state, initial.state) && same(current.manifests, initial.manifests), "source_changed");
-    await assertLiveCapture(store, current, closure);
+    await assertLiveCapture(store, lock, current, closure);
     await lock.assertHeld();
   };
   const guarded = await ArtifactStore.open(store.root, initial.source, { assertCurrent: () => lock.assertHeld() });

@@ -6,8 +6,43 @@ import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 
 const required = process.argv.includes("--required");
-if (process.argv.slice(2).some(argument => argument !== "--required")) throw new Error("Unsupported build argument");
-if (process.platform !== "darwin") {
+const sourceFiles = process.argv.includes("--source-files");
+if (process.argv.slice(2).some(argument => argument !== "--required" && argument !== "--source-files") ||
+  (required && sourceFiles)) throw new Error("Unsupported build argument combination");
+if (sourceFiles) {
+  // P0 is an opt-in Linux-only source FD bridge. Default npm postinstall and
+  // the existing Darwin tools retain their original behavior and failure scope.
+  if (process.platform !== "linux") throw new Error("Source-file native bridge requires Linux");
+  if (Number(process.versions.napi) < 8) throw new Error("Node-API 8 is required");
+  const root = fileURLToPath(new URL("../", import.meta.url));
+  const directory = path.join(root, "build", "maintenance-platform");
+  const target = path.join(directory, "maintenance-source-files-linux-" + process.arch + ".node");
+  const temporary = target + "." + randomUUID() + ".tmp";
+  const headers = path.join(root, "native", "node-api", "v24.22.1");
+  const source = JSON.parse(readFileSync(path.join(headers, "SOURCES.json"), "utf8"));
+  if (source.upstreamVersion !== "v24.22.1" || source.napiVersion !== 8 ||
+    !Array.isArray(source.files) || source.files.length !== 5) throw new Error("Node-API source mismatch");
+  for (const name of ["node_api.h", "node_api_types.h", "js_native_api.h", "js_native_api_types.h", "LICENSE"]) {
+    const matches = source.files.filter(file => file.name === name);
+    if (matches.length !== 1 ||
+      createHash("sha256").update(readFileSync(path.join(headers, name))).digest("hex") !== matches[0].sha256)
+      throw new Error("Node-API source checksum mismatch");
+  }
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try {
+    const built = spawnSync("/usr/bin/cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
+      "-DNAPI_VERSION=8", "-DNODE_GYP_MODULE_NAME=boardroom_source_files", "-shared", "-fPIC",
+      "-I", headers, path.join(root, "native", "maintenance-source-files.c"), "-o", temporary],
+    { encoding: "utf8", timeout: 60_000 });
+    if (built.status !== 0 || built.error) throw new Error("Linux source-file native compiler failed");
+    chmodSync(temporary, 0o700);
+    renameSync(temporary, target);
+  } catch (error) {
+    try { rmSync(temporary, { force: true }); } catch { /* The caller still fails. */ }
+    try { rmSync(target, { force: true }); } catch { /* Runtime must independently reject invalid output. */ }
+    throw error;
+  }
+} else if (process.platform !== "darwin") {
   if (required) throw new Error("macOS maintenance verification requires an actual Darwin host");
 } else {
   const root = fileURLToPath(new URL("../", import.meta.url));

@@ -7,6 +7,7 @@ import { Client } from "pg";
 import { parseStorageMaintenanceState, readPostgresMaintenanceState, type StorageMaintenanceState } from "../admission.ts";
 import { canonicalJson, digestJson, sha256 } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
+import { compatibleSourceClientWindow } from "./source-client-window.ts";
 import { maintenanceHostIdentityDigest } from "./host.ts";
 import { buildDatabaseManifests } from "./manifests.ts";
 import { listPostgresTables, quotePostgresIdentifier as quote, readPostgresCatalog, readPostgresEnvironment, readPostgresManifests,
@@ -143,8 +144,14 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   let publicBackup: { readonly sha256: string; readonly manifestDigest: string;
     readonly binding: PublicRestoreCatalogBinding; readonly owner: HeldMutex;
     readonly capture: SourceObservation } | undefined;
-  const samePublicBackupWindow = (backup: NonNullable<typeof publicBackup>, live: SourceObservation): boolean => {
+  // A committed control change may invalidate the source window without changing
+  // the native archive bytes. Preserve that distinction, never re-enable a
+  // poisoned backup merely because later DB rows resemble the capture again.
+  let publicBackupSourceChanged = false;
+  const samePublicBackupWindow = async (backup: NonNullable<typeof publicBackup>, live: SourceObservation): Promise<boolean> => {
     const before = backup.capture, a = before.state, b = live.state;
+    const migrationId = a.activeMigrationId, planDigest = a.planDigest;
+    if (!migrationId || !planDigest) return false;
     return backup.owner === mutex && !backup.owner.released && !backup.owner.retiring
       && b.admission === "sealed" && a.admission === "sealed"
       && b.databaseInstanceId === a.databaseInstanceId && b.activeMigrationId === a.activeMigrationId
@@ -154,7 +161,14 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       && same(live.source, before.source) && same(live.sourceIdentity, before.sourceIdentity)
       && live.manifests.schemaManifestDigest === before.manifests.schemaManifestDigest
       && live.manifests.frozenBusinessManifestDigest === before.manifests.frozenBusinessManifestDigest
-      && same(live.manifests.controlRows.storage_source_clients, before.manifests.controlRows.storage_source_clients);
+      && await compatibleSourceClientWindow(before.manifests.controlRows.storage_source_clients,
+         live.manifests.controlRows.storage_source_clients, {
+           // Preliminary native backup filter only: weak mode is explicitly not
+           // journal row-level authority; V rechecks with strict control proof.
+           journalAdvanced: b.journalSequence > a.journalSequence && b.ownerGeneration >= a.ownerGeneration,
+           mode: "weak", fenceEpoch: a.fenceEpoch, databaseInstanceId: a.databaseInstanceId,
+           source: before.source, migrationId, planDigest, currentSequence: b.journalSequence,
+         });
   };
   const activeVerifications = new Set<Promise<Json>>();
   const verificationInputs = new Map<FileHandle, { fd: number; identity?: string }>();
@@ -705,8 +719,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           if ((await inspectWriters(after, "backup-after")).length) throw new MaintenanceFailure("source_writer_unknown");
           const identity = await readIdentity(locked, sourceConnection, true);
           frozenCapture = capture.manifests;
-          if (publicBinding && publicArchiveDigest) publicBackup = { sha256: publicArchiveDigest,
-            manifestDigest: digestJson(capture.manifests), binding: publicBinding, owner: heldMutex, capture };
+          if (publicBinding && publicArchiveDigest) {
+            publicBackup = { sha256: publicArchiveDigest,
+              manifestDigest: digestJson(capture.manifests), binding: publicBinding, owner: heldMutex, capture };
+            publicBackupSourceChanged = false;
+          }
           return { manifests: capture.manifests, toolchain: { formatVersion: 1, engine: "postgres", format: "custom",
             pgDump: versions.pgDump, pgRestore: versions.pgRestore, serverVersion: identity.serverVersion,
             scope: object(capture.manifests.schema).scope!, sourceIdentityDigest: capture.source.identityDigest,
@@ -757,8 +774,8 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       // The native control transaction sees its own updates. Retain the original
       // archive only across the same sealed source, fence, plan and frozen data;
       // V still validates the complete actual journal path separately.
-      if (publicBackup && kind === "control" && !samePublicBackupWindow(publicBackup, await observation(locked)))
-        publicBackup = undefined;
+      if (publicBackup && kind === "control" && !(await samePublicBackupWindow(publicBackup, await observation(locked))))
+        publicBackupSourceChanged = true;
       await validateControlSqlCommit(lock); assertControlSqlCommit(lock); noteControlSql(lock, "committing");
       if ((await session.client.query("COMMIT")).command !== "COMMIT") throw new MaintenanceFailure("maintenance_lost");
       noteControlSql(lock, "committed"); active = false; return result;
@@ -861,8 +878,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       let restoredWith: Json;
       if (isPublic) {
         const backup = publicBackup;
-        if (!backup || backup.manifestDigest !== digestJson(expected)
-          || !samePublicBackupWindow(backup, await observe())) throw new MaintenanceFailure("snapshot_invalid");
+        // Invalid archive authority is distinct from a live source whose controls
+        // have changed since the native backup. Preserve both fail-closed gates.
+        if (!backup || backup.manifestDigest !== digestJson(expected)) throw new MaintenanceFailure("snapshot_invalid");
+        if (publicBackupSourceChanged || !(await samePublicBackupWindow(backup, await observe())))
+          throw new MaintenanceFailure("source_changed");
         const assertCurrent = async () => {
           await assertMutex(mutex, checkSuccess); if (!assertSnapshotLock) throw new MaintenanceFailure("maintenance_lost"); await assertSnapshotLock(checkSuccess);
           const live = await readIdentity(target, verificationConnection, false, checkSuccess);

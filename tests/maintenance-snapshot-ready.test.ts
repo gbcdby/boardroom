@@ -9,13 +9,41 @@ import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { parseVerification } from "../src/server/storage/maintenance/parse.ts";
 import { digestJson } from "../src/server/storage/maintenance/canonical.ts";
+import { buildDatabaseManifests } from "../src/server/storage/maintenance/manifests.ts";
 import { controlSqlOutcome } from "../src/server/storage/maintenance/control-sql.ts";
 import { snapshotReadyFixture } from "./fixtures/maintenance-snapshot-ready.ts";
-import type { ArtifactRef, SourceLock } from "../src/server/storage/maintenance/types.ts";
+import type { ArtifactRef, SourceLock, SourceObservation } from "../src/server/storage/maintenance/types.ts";
 
 const nativeTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
 const pgTest = process.env.AGENT_STUDIO_PG_TEST_URL ? test : test.skip;
 const artifacts = async (root: string) => (await readdir(root, { recursive: true })).sort();
+function inconsistentClientTable(observed: SourceObservation): SourceObservation {
+  const manifests = observed.manifests;
+  return { ...observed, manifests: buildDatabaseManifests(manifests.dialect, manifests.schema,
+    manifests.tables.map(table => table.name === "storage_source_clients" ? { ...table, digest: "f".repeat(64) } : table), manifests.controlRows) };
+}
+
+for (const kind of ["sqlite", "postgres"] as const) for (const point of ["after-CAS", "ready-retry"] as const)
+  (kind === "sqlite" ? nativeTest : pgTest)(`#245 R ${kind}: complete source-client table binding at ${point}`, async () => {
+    const f = await snapshotReadyFixture(kind);
+    try {
+      const input = await f.prepare();
+      if (point === "ready-retry") await f.run(lock => stageSnapshotReady(f.store, lock, f.mutex, input, f.request));
+      const before = (await f.observe()).state;
+      let anchored = false, changed = false;
+      // An inconsistent returned native table is the only fault. No archive or source row is rewritten.
+      await assert.rejects(f.run(lock => stageSnapshotReady(f.store, { ...lock,
+        anchor: async value => { await lock.anchor(value); anchored = true; },
+        observe: async () => {
+          const observed = await lock.observe();
+          if (point === "ready-retry" || anchored) { changed = true; return inconsistentClientTable(observed); }
+          return observed;
+        },
+      }, f.mutex, input, f.request)), error => error instanceof MaintenanceFailure && error.code === "source_changed");
+      assert.equal(changed, true); assert.equal(anchored, point === "after-CAS");
+      assert.deepEqual((await f.observe()).state, before, "failed staging rolls back; a rejected retry leaves the committed anchor alone");
+    } finally { await f.close(); }
+  });
 
 for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeTest : pgTest)(
   `#152 R ${kind}: actual D/V then durable R/Jr and native CAS commit; exact retry is read-only`, async t => {

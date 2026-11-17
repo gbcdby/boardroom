@@ -343,8 +343,15 @@ export class ArtifactStore {
       } catch (error) { failed = true; first = error; outcome.failureObserved = true; }
       // This settles the source iterator before retiring the owner, even if the
       // first thrown value was undefined. Return failure is only secondary.
-      if (!ended && iterator?.return) {
-        try { await iterator.return(); }
+      if (!ended && iterator) {
+        try {
+          const returnMethod = iterator.return;
+          if (returnMethod !== undefined && returnMethod !== null) {
+            if (typeof returnMethod !== "function")
+              throw new MaintenanceFailure("snapshot_invalid", "source-file-payload-iterator-return");
+            await returnMethod.call(iterator);
+          }
+        }
         catch (error) { if (!failed) { failed = true; first = error; outcome.failureObserved = true; } }
       }
       try { await closePublicationOwner(state, owner); }

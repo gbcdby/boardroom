@@ -5,8 +5,8 @@ import { assertFrozenSourceUnchanged, captureReference, verifyJournalChain, veri
 import { ArtifactStore } from "./objects.ts";
 import { hash, id, ref, source, text } from "./parse-primitives.ts";
 import { parseJournal, parseReceipt, parseVerification } from "./parse.ts";
-import { buildSourceClientsRoster } from "./source-clients.ts";
-import type { ArtifactRef, BlockerCode, ContinueRequest, MaintenanceRef, OperationMutex, SourceClientsRosterV1, SourceLock, SourceObservation } from "./types.ts";
+import { assertCapturedSourceClientBinding } from "./source-client-binding.ts";
+import type { ArtifactRef, BlockerCode, ContinueRequest, DatabaseManifests, MaintenanceRef, OperationMutex, SourceClientsRosterV1, SourceLock } from "./types.ts";
 
 const requestSchema = z.object({
   plan: z.object({ migrationId: id, planDigest: hash, immutablePlan: ref, controlRoot: text }).strict(),
@@ -56,18 +56,12 @@ export async function stageSnapshotReady(store: ArtifactStore, lock: SourceLock,
   requireValue(same(initial.source, request.expectedSource) && same(initial.source, chain.plan.source)
     && same(initial.sourceIdentity, chain.plan.sourceIdentity), "source_changed");
   requireValue(!chain.nodes.some(node => ["cancel_intent", "cancelled"].includes(node.record.event)), "phase_conflict");
-  const assertRoster = async (observed: SourceObservation, captured: SourceClientsRosterV1) => {
-    const live = await lock.observeSourceClients();
-    requireValue(same(live.source, observed.source) && same(live.sourceIdentity, observed.sourceIdentity)
-      && same(live.state, observed.state) && live.schemaManifestDigest === observed.manifests.schemaManifestDigest, "source_changed");
-    requireValue(same(buildSourceClientsRoster({ ...captured, source: live.source, textEncoding: live.textEncoding, rows: live.rows }), captured), "source_changed");
-  };
-  const assertCurrent = async (captured: SourceClientsRosterV1) => {
+  const assertCurrent = async (captured: SourceClientsRosterV1, archived: DatabaseManifests) => {
     await mutex.assertHeld(); await lock.assertHeld();
     const current = await lock.observe();
     requireValue(same(current.source, initial.source) && same(current.sourceIdentity, initial.sourceIdentity)
       && same(current.state, state) && same(current.manifests, initial.manifests), "source_changed");
-    await assertRoster(current, captured); await mutex.assertHeld(); await lock.assertHeld();
+    await assertCapturedSourceClientBinding(lock, current, captured, archived); await mutex.assertHeld(); await lock.assertHeld();
   };
   if (head.record.phase === "snapshot_ready") {
     requireValue(previous?.record.event === "ready", "request_conflict");
@@ -78,7 +72,7 @@ export async function stageSnapshotReady(store: ArtifactStore, lock: SourceLock,
     requireValue(captured.record.formatVersion === 2 && captured.record.sourceClients !== null, "journal_invalid");
     requireValue(closure.files.rootBindings.every(binding => binding.hostIdentityDigest === store.identity.hostIdentityDigest), "source_changed");
     assertFrozenSourceUnchanged(initial, closure.manifests, closure.chain);
-    await assertCurrent(captured.record.sourceClients);
+    await assertCurrent(captured.record.sourceClients, closure.manifests);
     return { receipt: closure.receiptRef, journal: previous.reference, ref: captureReference(head) };
   }
   requireValue(previous === undefined, "request_conflict");
@@ -92,7 +86,7 @@ export async function stageSnapshotReady(store: ArtifactStore, lock: SourceLock,
   requireValue(closure.files.rootBindings.every(binding => binding.hostIdentityDigest === store.identity.hostIdentityDigest), "source_changed");
   const verification = parseVerification(await store.readJson(fixed.verification, "verification"));
   requireValue(same(verification.bundle, fixed.bundle) && same(verification.publication, fixed.publication), "snapshot_invalid");
-  await assertCurrent(head.record.sourceClients);
+  await assertCurrent(head.record.sourceClients, closure.manifests);
   const guarded = await ArtifactStore.open(store.root, initial.source, { assertCurrent: async () => {
     await mutex.assertHeld(); await lock.assertHeld();
   } });
@@ -104,14 +98,14 @@ export async function stageSnapshotReady(store: ArtifactStore, lock: SourceLock,
     fullDataManifestDigest: closure.manifests.fullDataManifestDigest, frozenBusinessManifestDigest: closure.manifests.frozenBusinessManifestDigest,
     capturedControlManifestDigest: closure.manifests.capturedControlManifestDigest });
   const receipt = await guarded.putJson("receipt", receiptBody);
-  await assertCurrent(head.record.sourceClients);
+  await assertCurrent(head.record.sourceClients, closure.manifests);
   const record = parseJournal({ formatVersion: 2, kind: "journal", migrationId: head.record.migrationId,
     sequence: head.record.sequence + 1, previous: anchored, phase: "snapshot_ready", event: "ready",
     requestId: request.requestId, requestDigest, source: initial.source, plan: head.record.plan,
     fenceEpoch: state.fenceEpoch, ownerGeneration: state.ownerGeneration, evidence: [], snapshot: receipt, sourceClients: null, frozen: null });
   const journal = await guarded.putJson("journal", record), ready = await verifySnapshotClosure(guarded, journal);
   requireValue(same(ready.receiptRef, receipt) && same(ready.receipt, receiptBody), "snapshot_invalid");
-  await assertCurrent(head.record.sourceClients);
+  await assertCurrent(head.record.sourceClients, closure.manifests);
   await lock.anchor({ expected: state, admission: "sealed", fenceEpoch: state.fenceEpoch, ownerGeneration: state.ownerGeneration,
     activeMigrationId: state.activeMigrationId, planDigest: state.planDigest, controlRootIdentity: { ...store.identity },
     mutexIdentity: mutex.identity, journal, journalSequence: record.sequence });
@@ -120,6 +114,7 @@ export async function stageSnapshotReady(store: ArtifactStore, lock: SourceLock,
   requireValue(same(after.sourceIdentity, initial.sourceIdentity) && same(after.state, { ...state,
     journalRecordRef: journal.ref, journalDigest: journal.sha256, journalSequence: record.sequence }), "maintenance_lost");
   assertFrozenSourceUnchanged(after, closure.manifests, ready.chain);
-  await assertRoster(after, head.record.sourceClients); await mutex.assertHeld(); await lock.assertHeld();
+  await assertCapturedSourceClientBinding(lock, after, head.record.sourceClients, closure.manifests);
+  await mutex.assertHeld(); await lock.assertHeld();
   return { receipt, journal, ref: captureReference(ready.chain.nodes.at(-1)!) };
 }

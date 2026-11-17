@@ -44,10 +44,11 @@ async function fixture(encoding: "UTF8" | "LATIN1" | "SQL_ASCII" = "UTF8") {
       await sourceClient?.close();
       try { await mutex?.release(); }
       catch (error) {
-        // An intentional real source-backend kill can invalidate the adapter while
-        // a 1s mutex heartbeat is pending. The release still waits for that native
-        // query and closes the mutex session; only this exact, proven test fault
-        // may accept its maintenance_lost result. Other cleanup failures still fail.
+        // An intentional real source-backend kill or injected owned close failure can
+        // invalidate the adapter while a 1s mutex heartbeat is pending. The release
+        // still waits for that native query and closes the mutex session; only these
+        // exact, proven test faults may accept its maintenance_lost result. Other
+        // cleanup failures still fail.
         if (!allowExpectedNativeLockLoss || (error as { code?: unknown })?.code !== "maintenance_lost") throw error;
       }
       await adapter?.close();
@@ -257,7 +258,7 @@ pgTest("A11A PostgreSQL never reports facts success after a native owned close f
   for (const [target, mode] of [["inventory", "rejected-promise"], ["inventory", "synchronous-throw"],
     ["catalog-pin", "rejected-promise"], ["source-lock", "rejected-promise"]] as const) await t.test(`${target}: ${mode}`, async t => {
     const f = await fixture(); const original = Client.prototype.end, query = Client.prototype.query;
-    let attempted = false, consumed = false, selected: Client | undefined;
+    let attempted = false, consumed = false, selected: Client | undefined, closeFaultProven = false;
     try {
       t.mock.method(Client.prototype, "query", function(this: Client, ...args: unknown[]) {
         const sql = typeof args[0] === "string" ? args[0] : (args[0] as { text?: string })?.text ?? "";
@@ -277,7 +278,8 @@ pgTest("A11A PostgreSQL never reports facts success after a native owned close f
       await assert.rejects(f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference,
         async () => { consumed = true; })), error => /maintenance_lost/.test(String(error)) && !String(error).includes("canary"));
       assert.equal(attempted, true); assert.equal(consumed, target !== "inventory");
-    } finally { t.mock.restoreAll(); await f.close(); }
+      closeFaultProven = true;
+    } finally { t.mock.restoreAll(); await f.close(closeFaultProven); }
   });
 });
 
