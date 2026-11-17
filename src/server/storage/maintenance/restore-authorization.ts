@@ -32,28 +32,39 @@ type OwnedRestore = BaseRestore & (
 );
 const restores = new WeakMap<ControllerCommandScope, OwnedRestore>();
 const failures = new WeakMap<ControllerCommandScope, unknown>();
+type RestoreRole = "restore" | "callback" | "checking" | "consumer";
+interface RestoreFailureOccurrence {
+  readonly error: unknown;
+  readonly order: number;
+  readonly closeInduced: boolean;
+}
 interface RestoreOperation {
   readonly scope: ControllerCommandScope;
   readonly lock: SourceLock;
   readonly promise: Promise<unknown>;
+  readonly role: RestoreRole;
+  readonly parent: RestoreOperation | undefined;
+  readonly children: Set<RestoreOperation>;
   failed: boolean;
   failure?: unknown;
-  failureOrder: number;
+  failures?: readonly RestoreFailureOccurrence[];
   retainFailure?: boolean;
-  callbackFailed?: boolean;
-  callbackFailureRetained?: boolean;
-  returnedChild?: RestoreOperation;
-  joinedChild?: RestoreOperation;
+  callbackClosed?: boolean;
+  forwarded?: RestoreOperation;
+  consumer?: RestoreOperation;
+  checking?: RestoreOperation;
 }
 interface RestoreLockLifetime {
   closed: boolean;
   readonly pending: Set<RestoreOperation>;
   failureOrder: number;
   closeFailure?: MaintenanceFailure;
+  closeOccurrence?: RestoreFailureOccurrence;
   barrier?: Promise<void>;
 }
 const operations = new WeakMap<ControllerCommandScope, RestoreOperation>();
 const callbacks = new WeakMap<ControllerCommandScope, RestoreOperation>();
+const originalOperations = new WeakMap<Promise<unknown>, RestoreOperation>();
 const lockLifetimes = new WeakMap<SourceLock, RestoreLockLifetime>();
 
 function assertValid(scope: ControllerCommandScope): void {
@@ -76,52 +87,121 @@ function assertOpen(scope: ControllerCommandScope, lock: SourceLock): void {
     fail(scope, state.closeFailure); throw state.closeFailure;
   }
 }
-/** Register before work can yield. Failure occurrence is separate from its value,
- * so throw undefined and an already observed failure remain sticky. */
-function track<T>(scope: ControllerCommandScope, lock: SourceLock,
-  owner: WeakMap<ControllerCommandScope, RestoreOperation>, work: () => Promise<T>): Promise<T> {
+function orderedFailures(values: readonly RestoreFailureOccurrence[]): readonly RestoreFailureOccurrence[] {
+  // These are private occurrence objects. Equal raw errors are never keys.
+  const actual = [...new Set(values)].sort((left, right) => left.order - right.order);
+  return actual.some(value => !value.closeInduced) ? actual.filter(value => !value.closeInduced) : actual;
+}
+function ownFailure(operation: RestoreOperation, error: unknown): RestoreFailureOccurrence {
+  const state = lockLifetime(operation.lock);
+  if (state.closeFailure && error === state.closeFailure)
+    return state.closeOccurrence ??= { error, order: ++state.failureOrder, closeInduced: true };
+  return { error, order: ++state.failureOrder, closeInduced: false };
+}
+function retainFailures(operation: RestoreOperation, observed: readonly RestoreFailureOccurrence[]): void {
+  operation.failures = orderedFailures(observed);
+  if (operation.retainFailure) for (const occurrence of operation.failures)
+    if (!occurrence.closeInduced) notePendingControllerOperationFailure(operation.lock, occurrence, occurrence.error);
+}
+function throwFailures(observed: readonly RestoreFailureOccurrence[]): never {
+  const failures = orderedFailures(observed), first = failures[0];
+  requireValue(first);
+  if (failures.length === 1) throw first.error;
+  throw new AggregateError(failures.map(value => value.error),
+    "storage_maintenance: controller restore callback failed", { cause: first.error });
+}
+function parentFor(scope: ControllerCommandScope, role: RestoreRole): RestoreOperation | undefined {
+  const root = callbacks.get(scope);
+  if (role === "callback") { requireValue(!root); return undefined; }
+  if (role === "consumer") { requireValue(root && !root.consumer && !root.checking); return root; }
+  const parent = root?.consumer ?? root;
+  if (role === "checking") { requireValue(parent && !parent.checking); return parent; }
+  return parent?.checking ?? parent;
+}
+/** Every fixed boundary creates and registers its original Promise before its
+ * first action. There is no API for registering a supplied Promise or owner. */
+function track<T>(scope: ControllerCommandScope, lock: SourceLock, role: RestoreRole,
+  work: (operation: RestoreOperation) => Promise<T>): Promise<T> {
+  let parent: RestoreOperation | undefined;
   try {
-    assertOpen(scope, lock); requireValue(!owner.has(scope) && !operations.has(scope));
-    const parent = callbacks.get(scope); requireValue(!parent || parent.lock === lock);
+    assertOpen(scope, lock); requireValue(!operations.has(scope)); parent = parentFor(scope, role);
+    requireValue(!parent || parent.lock === lock && !parent.callbackClosed);
   } catch (error) { fail(scope, error); return Promise.reject(error); }
   const state = lockLifetime(lock);
   let tracked!: RestoreOperation;
-  const operation = Promise.resolve().then(() => { assertOpen(scope, lock); return work(); }).then(value => {
+  const operation: Promise<T> = Promise.resolve().then(() => { assertOpen(scope, lock); return work(tracked); }).then(value => {
     assertOpen(scope, lock); return value;
   }).catch(error => {
-    tracked.failed = true; tracked.failure = error; tracked.failureOrder = ++state.failureOrder;
-    const childPropagation = tracked.returnedChild?.failed && tracked.returnedChild.retainFailure
-      || !tracked.callbackFailed && tracked.joinedChild?.failed && tracked.joinedChild.retainFailure;
-    if (tracked.retainFailure && !tracked.callbackFailureRetained && !childPropagation && error !== state.closeFailure)
-      notePendingControllerOperationFailure(lock, operation, error);
-    fail(scope, error);
-    throw error;
+    tracked.failed = true; tracked.failure = error;
+    if (!tracked.failures) retainFailures(tracked, tracked.forwarded?.failures ?? [ownFailure(tracked, error)]);
+    fail(scope, error); throw error;
   }).finally(() => {
-    if (owner.get(scope) === tracked) owner.delete(scope);
+    if (operations.get(scope) === tracked) operations.delete(scope);
+    if (callbacks.get(scope) === tracked) callbacks.delete(scope);
+    if (parent?.consumer === tracked) delete parent.consumer;
+    if (parent?.checking === tracked) delete parent.checking;
     state.pending.delete(tracked);
   });
-  tracked = { scope, lock, promise: operation, failed: false, failureOrder: 0 };
-  owner.set(scope, tracked); state.pending.add(tracked);
-  // Observe a forgotten rejection without replacing the original returned
-  // Promise or the rejection retained by the source-close barrier.
+  tracked = { scope, lock, promise: operation, role, parent, children: new Set(), failed: false };
+  originalOperations.set(operation, tracked); state.pending.add(tracked); parent?.children.add(tracked);
+  if (role === "restore") operations.set(scope, tracked);
+  else if (role === "callback") callbacks.set(scope, tracked);
+  else if (role === "consumer") parent!.consumer = tracked;
+  else parent!.checking = tracked;
   void operation.catch(() => undefined);
   return operation;
 }
 function exclusive<T>(scope: ControllerCommandScope, lock: SourceLock, work: () => Promise<T>): Promise<T> {
-  return track(scope, lock, operations, work);
+  return track(scope, lock, "restore", work);
 }
 
-/** Mark only operations still owned at the adapter's failed callback exit.
- * Their actual catch records the occurrence before the original Promise retires.
- * A settled barrier that supplied the outer first error is not added again. */
+/** Terminal forwarding in fixed trusted code. A supplied error, id, success
+ * flag or foreign Promise cannot declare provenance. Closing admission does not
+ * rewrite an already owned rejection; retired parents cannot forward again. */
+export function forwardControllerRestoreFailure(scope: ControllerCommandScope, lock: SourceLock,
+  original: Promise<unknown>): never {
+  const child = originalOperations.get(original), parent = child?.parent, state = lockLifetime(lock);
+  requireValue(child && child.scope === scope && child.lock === lock && child.failed && child.failures
+    && parent && parent.scope === scope && parent.lock === lock && state.pending.has(parent));
+  parent.forwarded = child;
+  if (parent.retainFailure) for (const occurrence of child.failures)
+    if (!occurrence.closeInduced) notePendingControllerOperationFailure(lock, occurrence, occurrence.error);
+  throw child.failure;
+}
+
+/** Mark only original operations pending at the failed source callback exit. */
 export function retainPendingControllerRestoreFailures(lock: SourceLock | undefined): void {
   if (!lock) return;
-  for (const operation of lockLifetime(lock).pending) operation.retainFailure = true;
+  for (const operation of lockLifetime(lock).pending) {
+    operation.retainFailure = true;
+    if (operation.failures) retainFailures(operation, operation.failures);
+  }
 }
 
-/** Fixed adapter close-entry. Closing admission is synchronous, before awaiting
- * every original parent/child operation. Repeated cleanup gets the same barrier.
- * A pending operation that later resolves still cannot authorize COMMIT. */
+/** Callback invocation and its actual children share the existing lock barrier.
+ * Independent callback errors are recorded where caught, before joining children.
+ * Explicit forwarding preserves the child's occurrence through async adoption. */
+async function invokeCallback<T>(operation: RestoreOperation, callback: () => Promise<T>): Promise<T> {
+  let result: { value: T } | undefined, returnedChild: RestoreOperation | undefined;
+  const observed: RestoreFailureOccurrence[] = [];
+  try {
+    const returned = callback(), child = originalOperations.get(returned);
+    if (child?.parent === operation) returnedChild = child;
+    result = { value: await returned };
+  } catch (error) {
+    const forwarded = operation.forwarded ?? (returnedChild?.failed ? returnedChild : undefined);
+    observed.push(...forwarded?.failures ?? [ownFailure(operation, error)]);
+    retainFailures(operation, observed);
+  }
+  operation.callbackClosed = true;
+  const children = [...operation.children];
+  await Promise.allSettled(children.map(child => child.promise));
+  for (const child of children) if (child.failed) observed.push(...child.failures!);
+  if (observed.length) { retainFailures(operation, observed); throwFailures(observed); }
+  requireValue(result); return result.value;
+}
+
+/** Fixed adapter close-entry: preserve original operations and the same barrier. */
 export function finishControllerRestoreCallback(lock: SourceLock | undefined): Promise<void> | undefined {
   if (!lock) return undefined;
   const state = lockLifetime(lock); state.closed = true;
@@ -131,55 +211,28 @@ export function finishControllerRestoreCallback(lock: SourceLock | undefined): P
   const pending = [...state.pending];
   for (const operation of pending) fail(operation.scope, state.closeFailure);
   state.barrier = Promise.allSettled(pending.map(operation => operation.promise)).then(() => {
-    const rejected = pending.filter(operation => operation.failed).sort((left, right) => left.failureOrder - right.failureOrder);
-    // This private marker is one synchronous close event. Its known propagation
-    // through child and awaiting parent is not a second cleanup occurrence.
-    // Do not apply value-based deduplication to any raw callback/native errors.
-    if (rejected.length && rejected.every(operation => operation.failure === state.closeFailure)) throw state.closeFailure;
-    const first = rejected[0];
-    if (first && rejected.length === 1) throw first.failure;
-    if (first) throw new AggregateError(rejected.map(operation => operation.failure),
-      "storage_maintenance: controller restore callback failed", { cause: first.failure });
+    const observed = pending.flatMap(operation => operation.failures ?? []);
+    if (observed.length) throwFailures(observed);
     throw state.closeFailure;
   });
-  void state.barrier.catch(() => undefined);
-  return state.barrier;
+  void state.barrier.catch(() => undefined); return state.barrier;
 }
 
-/** Trusted fixed guard assembly only. This owns the complete callback lifetime,
- * including gaps between assertions; it issues no restore permit or references.
- * Child restore/check entries use the same original lock and remain individually
- * exclusive. Nothing supplied by a caller is installed as an owned Promise. */
+/** These two boundaries are used only by the fixed guard assembly. They create
+ * the actual checking/consumer Promise, not a caller-registered alias or permit. */
+export function runControllerRestoreCheck<T>(scope: ControllerCommandScope, lock: SourceLock, check: () => Promise<T>): Promise<T> {
+  return track(scope, lock, "checking", operation => invokeCallback(operation, check));
+}
+export function runControllerRestoreConsumer<T>(scope: ControllerCommandScope, lock: SourceLock, consume: () => Promise<T>): Promise<T> {
+  return track(scope, lock, "consumer", operation => invokeCallback(operation, consume));
+}
+/** Trusted fixed assembly only. The entire parent remains owned between checks. */
 export function withControllerRestoreCallback<T>(scope: ControllerCommandScope, lock: SourceLock,
   callback: () => Promise<T>): Promise<T> {
-  return track(scope, lock, callbacks, async () => {
-    const context = await currentWindow(scope, lock);
-    requireValue(context.kind === "snapshot");
-    const parent = callbacks.get(scope)!;
-    const errors: unknown[] = [];
-    let result: { value: T } | undefined;
-    try {
-      const returned = callback(), child = operations.get(scope);
-      if (child?.promise === returned) parent.returnedChild = child;
-      result = { value: await returned };
-    } catch (error) {
-      parent.callbackFailed = true; errors.push(error);
-      // The original returned child Promise is a known propagation edge. A
-      // separately thrown equal value, including undefined, is a new event.
-      if (parent.retainFailure && !(parent.returnedChild?.failed && parent.returnedChild.retainFailure)
-        && error !== lockLifetime(lock).closeFailure) {
-        notePendingControllerOperationFailure(lock, parent.promise, error); parent.callbackFailureRetained = true;
-      }
-    }
-    const child = operations.get(scope);
-    if (child) {
-      parent.joinedChild = child;
-      try { await child.promise; } catch (error) { errors.push(error); }
-    }
-    if (errors.length === 1) throw errors[0];
-    if (errors.length > 1) throw new AggregateError(errors, "storage_maintenance: controller restore consumer failed", { cause: errors[0] });
-    await currentWindow(scope, lock, context);
-    requireValue(result); return result.value;
+  return track(scope, lock, "callback", async operation => {
+    const context = await currentWindow(scope, lock); requireValue(context.kind === "snapshot");
+    const result = await invokeCallback(operation, callback);
+    await currentWindow(scope, lock, context); return result;
   });
 }
 async function currentWindow(scope: ControllerCommandScope, lock: SourceLock, initial?: Window): Promise<Window> {

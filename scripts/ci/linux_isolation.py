@@ -44,20 +44,26 @@ class IsolationError(RuntimeError):
     pass
 
 
-def command_for(entry):
+def validated_partition(entry, partition):
+    if partition is not None and (entry != 'full-suite' or partition not in ('1/4', '2/4', '3/4', '4/4')):
+        raise IsolationError('Unknown fixed full-suite partition')
+    return partition
+
+
+def command_for(entry, partition=None):
+    validated_partition(entry, partition)
     if entry == 'sqlite':
         return ("mkdir -p .agent-output/maintenance-native-diagnostics\n"
                 "timeout --signal=TERM --kill-after=10s 30s node --test --test-reporter=tap "
                 "--test-name-pattern='unknown source file users' tests/maintenance-sqlite.test.ts "
                 "2>&1 | tee .agent-output/maintenance-native-diagnostics/sqlite-source-users.tap")
     if entry == 'full-suite':
-        # Keep the original native discovery/process isolation, but use all four
-        # standard Linux runner CPUs. A flag appended after npm's test glob is ignored.
+        # Native Node sharding keeps the complete original glob. Each matrix
+        # runner owns its PG service/UID; no scheduling flag reaches nested Node.
+        script = 'test:ci:linux' + (':' + partition[0] + 'of4' if partition else '')
         return ("mkdir -p .agent-output/linux-ci-isolation/full-suite\n"
-                "node -e 'console.log(JSON.stringify({node:process.version, "
-                "availableParallelism:require(\"node:os\").availableParallelism(), configuredConcurrency:4}))' "
-                "| tee .agent-output/linux-ci-isolation/full-suite/test-scheduler.json\n"
-                "npm run test:ci:linux 2>&1 | tee .agent-output/linux-ci-isolation/full-suite/full-suite.tap")
+                "node scripts/ci/test-discovery.mjs\n"
+                f"npm run {script} 2>&1 | tee .agent-output/linux-ci-isolation/full-suite/full-suite.tap")
     raise IsolationError('Unknown fixed CI entry')
 
 
@@ -65,16 +71,22 @@ def child_environment(request, stage):
     env = {'PATH': request['node_dir'] + ':/usr/lib/postgresql/16/bin:' + SYSTEM_PATH,
            'HOME': str(stage / 'home'), 'TMPDIR': str(stage / 'tmp'),
            'npm_config_cache': str(stage / 'npm-cache'), 'LANG': 'C.UTF-8',
-           'CI': 'true', 'GITHUB_ACTIONS': 'true', 'GITHUB_JOB': 'database-tests',
+           'CI': 'true', 'GITHUB_ACTIONS': 'true', 'GITHUB_JOB': 'database-partitions',
            'GITHUB_SHA': request['head'], 'GITHUB_RUN_ID': request['run_id'],
            'GITHUB_RUN_ATTEMPT': request['attempt'], 'GITHUB_WORKSPACE': str(stage / WORKSPACE)}
+    partition = validated_partition(request['entry'], request.get('partition'))
     if request['entry'] == 'full-suite':
         if request.get('pg_url') != PG_URL:
             raise IsolationError('Full suite requires the original temporary CI PostgreSQL URL')
         env['AGENT_STUDIO_PG_TEST_URL'] = PG_URL
-        # Preserve each completed file's assertion details even if the outer
-        # job is later cancelled before the spec reporter's final summary.
-        env['NODE_OPTIONS'] = '--test-reporter=tap'
+        if partition is not None:
+            env['BOARDROOM_CI_TEST_PARTITION'] = partition
+        # TAP is file-buffered. The existing bounded observer also preserves
+        # execution-order completion and original process exit before that buffer.
+        observer = stage / WORKSPACE / 'scripts/ci'
+        env['NODE_OPTIONS'] = ('--test-reporter=tap --test-reporter-destination=stdout '
+            f'--test-reporter={observer / "test-execution-reporter.mjs"} --test-reporter-destination=stdout '
+            f'--import={observer / "test-process-observer.mjs"}')
     elif request.get('pg_url') is not None:
         raise IsolationError('SQLite diagnostic must not acquire a PostgreSQL environment')
     return env
@@ -626,7 +638,7 @@ def child(stage):
         raise IsolationError('Nonroot bootstrap setup blocked: ' + ', '.join(bootstrap['errors']))
     os.chdir(workspace)
     os.execve('/bin/bash', ['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c',
-                          command_for(request['entry'])], child_environment(request, stage))
+                          command_for(request['entry'], request.get('partition'))], child_environment(request, stage))
 
 
 def supervise(stage, cleanup_only=False):
@@ -659,7 +671,8 @@ def supervise(stage, cleanup_only=False):
         write_json(state_path, state)
     verify_marker(stage, request, state)
     report = {'entry': request['entry'], 'candidate': request['head'], 'tree': request['tree'],
-              'command': command_for(request['entry']), 'command_exit': None, 'errors': [],
+              'partition': validated_partition(request['entry'], request.get('partition')),
+              'command': command_for(request['entry'], request.get('partition')), 'command_exit': None, 'errors': [],
               'archives': request['archives'], 'protected_sha256': request['protected_sha256'],
               'source_snapshot': request.get('source_snapshot'),
               'cleanup_only': cleanup_only, 'setup_complete': False, 'product_entry_status': 'NOT_RUN'}
@@ -796,8 +809,8 @@ def job_name(run_id, attempt, entry):
 
 def hosted_context():
     if not sys.platform.startswith('linux') or os.getuid() == 0 or os.environ.get('GITHUB_ACTIONS') != 'true' or \
-       os.environ.get('GITHUB_JOB') != 'database-tests':
-        raise IsolationError('This launcher requires the nonroot Linux GitHub Actions database-tests job')
+       os.environ.get('GITHUB_JOB') != 'database-partitions':
+        raise IsolationError('This launcher requires the nonroot Linux GitHub Actions database-partitions job')
     run_id, attempt = os.environ.get('GITHUB_RUN_ID', ''), os.environ.get('GITHUB_RUN_ATTEMPT', '')
     if not re.fullmatch(r'[1-9][0-9]{0,19}', run_id) or not re.fullmatch(r'[1-9][0-9]{0,9}', attempt):
         raise IsolationError('Missing exact hosted run identity')
@@ -842,7 +855,8 @@ def frontend(entry):
                    {'run_id': run_id, 'attempt': attempt, 'checked_entries': list(ENTRIES),
                     'errors': errors, 'status': 'FAIL' if errors else 'PASS'})
         return int(bool(errors))
-    command_for(entry)
+    partition = validated_partition(entry, os.environ.get('BOARDROOM_CI_TEST_PARTITION'))
+    command_for(entry, partition)
     if shutil.which('sudo') is None:
         raise IsolationError('Hosted account initialization requires existing passwordless sudo')
     head = tool(['git', 'rev-parse', 'HEAD'], source)
@@ -861,7 +875,8 @@ def frontend(entry):
                'directory_identity': [info.st_dev, info.st_ino], 'name': job_name(run_id, attempt, entry),
                'token': secrets.token_hex(16), 'pid_namespace': os.readlink('/proc/self/ns/pid'),
                'node': str(node), 'node_dir': str(node.parent), 'node_sha256': digest(node),
-               'pg_url': os.environ.get('AGENT_STUDIO_PG_TEST_URL'), 'archives': {}, 'protected_sha256': {}}
+               'pg_url': os.environ.get('AGENT_STUDIO_PG_TEST_URL'), 'partition': partition,
+               'archives': {}, 'protected_sha256': {}}
     write_json(stage / 'request.json', request)
     child_environment(request, stage)  # Reject wrong PG scope before privileged initialization.
     try:

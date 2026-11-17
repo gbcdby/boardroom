@@ -147,8 +147,12 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  database-tests:
-    name: Node 24 · SQLite / PostgreSQL
+  database-partitions:
+    name: Linux 全量 · ${{ matrix.partition }}
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: ['1/4', '2/4', '3/4', '4/4']
     runs-on: ubuntu-24.04
     # CI231's outer 900s expired while the full suite still progressed.
     # Allow the bounded 26-minute suite transport plus preparation and post-suite
@@ -242,6 +246,9 @@ jobs:
           BOARDROOM_CI_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
         run: node scripts/ci/verify-pg-fixture.mjs
 
+      - name: 核对原生测试分片覆盖与聚合失败门
+        run: python3 -B scripts/ci/test_linux_isolation.py WholeSuitePartitionContracts -v
+
       - name: 类型检查
         run: npm run typecheck
 
@@ -280,6 +287,7 @@ jobs:
         timeout-minutes: 26
         env:
           AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
+          BOARDROOM_CI_TEST_PARTITION: ${{ matrix.partition }}
         run: python3 scripts/ci/linux_isolation.py full-suite
 
       - name: 核对 Linux 专属测试身份、进程与工件收尾
@@ -290,7 +298,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: maintenance-native-diagnostics-${{ github.run_attempt }}
+          name: maintenance-native-diagnostics-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: .agent-output/maintenance-native-diagnostics/
           include-hidden-files: true
           if-no-files-found: warn
@@ -300,7 +308,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: linux-ci-isolation-${{ github.run_attempt }}
+          name: linux-ci-isolation-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: .agent-output/linux-ci-isolation/
           include-hidden-files: true
           if-no-files-found: warn
@@ -319,7 +327,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: maintenance-pg-restart-${{ github.run_attempt }}
+          name: maintenance-pg-restart-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: .agent-output/maintenance-pg-restart/
           include-hidden-files: true
           if-no-files-found: warn
@@ -334,7 +342,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: lifecycle-load-${{ github.run_attempt }}
+          name: lifecycle-load-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: .agent-output/lifecycle-load/
           include-hidden-files: true
           if-no-files-found: warn
@@ -366,7 +374,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: tasks-protocol-${{ github.run_attempt }}
+          name: tasks-protocol-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: .agent-output/tasks-e2e/
           include-hidden-files: true
           if-no-files-found: warn
@@ -387,7 +395,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: memory-protocol-${{ github.run_attempt }}
+          name: memory-protocol-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: .agent-output/memory-e2e/
           include-hidden-files: true
           if-no-files-found: warn
@@ -408,11 +416,23 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: install-${{ github.run_attempt }}
+          name: install-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: .agent-output/install-e2e/
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
+
+  database-tests:
+    name: Node 24 · SQLite / PostgreSQL
+    needs: database-partitions
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: 所有固定分片与原后续门禁必须成功
+        env:
+          PARTITIONS_RESULT: ${{ needs.database-partitions.result }}
+        run: test "$PARTITIONS_RESULT" = success
 
   managed-web-browser:
     name: Chromium · 工作台与托管 Agent 页面

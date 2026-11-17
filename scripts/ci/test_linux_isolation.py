@@ -102,7 +102,7 @@ class WholeSuiteBudgetContracts(unittest.TestCase):
     def test_workflow_leaves_time_for_transport_and_post_suite_steps(self):
         import re
         workflow = (Path(ci.__file__).resolve().parents[2] / '.github/workflows/database-ci.yml').read_text()
-        linux = workflow.split('  database-tests:\n', 1)[1].split('\n  managed-web-browser:', 1)[0]
+        linux = workflow.split('  database-partitions:\n', 1)[1].split('\n  database-tests:', 1)[0]
         job_minutes = int(re.search(r'^    timeout-minutes: (\d+)$', linux, re.M).group(1))
         suite_step = linux.split('      - name: 全量测试（启用 PostgreSQL 门控用例）\n', 1)[1].split('\n      - name:', 1)[0]
         match = re.search(r'^        timeout-minutes: (\d+)$', suite_step, re.M)
@@ -113,7 +113,7 @@ class WholeSuiteBudgetContracts(unittest.TestCase):
         # Existing source/dependency archive bounds are 30s/90s outside supervise.
         self.assertGreater(step_seconds, 30 + 90 + outer['timeout'] + 2 * outer['grace'] + 5)
         self.assertGreaterEqual(job_minutes * 60 - step_seconds, 600)
-        self.assertIn('timeout-minutes: 15', workflow.split('  database-tests:', 1)[0])
+        self.assertIn('timeout-minutes: 15', workflow.split('  database-partitions:', 1)[0])
         self.assertIn('timeout-minutes: 15', workflow.split('  managed-web-browser:', 1)[1])
 
     def test_workflow_covers_actual_double_wait_and_finally_reap_paths(self):
@@ -162,6 +162,169 @@ class WholeSuiteBudgetContracts(unittest.TestCase):
                 self.assertGreater(step_seconds, 30 + 90 + clock[0])
 
 
+class WholeSuitePartitionContracts(unittest.TestCase):
+    root = Path(ci.__file__).resolve().parents[2]
+
+    def workflow(self):
+        # Read the actual workflow through the already locked Node YAML parser.
+        code = "import fs from 'node:fs';import YAML from 'yaml';console.log(JSON.stringify(YAML.parse(fs.readFileSync('.github/workflows/database-ci.yml','utf8'))))"
+        result = subprocess.run(['node', '--input-type=module', '-e', code], cwd=self.root,
+                                capture_output=True, text=True, timeout=10, check=True)
+        return json.loads(result.stdout)
+
+    def test_all_native_partitions_cover_the_original_glob_once_and_keep_failure(self):
+        import shlex
+        import shutil
+        package = json.loads((self.root / 'package.json').read_text())
+        scripts = package['scripts']
+        self.assertEqual(scripts['test'], 'node --test "tests/**/*.test.ts"')
+        self.assertEqual(scripts['test:ci:linux'], 'node --test --test-concurrency=4 "tests/**/*.test.ts"')
+        with tempfile.TemporaryDirectory(prefix='boardroom-partition-proof-') as directory:
+            stage = Path(directory)
+            root = stage / ci.WORKSPACE
+            root.mkdir(parents=True)
+            observer = root / 'scripts/ci'
+            observer.mkdir(parents=True)
+            for filename in ('test-execution-reporter.mjs', 'test-process-observer.mjs', 'test-discovery.mjs'):
+                shutil.copyfile(self.root / 'scripts/ci' / filename, observer / filename)
+            names = [f'tests/file-{i:02d}.test.ts' for i in range(9)] + ['tests/nested/a.test.ts', 'tests/nested/b.test.ts']
+            for i, name in enumerate(names):
+                file = root / name
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text("import test from 'node:test';import assert from 'node:assert/strict';import {appendFileSync} from 'node:fs';\n"
+                    f"test({json.dumps(name)},()=>{{appendFileSync(process.env.BOARDROOM_PARTITION_PROBE_FILE,{json.dumps(name + chr(10))});"
+                    + ("assert.fail('deliberate partition failure');" if i == 5 else "assert.ok(true);") + "});\n")
+            selected, codes = [], []
+            for index in range(1, 5):
+                script = scripts[f'test:ci:linux:{index}of4']
+                self.assertEqual(script, f'node --test --test-concurrency=4 --test-shard={index}/4 "tests/**/*.test.ts"')
+                log = root / f'partition-{index}.txt'
+                request = LauncherContracts().request('full-suite') | {'partition': f'{index}/4'}
+                observation_env = ci.child_environment(request, stage)
+                env = dict(os.environ, BOARDROOM_PARTITION_PROBE_FILE=str(log),
+                           BOARDROOM_CI_TEST_PARTITION=observation_env['BOARDROOM_CI_TEST_PARTITION'],
+                           GITHUB_SHA=request['head'], NODE_OPTIONS=observation_env['NODE_OPTIONS'])
+                if index == 1:
+                    discovery = subprocess.run(['node', str(observer / 'test-discovery.mjs')], cwd=root, env=env,
+                                               capture_output=True, text=True, timeout=10)
+                    self.assertEqual(discovery.returncode, 0, discovery.stderr)
+                    self.assertEqual(json.loads(discovery.stdout)['discovered'], len(names))
+                result = subprocess.run(shlex.split(script), cwd=root, env=env,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertIn(result.returncode, (0, 1), result.stderr)
+                entries = log.read_text().splitlines()
+                self.assertTrue(entries, f'partition {index} had no original test execution')
+                self.assertEqual(len(entries), len(set(entries)))
+                selected.append(set(entries)); codes.append(result.returncode)
+            self.assertEqual(sorted(codes), [0, 0, 0, 1])
+            self.assertEqual(set.union(*selected), set(names))
+            for left in range(4):
+                for right in range(left + 1, 4):
+                    self.assertFalse(selected[left] & selected[right])
+            evidence = root / '.agent-output/linux-ci-isolation/full-suite'
+            discovery = json.loads((evidence / 'test-scheduler.json').read_text())
+            self.assertEqual(discovery['candidate'], 'a' * 40)
+            self.assertEqual(discovery['partition'], '1/4')
+            self.assertEqual(discovery['result'], 'NOT_RUN')
+            self.assertEqual(discovery['entries'], sorted(names))
+            manifests = [json.loads(p.read_text()) for p in (evidence / 'test-entrypoints').glob('slot-*/entrypoints.json')]
+            self.assertEqual(len(manifests), 4)
+            self.assertEqual({m['partition'] for m in manifests}, {'1/4', '2/4', '3/4', '4/4'})
+            for manifest in manifests:
+                self.assertEqual(manifest['source'], 'node:fs.globSync')
+                self.assertEqual(set(manifest['entries']), set(names))
+            observations = []
+            for path in (evidence / 'test-processes').glob('slot-*/process.jsonl'):
+                observations += [json.loads(line) for line in path.read_text().splitlines()]
+            ready = [event for event in observations if event['event'] == 'observer-ready']
+            self.assertEqual(len(ready), len(names))
+            self.assertEqual({event['entryFile'] for event in ready}, set(names))
+            self.assertTrue(any(event['event'] == 'process-exit' and event['code'] != 0 for event in observations))
+            reporters = list((evidence / 'test-execution').glob('slot-*/runner-*.jsonl'))
+            self.assertEqual(len(reporters), 4)
+            for path in reporters:
+                events = [json.loads(line) for line in path.read_text().splitlines()]
+                self.assertEqual(events[0]['event'], 'reporter-ready')
+                self.assertEqual(events[-1]['event'], 'reporter-end')
+                self.assertTrue(events[-1]['sourceEnded'])
+
+    def test_fixed_partition_input_and_nested_node_scope(self):
+        for index in range(1, 5):
+            partition = f'{index}/4'
+            self.assertIn(f'npm run test:ci:linux:{index}of4', ci.command_for('full-suite', partition))
+            request = LauncherContracts().request('full-suite') | {'partition': partition}
+            env = ci.child_environment(request, Path('/owned/stage'))
+            self.assertEqual(env['BOARDROOM_CI_TEST_PARTITION'], partition)
+            self.assertEqual(env['AGENT_STUDIO_PG_TEST_URL'], ci.PG_URL)
+            self.assertNotIn('--test-shard', env['NODE_OPTIONS'])
+            self.assertNotIn('--test-concurrency', env['NODE_OPTIONS'])
+        for invalid in ('', '0/4', '5/4', '1/1', '1/8', '1/4 --test-name-pattern=skip', 1, {}, []):
+            with self.subTest(partition=invalid):
+                with self.assertRaises(ci.IsolationError):
+                    ci.command_for('full-suite', invalid)
+                with self.assertRaises(ci.IsolationError):
+                    ci.child_environment(LauncherContracts().request('full-suite') | {'partition': invalid}, Path('/owned/stage'))
+        with self.assertRaises(ci.IsolationError):
+            ci.command_for('sqlite', '1/4')
+
+    def test_hosted_frontend_accepts_only_the_actual_partition_job(self):
+        workflow = self.workflow()
+        executor = next(name for name, job in workflow['jobs'].items()
+                        if any(step.get('run') == 'python3 scripts/ci/linux_isolation.py full-suite'
+                               for step in job.get('steps', [])))
+        with tempfile.TemporaryDirectory(prefix='boardroom-partition-context-') as directory:
+            root = Path(directory).resolve()
+            source, temporary = root / 'source', root / 'runner-temp'
+            source.mkdir()
+            temporary.mkdir()
+            env = {'GITHUB_ACTIONS': 'true', 'GITHUB_JOB': executor,
+                   'GITHUB_RUN_ID': '42', 'GITHUB_RUN_ATTEMPT': '3',
+                   'GITHUB_WORKSPACE': str(source), 'RUNNER_TEMP': str(temporary)}
+            # Only identity inputs are simulated. The real hosted_context and
+            # path validation execute without accounts, sudo, or test children.
+            with mock.patch.dict(ci.os.environ, env, clear=True), \
+                 mock.patch.object(ci.sys, 'platform', 'linux'), \
+                 mock.patch.object(ci.os, 'getuid', return_value=1001):
+                self.assertEqual(ci.hosted_context(), (source, temporary, '42', '3'))
+                for job in ('database-tests', 'managed-web-browser', '', 'database-partitions-other'):
+                    with self.subTest(job=job), mock.patch.dict(ci.os.environ, {'GITHUB_JOB': job}):
+                        with self.assertRaises(ci.IsolationError):
+                            ci.hosted_context()
+                with mock.patch.object(ci.os, 'getuid', return_value=0):
+                    with self.assertRaises(ci.IsolationError):
+                        ci.hosted_context()
+                with mock.patch.dict(ci.os.environ, {'GITHUB_ACTIONS': 'false'}):
+                    with self.assertRaises(ci.IsolationError):
+                        ci.hosted_context()
+
+    def test_workflow_requires_every_partition_and_keeps_all_later_gates(self):
+        workflow = self.workflow()
+        partitions = workflow['jobs']['database-partitions']
+        aggregate = workflow['jobs']['database-tests']
+        self.assertEqual(partitions['strategy'], {'fail-fast': False, 'matrix': {'partition': ['1/4', '2/4', '3/4', '4/4']}})
+        self.assertEqual(aggregate['name'], 'Node 24 · SQLite / PostgreSQL')
+        self.assertEqual(aggregate['needs'], 'database-partitions')
+        self.assertEqual(aggregate['if'], '${{ always() }}')
+        gate = aggregate['steps'][0]
+        self.assertEqual(gate['env']['PARTITIONS_RESULT'], '${{ needs.database-partitions.result }}')
+        for state in ('success', 'failure', 'cancelled', 'skipped', ''):
+            result = subprocess.run(['/bin/bash', '-e', '-c', gate['run']],
+                                    env={'PARTITIONS_RESULT': state, 'PATH': '/usr/bin:/bin'}, timeout=5)
+            self.assertEqual(result.returncode == 0, state == 'success')
+        full = next(step for step in partitions['steps'] if step.get('run') == 'python3 scripts/ci/linux_isolation.py full-suite')
+        self.assertEqual(full['env']['BOARDROOM_CI_TEST_PARTITION'], '${{ matrix.partition }}')
+        self.assertEqual(full['env']['AGENT_STUDIO_PG_TEST_URL'], ci.PG_URL)
+        runs = [step.get('run', '') for step in partitions['steps']]
+        for command in ('npm run e2e', 'npm run e2e:tasks', 'npm run e2e:memory', 'node scripts/e2e-install.mjs'):
+            self.assertEqual(runs.count(command), 2, command)
+        self.assertTrue(any('tests/maintenance-postgres-restart.test.ts' in run for run in runs))
+        self.assertIn('node --test --test-concurrency=1 tests/lifecycle-load.acceptance.ts', runs)
+        self.assertEqual(next(step for step in partitions['steps'] if step.get('run') == 'python3 scripts/ci/linux_isolation.py cleanup')['if'], 'always()')
+        for step in partitions['steps']:
+            if step.get('uses', '').startswith('actions/upload-artifact@'):
+                self.assertIn('${{ strategy.job-index }}', step['with']['name'])
+
+
 class LauncherContracts(unittest.TestCase):
     def request(self, entry='sqlite'):
         return {'entry': entry, 'node_dir': '/opt/node/bin', 'head': 'a' * 40,
@@ -176,9 +339,7 @@ class LauncherContracts(unittest.TestCase):
             "2>&1 | tee .agent-output/maintenance-native-diagnostics/sqlite-source-users.tap")
         self.assertEqual(ci.command_for('full-suite'),
             "mkdir -p .agent-output/linux-ci-isolation/full-suite\n"
-            "node -e 'console.log(JSON.stringify({node:process.version, "
-            "availableParallelism:require(\"node:os\").availableParallelism(), configuredConcurrency:4}))' "
-            "| tee .agent-output/linux-ci-isolation/full-suite/test-scheduler.json\n"
+            "node scripts/ci/test-discovery.mjs\n"
             "npm run test:ci:linux 2>&1 | tee .agent-output/linux-ci-isolation/full-suite/full-suite.tap")
         package = json.loads((Path(ci.__file__).resolve().parents[2] / 'package.json').read_text())
         self.assertEqual(package['scripts']['test'], 'node --test "tests/**/*.test.ts"')
@@ -196,7 +357,15 @@ class LauncherContracts(unittest.TestCase):
             self.assertEqual(env.get('AGENT_STUDIO_PG_TEST_URL'), ci.PG_URL if entry == 'full-suite' else None)
             # The scheduling flag belongs to the original CLI only, not every
             # ordinary Node child or nested test runner via inherited NODE_OPTIONS.
-            self.assertEqual(env.get('NODE_OPTIONS'), '--test-reporter=tap' if entry == 'full-suite' else None)
+            if entry == 'full-suite':
+                self.assertIn('--test-reporter=tap --test-reporter-destination=stdout', env['NODE_OPTIONS'])
+                self.assertIn('--test-reporter=/owned/stage/work/workspace/scripts/ci/test-execution-reporter.mjs', env['NODE_OPTIONS'])
+                self.assertIn('--import=/owned/stage/work/workspace/scripts/ci/test-process-observer.mjs', env['NODE_OPTIONS'])
+                self.assertNotIn('--test-shard', env['NODE_OPTIONS'])
+                self.assertNotIn('--test-concurrency', env['NODE_OPTIONS'])
+            else:
+                self.assertNotIn('NODE_OPTIONS', env)
+            self.assertNotIn('BOARDROOM_CI_TEST_PARTITION', env)
 
     def test_identity_requires_actual_nonroot_caps_groups_and_namespace(self):
         value = {'uid': [42001] * 4, 'gid': [42001] * 4, 'groups': [], 'no_new_privs': 1,

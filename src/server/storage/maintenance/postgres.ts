@@ -159,7 +159,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   const auditFactories = new WeakMap<HeldMutex, BootstrapAuditFactory>();
   const publicMutexes = new WeakMap<HeldMutex, OperationMutex>();
   let currentControllerSource: { readonly lock: SourceLock; readonly session: Session; readonly held: HeldMutex;
-    readonly mutex: OperationMutex; readonly failures: unknown[]; controller: boolean } | undefined;
+    readonly mutex: OperationMutex; readonly failures: unknown[]; controller: boolean; callbackClosed: boolean; retirementFailed: boolean } | undefined;
   const archiveOwners = new WeakMap<SourceLock, { readonly owner: HeldMutex; readonly input: FileHandle; readonly identity: string;
     readonly selected: NonNullable<Awaited<ReturnType<typeof readAnchoredControllerArchive>>>;
     readonly binding?: PublicRestoreCatalogBinding }>();
@@ -267,7 +267,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     if (!confirmed) { invalidate(); throw new MaintenanceFailure("maintenance_lost", "source-client-facts"); }
   }
   async function connect(connection: PostgresConnection, sourceSession: boolean, critical = false,
-    role: Session["role"] = "inspection", preserveFailure = false): Promise<Session> {
+    role: Session["role"] = "inspection", preserveFailure = false, onCleanupFailure?: () => void): Promise<Session> {
     assertOpen();
     const client = new Client({ ...connection.clientConfig,
       application_name: `boardroom-maintenance:${randomUUID()}` });
@@ -286,7 +286,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     } catch (error) {
       const errors: unknown[] = [preserveFailure ? error : safeError(error, sourceSession ? "source_missing" : "restore_verification_unavailable")];
       try { await endSession(session, true); }
-      catch (closeError) { errors.push(preserveFailure ? closeError : safeError(closeError, "maintenance_lost", "connection-close")); }
+      catch (closeError) { onCleanupFailure?.(); errors.push(preserveFailure ? closeError : safeError(closeError, "maintenance_lost", "connection-close")); }
       throwResourceFailures(errors); throw errors[0];
     }
   }
@@ -883,7 +883,8 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       // is only established when a fresh real operation mutex AND source transaction lock are granted.
       const streamOf = (client: Client) => (client as unknown as { connection?: { stream?: { readonly closed?: boolean } } }).connection?.stream;
       const sourceStream = streamOf(locked.client), mutexStream = streamOf(heldMutex.session.client);
-      currentControllerSource = { lock, session: locked, held: heldMutex, mutex: publicMutex, failures: [], controller: false };
+      currentControllerSource = { lock, session: locked, held: heldMutex, mutex: publicMutex, failures: [], controller: false,
+        callbackClosed: false, retirementFailed: false };
       controllerSources.set(lock, { adapter, mutex: publicMutex, select: () => {
         controllerUsed = true;
         if (currentControllerSource?.lock === lock) currentControllerSource.controller = true;
@@ -905,6 +906,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         observe: () => lock.observeSourceClients(), manifests: () => lock.observe(), write: plan => writePostgresControlSql(locked.client, plan),
         sourceHandleClosed: () => sourceStream?.closed === true, mutexHandleClosed: () => mutexStream?.closed === true });
       const result = await callback(lock);
+      currentControllerSource.callbackClosed = true;
       const pending = finishControlSqlCallback(lock), restore = finishControllerRestoreCallback(lock);
       if (pending) { await pending; assertControlSqlCommit(lock); }
       if (restore) await restore;
@@ -949,6 +951,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       active = false; return result;
     } catch (error) {
       failed = true;
+      if (currentControllerSource && currentControllerSource.lock === trackedLock) currentControllerSource.callbackClosed = true;
       if (controllerUsed) factory.close();
       noteControlSql(trackedLock, "failure", error);
       retainPendingControlSqlFailure(trackedLock); retainPendingControllerRestoreFailures(trackedLock);
@@ -987,10 +990,15 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   }
   function verifyDatabase(databaseFile: string, expected: DatabaseManifests, restoreDirectory: string): Promise<Json> {
     const original = currentControllerSource;
+    if (!original || original.callbackClosed) return Promise.reject(new MaintenanceFailure("maintenance_lost"));
     const operation = verifyDatabaseOperation(databaseFile, expected, restoreDirectory);
     activeVerifications.add(operation);
     void operation.then(() => activeVerifications.delete(operation), error => {
-      activeVerifications.delete(operation); original?.failures.push(error);
+      activeVerifications.delete(operation);
+      // Only a settled ordinary refusal may be handled by the source callback.
+      // Actual controller, pending and retirement failures stay with its owner.
+      if (original.controller || original.callbackClosed || original.retirementFailed)
+        original.failures.push(error);
     });
     return operation;
   }
@@ -1008,7 +1016,8 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     await privateDirectory(restoreDirectory);
     const isPublic = sourceConnection.schema === "public";
     const preserveFailure = original?.controller === true;
-    const target = await connect(verificationConnection, false, isPublic, "inspection", preserveFailure);
+    const target = await connect(verificationConnection, false, isPublic, "inspection", preserveFailure,
+      () => { if (original) original.retirementFailed = true; });
     let input: Awaited<ReturnType<typeof open>> | undefined;
     let monitor: ReturnType<typeof setInterval> | undefined, monitorPending: Promise<void> | undefined;
     let targetIdentity: PostgresDatabaseIdentity | undefined, verifiedTargetIdentity: PostgresDatabaseIdentity | undefined;
@@ -1204,13 +1213,16 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
             || archiveIdentity(await lstat(databaseFile, { bigint: true })) !== owned.identity)
             throw new MaintenanceFailure("maintenance_lost");
         }
-      } catch (error) { errors.push(preserveFailure ? error : safeError(error, "restore_verification_unavailable", "verification-final-check")); }
+      } catch (error) { if (original) original.retirementFailed = true;
+        errors.push(preserveFailure ? error : safeError(error, "restore_verification_unavailable", "verification-final-check")); }
       // Every owned resource gets a close attempt even when an earlier cleanup failed.
       // A failed end response is not confirmation that the target session is gone.
       try { if (input) await closeVerificationInput(input); }
-      catch (error) { errors.push(preserveFailure ? error : safeError(error, "maintenance_lost", "verification-input-close")); }
+      catch (error) { if (original) original.retirementFailed = true;
+        errors.push(preserveFailure ? error : safeError(error, "maintenance_lost", "verification-input-close")); }
       try { await endSession(target, true); }
-      catch (error) { errors.push(preserveFailure ? error : safeError(error, "maintenance_lost", "verification-target-close")); }
+      catch (error) { if (original) original.retirementFailed = true;
+        errors.push(preserveFailure ? error : safeError(error, "maintenance_lost", "verification-target-close")); }
       if (original) archiveOwners.delete(original.lock);
       throwResourceFailures(errors);
     }

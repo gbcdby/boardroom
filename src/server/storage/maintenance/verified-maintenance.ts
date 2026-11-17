@@ -4,7 +4,7 @@ import type { ControllerCommandScope } from "./controller-write.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { captureReference, verifySnapshotClosure } from "./journal.ts";
 import { parseReceipt } from "./parse.ts";
-import { withControllerRestoreCallback } from "./restore-authorization.ts";
+import { forwardControllerRestoreFailure, runControllerRestoreCheck, runControllerRestoreConsumer, withControllerRestoreCallback } from "./restore-authorization.ts";
 import type { MaintenanceRef, SnapshotReceipt, SourceLock } from "./types.ts";
 
 const verifiedGuard: unique symbol = Symbol("verified-maintenance-guard");
@@ -32,6 +32,8 @@ interface GuardState {
   failed: boolean;
   firstFailure: unknown;
   checking?: Promise<void>;
+  failedChecking?: Promise<void>;
+  readonly checks: WeakSet<Promise<void>>;
 }
 const consumers = new WeakMap<VerifiedMaintenanceConsumer, ConsumerState>();
 const guards = new WeakMap<VerifiedMaintenanceGuard, GuardState>();
@@ -51,21 +53,33 @@ function assertGuardCurrent(this: VerifiedMaintenanceGuard): Promise<void> {
   const state = guards.get(this);
   if (!state || !state.active) return Promise.reject(new MaintenanceFailure("maintenance_lost", "verified-maintenance"));
   if (state.checking) return state.checking;
-  if (state.failed) return Promise.reject(state.firstFailure);
-  // Register the original check before any native/read await. Concurrent
-  // assertions observe that same Promise; scope closure must await it too.
-  let start!: () => void;
-  const gate = new Promise<void>(resolve => { start = resolve; });
-  const checking = gate.then(async () => {
+  if (state.failed) return state.failedChecking!;
+  // The fixed wrapper owns this exact checking Promise, including early native
+  // checks before any restore child. Public callers still observe its raw error.
+  const checking = runControllerRestoreCheck(state.scope, state.lock, async () => {
     const actual = await assertControllerCommandWindow(state.scope, state.lock), head = actual.chain?.nodes.at(-1);
     requireValue(state.active && head && same(captureReference(head), state.maintenance)
       && head.record.phase === "snapshot_ready" && !actual.chain!.nodes.some(node => ["cancel_intent", "cancelled"].includes(node.record.event)));
-    await state.current();
-  }).catch(error => {
-    if (!state.failed) state.firstFailure = error;
-    state.failed = true; throw error;
-  }).finally(() => { if (state.checking === checking) delete state.checking; });
-  state.checking = checking; start(); return checking;
+    const current = state.current();
+    try { await current; }
+    catch { forwardControllerRestoreFailure(state.scope, state.lock, current); }
+  });
+  state.checks.add(checking); state.checking = checking;
+  void checking.then(() => { if (state.checking === checking) delete state.checking; }, error => {
+    if (!state.failed) { state.firstFailure = error; state.failedChecking = checking; }
+    state.failed = true;
+    if (state.checking === checking) delete state.checking;
+  });
+  return checking;
+}
+
+/** Fixed trusted consumer forwarding only. No error value, id or propagation
+ * flag is accepted. The original guard and its actual checking Promise select
+ * the already observed failure; an independent throw does not call this entry. */
+export function forwardVerifiedMaintenanceFailure(guard: VerifiedMaintenanceGuard, checking: Promise<void>): never {
+  const state = guards.get(guard);
+  requireValue(state && state.active && state.checks.has(checking));
+  forwardControllerRestoreFailure(state.scope, state.lock, checking);
 }
 
 /** Actual consumers validate the original object in this private table, so a
@@ -96,33 +110,38 @@ function consumeVerified<T>(this: VerifiedMaintenanceConsumer, ref: MaintenanceR
       // A readonly current-ready check cannot issue this guard. This entry always
       // obtains a fresh actual restore in the original snapshot lock/owner.
       const { revalidateControllerReady } = await import("./restore-authorization.ts");
-      const verified = await revalidateControllerReady(state.scope, state.lock);
+      const revalidation = revalidateControllerReady(state.scope, state.lock);
+      let verified: Awaited<typeof revalidation>;
+      try { verified = await revalidation; }
+      catch { forwardControllerRestoreFailure(state.scope, state.lock, revalidation); }
       requireValue(same(verified.ref, ref) && same(verified.receipt, supplied), "snapshot_invalid");
       const maintenance = freeze(structuredClone(verified.ref)), receipt = freeze(structuredClone(verified.receipt));
       guard = Object.freeze({ [verifiedGuard]: true as const, maintenance, snapshot: receipt, assertCurrent: assertGuardCurrent });
       lifetime = { scope: state.scope, lock: state.lock, current: verified.assertCurrent, maintenance,
-        active: true, failed: false, firstFailure: undefined };
+        active: true, failed: false, firstFailure: undefined, checks: new WeakSet() };
       guards.set(guard, lifetime);
-      const failures: unknown[] = [];
-      let result: { value: T } | undefined;
-      try {
-        await assertVerifiedMaintenanceGuard(guard);
-        result = { value: await consume(guard) };
-        // A consumer may start a real guard assertion without awaiting it. Keep
-        // that exact operation alive, finish it, then make the final fresh check.
-        if (lifetime.checking) await lifetime.checking;
-        await assertVerifiedMaintenanceGuard(guard);
-      } catch (error) { failures.push(error); }
+      const check = async () => {
+        const checking = assertVerifiedMaintenanceGuard(guard!);
+        try { await checking; }
+        catch { forwardVerifiedMaintenanceFailure(guard!, checking); }
+      };
+      await check();
+      // Own the actual consumer invocation separately from its checking children.
+      // Its independent throw remains an occurrence even for an equal raw value.
+      const consumption = runControllerRestoreConsumer(state.scope, state.lock, () => consume(guard!));
+      let result: T;
+      try { result = await consumption; }
+      catch { forwardControllerRestoreFailure(state.scope, state.lock, consumption); }
       if (lifetime.checking) {
-        try { await lifetime.checking; }
-        catch (error) { failures.push(error); }
+        const checking = lifetime.checking;
+        try { await checking; }
+        catch { forwardVerifiedMaintenanceFailure(guard, checking); }
       }
-      // Sticky validation failure remains failure even if a trusted consumer
-      // catches it and returns normally. Literal undefined is an observed failure.
-      if (!failures.length && lifetime.failed) failures.push(lifetime.firstFailure);
-      if (failures.length === 1) throw failures[0];
-      if (failures.length > 1) throw new AggregateError(failures, "storage_maintenance: verified consumer failed", { cause: failures[0] });
-      requireValue(result); return result.value;
+      await check();
+      // The original failed checking remains available after its current slot is
+      // cleared. A sticky rejection never creates a new Promise or occurrence.
+      if (lifetime.failed) forwardVerifiedMaintenanceFailure(guard, lifetime.failedChecking!);
+      return result;
     } finally {
       if (lifetime) lifetime.active = false;
     }

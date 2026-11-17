@@ -1,8 +1,8 @@
-// Passive per-process evidence for the macOS full-suite investigation. This
+// Passive per-process evidence for the Linux/macOS full-suite investigation. This
 // module neither changes test outcomes nor makes a process stay alive.
 import { channel } from "node:diagnostics_channel";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, closeSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, globSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as schedule } from "node:timers";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,8 @@ const MAX_RUNNERS = 8;
 const MAX_ENTRYPOINT_BYTES = 128 * 1024;
 const MAX_ENTRYPOINTS = 1024;
 const SNAPSHOTS = [60_000, 180_000];
+export const observationParts = process.platform === "linux"
+  ? ["linux-ci-isolation", "full-suite"] : ["macos-tests"];
 // Existing tests mock Date. Keep observation timestamps on the original clock.
 const WallDate = Date;
 const monotonicNow = performance.now.bind(performance);
@@ -25,18 +27,23 @@ function within(root, path) {
 }
 
 export function prepareEntrypoints(root) {
-  // Only the actual --test parent records its tracked selection metadata. npm
-  // and ordinary helpers do not create a manifest or per-test process log.
-  const entries = execFileSync("git", ["-C", root, "ls-files", "-z", "--", "tests"], {
+  // Only the actual --test parent records selection metadata. The Linux child
+  // has an exact verified source archive without .git, so use its original glob.
+  // npm and ordinary helpers do not create a manifest or per-test process log.
+  const entries = process.platform === "linux"
+    ? globSync("tests/**/*.test.ts", { cwd: root }).sort()
+    : execFileSync("git", ["-C", root, "ls-files", "-z", "--", "tests"], {
     encoding: "utf8", timeout: 3000, maxBuffer: MAX_ENTRYPOINT_BYTES,
     stdio: ["ignore", "pipe", "pipe"],
   }).split("\0").filter(path => path.startsWith("tests/") && path.endsWith(".test.ts"));
   if (!entries.length || entries.length > MAX_ENTRYPOINTS) return;
   const text = JSON.stringify({ schema: "boardroom-test-entrypoints/v1", status: "READY",
     runnerPid: process.pid, ppid: process.ppid, node: process.version,
-    at: new WallDate().toISOString(), source: "git ls-files", entries });
+    at: new WallDate().toISOString(),
+    source: process.platform === "linux" ? "node:fs.globSync" : "git ls-files",
+    partition: process.platform === "linux" ? process.env.BOARDROOM_CI_TEST_PARTITION ?? "1/1" : undefined, entries });
   if (Buffer.byteLength(text) > MAX_ENTRYPOINT_BYTES) return;
-  const directory = join(root, ".agent-output", "macos-tests", "test-entrypoints");
+  const directory = join(root, ".agent-output", ...observationParts, "test-entrypoints");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   for (let slot = 0; slot < MAX_RUNNERS; slot++) {
     const path = join(directory, `slot-${slot}`);
@@ -49,7 +56,7 @@ export function prepareEntrypoints(root) {
 
 function trackedEntrypoint(root, path) {
   for (let slot = 0; slot < MAX_RUNNERS; slot++) {
-    const manifest = join(root, ".agent-output", "macos-tests", "test-entrypoints", `slot-${slot}`, "entrypoints.json");
+    const manifest = join(root, ".agent-output", ...observationParts, "test-entrypoints", `slot-${slot}`, "entrypoints.json");
     try {
       const stat = lstatSync(manifest);
       if (!stat.isFile() || stat.size > MAX_ENTRYPOINT_BYTES) continue;
@@ -75,7 +82,7 @@ function entry() {
 }
 
 function observe({ root, path }) {
-  const directory = join(root, ".agent-output", "macos-tests", "test-processes");
+  const directory = join(root, ".agent-output", ...observationParts, "test-processes");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   let output;
   // Atomic slots put a hard bound on all process logs, including nested runners.
@@ -202,7 +209,7 @@ function observe({ root, path }) {
     maxProcessLogs: MAX_PROCESSES, snapshotAfterMs: SNAPSHOTS,
     sourceSemantics: "node-v24.22.2", channels: ["start", "end", "error"],
     runtimeSourceReviewed: process.version === "v24.22.2",
-    entrypointGate: "child-v8 + direct parent tracked manifest + real regular repository test entrypoint",
+    entrypointGate: "child-v8 + direct parent discovery manifest + real regular repository test entrypoint",
     coverage: "before-main-module; trace starts after before hooks; end includes failure; no asyncStart/asyncEnd",
   }, true);
 }

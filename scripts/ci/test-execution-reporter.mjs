@@ -4,7 +4,7 @@
 import { appendFileSync, closeSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { prepareEntrypoints } from "./test-process-observer.mjs";
+import { observationParts, prepareEntrypoints } from "./test-process-observer.mjs";
 
 const ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const MAX_BYTES = 8 * 1024 * 1024;
@@ -39,7 +39,7 @@ function flag(value) {
 }
 
 function openLog() {
-  const directory = join(ROOT, ".agent-output", "macos-tests", "test-execution");
+  const directory = join(ROOT, ".agent-output", ...observationParts, "test-execution");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   for (let slot = 0; slot < MAX_RUNNERS; slot++) {
     const path = join(directory, `slot-${slot}`);

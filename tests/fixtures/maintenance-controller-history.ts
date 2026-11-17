@@ -7,6 +7,9 @@ import { randomUUID } from "node:crypto";
 import { Client } from "pg";
 import type { PostgresDescriptor } from "../../src/server/storage/maintenance/postgres-tools.ts";
 import { canonicalJson } from "../../src/server/storage/maintenance/canonical.ts";
+import { captureReference } from "../../src/server/storage/maintenance/journal.ts";
+import { parseReceipt } from "../../src/server/storage/maintenance/parse.ts";
+import type { VerifiedMaintenanceGuard } from "../../src/server/storage/maintenance/verified-maintenance.ts";
 import { registeredProcess, type EventFacts } from "../../src/server/storage/maintenance/control-candidate/schema.ts";
 import type { ControllerOwner } from "../../src/server/storage/maintenance/controller-owner.ts";
 import type { MaintenanceAdapter, OperationMutex, SourceLock, SourceRef } from "../../src/server/storage/maintenance/types.ts";
@@ -35,7 +38,7 @@ export async function controllerWriterFixture(kind: "sqlite" | "postgres" = "sql
     const url = new URL(process.env.AGENT_STUDIO_PG_TEST_URL); url.pathname = `/${name}`;
     verificationTarget = { kind: "postgres", connectionString: url.toString() };
   };
-  const names = new Set(["controller-write.ts", "control-sql.ts", "sqlite.ts", "postgres.ts", "restore-authorization.ts", "controller-owner.ts",
+  const names = new Set(["controller-write.ts", "control-sql.ts", "sqlite.ts", "postgres.ts", "restore-authorization.ts", "controller-owner.ts", "verified-maintenance.ts",
     "snapshot-bundle.ts", "snapshot-ready.ts", "verify-bundle.ts", "verification-source-client-binding.ts", "source-files.ts"]);
   try {
     if (kind === "postgres" && (options.legacyReady || options.verification)) await freshTarget();
@@ -67,6 +70,7 @@ export async function controllerWriterFixture(kind: "sqlite" | "postgres" = "sql
     const sql = await import(pathToFileURL(path.join(directory, "control-sql.ts")).href) as typeof import("../../src/server/storage/maintenance/control-sql.ts");
     const consumers = await import(pathToFileURL(path.join(directory, "restore-authorization.ts")).href) as typeof import("../../src/server/storage/maintenance/restore-authorization.ts");
     const owners = await import(pathToFileURL(path.join(directory, "controller-owner.ts")).href) as typeof import("../../src/server/storage/maintenance/controller-owner.ts");
+    const guard = await import(pathToFileURL(path.join(directory, "verified-maintenance.ts")).href) as typeof import("../../src/server/storage/maintenance/verified-maintenance.ts");
     const bundle = await import(pathToFileURL(path.join(directory, "snapshot-bundle.ts")).href) as typeof import("../../src/server/storage/maintenance/snapshot-bundle.ts");
     const verify = await import(pathToFileURL(path.join(directory, "verify-bundle.ts")).href) as typeof import("../../src/server/storage/maintenance/verify-bundle.ts");
     const readyStage = await import(pathToFileURL(path.join(directory, "snapshot-ready.ts")).href) as typeof import("../../src/server/storage/maintenance/snapshot-ready.ts");
@@ -101,7 +105,7 @@ export async function controllerWriterFixture(kind: "sqlite" | "postgres" = "sql
     }
     const ownedAdapter = adapter, held = mutex;
     if (commandOwner) owners.rememberControllerStore(commandOwner, store);
-    return { ...source, request, adapter: ownedAdapter, mutex: held, store, writer, sql, consumers, owners, commandOwner, verificationTarget, async close() {
+    return { ...source, request, adapter: ownedAdapter, mutex: held, store, writer, sql, consumers, owners, guard, commandOwner, verificationTarget, async close() {
       const errors: unknown[] = [];
       for (const cleanup of [() => held.release(), () => ownedAdapter.close(), dropTarget, () => admin?.end(),
         () => source.close(), () => rm(copyDirectory, { recursive: true })]) {
@@ -196,6 +200,106 @@ export async function assertControllerPendingFailures(kind: "sqlite" | "postgres
     assert.deepEqual(failures, [first, ...laterErrors]); assert.strictEqual(failures[0], first);
     for (const value of failures.slice(1)) assert.strictEqual(value, later);
   } finally { releaseParent(); release(); await Promise.allSettled([...(outer ? [outer] : []), ...(operation ? [operation] : [])]); await f.close(); }
+}
+
+/** Actual fixed withVerifiedMaintenance entry, including N07 and original owner.
+ * Only explicit terminal forwarding uses the guard's private checking identity. */
+export async function assertVerifiedConsumerFailure(kind: "sqlite" | "postgres",
+  variant: "revalidate" | "check-early" | "check-child" | "join" | "last-check" | "independent-same" | "independent-undefined" | "independent-after") {
+  const f = await controllerWriterFixture(kind, { legacyReady: true, commandOwner: true });
+  const first = new Error("outer source callback occurrence");
+  const later = variant === "independent-undefined" ? undefined : new Error("actual guarded operation occurrence");
+  const independent = variant.startsWith("independent-");
+  let release!: () => void, reached!: () => void, releaseConsumer!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; }), entered = new Promise<void>(resolve => { reached = resolve; });
+  const consumerGate = new Promise<void>(resolve => { releaseConsumer = resolve; });
+  let original: SourceLock | undefined, checking: Promise<void> | undefined, consumerPromise: Promise<unknown> | undefined;
+  let retained: VerifiedMaintenanceGuard | undefined, outer: Promise<void> | undefined;
+  let throws = 0, consumed = 0;
+  try {
+    const { scope } = await f.adapter.withSourceLock("control", lock => f.writer.beginControllerCommand(f.adapter, f.mutex, lock,
+      { operation: "resume-migration", request: f.request }));
+    const before = await f.adapter.observe(), rows = await f.adapter.observeSourceClients();
+    outer = f.adapter.withSourceLock("snapshot", async lock => {
+      original = lock;
+      const current = await f.writer.assertControllerCommandWindow(scope, lock), head = current.chain?.nodes.at(-1);
+      assert(head?.record.snapshot);
+      const consumer = await f.guard.createVerifiedMaintenanceConsumer(scope, lock);
+      const arm = (at: number) => {
+        const read = lock.observeSourceClients.bind(lock); let count = 0;
+        lock.observeSourceClients = async () => {
+          const raw = await read();
+          if (++count === at) { reached(); await gate; throws++; throw later; }
+          return raw;
+        };
+      };
+      // Parent currentWindow, fixed consumer currentWindow, then the actual
+      // revalidate child's currentWindow. All reads run before injecting C.
+      if (variant === "revalidate") arm(3);
+      consumerPromise = consumer.withVerifiedMaintenance(captureReference(head),
+        parseReceipt(await current.store.readJson(head.record.snapshot, "receipt")), async guard => {
+          retained = guard; consumed++;
+          assert.notEqual(variant, "revalidate", "initial revalidation must fail before consumer entry");
+          // First checking read is its own native precheck. The next read is
+          // within the original ControllerReadyView.assertCurrent child.
+          arm(variant === "check-child" ? 2 : 1);
+          if (variant === "last-check") return;
+          checking = guard.assertCurrent();
+          assert.strictEqual(guard.assertCurrent(), checking, "concurrent check returns the original Promise");
+          assert.throws(() => f.guard.forwardVerifiedMaintenanceFailure({ ...guard }, checking!), { code: "maintenance_lost" });
+          assert.throws(() => f.guard.forwardVerifiedMaintenanceFailure(guard, Promise.resolve()), { code: "maintenance_lost" });
+          if (variant === "join") { void checking.catch(() => undefined); return; }
+          if (independent && variant !== "independent-after") {
+            void checking.catch(() => undefined); await consumerGate; throws++; throw later;
+          }
+          try { await checking; }
+          catch (error) {
+            assert.strictEqual(error, later, "the guard exposes the original raw value, never a carrier");
+            assert.strictEqual(guard.assertCurrent(), checking, "sticky failure retains its original checking after the current slot clears");
+            if (variant === "independent-after") { throws++; throw later; }
+            f.guard.forwardVerifiedMaintenanceFailure(guard, checking);
+          }
+        });
+      void consumerPromise.catch(() => undefined);
+      await Promise.race([entered, consumerPromise.then(() => { throw new Error("consumer unexpectedly completed before fault"); })]);
+      throw first;
+    });
+    void outer.catch(() => undefined);
+    await Promise.race([entered, outer.then(() => { throw new Error("source unexpectedly completed before fault"); })]);
+    await new Promise<void>(resolve => setImmediate(resolve)); assert(original);
+    const files = (await readdir(f.store.root, { recursive: true })).sort();
+    assert.equal(f.sql.controlSqlOutcome(original).commitStarted, false);
+    assert.equal(f.sql.controlSqlOutcome(original).localSourceHandleClosed, false); await original.assertHeld();
+    if (independent) { releaseConsumer(); await new Promise<void>(resolve => setImmediate(resolve)); await original.assertHeld(); }
+    release();
+    let caught = false;
+    try { await outer; } catch (error) { caught = true; assert.strictEqual(error, first); }
+    assert(caught); caught = false;
+    try { await consumerPromise; } catch (error) {
+      caught = true;
+      if (independent) { assert(error instanceof AggregateError); assert.deepEqual(error.errors, [later, later]);
+        assert(error.errors.every(value => value === later)); }
+      else assert.strictEqual(error, later, "the original consumer parent exposes only the raw single occurrence");
+    }
+    assert(caught); assert.equal(throws, independent ? 2 : 1); assert.equal(consumed, variant === "revalidate" ? 0 : 1);
+    if (checking) { caught = false; try { await checking; } catch (error) { caught = true; assert.strictEqual(error, later); } assert(caught); }
+    const outcome = f.sql.controlSqlOutcome(original), laterErrors = independent ? [later, later] : [later];
+    assert.strictEqual(outcome.originalError, first); assert.equal(outcome.commitStarted, false); assert.equal(outcome.commitReturned, false);
+    assert.equal(outcome.localSourceHandleClosed, true);
+    assert.deepEqual(outcome.cleanupEvents?.map(event => event.error), laterErrors);
+    assert(outcome.cleanupEvents?.every(event => event.stage === "pending-operation-failure"));
+    assert.deepEqual(await f.adapter.observe(), before); assert.deepEqual(await f.adapter.observeSourceClients(), rows);
+    assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), files);
+    if (retained && checking) {
+      await assert.rejects(retained.assertCurrent(), { code: "maintenance_lost" });
+      assert.throws(() => f.guard.forwardVerifiedMaintenanceFailure(retained!, checking!), { code: "maintenance_lost" });
+      assert.throws(() => f.consumers.forwardControllerRestoreFailure(scope, original!, checking!), { code: "maintenance_lost" });
+    }
+    assert(f.commandOwner); caught = false; const failures = [first];
+    try { await f.owners.finishControllerCommandOwner(f.commandOwner, f.mutex, original, failures, "verified-consumer-test"); }
+    catch (error) { caught = true; assert(error instanceof AggregateError); assert.strictEqual(error.cause, first); assert.deepEqual(error.errors, [first, ...laterErrors]); }
+    assert(caught); assert.equal(f.commandOwner.adapterClosed, true);
+  } finally { releaseConsumer(); release(); await Promise.allSettled([...(outer ? [outer] : []), ...(consumerPromise ? [consumerPromise] : [])]); await f.close(); }
 }
 
 /** A real otherwise idle child, not a registered maintenance controller or a simulated exit. */

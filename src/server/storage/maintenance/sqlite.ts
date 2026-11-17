@@ -117,6 +117,8 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   private readonly verificationConnections = new Set<Database.Database>();
   private readonly verificationTasks = new Set<Promise<Json>>();
   private readonly verificationFailures = new WeakMap<SourceLock, unknown[]>();
+  private readonly closedVerificationCallbacks = new WeakSet<SourceLock>();
+  private readonly failedVerificationRetirements = new WeakSet<SourceLock>();
   private readonly archiveOwners = new WeakMap<SourceLock, ArchiveVerificationOwner>();
   private currentSourceLock: SourceLock | undefined;
   private readonly bindFiles = new Map<FileHandle, { fd: number; identity?: string }>();
@@ -264,10 +266,12 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     if (!db.open) this.mutexConnections.delete(db);
     throwResourceFailures(errors);
   }
-  private finishVerification(db: Database.Database, errors: unknown[]): void {
+  private finishVerification(db: Database.Database, errors: unknown[], sourceLock?: SourceLock): void {
     if (db.open) {
-      try { if (db.inTransaction) db.exec("ROLLBACK"); } catch (error) { errors.push(error); }
-      try { db.close(); } catch (error) { errors.push(error); }
+      try { if (db.inTransaction) db.exec("ROLLBACK"); }
+      catch (error) { if (sourceLock) this.failedVerificationRetirements.add(sourceLock); errors.push(error); }
+      try { db.close(); }
+      catch (error) { if (sourceLock) this.failedVerificationRetirements.add(sourceLock); errors.push(error); }
     }
     if (!db.open) this.verificationConnections.delete(db);
     throwResourceFailures(errors);
@@ -569,7 +573,9 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
         invalidateFacts: () => { factsInvalidated = true; controlSqlUsed = true; },
         observe: () => lock.observeSourceClients(), manifests: () => lock.observe(),
         write: async plan => writeSqliteControlSql(db, plan), sourceHandleClosed: () => !db.open, mutexHandleClosed: () => !mutex.db.open });
-      const result = await callback(lock), pending = finishControlSqlCallback(lock), restore = finishControllerRestoreCallback(lock);
+      const result = await callback(lock);
+      this.closedVerificationCallbacks.add(lock);
+      const pending = finishControlSqlCallback(lock), restore = finishControllerRestoreCallback(lock);
       if (pending) { await pending; assertControlSqlCommit(lock); }
       if (restore) await restore;
       if (this.backupTasks.size) await Promise.allSettled([...this.backupTasks]);
@@ -584,6 +590,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     } catch (error) {
       // Cleanup observations cannot replace the callback/COMMIT failure, including throw undefined.
       failed = true;
+      if (trackedLock) this.closedVerificationCallbacks.add(trackedLock);
       if (controllerUsed) factory.close();
       noteControlSql(trackedLock, "failure", error);
       retainPendingControlSqlFailure(trackedLock); retainPendingControllerRestoreFailures(trackedLock);
@@ -757,11 +764,17 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   }
   verifyDatabase(databaseFile: string, expected: DatabaseManifests, restoreDirectory: string): Promise<Json> {
     const sourceLock = this.currentSourceLock;
+    if (!sourceLock || this.closedVerificationCallbacks.has(sourceLock)) return Promise.reject(new MaintenanceFailure("maintenance_lost"));
     const operation = this.verifyDatabaseOperation(databaseFile, expected, restoreDirectory);
     this.verificationTasks.add(operation);
     void operation.then(() => this.verificationTasks.delete(operation), error => {
       this.verificationTasks.delete(operation);
-      if (sourceLock) this.verificationFailures.get(sourceLock)?.push(error);
+      // A settled ordinary refusal belongs to its awaiting callback. Controller
+      // failures, unfinished work at callback exit and actual cleanup failures
+      // remain the original source owner's responsibility even if caught.
+      if (controllerSources.get(sourceLock)?.selected() || this.closedVerificationCallbacks.has(sourceLock)
+        || this.failedVerificationRetirements.has(sourceLock))
+        this.verificationFailures.get(sourceLock)?.push(error);
     });
     return operation;
   }
@@ -807,7 +820,8 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     } catch (error) { appendResourceFailure(errors, error); }
     finally {
       this.archiveOwners.delete(lock);
-      for (const file of files) { try { await this.closeArchiveInput(file); } catch (error) { appendResourceFailure(errors, error); } }
+      for (const file of files) { try { await this.closeArchiveInput(file); }
+        catch (error) { this.failedVerificationRetirements.add(lock); appendResourceFailure(errors, error); } }
     }
     throwResourceFailures(errors); return result!;
   }
@@ -829,6 +843,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   }
   private async verifyDatabaseFromFile(databaseFile: string, expected: DatabaseManifests, restoreDirectory: string,
     preserveFailure = false): Promise<Json> {
+    const sourceLock = this.currentSourceLock;
     if (!this.mutex?.active || !this.currentLock) throw new MaintenanceFailure("maintenance_lost");
     if (this.verificationConnections.size) throw new MaintenanceFailure("maintenance_lost", "verification-close-unknown");
     await this.mutex.assertHeld();
@@ -854,7 +869,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       if (preserveFailure) errors.push(error);
       else try { failure(error); } catch (mapped) { errors.push(mapped); }
     }
-    this.finishVerification(db, errors);
+    this.finishVerification(db, errors, sourceLock);
     return result!;
   }
   async inspectWriters(_observation: SourceObservation): Promise<readonly Blocker[]> {

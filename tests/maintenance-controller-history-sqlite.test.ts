@@ -5,7 +5,7 @@ import filesystem from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import Database from "better-sqlite3";
 import { sqliteAuditFixture } from "./fixtures/maintenance-source-audit.ts";
-import { assertControllerPendingFailures, controllerWriterFixture, historicalControllerProcess, historicalControllerRow } from "./fixtures/maintenance-controller-history.ts";
+import { assertControllerPendingFailures, assertVerifiedConsumerFailure, controllerWriterFixture, historicalControllerProcess, historicalControllerRow } from "./fixtures/maintenance-controller-history.ts";
 import { readyRevalidationFixture } from "./fixtures/maintenance-ready-revalidation.ts";
 import { canonicalJson } from "../src/server/storage/maintenance/canonical.ts";
 import { verifySnapshotClosure } from "../src/server/storage/maintenance/journal.ts";
@@ -18,6 +18,11 @@ import type { SourceLock } from "../src/server/storage/maintenance/types.ts";
 // Only these new capture/restore engineering fixtures use the Linux source-FD bridge.
 // The existing native audit cases keep their original cross-platform gate.
 const captureTest = process.platform === "linux" ? test : test.skip;
+
+captureTest("C3 sqlite fixed verified consumer preserves original failure forwarding and independent occurrences", async t => {
+  for (const variant of ["revalidate", "check-early", "check-child", "join", "last-check", "independent-same", "independent-undefined", "independent-after"] as const)
+    await t.test(variant, () => assertVerifiedConsumerFailure("sqlite", variant));
+});
 
 captureTest("C3 SQLite keeps each independent pending callback failure after the original source callback failure", async t => {
   for (const variant of ["distinct", "same", "undefined", "parent-and-child", "control-writer"] as const)
@@ -184,6 +189,21 @@ captureTest("C3 SQLite ready writer consumes actual D/V only after snapshot COMM
     assert.equal(closure.receipt.capture.journal.sha256, selected.state.journalDigest);
     assert.deepEqual((await f.adapter.observeSourceClients()).rows, selected.rows);
     assert.equal((await f.adapter.observe()).state.journalDigest, ready.node.reference.sha256);
+  } finally { await f.close(); }
+});
+
+captureTest("C3 SQLite a handled verification refusal remains sticky in the original private controller window", async () => {
+  const f = await readyRevalidationFixture();
+  try {
+    const scope = await f.select(), before = await f.adapter.observe();
+    const attempt = await f.store.createAttempt(before.state.ownerGeneration);
+    await assert.rejects(f.snapshot(async lock => {
+      await f.writer.assertControllerCommandWindow(scope, lock);
+      const archive = path.join(attempt, "backup.sqlite"), backup = await lock.backup(archive);
+      await assert.rejects(f.adapter.verifyDatabase(archive, { ...backup.manifests, fullDataManifestDigest: "0".repeat(64) },
+        path.join(attempt, "restore")), { code: "snapshot_invalid" });
+    }), { code: "snapshot_invalid" });
+    assert.deepEqual(await f.adapter.observe(), before);
   } finally { await f.close(); }
 });
 
