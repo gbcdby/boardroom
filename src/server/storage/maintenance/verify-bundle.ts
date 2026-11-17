@@ -3,6 +3,7 @@ import { canonicalJson } from "./canonical.ts";
 import { decodeRow } from "./control-candidate/rows.ts";
 import { controlProofSchema } from "./control-candidate/schema.ts";
 import { MaintenanceFailure } from "./error.ts";
+import { assertCapturedSourceClientBinding } from "./source-client-binding.ts";
 import { compatibleSourceClientWindow, type SourceClientJournalProof, type SourceClientObservationProof, type SourceClientRegistrationProof } from "./source-client-window.ts";
 import { captureReference, verifyJournalChain, verifyRestoreBundleClosure, type JournalNode } from "./journal.ts";
 import { ArtifactStore } from "./objects.ts";
@@ -52,7 +53,7 @@ function liveControlProof(nodes: readonly JournalNode[], captureIndex: number): 
  * The native lock's *current* DB anchor must extend B's exact capture through only
  * the quiesced observation/takeover transitions permitted by the journal protocol.
  * Immutable artifacts are never selected by the filesystem's latest-looking name. */
-async function assertLiveCapture(store: ArtifactStore, observed: SourceObservation,
+async function assertLiveCapture(store: ArtifactStore, lock: SourceLock, observed: SourceObservation,
   closed: Awaited<ReturnType<typeof verifyRestoreBundleClosure>>): Promise<void> {
   const capture = closed.bundle.capture, state = observed.state;
   requireValue(state.admission === "sealed" && state.journalRecordRef !== null && state.journalDigest !== null
@@ -78,7 +79,10 @@ async function assertLiveCapture(store: ArtifactStore, observed: SourceObservati
     && head.reference.ref === state.journalRecordRef && head.reference.sha256 === state.journalDigest,
     "maintenance_lost");
 
-  const frozen = closed.chain.nodes.at(-1)!.record.frozen;
+  const captured = closed.chain.nodes.at(-1)!.record, frozen = captured.frozen;
+  requireValue(captured.formatVersion === 2 && captured.sourceClients !== null, "source_changed");
+  // Establish the archived baseline before the live window's same-row fast path.
+  await assertCapturedSourceClientBinding(lock, observed, captured.sourceClients, closed.manifests);
   requireValue(frozen !== null && state.guardManifestDigest === frozen.guardManifestDigest
     && observed.manifests.schemaManifestDigest === frozen.schemaManifestDigest
     && observed.manifests.frozenBusinessManifestDigest === frozen.frozenBusinessManifestDigest
@@ -133,13 +137,13 @@ export async function verifyRestoreBundle(store: ArtifactStore, adapter: Mainten
   requireValue(same(initial.source, closure.bundle.capture.source) && same(initial.sourceIdentity, closure.chain.plan.sourceIdentity)
     && adapter.dialect === initial.source.kind, "source_changed");
   requireValue(initial.state.controlRootJson === canonicalJson(store.identity) && initial.state.mutexIdentityJson !== null, "control_root_mismatch");
-  await assertLiveCapture(store, initial, closure);
+  await assertLiveCapture(store, lock, initial, closure);
   const assertCurrent = async () => {
     await lock.assertHeld();
     const current = await lock.observe();
     requireValue(same(current.source, initial.source) && same(current.sourceIdentity, initial.sourceIdentity)
       && same(current.state, initial.state) && same(current.manifests, initial.manifests), "source_changed");
-    await assertLiveCapture(store, current, closure);
+    await assertLiveCapture(store, lock, current, closure);
     await lock.assertHeld();
   };
   const guarded = await ArtifactStore.open(store.root, initial.source, { assertCurrent: () => lock.assertHeld() });

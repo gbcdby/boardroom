@@ -102,6 +102,25 @@ for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeT
   });
 
 for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeTest : pgTest)(
+  `#228 V ${kind}: the native roster read must agree before database verification starts`, async () => {
+    const f = await verificationBundleFixture(kind);
+    try {
+      await f.run(async lock => {
+        const refs = await f.publish(lock);
+        let restoreStarted = false;
+        const adapter = { ...f.adapter, verifyDatabase: async () => {
+          restoreStarted = true; throw new Error("database verification reached before source-client binding");
+        } };
+        // Only the returned observation is inconsistent. No source row, archive or process is changed.
+        const inconsistent = { ...lock, observeSourceClients: async () => ({ ...await lock.observeSourceClients(), schemaManifestDigest: "f".repeat(64) }) };
+        await assert.rejects(verifyRestoreBundle(f.store, adapter, inconsistent, refs.bundle, refs.publication),
+          error => error instanceof MaintenanceFailure && error.code === "source_changed");
+        assert.equal(restoreStarted, false);
+      });
+    } finally { await f.close(); }
+  });
+
+for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeTest : pgTest)(
   `#152 V ${kind}: original B/U cannot authorize a new sealed migration on the same physical source`, async t => {
     const f = await verificationBundleFixture(kind);
     let restored = 0;
