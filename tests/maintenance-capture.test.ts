@@ -489,9 +489,10 @@ for (const kind of ["sqlite", "postgres"] as const) {
   });
 
 
-  nativeTest("#152 C1 " + kind + ": lost mutex never releases the still-active source transaction", async () => {
+  nativeTest("#152 C1 " + kind + ": lost mutex never releases the still-active source transaction", async t => {
     const f = await captureFixture(kind);
     let other: Awaited<ReturnType<typeof f.createAdapter>> | undefined;
+    let otherMutex: OperationMutex | undefined, pgMutexClient: Client | undefined;
     let held!: OperationMutex, release!: () => void, reached!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; }), started = new Promise<void>(resolve => { reached = resolve; });
     let running: ReturnType<typeof f.capture> | undefined;
@@ -502,19 +503,50 @@ for (const kind of ["sqlite", "postgres"] as const) {
         owner.adapter.acquireMutex = async (...args) => held = await acquire(...args);
       };
       f.state.hook = async stage => { if (stage === "capture-begin") { reached(); await gate; } };
+      if (kind === "postgres") {
+        const query = Client.prototype.query;
+        t.mock.method(Client.prototype, "query", async function(this: Client, ...args: unknown[]) {
+          const result = await Reflect.apply(query, this, args) as QueryResult;
+          const database = (this as unknown as { connectionParameters: { database: string } }).connectionParameters.database;
+          if (!pgMutexClient && database === f.database && typeof args[0] === "string"
+            && args[0].startsWith("SELECT pg_catalog.pg_try_advisory_lock") && result.rows[0]?.acquired === true)
+            pgMutexClient = this;
+          return result;
+        } as typeof query);
+      }
       running = f.capture(f.options, f.request);
       await Promise.race([started, running.then(() => { throw new Error("C did not retain its source transaction"); })]);
-      await held.release();
+      if (kind === "sqlite") await held.release();
+      else {
+        // The PG API correctly forbids normal release during its source callback.
+        // Lose only the genuine original advisory lock, on its actual private session.
+        await assert.rejects(held.release(), { code: "maintenance_busy" });
+        assert(pgMutexClient); await pgMutexClient.query("SELECT pg_catalog.pg_advisory_unlock_all()");
+      }
       other = await f.createAdapter();
-      // These actual adapters first bind/check their mutex under source control.
-      // The retained original transaction blocks that earlier boundary too.
-      await assert.rejects(other.acquireMutex(store.identity, (await other.observe()).state), { code: "maintenance_busy" });
+      if (kind === "sqlite") {
+        // SQLite's mutex bind first requires the actual source write lock, so the
+        // retained original transaction blocks this earlier boundary already.
+        await assert.rejects(other.acquireMutex(store.identity, (await other.observe()).state), { code: "maintenance_busy" });
+      } else {
+        otherMutex = await other.acquireMutex(store.identity, (await other.observe()).state);
+        let entered = false;
+        await assert.rejects(other.withSourceLock("control", async () => { entered = true; }), { code: "maintenance_busy" });
+        assert.equal(entered, false, "a new advisory mutex cannot overlap the old real source critical section");
+        await otherMutex.release(); otherMutex = undefined;
+      }
       await other.close(); other = undefined;
-      release(); await assert.rejects(running, { code: "maintenance_lost" }); running = undefined;
+      release(); await assert.rejects(running, error => {
+        const first = error instanceof AggregateError ? error.errors[0] : error;
+        return first instanceof MaintenanceFailure && first.code === "maintenance_lost";
+      }); running = undefined;
       assert.deepEqual(await f.observe(), before);
       delete f.state.onOwner; f.state.hook = () => {};
       assert.equal((await f.capture(f.options, f.request)).status, "paused");
-    } finally { release(); await running?.catch(() => {}); await other?.close(); await f.close(); }
+    } finally {
+      release(); await running?.catch(() => {}); t.mock.restoreAll();
+      try { await otherMutex?.release(); } finally { await other?.close(); await f.close(); }
+    }
   });
   nativeTest("#152 C1 " + kind + ": actual v2 C artifacts feed existing D B V R Jr without widening default readers", async () => {
     const f = await captureFixture(kind, { sessions: true });
