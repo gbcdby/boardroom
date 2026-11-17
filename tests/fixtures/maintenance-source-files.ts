@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { chmodSync, lstatSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -36,6 +37,21 @@ interface State {
 const states = new Map<string, State>();
 const owners = new WeakMap<FixtureHandle, { state: State; file: string; active: () => boolean }>();
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+let nativePreparation: Promise<void> | undefined;
+function prepareNativeFixture(): Promise<void> {
+  if (process.platform !== "linux") return Promise.resolve();
+  // A fixture cannot depend on another test file having built this candidate.
+  // Keep both fulfillment and rejection for this module; never retry a failed
+  // build or infer validity from an addon left by a previous checkout.
+  return nativePreparation ??= Promise.resolve().then(() => {
+    const built = spawnSync(process.execPath,
+      [fileURLToPath(new URL("../../scripts/build-maintenance-platform.mjs", import.meta.url)), "--source-files"],
+      { cwd: fileURLToPath(new URL("../../", import.meta.url)), encoding: "utf8", timeout: 65_000 });
+    if (built.error !== undefined) throw built.error;
+    if (built.status !== 0 || built.signal !== null)
+      throw new Error(`source-files fixture native build failed (${built.status}/${built.signal}): ${built.stderr.slice(0, 4096)}`);
+  });
+}
 function stateFor(file: string): State {
   const state = [...states.values()].find(item => file === item.directory || file.startsWith(item.directory + path.sep)
     || file === path.dirname(item.directory));
@@ -156,6 +172,7 @@ export async function isolatedSourceFiles(limits: Readonly<Record<string, string
 }
 
 export async function sourceFilesFixture(options: { sessions?: "present" | "absent"; config?: boolean } = {}) {
+  await prepareNativeFixture();
   const directory = await mkdtemp(path.join(process.cwd(), "maintenance-s-test-"));
   chmodSync(directory, 0o700);
   const config = path.join(directory, "config.json"), sessions = path.join(directory, "sessions"), database = path.join(directory, "source.db");

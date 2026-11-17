@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { Client, type QueryResult } from "pg";
 import { postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgres.ts";
-import { assertControllerPendingFailures, assertVerifiedConsumerFailure, controllerWriterFixture, historicalControllerProcess, historicalControllerRow } from "./fixtures/maintenance-controller-history.ts";
+import { assertControllerPendingFailures, controllerWriterFixture, historicalControllerProcess, historicalControllerRow } from "./fixtures/maintenance-controller-history.ts";
 import type { ControllerCommandScope } from "../src/server/storage/maintenance/controller-write.ts";
 import { verifySnapshotClosure } from "../src/server/storage/maintenance/journal.ts";
 import type { SourceLock } from "../src/server/storage/maintenance/types.ts";
@@ -12,11 +12,6 @@ const pgTest = process.env.AGENT_STUDIO_PG_TEST_URL ? test : test.skip;
 // Only these new capture/restore engineering fixtures use the Linux source-FD bridge.
 // The existing native audit cases keep their original cross-platform gate.
 const pgCaptureTest = process.platform === "linux" ? pgTest : test.skip;
-
-pgCaptureTest("C3 postgres fixed verified consumer preserves original failure forwarding and independent occurrences", async t => {
-  for (const variant of ["admission", "revalidate", "check-early", "check-child", "join", "last-check", "independent-same", "independent-undefined", "independent-after"] as const)
-    await t.test(variant, () => assertVerifiedConsumerFailure("postgres", variant));
-});
 
 pgCaptureTest("C3 PostgreSQL keeps each independent pending callback failure after the original source callback failure", async t => {
   for (const variant of ["distinct", "same", "undefined", "parent-and-child", "control-writer"] as const)

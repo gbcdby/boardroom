@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import childProcess, { spawnSync } from "node:child_process";
 import { chmodSync, linkSync, lstatSync, mkdirSync, renameSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import promises, { readFile, readdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonicalJson, sha256 } from "../src/server/storage/maintenance/canonical.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
@@ -12,7 +13,7 @@ import type { SourceFileExtendedObservation, SourceFileNativeCall } from "../src
 import type { SourceFileRootObservation } from "../src/server/storage/maintenance/source-file-profile.ts";
 import type { ArtifactRef } from "../src/server/storage/maintenance/types.ts";
 import { readSourceFiles } from "../src/server/storage/maintenance/parse.ts";
-import { isolatedSourceFiles, sourceFilesFixture } from "./fixtures/maintenance-source-files.ts";
+import { isolatedSourceFiles, sourceFilesFixture, withNativeSourceRoot } from "./fixtures/maintenance-source-files.ts";
 
 const linuxTest = process.platform === "linux" ? test : test.skip;
 async function rejected(work: Promise<unknown>) {
@@ -63,6 +64,67 @@ linuxTest("#152 S fixture loads the real native owner bridge (no profile qualifi
   const result = spawnSync(process.execPath, ["scripts/build-maintenance-platform.mjs", "--source-files"],
     { cwd: process.cwd(), encoding: "utf8", timeout: 65_000 });
   assert.equal(result.error, undefined); assert.equal(result.status, 0, result.stderr);
+});
+linuxTest("#152 S shared fixture prepares the current native bridge once before actual owner use", async t => {
+  const original = childProcess.spawnSync;
+  const script = fileURLToPath(new URL("../scripts/build-maintenance-platform.mjs", import.meta.url));
+  const fixtures: Awaited<ReturnType<typeof sourceFilesFixture>>[] = [];
+  let builds = 0;
+  t.mock.method(childProcess, "spawnSync", function(...args: Parameters<typeof original>) {
+    if (args[0] === process.execPath && Array.isArray(args[1]) && args[1][0] === script) builds++;
+    return Reflect.apply(original, childProcess, args);
+  });
+  syncBuiltinESMExports();
+  try {
+    for (let index = 0; index < 2; index++) {
+      const f = await sourceFilesFixture(); fixtures.push(f);
+      await withNativeSourceRoot(f.sessions, handle => assert.equal(handle.kind, "directory"));
+      assert.equal(f.state.handles.size, 0);
+    }
+    assert.equal(builds, 1, "an existing addon is rebuilt, then the second fixture shares that completed preparation");
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    for (const f of fixtures) await f.close();
+  }
+});
+linuxTest("#152 S shared fixture preserves an actual compiler failure without retry or fixture creation", async t => {
+  const directory = await promises.mkdtemp(path.join(process.cwd(), ".agent-output-s-build-failure-"));
+  const originalFixture = new URL("./fixtures/maintenance-source-files.ts", import.meta.url);
+  const fixtureDirectory = path.join(directory, "tests", "fixtures"), nativeDirectory = path.join(directory, "native");
+  const addon = path.join(directory, "build", "maintenance-platform", "maintenance-source-files-linux-" + process.arch + ".node");
+  let creations = 0;
+  try {
+    await promises.mkdir(fixtureDirectory, { recursive: true });
+    await promises.mkdir(path.join(directory, "scripts"));
+    await promises.mkdir(nativeDirectory);
+    await promises.copyFile(new URL("../scripts/build-maintenance-platform.mjs", import.meta.url), path.join(directory, "scripts", "build-maintenance-platform.mjs"));
+    await promises.cp(new URL("../native/node-api", import.meta.url), path.join(nativeDirectory, "node-api"), { recursive: true });
+    await writeFile(path.join(nativeDirectory, "maintenance-source-files.c"), "#error controlled fixture compiler failure\n");
+    const code = (await readFile(originalFixture, "utf8")).replace(/from "(\.{1,2}\/[^"\n]+)"/g,
+      (_, relative: string) => "from " + JSON.stringify(new URL(relative, originalFixture).href));
+    const fixtureFile = path.join(fixtureDirectory, "maintenance-source-files.ts"); await writeFile(fixtureFile, code);
+    const fixture = await import(pathToFileURL(fixtureFile).href) as typeof import("./fixtures/maintenance-source-files.ts");
+    const mkdtemp = promises.mkdtemp;
+    t.mock.method(promises, "mkdtemp", ((...args: Parameters<typeof mkdtemp>) => {
+      if (String(args[0]).endsWith("maintenance-s-test-")) creations++;
+      return Reflect.apply(mkdtemp, promises, args);
+    }) as typeof mkdtemp);
+    syncBuiltinESMExports();
+    let first: unknown;
+    await assert.rejects(fixture.sourceFilesFixture(), error => {
+      first = error; assert(error instanceof Error);
+      assert.match(error.message, /source-files fixture native build failed \(1\/null\)/);
+      assert.match(error.message, /Linux source-file native compiler failed/); return true;
+    });
+    // A fresh build would now succeed, but this same failed initialization must
+    // remain failed. Only this test's private native input/output is changed.
+    await promises.copyFile(new URL("../native/maintenance-source-files.c", import.meta.url), path.join(nativeDirectory, "maintenance-source-files.c"));
+    await assert.rejects(fixture.sourceFilesFixture(), error => error === first);
+    assert.equal(creations, 0); await assert.rejects(promises.access(addon), { code: "ENOENT" });
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    await promises.rm(directory, { recursive: true, force: true });
+  }
 });
 linuxTest("#152 S captures exact streamed bytes, full roots and durable canonical payload closure", async () => {
   const copy = await isolatedSourceFiles(), f = await sourceFilesFixture();
