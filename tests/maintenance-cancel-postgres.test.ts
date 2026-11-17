@@ -17,11 +17,20 @@ postgresTest("#152 C3 cancel PostgreSQL: planned rejection and an actual termina
     assert.equal(invalid.status, "blocked"); if (invalid.status !== "blocked") throw new Error("planned PG cancel must fail closed");
     assert.deepEqual(invalid.blockers.map(blocker => blocker.code), ["request_conflict"]);
     assert.deepEqual(await f.observe(), before); assert.deepEqual((await readdir(f.reference.controlRoot, { recursive: true })).sort(), names);
+    // Cut after the original capture COMMIT/close. beforeSource runs before
+    // the controller selects the next lock and keeps ordinary PG error projection.
     const cut = new Error("actual PG first capture completed");
-    f.state.beforeSource = (_lock, stage) => { if (stage === 2) throw cut; };
+    let captureClosed = false;
+    f.state.afterSourceClose = (lock, stage, kind) => {
+      if (stage !== 1) return;
+      assert.equal(kind, "control");
+      const outcome = f.sql.controlSqlOutcome(lock);
+      assert.equal(outcome.commitReturned, true); assert.equal(outcome.localSourceHandleClosed, true);
+      captureClosed = true; throw cut;
+    };
     await assert.rejects(f.service.runMaintenanceServiceCommand(f.options, { operation: "resume-migration",
       request: { ...f.request, requestId: "pg-first-capture-before-cancel" } }), error => error === cut);
-    delete f.state.beforeSource;
+    assert.equal(captureClosed, true); delete f.state.afterSourceClose;
     const quiesced = await f.observe();
     assert.equal(quiesced.state.admission, "sealed"); assert.equal(quiesced.state.journalSequence, 2);
     assert(quiesced.state.journalDigest);

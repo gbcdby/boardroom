@@ -526,7 +526,9 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
             throw new MaintenanceFailure("snapshot_invalid", "source-clients");
           }
         },
-        withSourceClientFacts: (plan, consume) => {
+        withSourceClientFacts: async (plan, consume) => {
+          // Reject this expired window before issuing a lease for the still-held mutex.
+          await factsAccess.assertUnchangedLock();
           factsUsed = true;
           return withSourceClientFacts(factsAccess, plan, consume,
             { lease: factory.bind(this, mutex, lock, factsAccess.assertUnchangedLock), lock });

@@ -45,7 +45,7 @@ class IsolationError(RuntimeError):
 
 
 def validated_partition(entry, partition):
-    if partition is not None and (entry != 'full-suite' or partition not in ('1/4', '2/4', '3/4', '4/4')):
+    if partition is not None and (entry != 'full-suite' or partition not in ('1/8', '2/8', '3/8', '4/8', '5/8', '6/8', '7/8', '8/8')):
         raise IsolationError('Unknown fixed full-suite partition')
     return partition
 
@@ -59,8 +59,10 @@ def command_for(entry, partition=None):
                 "2>&1 | tee .agent-output/maintenance-native-diagnostics/sqlite-source-users.tap")
     if entry == 'full-suite':
         # Native Node sharding keeps the complete original glob. Each matrix
-        # runner owns its PG service/UID; no scheduling flag reaches nested Node.
-        script = 'test:ci:linux' + (':' + partition[0] + 'of4' if partition else '')
+        # runner owns its PG service/UID and runs one file at a time, avoiding
+        # another test entry's concurrent exit in its same-UID source inventory.
+        # No scheduling flag reaches nested Node. The unpartitioned entry stays at four.
+        script = 'test:ci:linux' + (':' + partition[0] + 'of8' if partition else '')
         return ("mkdir -p .agent-output/linux-ci-isolation/full-suite\n"
                 "node scripts/ci/test-discovery.mjs\n"
                 f"npm run {script} 2>&1 | tee .agent-output/linux-ci-isolation/full-suite/full-suite.tap")

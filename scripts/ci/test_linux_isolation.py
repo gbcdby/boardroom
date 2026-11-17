@@ -187,21 +187,28 @@ class WholeSuitePartitionContracts(unittest.TestCase):
             observer.mkdir(parents=True)
             for filename in ('test-execution-reporter.mjs', 'test-process-observer.mjs', 'test-discovery.mjs'):
                 shutil.copyfile(self.root / 'scripts/ci' / filename, observer / filename)
-            names = [f'tests/file-{i:02d}.test.ts' for i in range(9)] + ['tests/nested/a.test.ts', 'tests/nested/b.test.ts']
+            names = [f'tests/file-{i:02d}.test.ts' for i in range(24)] + ['tests/nested/a.test.ts', 'tests/nested/b.test.ts']
             for i, name in enumerate(names):
                 file = root / name
                 file.parent.mkdir(parents=True, exist_ok=True)
                 file.write_text("import test from 'node:test';import assert from 'node:assert/strict';import {appendFileSync} from 'node:fs';\n"
-                    f"test({json.dumps(name)},()=>{{appendFileSync(process.env.BOARDROOM_PARTITION_PROBE_FILE,{json.dumps(name + chr(10))});"
+                    "import {setTimeout as delay} from 'node:timers/promises';\n"
+                    f"const file={json.dumps(name)};const record=event=>appendFileSync(process.env.BOARDROOM_PARTITION_INTERVALS,"
+                    "JSON.stringify({event,file,pid:process.pid,ns:String(process.hrtime.bigint())})+'\\n');\n"
+                    "record('file-start');process.once('exit',()=>record('process-exit'));\n"
+                    f"test({json.dumps(name)},async()=>{{appendFileSync(process.env.BOARDROOM_PARTITION_PROBE_FILE,{json.dumps(name + chr(10))});"
+                    "await delay(60);"
                     + ("assert.fail('deliberate partition failure');" if i == 5 else "assert.ok(true);") + "});\n")
             selected, codes = [], []
-            for index in range(1, 5):
-                script = scripts[f'test:ci:linux:{index}of4']
-                self.assertEqual(script, f'node --test --test-concurrency=4 --test-shard={index}/4 "tests/**/*.test.ts"')
+            for index in range(1, 9):
+                script = scripts[f'test:ci:linux:{index}of8']
+                self.assertEqual(script, f'node --test --test-concurrency=1 --test-shard={index}/8 "tests/**/*.test.ts"')
                 log = root / f'partition-{index}.txt'
-                request = LauncherContracts().request('full-suite') | {'partition': f'{index}/4'}
+                intervals = root / f'partition-{index}-intervals.jsonl'
+                request = LauncherContracts().request('full-suite') | {'partition': f'{index}/8'}
                 observation_env = ci.child_environment(request, stage)
                 env = dict(os.environ, BOARDROOM_PARTITION_PROBE_FILE=str(log),
+                           BOARDROOM_PARTITION_INTERVALS=str(intervals),
                            BOARDROOM_CI_TEST_PARTITION=observation_env['BOARDROOM_CI_TEST_PARTITION'],
                            GITHUB_SHA=request['head'], NODE_OPTIONS=observation_env['NODE_OPTIONS'])
                 if index == 1:
@@ -213,23 +220,43 @@ class WholeSuitePartitionContracts(unittest.TestCase):
                                         capture_output=True, text=True, timeout=30)
                 self.assertIn(result.returncode, (0, 1), result.stderr)
                 entries = log.read_text().splitlines()
-                self.assertTrue(entries, f'partition {index} had no original test execution')
+                self.assertGreaterEqual(len(entries), 3, f'partition {index} needs multiple real files to check serialization')
                 self.assertEqual(len(entries), len(set(entries)))
+                # Observe actual test-file process intervals, not only a CLI flag.
+                # An exit hook is not a kernel reap receipt; that stronger claim is out of scope.
+                active, ended, maximum = set(), set(), 0
+                events = [json.loads(line) for line in intervals.read_text().splitlines()]
+                self.assertEqual(len(events), 2 * len(entries))
+                for event in events:
+                    self.assertIn(event['file'], entries)
+                    self.assertGreater(event['pid'], 0)
+                    if event['event'] == 'file-start':
+                        self.assertNotIn(event['file'], active | ended)
+                        active.add(event['file']); maximum = max(maximum, len(active))
+                        self.assertEqual(len(active), 1, f'overlapping actual files in partition {index}: {events}')
+                    else:
+                        self.assertEqual(event['event'], 'process-exit')
+                        self.assertIn(event['file'], active)
+                        active.remove(event['file']); ended.add(event['file'])
+                self.assertEqual(maximum, 1); self.assertEqual(active, set()); self.assertEqual(ended, set(entries))
+                if result.returncode:
+                    self.assertIn('deliberate partition failure', result.stdout)
                 selected.append(set(entries)); codes.append(result.returncode)
-            self.assertEqual(sorted(codes), [0, 0, 0, 1])
+            self.assertEqual(sorted(codes), [0] * 7 + [1])
             self.assertEqual(set.union(*selected), set(names))
-            for left in range(4):
-                for right in range(left + 1, 4):
+            for left in range(8):
+                for right in range(left + 1, 8):
                     self.assertFalse(selected[left] & selected[right])
             evidence = root / '.agent-output/linux-ci-isolation/full-suite'
             discovery = json.loads((evidence / 'test-scheduler.json').read_text())
             self.assertEqual(discovery['candidate'], 'a' * 40)
-            self.assertEqual(discovery['partition'], '1/4')
+            self.assertEqual(discovery['partition'], '1/8')
+            self.assertEqual(discovery['configuredConcurrency'], 1)
             self.assertEqual(discovery['result'], 'NOT_RUN')
             self.assertEqual(discovery['entries'], sorted(names))
             manifests = [json.loads(p.read_text()) for p in (evidence / 'test-entrypoints').glob('slot-*/entrypoints.json')]
-            self.assertEqual(len(manifests), 4)
-            self.assertEqual({m['partition'] for m in manifests}, {'1/4', '2/4', '3/4', '4/4'})
+            self.assertEqual(len(manifests), 8)
+            self.assertEqual({m['partition'] for m in manifests}, {f'{index}/8' for index in range(1, 9)})
             for manifest in manifests:
                 self.assertEqual(manifest['source'], 'node:fs.globSync')
                 self.assertEqual(set(manifest['entries']), set(names))
@@ -241,7 +268,7 @@ class WholeSuitePartitionContracts(unittest.TestCase):
             self.assertEqual({event['entryFile'] for event in ready}, set(names))
             self.assertTrue(any(event['event'] == 'process-exit' and event['code'] != 0 for event in observations))
             reporters = list((evidence / 'test-execution').glob('slot-*/runner-*.jsonl'))
-            self.assertEqual(len(reporters), 4)
+            self.assertEqual(len(reporters), 8)
             for path in reporters:
                 events = [json.loads(line) for line in path.read_text().splitlines()]
                 self.assertEqual(events[0]['event'], 'reporter-ready')
@@ -249,23 +276,78 @@ class WholeSuitePartitionContracts(unittest.TestCase):
                 self.assertTrue(events[-1]['sourceEnded'])
 
     def test_fixed_partition_input_and_nested_node_scope(self):
-        for index in range(1, 5):
-            partition = f'{index}/4'
-            self.assertIn(f'npm run test:ci:linux:{index}of4', ci.command_for('full-suite', partition))
+        for index in range(1, 9):
+            partition = f'{index}/8'
+            self.assertIn(f'npm run test:ci:linux:{index}of8', ci.command_for('full-suite', partition))
             request = LauncherContracts().request('full-suite') | {'partition': partition}
             env = ci.child_environment(request, Path('/owned/stage'))
             self.assertEqual(env['BOARDROOM_CI_TEST_PARTITION'], partition)
             self.assertEqual(env['AGENT_STUDIO_PG_TEST_URL'], ci.PG_URL)
             self.assertNotIn('--test-shard', env['NODE_OPTIONS'])
             self.assertNotIn('--test-concurrency', env['NODE_OPTIONS'])
-        for invalid in ('', '0/4', '5/4', '1/1', '1/8', '1/4 --test-name-pattern=skip', 1, {}, []):
+        for invalid in ('', '0/8', '9/8', '1/1', '1/4', '1/8 --test-name-pattern=skip', 1, {}, []):
             with self.subTest(partition=invalid):
                 with self.assertRaises(ci.IsolationError):
                     ci.command_for('full-suite', invalid)
                 with self.assertRaises(ci.IsolationError):
                     ci.child_environment(LauncherContracts().request('full-suite') | {'partition': invalid}, Path('/owned/stage'))
         with self.assertRaises(ci.IsolationError):
-            ci.command_for('sqlite', '1/4')
+            ci.command_for('sqlite', '1/8')
+
+    def test_discovery_reports_original_default_and_every_serial_partition(self):
+        with tempfile.TemporaryDirectory(prefix='boardroom-discovery-context-') as directory:
+            for partition in (None, *(f'{index}/8' for index in range(1, 9)), '1/4', '9/8'):
+                with self.subTest(partition=partition):
+                    root = Path(directory) / (partition.replace('/', '-') if partition else 'default')
+                    (root / 'tests').mkdir(parents=True)
+                    (root / 'tests' / 'only.test.ts').write_text('// Discovery only; never executed.\n')
+                    env = dict(os.environ, GITHUB_SHA='a' * 40)
+                    env.pop('BOARDROOM_CI_TEST_PARTITION', None)
+                    if partition is not None:
+                        env['BOARDROOM_CI_TEST_PARTITION'] = partition
+                    result = subprocess.run(['node', str(self.root / 'scripts/ci/test-discovery.mjs')], cwd=root,
+                                            env=env, capture_output=True, text=True, timeout=10)
+                    output = root / '.agent-output/linux-ci-isolation/full-suite/test-scheduler.json'
+                    if partition in ('1/4', '9/8'):
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn('unknown fixed partition', result.stderr)
+                        self.assertFalse(output.exists())
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        value = json.loads(output.read_text())
+                        self.assertEqual(value['partition'], partition or '1/1')
+                        self.assertEqual(value['configuredConcurrency'], 1 if partition else 4)
+                        self.assertEqual(value['entries'], ['tests/only.test.ts'])
+                        self.assertEqual(value['candidate'], 'a' * 40)
+                        self.assertEqual(value['result'], 'NOT_RUN')
+
+    def test_nested_node_receives_observation_without_inheriting_parent_scheduling(self):
+        import shlex
+        import shutil
+        scripts = json.loads((self.root / 'package.json').read_text())['scripts']
+        with tempfile.TemporaryDirectory(prefix='boardroom-nested-partition-') as directory:
+            stage = Path(directory); root = stage / ci.WORKSPACE
+            observer = root / 'scripts/ci'; observer.mkdir(parents=True)
+            for filename in ('test-execution-reporter.mjs', 'test-process-observer.mjs'):
+                shutil.copyfile(self.root / 'scripts/ci' / filename, observer / filename)
+            (root / 'tests').mkdir(); (root / 'nested').mkdir()
+            for name in ('a', 'b'):
+                (root / 'nested' / f'{name}.test.mjs').write_text("import test from 'node:test';import {appendFileSync} from 'node:fs';"
+                    f"test('{name}',()=>appendFileSync(process.env.BOARDROOM_NESTED_PROBE,{json.dumps(name + chr(10))}));")
+            (root / 'tests' / 'parent.test.ts').write_text("import test from 'node:test';import assert from 'node:assert/strict';"
+                "import {execFileSync} from 'node:child_process';"
+                "test('actual nested runner',()=>{assert.doesNotMatch(process.env.NODE_OPTIONS,/--test-(shard|concurrency)/);"
+                "const env={...process.env};delete env.NODE_TEST_CONTEXT;"
+                "const output=execFileSync(process.execPath,['--test','nested/a.test.mjs','nested/b.test.mjs'],{env,encoding:'utf8'});"
+                "assert.match(output,/# pass 2/);});")
+            request = LauncherContracts().request('full-suite') | {'partition': '1/8'}
+            env = dict(os.environ, **ci.child_environment(request, stage), BOARDROOM_NESTED_PROBE=str(root / 'nested.txt'))
+            # Keep the actual local Node binary while exercising the original child context values.
+            env['PATH'] = os.environ['PATH']
+            result = subprocess.run(shlex.split(scripts['test:ci:linux:1of8']), cwd=root, env=env,
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(sorted((root / 'nested.txt').read_text().splitlines()), ['a', 'b'])
 
     def test_hosted_frontend_accepts_only_the_actual_partition_job(self):
         workflow = self.workflow()
@@ -301,7 +383,7 @@ class WholeSuitePartitionContracts(unittest.TestCase):
         workflow = self.workflow()
         partitions = workflow['jobs']['database-partitions']
         aggregate = workflow['jobs']['database-tests']
-        self.assertEqual(partitions['strategy'], {'fail-fast': False, 'matrix': {'partition': ['1/4', '2/4', '3/4', '4/4']}})
+        self.assertEqual(partitions['strategy'], {'fail-fast': False, 'matrix': {'partition': [f'{index}/8' for index in range(1, 9)]}})
         self.assertEqual(aggregate['name'], 'Node 24 · SQLite / PostgreSQL')
         self.assertEqual(aggregate['needs'], 'database-partitions')
         self.assertEqual(aggregate['if'], '${{ always() }}')

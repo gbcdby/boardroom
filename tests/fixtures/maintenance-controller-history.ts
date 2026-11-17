@@ -14,6 +14,7 @@ import { registeredProcess, type EventFacts } from "../../src/server/storage/mai
 import type { ControllerOwner } from "../../src/server/storage/maintenance/controller-owner.ts";
 import type { MaintenanceAdapter, OperationMutex, SourceLock, SourceRef } from "../../src/server/storage/maintenance/types.ts";
 import { captureFixture } from "./maintenance-capture.ts";
+import { withSqliteSourceInventoryDiagnostics } from "./maintenance-source-inventory-diagnostic.ts";
 
 /** Actual adapter/factory/SQL/COMMIT/close paths, with the existing explicitly
  * synthetic filesystem-profile fixture only. Never a production qualification. */
@@ -205,18 +206,19 @@ export async function assertControllerPendingFailures(kind: "sqlite" | "postgres
 /** Actual fixed withVerifiedMaintenance entry, including N07 and original owner.
  * Only explicit terminal forwarding uses the guard's private checking identity. */
 export async function assertVerifiedConsumerFailure(kind: "sqlite" | "postgres",
-  variant: "revalidate" | "check-early" | "check-child" | "join" | "last-check" | "independent-same" | "independent-undefined" | "independent-after") {
+  variant: "admission" | "revalidate" | "check-early" | "check-child" | "join" | "last-check" | "independent-same" | "independent-undefined" | "independent-after") {
   const f = await controllerWriterFixture(kind, { legacyReady: true, commandOwner: true });
   const first = new Error("outer source callback occurrence");
   const later = variant === "independent-undefined" ? undefined : new Error("actual guarded operation occurrence");
   const independent = variant.startsWith("independent-");
+  const admission = variant === "admission";
   let release!: () => void, reached!: () => void, releaseConsumer!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; }), entered = new Promise<void>(resolve => { reached = resolve; });
   const consumerGate = new Promise<void>(resolve => { releaseConsumer = resolve; });
   let original: SourceLock | undefined, checking: Promise<void> | undefined, consumerPromise: Promise<unknown> | undefined;
   let retained: VerifiedMaintenanceGuard | undefined, outer: Promise<void> | undefined;
   let throws = 0, consumed = 0;
-  try {
+  const exercise = async () => {
     const { scope } = await f.adapter.withSourceLock("control", lock => f.writer.beginControllerCommand(f.adapter, f.mutex, lock,
       { operation: "resume-migration", request: f.request }));
     const before = await f.adapter.observe(), rows = await f.adapter.observeSourceClients();
@@ -229,16 +231,18 @@ export async function assertVerifiedConsumerFailure(kind: "sqlite" | "postgres",
         const read = lock.observeSourceClients.bind(lock); let count = 0;
         lock.observeSourceClients = async () => {
           const raw = await read();
-          if (++count === at) { reached(); await gate; throws++; throw later; }
+          if (++count === at) { reached(); await gate; if (!admission) { throws++; throw later; } }
           return raw;
         };
       };
       // Parent currentWindow, fixed consumer currentWindow, then the actual
       // revalidate child's currentWindow. All reads run before injecting C.
-      if (variant === "revalidate") arm(3);
+      if (admission) arm(2);
+      else if (variant === "revalidate") arm(3);
       consumerPromise = consumer.withVerifiedMaintenance(captureReference(head),
         parseReceipt(await current.store.readJson(head.record.snapshot, "receipt")), async guard => {
           retained = guard; consumed++;
+          assert.equal(admission, false, "closed admission must not restore or enter the consumer");
           assert.notEqual(variant, "revalidate", "initial revalidation must fail before consumer entry");
           // First checking read is its own native precheck. The next read is
           // within the original ControllerReadyView.assertCurrent child.
@@ -279,11 +283,17 @@ export async function assertVerifiedConsumerFailure(kind: "sqlite" | "postgres",
       caught = true;
       if (independent) { assert(error instanceof AggregateError); assert.deepEqual(error.errors, [later, later]);
         assert(error.errors.every(value => value === later)); }
+      else if (admission) {
+        assert.equal((error as { code?: unknown })?.code, "maintenance_lost");
+        // The already owned parent and its close barrier expose the same raw
+        // private marker; rejection of a new entry is not a new occurrence.
+        await assert.rejects(f.consumers.finishControllerRestoreCallback(original)!, value => value === error);
+      }
       else assert.strictEqual(error, later, "the original consumer parent exposes only the raw single occurrence");
     }
-    assert(caught); assert.equal(throws, independent ? 2 : 1); assert.equal(consumed, variant === "revalidate" ? 0 : 1);
+    assert(caught); assert.equal(throws, admission ? 0 : independent ? 2 : 1); assert.equal(consumed, admission || variant === "revalidate" ? 0 : 1);
     if (checking) { caught = false; try { await checking; } catch (error) { caught = true; assert.strictEqual(error, later); } assert(caught); }
-    const outcome = f.sql.controlSqlOutcome(original), laterErrors = independent ? [later, later] : [later];
+    const outcome = f.sql.controlSqlOutcome(original), laterErrors = admission ? [] : independent ? [later, later] : [later];
     assert.strictEqual(outcome.originalError, first); assert.equal(outcome.commitStarted, false); assert.equal(outcome.commitReturned, false);
     assert.equal(outcome.localSourceHandleClosed, true);
     assert.deepEqual(outcome.cleanupEvents?.map(event => event.error), laterErrors);
@@ -297,8 +307,19 @@ export async function assertVerifiedConsumerFailure(kind: "sqlite" | "postgres",
     }
     assert(f.commandOwner); caught = false; const failures = [first];
     try { await f.owners.finishControllerCommandOwner(f.commandOwner, f.mutex, original, failures, "verified-consumer-test"); }
-    catch (error) { caught = true; assert(error instanceof AggregateError); assert.strictEqual(error.cause, first); assert.deepEqual(error.errors, [first, ...laterErrors]); }
+    catch (error) { caught = true;
+      if (admission) assert.strictEqual(error, first);
+      else { assert(error instanceof AggregateError); assert.strictEqual(error.cause, first); assert.deepEqual(error.errors, [first, ...laterErrors]); }
+    }
     assert(caught); assert.equal(f.commandOwner.adapterClosed, true);
+  };
+  try {
+    // Observe only the original adapter's native calls. A refusal is preserved;
+    // failed PID summaries are derived from that invocation, never guessed or retried.
+    if (kind === "sqlite") await withSqliteSourceInventoryDiagnostics(f.adapter, phase => {
+      phase(`verified-consumer-${variant}`); return exercise();
+    });
+    else await exercise();
   } finally { releaseConsumer(); release(); await Promise.allSettled([...(outer ? [outer] : []), ...(consumerPromise ? [consumerPromise] : [])]); await f.close(); }
 }
 

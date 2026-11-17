@@ -20,7 +20,7 @@ import type { SourceLock } from "../src/server/storage/maintenance/types.ts";
 const captureTest = process.platform === "linux" ? test : test.skip;
 
 captureTest("C3 sqlite fixed verified consumer preserves original failure forwarding and independent occurrences", async t => {
-  for (const variant of ["revalidate", "check-early", "check-child", "join", "last-check", "independent-same", "independent-undefined", "independent-after"] as const)
+  for (const variant of ["admission", "revalidate", "check-early", "check-child", "join", "last-check", "independent-same", "independent-undefined", "independent-after"] as const)
     await t.test(variant, () => assertVerifiedConsumerFailure("sqlite", variant));
 });
 

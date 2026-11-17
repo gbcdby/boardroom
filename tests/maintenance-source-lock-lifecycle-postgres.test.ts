@@ -37,12 +37,25 @@ async function independentlyRead(f: Awaited<ReturnType<typeof fixture>>) {
 function assertOrdinaryOutcome(lock: SourceLock, expected: {
   commitStarted: boolean; commitReturned: boolean; failureObserved: boolean;
   rollbackFailureObserved: boolean; closeFailureObserved: boolean;
+  originalError?: unknown; rollbackError?: unknown; closeError?: unknown;
 }, sourceClosed = true) {
   const outcome = controlSqlOutcome(lock);
+  const cleanupEvents = [
+    ...(expected.rollbackFailureObserved ? [{ stage: "rollback-failure", error: expected.rollbackError }] : []),
+    ...(expected.closeFailureObserved ? [{ stage: "close-failure", error: expected.closeError }] : []),
+  ];
   assert.deepEqual(outcome, { kind: "untrusted-control-outcome", status: "unknown",
-    localSourceHandleClosed: sourceClosed, localMutexHandleClosed: false, ...expected });
+    localSourceHandleClosed: sourceClosed, localMutexHandleClosed: false,
+    originalError: undefined, rollbackError: undefined, closeError: undefined, ...expected, cleanupEvents });
+  // This private untrusted observation retains raw occurrence identities for owner cleanup.
+  // Safe mapping is checked on the actual public rejection, not by deleting private evidence.
+  assert.equal(outcome.originalError, expected.originalError);
+  assert.equal(outcome.rollbackError, expected.rollbackError); assert.equal(outcome.closeError, expected.closeError);
+  outcome.cleanupEvents!.forEach((event, index) => {
+    assert.equal(event.error, cleanupEvents[index]!.error); assert.equal(Object.isFrozen(event), true);
+  });
   assert.equal(Object.isFrozen(outcome), true);
-  assert.doesNotMatch(JSON.stringify(outcome), /ordinary-sensitive/);
+  assert.equal(Object.isFrozen(outcome.cleanupEvents), true);
   return outcome;
 }
 
@@ -85,7 +98,8 @@ pgTest("#152 PostgreSQL ordinary anchor requires confirmed end after its single 
       else { assert.equal(injected, true); assert.equal(rejection, failure); }
       assert.ok(captured);
       assertOrdinaryOutcome(captured, { commitStarted: true, commitReturned: true, failureObserved: false,
-        rollbackFailureObserved: false, closeFailureObserved: phase !== "success" }, phase !== "end-before");
+        rollbackFailureObserved: false, closeFailureObserved: phase !== "success",
+        closeError: phase === "success" ? undefined : failure }, phase !== "end-before");
       const actual = await independentlyRead(f);
       assert.equal(actual.maintenance[0].journal_record_ref, f.v.zeroRef.ref); assert.deepEqual(actual.clients, []);
       if (phase === "end-before") {
@@ -142,12 +156,15 @@ pgTest("#152 PostgreSQL first callback failure survives rollback/end errors and 
       if (scenario === "undefined" || scenario === "ordinary-undefined" || scenario === "busy") {
         assert.ok(rejection instanceof MaintenanceFailure); assert.equal(rejection.code, scenario === "busy" ? "maintenance_busy" : "snapshot_invalid");
       } else assert.equal(rejection, primary);
+      assert.doesNotMatch(JSON.stringify(rejection), /ordinary-sensitive/);
       if (mechanism) {
         const outcome = controlSqlOutcome(captured!);
         assert.equal(outcome.status, "unknown"); assert.equal(outcome.failureObserved, true); assert.equal(outcome.originalError, primary);
         assert.equal(outcome.rollbackError, rollbackFailure); assert.equal(outcome.closeError, closeFailure);
       } else assertOrdinaryOutcome(captured!, { commitStarted: false, commitReturned: false, failureObserved: true,
-        rollbackFailureObserved: scenario !== "ordinary-close", closeFailureObserved: scenario !== "ordinary-rollback" });
+        rollbackFailureObserved: scenario !== "ordinary-close", closeFailureObserved: scenario !== "ordinary-rollback",
+        originalError: primary, rollbackError: scenario === "ordinary-close" ? undefined : rollbackFailure,
+        closeError: scenario === "ordinary-rollback" ? undefined : closeFailure });
       assert.deepEqual(await independentlyRead(f), before, "another connection sees neither the rolled-back row nor anchor");
     } finally { child.mock.restoreAll(); if (writer) await invokeEnd(end, writer); await f.close(); }
   });
@@ -181,7 +198,8 @@ pgTest("#152 PostgreSQL COMMIT first failure is retained while an independent co
         assert.equal(outcome.status, "unknown"); assert.equal(outcome.originalError, primary);
         assert.equal(outcome.rollbackError, rollbackFailure); assert.equal(outcome.closeError, closeFailure);
       } else assertOrdinaryOutcome(captured!, { commitStarted: true, commitReturned: false, failureObserved: true,
-        rollbackFailureObserved: true, closeFailureObserved: true });
+        rollbackFailureObserved: true, closeFailureObserved: true,
+        originalError: primary, rollbackError: rollbackFailure, closeError: closeFailure });
       const actual = await independentlyRead(f);
       if (phase === "before") assert.deepEqual(actual, before);
       else { assert.equal(actual.maintenance[0].journal_record_ref, mode === "mechanism" ? f.v.insertedRef.ref : f.v.zeroRef.ref);

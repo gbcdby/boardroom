@@ -22,10 +22,14 @@
     "db:migrate": "node scripts/migrate-data.ts",
     "test": "node --test \"tests/**/*.test.ts\"",
     "test:ci:linux": "node --test --test-concurrency=4 \"tests/**/*.test.ts\"",
-    "test:ci:linux:1of4": "node --test --test-concurrency=4 --test-shard=1/4 \"tests/**/*.test.ts\"",
-    "test:ci:linux:2of4": "node --test --test-concurrency=4 --test-shard=2/4 \"tests/**/*.test.ts\"",
-    "test:ci:linux:3of4": "node --test --test-concurrency=4 --test-shard=3/4 \"tests/**/*.test.ts\"",
-    "test:ci:linux:4of4": "node --test --test-concurrency=4 --test-shard=4/4 \"tests/**/*.test.ts\"",
+    "test:ci:linux:1of8": "node --test --test-concurrency=1 --test-shard=1/8 \"tests/**/*.test.ts\"",
+    "test:ci:linux:2of8": "node --test --test-concurrency=1 --test-shard=2/8 \"tests/**/*.test.ts\"",
+    "test:ci:linux:3of8": "node --test --test-concurrency=1 --test-shard=3/8 \"tests/**/*.test.ts\"",
+    "test:ci:linux:4of8": "node --test --test-concurrency=1 --test-shard=4/8 \"tests/**/*.test.ts\"",
+    "test:ci:linux:5of8": "node --test --test-concurrency=1 --test-shard=5/8 \"tests/**/*.test.ts\"",
+    "test:ci:linux:6of8": "node --test --test-concurrency=1 --test-shard=6/8 \"tests/**/*.test.ts\"",
+    "test:ci:linux:7of8": "node --test --test-concurrency=1 --test-shard=7/8 \"tests/**/*.test.ts\"",
+    "test:ci:linux:8of8": "node --test --test-concurrency=1 --test-shard=8/8 \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit -p tsconfig.json && vue-tsc --noEmit -p src/web/tsconfig.json"
   },
   "dependencies": {

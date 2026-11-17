@@ -4,8 +4,8 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import { verificationV3Fixture } from "./fixtures/maintenance-verification-v3.ts";
 import { verifyRestoreBundle } from "../src/server/storage/maintenance/verify-bundle.ts";
-import { verifyVerificationRestoreBundleClosure } from "../src/server/storage/maintenance/journal.ts";
-import { parseVerification } from "../src/server/storage/maintenance/parse.ts";
+import { verifyRestoreBundleClosure, verifyVerificationRestoreBundleClosure } from "../src/server/storage/maintenance/journal.ts";
+import { parseJournal, parseVerification } from "../src/server/storage/maintenance/parse.ts";
 import { publishSnapshotBundle } from "../src/server/storage/maintenance/snapshot-bundle.ts";
 import { readSqliteManifests } from "../src/server/storage/maintenance/sqlite-manifests.ts";
 import { inspectRegisteredSourceProcess } from "../src/server/storage/maintenance/source-facts.ts";
@@ -48,14 +48,26 @@ async function verifyActual(f: Fixture, refs: { bundle: ArtifactRef; publication
 }
 
 for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeTest : pgTest)(
-  `#248 V ${kind}: an unchanged v3 root verifies while the production D reader remains v1/v2`, async () => {
+  `#152 C3 AC16 / #248 V ${kind}: production D and V verify an unchanged v3 root and D rejects a non-capture head`, async () => {
     const f = await verificationV3Fixture(kind);
     try {
-      const refs = await f.run(async lock => {
-        await assert.rejects(publishSnapshotBundle(f.store, lock), error => error instanceof MaintenanceFailure && error.code === "journal_invalid");
-        return f.publish(lock);
-      });
+      const original = await f.store.readBytes(f.root.reference);
+      for (const invalid of [{ ...f.root.record, formatVersion: 4 }, { ...f.root.record, controlProof: null },
+        { ...f.root.record, controlProof: { ...f.root.record.controlProof, unknown: true } }])
+        assert.throws(() => parseJournal(invalid), error => error instanceof MaintenanceFailure && error.code === "journal_invalid");
+      const refs = await f.run(lock => publishSnapshotBundle(f.store, lock));
+      const closed = await verifyRestoreBundleClosure(f.store, refs.bundle, refs.publication);
+      assert.deepEqual(closed.bundle.capture.journal, f.root.reference);
+      assert.deepEqual(closed.chain.nodes.at(-1)?.record, f.root.record);
+      assert.deepEqual(await verifyVerificationRestoreBundleClosure(f.store, refs.bundle, refs.publication), closed);
       await verifyActual(f, refs, 0);
+      await f.advance("takeover");
+      const before = await f.adapter.observe(), artifacts = (await readdir(f.store.root, { recursive: true })).sort();
+      await assert.rejects(f.run(lock => publishSnapshotBundle(f.store, lock)),
+        error => error instanceof MaintenanceFailure && error.code === "phase_conflict");
+      assert.deepEqual(await f.adapter.observe(), before);
+      assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), artifacts);
+      assert.deepEqual(await f.store.readBytes(f.root.reference), original);
     } finally { await f.close(); }
   });
 

@@ -65,12 +65,22 @@ test("#152 SQLite source-lock preserves callback first failure and both cleanup 
 function assertOrdinaryOutcome(lock: SourceLock, expected: {
   commitStarted: boolean; commitReturned: boolean; failureObserved: boolean;
   rollbackFailureObserved: boolean; closeFailureObserved: boolean;
+  originalError?: unknown; rollbackError?: unknown; closeError?: unknown;
+  cleanupEvents?: readonly { stage: "rollback-failure" | "close-failure"; error: unknown }[];
 }, sourceClosed = true) {
   const outcome = controlSqlOutcome(lock);
   assert.deepEqual(outcome, { kind: "untrusted-control-outcome", status: "unknown",
-    localSourceHandleClosed: sourceClosed, localMutexHandleClosed: false, ...expected });
+    localSourceHandleClosed: sourceClosed, localMutexHandleClosed: false,
+    originalError: undefined, rollbackError: undefined, closeError: undefined, cleanupEvents: [], ...expected });
+  // AC41 keeps raw occurrences in this private lifecycle record, including undefined.
+  assert.equal(outcome.originalError, expected.originalError);
+  assert.equal(outcome.rollbackError, expected.rollbackError); assert.equal(outcome.closeError, expected.closeError);
   assert.equal(Object.isFrozen(outcome), true);
-  assert.doesNotMatch(JSON.stringify(outcome), /ordinary-sensitive/);
+  assert.equal(Object.isFrozen(outcome.cleanupEvents), true);
+  for (const [index, event] of (expected.cleanupEvents ?? []).entries()) {
+    assert.equal(outcome.cleanupEvents![index]!.error, event.error);
+    assert.equal(Object.isFrozen(outcome.cleanupEvents![index]), true);
+  }
   return outcome;
 }
 
@@ -100,7 +110,9 @@ test("#152 SQLite ordinary anchor retains successful commits and rejects standal
       else { assert.equal(injected, true); assert.equal(rejection, failure); }
       assert.ok(captured);
       assertOrdinaryOutcome(captured, { commitStarted: true, commitReturned: true, failureObserved: false,
-        rollbackFailureObserved: false, closeFailureObserved: scenario !== "success" });
+        rollbackFailureObserved: false, closeFailureObserved: scenario !== "success",
+        closeError: scenario === "success" ? undefined : failure,
+        cleanupEvents: scenario === "success" ? [] : [{ stage: "close-failure", error: failure }] });
       const actual = independentlyRead(f.file);
       assert.equal((actual.maintenance[0] as {journal_record_ref: string}).journal_record_ref, f.v.zeroRef.ref);
       assert.deepEqual(actual.clients, [], "a post-COMMIT close error does not undo or repeat an ordinary anchor");
@@ -130,11 +142,20 @@ test("#152 SQLite callback error priority applies without a mechanism and does n
       try { await f.adapter.withSourceLock("control", async lock => { captured = lock; await ordinaryAnchor(f, lock); throw primary; }); }
       catch (error) { rejected = true; rejection = error; }
       assert.equal(rejected, true); assert.equal(rollbacks, 1); assert.equal(closes, 1);
-      if (scenario === "busy") { assert.ok(rejection instanceof MaintenanceFailure); assert.equal(rejection.code, "maintenance_busy"); }
+      if (scenario === "busy") {
+        assert.ok(rejection instanceof MaintenanceFailure); assert.equal(rejection.code, "maintenance_busy");
+        assert.doesNotMatch(JSON.stringify(rejection), /ordinary-sensitive/);
+      }
       else assert.equal(rejection, primary);
       assert.ok(captured);
       assertOrdinaryOutcome(captured, { commitStarted: false, commitReturned: false, failureObserved: true,
-        rollbackFailureObserved: scenario !== "close", closeFailureObserved: scenario !== "rollback" });
+        rollbackFailureObserved: scenario !== "close", closeFailureObserved: scenario !== "rollback",
+        originalError: primary, rollbackError: scenario === "close" ? undefined : secondary,
+        closeError: scenario === "rollback" ? undefined : secondary,
+        cleanupEvents: [
+          ...(scenario === "close" ? [] : [{ stage: "rollback-failure" as const, error: secondary }]),
+          ...(scenario === "rollback" ? [] : [{ stage: "close-failure" as const, error: secondary }]),
+        ] });
       assert.deepEqual(independentlyRead(f.file), before);
     } finally { child.mock.restoreAll(); await f.close(); }
   });
@@ -169,7 +190,12 @@ test("#152 SQLite COMMIT first failure survives cleanup and independent reads di
         assert.equal(outcome.rollbackFailureObserved, phase === "before");
         if (phase === "before") assert.equal(outcome.rollbackError, rollbackFailure);
       } else assertOrdinaryOutcome(captured!, { commitStarted: true, commitReturned: false, failureObserved: true,
-        rollbackFailureObserved: phase === "before", closeFailureObserved: true });
+        rollbackFailureObserved: phase === "before", closeFailureObserved: true,
+        originalError: primary, rollbackError: phase === "before" ? rollbackFailure : undefined, closeError: closeFailure,
+        cleanupEvents: [
+          ...(phase === "before" ? [{ stage: "rollback-failure" as const, error: rollbackFailure }] : []),
+          { stage: "close-failure", error: closeFailure },
+        ] });
       if (phase === "before") assert.deepEqual(independentlyRead(f.file), before);
       else {
         const actual = independentlyRead(f.file);

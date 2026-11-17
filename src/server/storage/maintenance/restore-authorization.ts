@@ -31,7 +31,7 @@ type OwnedRestore = BaseRestore & (
   | { readonly kind: "legacy-ready-bridge"; readonly ready: ArtifactRef; readonly receipt: ArtifactRef; readonly manifests: ArtifactRef }
 );
 const restores = new WeakMap<ControllerCommandScope, OwnedRestore>();
-const failures = new WeakMap<ControllerCommandScope, unknown>();
+const failures = new WeakMap<ControllerCommandScope, { readonly error: unknown; readonly operation: RestoreOperation | undefined }>();
 type RestoreRole = "restore" | "callback" | "checking" | "consumer";
 interface RestoreFailureOccurrence {
   readonly error: unknown;
@@ -68,11 +68,12 @@ const originalOperations = new WeakMap<Promise<unknown>, RestoreOperation>();
 const lockLifetimes = new WeakMap<SourceLock, RestoreLockLifetime>();
 
 function assertValid(scope: ControllerCommandScope): void {
-  if (failures.has(scope)) throw failures.get(scope);
+  const failure = failures.get(scope);
+  if (failure) throw failure.error;
 }
-function fail(scope: ControllerCommandScope, error: unknown): void {
+function fail(scope: ControllerCommandScope, error: unknown, operation?: RestoreOperation): void {
   restores.delete(scope);
-  if (!failures.has(scope)) failures.set(scope, error);
+  if (!failures.has(scope)) failures.set(scope, { error, operation });
 }
 function lockLifetime(lock: SourceLock): RestoreLockLifetime {
   let state = lockLifetimes.get(lock);
@@ -126,7 +127,22 @@ function track<T>(scope: ControllerCommandScope, lock: SourceLock, role: Restore
   try {
     assertOpen(scope, lock); requireValue(!operations.has(scope)); parent = parentFor(scope, role);
     requireValue(!parent || parent.lock === lock && !parent.callbackClosed);
-  } catch (error) { fail(scope, error); return Promise.reject(error); }
+  } catch (error) {
+    const state = lockLifetime(lock);
+    // A fixed child factory can reject admission after its original parent has
+    // yielded. Preserve that original rejection for forwarding, without running
+    // work, joining pending operations or reopening a closed entry.
+    if (!parent) { try { parent = parentFor(scope, role); } catch { /* No original parent relationship. */ } }
+    if (parent && parent.lock === lock && !parent.callbackClosed && state.pending.has(parent)) {
+      const rejected = Promise.reject<T>(error);
+      const tracked: RestoreOperation = { scope, lock, promise: rejected, role, parent,
+        children: new Set(), failed: true, failure: error, retainFailure: parent.retainFailure === true };
+      retainFailures(tracked, failures.get(scope)?.operation?.failures ?? [ownFailure(tracked, error)]);
+      originalOperations.set(rejected, tracked); parent.children.add(tracked);
+      fail(scope, error, tracked); void rejected.catch(() => undefined); return rejected;
+    }
+    fail(scope, error); return Promise.reject(error);
+  }
   const state = lockLifetime(lock);
   let tracked!: RestoreOperation;
   const operation: Promise<T> = Promise.resolve().then(() => { assertOpen(scope, lock); return work(tracked); }).then(value => {
@@ -134,7 +150,7 @@ function track<T>(scope: ControllerCommandScope, lock: SourceLock, role: Restore
   }).catch(error => {
     tracked.failed = true; tracked.failure = error;
     if (!tracked.failures) retainFailures(tracked, tracked.forwarded?.failures ?? [ownFailure(tracked, error)]);
-    fail(scope, error); throw error;
+    fail(scope, error, tracked); throw error;
   }).finally(() => {
     if (operations.get(scope) === tracked) operations.delete(scope);
     if (callbacks.get(scope) === tracked) callbacks.delete(scope);
