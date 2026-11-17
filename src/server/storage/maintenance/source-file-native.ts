@@ -33,11 +33,44 @@ export interface SourceFileStatxObservation {
   readonly attributesMask: bigint;
 }
 
+export interface SourceFileNativeCall {
+  readonly operation: string;
+  /** Null means this call was not made; errors retain actual rc and errno. */
+  readonly rc: bigint | null;
+  readonly errno: bigint | null;
+}
+export type SourceFileNativeFact<T> = {
+  readonly status: "observed"; readonly reason: null; readonly value: T;
+  readonly calls: readonly SourceFileNativeCall[];
+} | {
+  readonly status: "unavailable";
+  readonly reason: "syscall" | "length" | "identity" | "budget" | "enumeration" | "abi";
+  readonly value: null; readonly calls: readonly SourceFileNativeCall[];
+};
+export interface SourceFileExtendedMetadata extends SourceFileMetadata {
+  readonly gid: bigint;
+  readonly atimeNs: bigint;
+}
+/** P2 ordinary getters from one private live owner. Accessible xattrs are raw
+ * bytes; unavailable/hidden facts are never filled in or promoted to a profile.
+ * This is not an atomic source-preservation window or an Fs qualification. */
+export interface SourceFileExtendedObservation {
+  readonly before: SourceFileExtendedMetadata;
+  readonly after: SourceFileExtendedMetadata;
+  readonly metadataCalls: readonly SourceFileNativeCall[];
+  readonly uuid: SourceFileNativeFact<{ readonly length: bigint; readonly bytes: Buffer }>;
+  readonly fid: SourceFileNativeFact<{ readonly handleType: bigint; readonly handleBytes: bigint;
+    readonly mountId: bigint; readonly bytes: Buffer }>;
+  readonly inodeFlags: SourceFileNativeFact<bigint>;
+  readonly xattrs: SourceFileNativeFact<readonly { readonly name: Buffer; readonly value: Buffer }[]>;
+}
+
 interface NativeSourceBinding {
   openRoot(path: string): object;
   openChild(parent: object, leaf: string, kind: SourceFileMetadata["kind"]): object;
   observe(owner: object): unknown;
   observeStatx(owner: object): unknown;
+  observeExtended(owner: object): unknown;
   readAt(owner: object, offset: bigint, length: number): unknown;
   readDirectory(owner: object): unknown;
   close(owner: object): void;
@@ -46,6 +79,7 @@ export interface SourceFileHandle {
   readonly kind: SourceFileMetadata["kind"];
   observe(): SourceFileMetadata;
   observeStatx(): SourceFileStatxObservation;
+  observeExtended(): SourceFileExtendedObservation;
   openChild(leaf: string, kind: SourceFileMetadata["kind"]): SourceFileHandle;
   readAt(offset: bigint, length: number): Buffer;
   readDirectory(): readonly string[];
@@ -75,7 +109,7 @@ function binding(): NativeSourceBinding {
   let native: NativeSourceBinding;
   try { native = createRequire(import.meta.url)(sourceFileNativePath) as NativeSourceBinding; }
   catch { throw unavailable(); }
-  for (const method of ["openRoot", "openChild", "observe", "observeStatx", "readAt", "readDirectory", "close"] as const) {
+  for (const method of ["openRoot", "openChild", "observe", "observeStatx", "observeExtended", "readAt", "readDirectory", "close"] as const) {
     if (typeof native[method] !== "function") throw unavailable();
   }
   cached = native;
@@ -102,6 +136,80 @@ function checkedStatx(value: unknown, kind: SourceFileMetadata["kind"]): SourceF
   return item as SourceFileStatxObservation;
 }
 
+function object(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw sourceChanged();
+  return value as Record<string, unknown>;
+}
+function checkedCalls(value: unknown, operations: readonly string[]): readonly SourceFileNativeCall[] {
+  if (!Array.isArray(value) || value.length !== operations.length) throw sourceChanged();
+  for (let i = 0; i < value.length; i++) {
+    const call = object(value[i]);
+    if (call.operation !== operations[i] || Object.keys(call).sort().join() !== "errno,operation,rc") throw sourceChanged();
+    if (call.rc === null) { if (call.errno !== null) throw sourceChanged(); }
+    else if (typeof call.rc !== "bigint" || call.rc < -1n || typeof call.errno !== "bigint" || call.errno < 0n
+      || (call.rc === -1n ? call.errno === 0n : call.errno !== 0n)) throw sourceChanged();
+  }
+  return value as SourceFileNativeCall[];
+}
+function checkedFact<T>(value: unknown, operations: readonly string[], validate: (value: unknown) => void): SourceFileNativeFact<T> {
+  const item = object(value);
+  if (Object.keys(item).sort().join() !== "calls,reason,status,value") throw sourceChanged();
+  const calls = checkedCalls(item.calls, operations);
+  if (item.status === "observed") {
+    if (item.reason !== null || !calls.every(call => call.rc !== null && call.rc >= 0n && call.errno === 0n)) throw sourceChanged();
+    validate(item.value);
+  } else if (item.status !== "unavailable" || item.value !== null
+    || !["syscall", "length", "identity", "budget", "enumeration", "abi"].includes(String(item.reason))) throw sourceChanged();
+  return item as SourceFileNativeFact<T>;
+}
+function checkedExtended(value: unknown, kind: SourceFileMetadata["kind"]): SourceFileExtendedObservation {
+  const item = object(value);
+  if (Object.keys(item).sort().join() !== "after,before,fid,inodeFlags,metadataCalls,uuid,xattrs") throw sourceChanged();
+  checkedObservation(item.before, kind); checkedObservation(item.after, kind);
+  const before = object(item.before), after = object(item.after);
+  const fields = ["kind", "dev", "ino", "mode", "uid", "gid", "nlink", "size", "fsType", "atimeNs", "mtimeNs", "ctimeNs"];
+  if (Object.keys(before).sort().join() !== [...fields].sort().join() || Object.keys(after).sort().join() !== [...fields].sort().join()
+    || typeof before.gid !== "bigint" || typeof before.atimeNs !== "bigint"
+    || fields.some(key => before[key] !== after[key])) throw sourceChanged();
+  const metadataCalls = checkedCalls(item.metadataCalls, ["fstat-before", "fstatfs-before", "fstatfs-after", "fstat-after"]);
+  if (!metadataCalls.every(call => call.rc === 0n && call.errno === 0n)) throw sourceChanged();
+  checkedFact(item.uuid, ["ioctl-getfsuuid"], value => {
+    const uuid = object(value);
+    if (Object.keys(uuid).sort().join() !== "bytes,length" || typeof uuid.length !== "bigint" || uuid.length < 1n || uuid.length > 16n
+      || !Buffer.isBuffer(uuid.bytes) || BigInt(uuid.bytes.length) !== uuid.length) throw sourceChanged();
+  });
+  checkedFact(item.fid, ["name-to-handle-at"], value => {
+    const fid = object(value);
+    if (Object.keys(fid).sort().join() !== "bytes,handleBytes,handleType,mountId" || typeof fid.handleType !== "bigint"
+      || fid.handleType < 1n || fid.handleType > 0x7fffffffn || fid.handleType === 255n
+      || typeof fid.mountId !== "bigint" || fid.mountId < 1n || fid.mountId > 0xffffffffffffffffn
+      || typeof fid.handleBytes !== "bigint" || fid.handleBytes < 1n || fid.handleBytes > 128n || fid.handleBytes % 4n !== 0n
+      || !Buffer.isBuffer(fid.bytes) || BigInt(fid.bytes.length) !== fid.handleBytes) throw sourceChanged();
+  });
+  checkedFact(item.inodeFlags, ["ioctl-getflags"], value => {
+    if (typeof value !== "bigint" || value < 0n || value > 0xffffffffn) throw sourceChanged();
+  });
+  const xattrs = object(item.xattrs);
+  const xattrCalls = xattrs.calls;
+  if (!Array.isArray(xattrCalls) || xattrCalls.length < 2 || xattrCalls.length > 66) throw sourceChanged();
+  checkedFact(item.xattrs, ["flistxattr-before", ...Array<string>(xattrCalls.length - 2).fill("fgetxattr"), "flistxattr-after"], value => {
+    if (!Array.isArray(value) || value.length > 64 || xattrCalls.length !== value.length + 2) throw sourceChanged();
+    let total = 0, previous: Buffer | undefined;
+    for (let i = 0; i < value.length; i++) {
+      const entry = object(value[i]);
+      if (Object.keys(entry).sort().join() !== "name,value" || !Buffer.isBuffer(entry.name) || entry.name.length < 1 || entry.name.length > 255
+        || entry.name.includes(0) || !Buffer.isBuffer(entry.value) || previous && Buffer.compare(previous, entry.name) >= 0) throw sourceChanged();
+      total += entry.name.length + entry.value.length;
+      if (total > 65536 || (xattrs.calls as SourceFileNativeCall[])[i+1]!.rc !== BigInt(entry.value.length)) throw sourceChanged();
+      previous = entry.name;
+    }
+    const nameBytes = value.reduce((sum: number, entry: { name: Buffer }) => sum + entry.name.length + 1, 0);
+    if ((xattrs.calls as SourceFileNativeCall[])[0]!.rc !== BigInt(nameBytes)
+      || (xattrs.calls as SourceFileNativeCall[]).at(-1)!.rc !== BigInt(nameBytes)) throw sourceChanged();
+  });
+  return item as unknown as SourceFileExtendedObservation;
+}
+
 class OwnedSourceFile implements SourceFileHandle {
   readonly kind: SourceFileMetadata["kind"];
   private readonly owner: object;
@@ -123,6 +231,10 @@ class OwnedSourceFile implements SourceFileHandle {
   observeStatx(): SourceFileStatxObservation {
     this.assertActive();
     return checkedStatx(this.scope.binding.observeStatx(this.owner), this.kind);
+  }
+  observeExtended(): SourceFileExtendedObservation {
+    this.assertActive();
+    return checkedExtended(this.scope.binding.observeExtended(this.owner), this.kind);
   }
   openChild(leaf: string, kind: SourceFileMetadata["kind"]): SourceFileHandle {
     this.assertActive();
