@@ -11,6 +11,7 @@ import Database from "better-sqlite3";
 import { Client } from "pg";
 import type { QueryResult } from "pg";
 import { captureFixture } from "./fixtures/maintenance-capture.ts";
+import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { verifyJournalChain, verifySnapshotClosure } from "../src/server/storage/maintenance/journal.ts";
 import { digestJson } from "../src/server/storage/maintenance/canonical.ts";
@@ -330,6 +331,13 @@ for (const kind of ["sqlite", "postgres"] as const) {
         f.state.onLock = lock => {
           const anchor = lock.anchor; lock.anchor = async change => { laterAnchors++; return anchor(change); };
         };
+        if (kind === "sqlite" && point === "commit-before") f.state.onOwner = owner => {
+          const withSourceLock = owner.adapter.withSourceLock.bind(owner.adapter);
+          owner.adapter.withSourceLock = (purpose, consume) => withSqliteSourceInventoryDiagnostics(owner.adapter, phase => {
+            phase("c1-commit-before-fresh-source-window");
+            return withSourceLock(purpose, consume);
+          });
+        };
         const next = await f.capture(f.options, f.request); assert.equal(next.status, "paused");
         assert.equal(laterAnchors, committed ? 0 : 1);
         if (committed) {
@@ -337,7 +345,7 @@ for (const kind of ["sqlite", "postgres"] as const) {
           assert.deepEqual(f.state.events, ["live-begin", "live-end"]);
         } else assert.deepEqual(f.state.events, ["capture-begin", "capture-end", "live-begin", "live-end"]);
         assert.equal(f.profile.state.handles.size, 0);
-      } finally { child.mock.restoreAll(); await f.close(); }
+      } finally { delete f.state.onOwner; child.mock.restoreAll(); await f.close(); }
     });
   });
   nativeTest("#152 C1 " + kind + ": successful callback cannot hide mutex or adapter close failure", async t => {
