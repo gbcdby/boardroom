@@ -7,15 +7,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 type Call = (...args: unknown[]) => unknown;
-type Identity = { pid: string | null; state: string | null; threads: string | null; startTicks: string | null };
-type ReadSummary = { bytes: number; reads: number; eof: boolean; closed: boolean; sha256: string;
+type Identity = { pid: string | null; comm: string | null; ppid: string | null; state: string | null; threads: string | null; startTicks: string | null };
+type DirectoryIdentity = { event: number; dev: string | null; ino: string | null; uid: string | null; gid: string | null; mode: string | null };
+type ReadSummary = { event: number; bytes: number; reads: number; eof: boolean; closed: boolean; sha256: string;
   endsWithNewline: boolean; shortPositiveReads: number; identity?: Identity; identitySummaryTruncated?: boolean };
 type Proc = { pid: number; errors: object[]; droppedErrors: number; observationErrors: number;
-  stats: ReadSummary[]; maps: ReadSummary[]; uids: string[]; fdDirectoryCounts: number[]; droppedSummaries: number };
+  stats: ReadSummary[]; maps: ReadSummary[]; uids: string[]; directoryIdentities: DirectoryIdentity[]; fdDirectoryCounts: number[]; droppedSummaries: number };
 type Capture = { proc: Proc; subject: "stat" | "maps"; hash: Hash; bytes: number; reads: number; eof: boolean;
-  lastByte: number | null; shortPositiveReads: number; statBytes: Buffer[]; statCaptured: number };
+  event: number; lastByte: number | null; shortPositiveReads: number; statBytes: Buffer[]; statCaptured: number };
 type Frame = { index: number; phase: string; processes: Map<number, Proc>; pins: Map<number, Proc>;
-  descriptors: Map<number, Capture>; droppedProcesses: number; observationErrors: number; finished: boolean };
+  descriptors: Map<number, Capture>; event: number; droppedProcesses: number; observationErrors: number; finished: boolean };
 const limits = { inspections: 2, failedPidsPerInspection: 16, processesPerInspection: 512, errorsPerProcess: 32,
   summariesPerProcess: 4, statIdentityBytes: 8192 } as const;
 const root = fileURLToPath(new URL("../../", import.meta.url));
@@ -36,7 +37,7 @@ function getProcess(frame: Frame, pid: number): Proc | undefined {
   let result = frame.processes.get(pid);
   if (!result) {
     if (frame.processes.size === limits.processesPerInspection) { frame.droppedProcesses++; return undefined; }
-    result = { pid, errors: [], droppedErrors: 0, observationErrors: 0, stats: [], maps: [], uids: [], fdDirectoryCounts: [], droppedSummaries: 0 };
+    result = { pid, errors: [], droppedErrors: 0, observationErrors: 0, stats: [], maps: [], uids: [], directoryIdentities: [], fdDirectoryCounts: [], droppedSummaries: 0 };
     frame.processes.set(pid, result);
   }
   return result;
@@ -49,29 +50,47 @@ function subject(frame: Frame, value: unknown): { proc: Proc; subject: string } 
   const proc = item && frame.pins.get(Number(item[1]));
   if (proc && item) return { proc, subject: item[2] === "fd" && value.endsWith("/fd") ? "fd-directory" : item[2] === "fd" ? "process-fd" : item[2]! };
 }
-function recordError(frame: Frame, proc: Proc | undefined, operation: string, category: string, error: unknown) {
+function recordError(frame: Frame, proc: Proc | undefined, operation: string, category: string, error: unknown, event: number) {
   if (!proc) return;
   observe(frame, proc, () => {
     const safe = safeError(error);
-    if (proc.errors.length < limits.errorsPerProcess) proc.errors.push({ operation, subject: category, error: safe,
+    if (proc.errors.length < limits.errorsPerProcess) proc.errors.push({ event, operation, subject: category, error: safe,
       originalHandling: category === "process-fd" && ["ENOENT", "ESRCH", "EBADF"].includes(safe.code ?? "")
         ? "ignored-fd-race" : "requires-original-path-context" });
     else proc.droppedErrors++;
   });
 }
 function finishRead(capture: Capture, closed: boolean): ReadSummary {
-  const result: ReadSummary = { bytes: capture.bytes, reads: capture.reads, eof: capture.eof, closed,
+  const result: ReadSummary = { event: capture.event, bytes: capture.bytes, reads: capture.reads, eof: capture.eof, closed,
     sha256: capture.hash.copy().digest("hex"), endsWithNewline: capture.lastByte === 10, shortPositiveReads: capture.shortPositiveReads };
   if (capture.subject === "stat") {
-    // Minimal fields from the original returned bytes; never emit comm, raw stat/maps or reread proc.
+    // Bounded fields from the original returned bytes only. comm is at most the
+    // kernel's 15-byte task name, represented reversibly as Latin-1; never argv,
+    // environment, raw stat/maps, or a new proc read. Malformed names stay unknown.
     const text = Buffer.concat(capture.statBytes, capture.statCaptured).toString("latin1"), end = text.lastIndexOf(") ");
     const fields = end < 0 ? [] : text.slice(end + 2).trim().split(/\s+/), first = /^([1-9][0-9]*) \(/.exec(text);
     const numeric = (value: string | undefined) => value && /^[0-9]{1,24}$/.test(value) ? value : null;
-    result.identity = { pid: first?.[1] ?? null, state: /^[A-Za-z]$/.test(fields[0] ?? "") ? fields[0]! : null,
+    const comm = first && end >= first[0].length ? text.slice(first[0].length, end) : null;
+    result.identity = { pid: first?.[1] ?? null, comm: comm !== null && comm.length <= 15 ? comm : null, ppid: numeric(fields[1]),
+      state: /^[A-Za-z]$/.test(fields[0] ?? "") ? fields[0]! : null,
       threads: numeric(fields[17]), startTicks: numeric(fields[19]) };
     result.identitySummaryTruncated = capture.bytes !== capture.statCaptured;
   }
   capture.statBytes = []; return result;
+}
+function identityEvidence(proc: Proc | undefined): "OBSERVED" | "UNOBSERVED" {
+  return proc && !proc.observationErrors && !proc.droppedErrors && !proc.droppedSummaries && proc.stats.length > 0
+    && proc.stats.every(stat => stat.eof && stat.closed && !stat.identitySummaryTruncated && stat.identity
+      && Object.values(stat.identity).every(value => value !== null)) && proc.directoryIdentities.length > 0
+    && proc.directoryIdentities.every(directory => Object.values(directory).every(value => value !== null)) ? "OBSERVED" : "UNOBSERVED";
+}
+function nextEvent(frame: Frame): number {
+  if (frame.event < Number.MAX_SAFE_INTEGER) return ++frame.event;
+  frame.observationErrors++; return frame.event;
+}
+function decimal(value: unknown): string | null {
+  if (typeof value !== "bigint" && !(typeof value === "number" && Number.isSafeInteger(value))) return null;
+  const text = String(value); return /^[0-9]{1,24}$/.test(text) ? text : null;
 }
 function stageHint(proc: Proc): string {
   if (proc.errors.some(item => (item as { originalHandling?: string }).originalHandling !== "ignored-fd-race")) return "original-syscall-error";
@@ -111,6 +130,7 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
       const unfinished = [...frame.descriptors.values()].filter(capture => capture.proc === proc)
         .map(capture => ({ subject: capture.subject, ...finishRead({ ...capture, statBytes: [...capture.statBytes] }, false) }));
       if (!proc) reasons.push("target-not-observed");
+      if (identityEvidence(proc) !== "OBSERVED") reasons.push("identity-not-observed");
       if (frame.observationErrors || proc?.observationErrors) reasons.push("observer-error");
       if (frame.droppedProcesses || proc?.droppedErrors || proc?.droppedSummaries
         || [...(proc?.stats ?? []), ...unfinished].some(summary => summary.identitySummaryTruncated)) reasons.push("observer-truncated");
@@ -142,7 +162,7 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
     if (++failedInspections > limits.inspections) { droppedFailures += pids.length; return; }
     for (const pid of pids.slice(0, limits.failedPidsPerInspection)) {
       const proc = frame.processes.get(pid);
-      failures.push({ inspection: frame.index, phase: frame.phase, pid, observationErrors: frame.observationErrors,
+      failures.push({ inspection: frame.index, phase: frame.phase, pid, identityEvidenceState: identityEvidence(proc), observationErrors: frame.observationErrors,
         droppedProcesses: frame.droppedProcesses, frame: proc ? { ...proc, stageHint: stageHint(proc) } : null });
     }
     droppedFailures += Math.max(0, pids.length - limits.failedPidsPerInspection);
@@ -151,21 +171,22 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
     if (typeof originalInspect !== "function") throw new Error("diagnostic_boundary_unavailable");
     for (const name of syncNames) mutable[name] = function(this: unknown, ...args: unknown[]) {
       const frame = context.getStore(), enabled = frame && !frame.finished;
-      let item: ReturnType<typeof subject>, capture: Capture | undefined, pinned: Proc | undefined;
+      let item: ReturnType<typeof subject>, capture: Capture | undefined, pinned: Proc | undefined, event = 0;
       if (enabled) observe(frame, undefined, () => {
+        event = nextEvent(frame);
         item = subject(frame, args[0]); capture = frame.descriptors.get(Number(args[0])); pinned = frame.pins.get(Number(args[0]));
       });
       let value: unknown;
       try { value = Reflect.apply(syncOriginal[name], this, args); }
       catch (error) {
-        if (enabled) recordError(frame, item?.proc ?? capture?.proc ?? pinned, name, item?.subject ?? capture?.subject ?? "proc-directory", error);
+        if (enabled) recordError(frame, item?.proc ?? capture?.proc ?? pinned, name, item?.subject ?? capture?.subject ?? "proc-directory", error, event);
         throw error;
       }
       if (enabled) observe(frame, item?.proc ?? capture?.proc ?? pinned, () => {
         if (name === "openSync" && item && typeof value === "number") {
           if (item.subject === "proc-directory") frame.pins.set(value, item.proc);
           if (item.subject === "stat" || item.subject === "maps") frame.descriptors.set(value, { proc: item.proc, subject: item.subject,
-            hash: createHash("sha256"), bytes: 0, reads: 0, eof: false, lastByte: null, shortPositiveReads: 0, statBytes: [], statCaptured: 0 });
+            hash: createHash("sha256"), event, bytes: 0, reads: 0, eof: false, lastByte: null, shortPositiveReads: 0, statBytes: [], statCaptured: 0 });
         } else if (name === "readSync" && capture && typeof value === "number") {
           capture.reads++; capture.bytes += value;
           if (value === 0) capture.eof = true;
@@ -178,7 +199,11 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
             }
           }
         } else if (name === "fstatSync" && pinned) {
-          if (pinned.uids.length < limits.summariesPerProcess) pinned.uids.push(String((value as fs.Stats).uid)); else pinned.droppedSummaries++;
+          const stats = value as fs.Stats, uid = stats.uid;
+          if (pinned.uids.length < limits.summariesPerProcess) pinned.uids.push(String(uid)); else pinned.droppedSummaries++;
+          if (pinned.directoryIdentities.length < limits.summariesPerProcess)
+            pinned.directoryIdentities.push({ event, dev: decimal(stats.dev), ino: decimal(stats.ino), uid: decimal(uid), gid: decimal(stats.gid), mode: decimal(stats.mode) });
+          else pinned.droppedSummaries++;
         } else if (name === "closeSync") {
           if (capture) {
             const destination = capture.subject === "stat" ? capture.proc.stats : capture.proc.maps;
@@ -192,25 +217,25 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
     };
     for (const name of asyncNames) asyncMutable[name] = function(this: unknown, ...args: unknown[]) {
       const frame = context.getStore(), enabled = frame && !frame.finished;
-      let item: ReturnType<typeof subject>;
-      if (enabled) observe(frame, undefined, () => { item = subject(frame, args[0]); });
+      let item: ReturnType<typeof subject>, event = 0;
+      if (enabled) observe(frame, undefined, () => { event = nextEvent(frame); item = subject(frame, args[0]); });
       let pending: unknown;
       try { pending = Reflect.apply(asyncOriginal[name], this, args); }
-      catch (error) { if (enabled) recordError(frame, item?.proc, name, item?.subject ?? "other", error); throw error; }
+      catch (error) { if (enabled) recordError(frame, item?.proc, name, item?.subject ?? "other", error, event); throw error; }
       if (enabled && item) {
         const observed = item;
         observe(frame, observed.proc, () => { (pending as Promise<unknown>).then(value => observe(frame, observed.proc, () => {
           if (name === "readdir" && observed.subject === "fd-directory" && Array.isArray(value)) {
             if (observed.proc.fdDirectoryCounts.length < limits.summariesPerProcess) observed.proc.fdDirectoryCounts.push(value.length); else observed.proc.droppedSummaries++;
           }
-        }), error => recordError(frame, observed.proc, name, observed.subject, error)); });
+        }), error => recordError(frame, observed.proc, name, observed.subject, error, event)); });
       }
       return pending; // Keep the original promise, including its original rejection object and native call order.
     };
     syncBuiltinESMExports();
     Object.defineProperty(target, "inspectCurrentWriters", { configurable: true, writable: true, value: function(this: unknown, ...args: unknown[]) {
       const frame: Frame = { index: ++inspectionCalls, phase, processes: new Map(), pins: new Map(), descriptors: new Map(),
-        droppedProcesses: 0, observationErrors: 0, finished: false };
+        event: 0, droppedProcesses: 0, observationErrors: 0, finished: false };
       let value: unknown;
       try { value = context.run(frame, () => Reflect.apply(originalInspect, this, args)); }
       catch (error) { frame.finished = true; recordObservation(frame, undefined, true); throw error; }
@@ -239,6 +264,9 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
       provenance: observedPid === undefined
         ? "Original calls and returned bytes only. Failed PID summaries only; no proc/source reread, dump, retry or qualification change."
         : "Original calls and returned bytes only. Failed PID and opt-in owned PID summaries; no proc/source reread, dump, retry or qualification change.",
+      identityEvidenceScope: "Bounded original stat/fstat fields only; OBSERVED does not prove complete credentials, program path, exit, source qualification or cause.",
+      eventScope: "Inspection-local original-call dispatch order, not wall-clock timing or process exit evidence.",
+      commEncoding: "Latin-1 representation of at most 15 original task-name bytes; never command arguments.",
       stageHintScope: "Derived interval/input hints, not a caught internal parser exception or a root-cause conclusion.", failures }, null, 2) + "\n", { mode: 0o600, flag: "wx" });
   } catch { /* Artifact capture is best-effort; preserve the original operation's outcome. */ }
   // Do not report through stderr: its own synchronous or asynchronous failure can affect the original operation.

@@ -58,7 +58,9 @@ async function isolatedFreshSchema(phase: "sync" | "async" | "undefined" | "succ
     const sessions=new Set(), sql=[], sourceConnection={schema:'app'}, auditFactories=new WeakMap();
     const activeVerifications=new Set(), verificationInputs=new Map(), abort=new AbortController();
     const writerObservation={hasSubscribers:false}, note=()=>{}, sessionMetadata=()=>({});
-    let lockActive=false, assertSnapshotLock, publicBackup, closed=false, closingStarted=false, closeAttempt, mutexTimer;
+    // Keep the real adapter's mutex-loss state in the extracted withSourceLock closure.
+    // Missing lexical bindings must not turn a successful native path into a ReferenceError.
+    let lockActive=false, assertSnapshotLock, publicBackup, lost=false, closed=false, closingStarted=false, closeAttempt, mutexTimer;
     let permitEnd=phase==='success'||phase==='query', callbacks=0, freshEnds=0, sourceEnds=0, lastLock;
     const queryFailure=phase.startsWith('query'), combined=phase.endsWith('close');
     const first=phase==='undefined' ? undefined : combined && phase!=='query-undefined-close' ? new Error('postgres://fresh-cleanup-sensitive@host/private-database')
@@ -79,7 +81,8 @@ async function isolatedFreshSchema(phase: "sync" | "async" | "undefined" | "succ
     let mutex={root:{},identity:{},released:false,session:{ending:false,ended:false,client:client('mutex')}};
     sessions.add(mutex.session); const adapter={};
     async function connect(_connection,_readonly,_critical,role) { const item=role==='source-control'?owned:fresh; sessions.add(item); return item; }
-    const assertMutex=async()=>{}, invalidate=()=>{}, quote=value=>value, same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+    const assertMutex=async()=>{if(lost) throw new MaintenanceFailure('maintenance_lost');};
+    const invalidate=()=>{lost=true;publicBackup=undefined;}, quote=value=>value, same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
     const listPostgresTables=async()=>[{name:'test_table',oid:'1'}], checkedReader=value=>value;
     const observation=async()=>({manifests:{schemaManifestDigest:'schema'}});
     const readPostgresCatalog=async()=>{if(queryFailure)throw primary;return {schema:{mismatch:phase==='mismatch-close'}};};
@@ -89,14 +92,28 @@ async function isolatedFreshSchema(phase: "sync" | "async" | "undefined" | "succ
     async function endFactsSession(){throw new Error('ordinary control must not use facts cleanup');}
     ${body}
     return {sessions,fresh,first,primary,sql,run:()=>withSourceLock('control',async lock=>{lastLock=lock;callbacks++;await lock.observe();return 'result';}),
+      runLost:()=>withSourceLock('control',async lock=>{lastLock=lock;callbacks++;await lock.observe();
+        publicBackup={nativeCaptureCanary:true};lost=true;return 'must-not-commit';}),
+      backupPresent:()=>publicBackup!==undefined,
       close:closeAdapter,allowEnd:()=>{permitEnd=true;},facts:()=>({callbacks,freshEnds,sourceEnds}),outcome:()=>mechanism.controlSqlOutcome(lastLock)};
   `)(MaintenanceFailure, phase, controlSql) as {
     sessions: Set<unknown>; fresh: { ended: boolean }; first: unknown; primary: unknown; sql: string[];
-    run(): Promise<unknown>; close(): Promise<void>; allowEnd(): void;
+    run(): Promise<unknown>; runLost(): Promise<unknown>; backupPresent(): boolean; close(): Promise<void>; allowEnd(): void;
     facts(): { callbacks: number; freshEnds: number; sourceEnds: number };
     outcome(): ReturnType<typeof controlSql.controlSqlOutcome>;
   };
 }
+
+test("#152 PostgreSQL isolated lock loss rejects before source COMMIT and drops native backup authority", async () => {
+  const f = await isolatedFreshSchema("success");
+  try {
+    await assert.rejects(f.runLost(), error => error instanceof MaintenanceFailure && error.code === "maintenance_lost");
+    assert.equal(f.backupPresent(), false, "a lost operation mutex cannot retain old pg_dump authority");
+    assert.equal(f.sql.filter(sql => sql === "source:COMMIT").length, 0, "loss must not commit control work");
+    assert.equal(f.sql.filter(sql => sql === "source:ROLLBACK").length, 1);
+    assert.equal(f.outcome().failureObserved, true);
+  } finally { await f.close(); }
+});
 
 test("#152 PostgreSQL exact ordinary fresh-schema close must precede source COMMIT", async t => {
   for (const phase of ["sync", "async", "undefined", "success"] as const) await t.test(phase, async () => {

@@ -7,6 +7,7 @@ import { Client } from "pg";
 import { parseStorageMaintenanceState, readPostgresMaintenanceState, type StorageMaintenanceState } from "../admission.ts";
 import { canonicalJson, digestJson, sha256 } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
+import { compatibleSourceClientWindow } from "./source-client-window.ts";
 import { maintenanceHostIdentityDigest } from "./host.ts";
 import { buildDatabaseManifests } from "./manifests.ts";
 import { listPostgresTables, quotePostgresIdentifier as quote, readPostgresCatalog, readPostgresEnvironment, readPostgresManifests,
@@ -50,6 +51,9 @@ interface HeldMutex {
   readonly high: number;
   readonly low: number;
   released: boolean;
+  retiring: boolean;
+  heartbeat?: Promise<MaintenanceFailure | undefined> | undefined;
+  releaseAttempt?: Promise<void> | undefined;
 }
 const stateColumns: Readonly<Record<keyof StorageMaintenanceState, string>> = {
   databaseInstanceId: "database_instance_id", admission: "admission", fenceEpoch: "fence_epoch",
@@ -134,7 +138,38 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   let firstSourceIdentity: Json | undefined, mutexTimer: ReturnType<typeof setInterval> | undefined;
   let firstServerIdentity: PostgresDatabaseIdentity | undefined;
   let assertSnapshotLock: ((check?: () => void) => Promise<void>) | undefined;
-  let publicBackup: { readonly sha256: string; readonly manifestDigest: string; readonly binding: PublicRestoreCatalogBinding } | undefined;
+  // Public pg_restore authority comes from this adapter's actual native backup,
+  // not from a persisted B/U. Legitimate journal control successors can commit
+  // between source locks while the original operation mutex remains held.
+  let publicBackup: { readonly sha256: string; readonly manifestDigest: string;
+    readonly binding: PublicRestoreCatalogBinding; readonly owner: HeldMutex;
+    readonly capture: SourceObservation } | undefined;
+  // A committed control change may invalidate the source window without changing
+  // the native archive bytes. Preserve that distinction, never re-enable a
+  // poisoned backup merely because later DB rows resemble the capture again.
+  let publicBackupSourceChanged = false;
+  const samePublicBackupWindow = async (backup: NonNullable<typeof publicBackup>, live: SourceObservation): Promise<boolean> => {
+    const before = backup.capture, a = before.state, b = live.state;
+    const migrationId = a.activeMigrationId, planDigest = a.planDigest;
+    if (!migrationId || !planDigest) return false;
+    return backup.owner === mutex && !backup.owner.released && !backup.owner.retiring
+      && b.admission === "sealed" && a.admission === "sealed"
+      && b.databaseInstanceId === a.databaseInstanceId && b.activeMigrationId === a.activeMigrationId
+      && b.planDigest === a.planDigest && b.fenceEpoch === a.fenceEpoch
+      && b.controlRootJson === a.controlRootJson && b.mutexIdentityJson === a.mutexIdentityJson
+      && b.guardManifestDigest === a.guardManifestDigest
+      && same(live.source, before.source) && same(live.sourceIdentity, before.sourceIdentity)
+      && live.manifests.schemaManifestDigest === before.manifests.schemaManifestDigest
+      && live.manifests.frozenBusinessManifestDigest === before.manifests.frozenBusinessManifestDigest
+      && await compatibleSourceClientWindow(before.manifests.controlRows.storage_source_clients,
+         live.manifests.controlRows.storage_source_clients, {
+           // Preliminary native backup filter only: weak mode is explicitly not
+           // journal row-level authority; V rechecks with strict control proof.
+           journalAdvanced: b.journalSequence > a.journalSequence && b.ownerGeneration >= a.ownerGeneration,
+           mode: "weak", fenceEpoch: a.fenceEpoch, databaseInstanceId: a.databaseInstanceId,
+           source: before.source, migrationId, planDigest, currentSequence: b.journalSequence,
+         });
+  };
   const activeVerifications = new Set<Promise<Json>>();
   const verificationInputs = new Map<FileHandle, { fd: number; identity?: string }>();
   let inspectionSequence = 0;
@@ -150,7 +185,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   const sessionMetadata = (session: Session) => Object.freeze({ pid: session.pid,
     backendStart: session.backendStart.slice(0, 128), source: session.source, critical: session.critical,
     ending: session.ending, ended: session.ended, truncated: session.backendStart.length > 128 });
-  const invalidate = () => { if (mutex) auditFactories.get(mutex)?.close(); lost = true; abort.abort(); };
+  const invalidate = () => { publicBackup = undefined; if (mutex) auditFactories.get(mutex)?.close(); lost = true; abort.abort(); };
   function assertOpen(): void {
     if (closed || closingStarted || lost) throw new MaintenanceFailure("maintenance_lost");
   }
@@ -323,6 +358,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   async function acquireMutex(root: ControlRootIdentity, expected: StorageMaintenanceState): Promise<OperationMutex> {
     assertOpen();
     if (mutex && !mutex.released) throw new MaintenanceFailure("maintenance_busy");
+    publicBackup = undefined; // Never inherit a previous native mutex's backup authority.
     if (root.hostIdentityDigest !== await maintenanceHostIdentityDigest()) throw new MaintenanceFailure("control_root_mismatch");
     const session = await connect(sourceConnection, true, true, "operation-mutex");
     let acquired = false;
@@ -357,23 +393,45 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       } else if (locked.controlRootJson !== rootJson || locked.mutexIdentityJson !== identityJson)
         throw new MaintenanceFailure("control_root_mismatch");
       if ((await session.client.query("COMMIT")).command !== "COMMIT") throw new MaintenanceFailure("maintenance_lost");
-      const held: HeldMutex = { session, root, identity, sourceIdentity: actual, marker: expected.databaseInstanceId, high, low, released: false };
+      const held: HeldMutex = { session, root, identity, sourceIdentity: actual, marker: expected.databaseInstanceId, high, low, released: false, retiring: false };
       mutex = held;
-      let heartbeatRunning = false;
-      mutexTimer = setInterval(() => {
-        if (heartbeatRunning || held.released || closed) return;
-        heartbeatRunning = true;
-        void assertMutex(held).catch(invalidate).finally(() => { heartbeatRunning = false; });
-      }, 1_000); mutexTimer.unref();
+      const heartbeatTimer = setInterval(() => {
+        if (held.heartbeat || held.retiring || held.released || closed) return;
+        const pending = assertMutex(held).then(() => undefined, error => {
+          invalidate(); return safeError(error, "maintenance_lost", "mutex-heartbeat");
+        });
+        held.heartbeat = pending;
+        // A failed monitor remains available to release; success can admit the next tick.
+        void pending.then(error => { if (!error && held.heartbeat === pending) held.heartbeat = undefined; });
+      }, 1_000); mutexTimer = heartbeatTimer; heartbeatTimer.unref();
       return { identity,
         assertHeld: () => assertMutex(held),
         async release() {
           if (held.released) return;
+          if (held.releaseAttempt) return held.releaseAttempt;
           if (lockActive) throw new MaintenanceFailure("maintenance_busy");
-          auditFactories.get(held)?.close(); clearInterval(mutexTimer); mutexTimer = undefined;
-          try { await endSession(session, true); } catch (error) { throw safeError(error, "maintenance_lost", "mutex-close"); }
-          held.released = true;
-          if (mutex === held) mutex = undefined;
+          held.retiring = true;
+          publicBackup = undefined; // Invalid immediately, even if physical close is unknown.
+          auditFactories.get(held)?.close(); clearInterval(heartbeatTimer);
+          if (mutexTimer === heartbeatTimer) mutexTimer = undefined;
+          const attempt = (async () => {
+            const errors: MaintenanceFailure[] = [];
+            const pending = held.heartbeat;
+            if (pending) {
+              // Both real heartbeat queries retain the existing client query_timeout.
+              // Ending their connection first would itself manufacture a lock-loss error.
+              const error = await pending;
+              if (held.heartbeat === pending) held.heartbeat = undefined;
+              if (error) errors.push(error);
+            }
+            let confirmed = false;
+            try { await endSession(session, true); confirmed = true; }
+            catch (error) { errors.push(safeError(error, "maintenance_lost", "mutex-close")); }
+            if (confirmed) { held.released = true; if (mutex === held) mutex = undefined; }
+            throwResourceFailures(errors);
+          })();
+          held.releaseAttempt = attempt;
+          try { await attempt; } finally { if (held.releaseAttempt === attempt) held.releaseAttempt = undefined; }
         },
       };
     } catch (error) {
@@ -661,8 +719,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           if ((await inspectWriters(after, "backup-after")).length) throw new MaintenanceFailure("source_writer_unknown");
           const identity = await readIdentity(locked, sourceConnection, true);
           frozenCapture = capture.manifests;
-          if (publicBinding && publicArchiveDigest) publicBackup = { sha256: publicArchiveDigest,
-            manifestDigest: digestJson(capture.manifests), binding: publicBinding };
+          if (publicBinding && publicArchiveDigest) {
+            publicBackup = { sha256: publicArchiveDigest,
+              manifestDigest: digestJson(capture.manifests), binding: publicBinding, owner: heldMutex, capture };
+            publicBackupSourceChanged = false;
+          }
           return { manifests: capture.manifests, toolchain: { formatVersion: 1, engine: "postgres", format: "custom",
             pgDump: versions.pgDump, pgRestore: versions.pgRestore, serverVersion: identity.serverVersion,
             scope: object(capture.manifests.schema).scope!, sourceIdentityDigest: capture.source.identityDigest,
@@ -710,6 +771,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           }
         }
       }
+      // The native control transaction sees its own updates. Retain the original
+      // archive only across the same sealed source, fence, plan and frozen data;
+      // V still validates the complete actual journal path separately.
+      if (publicBackup && kind === "control" && !(await samePublicBackupWindow(publicBackup, await observation(locked))))
+        publicBackupSourceChanged = true;
       await validateControlSqlCommit(lock); assertControlSqlCommit(lock); noteControlSql(lock, "committing");
       if ((await session.client.query("COMMIT")).command !== "COMMIT") throw new MaintenanceFailure("maintenance_lost");
       noteControlSql(lock, "committed"); active = false; return result;
@@ -723,13 +789,15 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       }
       throw safeError(error, "snapshot_invalid");
     } finally {
-      active = false; lockActive = false; assertSnapshotLock = undefined; publicBackup = undefined;
+      active = false; lockActive = false; assertSnapshotLock = undefined;
+      if (failed || lost) publicBackup = undefined;
       if (session) {
         try {
           if (controlSqlUsed) { session.ending = true; await session.client.end(); session.ended = true; sessions.delete(session); }
           else if (factsUsed) await endFactsSession(session); else await endSession(session, true);
         } catch (error) {
           if (factsUsed) invalidate();
+          publicBackup = undefined;
           noteControlSql(trackedLock, "close-failure", error); if (!failed) throw error;
         }
       }
@@ -810,7 +878,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       let restoredWith: Json;
       if (isPublic) {
         const backup = publicBackup;
+        // Invalid archive authority is distinct from a live source whose controls
+        // have changed since the native backup. Preserve both fail-closed gates.
         if (!backup || backup.manifestDigest !== digestJson(expected)) throw new MaintenanceFailure("snapshot_invalid");
+        if (publicBackupSourceChanged || !(await samePublicBackupWindow(backup, await observe())))
+          throw new MaintenanceFailure("source_changed");
         const assertCurrent = async () => {
           await assertMutex(mutex, checkSuccess); if (!assertSnapshotLock) throw new MaintenanceFailure("maintenance_lost"); await assertSnapshotLock(checkSuccess);
           const live = await readIdentity(target, verificationConnection, false, checkSuccess);
@@ -965,7 +1037,8 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     async close() {
       if (closed) return;
       if (closeAttempt) return closeAttempt;
-      closingStarted = true; if (mutex) auditFactories.get(mutex)?.close(); clearInterval(mutexTimer); abort.abort();
+      closingStarted = true; publicBackup = undefined;
+      if (mutex) auditFactories.get(mutex)?.close(); clearInterval(mutexTimer); abort.abort();
       const attempt = (async () => {
         const errors: MaintenanceFailure[] = [];
         try { await waitForPostgresTools(abort.signal); } catch (error) { errors.push(safeError(error, "maintenance_lost", "tool-close")); }

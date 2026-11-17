@@ -1,5 +1,6 @@
-import { constants, createReadStream } from "node:fs";
+import { constants, createReadStream, fstatSync } from "node:fs";
 import { lstat, mkdir, open, readFile, realpath, rename } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import path from "node:path";
@@ -25,6 +26,67 @@ const RAW = new Set<ObjectKind>(["source-file-payload", "database-snapshot"]);
 const KINDS = new Set<ObjectKind>(["plan", "journal", "source-files", "source-file-payload", "database-snapshot", "database-manifests", "capability", "restore-bundle", "publication", "verification", "receipt"]);
 const uid = () => process.getuid?.();
 const id = (file: string, value: { dev: bigint; ino: bigint }): PathIdentity => ({ path: file, device: String(value.dev), inode: String(value.ino) });
+
+interface PublicationOutcome {
+  invocation: number; artifact: ArtifactRef; failureObserved: boolean; closeFailureObserved: boolean;
+  cleanupFailureObserved: boolean; handleOpened: boolean; handleClosed: boolean; operationFinished: boolean;
+}
+interface PublicationOwner { handle: FileHandle; fd: number; identity?: string; outcome: PublicationOutcome }
+interface PublicationState {
+  epoch: string; next: number; discarded: number; records: PublicationOutcome[];
+  active: Set<number>; owners: Map<FileHandle, PublicationOwner>; cleanup: Promise<void> | undefined;
+}
+const publicationLimits = Object.freeze({ roots: 64, records: 32 } as const);
+// A guarded store can become unreachable when its caller fails. Pending owners
+// therefore belong to an actually validated root identity, not a transient wrapper.
+// Idle history may be evicted; active or uncertain owners are never evicted.
+const publications = new Map<string, PublicationState>();
+function publicationState(key: string): PublicationState {
+  const known = publications.get(key); if (known) return known;
+  if (publications.size >= publicationLimits.roots) {
+    const idle = [...publications].find(([, state]) => !state.active.size && !state.owners.size && !state.cleanup);
+    if (!idle) throw new MaintenanceFailure("snapshot_invalid", "publication-owner-budget");
+    publications.delete(idle[0]);
+  }
+  const state: PublicationState = { epoch: randomUUID(), next: 0, discarded: 0, records: [], active: new Set(), owners: new Map(), cleanup: undefined };
+  publications.set(key, state); return state;
+}
+function assertNoPendingPublication(state: PublicationState): void {
+  if (state.cleanup || [...state.owners.values()].some(owner => !state.active.has(owner.outcome.invocation)))
+    throw new MaintenanceFailure("snapshot_invalid", "publication-cleanup-required");
+}
+function beginPublication(state: PublicationState, artifact: ArtifactRef): PublicationOutcome {
+  assertNoPendingPublication(state);
+  if (state.next === Number.MAX_SAFE_INTEGER) throw new MaintenanceFailure("snapshot_invalid", "publication-sequence-budget");
+  if (state.records.length === publicationLimits.records) {
+    const index = state.records.findIndex(record => !state.active.has(record.invocation)
+      && ![...state.owners.values()].some(owner => owner.outcome === record));
+    if (index < 0) throw new MaintenanceFailure("snapshot_invalid", "publication-owner-budget");
+    state.records.splice(index, 1); state.discarded++;
+  }
+  const record: PublicationOutcome = { invocation: ++state.next, artifact: { ...artifact }, failureObserved: false,
+    closeFailureObserved: false, cleanupFailureObserved: false, handleOpened: false, handleClosed: false, operationFinished: false };
+  state.records.push(record); state.active.add(record.invocation); return record;
+}
+async function closePublicationOwner(state: PublicationState, owner: PublicationOwner): Promise<void> {
+  const retire = () => { state.owners.delete(owner.handle); owner.outcome.handleClosed = true; };
+  const observedClosed = () => {
+    if (owner.handle.fd !== -1) return false;
+    try { const info = fstatSync(owner.fd, { bigint: true }); return owner.identity !== undefined && `${info.dev}:${info.ino}` !== owner.identity; }
+    catch (error) { return (error as NodeJS.ErrnoException)?.code === "EBADF"; }
+  };
+  if (owner.handle.fd === -1) {
+    if (observedClosed()) { retire(); return; }
+    // A retired FileHandle plus an ambiguous reused fd is not close evidence.
+    // Never close a replacement descriptor by its numeric value.
+    throw new MaintenanceFailure("snapshot_invalid", "publication-close-unknown");
+  }
+  try {
+    await owner.handle.close();
+    if (owner.handle.fd !== -1) throw new MaintenanceFailure("snapshot_invalid", "publication-close-unknown");
+    retire();
+  } catch (error) { if (observedClosed()) retire(); throw error; }
+}
 
 async function directoryIdentity(file: string, privateDirectory = false): Promise<PathIdentity> {
   const value = await lstat(file, { bigint: true });
@@ -65,8 +127,10 @@ export class ArtifactStore {
   readonly identity: ControlRootIdentity;
   private readonly marker: RootMarker;
   private readonly options: StoreOptions;
+  readonly #publicationRootKey: string;
   private constructor(marker: RootMarker, options: StoreOptions) {
     this.root = marker.root.path; this.identity = marker.root; this.marker = marker; this.options = options;
+    this.#publicationRootKey = canonicalJson(marker.root);
   }
   static async create(root: string, source: SourceRef, options: StoreOptions = {}): Promise<ArtifactStore> {
     assertMaintenancePlatform();
@@ -109,6 +173,40 @@ export class ArtifactStore {
     } catch { throw new MaintenanceFailure("control_root_mismatch"); }
   }
   private async assertCurrent(): Promise<void> { await this.assertRoot(); await this.options.assertCurrent?.(); }
+  private assertPublicationAvailable(): void {
+    if (canonicalJson(this.identity) !== this.#publicationRootKey) throw new MaintenanceFailure("control_root_mismatch");
+    const state = publications.get(this.#publicationRootKey); if (state) assertNoPendingPublication(state);
+  }
+  /** Bounded process-local observations, never success, COMMIT or qualification evidence.
+   * An epoch change or absent epoch means idle history was discarded; it does not
+   * mean prior calls succeeded. Caller mutation cannot alter records or root binding.
+   */
+  publicationOutcomes() {
+    const state = publications.get(this.#publicationRootKey);
+    return Object.freeze({ epoch: state?.epoch ?? null, discarded: state?.discarded ?? 0,
+      limits: publicationLimits, records: Object.freeze((state?.records ?? []).map(record => Object.freeze({ ...record,
+        artifact: Object.freeze({ ...record.artifact }), pendingCleanup: !!state && !state.active.has(record.invocation)
+          && [...state.owners.values()].some(owner => owner.outcome === record) }))) });
+  }
+  /** Explicit cleanup of this validated root's original publication handles only.
+   * No path lookup opens a replacement, and no write/rename/source SQL is replayed.
+   * Cleanup remains possible through the original store even if a path later moves.
+   */
+  async cleanupPublications(): Promise<void> {
+    const state = publications.get(this.#publicationRootKey); if (!state) return;
+    if (state.cleanup) return state.cleanup;
+    if (state.active.size) throw new MaintenanceFailure("snapshot_invalid", "publication-active");
+    const task = Promise.resolve().then(async () => {
+      let failed = false, first: unknown;
+      for (const owner of [...state.owners.values()]) {
+        try { await closePublicationOwner(state, owner); }
+        catch (error) { owner.outcome.cleanupFailureObserved = true; if (!failed) { failed = true; first = error; } }
+      }
+      if (failed) throw first;
+    });
+    state.cleanup = task;
+    try { await task; } finally { if (state.cleanup === task) state.cleanup = undefined; }
+  }
   pathFor(ref: ArtifactRef): string { assertRef(ref); return path.join(this.root, ref.ref); }
   kindFor(ref: ArtifactRef): ObjectKind { return assertRef(ref); }
   private async mkdirPrivate(relative: string): Promise<void> {
@@ -159,6 +257,7 @@ export class ArtifactStore {
   /** Import only an already closed regular file inside our unique attempt subtree. */
   async importDatabase(file: string): Promise<ArtifactRef> {
     assertMaintenancePlatform(); await this.assertCurrent();
+    this.assertPublicationAvailable();
     if (!file.startsWith(`${this.root}/attempts/`) || await realpath(file) !== file) throw new MaintenanceFailure("snapshot_invalid");
     const info = await lstat(file, { bigint: true });
     if (!info.isFile() || info.nlink !== 1n || info.size === 0n) throw new MaintenanceFailure("snapshot_invalid");
@@ -177,23 +276,36 @@ export class ArtifactStore {
       await syncDirectory(path.dirname(this.pathFor(ref))); await syncDirectory(path.dirname(file));
       await this.options.after?.("directory_synced");
     }
-    await this.verifyFile(ref); return ref;
+    await this.verifyFile(ref); this.assertPublicationAvailable(); return ref;
   }
   private async publish(ref: ArtifactRef, bytes: Uint8Array): Promise<ArtifactRef> {
     assertMaintenancePlatform(); await this.assertCurrent();
-    await this.mkdirPrivate(path.posix.dirname(ref.ref));
-    const target = this.pathFor(ref);
-    try { await lstat(target); await this.confirmDurable(ref); return ref; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    const temp = `${target}.${randomUUID()}.tmp`;
-    const handle = await open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    if (canonicalJson(this.identity) !== this.#publicationRootKey) throw new MaintenanceFailure("control_root_mismatch");
+    const state = publicationState(this.#publicationRootKey), outcome = beginPublication(state, ref);
     try {
-      await handle.writeFile(bytes); await this.options.after?.("temp_written");
-      await syncMaintenanceHandle(handle); await this.options.after?.("file_synced");
-    } finally { await handle.close(); }
-    await this.assertCurrent(); await rename(temp, target); await this.options.after?.("renamed");
-    await syncDirectory(path.dirname(target)); await this.options.after?.("directory_synced");
-    await this.verifyFile(ref); return ref;
+      await this.mkdirPrivate(path.posix.dirname(ref.ref));
+      const target = this.pathFor(ref);
+      try { await lstat(target); await this.confirmDurable(ref); assertNoPendingPublication(state); return ref; }
+      catch (error) { if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error; }
+      const temp = `${target}.${randomUUID()}.tmp`;
+      const handle = await open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      const owner: PublicationOwner = { handle, fd: handle.fd, outcome }; state.owners.set(handle, owner); outcome.handleOpened = true;
+      let failed = false, first: unknown, closeFailed = false, closeError: unknown;
+      try {
+        const info = fstatSync(handle.fd, { bigint: true }); owner.identity = `${info.dev}:${info.ino}`;
+        await handle.writeFile(bytes); await this.options.after?.("temp_written");
+        await syncMaintenanceHandle(handle); await this.options.after?.("file_synced");
+      } catch (error) { failed = true; first = error; outcome.failureObserved = true; }
+      try { await closePublicationOwner(state, owner); }
+      catch (error) { closeFailed = true; closeError = error; outcome.closeFailureObserved = true; }
+      if (failed) throw first;
+      if (closeFailed) throw closeError;
+      assertNoPendingPublication(state);
+      await this.assertCurrent(); await rename(temp, target); await this.options.after?.("renamed");
+      await syncDirectory(path.dirname(target)); await this.options.after?.("directory_synced");
+      await this.verifyFile(ref); assertNoPendingPublication(state); return ref;
+    } catch (error) { if (!outcome.closeFailureObserved) outcome.failureObserved = true; throw error; }
+    finally { state.active.delete(outcome.invocation); outcome.operationFinished = true; }
   }
   private async verifiedHandle(ref: ArtifactRef) {
     await this.assertRoot(); const file = this.pathFor(ref);
@@ -248,13 +360,13 @@ export class ArtifactStore {
   }
   /** Resync an already published immutable name; this invocation does not perform a rename. */
   async confirmDurable(ref: ArtifactRef): Promise<{ artifact: ArtifactRef; completed: readonly ["file_sync", "immutable_name_verified", "directory_sync"] }> {
-    assertMaintenancePlatform(); await this.assertCurrent(); await this.verifyFile(ref);
+    assertMaintenancePlatform(); await this.assertCurrent(); this.assertPublicationAvailable(); await this.verifyFile(ref);
     const handle = await this.verifiedHandle(ref);
     try { await syncMaintenanceHandle(handle); } finally { await handle.close(); }
     for (let parent = path.dirname(this.pathFor(ref)); ; parent = path.dirname(parent)) {
       await syncDirectory(parent); if (parent === this.root) break;
     }
-    await this.assertCurrent();
+    await this.assertCurrent(); this.assertPublicationAvailable();
     return { artifact: ref, completed: ["file_sync", "immutable_name_verified", "directory_sync"] };
   }
 }
