@@ -1,7 +1,13 @@
 import { z } from "zod";
 import { canonicalJson, digestJson } from "../canonical.ts";
+import { MaintenanceFailure } from "../error.ts";
+import { digestRowMultiset } from "../manifests.ts";
+import { encodePostgresCell } from "../postgres-manifests.ts";
+import { sameSourceClientRow } from "../source-client-equality.ts";
+import { sourceClientColumns } from "../source-clients-read.ts";
+import { sourceClientRawRowSchema } from "../source-clients.ts";
 import { counter, hash, id, ref, source } from "../parse-primitives.ts";
-import type { JournalRecord, MigrationPlan, SourceClientRawRow, SourceClientTextCell, SourceClientsRosterV1, SourceRef } from "../types.ts";
+import type { DatabaseManifests, JournalRecord, Json, MigrationPlan, SourceClientRawRow, SourceClientTextCell, SourceClientsRosterV1, SourceRef } from "../types.ts";
 import type { UntrustedJournalCandidate } from "./codec.ts";
 import { compareText, equal, ordered, requireCandidate } from "./common.ts";
 import { fence, ownedIdentity, safePos, processDisposition, type ClientFact, type EventFacts, type SuccessorProof } from "./schema.ts";
@@ -12,6 +18,8 @@ type Registration = { readonly creation: z.infer<typeof creation>; readonly acto
 export interface RowContext {
   readonly plan: MigrationPlan;
   readonly record: JournalRecord | UntrustedJournalCandidate;
+  /** Row/receipt history stays at the origin epoch, including the terminal E+1 record. */
+  readonly fenceEpoch: number;
   readonly encoding: Encoding;
   readonly receiptGeneration: string;
   readonly registrations: Map<string, Registration>;
@@ -53,14 +61,19 @@ function json(value: string | null): unknown {
 function object(value: unknown): Record<string, unknown> {
   requireCandidate(value !== null && typeof value === "object" && !Array.isArray(value)); return value as Record<string, unknown>;
 }
-export function supportedEncoding(encoding: Encoding): boolean { return encoding.backend === "sqlite" || encoding.name === "UTF8"; }
+export function supportedEncoding(encoding: Encoding): boolean {
+  return encoding.backend === "sqlite" ? ["UTF-8", "UTF-16le", "UTF-16be"].includes(encoding.name)
+    : encoding.backend === "postgres" && encoding.name === "UTF8";
+}
 export function encodeText(value: string, encoding: Encoding): SourceClientTextCell | null {
   if (!supportedEncoding(encoding)) return null;
+  requireCandidate(!/[\uD800-\uDFFF]/u.test(value));
   const bytes = Buffer.from(value, encoding.name === "UTF-16le" || encoding.name === "UTF-16be" ? "utf16le" : "utf8");
   if (encoding.name === "UTF-16be") bytes.swap16();
   return ["text", bytes.toString("hex")];
 }
 export function decodeRow(row: SourceClientRawRow, encoding: Encoding): Decoded | null {
+  requireCandidate(sourceClientRawRowSchema.safeParse(row).success);
   if (!supportedEncoding(encoding)) return null;
   const result: Partial<Decoded> = {};
   try {
@@ -76,6 +89,38 @@ export function decodeRow(row: SourceClientRawRow, encoding: Encoding): Decoded 
     }
   } catch { requireCandidate(false); }
   return result as Decoded;
+}
+
+/** Supplied manifest/raw data only. Native callers must additionally bind the exact
+ * columns and raw rows to their actual current source window. */
+export function bindSourceClientManifestRows(manifests: DatabaseManifests, rows: readonly SourceClientRawRow[], encoding: Encoding,
+  nativeColumns?: Json): { readonly kind: "untrusted-source-client-manifest-binding"; readonly rows: readonly Decoded[] } {
+  if (!supportedEncoding(encoding)) throw new MaintenanceFailure("source_changed", "v3-source-clients-encoding-unverified");
+  requireCandidate(manifests.dialect === encoding.backend);
+  const tables = manifests.tables.filter(table => table.name === "storage_source_clients");
+  requireCandidate(tables.length === 1);
+  const table = tables[0]!;
+  requireCandidate(Array.isArray(table.columns) && table.columns.length === sourceClientColumns.length
+    && (nativeColumns === undefined || equal(table.columns, nativeColumns)));
+  for (const [index, expected] of sourceClientColumns.entries()) {
+    const column = table.columns[index];
+    requireCandidate(column !== null && typeof column === "object" && !Array.isArray(column) && column.name === expected.name);
+    requireCandidate(encoding.backend === "sqlite"
+      ? column.cid === String(index) && column.type === expected.sqlite && column.notnull === (expected.nullable || index === 0 ? "0" : "1")
+      : column.position === String(index + 1) && column.type_oid === expected.postgres && column.not_null === !expected.nullable);
+  }
+  const decoded = rows.map(raw => { const value = decodeRow(raw, encoding); requireCandidate(value !== null && sameSourceClientRow(value, value)); return value; });
+  const indexed = new Map<string, Readonly<Record<string, Json>>>();
+  for (const row of manifests.controlRows.storage_source_clients) {
+    requireCandidate(sameSourceClientRow(row, row) && typeof row.client_id === "string" && !indexed.has(row.client_id)); indexed.set(row.client_id, row);
+  }
+  requireCandidate(indexed.size === decoded.length && new Set(decoded.map(row => row.client_id)).size === decoded.length);
+  for (const row of decoded) { const actual = indexed.get(row.client_id!); requireCandidate(actual && sameSourceClientRow(row, actual)); }
+  const typed: Json[] = rows.map((row, index) => sourceClientColumns.map(column => encoding.backend === "sqlite"
+    ? [...row[column.name]] : encodePostgresCell(column.postgres, decoded[index]![column.name])));
+  const expected = digestRowMultiset(typed);
+  requireCandidate(table.count === expected.count && table.digest === expected.digest);
+  return { kind: "untrusted-source-client-manifest-binding", rows: decoded };
 }
 function rowDigest(context: RowContext, row: SourceClientRawRow): string {
   return digestJson({ formatVersion: 1, kind: "source-client-row", source: context.record.source, textEncoding: context.encoding, row });
@@ -119,7 +164,7 @@ function ordinaryProfile(row: SourceClientRawRow, decoded: Decoded, fact: Exclud
       }
     }
   }
-  const current = currentClient(row, context.record.fenceEpoch), receipt = body.drainReceipt;
+  const current = currentClient(row, context.fenceEpoch), receipt = body.drainReceipt;
   requireCandidate(fact.classification === (current ? "current-client" : "historical-client"));
   if (receipt === null) {
     requireCandidate(!current && fact.receipt === null && decoded.ended_at !== null && decoded.drain_state === "none"
@@ -133,9 +178,9 @@ function ordinaryProfile(row: SourceClientRawRow, decoded: Decoded, fact: Exclud
     && String(receipt.drainEpoch) === decoded.drain_epoch && String(receipt.drainEpoch) === decoded.observed_epoch
     && receipt.drainEpoch === receipt.registeredEpoch + 1 && receipt.sourceIdentityDigest === digestJson(body.sourceIdentity)
     && receipt.processIdentityDigest === digestJson(json(decoded.process_identity_json)));
-  if (current) requireCandidate(receipt.drainEpoch === context.record.fenceEpoch && String(receipt.ownerGeneration) === context.receiptGeneration
+  if (current) requireCandidate(receipt.drainEpoch === context.fenceEpoch && String(receipt.ownerGeneration) === context.receiptGeneration
     && receipt.migrationId === context.record.migrationId && receipt.planDigest === context.record.plan.sha256);
-  else requireCandidate(receipt.drainEpoch < context.record.fenceEpoch);
+  else requireCandidate(receipt.drainEpoch < context.fenceEpoch);
   requireCandidate(fact.receipt.ownedExits.length === receipt.ownedExits.length);
   for (const [index, item] of receipt.ownedExits.entries()) requireCandidate(equal(item.fence, fact.receipt.ownedExits[index]!.fence)
     && equal(item.processIdentity, fact.receipt.ownedExits[index]!.processIdentity));
@@ -171,8 +216,8 @@ export function validateHistoricalControllerProfile(row: SourceClientRawRow, val
 function controllerProfile(row: SourceClientRawRow, decoded: Decoded, fact: Extract<ClientFact, { kind: "maintenance-controller" }>, context: RowContext): void {
   const body = controllerRegistration(row, decoded, fact, context.record.source), prior = context.registrations.get(row.client_id[1]);
   if (prior) requireCandidate(fact.registration === "current-chain" && equal(prior.creation, body.creation) && prior.actorId === fact.process.instanceId
-    && body.creation.fenceEpoch === String(context.record.fenceEpoch));
-  else requireCandidate(fact.registration === "R0-historical" && BigInt(body.creation.fenceEpoch) < BigInt(context.record.fenceEpoch)
+    && body.creation.fenceEpoch === String(context.fenceEpoch));
+  else requireCandidate(fact.registration === "R0-historical" && BigInt(body.creation.fenceEpoch) < BigInt(context.fenceEpoch)
     && fact.classification === "exited-actor");
   if (fact.classification === "active-actor") requireCandidate(row.ended_at[0] === "null");
 }
@@ -227,21 +272,23 @@ function sessionSources(facts: EventFacts, context: RowContext, expected: readon
 
 export function validateRowsFacts(rows: readonly SourceClientRawRow[], facts: EventFacts, context: RowContext): void {
   requireCandidate(facts.clients.length === rows.length && facts.beforeCount === String(rows.length));
+  // Even an empty/equal table retains the unverified encoding obligation.
+  if (!supportedEncoding(context.encoding)) context.unresolvedEncoding.add(context.encoding.name);
   const expected: PgRegistered[] = []; let allDecoded = true;
   for (const [index, row] of rows.entries()) {
     const fact = facts.clients[index]!;
     requireCandidate(equal(fact.subject, row.client_id) && fact.rowDigest === rowDigest(context, row));
     if (fact.kind !== "maintenance-controller") {
-      const current = currentClient(row, context.record.fenceEpoch);
-      requireCandidate(BigInt(row.registered_epoch[1]) < BigInt(context.record.fenceEpoch)
+      const current = currentClient(row, context.fenceEpoch);
+      requireCandidate(BigInt(row.registered_epoch[1]) < BigInt(context.fenceEpoch)
         && fact.classification === (current ? "current-client" : "historical-client") && (!current || fact.receipt !== null));
       if (fact.receipt === null) requireCandidate(row.ended_at[0] === "text" && processDisposition(fact.process, fact.processCheck) === "exited");
     } else {
       const registration = context.registrations.get(row.client_id[1]);
       requireCandidate(row.drain_epoch[0] === "null" && row.drain_receipt_digest[0] === "null" && equal(row.registered_epoch, row.observed_epoch));
       if (registration) requireCandidate(fact.registration === "current-chain" && registration.actorId === fact.process.instanceId
-        && row.registered_epoch[1] === String(context.record.fenceEpoch));
-      else requireCandidate(fact.registration === "R0-historical" && BigInt(row.registered_epoch[1]) < BigInt(context.record.fenceEpoch) && fact.classification === "exited-actor");
+        && row.registered_epoch[1] === String(context.fenceEpoch));
+      else requireCandidate(fact.registration === "R0-historical" && BigInt(row.registered_epoch[1]) < BigInt(context.fenceEpoch) && fact.classification === "exited-actor");
       if (fact.classification === "active-actor") requireCandidate(row.ended_at[0] === "null");
     }
     const decoded = decodeRow(row, context.encoding);
@@ -266,10 +313,10 @@ export function applyChanges(rows: readonly SourceClientRawRow[], proof: Success
       requireCandidate(!next.has(key) && proof.facts.actor.clientId === null && change.actorId === proof.facts.actor.actorId
         && proof.facts.clients.every(client => client.process.instanceId !== change.actorId)
         && ![...context.registrations.values()].some(item => item.actorId === change.actorId));
-      const creationValue = { migrationId: context.record.migrationId, plan: context.record.plan, fenceEpoch: String(context.record.fenceEpoch),
+      const creationValue = { migrationId: context.record.migrationId, plan: context.record.plan, fenceEpoch: String(context.fenceEpoch),
         ownerGeneration: String(context.record.ownerGeneration), previousAnchor: proof.previousAnchor, targetSequence: String(context.record.sequence) };
       const row = change.after, decoded = decodeRow(row, context.encoding);
-      requireCandidate(row.protocol_version[1] === "1" && row.registered_epoch[1] === String(context.record.fenceEpoch)
+      requireCandidate(row.protocol_version[1] === "1" && row.registered_epoch[1] === String(context.fenceEpoch)
         && equal(row.observed_epoch, row.registered_epoch) && row.drain_epoch[0] === "null" && row.drain_receipt_digest[0] === "null" && row.ended_at[0] === "null");
       if (time !== null) requireCandidate(equal(row.registered_at, time) && equal(row.last_observed_at, time));
       if (decoded !== null) {

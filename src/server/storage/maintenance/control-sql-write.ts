@@ -2,18 +2,23 @@ import type Database from "better-sqlite3";
 import type { Client } from "pg";
 import { MaintenanceFailure } from "./error.ts";
 import { sourceClientColumns } from "./source-clients-read.ts";
-import type { ExpectedMaintenance } from "./control-candidate/replay.ts";
 import type { SourceClientRawRow } from "./types.ts";
-import type { ControlSqlPlan } from "./control-sql.ts";
+import type { ControlSqlMaintenance, ControlSqlPlan } from "./control-sql.ts";
 
-const maintenanceColumns: Readonly<Record<keyof ExpectedMaintenance, string>> = {
+const maintenanceColumns: Readonly<Record<keyof ControlSqlMaintenance, string>> = {
   singleton: "singleton", databaseInstanceId: "database_instance_id", admission: "admission", fenceEpoch: "fence_epoch",
   ownerGeneration: "owner_generation", activeMigrationId: "active_migration_id", planDigest: "plan_digest",
   controlRootJson: "control_root_json", mutexIdentityJson: "mutex_identity_json", journalRecordRef: "journal_record_ref",
   journalDigest: "journal_digest", journalSequence: "journal_sequence", protocolVersion: "protocol_version", guardManifestDigest: "guard_manifest_digest",
 };
-const keys = Object.keys(maintenanceColumns) as (keyof ExpectedMaintenance)[];
-const changed = ["ownerGeneration", "journalRecordRef", "journalDigest", "journalSequence"] as const;
+const keys = Object.keys(maintenanceColumns) as (keyof ControlSqlMaintenance)[];
+const successorColumns = ["ownerGeneration", "journalRecordRef", "journalDigest", "journalSequence"] as const;
+function changedColumns(plan: ControlSqlPlan): readonly (keyof ControlSqlMaintenance)[] {
+  if (plan.transition === "sealed-successor") return successorColumns;
+  if (plan.transition === "first-seal") return ["admission", ...successorColumns];
+  if (plan.transition === "cancel-terminal") return ["admission", "fenceEpoch", "activeMigrationId", "planDigest", ...successorColumns];
+  throw new MaintenanceFailure("journal_invalid");
+}
 function one(count: number | bigint | null): void { if (count !== 1 && count !== 1n) throw new MaintenanceFailure("source_changed"); }
 function completeMaintenance(value: Record<string, unknown>[]): void {
   if (value.length !== 1 || Object.keys(value[0]!).length !== keys.length || keys.some(key => !Object.hasOwn(value[0]!, maintenanceColumns[key])))
@@ -22,6 +27,7 @@ function completeMaintenance(value: Record<string, unknown>[]): void {
 
 /** Only the adapter's already-held transaction passes its handle here. No input chooses SQL or columns. */
 export function writeSqliteControlSql(db: Database.Database, plan: ControlSqlPlan): void {
+  const changed = changedColumns(plan);
   completeMaintenance(db.prepare("SELECT * FROM storage_maintenance").all() as Record<string, unknown>[]);
   const cell = (value: SourceClientRawRow[keyof SourceClientRawRow]) => value[0] === "null" ? null
     : value[0] === "text" ? Buffer.from(value[1], "hex") : BigInt(value[1]);
@@ -44,6 +50,7 @@ export function writeSqliteControlSql(db: Database.Database, plan: ControlSqlPla
 
 /** The PG client and schema are fixed by the actual adapter, never by a mechanism input. */
 export async function writePostgresControlSql(client: Client, plan: ControlSqlPlan): Promise<void> {
+  const changed = changedColumns(plan);
   completeMaintenance((await client.query("SELECT * FROM storage_maintenance")).rows);
   const expression = (value: SourceClientRawRow[keyof SourceClientRawRow], index: number) => value[0] === "text"
     ? `convert_from(decode($${index},'hex'),current_setting('server_encoding'))` : `$${index}`;
@@ -61,6 +68,6 @@ export async function writePostgresControlSql(client: Client, plan: ControlSqlPl
         [value(change.after.last_observed_at), value(change.after.ended_at), ...sourceClientColumns.map(column => value(change.before[column.name]))])).rowCount);
     }
   }
-  one((await client.query(`UPDATE storage_maintenance SET ${changed.map((key, index) => `${maintenanceColumns[key]}=$${index + 1}`).join(",")} WHERE ${keys.map((key, index) => `${maintenanceColumns[key]} IS NOT DISTINCT FROM $${index + 5}`).join(" AND ")}`,
+  one((await client.query(`UPDATE storage_maintenance SET ${changed.map((key, index) => `${maintenanceColumns[key]}=$${index + 1}`).join(",")} WHERE ${keys.map((key, index) => `${maintenanceColumns[key]} IS NOT DISTINCT FROM $${index + changed.length + 1}`).join(" AND ")}`,
     [...changed.map(key => plan.after.expectedMaintenance[key]), ...keys.map(key => plan.before.expectedMaintenance[key])])).rowCount);
 }

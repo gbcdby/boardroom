@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { channel } from "node:diagnostics_channel";
-import { constants, fstatSync } from "node:fs";
+import { constants, fstatSync, type BigIntStats } from "node:fs";
 import { lstat, open, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { Client } from "pg";
@@ -18,10 +18,12 @@ import { parsePostgresConnection, postgresDatabaseArgument, postgresToolVersions
 import { postgresFileDigest, restorePostgresPublic } from "./postgres-public-restore.ts";
 import { readPublicRestoreCatalogBinding, type PublicRestoreCatalogBinding } from "./postgres-public-toc.ts";
 import { decodePostgresSourceRows, readPostgresSourceClients } from "./postgres-source-clients.ts";
-import { readSourceClientAudit, withSourceClientFacts, type SourceFactsAccess } from "./source-writers.ts";
+import { readSourceClientAudit, withCancellationSourceClientFacts, withControllerSourceClientFacts, withSourceClientFacts, type SourceFactsAccess } from "./source-writers.ts";
+import { readAnchoredControllerArchive, type ControllerSourceAccess } from "./controller-write.ts";
+import { finishControllerRestoreCallback, retainPendingControllerRestoreFailures } from "./restore-authorization.ts";
 import { BootstrapAuditFactory, type SessionAuditCollection } from "./native-audit.ts";
 import type { EventFacts } from "./control-candidate/schema.ts";
-import { assertControlSqlAnchorAllowed, assertControlSqlCommit, bindControlSql, finishControlSqlCallback, noteControlSql, validateControlSqlCommit } from "./control-sql.ts";
+import { assertControlSqlAnchorAllowed, assertControlSqlCommit, bindControlSql, finishControlSqlCallback, noteControlSql, retainPendingControlSqlFailure, validateControlSqlCommit } from "./control-sql.ts";
 import { writePostgresControlSql } from "./control-sql-write.ts";
 type PostgresAudit = Extract<EventFacts["sessions"], { kind: "postgres-session-audit-v1" }>;
 import type { AnchorChange, Blocker, BlockerCode, ControlRootIdentity, DatabaseManifests, Json,
@@ -55,6 +57,14 @@ interface HeldMutex {
   heartbeat?: Promise<MaintenanceFailure | undefined> | undefined;
   releaseAttempt?: Promise<void> | undefined;
 }
+const controllerSources = new WeakMap<SourceLock, { adapter: MaintenanceAdapter; mutex: OperationMutex;
+  select(): void; access: ControllerSourceAccess }>();
+/** Only this adapter's actual original lock installs an entry. */
+export async function postgresControllerSourceAccess(adapter: MaintenanceAdapter, mutex: OperationMutex, lock: SourceLock): Promise<ControllerSourceAccess> {
+  const binding = controllerSources.get(lock);
+  if (binding?.adapter !== adapter || binding.mutex !== mutex) throw new MaintenanceFailure("maintenance_lost");
+  await binding.access.assertHeld(); binding.select(); return binding.access;
+}
 const stateColumns: Readonly<Record<keyof StorageMaintenanceState, string>> = {
   databaseInstanceId: "database_instance_id", admission: "admission", fenceEpoch: "fence_epoch",
   ownerGeneration: "owner_generation", activeMigrationId: "active_migration_id", planDigest: "plan_digest",
@@ -85,6 +95,12 @@ interface BackupFileOwner {
   closed: boolean;
 }
 interface BackupPassfileOwner { readonly path: string; readonly file: BackupFileOwner; cleanupAttempted: boolean }
+function archiveIdentity(value: BigIntStats): string {
+  if (!value.isFile() || value.nlink !== 1n || (value.mode & 0o7777n) !== 0o600n || value.size <= 5n || value.size > BigInt(Number.MAX_SAFE_INTEGER)
+    || typeof process.getuid === "function" && value.uid !== BigInt(process.getuid())) throw new MaintenanceFailure("snapshot_invalid");
+  return canonicalJson({ device: String(value.dev), inode: String(value.ino), size: String(value.size), mode: String(value.mode),
+    uid: String(value.uid), links: String(value.nlink), mtime: String(value.mtimeNs), ctime: String(value.ctimeNs) });
+}
 function checkedCounter(value: number): boolean { return Number.isSafeInteger(value) && value >= 0; }
 /** Internal readers use promise queries. Bound every actual query dispatch and its
  * real completion; a failed check never leaves a detached query running. */
@@ -141,6 +157,12 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   const verificationConnection = verification ? parsePostgresConnection(verification) : undefined;
   const sessions = new Set<Session>();
   const auditFactories = new WeakMap<HeldMutex, BootstrapAuditFactory>();
+  const publicMutexes = new WeakMap<HeldMutex, OperationMutex>();
+  let currentControllerSource: { readonly lock: SourceLock; readonly session: Session; readonly held: HeldMutex;
+    readonly mutex: OperationMutex; readonly failures: unknown[]; controller: boolean } | undefined;
+  const archiveOwners = new WeakMap<SourceLock, { readonly owner: HeldMutex; readonly input: FileHandle; readonly identity: string;
+    readonly selected: NonNullable<Awaited<ReturnType<typeof readAnchoredControllerArchive>>>;
+    readonly binding?: PublicRestoreCatalogBinding }>();
   const abort = new AbortController();
   let closed = false, lost = false, mutex: HeldMutex | undefined, lockActive = false;
   let closingStarted = false, closeAttempt: Promise<void> | undefined;
@@ -245,7 +267,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     if (!confirmed) { invalidate(); throw new MaintenanceFailure("maintenance_lost", "source-client-facts"); }
   }
   async function connect(connection: PostgresConnection, sourceSession: boolean, critical = false,
-    role: Session["role"] = "inspection"): Promise<Session> {
+    role: Session["role"] = "inspection", preserveFailure = false): Promise<Session> {
     assertOpen();
     const client = new Client({ ...connection.clientConfig,
       application_name: `boardroom-maintenance:${randomUUID()}` });
@@ -262,8 +284,9 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       session.pid = row.pid; session.backendStart = row.backend_start;
       return session;
     } catch (error) {
-      const errors = [safeError(error, sourceSession ? "source_missing" : "restore_verification_unavailable")];
-      try { await endSession(session, true); } catch (closeError) { errors.push(safeError(closeError, "maintenance_lost", "connection-close")); }
+      const errors: unknown[] = [preserveFailure ? error : safeError(error, sourceSession ? "source_missing" : "restore_verification_unavailable")];
+      try { await endSession(session, true); }
+      catch (closeError) { errors.push(preserveFailure ? closeError : safeError(closeError, "maintenance_lost", "connection-close")); }
       throwResourceFailures(errors); throw errors[0];
     }
   }
@@ -417,7 +440,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         // A failed monitor remains available to release; success can admit the next tick.
         void pending.then(error => { if (!error && held.heartbeat === pending) held.heartbeat = undefined; });
       }, 1_000); mutexTimer = heartbeatTimer; heartbeatTimer.unref();
-      return { identity,
+      const lease: OperationMutex = { identity,
         assertHeld: () => assertMutex(held),
         async release() {
           if (held.released) return;
@@ -447,6 +470,8 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           try { await attempt; } finally { if (held.releaseAttempt === attempt) held.releaseAttempt = undefined; }
         },
       };
+      publicMutexes.set(held, lease); auditFactories.set(held, new BootstrapAuditFactory(adapter, held));
+      return lease;
     } catch (error) {
       const errors = [safeError(error, "maintenance_lost")];
       if (acquired) {
@@ -673,10 +698,13 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
   async function withSourceLock<T>(kind: "control" | "snapshot", callback: (lock: SourceLock) => Promise<T>): Promise<T> {
     await assertMutex();
     const heldMutex = mutex!;
+    const publicMutex = publicMutexes.get(heldMutex), factory = auditFactories.get(heldMutex);
+    if (!publicMutex || !factory) throw new MaintenanceFailure("maintenance_lost");
     if (lockActive) throw new MaintenanceFailure("maintenance_busy");
     lockActive = true;
     let session: Session | undefined, active = false, transactionId = "", changed = false, backupUsed = false, factsInvalidated = false, factsUsed = false, controlSqlUsed = false, failed = false;
     let trackedLock: SourceLock | undefined;
+    let controllerUsed = false, registrationCandidate = false;
     let tables: readonly PostgresTable[] = [], lockedSchemaDigest: string | undefined;
     let frozenCapture: DatabaseManifests | undefined;
     try {
@@ -741,11 +769,13 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
             await assertHeld(); return result;
           } catch (error) { throw safeError(error, "snapshot_invalid", "source-clients"); }
         },
-        withSourceClientFacts: (plan, consume) => { factsUsed = true; return withSourceClientFacts(factsAccess, plan, consume); },
+        withSourceClientFacts: (plan, consume) => {
+          factsUsed = true;
+          return withSourceClientFacts(factsAccess, plan, consume,
+            { lease: factory.bind(adapter, heldMutex, lock, factsAccess.assertUnchangedLock), lock });
+        },
         readSourceClientAudit: plan => {
           factsUsed = true;
-          let factory = auditFactories.get(heldMutex);
-          if (!factory) { factory = new BootstrapAuditFactory(adapter, heldMutex); auditFactories.set(heldMutex, factory); }
           return readSourceClientAudit(factsAccess, plan, factory.bind(adapter, heldMutex, lock, factsAccess.assertUnchangedLock), lock);
         },
         async anchor(change) {
@@ -853,13 +883,34 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       // is only established when a fresh real operation mutex AND source transaction lock are granted.
       const streamOf = (client: Client) => (client as unknown as { connection?: { stream?: { readonly closed?: boolean } } }).connection?.stream;
       const sourceStream = streamOf(locked.client), mutexStream = streamOf(heldMutex.session.client);
+      currentControllerSource = { lock, session: locked, held: heldMutex, mutex: publicMutex, failures: [], controller: false };
+      controllerSources.set(lock, { adapter, mutex: publicMutex, select: () => {
+        controllerUsed = true;
+        if (currentControllerSource?.lock === lock) currentControllerSource.controller = true;
+      }, access: Object.freeze({ kind, root: heldMutex.root, assertHeld,
+        withAdvanceFacts: (plan, consume) => {
+          controllerUsed = true; factsUsed = true;
+          return withControllerSourceClientFacts(factsAccess, plan, factory.bind(adapter, heldMutex, lock, factsAccess.assertUnchangedLock), lock, consume);
+        },
+        withCancellationFacts: (plan, consume) => {
+          controllerUsed = true; factsUsed = true;
+          return withCancellationSourceClientFacts(factsAccess, plan, factory.bind(adapter, heldMutex, lock, factsAccess.assertUnchangedLock), lock, consume);
+        },
+        stageRegistration: () => factory.stageRegistration(adapter, heldMutex, lock),
+        stageCandidate: async (reference, record) => { await factory.stageControlCandidate(adapter, heldMutex, lock, reference, record); registrationCandidate = true; },
+        invalidate: () => factory.close(),
+      } satisfies ControllerSourceAccess) });
       bindControlSql(lock, { adapter, root: heldMutex.root, control: kind === "control", assertHeld,
         invalidateFacts: () => { factsInvalidated = true; controlSqlUsed = true; changed = true; },
         observe: () => lock.observeSourceClients(), manifests: () => lock.observe(), write: plan => writePostgresControlSql(locked.client, plan),
         sourceHandleClosed: () => sourceStream?.closed === true, mutexHandleClosed: () => mutexStream?.closed === true });
       const result = await callback(lock);
+      const pending = finishControlSqlCallback(lock), restore = finishControllerRestoreCallback(lock);
+      if (pending) { await pending; assertControlSqlCommit(lock); }
+      if (restore) await restore;
       if (backupTasks.size) await Promise.allSettled([...backupTasks]);
-      const pending = finishControlSqlCallback(lock); if (pending) await pending;
+      if (activeVerifications.size) await Promise.allSettled([...activeVerifications]);
+      if (currentControllerSource.failures.length) throw currentControllerSource.failures[0];
       await assertHeld();
       if (frozenCapture) {
         const final = await observation(locked);
@@ -877,11 +928,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
           await fresh.client.query("COMMIT");
         } catch (error) { freshFailed = true; throw error; }
         finally {
-          if (factsUsed) await endFactsSession(fresh);
+          if (factsUsed && !controllerUsed) await endFactsSession(fresh);
           else {
             try { await endSession(fresh, true); }
             catch (error) {
-              noteControlSql(trackedLock, "close-failure", safeError(error, "maintenance_lost", "fresh-schema-close"));
+              noteControlSql(trackedLock, "close-failure", controllerUsed ? error : safeError(error, "maintenance_lost", "fresh-schema-close"));
               if (!freshFailed) throw error;
             }
           }
@@ -894,24 +945,38 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         publicBackupSourceChanged = true;
       await validateControlSqlCommit(lock); assertControlSqlCommit(lock); noteControlSql(lock, "committing");
       if ((await session.client.query("COMMIT")).command !== "COMMIT") throw new MaintenanceFailure("maintenance_lost");
-      noteControlSql(lock, "committed"); active = false; return result;
+      noteControlSql(lock, "committed"); if (registrationCandidate) factory.noteCommitReturned(adapter, heldMutex, lock);
+      active = false; return result;
     } catch (error) {
       failed = true;
-      if (backupTasks.size) { invalidate(); await Promise.allSettled([...backupTasks]); }
+      if (controllerUsed) factory.close();
       noteControlSql(trackedLock, "failure", error);
-      const pending = finishControlSqlCallback(trackedLock); if (pending) await pending;
+      retainPendingControlSqlFailure(trackedLock); retainPendingControllerRestoreFailures(trackedLock);
+      const pending = finishControlSqlCallback(trackedLock), restore = finishControllerRestoreCallback(trackedLock);
+      await Promise.allSettled([...(pending ? [pending] : []), ...(restore ? [restore] : [])]);
+      if (backupTasks.size) { invalidate(); await Promise.allSettled([...backupTasks]); }
+      if (activeVerifications.size) await Promise.allSettled([...activeVerifications]);
+      if (controllerUsed) factory.close();
       if (session) {
         try { await session.client.query("ROLLBACK"); }
         catch (failure) { noteControlSql(trackedLock, "rollback-failure", failure); }
       }
+      if (controllerUsed) throw error;
       throw safeError(error, "snapshot_invalid");
     } finally {
       active = false; lockActive = false; assertSnapshotLock = undefined;
+      if (trackedLock) archiveOwners.delete(trackedLock);
+      currentControllerSource = undefined;
       if (failed || lost) publicBackup = undefined;
       if (session) {
         try {
-          if (controlSqlUsed) { session.ending = true; await session.client.end(); session.ended = true; sessions.delete(session); }
-          else if (factsUsed) await endFactsSession(session); else await endSession(session, true);
+          if (controlSqlUsed) await endSession(session, true);
+          else if (factsUsed && !controllerUsed) await endFactsSession(session); else await endSession(session, true);
+          if (registrationCandidate && !failed) {
+            if (!session.ended || !trackedLock || !(session.client as unknown as { connection?: { stream?: { closed?: boolean } } }).connection?.stream?.closed)
+              throw new MaintenanceFailure("maintenance_lost");
+            factory.noteSourceClosed(adapter, heldMutex, trackedLock);
+          }
         } catch (error) {
           if (factsUsed) invalidate();
           publicBackup = undefined;
@@ -921,21 +986,29 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     }
   }
   function verifyDatabase(databaseFile: string, expected: DatabaseManifests, restoreDirectory: string): Promise<Json> {
+    const original = currentControllerSource;
     const operation = verifyDatabaseOperation(databaseFile, expected, restoreDirectory);
     activeVerifications.add(operation);
-    void operation.then(() => activeVerifications.delete(operation), () => activeVerifications.delete(operation));
+    void operation.then(() => activeVerifications.delete(operation), error => {
+      activeVerifications.delete(operation); original?.failures.push(error);
+    });
     return operation;
   }
   async function verifyDatabaseOperation(databaseFile: string, expected: DatabaseManifests, restoreDirectory: string): Promise<Json> {
     await assertMutex();
     if (!assertSnapshotLock) throw new MaintenanceFailure("maintenance_lost");
     await assertSnapshotLock();
+    const original = currentControllerSource;
+    const selected = !publicBackup && original ? await readAnchoredControllerArchive(adapter, original.mutex, original.lock) : undefined;
+    if (selected && (databaseFile !== selected.databaseFile || !same(expected, selected.manifests))) throw new MaintenanceFailure("snapshot_invalid");
+    if (selected) expected = selected.manifests;
     if (!verificationConnection || verificationConnection.schema !== sourceConnection.schema) throw new MaintenanceFailure("restore_verification_unavailable");
     if (!same(expected, buildDatabaseManifests("postgres", expected.schema, expected.tables, expected.controlRows))
       || object(expected.schema).profile !== "boardroom-pg16-closed-schema-v1") throw new MaintenanceFailure("snapshot_invalid");
     await privateDirectory(restoreDirectory);
     const isPublic = sourceConnection.schema === "public";
-    const target = await connect(verificationConnection, false, isPublic);
+    const preserveFailure = original?.controller === true;
+    const target = await connect(verificationConnection, false, isPublic, "inspection", preserveFailure);
     let input: Awaited<ReturnType<typeof open>> | undefined;
     let monitor: ReturnType<typeof setInterval> | undefined, monitorPending: Promise<void> | undefined;
     let targetIdentity: PostgresDatabaseIdentity | undefined, verifiedTargetIdentity: PostgresDatabaseIdentity | undefined;
@@ -950,7 +1023,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
     const targetReader = checkedReader(target.client, checkSuccess);
     let assertPublicCurrent: (() => Promise<void>) | undefined;
     let result: Json | undefined;
-    const errors: MaintenanceFailure[] = [];
+    const errors: unknown[] = [];
     try {
       const identity = await readIdentity(target, verificationConnection, false, checkSuccess);
       targetIdentity = identity;
@@ -994,14 +1067,47 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       if (!same(await readPostgresRoles(targetReader, roleNames), expectedRoles)) throw new MaintenanceFailure("restore_verification_unavailable");
       let restoredWith: Json;
       if (isPublic) {
-        const backup = publicBackup;
+        let backup = publicBackup;
+        let archiveOwner: ReturnType<typeof archiveOwners.get>;
+        if (!backup && selected && original) {
+          if (currentControllerSource !== original || original.held !== mutex || archiveOwners.has(original.lock))
+            throw new MaintenanceFailure("maintenance_lost");
+          input = await open(selected.databaseFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+          const owned: { fd: number; identity?: string } = { fd: input.fd }; verificationInputs.set(input, owned);
+          const info = fstatSync(input.fd, { bigint: true }); owned.identity = `${info.dev}:${info.ino}`;
+          const identity = archiveIdentity(info), header = Buffer.alloc(5); await input.read(header, 0, 5, 0);
+          if (String(info.size) !== selected.database.bytes || archiveIdentity(await lstat(databaseFile, { bigint: true })) !== identity
+            || header.toString("ascii") !== "PGDMP" || await postgresFileDigest(input) !== selected.database.sha256)
+            throw new MaintenanceFailure("snapshot_invalid");
+          // N07 needs a fresh tool version; it shares the one existing success
+          // deadline with the subsequent public pipeline, never resets it.
+          publicDeadline ??= performance.now() + 300_000;
+          const versions = await postgresToolVersions(sourceConnection.childEnvironment, abort.signal, "restore_verification_unavailable");
+          checkPublicDeadline();
+          // Catalog/OIDs/roles come from this exact currently held source session.
+          // The archive header never supplies its own restore permission.
+          const binding = await readPublicRestoreCatalogBinding(original.session.client,
+            await readIdentity(original.session, sourceConnection, true), selected.manifests, versions.pgDump);
+          archiveOwner = { owner: original.held, input, identity, selected, binding };
+          archiveOwners.set(original.lock, archiveOwner);
+          backup = { sha256: selected.database.sha256, manifestDigest: digestJson(selected.manifests),
+            binding, owner: original.held, capture: selected.observation };
+        }
         // Invalid archive authority is distinct from a live source whose controls
         // have changed since the native backup. Preserve both fail-closed gates.
         if (!backup || backup.manifestDigest !== digestJson(expected)) throw new MaintenanceFailure("snapshot_invalid");
-        if (publicBackupSourceChanged || !(await samePublicBackupWindow(backup, await observe())))
+        if (archiveOwner ? !same(await original!.lock.observe(), archiveOwner.selected.observation)
+          : publicBackupSourceChanged || !(await samePublicBackupWindow(backup, await observe())))
           throw new MaintenanceFailure("source_changed");
         const assertCurrent = async () => {
           await assertMutex(mutex, checkSuccess); if (!assertSnapshotLock) throw new MaintenanceFailure("maintenance_lost"); await assertSnapshotLock(checkSuccess);
+          if (archiveOwner) {
+            if (currentControllerSource !== original || archiveOwners.get(original!.lock) !== archiveOwner
+              || archiveOwner.owner !== mutex || archiveOwner.input.fd < 0
+              || archiveIdentity(await archiveOwner.input.stat({ bigint: true })) !== archiveOwner.identity
+              || archiveIdentity(await lstat(databaseFile, { bigint: true })) !== archiveOwner.identity)
+              throw new MaintenanceFailure("maintenance_lost");
+          }
           const live = await readIdentity(target, verificationConnection, false, checkSuccess);
           const { schemaOid: _oldSchema, ...oldIdentity } = identity, { schemaOid: _newSchema, ...liveIdentity } = live;
           const held = (await targetReader.query(`SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_locks WHERE locktype='advisory'
@@ -1022,7 +1128,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         restoredWith = await withPassfile(verificationConnection, restoreDirectory, environment => {
           // Start at the same first native stage as before, never at connection setup or
           // once per child. Keep this deadline after the helper and its file cleanup finish.
-          publicDeadline = performance.now() + 300_000;
+          publicDeadline ??= performance.now() + 300_000;
           return restorePostgresPublic({ archivePath: databaseFile, archiveDigest: backup.sha256, binding: backup.binding, restoreDirectory,
             environment: { ...environment, PGAPPNAME: applicationName }, signal: abort.signal, deadline: publicDeadline, assertCurrent,
             beforeExecute: async () => { await assertCurrent(); await assertEmpty(); },
@@ -1040,6 +1146,13 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         const header = Buffer.alloc(5); await input.read(header, 0, 5, 0);
         if (!info.isFile() || info.nlink !== 1 || info.size <= 5 || (info.mode & 0o077) !== 0 || header.toString("ascii") !== "PGDMP")
           throw new MaintenanceFailure("snapshot_invalid");
+        if (selected && original) {
+          const identity = archiveIdentity(await input.stat({ bigint: true }));
+          if (currentControllerSource !== original || original.held !== mutex || archiveOwners.has(original.lock)
+            || String(info.size) !== selected.database.bytes || archiveIdentity(await lstat(databaseFile, { bigint: true })) !== identity
+            || await postgresFileDigest(input) !== selected.database.sha256) throw new MaintenanceFailure("snapshot_invalid");
+          archiveOwners.set(original.lock, { owner: original.held, input, identity, selected });
+        }
         await withPassfile(verificationConnection, restoreDirectory, environment => runPostgresTool("pg_restore",
           [postgresDatabaseArgument(verificationConnection.database), "--format=custom", "--single-transaction", "--exit-on-error", "--no-password"],
           environment, { failure: "restore_verification_unavailable", signal: abort.signal, inputFd: input!.fd }));
@@ -1072,7 +1185,7 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       // A deadline discovered by the monitor aborts native work as well. Preserve
       // the timeout failure instead of reclassifying that cancellation as lock loss.
       let first = error; try { checkPublicDeadline(); } catch (deadline) { first = deadline; }
-      const mapped = safeError(first, "restore_verification_unavailable"); errors.push(mapped); throw mapped;
+      const caught = preserveFailure ? first : safeError(first, "restore_verification_unavailable"); errors.push(caught); throw caught;
     }
     finally {
       clearInterval(monitor);
@@ -1084,13 +1197,21 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
         if (result !== undefined && assertPublicCurrent) {
           checkPublicDeadline(); await assertPublicCurrent(); checkPublicDeadline();
         }
-      } catch (error) { errors.push(safeError(error, "restore_verification_unavailable", "verification-final-check")); }
+        if (selected && original && input && !isPublic) {
+          const owned = archiveOwners.get(original.lock);
+          if (!owned || owned.input !== input || owned.owner !== mutex || currentControllerSource !== original
+            || archiveIdentity(await input.stat({ bigint: true })) !== owned.identity
+            || archiveIdentity(await lstat(databaseFile, { bigint: true })) !== owned.identity)
+            throw new MaintenanceFailure("maintenance_lost");
+        }
+      } catch (error) { errors.push(preserveFailure ? error : safeError(error, "restore_verification_unavailable", "verification-final-check")); }
       // Every owned resource gets a close attempt even when an earlier cleanup failed.
       // A failed end response is not confirmation that the target session is gone.
       try { if (input) await closeVerificationInput(input); }
-      catch (error) { errors.push(safeError(error, "maintenance_lost", "verification-input-close")); }
+      catch (error) { errors.push(preserveFailure ? error : safeError(error, "maintenance_lost", "verification-input-close")); }
       try { await endSession(target, true); }
-      catch (error) { errors.push(safeError(error, "maintenance_lost", "verification-target-close")); }
+      catch (error) { errors.push(preserveFailure ? error : safeError(error, "maintenance_lost", "verification-target-close")); }
+      if (original) archiveOwners.delete(original.lock);
       throwResourceFailures(errors);
     }
     // Failure cleanup may wait beyond the budget for real exits; that never extends
@@ -1106,6 +1227,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
       assertOpen(); checkPublicDeadline();
     }
     if (result === undefined) throw new MaintenanceFailure("restore_verification_unavailable");
+    if (selected && original) {
+      const current = await readAnchoredControllerArchive(adapter, original.mutex, original.lock);
+      if (!current || !same(current, selected)) throw new MaintenanceFailure("source_changed");
+      checkPublicDeadline();
+    }
     return result;
   }
 

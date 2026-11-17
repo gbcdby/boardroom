@@ -4,9 +4,10 @@ import { decodeRow } from "./control-candidate/rows.ts";
 import { replayVerificationControls } from "./control-candidate/replay-core.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { assertCapturedSourceClientBinding } from "./source-client-binding.ts";
-import { assertVerificationSourceClientBinding } from "./verification-source-client-binding.ts";
+import { assertVerificationSourceClientBinding, replayConsumerSourceControls } from "./verification-source-client-binding.ts";
 import { compatibleSourceClientWindow, type SourceClientJournalProof, type SourceClientObservationProof, type SourceClientRegistrationProof } from "./source-client-window.ts";
-import { captureReference, verifyVerificationJournalChain, verifyVerificationRestoreBundleClosure, type JournalNode } from "./journal.ts";
+import { captureReference, verifyJournalChain, verifyRestoreBundleClosure, verifySnapshotClosure,
+  verifyVerificationJournalChain, verifyVerificationRestoreBundleClosure, type JournalNode } from "./journal.ts";
 import { ArtifactStore } from "./objects.ts";
 import { parseVerification } from "./parse.ts";
 import { restoreSourceFiles } from "./restore-files.ts";
@@ -52,7 +53,7 @@ function liveControlProof(nodes: readonly JournalNode<VerificationJournalRecord>
  * the quiesced observation/takeover transitions permitted by the journal protocol.
  * Immutable artifacts are never selected by the filesystem's latest-looking name. */
 async function assertLiveCapture(store: ArtifactStore, lock: SourceLock, observed: SourceObservation,
-  closed: Awaited<ReturnType<typeof verifyVerificationRestoreBundleClosure>>): Promise<void> {
+  closed: Awaited<ReturnType<typeof verifyVerificationRestoreBundleClosure>>, purpose: "quiesced" | "ready" = "quiesced"): Promise<void> {
   const capture = closed.bundle.capture, state = observed.state;
   requireValue(state.admission === "sealed" && state.journalRecordRef !== null && state.journalDigest !== null
     && state.activeMigrationId === capture.migrationId && state.planDigest === capture.planDigest
@@ -61,16 +62,20 @@ async function assertLiveCapture(store: ArtifactStore, lock: SourceLock, observe
   requireValue(same(observed.source, capture.source) && same(observed.sourceIdentity, closed.chain.plan.sourceIdentity),
     "source_changed");
   const anchored = await store.readAnchoredJournal({ ref: state.journalRecordRef, sha256: state.journalDigest });
-  const liveChain = await verifyVerificationJournalChain(store, anchored), head = liveChain.nodes.at(-1)!;
+  const liveChain = await (purpose === "ready" ? verifyJournalChain : verifyVerificationJournalChain)(store, anchored);
+  const head = liveChain.nodes.at(-1)!;
   const captureIndex = liveChain.nodes.findIndex(node => same(node.reference, capture.journal));
   requireValue(captureIndex === closed.chain.nodes.length - 1
     && same(liveChain.nodes.slice(0, captureIndex + 1).map(node => node.reference),
       closed.chain.nodes.map(node => node.reference))
     && same(liveChain.plan, closed.chain.plan)
     && same(captureReference(liveChain.nodes[captureIndex]!), capture)
-    && liveChain.nodes.slice(captureIndex + 1).every(node =>
-      node.record.phase === "quiesced" && ["observation", "takeover"].includes(node.record.event))
-    && head.record.phase === "quiesced" && ["capture", "observation", "takeover"].includes(head.record.event)
+    && liveChain.nodes.slice(captureIndex + 1).every(node => purpose === "ready"
+      ? ["ready", "observation", "takeover"].includes(node.record.event)
+      : node.record.phase === "quiesced" && ["observation", "takeover"].includes(node.record.event))
+    && (purpose === "ready" ? head.record.phase === "snapshot_ready"
+      && ["ready", "observation", "takeover"].includes(head.record.event)
+      : head.record.phase === "quiesced" && ["capture", "observation", "takeover"].includes(head.record.event))
     && head.record.migrationId === capture.migrationId && head.record.plan.sha256 === capture.planDigest
     && head.record.fenceEpoch === capture.fenceEpoch && head.record.ownerGeneration === state.ownerGeneration
     && head.record.sequence === state.journalSequence
@@ -82,11 +87,12 @@ async function assertLiveCapture(store: ArtifactStore, lock: SourceLock, observe
   let windowBefore = closed.manifests.controlRows.storage_source_clients, windowOrigin = captureIndex;
   // Validate every v3 proof and bind both capture/head row states before any
   // same-row fast path. Legacy v2 keeps its existing all-encoding native join.
-  if (captured.formatVersion === 3) {
+  if (head.record.formatVersion === 3) {
     let mutexIdentity: unknown;
     try { mutexIdentity = JSON.parse(state.mutexIdentityJson!); }
     catch { requireValue(false, "control_root_mismatch"); }
-    const replay = replayVerificationControls(liveChain.plan, liveChain.nodes, { controlRoot: store.identity, mutexIdentity });
+    const replay = purpose === "ready" ? await replayConsumerSourceControls(store, liveChain, mutexIdentity)
+      : replayVerificationControls(liveChain.plan, liveChain.nodes, { controlRoot: store.identity, mutexIdentity });
     windowBefore = await assertVerificationSourceClientBinding(lock, observed, closed.chain.nodes.at(-1)!, closed.manifests, replay);
     windowOrigin = liveChain.nodes.findIndex(node => same(node.reference, replay.originCapture));
     requireValue(windowOrigin >= 0 && windowOrigin <= captureIndex, "source_changed");
@@ -156,6 +162,21 @@ export async function verifyRestoreBundle(store: ArtifactStore, adapter: Mainten
   const guarded = await ArtifactStore.open(store.root, initial.source, { assertCurrent: () => lock.assertHeld() });
   requireValue(same(guarded.identity, store.identity), "control_root_mismatch");
   await assertCurrent();
+  const target = await restoreBundleTargets(guarded, adapter, initial, closure, assertCurrent);
+  // Recheck the exact closed byte/reference graph after the two real restorations.
+  // These immutable references must not silently select another bundle or payload.
+  await verifyVerificationRestoreBundleClosure(guarded, fixedBundle, fixedPublication);
+  await assertCurrent();
+  const verification: ActualRestoreVerification = parseVerification({ formatVersion: 1, kind: "verification",
+    bundle: fixedBundle, publication: fixedPublication, verificationTargetIdentity: target,
+    exactFullDataAndControlMatched: true, sourceFilePayloadsMatched: true, schemaAndScopeMatched: true });
+  const reference = await guarded.putJson("verification", verification);
+  await assertCurrent();
+  return reference;
+}
+
+async function restoreBundleTargets(guarded: ArtifactStore, adapter: MaintenanceAdapter, initial: SourceObservation,
+  closure: Awaited<ReturnType<typeof verifyRestoreBundleClosure>>, assertCurrent: () => Promise<void>): Promise<Json> {
   const databaseAttempt = await guarded.createAttempt(initial.state.ownerGeneration);
   // SQLite creates its restore leaf exclusively; PostgreSQL requires an existing
   // private directory for its native tool files. Neither is a future active target.
@@ -165,17 +186,48 @@ export async function verifyRestoreBundle(store: ArtifactStore, adapter: Mainten
   const fileAttempt = await guarded.createAttempt(initial.state.ownerGeneration);
   const files = await restoreSourceFiles(guarded, closure.bundle.sourceFilesManifest, path.join(fileAttempt, "files"));
   requireValue(same(files.sourceFilesManifest, closure.bundle.sourceFilesManifest), "snapshot_invalid");
-  // Recheck the exact closed byte/reference graph after the two real restorations.
-  // These immutable references must not silently select another bundle or payload.
-  await verifyVerificationRestoreBundleClosure(guarded, fixedBundle, fixedPublication);
   await assertCurrent();
-  const target: Json = { kind: "isolated-restore-targets", database,
+  return { kind: "isolated-restore-targets", database,
     sourceFiles: { kind: files.kind, sourceFilesManifest: { ...files.sourceFilesManifest }, target: { ...files.target },
       entries: files.entries.map(entry => ({ ...entry, identity: entry.identity ? { ...entry.identity } : null })) } };
-  const verification: ActualRestoreVerification = parseVerification({ formatVersion: 1, kind: "verification",
-    bundle: fixedBundle, publication: fixedPublication, verificationTargetIdentity: target,
-    exactFullDataAndControlMatched: true, sourceFilePayloadsMatched: true, schemaAndScopeMatched: true });
-  const reference = await guarded.putJson("verification", verification);
-  await assertCurrent();
-  return reference;
+}
+
+/** Exact ready-byte and same-lock O/S/H binding. This is a read-only data check,
+ * not actual restore execution or a native archive permission. Consumers must
+ * separately retain their original command, runtime window and live Fs checks. */
+export async function assertReadySnapshotBinding(store: ArtifactStore, lock: SourceLock) {
+  await lock.assertHeld(); await store.assertRoot();
+  const initial = await lock.observe(), state = initial.state;
+  requireValue(state.admission === "sealed" && state.journalRecordRef && state.journalDigest, "maintenance_lost");
+  requireValue(state.controlRootJson === canonicalJson(store.identity) && state.mutexIdentityJson !== null, "control_root_mismatch");
+  const head = await store.readAnchoredJournal({ ref: state.journalRecordRef, sha256: state.journalDigest });
+  const snapshot = await verifySnapshotClosure(store, head);
+  const closure = await verifyRestoreBundleClosure(store, snapshot.receipt.bundle, snapshot.receipt.publication);
+  requireValue(same(snapshot.receipt.capture, closure.bundle.capture)
+    && snapshot.files.rootBindings.every(binding => binding.hostIdentityDigest === store.identity.hostIdentityDigest), "source_changed");
+  await assertLiveCapture(store, lock, initial, closure, "ready");
+  const assertCurrent = async () => {
+    await lock.assertHeld();
+    const current = await lock.observe();
+    requireValue(same(current, initial), "source_changed");
+    const reread = await verifySnapshotClosure(store, head);
+    requireValue(same(reread, snapshot), "snapshot_invalid");
+    await assertLiveCapture(store, lock, current, closure, "ready");
+    await lock.assertHeld();
+  };
+  return { snapshot, closure, initial, assertCurrent };
+}
+
+/** Actual repeat restoration selected only from the exact current ready anchor.
+ * Adapters reconstruct any N07 archive owner themselves from that native window.
+ * Historical R/V bytes are retained; no new verification or receipt is published. */
+export async function restoreAnchoredSnapshot(store: ArtifactStore, adapter: MaintenanceAdapter, lock: SourceLock) {
+  const binding = await assertReadySnapshotBinding(store, lock);
+  requireValue(adapter.dialect === binding.initial.source.kind, "source_changed");
+  const guarded = await ArtifactStore.open(store.root, binding.initial.source, { assertCurrent: () => lock.assertHeld() });
+  requireValue(same(guarded.identity, store.identity), "control_root_mismatch");
+  await binding.assertCurrent();
+  await restoreBundleTargets(guarded, adapter, binding.initial, binding.closure, binding.assertCurrent);
+  await binding.assertCurrent();
+  return binding;
 }

@@ -1,9 +1,10 @@
 import { canonicalJson } from "./canonical.ts";
 import { registeredProcess } from "./control-candidate/schema.ts";
+import { supportedEncoding } from "./control-candidate/rows.ts";
 import { sameSourceClientCell, sameSourceClientRow } from "./source-client-equality.ts";
 import { sourceClientColumns } from "./source-clients-read.ts";
 import { inspectRegisteredSourceProcess } from "./source-facts.ts";
-import type { ArtifactRef, Json, SourceRef } from "./types.ts";
+import type { ArtifactRef, Json, SourceClientsRosterV1, SourceRef } from "./types.ts";
 
 type Row = Readonly<Record<string, Json>>;
 type ProofRow = Readonly<Record<string, Json>>;
@@ -75,6 +76,43 @@ export type CompatibleSourceClientWindowOptions = CommonOptions & (
   | { readonly mode: "strict"; readonly proof: SourceClientJournalProof }
   | { readonly mode: "weak"; readonly proof?: undefined }
 );
+
+export type OriginSourceClientWindowOptions = Omit<Extract<CompatibleSourceClientWindowOptions, { mode: "strict" }>,
+  "mode" | "inspectProcess" | "journalAdvanced"> & {
+    readonly originCapture: SourceClientJournalAnchor;
+    readonly textEncoding: SourceClientsRosterV1["textEncoding"];
+  };
+
+/** v3 final live comparison always starts at O, even when archive S is newer.
+ * This is a native observation over already-bound data, never a lock/guard permit.
+ * Unlike the legacy structural helper it has no native-inspection override. */
+export async function compatibleOriginSourceClientWindow(origin: readonly Row[], current: readonly Row[],
+  options: OriginSourceClientWindowOptions): Promise<boolean> {
+  if ("inspectProcess" in options || !supportedEncoding(options.textEncoding)
+    || options.textEncoding.backend !== options.source.kind || !Number.isSafeInteger(options.fenceEpoch) || options.fenceEpoch < 1)
+    return false;
+  const anchors = options.anchors, first = options.originCapture;
+  if (!anchors?.length || !same(anchors[0], first) || first.sequence < 2
+    || !Number.isSafeInteger(options.currentSequence) || anchors.at(-1)!.sequence !== options.currentSequence) return false;
+  // Validate this relationship even when both tables and all changes are empty.
+  for (const [index, anchor] of anchors.entries()) {
+    if (!Number.isSafeInteger(anchor.sequence) || !ref(anchor.reference) || !ref(anchor.previous)
+      || anchor.reference.ref !== `journals/${options.migrationId}/${anchor.sequence}-${anchor.reference.sha256}.json`
+      || anchor.previous.ref !== `journals/${options.migrationId}/${anchor.sequence - 1}-${anchor.previous.sha256}.json`
+      || anchor.migrationId !== options.migrationId || anchor.planDigest !== options.planDigest || anchor.fenceEpoch !== options.fenceEpoch
+      || !Number.isSafeInteger(anchor.ownerGeneration) || anchor.ownerGeneration < 1
+      || index > 0 && (anchor.sequence !== anchors[index - 1]!.sequence + 1 || !same(anchor.previous, anchors[index - 1]!.reference))) return false;
+  }
+  for (const row of origin) if (row.entrypoint === "maintenance-controller" || row.build_id === "boardroom-maintenance-control-v1") {
+    const epoch = row.registered_epoch;
+    if (typeof epoch !== "number" && typeof epoch !== "string" || !/^(0|[1-9][0-9]*)$/.test(String(epoch))
+      || typeof epoch === "number" && !Number.isSafeInteger(epoch) || BigInt(epoch) >= BigInt(options.fenceEpoch)) return false;
+  }
+  return compatibleSourceClientWindow(origin, current, { mode: "strict", journalAdvanced: options.currentSequence > first.sequence,
+    fenceEpoch: options.fenceEpoch, databaseInstanceId: options.databaseInstanceId, source: options.source,
+    migrationId: options.migrationId, planDigest: options.planDigest, currentSequence: options.currentSequence,
+    anchors, proof: options.proof });
+}
 
 /** The envelope is only self-describing; strict mode additionally binds it to a
  * journal-anchored registration change and its actor. Weak mode is an explicitly

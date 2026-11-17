@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
-import { constants, closeSync, fstatSync, lstatSync, openSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { constants, closeSync, fstatSync, lstatSync, openSync, readdirSync, readlinkSync, realpathSync, statSync, type BigIntStats } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, stat, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { assertSqliteSourceUnchanged, type SqliteDatabaseDescriptor } from "../../environment.ts";
@@ -15,11 +16,13 @@ import { inspectLinuxSourceProcesses, linuxMappedSourceHandles, linuxSourceMappi
 import { fullSyncDarwinDatabaseHandle, syncMaintenanceHandle } from "./platform.ts";
 import { readSqliteManifests } from "./sqlite-manifests.ts";
 import { readSqliteSourceClients } from "./sqlite-source-clients.ts";
-import { readSourceClientAudit, withSourceClientFacts, type SourceFactsAccess } from "./source-writers.ts";
+import { readSourceClientAudit, withCancellationSourceClientFacts, withControllerSourceClientFacts, withSourceClientFacts, type SourceFactsAccess } from "./source-writers.ts";
+import { readAnchoredControllerArchive, type ControllerSourceAccess } from "./controller-write.ts";
+import { finishControllerRestoreCallback, retainPendingControllerRestoreFailures } from "./restore-authorization.ts";
 import { BootstrapAuditFactory, type SessionAuditCollection } from "./native-audit.ts";
 import type { EventFacts } from "./control-candidate/schema.ts";
 import { decodeSqliteSourceRows } from "./source-facts.ts";
-import { assertControlSqlAnchorAllowed, assertControlSqlCommit, bindControlSql, finishControlSqlCallback, noteControlSql, validateControlSqlCommit } from "./control-sql.ts";
+import { assertControlSqlAnchorAllowed, assertControlSqlCommit, bindControlSql, finishControlSqlCallback, noteControlSql, retainPendingControlSqlFailure, validateControlSqlCommit } from "./control-sql.ts";
 import { writeSqliteControlSql } from "./control-sql-write.ts";
 import type { AnchorChange, Blocker, ControlRootIdentity, DatabaseManifests, Json, MaintenanceAdapter, OperationMutex, SourceClientsObservation, SourceLock, SourceObservation } from "./types.ts";
 
@@ -67,6 +70,29 @@ interface BackupFileOwner {
   closed: boolean;
 }
 interface BackupDatabaseOwner { readonly db: Database.Database; closeAttempted: boolean }
+interface ArchiveVerificationOwner {
+  readonly mutex: MutexLease;
+  readonly lock: SourceLock;
+  readonly selected: NonNullable<Awaited<ReturnType<typeof readAnchoredControllerArchive>>>;
+  readonly input: BackupFileOwner;
+  readonly identity: string;
+}
+function archiveIdentity(value: BigIntStats): string {
+  if (!value.isFile() || value.nlink !== 1n || (value.mode & 0o7777n) !== 0o600n || value.size < 100n || value.size > BigInt(Number.MAX_SAFE_INTEGER)
+    || typeof process.getuid === "function" && value.uid !== BigInt(process.getuid())) throw new MaintenanceFailure("snapshot_invalid");
+  return canonicalJson({ device: String(value.dev), inode: String(value.ino), size: String(value.size),
+    mode: String(value.mode), uid: String(value.uid), links: String(value.nlink), mtime: String(value.mtimeNs), ctime: String(value.ctimeNs) });
+}
+const originalSqliteAdapters = new WeakSet<object>();
+const controllerSources = new WeakMap<SourceLock, { adapter: MaintenanceAdapter; mutex: OperationMutex;
+  select(): void; readonly selected: () => boolean; access: ControllerSourceAccess }>();
+/** Lookup only; no caller can populate the adapter's original native binding. */
+export async function sqliteControllerSourceAccess(adapter: MaintenanceAdapter, mutex: OperationMutex, lock: SourceLock): Promise<ControllerSourceAccess> {
+  const binding = controllerSources.get(lock);
+  if (!originalSqliteAdapters.has(adapter) || binding?.adapter !== adapter || binding.mutex !== mutex)
+    throw new MaintenanceFailure("maintenance_lost");
+  await binding.access.assertHeld(); binding.select(); return binding.access;
+}
 
 function configureDurableSqlite(db: Database.Database): void {
   db.pragma("synchronous=FULL");
@@ -89,6 +115,10 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   private readonly sourceConnections = new Set<Database.Database>();
   private readonly mutexConnections = new Set<Database.Database>();
   private readonly verificationConnections = new Set<Database.Database>();
+  private readonly verificationTasks = new Set<Promise<Json>>();
+  private readonly verificationFailures = new WeakMap<SourceLock, unknown[]>();
+  private readonly archiveOwners = new WeakMap<SourceLock, ArchiveVerificationOwner>();
+  private currentSourceLock: SourceLock | undefined;
   private readonly bindFiles = new Map<FileHandle, { fd: number; identity?: string }>();
   private readonly backupFiles = new Set<BackupFileOwner>();
   private readonly backupDatabases = new Set<BackupDatabaseOwner>();
@@ -108,6 +138,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   }
   static async create(source: SqliteDatabaseDescriptor): Promise<MaintenanceAdapter> {
     const adapter = new SqliteMaintenanceAdapter(source);
+    originalSqliteAdapters.add(adapter);
     for (const pending of this.pendingInitializations) {
       if (path.resolve(pending.source.sqlitePath) !== path.resolve(adapter.source.sqlitePath)
         && (pending.source.identity!.device !== adapter.source.identity!.device || pending.source.identity!.inode !== adapter.source.identity!.inode)) continue;
@@ -450,10 +481,14 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       || !same(db.prepare("SELECT * FROM maintenance_mutex").all(), [{ id: 1 }])) throw new MaintenanceFailure("control_root_mismatch");
   }
   async withSourceLock<T>(kind: "control" | "snapshot", callback: (lock: SourceLock) => Promise<T>): Promise<T> {
+    if (!originalSqliteAdapters.has(this)) throw new MaintenanceFailure("maintenance_lost");
     const mutex = this.mutex;
     if (!mutex || this.currentLock) throw new MaintenanceFailure(this.currentLock ? "maintenance_busy" : "maintenance_lost");
     await mutex.assertHeld();
     const db = this.openSource(false); let active = true, factsInvalidated = false, factsUsed = false, controlSqlUsed = false, failed = false;
+    let controllerUsed = false, registrationCandidate = false;
+    const factory = this.auditFactories.get(mutex);
+    if (!factory) { this.closeSource(db); throw new MaintenanceFailure("maintenance_lost"); }
     let trackedLock: SourceLock | undefined;
     try {
       this.beginSourceWrite(db); this.currentLock = db;
@@ -487,11 +522,13 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
             throw new MaintenanceFailure("snapshot_invalid", "source-clients");
           }
         },
-        withSourceClientFacts: (plan, consume) => { factsUsed = true; return withSourceClientFacts(factsAccess, plan, consume); },
+        withSourceClientFacts: (plan, consume) => {
+          factsUsed = true;
+          return withSourceClientFacts(factsAccess, plan, consume,
+            { lease: factory.bind(this, mutex, lock, factsAccess.assertUnchangedLock), lock });
+        },
         readSourceClientAudit: plan => {
           factsUsed = true;
-          let factory = this.auditFactories.get(mutex);
-          if (!factory) { factory = new BootstrapAuditFactory(this, mutex); this.auditFactories.set(mutex, factory); }
           return readSourceClientAudit(factsAccess, plan, factory.bind(this, mutex, lock, factsAccess.assertUnchangedLock), lock);
         },
         anchor: async change => {
@@ -513,20 +550,48 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
         },
       };
       trackedLock = lock;
+      this.currentSourceLock = lock; this.verificationFailures.set(lock, []);
+      controllerSources.set(lock, { adapter: this, mutex, select: () => { controllerUsed = true; }, selected: () => controllerUsed,
+        access: Object.freeze({ kind, root: mutex.root, assertHeld,
+        withAdvanceFacts: (plan, consume) => {
+          controllerUsed = true; factsUsed = true;
+          return withControllerSourceClientFacts(factsAccess, plan, factory.bind(this, mutex, lock, factsAccess.assertUnchangedLock), lock, consume);
+        },
+        withCancellationFacts: (plan, consume) => {
+          controllerUsed = true; factsUsed = true;
+          return withCancellationSourceClientFacts(factsAccess, plan, factory.bind(this, mutex, lock, factsAccess.assertUnchangedLock), lock, consume);
+        },
+        stageRegistration: () => factory.stageRegistration(this, mutex, lock),
+        stageCandidate: async (reference, record) => { await factory.stageControlCandidate(this, mutex, lock, reference, record); registrationCandidate = true; },
+        invalidate: () => factory.close(),
+      } satisfies ControllerSourceAccess) });
       bindControlSql(lock, { adapter: this, root: mutex.root, control: kind === "control", assertHeld,
         invalidateFacts: () => { factsInvalidated = true; controlSqlUsed = true; },
         observe: () => lock.observeSourceClients(), manifests: () => lock.observe(),
         write: async plan => writeSqliteControlSql(db, plan), sourceHandleClosed: () => !db.open, mutexHandleClosed: () => !mutex.db.open });
-      const result = await callback(lock), pending = finishControlSqlCallback(lock); if (pending) await pending;
+      const result = await callback(lock), pending = finishControlSqlCallback(lock), restore = finishControllerRestoreCallback(lock);
+      if (pending) { await pending; assertControlSqlCommit(lock); }
+      if (restore) await restore;
       if (this.backupTasks.size) await Promise.allSettled([...this.backupTasks]);
+      if (this.verificationTasks.size) await Promise.allSettled([...this.verificationTasks]);
+      const verificationFailures = this.verificationFailures.get(lock)!;
+      if (verificationFailures.length) throw verificationFailures[0];
       await assertHeld(); await validateControlSqlCommit(lock); assertControlSqlCommit(lock); noteControlSql(lock, "committing");
-      db.exec("COMMIT"); this.fullSyncSource(); noteControlSql(lock, "committed"); return result;
+      db.exec("COMMIT"); noteControlSql(lock, "committed");
+      if (registrationCandidate) factory.noteCommitReturned(this, mutex, lock);
+      this.fullSyncSource();
+      return result;
     } catch (error) {
       // Cleanup observations cannot replace the callback/COMMIT failure, including throw undefined.
       failed = true;
-      if (this.backupTasks.size) { this.backupFailed = true; await Promise.allSettled([...this.backupTasks]); }
+      if (controllerUsed) factory.close();
       noteControlSql(trackedLock, "failure", error);
-      const pending = finishControlSqlCallback(trackedLock); if (pending) await pending;
+      retainPendingControlSqlFailure(trackedLock); retainPendingControllerRestoreFailures(trackedLock);
+      const pending = finishControlSqlCallback(trackedLock), restore = finishControllerRestoreCallback(trackedLock);
+      await Promise.allSettled([...(pending ? [pending] : []), ...(restore ? [restore] : [])]);
+      if (this.backupTasks.size) { this.backupFailed = true; await Promise.allSettled([...this.backupTasks]); }
+      if (this.verificationTasks.size) await Promise.allSettled([...this.verificationTasks]);
+      if (controllerUsed) factory.close();
       try { if (db.inTransaction) db.exec("ROLLBACK"); }
       catch (rollbackError) { noteControlSql(trackedLock, "rollback-failure", rollbackError); }
       if (error instanceof MaintenanceFailure && error.code === "maintenance_lost") this.auditFactories.get(mutex)?.close();
@@ -534,8 +599,15 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       if (["SQLITE_BUSY", "SQLITE_LOCKED"].includes(String((error as { code?: string } | null)?.code))) throw new MaintenanceFailure("maintenance_busy");
       throw error;
     } finally {
-      active = false; this.currentLock = null;
-      try { if (factsUsed && !controlSqlUsed) this.closeFactsSource(db); else this.closeSource(db); }
+      active = false; this.currentLock = null; this.currentSourceLock = undefined;
+      if (trackedLock) this.archiveOwners.delete(trackedLock);
+      try {
+        if (factsUsed && !controlSqlUsed && !controllerUsed) this.closeFactsSource(db); else this.closeSource(db);
+        if (registrationCandidate && !failed) {
+          if (db.open || !trackedLock) throw new MaintenanceFailure("maintenance_lost");
+          factory.noteSourceClosed(this, mutex, trackedLock);
+        }
+      }
       catch (error) {
         if (factsUsed) this.auditFactories.get(mutex)?.close();
         noteControlSql(trackedLock, "close-failure", error); if (!failed) throw error;
@@ -683,7 +755,80 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     if (failed) throw first;
     return result!;
   }
-  async verifyDatabase(databaseFile: string, expected: DatabaseManifests, restoreDirectory: string): Promise<Json> {
+  verifyDatabase(databaseFile: string, expected: DatabaseManifests, restoreDirectory: string): Promise<Json> {
+    const sourceLock = this.currentSourceLock;
+    const operation = this.verifyDatabaseOperation(databaseFile, expected, restoreDirectory);
+    this.verificationTasks.add(operation);
+    void operation.then(() => this.verificationTasks.delete(operation), error => {
+      this.verificationTasks.delete(operation);
+      if (sourceLock) this.verificationFailures.get(sourceLock)?.push(error);
+    });
+    return operation;
+  }
+  private async verifyDatabaseOperation(databaseFile: string, expected: DatabaseManifests, restoreDirectory: string): Promise<Json> {
+    const mutex = this.mutex, lock = this.currentSourceLock;
+    if (!mutex || !lock) throw new MaintenanceFailure("maintenance_lost");
+    const selected = await readAnchoredControllerArchive(this, mutex, lock);
+    if (!selected) return this.verifyDatabaseFromFile(databaseFile, expected, restoreDirectory,
+      controllerSources.get(lock)?.selected() === true);
+    if (databaseFile !== selected.databaseFile || !same(expected, selected.manifests) || this.archiveOwners.has(lock))
+      throw new MaintenanceFailure("snapshot_invalid");
+    const files: BackupFileOwner[] = [], errors: unknown[] = [];
+    let result: Json | undefined;
+    try {
+      const input = await this.openBackupFile(databaseFile, constants.O_RDONLY | constants.O_NOFOLLOW, files);
+      const identity = archiveIdentity(fstatSync(input.fd, { bigint: true }));
+      const owned: ArchiveVerificationOwner = { mutex, lock, selected, input, identity };
+      this.archiveOwners.set(lock, owned);
+      const assertInput = async () => {
+        await lock.assertHeld(); await mutex.assertHeld();
+        if (this.archiveOwners.get(lock) !== owned || this.mutex !== mutex || this.currentSourceLock !== lock || input.closed
+          || input.handle.fd !== input.fd || archiveIdentity(fstatSync(input.fd, { bigint: true })) !== identity
+          || archiveIdentity(lstatSync(databaseFile, { bigint: true })) !== identity || String(fstatSync(input.fd, { bigint: true }).size) !== selected.database.bytes)
+          throw new MaintenanceFailure("source_changed");
+      };
+      await assertInput();
+      const header = Buffer.alloc(16); await input.handle.read(header, 0, header.length, 0);
+      if (!header.equals(Buffer.from("SQLite format 3\0", "ascii"))) throw new MaintenanceFailure("snapshot_invalid");
+      const hash = createHash("sha256"), buffer = Buffer.alloc(128 * 1024); let position = 0;
+      while (true) {
+        await assertInput(); const { bytesRead } = await input.handle.read(buffer, 0, buffer.length, position);
+        if (!bytesRead) break; hash.update(buffer.subarray(0, bytesRead)); position += bytesRead;
+      }
+      if (String(position) !== selected.database.bytes || hash.digest("hex") !== selected.database.sha256)
+        throw new MaintenanceFailure("snapshot_invalid");
+      await assertInput();
+      // The actual original descriptor supplies the copy; a replaced pathname
+      // cannot redirect the isolated restore after the private owner was issued.
+      result = await this.verifyDatabaseFromFile(`/dev/fd/${input.fd}`, selected.manifests, restoreDirectory, true);
+      await assertInput();
+      const current = await readAnchoredControllerArchive(this, mutex, lock);
+      if (!current || !same(current, selected)) throw new MaintenanceFailure("source_changed");
+    } catch (error) { appendResourceFailure(errors, error); }
+    finally {
+      this.archiveOwners.delete(lock);
+      for (const file of files) { try { await this.closeArchiveInput(file); } catch (error) { appendResourceFailure(errors, error); } }
+    }
+    throwResourceFailures(errors); return result!;
+  }
+  private async closeArchiveInput(owner: BackupFileOwner): Promise<void> {
+    if (owner.closed) return;
+    // This operation delivers its complete error graph directly. Do not also add
+    // the same close occurrence to D's delayed cleanup ledger.
+    owner.closeAttempt ??= (async () => {
+      try {
+        owner.nativeCloseAttempt = owner.handle.close(); await owner.nativeCloseAttempt;
+        if (owner.handle.fd !== -1) throw new MaintenanceFailure("maintenance_lost", "archive-input-close-unknown");
+        owner.closed = true; this.backupFiles.delete(owner);
+      } catch (error) {
+        if (this.backupFileRetired(owner)) { owner.closed = true; this.backupFiles.delete(owner); }
+        throw error;
+      }
+    })();
+    await owner.closeAttempt;
+  }
+  private async verifyDatabaseFromFile(databaseFile: string, expected: DatabaseManifests, restoreDirectory: string,
+    preserveFailure = false): Promise<Json> {
     if (!this.mutex?.active || !this.currentLock) throw new MaintenanceFailure("maintenance_lost");
     if (this.verificationConnections.size) throw new MaintenanceFailure("maintenance_lost", "verification-close-unknown");
     await this.mutex.assertHeld();
@@ -706,7 +851,8 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
       result = { kind: "sqlite-restore-verification", ...identity, fullDataManifestDigest: expected.fullDataManifestDigest,
         capturedControlManifestDigest: expected.capturedControlManifestDigest, integrityCheck: "ok", foreignKeyViolations: 0 };
     } catch (error) {
-      try { failure(error); } catch (mapped) { errors.push(mapped); }
+      if (preserveFailure) errors.push(error);
+      else try { failure(error); } catch (mapped) { errors.push(mapped); }
     }
     this.finishVerification(db, errors);
     return result!;
@@ -779,6 +925,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
   private async closeResources(): Promise<void> {
     const errors: unknown[] = [];
     await Promise.allSettled([...this.backupTasks]);
+    await Promise.allSettled([...this.verificationTasks]);
     const pendingErrors = this.backupCleanupErrors.splice(0);
     for (const owner of [...this.backupDatabases]) {
       const eventsBefore = this.backupCleanupErrors.length;
@@ -807,7 +954,7 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
     }
     try { this.closeSourceDescriptor(); } catch (error) { appendResourceFailure(errors, error); }
     if (this.sourceFdClosed && !this.sourceConnections.size && !this.mutexConnections.size && !this.verificationConnections.size && !this.bindFiles.size && !this.mutex
-      && !this.backupFiles.size && !this.backupDatabases.size && !this.backupTasks.size) {
+      && !this.backupFiles.size && !this.backupDatabases.size && !this.backupTasks.size && !this.verificationTasks.size) {
       this.closed = true; this.ownFds.clear();
     }
     throwResourceFailures(errors);

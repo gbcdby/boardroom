@@ -4,6 +4,7 @@ import { readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { snapshotBundleFixture } from "./fixtures/maintenance-snapshot-bundle.ts";
+import { verificationV3Fixture } from "./fixtures/maintenance-verification-v3.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { verifyRestoreBundleClosure } from "../src/server/storage/maintenance/journal.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
@@ -18,6 +19,28 @@ const publish = async (store: ArtifactStore, lock: SourceLock) => {
   return snapshot.publishSnapshotBundle(store, lock);
 };
 const names = async (store: ArtifactStore) => (await readdir(store.root, { recursive: true })).sort();
+
+for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeTest : pgTest)(
+  `C3 snapshot B/U ${kind}: actual D uses selected v3 replay rows while preserving the original roster`, async () => {
+    const f = await verificationV3Fixture(kind);
+    try {
+      await f.advance("register"); await f.advance("recapture");
+      const selected = await f.adapter.observe();
+      const refs = await f.run(lock => publish(f.store, lock));
+      const closure = await verifyRestoreBundleClosure(f.store, refs.bundle, refs.publication);
+      const origin = closure.chain.nodes.find(node => node.record.event === "capture")!;
+      const capture = closure.chain.nodes.at(-1)!;
+      assert.equal(capture.record.formatVersion, 3);
+      assert.equal(closure.bundle.capture.journal.sha256, selected.state.journalDigest);
+      assert.deepEqual(closure.manifests, selected.manifests);
+      assert.equal(closure.manifests.controlRows.storage_source_clients.length, 1);
+      assert(origin.record.formatVersion !== 1);
+      assert.equal(origin.record.sourceClients!.rows.length, 0);
+      assert.deepEqual(capture.record.sourceClients, origin.record.sourceClients);
+      assert.deepEqual(capture.record.frozen, origin.record.frozen);
+      assert.deepEqual(await f.adapter.observe(), selected);
+    } finally { await f.close(); }
+  });
 
 for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeTest : pgTest)(
   `#152 snapshot B/U ${kind}: real native backup binds exact Jq, typed DB controls and complete durable closure`, async () => {

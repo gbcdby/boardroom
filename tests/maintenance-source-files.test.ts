@@ -79,6 +79,70 @@ linuxTest("#152 S captures exact streamed bytes, full roots and durable canonica
     assert.equal(f.state.handles.size, 0);
   } finally { await f.close(); await copy.close(); }
 });
+
+linuxTest("C3 readonly S revalidates the full source without creating an attempt or publication", async t => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture();
+  try {
+    const captured = await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+    const before = (await readdir(f.store.root, { recursive: true })).sort(), frozen = await f.store.readBytes(captured.ref);
+    const windows = f.state.windows;
+    for (const method of ["createAttempt", "putJson", "putBytes", "putSourceFilePayload", "confirmDurable"] as const)
+      t.mock.method(ArtifactStore.prototype, method, () => { assert.fail("readonly S must not publish or create attempts"); });
+    await copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref);
+    assert(f.state.windows > windows, "the fixed entry actually reopens and scans native source windows");
+    assert.equal(f.state.handles.size, 0);
+    assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), before);
+    assert.deepEqual(await f.store.readBytes(captured.ref), frozen);
+    f.state.health = "1\n";
+    const failed = await rejected(copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref));
+    assert.equal(failed.error.code, "backup_capability_unavailable");
+    assert.equal(f.state.handles.size, 0);
+    assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), before);
+    f.state.health = "0\n";
+    writeFileSync(path.join(f.sessions, "nested", "binary"), "changed source bytes", { mode: 0o600 });
+    f.resetReadTimes();
+    const changed = await rejected(copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref));
+    assert.equal(changed.error.code, "source_changed");
+    assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), before);
+  } finally { t.mock.restoreAll(); await f.close(); await copy.close(); }
+});
+
+linuxTest("C3 readonly S enforces retained metadata and final diagnostic envelope budgets without attempts", async t => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture();
+  try {
+    const captured = await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+    const before = (await readdir(f.store.root, { recursive: true })).sort();
+    for (const [name, limits] of [
+      ["retained metadata", { "const MAX_MANIFEST_BYTES = 16 * 1024 * 1024": "const MAX_MANIFEST_BYTES = 2_000" }],
+      ["final envelope", { "Buffer.byteLength(encoded) <= MAX_MANIFEST_BYTES": "Buffer.byteLength(encoded) <= 1" }],
+    ] as const) await t.test(name, async () => {
+      const bounded = await isolatedSourceFiles(limits);
+      try {
+        const failed = await rejected(bounded.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref));
+        assert.equal(failed.error.code, "backup_capability_unavailable");
+        assert.match(String(failed.error.cause), /source-files-budget/);
+        assert.equal(f.state.handles.size, 0);
+        assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), before);
+      } finally { await bounded.close(); }
+    });
+  } finally { await f.close(); await copy.close(); }
+});
+
+linuxTest("C3 readonly S retains a thrown undefined and independent real-owner close failure", async () => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture(), closeError = new Error("readonly-child-close");
+  try {
+    const captured = await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+    const before = (await readdir(f.store.root, { recursive: true })).sort();
+    f.state.hook = (operation, file) => {
+      if (file.endsWith("/binary") && operation === "read") throw undefined;
+      if (file.endsWith("/binary") && operation === "closed") throw closeError;
+    };
+    const failed = await rejected(copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref));
+    assert.equal(failed.error.cause, undefined); assert(failed.error.closeErrors.includes(closeError));
+    assert.equal(failed.error.tcutReached, false); assert.equal(f.state.handles.size, 0);
+    assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), before);
+  } finally { await f.close(); await copy.close(); }
+});
 linuxTest("#152 S private entry windows retain nested directory times and child atime in capture and live", async () => {
   const copy = await isolatedSourceFiles(), f = await sourceFilesFixture();
   try {

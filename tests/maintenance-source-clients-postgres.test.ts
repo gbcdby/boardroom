@@ -123,6 +123,24 @@ async function seed(client: Client, raw: ReturnType<typeof cells>) {
   await client.query(`INSERT INTO storage_source_clients(${columns.join(",")}) VALUES(${expressions.join(",")})`, parameters);
 }
 
+pgTest("#152 C3 PG source rows have identical raw order for opposite physical insertion orders", async t => {
+  for (const encoding of ["UTF8", "LATIN1", "SQL_ASCII"] as const) await t.test(encoding, async () => {
+    const f = await fixture(encoding);
+    try {
+      const higher = cells(encoding);
+      const lower = { ...cells(encoding), client_id: ["text", "41"], observed_epoch: ["integer", "0"],
+        ended_at: ["text", "656e646564"], entrypoint: ["text", "68747470"] };
+      await seed(f.writer, higher); await seed(f.writer, lower);
+      const descending = await f.adapter.observeSourceClients();
+      assert.deepEqual(descending.rows, [lower, higher]);
+      await f.writer.query("DELETE FROM storage_source_clients");
+      await seed(f.writer, lower); await seed(f.writer, higher);
+      const ascending = await f.adapter.observeSourceClients();
+      assert.deepEqual(ascending, descending, "complete native cells and source/schema/encoding bindings must be insertion-order independent");
+    } finally { await f.close(); }
+  });
+});
+
 pgTest("#228 PG UTF8/LATIN1/SQL_ASCII: capture/archive binding uses the actual native encoding in one lock", async t => {
   for (const encoding of ["UTF8", "LATIN1", "SQL_ASCII"] as const) await t.test(encoding, async () => {
     const f = await fixture(encoding); let mutex;

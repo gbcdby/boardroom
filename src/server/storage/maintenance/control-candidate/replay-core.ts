@@ -1,8 +1,8 @@
 import { canonicalJson, digestJson } from "../canonical.ts";
-import type { ArtifactRef, MigrationPlan, SourceClientRawRow, SourceClientsRosterV1, SourceRef, VerificationJournalRecord } from "../types.ts";
+import type { ArtifactRef, JournalFrozenV2, MigrationPlan, SourceClientRawRow, SourceClientsRosterV1, SourceRef, VerificationJournalRecord } from "../types.ts";
 import { equal, requireCandidate } from "./common.ts";
 import { applyChanges, validateRowsFacts, type RowContext } from "./rows.ts";
-import type { ControlProof, MaintenanceInvariant, SuccessorProof } from "./schema.ts";
+import type { CancelTerminalProof, ControlProof, MaintenanceInvariant, SuccessorProof } from "./schema.ts";
 
 export interface ControlReplayNode { readonly reference: ArtifactRef; readonly record: VerificationJournalRecord }
 export interface ControlReplayState {
@@ -12,6 +12,70 @@ export interface ControlReplayState {
   readonly unresolvedEncoding: Set<string>;
 }
 export interface ControlReplayBindings { readonly controlRoot: unknown; readonly mutexIdentity: unknown }
+export type CancellationState = "active" | "pending" | "terminal";
+
+/** One finite version/event/frozen protocol shared by default and untrusted readers.
+ * Records must have passed the shared strict codec. No native authority is established. */
+export function validateJournalSequence(nodes: readonly ControlReplayNode[]): CancellationState {
+  requireCandidate(nodes.length > 0 && nodes.length <= 4096);
+  const first = nodes[0]!.record;
+  requireCandidate(first.event === "enter" && first.phase === "planned" && first.previous === null && first.sequence === 1);
+  let origin: ControlReplayNode | null = null, frozen: JournalFrozenV2 | null = null, roster: SourceClientsRosterV1 | null = null;
+  let cancellation: CancellationState = "active";
+  const requests = new Map<string, string>(), completedRequests = new Set<string>();
+  for (const [index, node] of nodes.entries()) {
+    const record = node.record, previous = nodes[index - 1];
+    requireCandidate(record.sequence === index + 1 && record.migrationId === first.migrationId
+      && equal(record.source, first.source) && equal(record.plan, first.plan));
+    const oldDigest = requests.get(record.requestId);
+    requireCandidate(oldDigest === undefined || oldDigest === record.requestDigest);
+    requests.set(record.requestId, record.requestDigest);
+    if (previous && previous.record.requestId !== record.requestId) completedRequests.add(previous.record.requestId);
+    // Legacy bytes retain their old structural read rules. New v3 commands never reopen a prior request.
+    if (record.formatVersion === 3) requireCandidate(!completedRequests.has(record.requestId));
+    if (record.formatVersion === 1) requireCandidate((!previous || previous.record.formatVersion === 1)
+      && record.phase === "planned" && ["enter", "takeover", "observation"].includes(record.event)
+      && record.frozen === null && record.snapshot === null);
+    if (previous) {
+      requireCandidate(cancellation !== "terminal" && equal(record.previous, previous.reference) && record.event !== "enter"
+        && record.ownerGeneration === previous.record.ownerGeneration + (record.event === "takeover" ? 1 : 0)
+        && record.fenceEpoch === previous.record.fenceEpoch + (record.event === "cancelled" ? 1 : 0));
+      if (previous.record.formatVersion === 3) requireCandidate(record.formatVersion === 3);
+      if (previous.record.formatVersion === 1 && record.formatVersion !== 1) requireCandidate(record.event === "capture" && origin === null);
+      if (previous.record.formatVersion === 2 && record.formatVersion === 3) requireCandidate(origin === null
+        ? record.event === "capture" : record.controlProof?.kind === "legacy-first-capture-bridge");
+      if (["takeover", "observation", "cancel_intent", "cancelled"].includes(record.event)) requireCandidate(record.phase === previous.record.phase);
+      if (record.event === "capture") requireCandidate(cancellation === "active" && record.phase === "quiesced"
+        && ["planned", "quiesced"].includes(previous.record.phase));
+      if (record.event === "ready") requireCandidate(cancellation === "active" && previous.record.phase === "quiesced" && record.phase === "snapshot_ready");
+    }
+    if (cancellation === "pending") requireCandidate(["takeover", "observation", "cancelled"].includes(record.event));
+    if (record.event === "cancel_intent") {
+      requireCandidate(origin !== null && record.phase !== "planned" && cancellation === "active"); cancellation = "pending";
+    }
+    if (record.event === "cancelled") { requireCandidate(cancellation === "pending"); cancellation = "terminal"; }
+    requireCandidate((record.event === "capture") === (record.frozen !== null) && (record.event === "ready") === (record.snapshot !== null));
+    requireCandidate(new Set(record.evidence.map(item => item.ref)).size === record.evidence.length);
+    if (record.formatVersion === 3) {
+      if (record.event === "capture") requireCandidate(record.controlProof?.kind === (origin === null ? "capture-controls" : "control-successor"));
+      if (record.controlProof?.kind === "capture-controls") requireCandidate(record.event === "capture" && origin === null
+        && nodes.slice(0, index).every(item => ["enter", "observation"].includes(item.record.event)));
+      if (record.controlProof?.kind === "legacy-first-capture-bridge") requireCandidate(previous?.record.formatVersion === 2
+        && previous.record.phase === "snapshot_ready" && origin?.record.formatVersion === 2 && cancellation === "active");
+    }
+    if (record.event === "capture") {
+      requireCandidate(record.formatVersion !== 1 && record.sourceClients !== null && record.frozen !== null);
+      const original = record.sourceClients;
+      requireCandidate(equal(original.source, record.source) && equal(original.plan, record.plan)
+        && original.migrationId === record.migrationId && original.fenceEpoch === String(record.fenceEpoch)
+        && original.textEncoding.backend === record.source.kind && digestJson(original) === record.frozen.sourceClientsDigest);
+      requireCandidate(roster === null ? original.receiptGeneration === String(record.ownerGeneration) : equal(roster, original));
+      requireCandidate(frozen === null || equal(frozen, record.frozen));
+      if (origin === null) { origin = node; frozen = record.frozen; roster = original; }
+    }
+  }
+  return cancellation;
+}
 export function rowsDigest(source: SourceRef, textEncoding: SourceClientsRosterV1["textEncoding"], rows: readonly SourceClientRawRow[]): string {
   const sorted = [...rows].sort((a, b) => a.client_id[1] < b.client_id[1] ? -1 : a.client_id[1] > b.client_id[1] ? 1 : 0);
   requireCandidate(sorted.every((row, index) => index === 0 || sorted[index - 1]!.client_id[1] !== row.client_id[1]));
@@ -24,6 +88,18 @@ function successorBinding(proof: SuccessorProof, node: ControlReplayNode, previo
     && proof.fenceEpoch === String(node.record.fenceEpoch) && proof.receiptGeneration === roster.receiptGeneration && equal(proof.textEncoding, roster.textEncoding)
     && equal(proof.previousAnchor, previous.reference) && proof.fromGeneration === String(previous.record.ownerGeneration)
     && proof.toGeneration === String(node.record.ownerGeneration) && proof.targetSequence === String(node.record.sequence));
+}
+function terminalBinding(proof: CancelTerminalProof, node: ControlReplayNode, previous: ControlReplayNode,
+  origin: ControlReplayNode, roster: SourceClientsRosterV1): void {
+  requireCandidate(node.record.event === "cancelled" && equal(proof.originCapture, origin.reference)
+    && proof.originSourceClientsDigest === digestJson(roster) && equal(proof.source, node.record.source)
+    && equal(proof.plan, node.record.plan) && proof.migrationId === node.record.migrationId
+    && proof.epochBefore === roster.fenceEpoch && proof.epochBefore === String(previous.record.fenceEpoch)
+    && proof.epochAfter === String(node.record.fenceEpoch) && BigInt(proof.epochAfter) === BigInt(proof.epochBefore) + 1n
+    && proof.receiptGeneration === roster.receiptGeneration && equal(proof.textEncoding, roster.textEncoding)
+    && equal(proof.previousAnchor, previous.reference) && proof.ownerGeneration === String(previous.record.ownerGeneration)
+    && proof.ownerGeneration === String(node.record.ownerGeneration) && proof.targetSequence === String(node.record.sequence)
+    && proof.changes.length === 0 && proof.beforeRowsDigest === proof.afterRowsDigest);
 }
 
 /** Shared pure data rules. The caller must validate its finite chain and any legacy bridge.
@@ -42,15 +118,16 @@ export function applyControlNode(plan: MigrationPlan, node: ControlReplayNode, p
       && state.invariant.mutexIdentityJson === canonicalJson(bindings.mutexIdentity));
   } else {
     requireCandidate(proof.kind !== "capture-controls" && previous && state.invariant !== null);
-    successorBinding(proof, node, previous, origin, roster);
+    if (proof.kind === "cancel-terminal-controls") terminalBinding(proof, node, previous, origin, roster);
+    else successorBinding(proof, node, previous, origin, roster);
     requireCandidate(proof.beforeRowsDigest === rowsDigest(record.source, roster.textEncoding, state.rows));
   }
   requireCandidate(proof.facts.beforeCount === String(state.rows.length)
     && proof.facts.beforeRowsDigest === rowsDigest(record.source, roster.textEncoding, state.rows));
-  const context: RowContext = { plan, record, encoding: roster.textEncoding, receiptGeneration: roster.receiptGeneration,
+  const context: RowContext = { plan, record, fenceEpoch: Number(roster.fenceEpoch), encoding: roster.textEncoding, receiptGeneration: roster.receiptGeneration,
     registrations: state.registrations, unresolvedEncoding: state.unresolvedEncoding };
   validateRowsFacts(state.rows, proof.facts, context);
-  if (proof.kind !== "capture-controls") {
+  if (proof.kind === "control-successor" || proof.kind === "legacy-first-capture-bridge") {
     state.rows = applyChanges(state.rows, proof, context);
     requireCandidate(proof.afterRowsDigest === rowsDigest(record.source, roster.textEncoding, state.rows));
   }
@@ -59,6 +136,7 @@ export function applyControlNode(plan: MigrationPlan, node: ControlReplayNode, p
 
 /** A V-only root is the first capture-controls. Legacy ready bridges remain elsewhere. */
 export function replayVerificationControls(plan: MigrationPlan, nodes: readonly ControlReplayNode[], bindings: ControlReplayBindings) {
+  requireCandidate(validateJournalSequence(nodes) === "active");
   const firstCapture = nodes.findIndex(node => node.record.event === "capture"), origin = nodes[firstCapture];
   requireCandidate(origin && origin.record.formatVersion === 3 && origin.record.sourceClients !== null
     && nodes.slice(0, firstCapture).every(node => node.record.phase === "planned" && ["enter", "observation"].includes(node.record.event)));

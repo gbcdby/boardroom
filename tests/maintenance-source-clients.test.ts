@@ -144,9 +144,12 @@ test("SC-A06/A08: journal v2 requires the complete roster and fifth frozen field
   assert.deepEqual(parseJournal(planned), planned);
   const { sourceClients: _roster, ...withoutRoster } = captured;
   const { sourceClientsDigest: _digest, ...legacyFrozen } = captured.frozen;
-  for (const value of [withoutRoster, { ...captured, frozen: legacyFrozen }, { ...captured, formatVersion: 3 },
+  for (const value of [withoutRoster, { ...captured, frozen: legacyFrozen },
     { ...captured, sourceClients: { ...sourceClients, textEncoding: { backend: "postgres", name: "UTF8" } } },
     { ...captured, frozen: { ...captured.frozen, sixth: hash } }]) assert.throws(() => parseJournal(value), invalid);
+  // v3 is now recognized, but relabeling v2 cannot supply its required proof.
+  assert.throws(() => parseJournal({ ...captured, formatVersion: 3 }), error => error instanceof MaintenanceFailure
+    && error.code === "journal_invalid" && error.message === "storage_maintenance: journal_invalid (verification-journal)");
   const legacy = { ...withoutRoster, formatVersion: 1, frozen: legacyFrozen };
   assert.deepEqual(parseJournal(legacy), legacy); // Structural legacy decoding is not current-chain acceptance.
   assert.throws(() => parseJournal({ ...legacy, sourceClients: null }), invalid);

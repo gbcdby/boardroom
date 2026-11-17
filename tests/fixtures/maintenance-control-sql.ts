@@ -48,6 +48,16 @@ export function controlSqlVector(observed: SourceClientsObservation, root: Contr
   const zero = successorVector(f, { origin: capture, previous: capture, sequence: 3, before: [], after: [], clients: [], changes: [],
     event: "takeover", fromGeneration: 7, toGeneration: 8 });
   const zeroRef = f.pack("journal", zero);
+  const cancellation = successorVector(f, { origin: capture, previous: zeroRef, sequence: 4,
+    before: [], after: [], clients: [], changes: [], fromGeneration: 8, toGeneration: 8 });
+  const intent = { ...cancellation, event: "cancel_intent" }, intentRef = f.pack("journal", intent);
+  const terminal = { ...intent, event: "cancelled", sequence: 5, previous: intentRef, fenceEpoch: 3,
+    controlProof: { formatVersion: 1, kind: "cancel-terminal-controls", originCapture: capture,
+      originSourceClientsDigest: f.captured.frozen.sourceClientsDigest, source: f.source, plan: f.planRef, migrationId: "a12",
+      epochBefore: "2", epochAfter: "3", receiptGeneration: "7", textEncoding: f.encoding, previousAnchor: intentRef,
+      ownerGeneration: "8", targetSequence: "5", beforeRowsDigest: f.rowsDigest([]), afterRowsDigest: f.rowsDigest([]),
+      changes: [], facts: cancellation.controlProof.facts, successorRule: "open-next-epoch-clear-active-v1" } };
+  const terminalRef = f.pack("journal", terminal);
   const input = (head: ArtifactRef) => ({ head, objects: f.objects, controlRoot: f.root, mutexIdentity: f.mutex });
   const reconstruct = (head: ArtifactRef) => {
     const value = reconstructControlCandidates(input(head));
@@ -56,7 +66,8 @@ export function controlSqlVector(observed: SourceClientsObservation, root: Contr
     return value;
   };
   for (const head of [capture, insertedRef, updatedRef, endedRef, zeroRef]) reconstruct(head);
-  return { f, capture, row, inserted, insertedRef, updated, updatedRow, updatedRef, endedRow, endedRef, zeroRef, input, reconstruct };
+  return { f, capture, row, inserted, insertedRef, updated, updatedRow, updatedRef, endedRow, endedRef, zeroRef,
+    intentRef, terminalRef, input, reconstruct };
 }
 
 export const controlSeedColumns = {

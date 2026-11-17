@@ -1,10 +1,13 @@
 import path from "node:path";
 import { canonicalJson, digestJson, parseCanonical } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
+import { applyControlNode, replayVerificationControls, validateJournalSequence, type ControlReplayState } from "./control-candidate/replay-core.ts";
+import { bindSourceClientManifestRows, supportedEncoding } from "./control-candidate/rows.ts";
+import { invariantFromManifests } from "./control-candidate/closure.ts";
 import { buildDatabaseManifests } from "./manifests.ts";
 import { ArtifactStore } from "./objects.ts";
-import { parseBundle, parseCapability, parseJournal, parseManifests, parsePlan, parsePublication, parseReceipt, parseVerification, parseVerificationJournal, readSourceFiles } from "./parse.ts";
-import type { ArtifactRef, DatabaseManifests, JournalFrozenV2, JournalRecord, MaintenanceCaptureRef, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceClientsRosterV1, SourceFilesManifest, SourceObservation, VerificationJournalRecord } from "./types.ts";
+import { maintenanceRequestDigest, parseBundle, parseCapability, parseJournal, parseMaintenanceCommand, parseManifests, parsePlan, parsePublication, parseReceipt, parseVerification, parseVerificationJournal, readSourceFiles } from "./parse.ts";
+import type { ArtifactRef, DatabaseManifests, JournalRecord, MaintenanceCaptureRef, MaintenanceCommand, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceFilesManifest, SourceObservation, VerificationJournalRecord } from "./types.ts";
 
 const equal = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
 function requireValue(condition: unknown): asserts condition { if (!condition) throw new MaintenanceFailure("journal_invalid"); }
@@ -21,10 +24,10 @@ export async function verifyJournalChain(store: ArtifactStore, current: Artifact
 }
 /** Explicit V-only envelope/closure read; control replay and native binding remain mandatory. */
 export async function verifyVerificationJournalChain(store: ArtifactStore, current: ArtifactRef): Promise<VerifiedJournalChain<VerificationJournalRecord>> {
-  return readJournalChain(store, current, parseVerificationJournal);
+  return readJournalChain(store, current, parseVerificationJournal, true);
 }
 async function readJournalChain<T extends VerificationJournalRecord>(store: ArtifactStore, current: ArtifactRef,
-  parseRecord: (value: unknown) => T): Promise<VerifiedJournalChain<T>> {
+  parseRecord: (value: unknown) => T, verificationOnly = false): Promise<VerifiedJournalChain<T>> {
   const reversed: JournalNode<T>[] = [], seen = new Set<string>(); let reference: ArtifactRef | null = current;
   while (reference) {
     requireValue(!seen.has(reference.ref) && reversed.length < 4096); seen.add(reference.ref);
@@ -36,72 +39,59 @@ async function readJournalChain<T extends VerificationJournalRecord>(store: Arti
     requireValue(reference.ref === `journals/${record.migrationId}/${record.sequence}-${reference.sha256}.json`);
     reversed.push({ reference, record }); reference = record.previous;
   }
-  const nodes = reversed.reverse(); const first = nodes[0]!.record;
+  const nodes = reversed.reverse(); validateJournalSequence(nodes); const first = nodes[0]!.record;
+  if (verificationOnly) requireValue(nodes.every(node => node.record.phase !== "snapshot_ready"
+    && !["ready", "cancel_intent", "cancelled"].includes(node.record.event)
+    && (node.record.formatVersion !== 3 || node.record.controlProof?.kind !== "legacy-first-capture-bridge")));
   const plan = parsePlan(await store.readJson(first.plan, "plan"));
   requireValue(first.event === "enter" && first.phase === "planned" && first.sequence === 1
     && first.migrationId === plan.migrationId && equal(first.source, plan.source)
     && digestJson(plan.sourceIdentity) === plan.source.identityDigest && plan.controlRoot.path === store.root);
-  let cancelPending = false;
-  let firstFrozen: JournalFrozenV2 | null = null;
-  let firstSourceClients: SourceClientsRosterV1 | null = null;
-  const requests = new Map<string, string>();
-  for (let index = 0; index < nodes.length; index++) {
-    const record = nodes[index]!.record, previous = nodes[index - 1]?.record;
-    requireValue(record.sequence === index + 1 && record.migrationId === first.migrationId
-      && equal(record.source, first.source) && equal(record.plan, first.plan));
-    if (record.formatVersion === 1) {
-      // Only a still-planned legacy prefix is usable. Never fill or re-sign an old capture.
-      requireValue((!previous || previous.formatVersion === 1) && record.phase === "planned"
-        && ["enter", "takeover", "observation"].includes(record.event) && record.frozen === null && record.snapshot === null);
-    } else if (previous?.formatVersion === 1) {
-      // This is the sole version edge; ordinary generation checks below still apply.
-      requireValue(record.event === "capture" && firstFrozen === null);
-    }
-    if (previous?.formatVersion === 3) requireValue(record.formatVersion === 3);
-    if (record.formatVersion === 3) {
-      requireValue(record.phase !== "snapshot_ready" && !["ready", "cancel_intent", "cancelled"].includes(record.event)
-        && record.controlProof?.kind !== "legacy-first-capture-bridge");
-      if (previous?.formatVersion === 2) requireValue(firstFrozen === null && record.event === "capture");
-      if (record.event === "capture") requireValue(record.controlProof?.kind === (firstFrozen === null ? "capture-controls" : "control-successor"));
-    }
-    const digest = requests.get(record.requestId);
-    requireValue(digest === undefined || digest === record.requestDigest); requests.set(record.requestId, record.requestDigest);
-    if (previous) {
-      requireValue(previous.event !== "cancelled" && record.event !== "enter"
-        && record.ownerGeneration === previous.ownerGeneration + (record.event === "takeover" ? 1 : 0)
-        && record.fenceEpoch === previous.fenceEpoch + (record.event === "cancelled" ? 1 : 0));
-      if (["takeover", "observation", "cancel_intent", "cancelled"].includes(record.event)) requireValue(record.phase === previous.phase);
-      if (record.event === "capture") requireValue(!cancelPending && ["planned", "quiesced"].includes(previous.phase) && record.phase === "quiesced");
-      if (record.event === "ready") requireValue(!cancelPending && previous.phase === "quiesced" && record.phase === "snapshot_ready");
-    }
-    requireValue((record.event === "capture") === (record.frozen !== null));
-    requireValue((record.event === "ready") === (record.snapshot !== null));
-    if (record.event === "cancel_intent") {
-      // The verified prefix must already contain capture/Jq; planned/no-Jq cancellation is forbidden.
-      requireValue(record.phase !== "planned");
-      cancelPending = true;
-    }
-    if (record.event === "cancelled") requireValue(cancelPending);
-    const evidence = new Set(record.evidence.map(item => item.ref)); requireValue(evidence.size === record.evidence.length);
+  for (const { record } of nodes) {
     for (const artifact of record.evidence) await verifyCapability(store, artifact);
     if (record.frozen) {
       requireValue(record.formatVersion !== 1 && record.sourceClients !== null);
-      const roster = record.sourceClients;
-      requireValue(equal(roster.source, record.source) && equal(roster.plan, record.plan)
-        && roster.migrationId === record.migrationId && roster.fenceEpoch === String(record.fenceEpoch)
-        && roster.textEncoding.backend === record.source.kind && digestJson(roster) === record.frozen.sourceClientsDigest);
-      requireValue(firstSourceClients === null ? roster.receiptGeneration === String(record.ownerGeneration) : equal(firstSourceClients, roster));
       const files = await readSourceFiles(store, record.frozen.sourceFilesManifest);
       requireValue(equal(files.source, record.source) && equal(files.roots, plan.fileRoots)
         && record.frozen.schemaManifestDigest === plan.schemaManifestDigest && record.frozen.guardManifestDigest === plan.guardManifestDigest);
       await verifySourceFilesClosure(store, files);
-      // Takeover may advance the owner, but cannot replace the first capture's frozen facts.
-      requireValue(firstFrozen === null || equal(firstFrozen, record.frozen));
-      firstFrozen ??= record.frozen;
-      firstSourceClients ??= roster;
     }
   }
-  return { plan, nodes };
+  const chain = { plan, nodes };
+  await verifyDefaultControlProofs(store, chain);
+  return chain;
+}
+
+/** Full pure O→S→H proof replay. Mutex bytes here are historical data; actual consumers
+ * must independently bind them, current raw rows and the runtime obligations to a real lock. */
+async function verifyDefaultControlProofs(store: ArtifactStore, chain: VerifiedJournalChain): Promise<void> {
+  const { nodes, plan } = chain, origin = nodes.find(node => node.record.event === "capture");
+  if (!origin || origin.record.formatVersion === 1 || origin.record.sourceClients === null) return;
+  const roster = origin.record.sourceClients;
+  const state: ControlReplayState = { rows: roster.rows, invariant: null, registrations: new Map(), unresolvedEncoding: new Set() };
+  let lastReady: Awaited<ReturnType<typeof readSnapshotClosure>> | undefined;
+  let mutexIdentity: unknown;
+  for (const [index, node] of nodes.entries()) {
+    const record = node.record;
+    if (record.formatVersion === 3 && record.controlProof !== null) {
+      const proof = record.controlProof;
+      if (proof.kind === "capture-controls") mutexIdentity = JSON.parse(proof.maintenanceInvariant.mutexIdentityJson);
+      if (proof.kind === "legacy-first-capture-bridge") {
+        requireValue(origin.record.formatVersion === 2 && state.invariant === null && lastReady
+          && equal(lastReady.receipt.capture.journal, origin.reference)
+          && equal(proof.legacy.ready, nodes.slice(0, index).find(item => item.record.event === "ready")?.reference)
+          && equal(proof.legacy.receipt, lastReady.receiptRef) && equal(proof.legacy.manifests, lastReady.receipt.manifests)
+          && supportedEncoding(roster.textEncoding));
+        const row = lastReady.manifests.controlRows.storage_maintenance[0];
+        requireValue(row && typeof row.mutex_identity_json === "string");
+        mutexIdentity = parseCanonical(Buffer.from(row.mutex_identity_json, "utf8"));
+        state.invariant = invariantFromManifests(lastReady.manifests, origin, store.identity, mutexIdentity);
+        bindSourceClientManifestRows(lastReady.manifests, roster.rows, roster.textEncoding);
+      }
+      applyControlNode(plan, node, nodes[index - 1], origin, roster, { controlRoot: store.identity, mutexIdentity }, state);
+    }
+    if (record.event === "ready") lastReady = await readSnapshotClosure(store, { plan, nodes: nodes.slice(0, index + 1) });
+  }
 }
 
 export async function verifySourceFilesClosure(store: ArtifactStore, manifest: SourceFilesManifest): Promise<void> {
@@ -174,6 +164,15 @@ async function readRestoreBundleClosure<T extends VerificationJournalRecord>(sto
     && control.guard_manifest_digest === frozen.guardManifestDigest && String(control.protocol_version) === "1"
     && control.journal_record_ref === bundle.capture.journal.ref && control.journal_digest === bundle.capture.journal.sha256
     && String(control.journal_sequence) === String(bundle.capture.journalSequence));
+  if (captured.record.formatVersion === 3) {
+    const origin = chain.nodes.find(node => node.record.event === "capture");
+    requireValue(origin?.record.formatVersion === 3 && origin.record.controlProof?.kind === "capture-controls");
+    const mutexIdentity = JSON.parse(origin.record.controlProof.maintenanceInvariant.mutexIdentityJson);
+    const replay = replayVerificationControls(chain.plan, chain.nodes, { controlRoot: store.identity, mutexIdentity });
+    const selected = replay.captures.get(captured.reference.ref); requireValue(selected);
+    bindSourceClientManifestRows(manifests, selected.rows, replay.originalRoster.textEncoding);
+    requireValue(equal(invariantFromManifests(manifests, captured, store.identity, mutexIdentity), selected.invariant));
+  }
   const expected = new Map<string, { role: string; object: ArtifactRef }>();
   const add = (role: string, object: ArtifactRef) => {
     const prior = expected.get(object.ref); requireValue(!prior || prior.role === role && equal(prior.object, object)); expected.set(object.ref, { role, object });
@@ -199,7 +198,10 @@ async function readRestoreBundleClosure<T extends VerificationJournalRecord>(sto
 export async function verifySnapshotClosure(store: ArtifactStore, current: ArtifactRef): Promise<{
   chain: VerifiedJournalChain; receipt: SnapshotReceipt; receiptRef: ArtifactRef; files: SourceFilesManifest; manifests: DatabaseManifests;
 }> {
-  const chain = await verifyJournalChain(store, current), last = chain.nodes.at(-1)!.record;
+  return readSnapshotClosure(store, await verifyJournalChain(store, current));
+}
+async function readSnapshotClosure(store: ArtifactStore, chain: VerifiedJournalChain) {
+  const last = chain.nodes.at(-1)!.record;
   requireValue(last.phase === "snapshot_ready" && !chain.nodes.some(node => ["cancel_intent", "cancelled"].includes(node.record.event)));
   const ready = [...chain.nodes].reverse().find(node => node.record.event === "ready")!;
   requireValue(ready?.record.snapshot); const receiptRef = ready.record.snapshot;
@@ -220,6 +222,47 @@ export async function verifySnapshotClosure(store: ArtifactStore, current: Artif
     && manifests.schemaManifestDigest === receipt.schemaManifestDigest && manifests.fullDataManifestDigest === receipt.fullDataManifestDigest
     && manifests.frozenBusinessManifestDigest === receipt.frozenBusinessManifestDigest && manifests.capturedControlManifestDigest === receipt.capturedControlManifestDigest);
   return { chain, receipt, receiptRef, files, manifests };
+}
+
+export interface UntrustedRequestPrefix {
+  readonly kind: "untrusted-request-prefix";
+  readonly status: "new" | "paused" | "ready" | "cancel_pending" | "cancelled";
+  readonly head: ArtifactRef | null;
+  readonly firstSequence: number | null;
+}
+/** Exact anchored request classification only. The caller still owns actual DB head,
+ * source, current native window and all cleanup checks; "ready" here is a historical prefix. */
+export function classifyMaintenanceRequest(nodes: readonly JournalNode[], value: MaintenanceCommand): UntrustedRequestPrefix {
+  const command = parseMaintenanceCommand(value), { request, operation } = command, digest = maintenanceRequestDigest(command);
+  const conflict = (condition: unknown): void => { if (!condition) throw new MaintenanceFailure("request_conflict", "maintenance-command"); };
+  if (nodes.length) validateJournalSequence(nodes);
+  // Legacy bytes can still be inspected, but no new public command repairs a wrong pre-Jq generation.
+  conflict(!nodes.some(node => node.record.phase === "planned" && node.record.event === "takeover"));
+  const head = nodes.at(-1), matches = nodes.map((node, index) => ({ node, index })).filter(item => item.node.record.requestId === request.requestId);
+  if (head) conflict(equal(head.record.source, request.expectedSource) && head.record.migrationId === request.plan.migrationId
+    && equal(head.record.plan, request.plan.immutablePlan));
+  const before = matches.length ? nodes[matches[0]!.index - 1] : head;
+  conflict(request.expectedPhase === (before?.record.phase ?? null) && request.expectedJournalDigest === (before?.reference.sha256 ?? null));
+  if (!matches.length) {
+    conflict(head?.record.event !== "cancelled");
+    if (operation === "execute-migration") conflict(!nodes.some(node => node.record.event === "cancel_intent"));
+    if (operation === "cancel-migration") conflict(head && head.record.phase !== "planned");
+    if (operation === "resume-migration") conflict(head !== undefined);
+    return { kind: "untrusted-request-prefix", status: "new", head: head?.reference ?? null, firstSequence: null };
+  }
+  conflict(matches.every(item => item.node.record.requestDigest === digest)
+    && matches[0]!.index + matches.length === nodes.length
+    && matches.every((item, index) => item.index === matches[0]!.index + index));
+  const cancellation = operation === "cancel-migration" || operation === "resume-migration"
+    && nodes.slice(0, matches[0]!.index).some(item => item.record.event === "cancel_intent");
+  const allowed = cancellation ? ["takeover", "observation", "cancel_intent", "cancelled"] : ["enter", "capture", "takeover", "observation", "ready"];
+  conflict(matches.every(item => allowed.includes(item.node.record.event)));
+  if (operation !== "execute-migration") conflict(matches.every(item => item.node.record.event !== "enter"));
+  if (cancellation) conflict(before && before.record.phase !== "planned");
+  const pending = nodes.some(node => node.record.event === "cancel_intent");
+  const status = head!.record.event === "cancelled" ? "cancelled" : pending ? "cancel_pending"
+    : head!.record.phase === "snapshot_ready" ? "ready" : "paused";
+  return { kind: "untrusted-request-prefix", status, head: head!.reference, firstSequence: matches[0]!.node.record.sequence };
 }
 
 /** A ready pointer/takeover changes controls, not frozen domain values. Never omit all controls. */

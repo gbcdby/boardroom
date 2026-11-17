@@ -1,10 +1,12 @@
 import { canonicalJson, digestJson } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
+import { parseJournal } from "./parse.ts";
 import { CandidateContents, parseReconstructionInput, type ReconstructionInput } from "./control-candidate/content.ts";
 import { readControlJournalCandidate } from "./control-candidate/codec.ts";
 import { reconstructControlCandidates, type ExpectedMaintenance, type ReconstructedControls } from "./control-candidate/replay.ts";
 import type { SuccessorProof } from "./control-candidate/schema.ts";
 import type { ArtifactRef, ControlRootIdentity, MaintenanceAdapter, MigrationPlan, SourceClientRawRow, SourceClientsObservation, SourceLock, SourceObservation } from "./types.ts";
+import { consumeControllerSqlPlan, controllerWriteOperation } from "./controller-write.ts";
 
 const same = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
 function requireData(condition: unknown): asserts condition { if (!condition) throw new MaintenanceFailure("journal_invalid"); }
@@ -15,12 +17,23 @@ export interface ControlSqlPlan {
   readonly source: SourceClientsObservation["source"];
   readonly textEncoding: SourceClientsObservation["textEncoding"];
   readonly schemaManifestDigest: string;
-  readonly before: ReconstructedControls;
-  readonly after: ReconstructedControls;
+  readonly before: ControlSqlState;
+  readonly after: ControlSqlState;
+  readonly transition: "first-seal" | "sealed-successor" | "cancel-terminal";
   readonly changes: SuccessorProof["changes"];
   readonly previous: ArtifactRef;
   readonly head: ArtifactRef;
-  readonly input: ReconstructionInput;
+  readonly input: Pick<ReconstructionInput, "head" | "controlRoot" | "mutexIdentity">;
+}
+export type ControlSqlMaintenance = Omit<ExpectedMaintenance, "admission" | "activeMigrationId" | "planDigest"> & {
+  readonly admission: "draining" | "sealed" | "open";
+  readonly activeMigrationId: string | null;
+  readonly planDigest: string | null;
+};
+export interface ControlSqlState {
+  readonly originalRoster: ReconstructedControls["originalRoster"];
+  readonly expectedRows: ReconstructedControls["expectedRows"];
+  readonly expectedMaintenance: ControlSqlMaintenance;
 }
 function compile(value: unknown): ControlSqlPlan {
   const parsed = parseReconstructionInput(value);
@@ -28,26 +41,40 @@ function compile(value: unknown): ControlSqlPlan {
     objects: parsed.objects.map(item => ({ reference: { ...item.reference }, bytes: Buffer.from(item.bytes) })) };
   const contents = new CandidateContents(input);
   const node = readControlJournalCandidate(input.head, contents.bytes(input.head, "journal"));
-  requireData(node.previous && node.controlProof?.kind === "control-successor");
-  const before = reconstructControlCandidates({ ...input, head: node.previous }), after = reconstructControlCandidates(input);
-  requireData(before.kind === "untrusted-control-reconstruction" && after.kind === "untrusted-control-reconstruction");
+  requireData(node.previous && node.controlProof);
+  const previous = parseJournal(contents.json(node.previous, "journal"));
+  const baseline = reconstructControlCandidates({ ...input, head: node.previous }), after = reconstructControlCandidates(input);
+  requireData(after.kind === "untrusted-control-reconstruction");
+  const transition = node.controlProof.kind === "capture-controls" ? "first-seal"
+    : node.controlProof.kind === "cancel-terminal-controls" ? "cancel-terminal" : "sealed-successor";
+  let before: ControlSqlState;
+  if (baseline.kind === "untrusted-control-reconstruction") before = baseline;
+  else {
+    requireData(transition === "first-seal" && baseline.reason === "first-capture-unavailable"
+      || node.controlProof.kind === "legacy-first-capture-bridge" && baseline.reason === "legacy-baseline-unavailable");
+    before = { originalRoster: after.originalRoster, expectedRows: after.originalRoster.rows,
+      expectedMaintenance: { ...after.sealedInvariant, admission: transition === "first-seal" ? "draining" : "sealed",
+        ownerGeneration: String(previous.ownerGeneration), journalRecordRef: node.previous.ref,
+        journalDigest: node.previous.sha256, journalSequence: String(previous.sequence) } };
+  }
   requireData(node.sequence === Number(before.expectedMaintenance.journalSequence) + 1
-    && node.controlProof.beforeRowsDigest === digestJson({ formatVersion: 1, kind: "source-clients-live-rows", source: node.source,
+    && (node.controlProof.kind === "capture-controls" ? node.controlProof.facts.beforeRowsDigest : node.controlProof.beforeRowsDigest) === digestJson({ formatVersion: 1, kind: "source-clients-live-rows", source: node.source,
       textEncoding: before.originalRoster.textEncoding, rows: before.expectedRows }));
-  return { source: node.source, textEncoding: before.originalRoster.textEncoding, before, after,
+  return { source: node.source, textEncoding: before.originalRoster.textEncoding, before, after, transition,
     schemaManifestDigest: (contents.json(node.plan, "plan") as unknown as MigrationPlan).schemaManifestDigest,
-    changes: node.controlProof.changes, previous: node.previous, head: input.head, input };
+    changes: node.controlProof.kind === "capture-controls" ? [] : node.controlProof.changes, previous: node.previous, head: input.head, input };
 }
-export function observedControlState(value: SourceClientsObservation): ExpectedMaintenance {
+export function observedControlState(value: SourceClientsObservation): ControlSqlMaintenance {
   const state = value.state;
-  if (state.admission !== "sealed" || !state.controlRootJson || !state.mutexIdentityJson || !state.activeMigrationId
-    || !state.planDigest || !state.journalRecordRef || !state.journalDigest) throw new MaintenanceFailure("source_changed");
-  return { singleton: "1", databaseInstanceId: state.databaseInstanceId, admission: "sealed", fenceEpoch: String(state.fenceEpoch),
+  if (!state.controlRootJson || !state.mutexIdentityJson || !state.journalRecordRef || !state.journalDigest
+    || (state.admission === "open" ? state.activeMigrationId !== null || state.planDigest !== null
+      : !state.activeMigrationId || !state.planDigest)) throw new MaintenanceFailure("source_changed");
+  return { singleton: "1", databaseInstanceId: state.databaseInstanceId, admission: state.admission, fenceEpoch: String(state.fenceEpoch),
     ownerGeneration: String(state.ownerGeneration), activeMigrationId: state.activeMigrationId, planDigest: state.planDigest,
     controlRootJson: state.controlRootJson, mutexIdentityJson: state.mutexIdentityJson, protocolVersion: "1", guardManifestDigest: state.guardManifestDigest,
     journalRecordRef: state.journalRecordRef, journalDigest: state.journalDigest, journalSequence: String(state.journalSequence) };
 }
-function matches(observed: SourceClientsObservation, expected: ReconstructedControls, source: ControlSqlPlan["source"]): boolean {
+function matches(observed: SourceClientsObservation, expected: ControlSqlState, source: ControlSqlPlan["source"]): boolean {
   return same(observed.source, source) && same(observed.textEncoding, expected.originalRoster.textEncoding)
     && same(observedControlState(observed), expected.expectedMaintenance) && same(rows(observed.rows), expected.expectedRows);
 }
@@ -66,6 +93,7 @@ export interface ControlSqlAccess {
   mutexHandleClosed(): boolean;
 }
 interface Attempt {
+  readonly runtime?: boolean;
   plan?: ControlSqlPlan;
   afterValidated: boolean;
   finalValidated: boolean;
@@ -79,36 +107,96 @@ interface Attempt {
   failure?: unknown;
   rollbackFailure?: unknown;
   closeFailure?: unknown;
+  retainPendingFailure?: boolean;
+  failurePropagated?: boolean;
+  readonly cleanupEvents: ControlCleanupEvent[];
   businessDigest?: string;
   schemaDigest?: string;
 }
 const bindings = new WeakMap<object, ControlSqlAccess>();
 const attempts = new WeakMap<object, Attempt>();
-// Ordinary locks have no control-SQL Attempt. Retain only bounded phase facts,
-// never raw errors or an authorization/validation claim for those locks.
-type OrdinaryLifecycle = Pick<Attempt, "committing" | "committed" | "failed" | "rollbackFailed" | "closeFailed">;
+// Ordinary locks have no SQL-plan validation claim. Their actual failure values
+// and separate cleanup occurrences still belong to the original command owner.
+type OrdinaryLifecycle = Pick<Attempt, "committing" | "committed" | "failed" | "rollbackFailed" | "closeFailed"
+  | "failure" | "rollbackFailure" | "closeFailure" | "cleanupEvents">;
 const ordinaryLifecycles = new WeakMap<object, OrdinaryLifecycle>();
 const callbackClosed = new WeakSet<object>();
-export function bindControlSql(lock: SourceLock, access: ControlSqlAccess): void { bindings.set(lock, Object.freeze(access)); }
-export function noteControlSql(lock: SourceLock | undefined, stage: "committing" | "committed" | "failure" | "rollback-failure" | "close-failure", error?: unknown): void {
+type ControlCleanupEvent = Readonly<{ stage: "pending-operation-failure" | "rollback-failure" | "close-failure"; error: unknown }>;
+const retainedOperations = new WeakMap<SourceLock, WeakSet<object>>();
+
+/** Internal observations of original operations only. Identity suppresses a
+ * second observation of one rejection, never an independent equal raw value. */
+export function notePendingControllerOperationFailure(lock: SourceLock, operation: object, error: unknown): void {
+  let retained = retainedOperations.get(lock);
+  if (!retained) { retained = new WeakSet(); retainedOperations.set(lock, retained); }
+  if (retained.has(operation)) return;
+  retained.add(operation); noteControlSql(lock, "pending-operation-failure", error);
+}
+/** The adapter calls this only after its original source callback has failed.
+ * A later rejection of the still-owned writer is a separate lifecycle event. */
+export function retainPendingControlSqlFailure(lock: SourceLock | undefined): void {
+  const attempt = lock && attempts.get(lock);
+  if (attempt?.running) attempt.retainPendingFailure = true;
+}
+function propagateControlSqlFailure(attempt: Attempt): never {
+  // The fixed writer will propagate this recorded failure through its original
+  // Promise. It is not a newly failing native operation, even for undefined.
+  attempt.failurePropagated = true; throw attempt.failure;
+}
+export function bindControlSql(lock: SourceLock, access: ControlSqlAccess): void {
+  if (bindings.has(lock)) throw new MaintenanceFailure("maintenance_lost");
+  bindings.set(lock, Object.freeze(access));
+}
+/** The writer registers its original Promise before any native/file await.
+ * The callback cannot finish or COMMIT around a forgotten in-flight writer. */
+export function trackControllerControlSql(lock: SourceLock): void {
+  const access = bindings.get(lock);
+  if (!access?.control || callbackClosed.has(lock) || attempts.has(lock)) throw new MaintenanceFailure("maintenance_lost");
+  const operation = controllerWriteOperation(lock);
+  const attempt: Attempt = { runtime: true, afterValidated: false, finalValidated: false, running: true,
+    settled: operation.then(() => { attempt.running = false; }, error => {
+      if (attempt.retainPendingFailure && !attempt.failurePropagated) notePendingControllerOperationFailure(lock, operation, error);
+      noteControlSql(lock, "failure", error); attempt.running = false;
+    }),
+    committing: false, committed: false, failed: false, rollbackFailed: false, closeFailed: false, cleanupEvents: [] };
+  attempts.set(lock, attempt);
+}
+export function assertControllerControlSqlActive(lock: SourceLock): void {
+  const attempt = attempts.get(lock);
+  if (attempt?.failed) propagateControlSqlFailure(attempt);
+  if (!attempt?.runtime || !attempt.running || callbackClosed.has(lock)) throw new MaintenanceFailure("maintenance_lost");
+}
+export function noteControlSql(lock: SourceLock | undefined, stage: "committing" | "committed" | "failure" | ControlCleanupEvent["stage"], error?: unknown): void {
   const attempt = lock && attempts.get(lock);
   if (!attempt) {
     if (!lock || !bindings.has(lock)) return;
-    const lifecycle = ordinaryLifecycles.get(lock) ?? {
-      committing: false, committed: false, failed: false, rollbackFailed: false, closeFailed: false };
+    const lifecycle: OrdinaryLifecycle = ordinaryLifecycles.get(lock) ?? {
+      committing: false, committed: false, failed: false, rollbackFailed: false, closeFailed: false, cleanupEvents: [] };
     if (stage === "committing") lifecycle.committing = true;
     else if (stage === "committed") lifecycle.committed = true;
-    else if (stage === "failure") lifecycle.failed = true;
-    else if (stage === "rollback-failure") lifecycle.rollbackFailed = true;
-    else lifecycle.closeFailed = true;
+    else if (stage === "failure") { if (!lifecycle.failed) lifecycle.failure = error; lifecycle.failed = true; }
+    else if (stage === "pending-operation-failure") lifecycle.cleanupEvents.push({ stage, error });
+    else if (stage === "rollback-failure") {
+      if (!lifecycle.rollbackFailed) lifecycle.rollbackFailure = error;
+      lifecycle.rollbackFailed = true; lifecycle.cleanupEvents.push({ stage, error });
+    } else {
+      if (!lifecycle.closeFailed) lifecycle.closeFailure = error;
+      lifecycle.closeFailed = true; lifecycle.cleanupEvents.push({ stage, error });
+    }
     ordinaryLifecycles.set(lock, lifecycle);
     return;
   }
   if (stage === "committing") attempt.committing = true;
   else if (stage === "committed") attempt.committed = true;
   else if (stage === "failure") { if (!attempt.failed) attempt.failure = error; attempt.failed = true; }
-  else if (stage === "rollback-failure") { attempt.rollbackFailure = error; attempt.rollbackFailed = true; }
-  else { attempt.closeFailure = error; attempt.closeFailed = true; }
+  else if (stage === "pending-operation-failure") attempt.cleanupEvents.push({ stage, error });
+  else if (stage === "rollback-failure") {
+    if (!attempt.rollbackFailed) attempt.rollbackFailure = error;
+    attempt.rollbackFailed = true; attempt.cleanupEvents.push({ stage, error });
+  } else {
+    if (!attempt.closeFailed) attempt.closeFailure = error;
+    attempt.closeFailed = true; attempt.cleanupEvents.push({ stage, error });
+  }
 }
 export function assertControlSqlCommit(lock: SourceLock): void {
   const attempt = attempts.get(lock);
@@ -137,7 +225,7 @@ export async function validateControlSqlCommit(lock: SourceLock): Promise<void> 
   const attempt = attempts.get(lock), access = bindings.get(lock);
   if (!attempt) return;
   try {
-    if (attempt.failed) throw attempt.failure;
+    if (attempt.failed) propagateControlSqlFailure(attempt);
     if (!access || !callbackClosed.has(lock) || attempt.running || !attempt.afterValidated || !attempt.plan)
       throw new MaintenanceFailure("maintenance_lost");
     await access.assertHeld();
@@ -146,33 +234,43 @@ export async function validateControlSqlCommit(lock: SourceLock): Promise<void> 
       || manifest.manifests.schemaManifestDigest !== attempt.schemaDigest
       || manifest.manifests.frozenBusinessManifestDigest !== attempt.businessDigest) throw new MaintenanceFailure("source_changed");
     await access.assertHeld();
-    if (attempt.failed) throw attempt.failure;
+    if (attempt.failed) propagateControlSqlFailure(attempt);
     attempt.finalValidated = true;
   } catch (error) { noteControlSql(lock, "failure", error); throw error; }
 }
 
 /** Isolated mechanism only: no production caller, publication, registration or authority transition. */
 export async function applyUntrustedControlSql(lock: SourceLock, input: unknown): Promise<Readonly<{ kind: "untrusted-control-transaction-view"; observation: SourceClientsObservation }>> {
+  return applyFixedControlSql(lock, () => compile(input));
+}
+
+/** Only consumes a once-created plan from the runtime writer's private original-lock table.
+ * No public argument supplies rows, candidate bytes, callbacks, SQL or a success claim. */
+export async function applyControllerControlSql(lock: SourceLock): Promise<Readonly<{ kind: "untrusted-control-transaction-view"; observation: SourceClientsObservation }>> {
+  return applyFixedControlSql(lock, () => consumeControllerSqlPlan(lock), true);
+}
+async function applyFixedControlSql(lock: SourceLock, prepare: () => ControlSqlPlan, runtime = false): Promise<Readonly<{ kind: "untrusted-control-transaction-view"; observation: SourceClientsObservation }>> {
   const access = bindings.get(lock);
-  if (!access?.control || callbackClosed.has(lock) || attempts.has(lock)) {
+  const reserved = attempts.get(lock);
+  if (!access?.control || callbackClosed.has(lock) || (runtime ? !reserved?.runtime || !reserved.running || reserved.plan !== undefined : reserved !== undefined)) {
     const error = new MaintenanceFailure("maintenance_lost"), prior = attempts.get(lock);
     if (prior && !prior.failed) { prior.failure = error; prior.failed = true; }
     throw error;
   }
-  let settle!: () => void;
-  const attempt: Attempt = { afterValidated: false, finalValidated: false, running: true, settled: new Promise<void>(resolve => { settle = resolve; }),
-    committing: false, committed: false, failed: false, rollbackFailed: false, closeFailed: false }; attempts.set(lock, attempt);
+  let settle = () => {};
+  const attempt: Attempt = reserved ?? { afterValidated: false, finalValidated: false, running: true, settled: new Promise<void>(resolve => { settle = resolve; }),
+    committing: false, committed: false, failed: false, rollbackFailed: false, closeFailed: false, cleanupEvents: [] }; attempts.set(lock, attempt);
   try {
     await access.assertHeld();
-    if (attempt.failed) throw attempt.failure;
-    const plan = compile(input); attempt.plan = plan;
+    if (attempt.failed) propagateControlSqlFailure(attempt);
+    const plan = prepare(); attempt.plan = plan;
     const before = await access.observe(), manifest = await access.manifests();
     attempt.businessDigest = manifest.manifests.frozenBusinessManifestDigest;
     attempt.schemaDigest = manifest.manifests.schemaManifestDigest;
     if (!same(access.root, plan.input.controlRoot) || before.schemaManifestDigest !== plan.schemaManifestDigest
       || !matches(before, plan.before, plan.source)) throw new MaintenanceFailure("source_changed");
     await access.assertHeld();
-    if (attempt.failed) throw attempt.failure;
+    if (attempt.failed) propagateControlSqlFailure(attempt);
     access.invalidateFacts();
     await access.write(plan);
     await access.assertHeld();
@@ -183,7 +281,7 @@ export async function applyUntrustedControlSql(lock: SourceLock, input: unknown)
     attempt.afterValidated = true;
     return Object.freeze({ kind: "untrusted-control-transaction-view", observation: after });
   } catch (error) { noteControlSql(lock, "failure", error); throw error; }
-  finally { attempt.running = false; settle(); }
+  finally { if (!runtime) { attempt.running = false; settle(); } }
 }
 
 export interface ControlSqlOutcome {
@@ -201,6 +299,7 @@ export interface ControlSqlOutcome {
   readonly originalError?: unknown;
   readonly rollbackError?: unknown;
   readonly closeError?: unknown;
+  readonly cleanupEvents?: readonly ControlCleanupEvent[];
 }
 /** This reports the actual outer lifecycle. A transaction-local view alone is never committed. */
 export function controlSqlOutcome(lock: SourceLock): Readonly<ControlSqlOutcome> {
@@ -212,7 +311,9 @@ export function controlSqlOutcome(lock: SourceLock): Readonly<ControlSqlOutcome>
     return Object.freeze({ kind: "untrusted-control-outcome" as const, status: "unknown" as const,
       localSourceHandleClosed: access.sourceHandleClosed(), localMutexHandleClosed: access.mutexHandleClosed(),
       commitStarted: lifecycle.committing, commitReturned: lifecycle.committed, failureObserved: lifecycle.failed,
-      rollbackFailureObserved: lifecycle.rollbackFailed, closeFailureObserved: lifecycle.closeFailed });
+      rollbackFailureObserved: lifecycle.rollbackFailed, closeFailureObserved: lifecycle.closeFailed,
+      originalError: lifecycle.failure, rollbackError: lifecycle.rollbackFailure, closeError: lifecycle.closeFailure,
+      cleanupEvents: Object.freeze(lifecycle.cleanupEvents.map(event => Object.freeze({ ...event }))) });
   }
   const sourceClosed = access.sourceHandleClosed(), mutexClosed = access.mutexHandleClosed();
   return Object.freeze({ kind: "untrusted-control-outcome" as const,
@@ -220,7 +321,8 @@ export function controlSqlOutcome(lock: SourceLock): Readonly<ControlSqlOutcome>
       ? "source-transaction-completed" as const : "unknown" as const,
     localSourceHandleClosed: sourceClosed, localMutexHandleClosed: mutexClosed, afterValidated: attempt.afterValidated, finalValidated: attempt.finalValidated, commitStarted: attempt.committing,
     commitReturned: attempt.committed, failureObserved: attempt.failed, rollbackFailureObserved: attempt.rollbackFailed, closeFailureObserved: attempt.closeFailed,
-    originalError: attempt.failure, rollbackError: attempt.rollbackFailure, closeError: attempt.closeFailure });
+    originalError: attempt.failure, rollbackError: attempt.rollbackFailure, closeError: attempt.closeFailure,
+    cleanupEvents: Object.freeze(attempt.cleanupEvents.map(event => Object.freeze({ ...event }))) });
 }
 
 /** Re-observation only, no retry/write. Retired actual local handles precede a NEW real mutex and source-lock acquisition.
@@ -251,7 +353,7 @@ export async function resolveUntrustedControlSql(adapter: MaintenanceAdapter, ol
       // The observed head must contain the exact prior anchor, not merely a greater sequence or an available file.
       let reference: ArtifactRef | null = proof.head; let found = false;
       while (reference) {
-        if (same(reference, plan.previous)) { found = true; break; }
+        if (same(reference, plan.head)) { found = true; break; }
         const value = contents.json(reference, "journal") as { previous: ArtifactRef | null };
         reference = value.previous;
       }

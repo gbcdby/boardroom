@@ -1,12 +1,12 @@
 import path from "node:path";
 import { z } from "zod";
-import { canonicalJson, parseCanonical } from "./canonical.ts";
+import { canonicalJson, digestJson, parseCanonical } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { counter, hash, id, ref, source, text } from "./parse-primitives.ts";
 import { sourceClientsRosterSchema } from "./source-clients.ts";
 import { checkFactsShape, controlProofSchema } from "./control-candidate/schema.ts";
 import type { ArtifactStore } from "./objects.ts";
-import type { ActualRestoreVerification, ArtifactRef, DatabaseManifests, DurabilityCapability, JournalRecord, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceFilesManifest, VerificationJournalRecord } from "./types.ts";
+import type { ActualRestoreVerification, ArtifactRef, DatabaseManifests, DurabilityCapability, JournalRecord, JournalRecordV1, JournalRecordV2, MaintenanceCommand, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceFilesManifest, VerificationJournalRecord } from "./types.ts";
 
 const blockerCode = z.enum(["source_changed", "source_missing", "plan_stale", "target_conflict", "control_root_mismatch",
   "source_writer_unknown", "source_writer_active", "drain_incomplete", "maintenance_busy", "maintenance_lost", "schema_guard_incomplete",
@@ -89,36 +89,58 @@ function parse<T>(schema: z.ZodTypeAny, value: unknown): T {
 }
 export const parsePlan = (value: unknown): MigrationPlan => parse(plan, value);
 export const parseCapability = (value: unknown): DurabilityCapability => parse(capability, value);
-/** Strict structural decoding; legacy capture acceptance is forbidden by the current chain reader. */
-export const parseJournal = (value: unknown): JournalRecord => parse(journal, value);
-/** V opts into the same strict v3 data codec; parsing never grants runtime authority. */
-export function parseVerificationJournal(value: unknown): VerificationJournalRecord {
+/** Strict shared structural decoding. Version edges and all runtime obligations are separate. */
+export function parseJournal(value: unknown): JournalRecord {
   canonicalJson(value);
   if (value === null || typeof value !== "object" || Array.isArray(value) || !("formatVersion" in value)
-    || value.formatVersion !== 3) return parseJournal(value);
+    || value.formatVersion !== 3) return parse<JournalRecordV1 | JournalRecordV2>(journal, value);
   const requireValue = (condition: unknown): void => {
     if (!condition) throw new MaintenanceFailure("journal_invalid", "verification-journal");
   };
   const { controlProof, ...body } = value as Record<string, unknown>;
   requireValue(Object.hasOwn(value, "controlProof"));
-  const record = parseJournal({ ...body, formatVersion: 2 });
+  const record = parse<JournalRecordV2>(journal, { ...body, formatVersion: 2 });
   if (record.formatVersion !== 2) throw new MaintenanceFailure("journal_invalid");
   requireValue((record.event === "ready") === (record.snapshot !== null) && (record.event === "capture") === (record.frozen !== null));
-  if (["cancel_intent", "cancelled"].includes(record.event)
-    || record.phase === "planned" && (record.event === "enter" || record.event === "observation")) {
+  if (record.phase === "planned" && (record.event === "enter" || record.event === "observation")) {
     requireValue(controlProof === null);
     return { ...record, formatVersion: 3, controlProof: null };
   }
   requireValue(record.event === "capture" && record.phase === "quiesced"
     || record.event === "ready" && record.phase === "snapshot_ready"
-    || (record.event === "observation" || record.event === "takeover") && record.phase !== "planned");
+    || ["observation", "takeover", "cancel_intent", "cancelled"].includes(record.event) && record.phase !== "planned");
   const proof = controlProofSchema.safeParse(controlProof);
   if (!proof.success) throw new MaintenanceFailure("journal_invalid", "verification-journal");
   if (proof.data.kind === "capture-controls") requireValue(record.event === "capture");
+  requireValue((record.event === "cancelled") === (proof.data.kind === "cancel-terminal-controls"));
+  if (record.event === "cancel_intent") requireValue(proof.data.kind === "control-successor");
+  if (proof.data.kind === "control-successor" && ["capture", "ready", "cancel_intent"].includes(record.event))
+    requireValue(proof.data.changes.length === 0 && proof.data.beforeRowsDigest === proof.data.afterRowsDigest);
   if (proof.data.kind === "legacy-first-capture-bridge") requireValue(record.phase === "snapshot_ready" && record.event === "observation"
     && proof.data.changes.length === 0 && proof.data.beforeRowsDigest === proof.data.afterRowsDigest);
+  if (proof.data.kind === "cancel-terminal-controls") requireValue(proof.data.epochAfter === String(record.fenceEpoch)
+    && BigInt(proof.data.epochAfter) === BigInt(proof.data.epochBefore) + 1n
+    && proof.data.ownerGeneration === String(record.ownerGeneration) && proof.data.targetSequence === String(record.sequence)
+    && proof.data.beforeRowsDigest === proof.data.afterRowsDigest);
   checkFactsShape(proof.data.facts, record.source);
   return { ...record, formatVersion: 3, controlProof: proof.data };
+}
+/** V deliberately shares the strict codec, not the default reader's broader purposes. */
+export const parseVerificationJournal = (value: unknown): VerificationJournalRecord => parseJournal(value);
+
+const persistedPlan = z.object({ migrationId: id, planDigest: hash, immutablePlan: ref, controlRoot: text }).strict()
+  .refine(value => value.planDigest === value.immutablePlan.sha256 && value.immutablePlan.ref === `plans/${value.planDigest}.json`);
+const continueRequest = z.object({ plan: persistedPlan, expectedSource: source,
+  expectedPhase: z.enum(["planned", "quiesced", "snapshot_ready"]).nullable(), expectedJournalDigest: hash.nullable(), requestId: id }).strict()
+  .refine(value => (value.expectedPhase === null) === (value.expectedJournalDigest === null));
+const maintenanceCommand = z.object({ operation: z.enum(["execute-migration", "resume-migration", "cancel-migration"]), request: continueRequest }).strict();
+export function parseMaintenanceCommand(value: unknown): MaintenanceCommand {
+  const parsed = maintenanceCommand.safeParse(value);
+  if (!parsed.success) throw new MaintenanceFailure("request_conflict", "maintenance-command");
+  return parsed.data;
+}
+export function maintenanceRequestDigest(value: MaintenanceCommand): string {
+  return digestJson(parseMaintenanceCommand(value));
 }
 function requireSourceFiles(condition: unknown): asserts condition {
   if (!condition) throw new MaintenanceFailure("snapshot_invalid");

@@ -38,10 +38,13 @@ export function sourceClientsRows(values: readonly unknown[], count: bigint): re
   if (count < 0n) invalidSourceClients();
   if (BigInt(values.length) !== count) throw new MaintenanceFailure("source_changed", "source-clients");
   const ids = new Set<string>();
-  return values.map(value => {
+  const rows = values.map(value => {
     const result = sourceClientRawRowSchema.safeParse(value);
     if (!result.success || ids.has(result.data.client_id[1])) invalidSourceClients();
     ids.add(result.data.client_id[1]);
     return result.data;
   });
+  // Native query order is not part of the full-row relation. Match the roster
+  // and replay's unsigned original ID bytes only after every row is validated.
+  return rows.sort((a, b) => a.client_id[1] < b.client_id[1] ? -1 : a.client_id[1] > b.client_id[1] ? 1 : 0);
 }

@@ -7,9 +7,9 @@ import * as journal from "../src/server/storage/maintenance/journal.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { controlVector, successorVector } from "./fixtures/maintenance-control-candidate.ts";
 
-test("#248 parser: V explicitly accepts strict v3 while the default reader stays v1/v2", () => {
+test("C3 AC16 / #248 parser: default and V share strict v3 decoding with unchanged legacy values", () => {
   const f = controlVector();
-  assert.throws(() => parsing.parseJournal(f.captured), /journal_invalid/);
+  assert.deepEqual(parsing.parseJournal(f.captured), f.captured);
   assert.deepEqual(parsing.parseVerificationJournal(f.captured), f.captured);
   const legacy = controlVector({ initialVersion: 2 });
   assert.deepEqual(parsing.parseVerificationJournal(legacy.enter), parsing.parseJournal(legacy.enter));
@@ -19,7 +19,7 @@ test("#248 parser: V explicitly accepts strict v3 while the default reader stays
 });
 
 const nativeTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
-nativeTest("#248 journal: V reads the exact v3 capture chain without widening default or legacy edges", async () => {
+nativeTest("C3 AC16 / #248 journal: default and V read exact v3 captures and keep strict legacy edges", async () => {
   const directory = await mkdtemp(path.join(process.cwd(), "maintenance-v3-journal-test-"));
   try {
     const seed = controlVector(), store = await ArtifactStore.create(path.join(directory, "control"), seed.source);
@@ -27,12 +27,15 @@ nativeTest("#248 journal: V reads the exact v3 capture chain without widening de
       root: store.identity, mutex: seed.mutex, schemaManifestDigest: seed.plan.schemaManifestDigest, guardManifestDigest: seed.plan.guardManifestDigest } });
     for (const item of f.objects) await store.putJson(store.kindFor(item.reference) as "plan" | "journal" | "source-files", JSON.parse(item.bytes.toString("utf8")));
     const capture = await store.putJson("journal", f.captured);
-    await assert.rejects(journal.verifyJournalChain(store, capture), /journal_invalid/);
+    assert.deepEqual((await journal.verifyJournalChain(store, capture)).nodes.map(node => node.reference), [f.enterRef, capture]);
     const chain = await journal.verifyVerificationJournalChain(store, capture);
     assert.deepEqual(chain.nodes.map(node => node.reference), [f.enterRef, capture]);
     const successor = successorVector(f, { origin: capture, previous: capture, sequence: 3, before: [], after: [], clients: [], changes: [] });
     const head = await store.putJson("journal", successor);
     assert.equal((await journal.verifyVerificationJournalChain(store, head)).nodes.at(-1)!.record.formatVersion, 3);
+    const intent = await store.putJson("journal", { ...successor, event: "cancel_intent" });
+    assert.equal((await journal.verifyJournalChain(store, intent)).nodes.at(-1)!.record.event, "cancel_intent");
+    await assert.rejects(journal.verifyVerificationJournalChain(store, intent), /journal_invalid/);
     const { controlProof: _proof, ...plain } = successor;
     await assert.rejects(journal.verifyVerificationJournalChain(store, await store.putJson("journal", { ...plain, formatVersion: 2 })), /journal_invalid/);
     const legacy = controlVector({ initialVersion: 2, mechanism: { databaseInstanceId: seed.source.databaseInstanceId, sourceIdentity: seed.sourceIdentity,
