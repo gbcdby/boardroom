@@ -2,28 +2,558 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { constants } from "node:fs";
-import { chmod, link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { closeSync, constants, fstatSync, openSync, readSync, readdirSync } from "node:fs";
+import { chmod, copyFile, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir, constants as osConstants } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { withNativeSourceRoot, observeSourceFile, sourceFileNativePath } from "../src/server/storage/maintenance/source-file-native.ts";
-import type { SourceFileExtendedObservation } from "../src/server/storage/maintenance/source-file-native.ts";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { withNativeSourceRoot, observeSourceFile, observeSourceFileRootContext, sourceFileNativePath } from "../src/server/storage/maintenance/source-file-native.ts";
+import type { SourceFileExtendedObservation, SourceFileNativeCall, SourceFileContextFact, SourceFileKernelReadValue, SourceFileRootEnvironment } from "../src/server/storage/maintenance/source-file-native.ts";
 import { matchSourceFileProfile } from "../src/server/storage/maintenance/source-file-profile.ts";
+import type { SourceFileMountBinding } from "../src/server/storage/maintenance/source-file-profile.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 
 const linuxTest = process.platform === "linux" ? test : test.skip;
 const root = fileURLToPath(new URL("../", import.meta.url));
+/** This isolated source exports only a pure ABI decoder. It neither replaces
+ * the production binding/registry nor registers any synthetic root/profile. */
+interface PureNativeDecoders {
+  checkedKernelReadFact(value: unknown, limit: number, samples?: 1 | 2): SourceFileContextFact<SourceFileKernelReadValue>;
+  checkedAuxiliaryCalls(value: unknown, complete?: boolean, unavailableGraph?: boolean): readonly SourceFileNativeCall[];
+  checkedEnumeration(value: unknown, index: number): readonly SourceFileNativeCall[];
+}
+async function withNativeDecoders(consume: (decode: PureNativeDecoders) => void) {
+  const directory = await mkdtemp(path.join(tmpdir(), "br-p3-decoder-"));
+  try {
+    const original = path.join(root, "src/server/storage/maintenance/source-file-native.ts");
+    const source = (await readFile(original, "utf8")).replace('from "./error.ts"',
+      `from ${JSON.stringify(pathToFileURL(path.join(root, "src/server/storage/maintenance/error.ts")).href)}`);
+    const file = path.join(directory, "native-decoder.mts");
+    await writeFile(file, source + "\nexport { checkedKernelReadFact, checkedAuxiliaryCalls, checkedEnumeration };\n");
+    const module = await import(pathToFileURL(file).href) as PureNativeDecoders;
+    consume(module);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+}
+interface PureProfileParsers {
+  parseStatx(raw: Buffer, unique: boolean, metadata: unknown): Record<string, bigint>;
+  parseMount(raw: { request: Buffer; result: Buffer }, legacy: unknown, unique: unknown): SourceFileMountBinding;
+  selectedMountinfo(raw: Buffer, mount: SourceFileMountBinding): unknown;
+  ordinaryProcess(environment: unknown): unknown;
+  parseOptions(raw: Buffer): Readonly<Record<string, string | true>>;
+  boundHealth(environment: unknown, mount: SourceFileMountBinding): unknown;
+  analyzeEnvironment(context: unknown): { unresolved: readonly string[]; contextBinding: string; windowBinding: string };
+  typed(value: unknown): unknown;
+}
+/** Exposes only pure mechanical parsers. FIXED_PROFILES, owner registration,
+ * selection and SourceProfile construction remain unchanged and unexported. */
+async function withProfileParsers(consume: (parsers: PureProfileParsers) => void) {
+  const directory = await mkdtemp(path.join(tmpdir(), "br-p3-profile-parsers-"));
+  try {
+    const base = path.join(root, "src/server/storage/maintenance");
+    let source = await readFile(path.join(base, "source-file-profile.ts"), "utf8");
+    for (const name of ["canonical.ts", "error.ts", "source-file-native.ts"])
+      source = source.replaceAll(`from "./${name}"`, `from ${JSON.stringify(pathToFileURL(path.join(base, name)).href)}`);
+    const file = path.join(directory, "profile-parsers.mts");
+    await writeFile(file, source + "\nexport { parseStatx, parseMount, selectedMountinfo, ordinaryProcess, parseOptions, boundHealth, analyzeEnvironment, typed };\n");
+    consume(await import(pathToFileURL(file).href) as PureProfileParsers);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+}
+
+/** Inert ABI/parser values from the accepted x86_64 statx/statmount layouts.
+ * They are never submitted to native acquisition, the registry, or S. */
+function profileParserFixture(): any {
+  const metadata = { kind: "file", dev: 2049n, ino: 9007199254741001n, mode: 0o100600n, uid: 1001n, gid: 1001n,
+    nlink: 1n, size: 7n, fsType: 0xef53n, atimeNs: 1000000002n, mtimeNs: 2000000003n, ctimeNs: 3000000004n };
+  function statx(unique: boolean): Buffer {
+    const raw = Buffer.alloc(256);
+    raw.writeUInt32LE(0xfff | (unique ? 0x4000 : 0x1000), 0);
+    raw.writeBigUInt64LE(0x200000n, 56); raw.writeUInt32LE(1, 16);
+    raw.writeUInt32LE(1001, 20); raw.writeUInt32LE(1001, 24); raw.writeUInt16LE(Number(metadata.mode), 28);
+    raw.writeBigUInt64LE(metadata.ino, 32); raw.writeBigUInt64LE(metadata.size, 40);
+    for (const [offset, value] of [[64, metadata.atimeNs], [80, 1n], [96, metadata.ctimeNs], [112, metadata.mtimeNs]] as const) {
+      raw.writeBigInt64LE(value / 1000000000n, offset); raw.writeUInt32LE(Number(value % 1000000000n), offset + 8);
+    }
+    raw.writeUInt32LE(8, 136); raw.writeUInt32LE(1, 140); raw.writeBigUInt64LE(unique ? 9007199254740995n : 17n, 144);
+    return raw;
+  }
+  const legacyBytes = statx(false), uniqueBytes = statx(true), strings = Buffer.from("ext4\0/\0/source path\0");
+  const request = Buffer.alloc(32), result = Buffer.alloc(512 + strings.length);
+  request.writeUInt32LE(32, 0); request.writeBigUInt64LE(9007199254740995n, 8); request.writeBigUInt64LE(59n, 16);
+  result.writeUInt32LE(result.length, 0); result.writeBigUInt64LE(59n, 8); result.writeUInt32LE(8, 16); result.writeUInt32LE(1, 20);
+  result.writeBigUInt64LE(0xef53n, 24); result.writeBigUInt64LE(9007199254740995n, 40); result.writeUInt32LE(17, 56);
+  result.writeBigUInt64LE(0x40000n, 72); result.writeUInt32LE(5, 104); result.writeUInt32LE(7, 108); strings.copy(result, 512);
+  const mountinfo = Buffer.from("17 1 8:1 / /source\\040path rw,relatime - ext4 /dev/vdb1 rw,data=ordered\n");
+  const observed = (value: unknown) => ({ status: "observed", reason: null, value, calls: [] });
+  const read = (bytes: string, inode = 40n, samples: 1 | 2 = 1) => {
+    const fact = kernelReadFixture(samples) as any;
+    Object.assign(fact.value, { bytes: Buffer.from(bytes), device: 7n, inode });
+    fact.calls[3].rc = BigInt(Buffer.byteLength(bytes));
+    if (samples === 2) fact.calls[11].rc = BigInt(Buffer.byteLength(bytes));
+    return fact;
+  };
+  const uid = [1001n, 1001n, 1001n, 1001n], gid = [...uid];
+  const status = "Name:\tfixture\nTgid:\t222\nPid:\t222\nUid:\t1001\t1001\t1001\t1001\nGid:\t1001\t1001\t1001\t1001\nGroups:\t\nNoNewPrivs:\t1\n"
+    + ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"].map(name => `${name}:\t0000000000000000\n`).join("");
+  const uname = Buffer.alloc(390);
+  ["Linux", "fixture", "7.0", "fixture-build", "x86_64", "(none)"].forEach((value, index) => uname.write(value, index * 65));
+  const deviceIdentity = { device: 7n, inode: 31n, mode: 0o040555n, filesystemType: 0x62656572n };
+  const binding = { sourceDevMajor: 8n, sourceDevMinor: 1n, sysfs: deviceIdentity,
+    kernelName: Buffer.from("vdb1"), resolved: Buffer.from("/sys/devices/fixture/vdb1"), sbId: Buffer.from("vdb1") };
+  const dev = read("8:1\n", 40n, 2), uevent = read("DEVNAME=vdb1\n", 41n, 2);
+  const healthNames = ["errors_count", "first_error_errcode", "last_error_errcode", "first_error_ino", "last_error_ino", "first_error_block",
+    "last_error_block", "first_error_line", "last_error_line", "first_error_time", "last_error_time", "first_error_func", "last_error_func"];
+  const environment = {
+    process: { identity: observed({ pid: 222n, tid: 222n, uid, gid, groups: [], noNewPrivileges: 1n }),
+      threadStatus: read(status), processStat: read(`222 (fixture) S ${Array<string>(18).fill("0").join(" ")} 987654321\n`),
+      namespaces: observed({ pid: { inode: 1n }, mount: { inode: 2n }, user: { inode: 3n } }) },
+    kernel: { uname: observed(uname), notes: read("fixture-not-a-qualified-build"), config: { status: "unavailable", reason: "unsupported", value: null, calls: [] } },
+    mount: { legacyStatx: observed(legacyBytes), uniqueStatx: observed(uniqueBytes), statmount: observed({ request, result }), mountinfo: read(mountinfo.toString()) },
+    configuration: { tune: observed(Buffer.alloc(232)), options: read("rw,data=ordered,errors=remount-ro\n", 42n, 2), mbGroups: read("raw-mb-groups\n", 43n, 2),
+      journalTaskBefore: read("333\n"), journalTaskAfter: read("333\n"), journalIoprio: observed({ which: 1n, who: 333n, rawValue: 16388n }) },
+    device: { binding: observed(binding), dev, uevent, topology: observed({ nodes: [{ index: 0, major: 8n, minor: 1n, identity: deviceIdentity,
+      kernelName: binding.kernelName, resolved: binding.resolved, dev, uevent, holders: [], slaves: [] }], edges: [] }) },
+    health: { binding: observed({ sourceDevMajor: 8n, sourceDevMinor: 1n, device: deviceIdentity,
+      health: { ...deviceIdentity, inode: 32n }, sbId: binding.sbId }),
+      fields: healthNames.map((name, index) => ({ name, fact: read(index >= 11 ? "\n" : "0\n", BigInt(100 + index)) })) },
+    auxiliaryCalls: [],
+  };
+  const context = { info: { abiVersion: 1, kind: "file", stage: "readable", metadata }, environment,
+    root: { before: metadata, after: metadata, metadataCalls: [], uuid: observed({ length: 16n, bytes: Buffer.alloc(16, 1) }),
+      fid: observed({ handleType: 1n, handleBytes: 8n, mountId: 9007199254740995n, bytes: Buffer.alloc(8, 2) }),
+      inodeFlags: observed(0x80000n), xattrs: observed([]) },
+    uniqueStatx: { uniqueMountId: 9007199254740995n, ino: metadata.ino }, legacyStatx: { mountId: 17n, ino: metadata.ino } };
+  return { metadata, legacyBytes, uniqueBytes, request, result, mountinfo, environment, context };
+}
+
+test("#152 P3 pure statx and mount parsers bind separate IDs, exact ABI and complete mountinfo", async () => {
+  await withProfileParsers(parse => {
+    const fixture = profileParserFixture(), legacy = parse.parseStatx(fixture.legacyBytes, false, fixture.metadata);
+    const unique = parse.parseStatx(fixture.uniqueBytes, true, fixture.metadata);
+    const mount = parse.parseMount(fixture, legacy, unique);
+    assert.equal(mount.legacyMountId, 17n); assert.equal(mount.uniqueMountId, 9007199254740995n);
+    assert.equal(mount.point, "/source path"); assert.doesNotThrow(() => parse.selectedMountinfo(fixture.mountinfo, mount));
+    const coincident = profileParserFixture(); coincident.uniqueBytes.writeBigUInt64LE(17n, 144);
+    coincident.request.writeBigUInt64LE(17n, 8); coincident.result.writeBigUInt64LE(17n, 40);
+    assert.equal(parse.parseMount(coincident, legacy, parse.parseStatx(coincident.uniqueBytes, true, coincident.metadata)).uniqueMountId, 17n,
+      "numerical coincidence does not merge or invalidate two independently bound ID namespaces");
+    for (const change of ["wrong-mask", "bad-nanos", "wrong-inode", "request-id", "unterminated-path", "wrong-encoding", "missing-eof", "duplicate-id", "bad-escape"]) {
+      const value = profileParserFixture();
+      if (change === "wrong-mask") value.uniqueBytes.writeUInt32LE(0x1fff, 0);
+      if (change === "bad-nanos") value.uniqueBytes.writeUInt32LE(1000000000, 72);
+      if (change === "wrong-inode") value.uniqueBytes.writeBigUInt64LE(1n, 32);
+      if (change === "request-id") value.request.writeBigUInt64LE(17n, 8);
+      if (change === "unterminated-path") value.result[value.result.length - 1] = 65;
+      if (change === "wrong-encoding") value.result[520] = 255;
+      if (change === "missing-eof") value.mountinfo = value.mountinfo.subarray(0, -1);
+      if (change === "duplicate-id") value.mountinfo = Buffer.concat([value.mountinfo, value.mountinfo]);
+      if (change === "bad-escape") value.mountinfo = Buffer.from(value.mountinfo.toString().replace("\\040", "\\041"));
+      assert.throws(() => {
+        const candidate = parse.parseMount(value, parse.parseStatx(value.legacyBytes, false, value.metadata), parse.parseStatx(value.uniqueBytes, true, value.metadata));
+        parse.selectedMountinfo(value.mountinfo, candidate);
+      }, { code: change === "wrong-inode" ? "source_changed" : "backup_capability_unavailable" }, change);
+    }
+  });
+});
+
+test("#152 P3 pure process and options parsing retains missing ordinary-authority obligations", async () => {
+  await withProfileParsers(parse => {
+    const value = profileParserFixture();
+    assert.doesNotThrow(() => parse.ordinaryProcess(value.environment));
+    assert.equal(parse.parseOptions(Buffer.from("rw,data=ordered,errors=remount-ro\n")).data, "ordered");
+    for (const options of ["rw,data=ordered,data=writeback\n", "rw,\n", "rw\0", "rw,unknown=é\n"])
+      assert.throws(() => parse.parseOptions(Buffer.from(options)), { code: "backup_capability_unavailable" });
+    for (const change of ["capability", "uid-mismatch", "extra-group", "privileges", "missing-field", "wrong-pid", "missing-lifetime"]) {
+      const environment = profileParserFixture().environment;
+      let status = environment.process.threadStatus.value.bytes.toString();
+      if (change === "capability") status = status.replace("CapEff:\t0000000000000000", "CapEff:\t0000000000000001");
+      if (change === "uid-mismatch") status = status.replace("Uid:\t1001", "Uid:\t1002");
+      if (change === "extra-group") { status = status.replace("Groups:\t", "Groups:\t1001"); environment.process.identity.value.groups = [1001n]; }
+      if (change === "privileges") { status = status.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"); environment.process.identity.value.noNewPrivileges = 0n; }
+      if (change === "missing-field") status = status.replace("CapBnd:\t0000000000000000\n", "");
+      if (change === "wrong-pid") environment.process.processStat.value.bytes[0] = 51;
+      if (change === "missing-lifetime") environment.process.processStat.value.bytes = Buffer.from(environment.process.processStat.value.bytes.toString().replace("987654321", "0"));
+      environment.process.threadStatus.value.bytes = Buffer.from(status);
+      assert.throws(() => parse.ordinaryProcess(environment), { code: ["uid-mismatch", "wrong-pid"].includes(change)
+        ? "source_changed" : "backup_capability_unavailable" }, change);
+    }
+    const analysis = parse.analyzeEnvironment(value.context);
+    assert.equal(analysis.unresolved.length, 4);
+    assert.ok(analysis.unresolved.every(item => item.endsWith("UNPROVEN")));
+    assert.equal(Object.hasOwn(analysis, "qualified"), false, "pure mechanical completeness still cannot issue a profile");
+  });
+});
+
+test("#152 P3 pure health parser binds all thirteen raw fields and the identical device roster", async () => {
+  await withProfileParsers(parse => {
+    const fixture = profileParserFixture(), mount = parse.parseMount(fixture,
+      parse.parseStatx(fixture.legacyBytes, false, fixture.metadata), parse.parseStatx(fixture.uniqueBytes, true, fixture.metadata));
+    assert.doesNotThrow(() => parse.boundHealth(fixture.environment, mount));
+    for (let index = 0; index < 13; index++) {
+      const environment = profileParserFixture().environment;
+      environment.health.fields[index].fact.value.bytes = Buffer.from(index >= 11 ? "known_error\n" : "1\n");
+      assert.throws(() => parse.boundHealth(environment, mount), { code: "backup_capability_unavailable" }, `health field ${index}`);
+    }
+    const missing = profileParserFixture().environment;
+    missing.health.fields[0].fact = { status: "unavailable", reason: "syscall", value: null, calls: [] };
+    assert.throws(() => parse.boundHealth(missing, mount), { code: "backup_capability_unavailable" });
+    const wrongDevice = profileParserFixture().environment;
+    wrongDevice.device.topology.value.nodes[0].dev = kernelReadFixture(2);
+    assert.throws(() => parse.boundHealth(wrongDevice, mount), { code: "source_changed" });
+    const wrongBinding = profileParserFixture().environment;
+    wrongBinding.health.binding.value.sourceDevMinor = 2n;
+    assert.throws(() => parse.boundHealth(wrongBinding, mount), { code: "source_changed" });
+  });
+});
+
+test("#152 P3 typed runtime material keeps bytes and integers distinct without executing accessors", async () => {
+  await withProfileParsers(({ typed }) => {
+    const values = ["9007199254740993", 9007199254740993n, Buffer.from("9007199254740993"), 1, true, null];
+    assert.equal(new Set(values.map(value => JSON.stringify(typed(value)))).size, values.length);
+    assert.deepEqual(typed({ b: 2n, a: Buffer.from([0, 255]) }), typed({ a: Buffer.from([0, 255]), b: 2n }));
+    for (const value of [undefined, Number.NaN, Number.POSITIVE_INFINITY, -0, 9007199254740992])
+      assert.throws(() => typed(value), { code: "backup_capability_unavailable" });
+    let invoked = false;
+    const accessor = Object.defineProperty({}, "proof", { enumerable: true, get() { invoked = true; return 1n; } });
+    assert.throws(() => typed(accessor), { code: "backup_capability_unavailable" });
+    assert.equal(invoked, false);
+    const sparse: unknown[] = []; sparse.length = 1;
+    assert.throws(() => typed(sparse), { code: "backup_capability_unavailable" });
+  });
+});
+function kernelReadFixture(samples: 1 | 2 = 1): SourceFileContextFact<SourceFileKernelReadValue> {
+  const call = (operation: string, rc: bigint | null): SourceFileNativeCall => ({ operation, rc, errno: rc === null ? null : 0n });
+  const before = [
+    call("open-kernel-read", 7n), call("fstat-kernel-before", 0n), call("fstatfs-kernel-before", 0n),
+    call("read-kernel", 2n), call("read-kernel", 0n), call("fstatfs-kernel-after", 0n),
+    call("fstat-kernel-after", 0n), call("close-kernel-read", 0n),
+  ];
+  return { status: "observed", reason: null, value: { bytes: Buffer.from("0\n"), device: 17n,
+    inode: 29n, mode: 0o100444n, filesystemType: 0x62656572n }, calls: samples === 1 ? before :
+      [...before, ...before.map(entry => ({ ...entry, operation: `${entry.operation}-after` }))] };
+}
+test("#152 P3 pure pseudo-read ABI requires exact actual bytes, EOF and close without qualification", async () => {
+  await withNativeDecoders(({ checkedKernelReadFact: decode }) => {
+    const original = kernelReadFixture(), result = decode(original, 4096);
+    assert.equal(result.status, "observed");
+    if (result.status !== "observed" || original.status !== "observed") assert.fail();
+    assert.deepEqual(result.value.bytes, Buffer.from("0\n"));
+    original.value.bytes.fill(255);
+    assert.deepEqual(result.value.bytes, Buffer.from("0\n"), "private matching bytes are detached from returned native objects");
+    for (const change of ["length", "no-eof", "early-eof", "close-error", "extra-field", "unknown-call", "non-bigint", "budget"]) {
+      const value = kernelReadFixture() as any;
+      if (change === "length") value.calls[3].rc = 1n;
+      if (change === "no-eof") value.calls[4].rc = 1n;
+      if (change === "early-eof") value.calls[3].rc = 0n;
+      if (change === "close-error") Object.assign(value.calls.at(-1), { rc: -1n, errno: 5n });
+      if (change === "extra-field") value.value.verified = true;
+      if (change === "unknown-call") value.calls[0].operation = "caller-open";
+      if (change === "non-bigint") value.calls[3].rc = 2;
+      if (change === "budget") value.value.bytes = Buffer.alloc(4097);
+      assert.throws(() => decode(value, 4096), { code: "backup_capability_unavailable" }, change);
+    }
+    const failed = kernelReadFixture() as any;
+    failed.status = "unavailable"; failed.reason = "syscall"; failed.value = null;
+    failed.calls[3] = { operation: "read-kernel", rc: -1n, errno: 5n };
+    failed.calls.splice(4, 1);
+    const failure = decode(failed, 4096);
+    assert.equal(failure.status, "unavailable"); assert.equal(failure.value, null);
+    assert.deepEqual(failure.calls[3], { operation: "read-kernel", rc: -1n, errno: 5n });
+  });
+});
+test("#152 P3 double samples independently require EOF, close and full bytes within one read budget", async () => {
+  await withNativeDecoders(({ checkedKernelReadFact: decode }) => {
+    const positive = decode(kernelReadFixture(2), 4096, 2);
+    assert.equal(positive.status, "observed"); assert.equal(positive.calls.length, 16);
+    assert.equal(positive.calls.at(-2)!.operation, "fstat-kernel-after-after");
+    for (const change of ["after-length", "after-no-eof", "after-close", "before-length", "missing-after", "unexecuted-after", "shared-read-budget"]) {
+      const value = kernelReadFixture(2) as any;
+      if (change === "after-length") value.calls[11].rc = 1n;
+      if (change === "after-no-eof") value.calls[12].rc = 1n;
+      if (change === "after-close") Object.assign(value.calls[15], { rc: -1n, errno: 5n });
+      if (change === "before-length") value.calls[3].rc = 1n;
+      if (change === "missing-after") value.calls.splice(8);
+      if (change === "unexecuted-after") value.calls.slice(8).forEach((call: any) => Object.assign(call, { rc: null, errno: null }));
+      if (change === "shared-read-budget") {
+        value.value.bytes = Buffer.alloc(128);
+        const stage = (suffix: string) => [
+          { operation: `open-kernel-read${suffix}`, rc: 7n, errno: 0n },
+          { operation: `fstat-kernel-before${suffix}`, rc: 0n, errno: 0n },
+          { operation: `fstatfs-kernel-before${suffix}`, rc: 0n, errno: 0n },
+          ...Array.from({ length: 128 }, () => ({ operation: `read-kernel${suffix}`, rc: 1n, errno: 0n })),
+          { operation: `read-kernel${suffix}`, rc: 0n, errno: 0n },
+          { operation: `fstatfs-kernel-after${suffix}`, rc: 0n, errno: 0n },
+          { operation: `fstat-kernel-after${suffix}`, rc: 0n, errno: 0n },
+          { operation: `close-kernel-read${suffix}`, rc: 0n, errno: 0n },
+        ];
+        value.calls = [...stage(""), ...stage("-after")];
+      }
+      assert.throws(() => decode(value, 4096, 2), { code: "backup_capability_unavailable" }, change);
+    }
+    const absent = kernelReadFixture(2) as any;
+    absent.status = "unavailable"; absent.reason = "syscall"; absent.value = null;
+    absent.calls = ["", "-after"].flatMap(suffix => ["open-kernel-read", "fstat-kernel-before", "fstatfs-kernel-before", "read-kernel",
+      "fstatfs-kernel-after", "fstat-kernel-after", "close-kernel-read"].map((operation, index) => ({
+      operation: operation + suffix, rc: index === 0 ? -1n : null, errno: index === 0 ? 2n : null,
+    })));
+    const unavailable = decode(absent, 4096, 2);
+    assert.equal(unavailable.status, "unavailable"); assert.equal(unavailable.value, null);
+    assert.equal(unavailable.calls[7]!.errno, 2n, "both real absence observations remain explicit, never a success value");
+  });
+});
+function enumerationFixture(): SourceFileNativeCall[] {
+  const stage = (suffix: string) => ["holders", "slaves", "partitions"].flatMap(kind => [
+    { operation: `open-${kind}-0${suffix}`, rc: 7n, errno: 0n },
+    { operation: `fstat-${kind}-0-before${suffix}`, rc: 0n, errno: 0n },
+    { operation: `fstatfs-${kind}-0-before${suffix}`, rc: 0n, errno: 0n },
+    { operation: `getdents-${kind}-0${suffix}`, rc: 24n, errno: 0n },
+    { operation: `getdents-${kind}-0${suffix}`, rc: 0n, errno: 0n },
+    { operation: `fstat-${kind}-0-after${suffix}`, rc: 0n, errno: 0n },
+    { operation: `fstatfs-${kind}-0-after${suffix}`, rc: 0n, errno: 0n },
+    { operation: `close-${kind}-0${suffix}`, rc: 0n, errno: 0n },
+  ]);
+  return [...stage(""), { operation: "stat-partition-entry-0", rc: -1n, errno: 2n },
+    { operation: "stat-device-link-0", rc: 0n, errno: 0n }, ...stage("-after"),
+    { operation: "stat-partition-entry-0-after", rc: -1n, errno: 2n },
+    { operation: "stat-device-link-0-after", rc: 0n, errno: 0n }];
+}
+test("#152 P3 device enumeration requires two complete bounded scopes and held auxiliary owners", async () => {
+  await withNativeDecoders(({ checkedAuxiliaryCalls: auxiliary, checkedEnumeration: enumeration }) => {
+    assert.equal(enumeration(enumerationFixture(), 0).length, 52);
+    for (const change of ["after-eof", "missing-after", "wrong-owner", "partition-error", "link-error", "per-scope-budget",
+      "missing-partition-after", "partition-after-different", "link-after-error"]) {
+      const rows = enumerationFixture();
+      if (change === "after-eof") (rows.find(call => call.operation === "getdents-holders-0-after" && call.rc === 0n)! as any).rc = 24n;
+      if (change === "missing-after") rows.splice(26);
+      if (change === "wrong-owner") (rows[25] as any).operation = "stat-device-link-1";
+      if (change === "partition-error") (rows[24] as any).errno = 13n;
+      if (change === "link-error") Object.assign(rows[25]!, { rc: -1n, errno: 2n });
+      if (change === "missing-partition-after") rows.splice(50, 1);
+      if (change === "partition-after-different") Object.assign(rows[50]!, { rc: 0n, errno: 0n });
+      if (change === "link-after-error") Object.assign(rows[51]!, { rc: -1n, errno: 2n });
+      if (change === "per-scope-budget") {
+        for (const suffix of ["-after", ""]) {
+          const index = rows.findIndex(call => call.operation === `getdents-holders-0${suffix}`);
+          rows.splice(index, 1, ...Array.from({ length: 128 }, () => ({ operation: `getdents-holders-0${suffix}`, rc: 24n, errno: 0n })));
+        }
+      }
+      assert.throws(() => enumeration(rows, 0), { code: "backup_capability_unavailable" }, change);
+    }
+    const call = (operation: string, rc: bigint): SourceFileNativeCall => ({ operation, rc, errno: 0n });
+    const scope = [call("open-sysfs-root", 3n), call("fstat-sysfs-root", 0n), call("fstatfs-sysfs-root", 0n),
+      call("open-device-node-0", 4n), call("fstat-device-node-0-before", 0n), call("fstatfs-device-node-0-before", 0n),
+      call("readlink-device-node-0", 12n), ...enumerationFixture(), call("fstat-device-node-0-after", 0n),
+      call("fstatfs-device-node-0-after", 0n), call("readlink-device-node-0-after", 12n),
+      call("close-device-node-0", 0n), call("close-sysfs-root", 0n)];
+    assert.equal(auxiliary(scope, true).length, scope.length);
+    assert.throws(() => auxiliary(scope.slice(3), true), { code: "backup_capability_unavailable" }, "a relation needs the actual sysfs anchor");
+    const repeatedClose = [...scope, call("close-device-node-0", 0n)];
+    assert.throws(() => auxiliary(repeatedClose, true), { code: "backup_capability_unavailable" });
+    const unavailable = { operation: "enumerate-device-graph", rc: null, errno: null };
+    assert.equal(auxiliary([unavailable], true, true).length, 1);
+    assert.throws(() => auxiliary([unavailable], true), { code: "backup_capability_unavailable" }, "observed graphs cannot carry an unexecuted diagnostic");
+    assert.throws(() => auxiliary([{ ...unavailable, rc: 0n, errno: 0n }], true, true), { code: "backup_capability_unavailable" });
+    assert.throws(() => auxiliary([unavailable, unavailable], true, true), { code: "backup_capability_unavailable" });
+    const reads = kernelReadFixture(2).calls.map(call => ({ ...call }));
+    reads[3]!.rc = 1048576n; reads[11]!.rc = 1048576n;
+    assert.equal(auxiliary(reads, true).length, 16, "both observations consume the same global byte budget");
+    reads[11]!.rc++;
+    assert.throws(() => auxiliary(reads, true), { code: "backup_capability_unavailable" }, "after sampling cannot reset the global budget");
+  });
+});
 type NativeBinding = {
   openRoot(path: string): object;
+  rootInfo(owner: object): { abiVersion: 1; kind: "file" | "directory"; stage: "metadata-only" | "readable"; metadata: { dev: bigint; ino: bigint } };
+  openRootContent(bootstrap: object): object;
+  observeEnvironment(owner: object): unknown;
   openChild(parent: object, leaf: string, kind: "file" | "directory"): object;
   observe(owner: object): { kind: string; dev: bigint; ino: bigint; size: bigint };
   observeStatx(owner: object): unknown;
+  observeStatxUnique(owner: object): unknown;
   observeExtended(owner: object): unknown;
   readAt(owner: object, offset: bigint, length: number): Buffer;
   readDirectory(owner: object): string[];
   close(owner: object): void;
 };
+
+/** Test-only linkage uses an isolated package with byte-identical TS modules
+ * and the normal fixed addon pathname. There is no production loader override,
+ * registry replacement, caller proof or synthetic native owner. */
+const fixedP3Variants = {
+  P3_TEST_CONTENT_OPEN_FAILURE: { extra: [], wrappers: [] },
+  P3_TEST_CONTENT_CLOSE_FAILURE: { extra: [], wrappers: ["close"] },
+  P3_TEST_SHORT_READS: { extra: [], wrappers: ["read", "__read_chk"] },
+  P3_TEST_NO_EOF: { extra: [], wrappers: ["read", "__read_chk"] },
+  P3_TEST_BYTE_BUDGET: { extra: [], wrappers: ["read", "__read_chk", "fstatfs", "close"] },
+  P3_TEST_PSEUDO_CLOSE_FAILURE: { extra: [], wrappers: ["close"] },
+  P3_TEST_SOURCE_CHANGE: { extra: [], wrappers: ["read", "__read_chk", "fstat"] },
+  P3_TEST_DIRECTORY_CLOSE_FAILURE: { extra: [], wrappers: ["closedir"] },
+  P3_TEST_CHILD_IDENTITY_FAILURE: { extra: ["P3_TEST_CONTENT_CLOSE_FAILURE"], wrappers: ["fstat", "close"] },
+} as const;
+async function withFixedP3Package(
+  macro: keyof typeof fixedP3Variants,
+  consume: (value: { directory: string; api: typeof import("../src/server/storage/maintenance/source-file-native.ts");
+    native: NativeBinding }) => Promise<void>,
+  compiler: "default" | "fortified" = "default",
+) {
+  const directory = await mkdtemp(path.join(tmpdir(), "br-p3-fixed-link-"));
+  try {
+    const source = path.join(directory, "src/server/storage/maintenance"), output = path.join(directory, "build/maintenance-platform");
+    await mkdir(source, { recursive: true }); await mkdir(output, { recursive: true });
+    await writeFile(path.join(directory, "package.json"), '{"type":"module"}\n');
+    for (const name of ["source-file-native.ts", "source-file-profile.ts", "canonical.ts", "error.ts"])
+      await copyFile(path.join(root, "src/server/storage/maintenance", name), path.join(source, name));
+    const addon = path.join(output, `maintenance-source-files-linux-${process.arch}.node`);
+    const variant = fixedP3Variants[macro];
+    const build = spawnSync("/usr/bin/cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-DNAPI_VERSION=8",
+      ...(compiler === "fortified" ? ["-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=3"] : []),
+      "-DNODE_GYP_MODULE_NAME=boardroom_source_file_fixed_p3", `-D${macro}`, ...variant.extra.map(name => `-D${name}`), "-shared", "-fPIC",
+      "-I", path.join(root, "native/node-api/v24.22.1"), path.join(root, "native/maintenance-source-files.c"),
+      path.join(root, "tests/fixtures/maintenance-source-file-getter-errors.c"), "-Wl,--wrap=ioctl", "-Wl,--wrap=syscall",
+      ...variant.wrappers.map(name => `-Wl,--wrap=${name}`), "-o", addon], { encoding: "utf8", timeout: 30_000 });
+    assert.equal(build.error, undefined); assert.equal(build.status, 0, build.stderr);
+    await chmod(addon, 0o700);
+    const api = await import(pathToFileURL(path.join(source, "source-file-native.ts")).href) as typeof import("../src/server/storage/maintenance/source-file-native.ts");
+    const native = createRequire(import.meta.url)(addon) as NativeBinding;
+    await consume({ directory, api, native });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+}
+function rawContextFacts(raw: SourceFileRootEnvironment): SourceFileContextFact<unknown>[] {
+  return [...Object.values(raw.process), ...Object.values(raw.kernel), ...Object.values(raw.mount), ...Object.values(raw.configuration),
+    ...Object.values(raw.device), raw.health.binding, ...raw.health.fields.map(field => field.fact)];
+}
+function rawKernelFacts(raw: SourceFileRootEnvironment): SourceFileContextFact<unknown>[] {
+  const values = rawContextFacts(raw);
+  if (raw.device.topology.status === "observed") for (const node of raw.device.topology.value.nodes)
+    values.push(node.dev, node.uevent, node.partition, ...Object.values(node.backing));
+  // topology.calls aggregates many distinct facts; it is not one 256-read item.
+  return values.filter(fact => fact.calls[0]?.operation === "open-kernel-read");
+}
+
+// Hardened compilers may emit __read_chk instead of read. Both builds must
+// exercise the same fixed failure and retain all production bounds.
+for (const compiler of ["default", "fortified"] as const)
+for (const variant of ["P3_TEST_SHORT_READS", "P3_TEST_NO_EOF", "P3_TEST_BYTE_BUDGET"] as const) {
+  linuxTest(`#152 P3 fixed ${variant} retains bounded unavailable facts through the strict TS decoder (${compiler})`, async () => {
+    await withFixedP3Package(variant, async ({ directory, api }) => {
+      const source = path.join(directory, "source"); await mkdir(source, { mode: 0o700 });
+      await api.withNativeSourceRoot(source, handle => {
+        const raw = api.observeSourceFileRootContext(handle).environment;
+        for (const fact of rawKernelFacts(raw))
+          assert.ok(fact.calls.filter(call => /^read-kernel(?:-after)?$/.test(call.operation) && call.rc !== null).length <= 256);
+        for (const fact of rawContextFacts(raw)) if (fact.status === "unavailable") assert.equal(fact.value, null);
+        assert.equal(raw.health.fields.length, 13);
+        const bytes = raw.auxiliaryCalls.filter(call => /^(?:read-kernel|readlink-|getdents-)/.test(call.operation)
+          && call.rc !== null && call.rc > 0n).reduce((sum, call) => sum + call.rc!, 0n);
+        assert.ok(bytes <= 2097152n);
+        if (variant === "P3_TEST_SHORT_READS") {
+          const status = raw.process.threadStatus, reads = status.calls.filter(call => call.operation === "read-kernel" && call.rc !== null);
+          assert.equal(status.status, "unavailable"); assert.equal(status.reason, "budget");
+          assert.equal(reads.length, 256); assert.ok(reads.every(call => call.rc === 1n));
+          assert.equal(status.calls.at(-1)!.rc, 0n);
+        } else {
+          assert.ok(bytes > 1000000n); assert.equal(raw.configuration.options.status, "unavailable");
+          assert.equal(raw.device.binding.status, "unavailable");
+          if (variant === "P3_TEST_BYTE_BUDGET") {
+            assert.ok(bytes > 2090000n);
+            assert.equal(raw.mount.mountinfo.status, "unavailable"); assert.equal(raw.mount.mountinfo.reason, "budget");
+            assert.equal(raw.kernel.uname.status, "observed");
+            if (raw.kernel.uname.status !== "observed") assert.fail();
+            const fixed = BigInt(raw.kernel.uname.value.length) + 256n * BigInt(
+              [...raw.mount.legacyStatx.calls, ...raw.mount.uniqueStatx.calls].filter(call => call.rc === 0n).length);
+            assert.ok(bytes + fixed <= 2097152n, "raw UAPI bytes share the same global cap");
+          }
+        }
+      });
+    }, compiler);
+  });
+}
+
+linuxTest("#152 P3 fixed pseudo close preserves the first failure and real reused auxiliary FD", async () => {
+  await withFixedP3Package("P3_TEST_PSEUDO_CLOSE_FAILURE", async ({ directory, api, native }) => {
+    const source = path.join(directory, "source"), sentinel = path.join(source, "sentinel");
+    await mkdir(source, { mode: 0o700 }); await writeFile(sentinel, "still owned", { mode: 0o600 });
+    const descriptors: number[] = []; let first: any;
+    try {
+      await assert.rejects(api.withNativeSourceRoot(source, handle => {
+        try { api.observeSourceFileRootContext(handle); assert.fail("fixed pseudo close must fail"); }
+        catch (error) {
+          first = error; assert.equal(first.code, "ERR_SOURCE_NATIVE_IO"); assert.equal(first.errno, osConstants.errno.EIO);
+          assert.equal(first.syscall, "environment-close");
+        }
+        const calls = first.cleanupCalls as SourceFileNativeCall[];
+        const unknown = calls.find(call => call.operation === "open-kernel-read" && call.rc !== null && call.rc >= 0n)!.rc;
+        assert.ok(calls.some(call => call.operation === "close-kernel-read" && call.rc === -1n && call.errno === BigInt(osConstants.errno.EIO)));
+        assert.ok(calls.some(call => call.operation === "close-proc-root" && call.rc === 0n));
+        const sysfs = calls.find(call => call.operation === "open-sysfs-root")!.rc;
+        assert.ok(calls.some(call => call.operation === "close-sysfs-root" && call.rc === (sysfs !== null && sysfs >= 0n ? 0n : null)));
+        assert.throws(() => native.rootInfo(first.nativeCleanupOwner));
+        for (let index = 0; index < 16; index++) {
+          const fd = openSync(sentinel, constants.O_RDONLY); descriptors.push(fd);
+          if (BigInt(fd) === unknown) break;
+        }
+        assert.ok(descriptors.some(fd => BigInt(fd) === unknown), "the unknown auxiliary descriptor was actually reused");
+        assert.throws(() => handle.observe(), { code: "maintenance_lost" });
+      }), (error: unknown) => error instanceof AggregateError && error.errors[0] === first && error.cause === first);
+      for (const fd of descriptors) assert.equal(fstatSync(fd).size, 11);
+    } finally { for (const fd of descriptors) closeSync(fd); }
+  });
+});
+
+for (const compiler of ["default", "fortified"] as const)
+linuxTest(`#152 P3 fixed source change remains sticky even when the caller catches it and close succeeds (${compiler})`, async () => {
+  await withFixedP3Package("P3_TEST_SOURCE_CHANGE", async ({ directory, api, native }) => {
+    const source = path.join(directory, "source"); await mkdir(source, { mode: 0o700 }); let first: any;
+    await assert.rejects(api.withNativeSourceRoot(source, handle => {
+      const initial = readdirSync("/proc/self/fd").length;
+      try { api.observeSourceFileRootContext(handle); assert.fail("fixed source observation must change"); }
+      catch (error) { first = error; assert.equal(first.code, "ERR_SOURCE_IDENTITY"); assert.equal(first.syscall, "environment-changed"); }
+      assert.equal(readdirSync("/proc/self/fd").length, initial, "every new known auxiliary owner is closed before failure escapes");
+      assert.throws(() => native.rootInfo(first.nativeCleanupOwner));
+      assert.throws(() => handle.observe(), { code: "maintenance_lost" });
+      return "the caught source failure must not become a successful scope";
+    }), (error: unknown) => error instanceof AggregateError && error.errors.length === 1 && error.errors[0] === first && error.cause === first);
+  }, compiler);
+});
+
+linuxTest("#152 P3 fixed directory close keeps its original error and cannot close a reused duplicate", async () => {
+  await withFixedP3Package("P3_TEST_DIRECTORY_CLOSE_FAILURE", async ({ directory, api }) => {
+    const source = path.join(directory, "source"), sentinel = path.join(source, "sentinel");
+    await mkdir(source, { mode: 0o700 }); await writeFile(sentinel, "still owned", { mode: 0o600 });
+    let first: any, current: number | undefined;
+    try {
+      await assert.rejects(api.withNativeSourceRoot(source, handle => {
+        try { handle.readDirectory(); assert.fail("fixed directory close must fail"); }
+        catch (error) { first = error; assert.equal(first.code, "ERR_SOURCE_DIRECTORY"); assert.equal(first.errno, osConstants.errno.EIO); }
+        const calls = first.cleanupCalls as SourceFileNativeCall[];
+        assert.ok(calls.some(call => call.operation === "closedir-source" && call.rc === -1n));
+        const unknown = calls.find(call => call.operation === "duplicate-source-dir")!.rc;
+        current = openSync(sentinel, constants.O_RDONLY); assert.equal(BigInt(current), unknown);
+      }), (error: unknown) => error instanceof AggregateError && error.errors[0] === first && error.cause === first);
+      assert.equal(fstatSync(current!).size, 11);
+    } finally { if (current !== undefined) closeSync(current); }
+  });
+});
+
+linuxTest("#152 P3 fixed failed child acquisition retains identity error and unknown cleanup owner", async () => {
+  await withFixedP3Package("P3_TEST_CHILD_IDENTITY_FAILURE", async ({ directory, api, native }) => {
+    const source = path.join(directory, "source"), sentinel = path.join(source, "sentinel");
+    await mkdir(source, { mode: 0o700 }); await writeFile(sentinel, "still owned", { mode: 0o600 });
+    let first: any, current: number | undefined;
+    try {
+      await assert.rejects(api.withNativeSourceRoot(source, handle => {
+        try { handle.openChild("sentinel", "file"); assert.fail("fixed child validation must fail"); }
+        catch (error) {
+          first = error; assert.equal(first.code, "ERR_SOURCE_IDENTITY"); assert.equal(first.errno, osConstants.errno.ESTALE);
+          assert.ok(first.cleanupCalls.some((call: SourceFileNativeCall) => call.operation === "close-source" && call.rc === -1n && call.errno === BigInt(osConstants.errno.EIO)));
+        }
+        assert.ok(first.nativeCleanupOwner); assert.throws(() => native.observe(first.nativeCleanupOwner));
+        current = openSync(sentinel, constants.O_RDONLY);
+        assert.throws(() => native.close(first.nativeCleanupOwner), { errno: osConstants.errno.EIO });
+      }), (error: unknown) => error instanceof AggregateError && error.errors[0] === first && error.cause === first);
+      assert.equal(fstatSync(current!).size, 11);
+    } finally { if (current !== undefined) closeSync(current); }
+  });
+});
 
 linuxTest("#152 P0 Linux source FD builds against fixed checked Node-API 8 headers", { timeout: 90_000 }, () => {
   const build = spawnSync(process.execPath, ["scripts/build-maintenance-platform.mjs", "--source-files"],
@@ -31,8 +561,230 @@ linuxTest("#152 P0 Linux source FD builds against fixed checked Node-API 8 heade
   assert.equal(build.error, undefined, "native bridge compilation must actually run");
   assert.equal(build.status, 0, build.stderr.slice(0, 1000));
   const native = createRequire(import.meta.url)(sourceFileNativePath) as NativeBinding;
-  for (const name of ["openRoot", "openChild", "observe", "observeStatx", "observeExtended", "readAt", "readDirectory", "close"] as const)
+  for (const name of ["openRoot", "rootInfo", "openRootContent", "observeEnvironment", "openChild", "observe", "observeStatx", "observeStatxUnique", "observeExtended", "readAt", "readDirectory", "close"] as const)
     assert.equal(typeof native[name], "function");
+});
+
+linuxTest("#152 P3 strict context consumes the real collector with complete typed unavailable facts", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "br-p3-real-context-"));
+  try {
+    await withNativeSourceRoot(tmp, handle => {
+      const current = handle.observe(), context = observeSourceFileRootContext(handle), environment = context.environment;
+      assert.equal(context.info.abiVersion, 1); assert.equal(environment.abiVersion, 1);
+      assert.equal(context.info.metadata.ino, current.ino); assert.equal(context.info.metadata.dev, current.dev);
+      assert.deepEqual(environment.source.before, context.info.metadata);
+      assert.deepEqual(environment.source.after, environment.source.before);
+      assert.equal(environment.health.fields.length, 13);
+      assert.equal(environment.configuration.options.calls[0]!.operation, "open-kernel-read");
+      assert.ok(environment.configuration.options.calls.some(call => call.operation === "open-kernel-read-after"));
+      assert.equal(environment.mount.uniqueStatx.calls[1]!.operation, "statx-unique-after");
+      assert.equal(environment.kernel.config.status, "unavailable");
+      assert.equal(environment.kernel.config.reason, "unsupported");
+      assert.equal(environment.kernel.config.value, null);
+      assert.equal(Object.hasOwn(context, "qualified"), false);
+      for (const { fact } of environment.health.fields) {
+        if (fact.status === "observed") assert.equal(Buffer.isBuffer(fact.value.bytes), true);
+        else assert.equal(fact.value, null);
+      }
+    });
+  } finally { await rm(tmp, { recursive: true, force: true }); }
+});
+
+linuxTest("#152 P3 complete real root and file preflight reach the fixed empty registry", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "br-p3-empty-registry-")), file = path.join(tmp, "file");
+  try {
+    await writeFile(file, "unqualified", { mode: 0o600 });
+    const registryFailure = (error: unknown) => error instanceof MaintenanceFailure
+      && error.code === "backup_capability_unavailable" && error.message.includes("source-file-profile-unqualified");
+    await withNativeSourceRoot(tmp, handle => assert.throws(() => matchSourceFileProfile(handle), registryFailure));
+    let called = false;
+    await assert.rejects(withNativeSourceRoot(file, () => { called = true; }), registryFailure);
+    assert.equal(called, false, "a complete native preflight reaches registry rejection before content admission");
+  } finally { await rm(tmp, { recursive: true, force: true }); }
+});
+
+linuxTest("#152 P3 fixed content-open failure proves real file preflight rejects before ordinary open", async () => {
+  await withFixedP3Package("P3_TEST_CONTENT_OPEN_FAILURE", async ({ directory, api, native }) => {
+    const source = path.join(directory, "source"), file = path.join(source, "file");
+    await mkdir(source, { mode: 0o700 }); await writeFile(file, "never-admitted", { mode: 0o600 });
+    const bootstrap = native.openRoot(file);
+    try {
+      assert.equal(native.rootInfo(bootstrap).stage, "metadata-only");
+      assert.equal((native.observeEnvironment(bootstrap) as { abiVersion: number }).abiVersion, 1,
+        "fixed content fault does not intercept actual pseudo-file collection");
+      assert.throws(() => native.openRootContent(bootstrap), (error: unknown) => {
+        const failure = error as { code?: unknown; errno?: unknown; syscall?: unknown };
+        return failure.code === "ERR_SOURCE_NATIVE_IO" && failure.errno === 130 && failure.syscall === "openat2-root-content";
+      }, "the actual content-open branch must demonstrably fail when reached");
+    } finally { native.close(bootstrap); }
+    let called = false;
+    await assert.rejects(api.withNativeSourceRoot(file, () => { called = true; }), (error: unknown) => {
+      const failure = error as { code?: unknown; message?: unknown; cause?: unknown };
+      return failure.code === "backup_capability_unavailable" && typeof failure.message === "string"
+        && failure.message.includes("source-file-profile-unqualified") && failure.cause === undefined;
+    });
+    assert.equal(called, false);
+  });
+});
+
+linuxTest("#152 P3 fixed close failure invalidates the scope, preserves first error and never recloses a reused FD", async () => {
+  await withFixedP3Package("P3_TEST_CONTENT_CLOSE_FAILURE", async ({ directory, api }) => {
+    const source = path.join(directory, "source"), spare = path.join(source, "spare");
+    await mkdir(source, { mode: 0o700 });
+    await writeFile(path.join(source, "one"), "one", { mode: 0o600 });
+    await writeFile(path.join(source, "two"), "two", { mode: 0o600 });
+    await writeFile(spare, "retained", { mode: 0o600 });
+    let first: unknown, unrelated: number | undefined;
+    try {
+      await assert.rejects(api.withNativeSourceRoot(source, rootHandle => {
+        const one = rootHandle.openChild("one", "file"), two = rootHandle.openChild("two", "file");
+        try { one.close(); assert.fail("fixed close fault must occur"); }
+        catch (error) {
+          assert.equal((error as { code: string }).code, "ERR_SOURCE_NATIVE_IO");
+          assert.equal((error as { errno: number }).errno, osConstants.errno.EIO); first = error;
+        }
+        // The fixture really closed the regular file but returned EIO. The next
+        // ordinary Node open can reuse that slot; it is not owned by this scope.
+        unrelated = openSync(spare, constants.O_RDONLY);
+        assert.throws(() => one.close(), { code: "maintenance_lost" });
+        assert.throws(() => two.observe(), { code: "maintenance_lost" });
+        // 'two' and root remain known owners for deterministic cleanup.
+      }), (error: unknown) => error instanceof AggregateError && error.errors.length === 1 && error.errors[0] === first && error.cause === first);
+      const bytes = Buffer.alloc(8);
+      assert.equal(readSync(unrelated!, bytes, 0, bytes.length, 0), 8);
+      assert.equal(bytes.toString(), "retained");
+    } finally { if (unrelated !== undefined) closeSync(unrelated); }
+  });
+});
+
+linuxTest("#152 P3 a caught fatal native context error cannot become a successful scope result", async () => {
+  await withFixedP3Package("P3_TEST_CONTENT_CLOSE_FAILURE", async ({ directory, api }) => {
+    const source = path.join(directory, "source"); await mkdir(source, { mode: 0o700 });
+    let first: unknown;
+    await assert.rejects(api.withNativeSourceRoot(source, handle => {
+      try { api.observeSourceFileRootContext(handle); assert.fail("fixed pseudo close must fail during actual collection"); }
+      catch (error) {
+        assert.equal((error as { code: string }).code, "ERR_SOURCE_NATIVE_IO");
+        assert.equal((error as { syscall: string }).syscall, "environment-close"); first = error;
+      }
+      return "caught failures cannot become source success";
+    }), (error: unknown) => error instanceof AggregateError && error.errors[0] === first && error.cause === first);
+  });
+});
+
+linuxTest("#152 P3 profile matching rejects fake, child, copied and expired owners and retains failure", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "br-p3-root-profile-"));
+  try {
+    await writeFile(path.join(tmp, "file"), "ordinary", { mode: 0o600 });
+    let escaped: Parameters<typeof matchSourceFileProfile>[0] | undefined;
+    await withNativeSourceRoot(tmp, handle => {
+      escaped = handle;
+      let invoked = false;
+      const fake = { kind: "directory", observe() { invoked = true; return handle.observe(); } };
+      assert.throws(() => matchSourceFileProfile(fake as Parameters<typeof matchSourceFileProfile>[0]), { code: "maintenance_lost" });
+      assert.equal(invoked, false);
+      const copy = Object.assign(Object.create(Object.getPrototypeOf(handle)), handle);
+      assert.throws(() => matchSourceFileProfile(copy), { code: "maintenance_lost" });
+      const child = handle.openChild("file", "file");
+      try { assert.throws(() => matchSourceFileProfile(child), { code: "backup_capability_unavailable" }); }
+      finally { child.close(); }
+      let first: unknown;
+      try { matchSourceFileProfile(handle); assert.fail("an empty fixed registry cannot qualify a real root"); }
+      catch (error) { assert.equal((error as MaintenanceFailure).code, "backup_capability_unavailable"); first = error; }
+      assert.throws(() => matchSourceFileProfile(handle), error => error === first,
+        "a failed context is sticky; later calls cannot replace its failure with a new baseline");
+    });
+    assert.throws(() => matchSourceFileProfile(escaped!), { code: "maintenance_lost" });
+  } finally { await rm(tmp, { recursive: true, force: true }); }
+});
+
+linuxTest("#152 P3 file bootstrap has no readable FD and content promotion creates an independent owner", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "br-p3-file-bootstrap-")), file = path.join(tmp, "file");
+  try {
+    await writeFile(file, "content", { mode: 0o600 });
+    const native = createRequire(import.meta.url)(sourceFileNativePath) as NativeBinding;
+    const before = await stat(file, { bigint: true }), bootstrap = native.openRoot(file);
+    let bootstrapClosed = false, content: object | undefined;
+    try {
+      const info = native.rootInfo(bootstrap);
+      assert.equal(info.abiVersion, 1); assert.equal(info.kind, "file"); assert.equal(info.stage, "metadata-only");
+      assert.equal(info.metadata.dev, before.dev); assert.equal(info.metadata.ino, before.ino);
+      assert.throws(() => native.observe(bootstrap), { code: "ERR_SOURCE_HANDLE" });
+      assert.throws(() => native.observeExtended(bootstrap), { code: "ERR_SOURCE_HANDLE" });
+      assert.throws(() => native.readAt(bootstrap, 0n, 1));
+      assert.throws(() => native.rootInfo({ ...bootstrap }), { code: "ERR_SOURCE_HANDLE" });
+      content = native.openRootContent(bootstrap);
+      assert.notEqual(content, bootstrap); assert.equal(native.rootInfo(content).stage, "readable");
+      assert.deepEqual(native.rootInfo(content).metadata, info.metadata);
+      assert.equal(native.rootInfo(bootstrap).stage, "metadata-only");
+      assert.throws(() => native.openRootContent(bootstrap), { code: "ERR_SOURCE_HANDLE" });
+      native.close(bootstrap); bootstrapClosed = true;
+      assert.equal(native.readAt(content, 0n, 7).toString(), "content");
+    } finally {
+      if (content) native.close(content);
+      if (!bootstrapClosed) native.close(bootstrap);
+    }
+    assert.equal((await stat(file, { bigint: true })).atimeNs, before.atimeNs, "the ordinary content owner really uses NOATIME");
+    let consumed = false;
+    await assert.rejects(withNativeSourceRoot(file, () => { consumed = true; }), { code: "backup_capability_unavailable" });
+    assert.equal(consumed, false, "the fixed file factory does not expose a content owner before profile admission");
+  } finally { await rm(tmp, { recursive: true, force: true }); }
+});
+
+linuxTest("#152 P3 native directory enumeration rejects invalid UTF-8 instead of replacing bytes", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "br-p3-native-utf8-"));
+  try {
+    await writeFile(path.join(tmp, "中文"), "ok", { mode: 0o600 });
+    await withNativeSourceRoot(tmp, handle => assert.deepEqual(handle.readDirectory(), ["中文"]));
+    await writeFile(Buffer.concat([Buffer.from(tmp + "/"), Buffer.from([0xff])]), "raw", { mode: 0o600 });
+    await withNativeSourceRoot(tmp, handle => {
+      assert.throws(() => handle.readDirectory(), { code: "ERR_SOURCE_DIRECTORY" });
+    });
+  } finally { await rm(tmp, { recursive: true, force: true }); }
+});
+
+linuxTest("#152 P3 handles keep native ownership private and copies cannot borrow a live owner", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "br-p3-private-owner-"));
+  try {
+    let escaped: Parameters<typeof observeSourceFile>[0] | undefined;
+    await withNativeSourceRoot(tmp, handle => {
+      escaped = handle;
+      assert.deepEqual(Reflect.ownKeys(handle), ["kind"]);
+      const copied = Object.assign(Object.create(Object.getPrototypeOf(handle)), handle);
+      assert.throws(() => observeSourceFile(copied), { code: "maintenance_lost" });
+      assert.throws(() => handle.observe.call(copied), { code: "maintenance_lost" });
+      let called = false;
+      const fake = { kind: "directory", observe() { called = true; return handle.observe(); } };
+      assert.throws(() => observeSourceFile(fake as Parameters<typeof observeSourceFile>[0]), { code: "maintenance_lost" });
+      assert.equal(called, false, "source provenance never invokes caller supplied methods");
+      assert.equal(Object.isFrozen(handle), true);
+    });
+    assert.throws(() => observeSourceFile(escaped!), { code: "maintenance_lost" });
+  } finally { await rm(tmp, { recursive: true, force: true }); }
+});
+
+linuxTest("#152 P3 UNIQUE statx is a separate same-owner observation, never a legacy-ID alias", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "br-p3-unique-statx-"));
+  try {
+    await writeFile(path.join(tmp, "file"), "unique-statx", { mode: 0o600 });
+    await withNativeSourceRoot(tmp, handle => {
+      const child = handle.openChild("file", "file");
+      try {
+        for (const owner of [handle, child]) {
+          const observed = owner.observe(), legacy = owner.observeStatx();
+          assert.equal(typeof owner.observeStatxUnique, "function");
+          const unique = owner.observeStatxUnique();
+          assert.equal(unique.kind, observed.kind); assert.equal(unique.ino, observed.ino);
+          assert.equal(unique.devMajor, legacy.devMajor); assert.equal(unique.devMinor, legacy.devMinor);
+          assert.equal(Object.hasOwn(unique, "mountId"), false);
+          assert.equal((unique.mask & 0x4000n) !== 0n, unique.uniqueMountId !== null);
+          const extended = owner.observeExtended();
+          if (extended.fid.status === "observed") assert.equal(unique.uniqueMountId, extended.fid.value.mountId);
+        }
+      } finally { child.close(); }
+      assert.throws(() => child.observeStatxUnique(), { code: "maintenance_lost" });
+    });
+  } finally { await rm(tmp, { recursive: true, force: true }); }
 });
 
 linuxTest("#152 P2 extended facts use the live owner and retain explicit syscall outcomes", async t => {
