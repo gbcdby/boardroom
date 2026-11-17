@@ -69,19 +69,25 @@ node --test tests/maintenance-restore-directory.test.ts tests/maintenance-restor
 - [SQLite 文件控制接口](https://sqlite.org/c3ref/c_fcntl_begin_atomic_write.html)：`SQLITE_FCNTL_HAS_MOVED` 核对当前连接打开的文件是否仍为原路径，避免以“出现新 FD”误判 SQLite 的合法句柄复用。
 
 
-## Linux P0：不透明源 FD 只读基础（不具备 Fs 资格）
+## Linux P0–P2：不透明源 FD 与普通原生事实（不具备 Fs 资格）
 
-#152 的源文件原生接缝 P 已固定完整原始 getter、同 FD FID/UUID/健康状态、profile 与 open-at 交付合同。当前 P0 只完成以下最小子能力，不属于完整 P，也不发放可用于迁移的源资格：
+#152 的源文件原生接缝 P 已固定完整原始 getter、同 FD FID/UUID/健康状态、profile 与 open-at 交付合同。当前 P0–P2 只完成以下子能力，不属于完整 P，也不发放可用于迁移的源资格：
 
 - **native/maintenance-source-files.c**：Node-API 8 的私有 napi_wrap owner；只通过 openat2 打开真实只读根和子叶，子项强制 RESOLVE_BENEATH、RESOLVE_NO_XDEV、RESOLVE_NO_SYMLINKS 与 RESOLVE_NO_MAGICLINKS。不导出 FD、任意 syscall 或写入口。observe/readAt/readDirectory 始终使用同一个真实持有的 FD。
 - **source-file-native.ts**：当前 scope 内一次性使用、显式关闭子 owner；失败、子 owner 遗漏或关闭未知都不返回可消费成功。返回的是事实而不是资格标志。生产加载检查 Node-API、实际当前 UID、单链接普通文件和 0700 权限；缺少/编译失败保持 unavailable。
 - **source-file-profile.ts**：当前支持表为空，生产匹配始终拒绝 backup_capability_unavailable；不得从本基础 observe 数据、测试替身或调用者 proof 生成 source-preservation 资格、Fs/Jq/Tcut。
+
+P1 的 `observeStatx()` 保留原始 mask、设备/ino、mount ID、btime、attributes/mask；未返回的 optional 字段为 null。P2 的 `observeExtended()` 同步借用当前 owner 的同一 FD，读取 `FS_IOC_GETFSUUID`、带 `AT_EMPTY_PATH | AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE` 的 `name_to_handle_at`、`FS_IOC_GETFLAGS` 以及 `flistxattr/fgetxattr`，不重新按路径打开、不导出数字 FD，也不申请权限。前后 fstat（含 uid/gid、mode、nlink、size、atime/mtime/ctime）及 fstatfs 类型不一致时拒绝整个观察。
+
+每个 getter 返回 `observed` 或 `unavailable`、原始 syscall rc/errno 及原始值；未执行的调用用 null rc/errno。权限、系统调用、长度、身份或枚举未知均为 unavailable，值为 null；不会用零值代替。UUID 长度限 1..16 bytes；FID 使用固定 128-byte 缓冲，不按 EOVERFLOW 扩容或重试，返回原始 type/bytes 与 u64 unique mount ID。普通 inode flags 以无符号 32 位 BigInt 返回。xattr 名称和值都是 Buffer，不经过 UTF-8 替换；只涵盖当前普通权限可枚举且可读取的属性，隐藏/特权属性不被推断。集合按原始名称排序并复读名称清单，最多 64 项、名称加值总计 65536 bytes，任何缺失、ERANGE、超额或枚举变化都不返回部分成功集合。
+
+声明依据为固定 [Linux v6.18 fs.h](https://github.com/torvalds/linux/blob/v6.18/include/uapi/linux/fs.h)、[fcntl.h](https://github.com/torvalds/linux/blob/v6.18/include/uapi/linux/fcntl.h)、[fhandle.c](https://github.com/torvalds/linux/blob/v6.18/fs/fhandle.c) 与 [ioctl.c](https://github.com/torvalds/linux/blob/v6.18/fs/ioctl.c)。构建静态核对 fsuuid2/file_handle 布局及 ioctl/flag 编码；仅补缺失声明，不猜 syscall 编号。缺少 FID syscall 声明时该事实明确为 ABI unavailable。
 
 Linux 的此组件须显式执行以下两行，普通 npm ci / postinstall **不会**启用；现有 macOS 构建和保守失败语义不变：
 
     node scripts/build-maintenance-platform.mjs --source-files
     node --test tests/maintenance-source-file-native.test.ts
 
-编译使用仓库随附已逐项校验 SHA256 的 Node 24.22.1 Node-API 8 headers，输出位于已忽略的 build/maintenance-platform/maintenance-source-files-linux-<arch>.node，权限 0700。真实完整 P 还必须补齐原始 statx/ABI/mask、同打开对象 FID/UUID、inode flags、xattr 原始值、十三项健康字段、source-state 与固定非空支持资格，严格验证 Linux 内核/挂载/FD 引用与后续 S/C 的原生正反例；未验收前 production_enable 继续 false。
+编译使用仓库随附已逐项校验 SHA256 的 Node 24.22.1 Node-API 8 headers，输出位于已忽略的 build/maintenance-platform/maintenance-source-files-linux-<arch>.node，权限 0700。真实完整 P 仍需十三项健康字段、source-state、完整窗口与固定非空支持资格，严格验证 Linux 内核/挂载/FD 引用与后续 S/C 的原生正反例；未验收前 production_enable 继续 false。
 
-测试中的真实文件读/目录和权限、别名、关闭后拒绝只属于 **Linux P0 ABI 控制**，不证明 macOS、正式 Profile、物理断电耐久、迁移 journal、S4 三个命名产物或可用的公共迁移入口。
+测试中的真实文件/目录、原始 xattr、预算、权限及关闭后拒绝只属于 **Linux 普通 getter/ABI 控制**。独立临时 addon 的固定 syscall 故障注入只检验 unavailable 与 rc/errno 保留，不代表真实权限失败或资格证据。它们不证明 macOS、正式 Profile、源不变窗口、物理断电耐久、迁移 journal、S4 三个命名产物或可用的公共迁移入口。
