@@ -3,11 +3,14 @@ import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { mkdtemp, readdir, rm, stat, writeFile, mkdir, rename } from "node:fs/promises";
 import path from "node:path";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { resolveBoardroomEnvironment } from "../src/server/environment.ts";
 import { createSqliteMaintenanceAdapter } from "../src/server/storage/maintenance/sqlite.ts";
 import { loadPersistedPlan, persistMigrationPlan, planMigration, revalidatePlan } from "../src/server/storage/maintenance/plan.ts";
+import * as planning from "../src/server/storage/maintenance/plan.ts";
 import { digestJson } from "../src/server/storage/maintenance/canonical.ts";
 import { postgresDescriptorDigest } from "../src/server/storage/maintenance/postgres-tools.ts";
 import type { MaintenanceAdapter } from "../src/server/storage/maintenance/types.ts";
@@ -61,6 +64,28 @@ platformTest("#152 preview data is not an execution fence; schema/config/target 
     await writeFile(f.configFile, JSON.stringify({ dataDir: f.dataDir, port: 12345 }));
     await assert.rejects(revalidatePlan(plan, f.options, f.adapter), /plan_stale/);
   } finally { await f.close(); }
+});
+
+platformTest("#152 C1 metadata-only plan binding never opens config content and preserves ordinary revalidation", async t => {
+  const f = await fixture();
+  try {
+    const plan = await planMigration(f.options, f.adapter);
+    await persistMigrationPlan(plan, f.options, f.adapter);
+    const open = fs.promises.open, outsideWindow = new Error("config content read outside S/P");
+    let configOpens = 0;
+    t.mock.method(fs.promises, "open", async (...args: Parameters<typeof open>) => {
+      if (String(args[0]) === f.configFile) { configOpens++; throw outsideWindow; }
+      return Reflect.apply(open, fs.promises, args);
+    });
+    syncBuiltinESMExports();
+    const observation = await planning.observeCapturePlanBindings(plan, f.options, f.adapter);
+    assert.deepEqual(observation.source, plan.source); assert.equal(configOpens, 0);
+    await assert.rejects(revalidatePlan(plan, f.options, f.adapter), error => error === outsideWindow);
+    assert.equal(configOpens, 1);
+    await assert.rejects(planning.observeCapturePlanBindings(plan, { ...f.options, originalCwd: f.dataDir }, f.adapter),
+      { code: "plan_stale" });
+    assert.equal(configOpens, 1);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
 });
 
 platformTest("#152 plan rejects missing/replaced source, an unrecognized control root and protected destination overlap", async () => {

@@ -117,9 +117,8 @@ export async function planMigration(options: MaintenanceServiceOptions, adapter:
     requiredCapabilities: ["physical-source-lock", "all-source-writers-quiesced", "source-files-inventory", "known-workspace-root-clearance", "filesystem-durable-publication", "actual-database-restore"], blockers });
 }
 
-/** Immutable binding check only: successful revalidation is never write/seal authorization. */
-export async function revalidatePlan(planValue: MigrationPlan, options: MaintenanceServiceOptions, adapter: MaintenanceAdapter): Promise<SourceObservation> {
-  const plan = parsePlan(planValue); assertSelection(options, adapter);
+async function observePlanBindings(plan: MigrationPlan, options: MaintenanceServiceOptions, adapter: MaintenanceAdapter): Promise<SourceObservation> {
+  assertSelection(options, adapter);
   const observation = await adapter.observe(); assertObservedDescriptor(options, observation);
   const locations = await observeLocations(options);
   let controlMatches = same(locations.controlRoot, plan.controlRoot);
@@ -132,8 +131,22 @@ export async function revalidatePlan(planValue: MigrationPlan, options: Maintena
   if (!same(observation.source, plan.source) || !same(observation.sourceIdentity, plan.sourceIdentity)
     || observation.manifests.schemaManifestDigest !== plan.schemaManifestDigest || observation.state.guardManifestDigest !== plan.guardManifestDigest
     || plan.originalCwd !== path.resolve(options.originalCwd) || plan.originalConfigPath !== options.environment.configFile
-    || plan.configDigest !== await configDigest(plan.originalConfigPath) || plan.effectiveConfigDigest !== effectiveConfigDigest(options)
+    || plan.effectiveConfigDigest !== effectiveConfigDigest(options)
     || !controlMatches || !same(locations.targetRoot, plan.targetRoot) || !same(locations.fileRoots, plan.fileRoots)) throw new MaintenanceFailure("plan_stale");
+  return observation;
+}
+
+/** Internal C metadata/selection observation only. Source config bytes must be read and
+ * bound by the actual S/P window; this result is never capture or publication authority. */
+export async function observeCapturePlanBindings(planValue: MigrationPlan, options: MaintenanceServiceOptions,
+  adapter: MaintenanceAdapter): Promise<SourceObservation> {
+  return observePlanBindings(parsePlan(planValue), options, adapter);
+}
+
+/** Immutable binding check only: successful revalidation is never write/seal authorization. */
+export async function revalidatePlan(planValue: MigrationPlan, options: MaintenanceServiceOptions, adapter: MaintenanceAdapter): Promise<SourceObservation> {
+  const plan = parsePlan(planValue), observation = await observePlanBindings(plan, options, adapter);
+  if (plan.configDigest !== await configDigest(plan.originalConfigPath)) throw new MaintenanceFailure("plan_stale");
   return observation;
 }
 

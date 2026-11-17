@@ -1,20 +1,16 @@
 import { z } from "zod";
 import path from "node:path";
 import { canonicalJson, digestJson } from "./canonical.ts";
-import { controlSqlOutcome } from "./control-sql.ts";
+import { awaitControllerAdmission, createControllerOwner, finishControllerOwner, recordControllerFailure, rememberControllerStore } from "./controller-owner.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { ArtifactStore } from "./objects.ts";
 import { hash, id, ref, source, text } from "./parse-primitives.ts";
 import { parseJournal } from "./parse.ts";
 import { loadPersistedPlan, revalidatePlan } from "./plan.ts";
 import { captureReference, verifyJournalChain } from "./journal.ts";
-import { createSqliteMaintenanceAdapter } from "./sqlite.ts";
-import { createPostgresMaintenanceAdapter } from "./postgres.ts";
-import { postgresDescriptorDigest } from "./postgres-tools.ts";
 import { maintenanceFilesystem } from "./platform.ts";
 import type { StorageMaintenanceState } from "../admission.ts";
-import type { DatabaseDescriptor } from "../../environment.ts";
-import type { ContinueRequest, Json, MaintenanceAdapter, MaintenanceResult, MaintenanceServiceOptions, MigrationPlan, OperationMutex, SourceLock } from "./types.ts";
+import type { ContinueRequest, MaintenanceResult, MaintenanceServiceOptions, MigrationPlan, OperationMutex, SourceLock } from "./types.ts";
 
 const requestSchema = z.object({
   plan: z.object({ migrationId: id, planDigest: hash, immutablePlan: ref, controlRoot: text }).strict(),
@@ -27,34 +23,6 @@ function requireValue(value: unknown, code: ConstructorParameters<typeof Mainten
 }
 const recovery = (): MaintenanceResult => ({ status: "recovery_required", lastVerifiedPhase: null,
   blockers: [{ code: "journal_invalid", subjectRef: "db-exact-journal" }] });
-
-interface PendingCleanup { readonly adapter: MaintenanceAdapter; readonly keys: readonly string[]; closing?: Promise<void> }
-const pendingCleanups = new Set<PendingCleanup>();
-function cleanupKeys(descriptor: DatabaseDescriptor, plan: MigrationPlan): readonly string[] {
-  // These copied keys only select a prior owner for cleanup. They never authorize a new
-  // source operation; the new adapter must still establish all actual native bindings.
-  const keys = [`source:${digestJson(plan.source)}`];
-  if (descriptor.kind === "sqlite") {
-    keys.push(`sqlite-path:${path.resolve(descriptor.sqlitePath)}`);
-    if (descriptor.identity) keys.push(`sqlite-inode:${digestJson(descriptor.identity)}`);
-  } else {
-    keys.push(`postgres-descriptor:${postgresDescriptorDigest(descriptor)}`);
-    const identity = plan.sourceIdentity;
-    if (identity && typeof identity === "object" && !Array.isArray(identity)) {
-      const values = identity as Readonly<Record<string, Json>>;
-      const fields = ["systemIdentifier", "databaseOid", "schemaOid", "serverAddress", "serverPort", "databaseInstanceId"];
-      if (values.kind === "postgres" && fields.every(field => Object.hasOwn(values, field))) {
-        const physical = Object.fromEntries(fields.map(field => [field, values[field]!]));
-        keys.push(`postgres-native:${digestJson(physical)}`);
-      }
-    }
-  }
-  return Object.freeze(keys);
-}
-async function finishPending(owner: PendingCleanup): Promise<void> {
-  const attempt = owner.closing ??= Promise.resolve().then(() => owner.adapter.close()).then(() => { pendingCleanups.delete(owner); });
-  try { await attempt; } finally { if (owner.closing === attempt) delete owner.closing; }
-}
 
 async function classifyExisting(store: ArtifactStore, state: StorageMaintenanceState, plan: MigrationPlan,
   request: ContinueRequest, requestDigest: string): Promise<MaintenanceResult> {
@@ -97,27 +65,26 @@ export async function enterMaintenance(options: MaintenanceServiceOptions, value
   requireValue(parsed.success, "request_conflict");
   const request = parsed.data, requestDigest = digestJson({ operation: "internal-enter", request });
   const plan = await loadPersistedPlan(request.plan, request.expectedSource);
-  const selected = options.environment.databaseDescriptor;
-  const descriptor: DatabaseDescriptor = selected.kind === "sqlite"
-    ? { ...selected, identity: selected.identity && { ...selected.identity } } : { ...selected };
-  const keys = cleanupKeys(descriptor, plan);
-  for (const pending of pendingCleanups) if (keys.some(key => pending.keys.includes(key))) await finishPending(pending);
-  const adapter = descriptor.kind === "sqlite" ? await createSqliteMaintenanceAdapter(descriptor)
-    : await createPostgresMaintenanceAdapter(descriptor, options.postgresVerification);
-  const owner: PendingCleanup = { adapter, keys };
+  const owner = await createControllerOwner(options, plan), { adapter, descriptor } = owner;
   let mutex: OperationMutex | undefined, sourceLock: SourceLock | undefined, result: MaintenanceResult | undefined;
   const failures: unknown[] = [];
   try {
+    await awaitControllerAdmission(owner);
     const observed = await revalidatePlan(plan, options, adapter);
     const initialStore = await ArtifactStore.open(request.plan.controlRoot, request.expectedSource);
+    rememberControllerStore(owner, initialStore);
     // Durable entry consumes the existing platform/FS support policy. A successful fsync on
     // an unsupported filesystem is not qualification; preview/persist alone does not grant it.
     await maintenanceFilesystem(initialStore.root);
     if (descriptor.kind === "sqlite") await maintenanceFilesystem(path.dirname(descriptor.sqlitePath));
+    await awaitControllerAdmission(owner);
     mutex = await adapter.acquireMutex(initialStore.identity, observed.state);
+    await awaitControllerAdmission(owner);
     const heldMutex = mutex;
     result = await adapter.withSourceLock("control", async (lock: SourceLock) => {
       sourceLock = lock;
+      try { await awaitControllerAdmission(owner); }
+      catch (error) { recordControllerFailure(owner, failures, error); throw error; }
       // acquireMutex may have committed the first physical root/mutex binding. Read again under
       // the actual source lock; the earlier observation cannot be used as anchor.expected.
       await revalidatePlan(plan, options, adapter);
@@ -133,6 +100,7 @@ export async function enterMaintenance(options: MaintenanceServiceOptions, value
           && same(live.sourceIdentity, plan.sourceIdentity) && live.schemaManifestDigest === plan.schemaManifestDigest, "maintenance_lost");
       };
       const store = await ArtifactStore.open(request.plan.controlRoot, request.expectedSource, { assertCurrent });
+      rememberControllerStore(owner, store);
       await assertCurrent();
       if (expected.admission !== "open" || expected.journalSequence !== 0) {
         const existing = await classifyExisting(store, expected, plan, request, requestDigest);
@@ -154,21 +122,7 @@ export async function enterMaintenance(options: MaintenanceServiceOptions, value
         mutexIdentity: heldMutex.identity, journal, journalSequence: 1 });
       return { status: "paused", phase: "planned", ref: captureReference(chain.nodes[0]!) };
     });
-  } catch (error) { failures.push(error); }
-  // Ordinary anchors expose only bounded lifecycle facts. The outer rejection remains the
-  // primary error; record suppressed cleanup stages without reading raw auxiliary errors.
-  // A standalone close rejection is already that primary, so do not report it twice.
-  try {
-    const outcome = sourceLock && controlSqlOutcome(sourceLock);
-    if (outcome?.rollbackFailureObserved) failures.push(new MaintenanceFailure("maintenance_lost", "source-rollback-failure"));
-    if (outcome?.failureObserved && outcome.closeFailureObserved)
-      failures.push(new MaintenanceFailure("maintenance_lost", "source-close-failure"));
-  } catch (error) { failures.push(error); }
-  // Even when release fails, whole-adapter close is necessary. Never treat a callback value as
-  // commit/closure confirmation, or replace an earlier error with a cleanup exception.
-  try { await mutex?.release(); } catch (error) { failures.push(error); }
-  try { await adapter.close(); } catch (error) { pendingCleanups.add(owner); failures.push(error); }
-  if (failures.length === 1) throw failures[0];
-  if (failures.length > 1) throw new AggregateError(failures, "storage_maintenance: internal-enter cleanup failed", { cause: failures[0] });
+  } catch (error) { recordControllerFailure(owner, failures, error); }
+  await finishControllerOwner(owner, mutex, sourceLock, failures, "internal-enter");
   return result!;
 }
