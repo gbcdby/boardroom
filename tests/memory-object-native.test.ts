@@ -494,9 +494,10 @@ test("#161 E3 actual 8 pending and 64 descriptor boundaries include aliases and 
     assert.ok(identities.every(info => info.isDirectory() || info.isFile()));
     assert.ok(identities.filter(info => info.isFile()).length >= 2, "prepared canonical and actual temporary writer");
     assert.ok(identities.some(info => info.isDirectory()));
-    const openCalls = native.fixtureTrace(root).filter(t => t.syscall === "openat2" || t.syscall === "openat").length;
+    const openCalls = native.fixtureTrace(root).filter(t => t.syscall === "open").length;
+    assert.ok(openCalls > 0, "the trace must contain actual opens before the descriptor boundary");
     failure(await native.prepare(root, "sixty five"), "resource_unavailable");
-    assert.equal(native.fixtureTrace(root).filter(t => t.syscall === "openat2" || t.syscall === "openat").length, openCalls);
+    assert.equal(native.fixtureTrace(root).filter(t => t.syscall === "open").length, openCalls);
     assert.equal(native.observeRoot(root).resources.fdOwned, 64);
     assert.equal(native.fixtureCloseFdHold(hold).kind, "closed");
     native.fixtureRelease(root, "write");
@@ -504,6 +505,90 @@ test("#161 E3 actual 8 pending and 64 descriptor boundaries include aliases and 
     for (const item of [prepared[0], written]) if (item?.kind === "prepared-file") await native.closePrepared(item.file);
     assert.equal(native.observeRoot(root).resources.pending, 0);
   } finally { native.fixtureRelease(root, "write"); await native.closeRoot(root); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("#161 E3 fixture close is an actual task joined by another Worker's root close", { skip: !supportedMemoryNativePlatform }, async () => {
+  const { file } = await buildMemoryNativeFixture(); const directory = await createMemoryRoot();
+  try { console.log(await runMemoryChild(file, directory, `
+    const n=createRequire(import.meta.url)(file),root=n.fixtureOpenRoot(directory,'fixture-close-join',1048576);
+    let worker,rootClose,workerClose,closeSettled=false;
+    const nextMessage=()=>new Promise((resolve,reject)=>{worker.once('message',resolve);worker.once('error',reject);});
+    try {
+      worker=new Worker(\`
+        const {parentPort,workerData}=require('node:worker_threads');
+        const n=require(workerData.file),root=n.fixtureOpenRoot(workerData.directory,'fixture-close-join',1048576);
+        let hold=n.fixtureFillFdBoundary(root);
+        parentPort.postMessage({kind:'ready',observation:n.observeRoot(root)});
+        parentPort.once('message',()=>{
+          const result=n.fixtureCloseFdHold(hold);hold=null;
+          parentPort.postMessage({kind:'closed-hold',result});parentPort.close();
+        });
+      \`,{eval:true,execArgv:[],workerData:{file,directory}});
+      const ready=await nextMessage();assert.equal(ready.observation.resources.fdOwned,64);
+      n.fixtureSetFaults(root,[{point:'file-close',occurrence:1,action:'hold'}]);
+      workerClose=nextMessage();worker.postMessage('close');
+      const until=Date.now()+10000;
+      while(!n.fixtureTrace(root).some(t=>t.point==='file-close'&&t.syscall==='fixture-hold')){
+        if(Date.now()>until)throw new Error('actual fixture close was not held');
+        await new Promise(resolve=>setImmediate(resolve));
+      }
+      const held=n.observeRoot(root),heldSlots=n.fixtureFdSnapshot(root).filter(fd=>fd.state==='closing');
+      assert.equal(heldSlots.length,1);assert.ok(fs.fstatSync(heldSlots[0].fd).isDirectory());
+      rootClose=n.closeRoot(root).then(result=>{closeSettled=true;return result;});
+      await Promise.race([rootClose,new Promise(resolve=>setTimeout(resolve,250))]);
+      const beforeRelease={closeSettled,observation:n.observeRoot(root),closing:n.fixtureFdSnapshot(root).filter(fd=>fd.state==='closing')};
+      n.fixtureRelease(root,'file-close');
+      const closedHold=await workerClose,closedRoot=await rootClose;
+      await worker.terminate();worker=null;global.gc();
+      const afterRelease=n.observeRoot(root);
+      console.log(JSON.stringify({fixtureCloseJoin:{held,beforeRelease,closedHold,closedRoot,afterRelease}}));
+      assert.equal(beforeRelease.closeSettled,false,'root close must join the actual held close');
+      assert.equal(held.resources.nativeTasks,1,'the synchronous fixture close owns a real native task');
+      assert.equal(beforeRelease.observation.state,'closing');assert.equal(beforeRelease.closing.length,1);
+      assert.equal(beforeRelease.observation.resources.pending,1);
+      assert.equal(closedHold.result.kind,'closed');assert.equal(closedRoot.kind,'closed');
+      assert.equal(afterRelease.state,'closed');
+      assert.deepEqual(afterRelease.resources,{pending:0,fdReserved:0,fdOwned:0,fdUnknown:0,nativeTasks:0,preparedFiles:0,bodyBytes:0});
+    } finally {
+      n.fixtureRelease(root,'file-close');
+      if(worker)await worker.terminate();
+      if(rootClose)await rootClose;
+      await n.closeRoot(root);
+    }
+  `)); } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("#161 E3 fixture hold rejects cleanup already owned by an actual root close", { skip: !supportedMemoryNativePlatform }, async () => {
+  const { file } = await buildMemoryNativeFixture(); const directory = await createMemoryRoot();
+  try { console.log(await runMemoryChild(file, directory, `
+    const n=createRequire(import.meta.url)(file),root=n.fixtureOpenRoot(directory,'fixture-close-exclusive',1048576);
+    let hold=n.fixtureFillFdBoundary(root),closing;
+    try {
+      n.fixtureSetFaults(root,[{point:'file-close',occurrence:1,action:'hold'}]);
+      closing=n.closeRoot(root);
+      const until=Date.now()+10000;
+      while(!n.fixtureTrace(root).some(t=>t.point==='file-close'&&t.syscall==='fixture-hold')){
+        if(Date.now()>until)throw new Error('actual root close was not held');
+        await new Promise(resolve=>setImmediate(resolve));
+      }
+      const before=n.fixtureFdSnapshot(root),held=before.filter(fd=>fd.state==='closing');
+      assert.equal(held.length,1);assert.ok(fs.fstatSync(held[0].fd).isDirectory());
+      const refused=n.fixtureCloseFdHold(hold);
+      const afterRefusal=n.fixtureFdSnapshot(root);
+      n.fixtureRelease(root,'file-close');const closed=await closing;
+      const repeated=n.fixtureCloseFdHold(hold);hold=null;global.gc();
+      const afterRelease=n.observeRoot(root);
+      console.log(JSON.stringify({fixtureCloseExclusive:{refused,before,afterRefusal,closed,repeated,afterRelease}}));
+      assert.equal(refused.kind,'failed');assert.equal(refused.primary.code,'owner_closing');
+      assert.deepEqual(afterRefusal,before,'the competing fixture close cannot touch an owned close');
+      assert.equal(closed.kind,'closed');assert.equal(repeated.kind,'closed');assert.equal(afterRelease.state,'closed');
+      assert.deepEqual(afterRelease.resources,{pending:0,fdReserved:0,fdOwned:0,fdUnknown:0,nativeTasks:0,preparedFiles:0,bodyBytes:0});
+    } finally {
+      n.fixtureRelease(root,'file-close');
+      if(closing)await closing;
+      await n.closeRoot(root);
+    }
+  `)); } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test("#161 E3 unknown close remains owned and never closes a reused descriptor", { skip: !supportedMemoryNativePlatform }, async () => {

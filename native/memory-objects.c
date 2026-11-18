@@ -648,7 +648,9 @@ static bool mo_directory(mo_op *op, int parent, const char *leaf, bool inside, b
     mo_logic(out, "root_changed", "object-directories");
     return false;
   }
+  pthread_mutex_lock(&mo_mutex);
   op->root->fds[fd].identity = s;
+  pthread_mutex_unlock(&mo_mutex);
   if (inside) {
     struct statfs root_fs, child_fs;
     if (!mo_gate(op, out, "object-directories"))return false;

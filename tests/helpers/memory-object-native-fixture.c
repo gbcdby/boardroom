@@ -125,9 +125,17 @@ static napi_value fixture_fds(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, &arg, NULL, NULL);
   mo_wrap *w = mo_owner(env, arg, WR_ROOT);
   if (!w)return mo_error(env, "invalid_owner");
-  mo_fd snapshot[MO_FDS];
+  struct {
+    mo_fd_state state;
+    int fd;
+    const char *role;
+  } snapshot[MO_FDS];
   pthread_mutex_lock(&mo_mutex);
-  memcpy(snapshot, w->root->fds, sizeof(snapshot));
+  for (int i = 0;i < MO_FDS;i++) {
+    snapshot[i].state = w->root->fds[i].state;
+    snapshot[i].fd = w->root->fds[i].fd;
+    snapshot[i].role = w->root->fds[i].role;
+  }
   pthread_mutex_unlock(&mo_mutex);
   napi_value array;
   napi_create_array(env, &array);
@@ -136,12 +144,11 @@ static napi_value fixture_fds(napi_env env, napi_callback_info info) {
     "free", "reserved", "owned", "closing", "unknown"
   };
   for (int i = 0;i < MO_FDS;i++) {
-    const mo_fd *fd = &snapshot[i];
-    if (fd->state == FD_FREE)continue;
+    if (snapshot[i].state == FD_FREE)continue;
     napi_value v = mo_object(env);
-    mo_set(env, v, "fd", mo_number(env, fd->fd));
-    mo_set(env, v, "state", mo_string(env, states[fd->state]));
-    mo_set(env, v, "role", mo_string(env, fd->role));
+    mo_set(env, v, "fd", mo_number(env, snapshot[i].fd));
+    mo_set(env, v, "state", mo_string(env, states[snapshot[i].state]));
+    mo_set(env, v, "role", mo_string(env, snapshot[i].role));
     mo_index(env, array, index++, mo_freeze(env, v));
   }
   return mo_freeze(env, array);
@@ -156,6 +163,13 @@ static napi_value fixture_fill(napi_env env, napi_callback_info info) {
   const char *error = NULL;
   mo_op *op = mo_new_op(w->root, e, &error);
   if (!op)return mo_error(env, error);
+  mo_root *r = w->root;
+  /* Keep dispatch exclusion until a wrapper owns the op, and keep independent
+     C references until this synchronous invocation has finished using it. */
+  pthread_mutex_lock(&mo_mutex);
+  op->refs++;
+  r->refs++;
+  pthread_mutex_unlock(&mo_mutex);
   mo_result result = {
     0
   };
@@ -167,16 +181,35 @@ static napi_value fixture_fill(napi_env env, napi_callback_info info) {
     mo_acquired(w->root, slot, fd);
     if (fd < 0) {
       mo_fail(&result, "native_io", "reserve-fd", "status", -1, err);
-      mo_op_cleanup(op, &result);
-      mo_abandon(op);
-      return mo_error(env, "native_io");
+      error = "native_io";
+      break;
+    }
+  }
+  napi_value value = NULL;
+  bool retained = false;
+  if (error) {
+    mo_op_cleanup(op, &result);
+    retained = mo_retains_op(op);
+  } else {
+    mo_js_frame frame;
+    mo_js_begin(&frame);
+    value = mo_wrap_owner(env, e, r, op, WR_HOLD);
+    mo_js_end(&frame);
+    if (!value || frame.status != napi_ok) {
+      error = "native_abi_unavailable";
+      retained = true;
     }
   }
   pthread_mutex_lock(&mo_mutex);
+  if (error && !retained)op->pending = false;
+  if (retained)r->state = ROOT_RETAINED;
   op->dispatching = false;
-  w->root->dispatching--;
+  r->dispatching--;
+  pthread_cond_broadcast(&mo_condition);
   pthread_mutex_unlock(&mo_mutex);
-  return mo_wrap_owner(env, e, w->root, op, WR_HOLD);
+  mo_drop_op_ref(op);
+  mo_drop_root_ref(r);
+  return error ? mo_error(env, error) : value;
 }
 static napi_value fixture_close_hold(napi_env env, napi_callback_info info) {
   napi_value arg = NULL;
@@ -185,20 +218,47 @@ static napi_value fixture_close_hold(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, &arg, NULL,(void **)&e);
   mo_wrap *w = mo_owner(env, arg, WR_HOLD);
   if (!w)return mo_error(env, "invalid_owner");
+  mo_root *r = w->root;
+  mo_op *op = w->op;
+  const char *error = NULL;
+  pthread_mutex_lock(&mo_mutex);
+  if (r->close_running || r->state == ROOT_CLOSING)error = "owner_closing";
+  else if (op->active || op->dispatching)error = "resource_unavailable";
+  if (!error) {
+    op->active = true;
+    op->refs++;
+    r->tasks++;
+    r->refs++;
+  }
+  pthread_mutex_unlock(&mo_mutex);
   mo_result result = {
     0
   };
-  mo_op_cleanup(w->op, &result);
-  if (!mo_retains_op(w->op)) {
-    pthread_mutex_lock(&mo_mutex);
-    w->op->pending = false;
-    pthread_mutex_unlock(&mo_mutex);
+  if (error) {
+    mo_logic(&result, error, "file-close");
+    return mo_failure(env, e, r, &result);
   }
-  if (result.first.code)return mo_failure(env, e, w->root, &result);
-  napi_value v = mo_object(env);
-  mo_set(env, v, "kind", mo_string(env, "closed"));
-  mo_set(env, v, "resources", mo_resources(env, w->root));
-  return mo_freeze(env, v);
+  /* A fixture close performs the same real cleanup as an ordinary file task.
+     Root close and env cleanup must join it, including an actual close hold. */
+  mo_op_cleanup(op, &result);
+  bool retained = mo_retains_op(op);
+  pthread_mutex_lock(&mo_mutex);
+  if (!retained)op->pending = false;
+  op->active = false;
+  r->tasks--;
+  pthread_cond_broadcast(&mo_condition);
+  pthread_mutex_unlock(&mo_mutex);
+  napi_value value;
+  if (result.first.code)value = mo_failure(env, e, r, &result);
+  else {
+    value = mo_object(env);
+    mo_set(env, value, "kind", mo_string(env, "closed"));
+    mo_set(env, value, "resources", mo_resources(env, r));
+    mo_freeze(env, value);
+  }
+  mo_drop_op_ref(op);
+  mo_drop_root_ref(r);
+  return value;
 }
 static napi_value fixture_trace(napi_env env, napi_callback_info info) {
   napi_value arg = NULL;

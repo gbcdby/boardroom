@@ -139,6 +139,8 @@ node --test --test-concurrency=1 tests/memory-object-native.test.ts
 
 测试 fixture 是另编 translation unit，包含相同生产 C 文件；普通构建无法选择它。固定故障、hold、实际 FD 诊断及临时 root 获取仅存在于测试产物。`short-one` 只命中指定一次；`short-repeat` 是独立的固定测试 action，从指定序号起每次真实 read/write 请求最多 1 byte，直到实际普通预算耗尽，不修改计数或伪造成功。未知 close 和最后 env 退出的控制在专属 child 中运行并等待整个 child 实际退出。现有 Linux/macOS 完整测试 glob 会真实编译和执行该文件，Darwin 的实际只读 FD/目录 F_FULLFSYNC 和最后 Worker 生命周期仍必须由对应 CI 验证。
 
+fixture 的同步 FD hold 关闭同样登记真实 operation task 与 C 引用，root close 必须等它完成；root 已占有关闭任务时，fixture 返回固定 `owner_closing`，不并行触碰该 FD。填满边界的 invocation 持有 dispatch 与独立引用，直到 hold wrapper 注册或失败责任挂账后才释放。诊断快照只在账本锁内复制 FD、状态与固定 role；第 65 个 FD 的用例先证明已有真实 `open` 事件，再要求预算拒绝前后该计数不增加。
+
 分配负控明确是 `FAULT_INJECTED`，不是实际 OOM：`native-dispatch/fail-before` 的 occurrence 按每次 dispatch 中两个有序分配边界累计，先 C job calloc，再 `napi_create_promise`；1 保留 job 拒绝，2 拒绝同次 Promise 创建，后者进入与真实 Node-API 失败相同的固定 `napi_generic_failure` 分支。trace 分别为 `fixture-job-allocation` 和 `fixture-promise-allocation`，不能自选状态。该点的 hold 仍只作用于工作线程实际 dispatch。`native-complete/fail-before` 在实际 native 结束后、JS 结果构造前拒绝分配，走与真实构造错误相同的 retained 判定；hold 仍留在真实 native completion 前。异步固定错误通过 Node-API 的 uncaught-exception 递送机制报告，挂账先于递送，不假装返回成功结果。测试核实际 prepared/FD、新正文撤销、GC、Worker 退出及 unknown 责任。
 
 Node 24 的 Node-API 8 在禁用 JS 时可能返回 `napi_pending_exception`；只有 `napi_is_exception_pending` 查询成功且实际为 false，才按退出处理，真实 pending exception 仍是构造失败。canonical 前后 stat 比较 Linux `st_mtim/st_ctim` 或 Darwin `st_mtimespec/st_ctimespec` 的秒及纳秒，读取中同秒修改已读字节仍须拒绝。测试日志绑定当前 C/fixture 源、两个实际 addon 摘要、Node/NAPI、compiler、OS、UID 与实际文件系统类型。
