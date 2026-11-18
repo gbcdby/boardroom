@@ -175,6 +175,39 @@ class WholeSuitePartitionContracts(unittest.TestCase):
         return json.loads(result.stdout)
 
     def test_all_balanced_partitions_cover_the_original_glob_once_and_keep_failure(self):
+        names = [f'tests/file-{i:02d}.test.ts' for i in range(48)] + ['tests/nested/a.test.ts', 'tests/nested/b.test.ts']
+        self.verify_partition_execution(names, 'cost-balanced')
+
+    def test_glob_metacharacter_files_use_the_original_native_glob_without_omission_or_overlap(self):
+        names = [f'tests/file-{i:02d}.test.ts' for i in range(48)] + [
+            'tests/a[1].test.ts', 'tests/a1.test.ts', 'tests/a{1,2}.test.ts', 'tests/a2.test.ts',
+            'tests/a?.test.ts', 'tests/a*.test.ts', 'tests/a+.test.ts', 'tests/a!.test.ts',
+            'tests/a@.test.ts', 'tests/a(1).test.ts', 'tests/nested/a.test.ts']
+        self.verify_partition_execution(names, 'native-glob')
+
+    def test_backslash_filename_retains_original_node_load_failure(self):
+        import shutil
+        with tempfile.TemporaryDirectory(prefix='boardroom-backslash-entry-') as directory:
+            root = Path(directory); support = root / 'scripts/ci'; support.mkdir(parents=True)
+            for filename in self.support_files:
+                shutil.copyfile(self.root / 'scripts/ci' / filename, support / filename)
+            (root / 'tests').mkdir()
+            (root / 'tests/a\\backslash.test.ts').write_text("import {writeFileSync} from 'node:fs';writeFileSync('executed.txt','ran');")
+            env = dict(os.environ, GITHUB_SHA='a' * 40, BOARDROOM_CI_TEST_PARTITION='1/16')
+            original = subprocess.run(['node', '--test', '--test-concurrency=1', '--test-shard=1/16', 'tests/**/*.test.ts'],
+                                      cwd=root, env=env, capture_output=True, text=True, timeout=10)
+            subprocess.run(['node', 'scripts/ci/test-discovery.mjs'], cwd=root, env=env,
+                           capture_output=True, text=True, timeout=10, check=True)
+            actual = subprocess.run(['node', 'scripts/ci/run-linux-partition.mjs', '1/16'], cwd=root, env=env,
+                                    capture_output=True, text=True, timeout=10)
+            for result in (original, actual):
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('ERR_INVALID_MODULE_SPECIFIER', result.stdout)
+                self.assertIn('backslash.test.ts', result.stdout)
+            self.assertEqual(actual.returncode, original.returncode)
+            self.assertFalse((root / 'executed.txt').exists())
+
+    def verify_partition_execution(self, names, selection_mode):
         import shlex
         import shutil
         package = json.loads((self.root / 'package.json').read_text())
@@ -182,7 +215,6 @@ class WholeSuitePartitionContracts(unittest.TestCase):
         self.assertEqual(scripts['test'], 'node --test "tests/**/*.test.ts"')
         self.assertEqual(scripts['test:ci:linux'], 'node --test --test-concurrency=4 "tests/**/*.test.ts"')
         with tempfile.TemporaryDirectory(prefix='boardroom-partition-proof-') as directory:
-            names = [f'tests/file-{i:02d}.test.ts' for i in range(48)] + ['tests/nested/a.test.ts', 'tests/nested/b.test.ts']
             selected, codes, receipts = [], [], []
             for index in range(1, 17):
                 # Actual CI has a fresh workspace per partition. Preserve that
@@ -255,6 +287,7 @@ class WholeSuitePartitionContracts(unittest.TestCase):
                 self.assertEqual(discovery['configuredConcurrency'], 1)
                 self.assertEqual(discovery['result'], 'NOT_RUN')
                 self.assertEqual(discovery['entries'], sorted(names))
+                self.assertEqual(discovery['selectionMode'], selection_mode)
                 self.assertEqual(discovery['selectedEntries'], sorted(entries))
                 self.assertEqual(sorted(entry for shard in discovery['plan'] for entry in shard['entries']), sorted(names))
                 manifests = [json.loads(p.read_text()) for p in (evidence / 'test-entrypoints').glob('slot-*/entrypoints.json')]

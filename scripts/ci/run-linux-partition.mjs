@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { linuxTestSelection, partitionIndex } from './linux-test-partitions.mjs';
+import { linuxTestSelection, partitionIndex, TEST_GLOB } from './linux-test-partitions.mjs';
 
 assert.equal(process.argv.length, 3, 'one fixed partition is required');
 const partition = process.argv[2];
@@ -16,10 +16,12 @@ assert.equal(recorded.schema, 'boardroom-linux-test-discovery/v2');
 assert.equal(recorded.candidate, process.env.GITHUB_SHA);
 assert.equal(recorded.partition, partition);
 assert.equal(recorded.configuredConcurrency, 1);
-for (const key of ['entries', 'entriesSha256', 'selectedEntries', 'weightsSha256', 'planSha256', 'plan']) {
+for (const key of ['entries', 'entriesSha256', 'selectedEntries', 'weightsSha256', 'planSha256', 'plan', 'selectionMode']) {
   assert.deepEqual(recorded[key], expected[key], `discovery changed before execution: ${key}`);
 }
-const result = spawnSync(process.execPath, ['--test', '--test-concurrency=1', ...expected.selectedEntries], {
+const files = expected.selectionMode === 'native-glob'
+  ? [`--test-shard=${partition}`, TEST_GLOB] : expected.selectedEntries;
+const result = spawnSync(process.execPath, ['--test', '--test-concurrency=1', ...files], {
   stdio: 'inherit', env: process.env,
 });
 if (result.error) throw result.error;

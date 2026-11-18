@@ -11,7 +11,9 @@ const selection = linuxTestSelection(partition);
 const manifest = { schema: "boardroom-linux-test-discovery/v2", candidate: process.env.GITHUB_SHA,
   node: process.version, availableParallelism: availableParallelism(), configuredConcurrency: partition === "1/1" ? 4 : 1,
   partition, glob: TEST_GLOB, ...selection,
-  selection: partition === "1/1" ? "complete glob; original unpartitioned runner" : "deterministic longest-first estimates; complete glob assigned once to 16 serial partitions",
+  selection: partition === "1/1" ? "complete glob; original unpartitioned runner"
+    : selection.selectionMode === "native-glob" ? "original native Node full glob and shard; literal metacharacter filenames preserved"
+      : "deterministic longest-first estimates; complete glob assigned once to 16 serial partitions",
   result: "NOT_RUN" };
 const directory = ".agent-output/linux-ci-isolation/full-suite";
 mkdirSync(directory, { recursive: true, mode: 0o700 });

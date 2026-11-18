@@ -9,6 +9,12 @@ export const TEST_GLOB = 'tests/**/*.test.ts';
 const DEFAULT_MS = 1000;
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
+// Node interprets every positional CLI argument as a glob, even when it was
+// already discovered as a filename. Preserve the original full-glob runner for
+// every shard if any filename needs literal semantics that argv cannot promise.
+export const selectionMode = entries => entries.some(path => /[\\*?\[\]{}()!+@]/.test(path))
+  ? 'native-glob' : 'cost-balanced';
+
 export function partitionIndex(partition) {
   assert.equal(typeof partition, 'string', 'unknown fixed partition');
   assert.match(partition, /^(?:[1-9]|1[0-6])\/16$/, 'unknown fixed partition');
@@ -29,13 +35,15 @@ export function planLinuxPartitions(entries, weights) {
     assert.ok(Number.isSafeInteger(cost) && cost > 0 && cost <= 3_600_000, 'invalid scheduling cost');
   }
   const cost = path => Object.hasOwn(weights, path) ? weights[path] : DEFAULT_MS;
-  const ordered = entries.toSorted((a, b) => cost(b) - cost(a) || (a < b ? -1 : a > b ? 1 : 0));
+  const native = selectionMode(entries) === 'native-glob';
+  const ordered = native ? entries.toSorted()
+    : entries.toSorted((a, b) => cost(b) - cost(a) || (a < b ? -1 : a > b ? 1 : 0));
   const shards = Array.from({ length: LINUX_PARTITIONS }, (_, index) => ({
     partition: `${index + 1}/${LINUX_PARTITIONS}`, entries: [], estimatedMs: 0,
   }));
-  for (const path of ordered) {
-    let target = shards[0];
-    for (const shard of shards) if (shard.estimatedMs < target.estimatedMs) target = shard;
+  for (const [index, path] of ordered.entries()) {
+    let target = native ? shards[index % LINUX_PARTITIONS] : shards[0];
+    if (!native) for (const shard of shards) if (shard.estimatedMs < target.estimatedMs) target = shard;
     target.entries.push(path);
     target.estimatedMs += cost(path);
   }
@@ -52,7 +60,7 @@ export function linuxTestSelection(partition) {
   const weights = JSON.parse(rawWeights);
   assert.equal(weights.schema, 'boardroom-linux-test-estimates/v1');
   const plan = planLinuxPartitions(entries, weights.durationMs);
-  return { entries, entriesSha256: digest(entries),
+  return { entries, entriesSha256: digest(entries), selectionMode: selectionMode(entries),
     selectedEntries: index === null ? entries : plan[index].entries,
     estimatedMs: index === null ? plan.reduce((total, shard) => total + shard.estimatedMs, 0) : plan[index].estimatedMs,
     weightsSha256: createHash('sha256').update(rawWeights).digest('hex'),
