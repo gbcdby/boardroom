@@ -31,7 +31,7 @@ export function prepareEntrypoints(root) {
   // has an exact verified source archive without .git, so use its original glob.
   // npm and ordinary helpers do not create a manifest or per-test process log.
   const entries = process.platform === "linux"
-    ? globSync("tests/**/*.test.ts", { cwd: root }).sort()
+    ? globSync("tests/**/*.test.ts", { cwd: root, exclude: name => name === "node_modules" }).sort()
     : execFileSync("git", ["-C", root, "ls-files", "-z", "--", "tests"], {
     encoding: "utf8", timeout: 3000, maxBuffer: MAX_ENTRYPOINT_BYTES,
     stdio: ["ignore", "pipe", "pipe"],

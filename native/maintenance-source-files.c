@@ -892,9 +892,21 @@ static int p3_anchor(p3_context *c, const char *path, const char *label, long ma
   *owned = fd;
   return p3_dir_stat(c, fd, stat_name, fs_name, calls, magic, &st, &fs) ? fd : -1;
 }
+typedef enum { P3_KERNEL_GENERIC, P3_M04_SIZE, P3_M04_RO, P3_M04_DISKSEQ } p3_reader;
+static const char *const p3_read_operations[][7] = {
+  {"open-kernel-read", "fstat-kernel-before", "fstatfs-kernel-before", "read-kernel",
+    "fstatfs-kernel-after", "fstat-kernel-after", "close-kernel-read"},
+  {"open-block-size", "fstat-block-size-before", "fstatfs-block-size-before", "read-block-size",
+    "fstatfs-block-size-after", "fstat-block-size-after", "close-block-size"},
+  {"open-block-ro", "fstat-block-ro-before", "fstatfs-block-ro-before", "read-block-ro",
+    "fstatfs-block-ro-after", "fstat-block-ro-after", "close-block-ro"},
+  {"open-block-diskseq", "fstat-block-diskseq-before", "fstatfs-block-diskseq-before", "read-block-diskseq",
+    "fstatfs-block-diskseq-after", "fstat-block-diskseq-after", "close-block-diskseq"},
+};
 static p3_read p3_kernel_read_phase(p3_context *c, int base, const char *path, size_t limit,
-                                    long magic, bool second, size_t prior_reads) {
+                                    long magic, bool second, size_t prior_reads, p3_reader reader) {
   p3_read out = { .calls = p3_array(c), .read_count = prior_reads };
+  const char *const *operations = p3_read_operations[reader];
   const char *reason = NULL; int fd = -1, rc = -1, error = 0;
   unsigned char *data = NULL; size_t size = 0; bool eof = false;
   struct stat after = {0}; struct statfs fs_after = {0};
@@ -903,17 +915,17 @@ static p3_read p3_kernel_read_phase(p3_context *c, int base, const char *path, s
       .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS };
     errno = 0; fd = (int)syscall(SYS_openat2, base, path, &how, sizeof(how)); error = fd < 0 ? errno : 0;
     out.open_error = error;
-    p3_phase_call(c, out.calls, "open-kernel-read", second, true, fd, error, true);
+    p3_phase_call(c, out.calls, operations[0], second, true, fd, error, true);
     if (fd < 0) reason = "syscall";
   } else {
     reason = c->budget_failed ? "budget" : "binding";
-    p3_phase_call(c, out.calls, "open-kernel-read", second, false, 0, 0, true);
+    p3_phase_call(c, out.calls, operations[0], second, false, 0, 0, true);
   }
   if (fd >= 0) { errno = 0; rc = fstat(fd, &out.st); error = rc ? errno : 0; }
-  p3_phase_call(c, out.calls, "fstat-kernel-before", second, fd >= 0, rc, error, true);
+  p3_phase_call(c, out.calls, operations[1], second, fd >= 0, rc, error, true);
   if (fd >= 0 && rc && !reason) reason = "syscall";
   if (fd >= 0) { errno = 0; rc = fstatfs(fd, &out.fs); error = rc ? errno : 0; }
-  p3_phase_call(c, out.calls, "fstatfs-kernel-before", second, fd >= 0, rc, error, true);
+  p3_phase_call(c, out.calls, operations[2], second, fd >= 0, rc, error, true);
   if (fd >= 0 && rc && !reason) reason = "syscall";
   if (!reason && (!S_ISREG(out.st.st_mode) || (long)out.fs.f_type != magic)) reason = "binding";
   if (!reason) {
@@ -928,7 +940,7 @@ static p3_read p3_kernel_read_phase(p3_context *c, int base, const char *path, s
     if (amount > 16384) amount = 16384;
     if (amount > MAX_CONTEXT_BYTES - c->bytes) amount = MAX_CONTEXT_BYTES - c->bytes;
     errno = 0; const ssize_t got = read(fd, data + size, amount); error = got < 0 ? errno : 0;
-    p3_phase_call(c, out.calls, "read-kernel", second, true, got, error, true);
+    p3_phase_call(c, out.calls, operations[3], second, true, got, error, true);
     ran = true; out.read_count++;
     if (got < 0) { reason = "syscall"; break; }
     if ((size_t)got > amount) { reason = "length"; break; }
@@ -936,18 +948,19 @@ static p3_read p3_kernel_read_phase(p3_context *c, int base, const char *path, s
     size += (size_t)got; c->bytes += (size_t)got;
     if (size > limit || c->bytes > MAX_CONTEXT_BYTES) { reason = "budget"; break; }
   }
-  if (!ran) p3_phase_call(c, out.calls, "read-kernel", second, false, 0, 0, true);
+  if (!ran) p3_phase_call(c, out.calls, operations[3], second, false, 0, 0, true);
   if (!reason && !eof) reason = "budget";
   if (fd >= 0) { errno = 0; rc = fstatfs(fd, &fs_after); error = rc ? errno : 0; }
-  p3_phase_call(c, out.calls, "fstatfs-kernel-after", second, fd >= 0, rc, error, true);
+  p3_phase_call(c, out.calls, operations[4], second, fd >= 0, rc, error, true);
   if (fd >= 0 && rc && !reason) reason = "syscall";
   if (fd >= 0) { errno = 0; rc = fstat(fd, &after); error = rc ? errno : 0; }
-  p3_phase_call(c, out.calls, "fstat-kernel-after", second, fd >= 0, rc, error, true);
+  p3_phase_call(c, out.calls, operations[5], second, fd >= 0, rc, error, true);
   if (fd >= 0 && rc && !reason) reason = "syscall";
   if (!reason && (!p3_same_identity(&out.st, &after) || out.fs.f_type != fs_after.f_type)) {
     p3_changed(c); reason = "binding";
   }
-  const int ce = p3_close(c, &fd, out.calls, second ? "close-kernel-read-after" : "close-kernel-read");
+  char close_name[128]; snprintf(close_name, sizeof(close_name), "%s%s", operations[6], second ? "-after" : "");
+  const int ce = p3_close(c, &fd, out.calls, close_name);
   if (ce && !reason) reason = "syscall";
   if (!reason) {
     out.value = p3_identity(c, &out.st, &out.fs); napi_value bytes;
@@ -961,10 +974,10 @@ static p3_read p3_kernel_read_phase(p3_context *c, int base, const char *path, s
   return out;
 }
 static p3_read p3_kernel_read(p3_context *c, int base, const char *path, size_t limit, long magic) {
-  return p3_kernel_read_phase(c, base, path, limit, magic, false, 0);
+  return p3_kernel_read_phase(c, base, path, limit, magic, false, 0, P3_KERNEL_GENERIC);
 }
-static void p3_kernel_after(p3_context *c, p3_read *first, int base, const char *path, size_t limit, long magic) {
-  p3_read second = p3_kernel_read_phase(c, base, path, limit, magic, true, first->read_count);
+static void p3_kernel_after_reader(p3_context *c, p3_read *first, int base, const char *path, size_t limit, long magic, p3_reader reader) {
+  p3_read second = p3_kernel_read_phase(c, base, path, limit, magic, true, first->read_count, reader);
   p3_extend_calls(c, first->calls, second.calls);
   if ((first->ok && second.ok && (!p3_same_identity(&first->st, &second.st) ||
         first->fs.f_type != second.fs.f_type || first->length != second.length ||
@@ -976,6 +989,25 @@ static void p3_kernel_after(p3_context *c, p3_read *first, int base, const char 
   first->ok = !first->reason; first->read_count = second.read_count;
   if (first->open_error != ENOENT || second.open_error != ENOENT) first->open_error = 0;
   first->result = p3_fact(c, first->calls, first->ok ? first->value : NULL, first->reason);
+}
+static void p3_kernel_after(p3_context *c, p3_read *first, int base, const char *path, size_t limit, long magic) {
+  p3_kernel_after_reader(c, first, base, path, limit, magic, P3_KERNEL_GENERIC);
+}
+/* No caller-selected path, descriptor, node, read limit or magic enters these
+ * readers. The supplied base is the original source-derived node zero FD. */
+static const char *p3_block_leaf(p3_reader reader) {
+  switch (reader) {
+    case P3_M04_SIZE: return "size";
+    case P3_M04_RO: return "ro";
+    case P3_M04_DISKSEQ: return "diskseq";
+    default: return NULL;
+  }
+}
+static p3_read p3_block_before(p3_context *c, int base, p3_reader reader) {
+  return p3_kernel_read_phase(c, base, p3_block_leaf(reader), 4096, SYSFS_MAGIC, false, 0, reader);
+}
+static void p3_block_after(p3_context *c, p3_read *first, int base, p3_reader reader) {
+  p3_kernel_after_reader(c, first, base, p3_block_leaf(reader), 4096, SYSFS_MAGIC, reader);
 }
 static napi_value p3_sample_result(p3_context *c, p3_sample *sample) {
   sample->result = p3_fact(c, sample->calls, sample->reason ? NULL : sample->value, sample->reason);
@@ -1642,6 +1674,13 @@ static void p3_read_reject(p3_context *c, p3_read *read, const char *reason) {
   if (!read->reason) read->reason = reason;
   read->ok = false; read->result = p3_fact(c, read->calls, NULL, read->reason);
 }
+static void p3_block_format(p3_context *c, p3_read *read, p3_reader reader) {
+  if (!read->ok) return;
+  uint64_t ignored = 0;
+  const bool valid = reader == P3_M04_RO ? read->length == 2 && read->bytes[1] == '\n' &&
+    (read->bytes[0] == '0' || read->bytes[0] == '1') : p3_decimal_line(read, UINT64_MAX, &ignored);
+  if (!valid) p3_read_reject(c, read, "format");
+}
 static void p3_mountinfo_limit(p3_context *c, p3_read *read) {
   if (!read->ok) return;
   size_t lines = 0, length = 0;
@@ -1731,7 +1770,11 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
     else p3_call(&c, graph->calls, "enumerate-device-graph", false, 0, 0, true);
     c.graph_active = false;
   }
-  const bool device_bound = device_node && device_node->valid;
+  const bool device_bound = graph && device_node == &graph->nodes[0] && device_node->valid;
+  const int block_base = device_bound ? device_node->fd : -1;
+  p3_read block_size = p3_block_before(&c, block_base, P3_M04_SIZE);
+  p3_read block_ro = p3_block_before(&c, block_base, P3_M04_RO);
+  p3_read block_diskseq = p3_block_before(&c, block_base, P3_M04_DISKSEQ);
   snprintf(path, sizeof(path), "fs/ext4/%s", device_bound ? device_node->name : "");
   p3_directory health_dir = p3_directory_before(&c, device_bound && ext4 ? c.sys_fd : -1,
     path, "health-directory", SYSFS_MAGIC);
@@ -1765,6 +1808,14 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
   napi_value legacy_value = p3_sample_join(&c, &legacy, &legacy_after);
   napi_value unique_value = p3_sample_join(&c, &unique, &unique_after);
   napi_value mount_value = p3_sample_join(&c, &mount, &mount_after);
+  p3_block_after(&c, &block_size, block_base, P3_M04_SIZE);
+  p3_block_after(&c, &block_ro, block_base, P3_M04_RO);
+  p3_block_after(&c, &block_diskseq, block_base, P3_M04_DISKSEQ);
+  /* Compare the successful raw endpoints before classifying stable invalid
+   * text. Otherwise two different invalid strings could hide a change. */
+  p3_block_format(&c, &block_size, P3_M04_SIZE);
+  p3_block_format(&c, &block_ro, P3_M04_RO);
+  p3_block_format(&c, &block_diskseq, P3_M04_DISKSEQ);
   if (graph) { p3_graph_after(&c, graph); p3_finish_nodes(&c, graph); }
   p3_directory_after(&c, &health_dir); p3_directory_after(&c, &ext4_proc);
   if (!ext4_proc.post_valid) { p3_read_reject(&c, &options, "binding"); p3_read_reject(&c, &mb_groups, "binding"); }
@@ -1801,8 +1852,8 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
 
   napi_value result = p3_object(&c), source = p3_object(&c), filesystem_carrier = p3_object(&c),
     process = p3_object(&c), kernel = p3_object(&c), mount_group = p3_object(&c), configuration = p3_object(&c),
-    device = p3_object(&c), health = p3_object(&c), health_fields = p3_array(&c), version;
-  if (napi_create_uint32(env, 1, &version) != napi_ok || !p3_property(&c, result, "abiVersion", version) ||
+    device = p3_object(&c), block_attributes = p3_object(&c), health = p3_object(&c), health_fields = p3_array(&c), version;
+  if (napi_create_uint32(env, 2, &version) != napi_ok || !p3_property(&c, result, "abiVersion", version) ||
       !set_text(env, result, "rootKind", owner->directory ? "directory" : "file") ||
       !set_text(env, result, "rootStage", owner->metadata_only ? "metadata-only" : "readable")) c.failed = true;
   (void)p3_property(&c, source, "before", extended_metadata(env, &before, &fs_before, owner->directory));
@@ -1822,6 +1873,18 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
   (void)p3_property(&c, configuration, "mbGroups", mb_groups.result); (void)p3_property(&c, configuration, "journalTaskBefore", journal_before.result);
   (void)p3_property(&c, configuration, "journalTaskAfter", journal_after.result); (void)p3_property(&c, configuration, "journalIoprio", ioprio_value);
   const bool device_stable = device_bound && device_node->post_valid;
+  if (!device_stable) {
+    p3_read_reject(&c, &block_size, "binding"); p3_read_reject(&c, &block_ro, "binding");
+    p3_read_reject(&c, &block_diskseq, "binding");
+  }
+  napi_value reader_revision = NULL, source_node_index = NULL;
+  if (napi_create_uint32(env, 1, &reader_revision) != napi_ok || napi_create_uint32(env, 0, &source_node_index) != napi_ok) c.failed = true;
+  (void)p3_property(&c, block_attributes, "readerRevision", reader_revision);
+  (void)p3_property(&c, block_attributes, "sourceNodeIndex", source_node_index);
+  (void)p3_property(&c, block_attributes, "size", block_size.result);
+  (void)p3_property(&c, block_attributes, "readOnly", block_ro.result);
+  (void)p3_property(&c, block_attributes, "diskSequence", block_diskseq.result);
+  (void)p3_property(&c, device, "blockAttributes", block_attributes);
   napi_value device_binding = p3_fact(&c, device_node->binding_calls,
     device_stable ? p3_binding_value(&c, device_node) : NULL, device_stable ? NULL : "binding");
   (void)p3_property(&c, device, "binding", device_binding); (void)p3_property(&c, device, "dev", device_node->dev.result);

@@ -59,7 +59,7 @@ def command_for(entry, partition=None):
                 "--test-name-pattern='unknown source file users' tests/maintenance-sqlite.test.ts "
                 "2>&1 | tee .agent-output/maintenance-native-diagnostics/sqlite-source-users.tap")
     if entry == 'full-suite':
-        # Native Node sharding keeps the complete original glob. Each matrix
+        # Cost-balanced selection keeps the complete original glob. Each matrix
         # runner owns its PG service/UID and runs one file at a time, avoiding
         # another test entry's concurrent exit in its same-UID source inventory.
         # No scheduling flag reaches nested Node. The unpartitioned entry stays at four.

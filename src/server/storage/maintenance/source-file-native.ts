@@ -126,8 +126,15 @@ export interface SourceFileDeviceGraph {
   readonly nodes: readonly SourceFileDeviceGraphNode[];
   readonly edges: readonly { readonly kind: "parent" | "holder" | "slave"; readonly from: number; readonly to: number }[];
 }
+export interface SourceFileBlockAttributes {
+  readonly readerRevision: 1;
+  readonly sourceNodeIndex: 0;
+  readonly size: SourceFileContextFact<SourceFileKernelReadValue>;
+  readonly readOnly: SourceFileContextFact<SourceFileKernelReadValue>;
+  readonly diskSequence: SourceFileContextFact<SourceFileKernelReadValue>;
+}
 export interface SourceFileRootEnvironment {
-  readonly abiVersion: 1;
+  readonly abiVersion: 2;
   readonly rootKind: SourceFileMetadata["kind"];
   readonly rootStage: SourceFileRootInfo["stage"];
   readonly source: {
@@ -156,7 +163,7 @@ export interface SourceFileRootEnvironment {
     readonly journalTaskAfter: SourceFileContextFact<SourceFileKernelReadValue> };
   readonly device: { readonly binding: SourceFileContextFact<SourceFileDeviceBinding>;
     readonly dev: SourceFileContextFact<SourceFileKernelReadValue>; readonly uevent: SourceFileContextFact<SourceFileKernelReadValue>;
-    readonly topology: SourceFileContextFact<SourceFileDeviceGraph> };
+    readonly topology: SourceFileContextFact<SourceFileDeviceGraph>; readonly blockAttributes: SourceFileBlockAttributes };
   readonly health: { readonly binding: SourceFileContextFact<SourceFileHealthBinding>;
     readonly fields: readonly { readonly name: SourceFileHealthName; readonly fact: SourceFileContextFact<SourceFileKernelReadValue> }[] };
   readonly auxiliaryCalls: readonly SourceFileNativeCall[];
@@ -377,6 +384,10 @@ function checkedKernelReadValue(value: unknown, limit: number): SourceFileKernel
     mode: item.mode as bigint, filesystemType: item.filesystemType as bigint });
 }
 function checkedKernelReadFact(value: unknown, limit: number, samples: 1 | 2 = 1): SourceFileContextFact<SourceFileKernelReadValue> {
+  return checkedReadFact(value, limit, samples, ["open-kernel-read", "fstat-kernel-before", "fstatfs-kernel-before",
+    "read-kernel", "fstatfs-kernel-after", "fstat-kernel-after", "close-kernel-read"]);
+}
+function checkedReadFact(value: unknown, limit: number, samples: 1 | 2, template: readonly string[]): SourceFileContextFact<SourceFileKernelReadValue> {
   const item = exactObject(value, ["status", "reason", "value", "calls"]);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1048576 || samples !== 1 && samples !== 2 || !Array.isArray(item.calls)
     || item.calls.length < 7 * samples || item.calls.length > 256 + 7 * samples) throw invalidContext();
@@ -384,11 +395,10 @@ function checkedKernelReadFact(value: unknown, limit: number, samples: 1 | 2 = 1
   const operations: string[] = [], lengths: number[] = [];
   let offset = 0;
   for (let phase = 0; phase < samples; phase++) {
-    const suffix = phase ? "-after" : "", end = rawOperations.indexOf(`close-kernel-read${suffix}`, offset);
+    const suffix = phase ? "-after" : "", end = rawOperations.indexOf(`${template[6]}${suffix}`, offset);
     const reads = end - offset - 5;
     if (reads < 1 || reads > 257) throw invalidContext();
-    const stage = ["open-kernel-read", "fstat-kernel-before", "fstatfs-kernel-before",
-      ...Array<string>(reads).fill("read-kernel"), "fstatfs-kernel-after", "fstat-kernel-after", "close-kernel-read"];
+    const stage = [...template.slice(0, 3), ...Array<string>(reads).fill(template[3]!), ...template.slice(4)];
     operations.push(...stage.map(operation => operation + suffix)); lengths.push(stage.length); offset = end + 1;
   }
   const fact = checkedContextFact(value, operations, raw => checkedKernelReadValue(raw, limit));
@@ -504,9 +514,32 @@ function checkedProcessIdentity(value: unknown): SourceFileRootEnvironment["proc
   }
   return fact;
 }
+const blockReaders = [
+  { field: "size", label: "block-size" },
+  { field: "readOnly", label: "block-ro" },
+  { field: "diskSequence", label: "block-diskseq" },
+] as const;
+type BlockLabel = typeof blockReaders[number]["label"];
+const blockReadTemplate = (label: BlockLabel): readonly string[] => [
+  `open-${label}`, `fstat-${label}-before`, `fstatfs-${label}-before`, `read-${label}`,
+  `fstatfs-${label}-after`, `fstat-${label}-after`, `close-${label}`,
+];
+// This finite table distinguishes the before phase's post-stat from the
+// after phase. A suffix/prefix heuristic would confuse their ownership.
+const blockOperations = new Map(blockReaders.flatMap(({ label }) => ["", "-after"].flatMap(suffix =>
+  blockReadTemplate(label).map(operation => [operation + suffix, label + suffix] as const))));
+const blockReadCalls = new Set(blockReaders.flatMap(({ label }) => [`read-${label}`, `read-${label}-after`]));
+function denseDataArray(value: unknown, maximum: number): asserts value is unknown[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length > maximum
+    || Reflect.ownKeys(value).length !== value.length + 1) throw invalidContext();
+  for (let index = 0; index < value.length; index++)
+    if (!Object.getOwnPropertyDescriptor(value, String(index))?.hasOwnProperty("value")) throw invalidContext();
+}
 const kernelReadOperations = new Set(["open-kernel-read", "fstat-kernel-before", "fstatfs-kernel-before", "read-kernel",
   "fstatfs-kernel-after", "fstat-kernel-after", "close-kernel-read"]);
 function auxiliaryResource(operation: string): string | null {
+  const block = blockOperations.get(operation);
+  if (block !== undefined) return block;
   if (kernelReadOperations.has(operation)) return "kernel-read";
   if (operation.endsWith("-after") && kernelReadOperations.has(operation.slice(0, -6))) return "kernel-read-after";
   let match = /^(?:open|fstat|fstatfs|readlink|close)-(namespace-(?:pid|mount|user)(?:-after)?)$/.exec(operation);
@@ -536,6 +569,7 @@ function auxiliaryResource(operation: string): string | null {
 }
 function checkedAuxiliaryCalls(value: unknown, complete = false, unavailableGraph = false): readonly SourceFileNativeCall[] {
   if (!Array.isArray(value) || value.length > 32768) throw invalidContext();
+  if (complete) denseDataArray(value, 32768);
   const operations = value.map(raw => {
     const item = exactObject(raw, ["operation", "rc", "errno"]);
     if (item.operation === "enumerate-device-graph" && unavailableGraph) {
@@ -549,10 +583,16 @@ function checkedAuxiliaryCalls(value: unknown, complete = false, unavailableGrap
   if (operations.filter(operation => operation === "enumerate-device-graph").length > 1) throw invalidContext();
   if (!complete) return calls;
   const opened = new Map<string, bigint>();
+  const firstBlock = calls.findIndex(call => blockOperations.has(call.operation) && call.rc !== null);
+  const lastBlock = calls.findLastIndex(call => blockOperations.has(call.operation) && call.rc !== null);
   let bytes = 0n;
-  for (const call of calls) {
+  for (const [index, call] of calls.entries()) {
     if (call.operation === "enumerate-device-graph") continue; // Fixed null/null diagnostic; it owns no FD.
     const resource = auxiliaryResource(call.operation)!;
+    if (blockOperations.has(call.operation) && call.rc !== null
+      && (!opened.has("sysfs-root") || !opened.has("device-node-0"))) throw invalidContext();
+    if (index > firstBlock && index < lastBlock && call.rc !== null
+      && ["open-sysfs-root", "close-sysfs-root", "open-device-node-0", "close-device-node-0"].includes(call.operation)) throw invalidContext();
     if (call.operation.startsWith("open-")) {
       if (call.rc !== null && call.rc >= 0n) {
         if (call.rc > 0x7fffffffn || opened.has(resource) || [...opened.values()].includes(call.rc)) throw invalidContext();
@@ -567,12 +607,77 @@ function checkedAuxiliaryCalls(value: unknown, complete = false, unavailableGrap
     if (call.operation.startsWith("stat-device-link-") && call.rc !== null && !opened.has("sysfs-root")) throw invalidContext();
     if (call.operation === "stat-health-directory-link-after" && call.rc !== null && !opened.has("sysfs-root")
       || call.operation === "stat-ext4-proc-directory-link-after" && call.rc !== null && !opened.has("proc-root")) throw invalidContext();
-    if ((/^read-kernel(?:-after)?$/.test(call.operation) || call.operation.startsWith("readlink-") || call.operation.startsWith("getdents-"))
+    if ((/^read-kernel(?:-after)?$/.test(call.operation) || blockReadCalls.has(call.operation)
+      || call.operation.startsWith("readlink-") || call.operation.startsWith("getdents-"))
       && call.rc !== null && call.rc > 0n) bytes += call.rc;
     if (bytes > 2097152n) throw invalidContext();
   }
   if (opened.size) throw invalidContext();
   return calls;
+}
+function checkedBlockAttributes(value: unknown, source: SourceFileExtendedMetadata,
+  device: Pick<SourceFileRootEnvironment["device"], "binding" | "dev" | "topology">,
+  auxiliary: readonly SourceFileNativeCall[]): SourceFileBlockAttributes {
+  const item = exactObject(value, ["readerRevision", "sourceNodeIndex", "size", "readOnly", "diskSequence"]);
+  if (item.readerRevision !== 1 || item.sourceNodeIndex !== 0) throw invalidContext();
+  const phases: SourceFileNativeCall[][] = [[], []];
+  const fields = blockReaders.map(({ field, label }) => {
+    const raw = exactObject(item[field], ["status", "reason", "value", "calls"]);
+    denseDataArray(raw.calls, 270);
+    const fact = checkedReadFact(raw, 4096, 2, blockReadTemplate(label));
+    if (fact.status === "unavailable" && !["syscall", "length", "binding", "budget", "format"].includes(fact.reason)) throw invalidContext();
+    const split = fact.calls.findIndex(call => call.operation === `open-${label}-after`);
+    const samples = [fact.calls.slice(0, split), fact.calls.slice(split)];
+    const lengths: bigint[] = [];
+    for (const [phase, calls] of samples.entries()) {
+      const reads = calls.slice(3, -3);
+      if (reads.every(call => call.rc === null) && reads.length !== 1
+        || reads.some(call => call.rc === null) && reads.some(call => call.rc !== null)) throw invalidContext();
+      if ((calls[0]!.rc === null || calls[0]!.rc === -1n) && calls.length !== 7) throw invalidContext();
+      if (fact.status === "unavailable" && fact.reason === "format") {
+        if (calls.some(call => call.rc === null || call.rc < 0n) || reads.at(-1)!.rc !== 0n
+          || reads.slice(0, -1).some(call => call.rc! <= 0n)
+          || [1, 2, calls.length - 3, calls.length - 2, calls.length - 1].some(index => calls[index]!.rc !== 0n)) throw invalidContext();
+        const total = reads.reduce((sum, call) => sum + call.rc!, 0n);
+        if (total > 4096n) throw invalidContext();
+        lengths.push(total);
+      }
+      phases[phase]!.push(...calls);
+    }
+    if (lengths.length === 2 && lengths[0] !== lengths[1]) throw invalidContext();
+    if (fact.status === "unavailable" && fact.reason === "syscall" && !fact.calls.some(call => call.rc === -1n)) throw invalidContext();
+    if (fact.status === "observed") {
+      const bytes = fact.value.bytes, text = bytes.toString("ascii");
+      if (fact.value.filesystemType !== 0x62656572n || bytes.some(byte => byte > 0x7f)
+        || (field === "readOnly" ? text !== "0\n" && text !== "1\n" : bytes.length > 21
+          || !/^(0|[1-9][0-9]*)\n$/.test(text) || BigInt(text.slice(0, -1)) > 0xffffffffffffffffn)) throw invalidContext();
+    }
+    return [field, fact] as const;
+  });
+  const expected = phases.flat(), actual = auxiliary.filter(call => blockOperations.has(call.operation));
+  if (expected.length !== actual.length || expected.some((call, index) => call.operation !== actual[index]!.operation
+    || call.rc !== actual[index]!.rc || call.errno !== actual[index]!.errno)) throw invalidContext();
+  if (fields.some(([, fact]) => fact.status === "observed")) {
+    if (device.binding.status !== "observed" || device.dev.status !== "observed") throw invalidContext();
+    const binding = device.binding.value, major = ((source.dev >> 8n) & 0xfffn) | ((source.dev >> 32n) & 0xfffff000n);
+    const minor = (source.dev & 0xffn) | ((source.dev >> 12n) & 0xffffff00n);
+    if (binding.sourceDevMajor !== major || binding.sourceDevMinor !== minor
+      || !device.dev.value.bytes.equals(Buffer.from(`${major}:${minor}\n`))
+      || device.dev.value.device !== binding.sysfs.device
+      || fields.some(([, fact]) => fact.status === "observed" && fact.value.device !== binding.sysfs.device)) throw sourceChanged();
+    if (device.topology.status === "observed") {
+      const node = device.topology.value.nodes[0];
+      if (!node || node.index !== 0 || node.major !== major || node.minor !== minor
+        || ["device", "inode", "mode", "filesystemType"].some(key => node.identity[key as keyof SourceFileNativeIdentity]
+          !== binding.sysfs[key as keyof SourceFileNativeIdentity]) || !node.kernelName.equals(binding.kernelName)
+        || !node.resolved.equals(binding.resolved) || !node.kernelName.equals(binding.sbId)
+        || node.dev.status !== "observed" || !node.dev.value.bytes.equals(device.dev.value.bytes)) throw sourceChanged();
+    }
+    const scope = auxiliary.filter(call => deviceScopeOperations(0).includes(call.operation));
+    if (scope.length !== device.binding.calls.length || scope.some((call, index) => call.operation !== device.binding.calls[index]!.operation
+      || call.rc !== device.binding.calls[index]!.rc || call.errno !== device.binding.calls[index]!.errno)) throw invalidContext();
+  }
+  return Object.freeze({ readerRevision: 1, sourceNodeIndex: 0, ...Object.fromEntries(fields) }) as SourceFileBlockAttributes;
 }
 const deviceScopeOperations = (index: number) => [`open-device-node-${index}`, `fstat-device-node-${index}-before`,
   `fstatfs-device-node-${index}-before`, `readlink-device-node-${index}`, `fstat-device-node-${index}-after`,
@@ -724,7 +829,7 @@ function checkedGraphFact(value: unknown): SourceFileContextFact<SourceFileDevic
 }
 function checkedEnvironment(value: unknown, info: SourceFileRootInfo): SourceFileRootEnvironment {
   const item = exactObject(value, ["abiVersion", "rootKind", "rootStage", "source", "process", "kernel", "mount", "configuration", "device", "health", "auxiliaryCalls"]);
-  if (item.abiVersion !== 1 || item.rootKind !== info.kind || item.rootStage !== info.stage) throw invalidContext();
+  if (item.abiVersion !== 2 || item.rootKind !== info.kind || item.rootStage !== info.stage) throw invalidContext();
   const source = exactObject(item.source, ["before", "after", "metadataCalls", "filesystemCarrier", "carrierCalls"]);
   const carrier = exactObject(source.filesystemCarrier, ["role", "before", "after"]), parent = info.stage === "metadata-only";
   if (carrier.role !== (parent ? "bootstrap-parent" : "root")) throw invalidContext();
@@ -740,7 +845,7 @@ function checkedEnvironment(value: unknown, info: SourceFileRootInfo): SourceFil
   const kernel = exactObject(item.kernel, ["uname", "notes", "config"]);
   const mount = exactObject(item.mount, ["legacyStatx", "uniqueStatx", "statmount", "mountinfo"]);
   const configuration = exactObject(item.configuration, ["tune", "options", "mbGroups", "journalTaskBefore", "journalIoprio", "journalTaskAfter"]);
-  const device = exactObject(item.device, ["binding", "dev", "uevent", "topology"]);
+  const device = exactObject(item.device, ["binding", "dev", "uevent", "topology", "blockAttributes"]);
   const health = exactObject(item.health, ["binding", "fields"]);
   function read(raw: unknown, limit: number, magic: bigint, samples: 1 | 2 = 1): SourceFileContextFact<SourceFileKernelReadValue> {
     const fact = checkedKernelReadFact(raw, limit, samples);
@@ -770,7 +875,10 @@ function checkedEnvironment(value: unknown, info: SourceFileRootInfo): SourceFil
     return Object.freeze({ name, fact: read(row.fact, 4096, 0x62656572n) });
   });
   const topology = checkedGraphFact(device.topology);
-  return Object.freeze({ abiVersion: 1, rootKind: info.kind, rootStage: info.stage,
+  const binding = checkedDeviceBinding(device.binding), dev = read(device.dev, 4096, 0x62656572n, 2);
+  const auxiliaryCalls = checkedAuxiliaryCalls(item.auxiliaryCalls, true, topology.status === "unavailable");
+  const blockAttributes = checkedBlockAttributes(device.blockAttributes, before, { binding, dev, topology }, auxiliaryCalls);
+  return Object.freeze({ abiVersion: 2, rootKind: info.kind, rootStage: info.stage,
     source: Object.freeze({ before, after, metadataCalls, filesystemCarrier: Object.freeze({ role: parent ? "bootstrap-parent" : "root", before: carrierBefore, after: carrierAfter }), carrierCalls }),
     process: Object.freeze({ identity: checkedProcessIdentity(process.identity), threadStatus: read(process.threadStatus, 65536, 0x9fa0n),
       processStat: read(process.processStat, 8192, 0x9fa0n), namespaces: checkedNamespaces(process.namespaces) }),
@@ -780,10 +888,9 @@ function checkedEnvironment(value: unknown, info: SourceFileRootInfo): SourceFil
     configuration: Object.freeze({ tune: abi(configuration.tune, "ioctl-get-tune", 232, 2), options: read(configuration.options, 16384, 0x9fa0n, 2),
       mbGroups: read(configuration.mbGroups, 16384, 0x9fa0n, 2), journalTaskBefore: read(configuration.journalTaskBefore, 4096, 0x62656572n),
       journalIoprio: ioprio, journalTaskAfter: read(configuration.journalTaskAfter, 4096, 0x62656572n) }),
-    device: Object.freeze({ binding: checkedDeviceBinding(device.binding), dev: read(device.dev, 4096, 0x62656572n, 2),
-      uevent: read(device.uevent, 4096, 0x62656572n, 2), topology }),
+    device: Object.freeze({ binding, dev, uevent: read(device.uevent, 4096, 0x62656572n, 2), topology, blockAttributes }),
     health: Object.freeze({ binding: checkedHealthBinding(health.binding), fields: Object.freeze(fields) }),
-    auxiliaryCalls: checkedAuxiliaryCalls(item.auxiliaryCalls, true, topology.status === "unavailable") });
+    auxiliaryCalls });
 }
 function checkedFact<T>(value: unknown, operations: readonly string[], validate: (value: unknown) => void): SourceFileNativeFact<T> {
   const item = object(value);

@@ -14,14 +14,132 @@
 #include <unistd.h>
 #include <string.h>
 #include <dirent.h>
+#include <stdio.h>
 
 long __real_syscall(long number, ...);
 #if defined(P3_TEST_CONTENT_OPEN_FAILURE) || defined(P3_TEST_CONTENT_CLOSE_FAILURE) || \
     defined(P3_TEST_PSEUDO_CLOSE_FAILURE) || defined(P3_TEST_SHORT_READS) || \
     defined(P3_TEST_NO_EOF) || defined(P3_TEST_SOURCE_CHANGE) || defined(P3_TEST_BYTE_BUDGET) || \
-    defined(P3_TEST_DIRECTORY_CLOSE_FAILURE)
+    defined(P3_TEST_DIRECTORY_CLOSE_FAILURE) || defined(P3_TEST_BLOCK_READERS)
 #define P3_TEST_FORWARD_GETTERS 1
 int __real_ioctl(int fd, unsigned long request, ...);
+#endif
+
+#ifdef P3_TEST_BLOCK_READERS
+/* A compile-time isolated pseudo-sysfs tree of owned ordinary files. The
+ * fixture changes only the sysfs magic and resolved path observations; read,
+ * EOF, fstat identities, opens and closes act on those real files. This is
+ * never a real sysfs/driver/qualification positive. No runtime override is
+ * present in the production addon. */
+static struct { int fd, kind; } block_owned[64];
+static size_t block_owned_count;
+static unsigned block_size_opens, block_disk_opens;
+static bool block_fault_applied;
+static int block_kind(int fd) {
+  for (size_t i = 0; i < block_owned_count; i++) if (block_owned[i].fd == fd) return block_owned[i].kind;
+  return 0;
+}
+static int block_track(int fd, int kind) {
+  if (fd < 0) return fd;
+  if (block_owned_count == 64) { close(fd); errno = EMFILE; return -1; }
+  block_owned[block_owned_count].fd = fd; block_owned[block_owned_count++].kind = kind; return fd;
+}
+static void block_forget(int fd) {
+  for (size_t i = 0; i < block_owned_count; i++) if (block_owned[i].fd == fd) {
+    block_owned[i] = block_owned[--block_owned_count]; return;
+  }
+}
+int __real_close(int fd);
+#if defined(P3_TEST_BLOCK_RAW_CHANGE) || defined(P3_TEST_BLOCK_IDENTITY_CHANGE) || defined(P3_TEST_BLOCK_APPEAR) || defined(P3_TEST_BLOCK_BAD_CHANGE)
+static int block_write(const char *name, const char *bytes) {
+  char target[4096]; snprintf(target, sizeof(target), "%s/devices/m04-test-node/%s", P3_TEST_BLOCK_ROOT, name);
+  int fd = open(target, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) return -1;
+  const size_t size = strlen(bytes); const ssize_t wrote = write(fd, bytes, size); const int rc = __real_close(fd);
+  if (wrote != (ssize_t)size || rc) { errno = EIO; return -1; }
+  return 0;
+}
+#endif
+int __real_fstatfs(int fd, struct statfs *value);
+int __wrap_fstatfs(int fd, struct statfs *value) {
+  const int rc = __real_fstatfs(fd, value);
+  if (!rc && block_kind(fd)) value->f_type = SYSFS_MAGIC;
+  return rc;
+}
+ssize_t __real_readlinkat(int fd, const char *name, char *buffer, size_t size);
+ssize_t __wrap_readlinkat(int fd, const char *name, char *buffer, size_t size) {
+  int target = -1; char extra;
+  if (sscanf(name, "self/fd/%d%c", &target, &extra) == 1 && block_kind(target) == 2) {
+    const char *resolved = "/sys/devices/m04-test-node"; size_t length = strlen(resolved);
+    if (length > size) length = size;
+    memcpy(buffer, resolved, length); return (ssize_t)length;
+  }
+  return __real_readlinkat(fd, name, buffer, size);
+}
+ssize_t __real_read(int fd, void *buffer, size_t size);
+ssize_t __wrap_read(int fd, void *buffer, size_t size) {
+  // Short reads are real reads of the same original leaf, never invented bytes.
+  return __real_read(fd, buffer, block_kind(fd) == 3 && size ? 1 : size);
+}
+#ifdef __GLIBC__
+ssize_t __real___read_chk(int fd, void *buffer, size_t size, size_t capacity);
+ssize_t __wrap___read_chk(int fd, void *buffer, size_t size, size_t capacity) {
+  if (size > capacity) return __real___read_chk(fd, buffer, size, capacity);
+  return __wrap_read(fd, buffer, size);
+}
+#endif
+int __wrap_close(int fd) {
+  const int kind = block_kind(fd), rc = __real_close(fd);
+  if (rc) return rc;
+  block_forget(fd);
+  if (block_fault_applied) return rc;
+#if defined(P3_TEST_BLOCK_CLOSE_FAILURE)
+  if (kind == 3) { block_fault_applied = true; errno = EIO; return -1; }
+#elif defined(P3_TEST_BLOCK_RAW_CHANGE) || defined(P3_TEST_BLOCK_BAD_CHANGE)
+  if (kind == 3) {
+    block_fault_applied = true;
+    return block_write("size",
+#ifdef P3_TEST_BLOCK_BAD_CHANGE
+      "01\n"
+#else
+      "2\n"
+#endif
+    );
+  }
+#elif defined(P3_TEST_BLOCK_IDENTITY_CHANGE)
+  if (kind == 3) {
+    block_fault_applied = true;
+    if (rename(P3_TEST_BLOCK_ROOT "/devices/m04-test-node/size", P3_TEST_BLOCK_ROOT "/retained-size")) return -1;
+    return block_write("size", "18446744073709551615\n");
+  }
+#elif defined(P3_TEST_BLOCK_DISAPPEAR)
+  if (kind == 5) {
+    block_fault_applied = true;
+    return unlink(P3_TEST_BLOCK_ROOT "/devices/m04-test-node/diskseq");
+  }
+#else
+  (void)kind;
+#endif
+  return rc;
+}
+static int block_open(long number, int base, const char *name, const struct open_how *how, size_t size) {
+  if (base == AT_FDCWD && !strcmp(name, "/sys"))
+    return block_track((int)__real_syscall(number, base, P3_TEST_BLOCK_ROOT, how, size), 1);
+  const int parent = block_kind(base);
+  int kind = 6;
+  if (parent == 1 && !strncmp(name, "dev/block/", 10)) kind = 2;
+  if (parent == 2 && !strcmp(name, "size")) { kind = 3; block_size_opens++; }
+  if (parent == 2 && !strcmp(name, "ro")) kind = 4;
+  if (parent == 2 && !strcmp(name, "diskseq")) { kind = 5; block_disk_opens++; }
+  const int fd = (int)__real_syscall(number, base, name, how, size), error = errno;
+#ifdef P3_TEST_BLOCK_APPEAR
+  if (kind == 5 && block_disk_opens == 1 && fd < 0 && error == ENOENT) {
+    if (block_write("diskseq", "0\n")) return -1;
+  }
+#endif
+  errno = error;
+  return parent ? block_track(fd, kind) : fd;
+}
 #endif
 
 #ifdef P3_TEST_DIRECTORY_CLOSE_FAILURE
@@ -145,6 +263,9 @@ long __wrap_syscall(long number, ...) {
     const struct open_how *how = va_arg(args, const struct open_how *);
     const size_t size = va_arg(args, size_t);
     va_end(args);
+#ifdef P3_TEST_BLOCK_READERS
+    return block_open(number, fd, name, how, size);
+#endif
 #ifdef P3_TEST_CONTENT_OPEN_FAILURE
     if ((how->flags & O_NOATIME) && !(how->flags & O_PATH) && !(how->flags & O_DIRECTORY)) { errno = EOWNERDEAD; return -1; }
 #endif
