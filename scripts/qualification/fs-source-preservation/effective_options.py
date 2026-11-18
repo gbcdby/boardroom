@@ -3,7 +3,8 @@
 Inputs are supplied data, including completion and source-context claims. Checking
 their consistency does not attest a live read, held FD, kernel build, task lease,
 or bounded native execution. This module has no reader, bridge, matcher, registry,
-CLI, or production caller. Every result keeps qualification UNSUPPORTED.
+CLI, or production caller. Success means PARSED_SUPPLIED, retains the original
+supplied records, and always keeps qualification UNSUPPORTED.
 
 Grammar: Linux Azure 7.0.0-1017.17~24.04.1, fs/ext4/mballoc.c
 ff5c47fbbbe353356752b7f0628abe06ebdacadfbdb803fd90d853447b53892f;
@@ -81,6 +82,8 @@ class Read:
     close_rc: int
     close_errno: int
     native_finished: bool
+    source: str  # Supplied endpoint label, not authenticated provenance.
+    slot: str  # Independent of the enclosing Context.phase.
 
 
 @dataclass(frozen=True)
@@ -122,8 +125,9 @@ T = TypeVar('T')
 @dataclass(frozen=True)
 class Observation(Generic[T]):
     value: T
-    status: str = 'OBSERVED'
+    supplied_inputs: tuple
     reason: str = 'RUNTIME_QUALIFICATION_NOT_RUN'
+    status: str = field(default='PARSED_SUPPLIED', init=False)
     qualification: str = field(default='UNSUPPORTED', init=False)
     production_supported: bool = field(default=False, init=False)
 
@@ -143,6 +147,8 @@ class JournalPriority:
     priority_class: int
     hint: int
     level: int
+    value_domain: str
+    value_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -179,9 +185,16 @@ def _context(actual, expected):
     require(actual == expected, 'SOURCE_BINDING_MISMATCH', status='FAILED')
 
 
-def _read(record, expected):
+def _read(record, expected, source, slot='single'):
     require(type(record) is Read)
     _context(record.context, expected)
+    require(type(record.source) is str and record.source in
+            ('ext4_proc_options', 'ext4_mb_groups', 'ext4_mb_structs_summary',
+             'ext4_journal_task'), 'READ_SOURCE_UNSUPPORTED')
+    require(record.source == source, 'READ_SOURCE_MISMATCH', status='FAILED')
+    slots = ('journal-before', 'journal-after') if source == 'ext4_journal_task' else ('single',)
+    require(type(record.slot) is str and record.slot in slots and record.slot == slot,
+            'READ_SLOT_MISMATCH', status='FAILED')
     require(type(record.raw) is bytes and len(record.raw) <= 16384 and
             _integer(record.bytes_read, 0, 16384) and record.bytes_read == len(record.raw))
     require(type(record.read_rc) is int and _integer(record.errno, 0, 4095))
@@ -196,8 +209,14 @@ def _read(record, expected):
 
 
 def _options(record, expected):
-    raw = _read(record, expected)
-    require(raw.endswith(b'\n') and raw.count(b'\n') == 1 and b'\r' not in raw)
+    raw = _read(record, expected, 'ext4_proc_options')
+    # The pinned proc/options endpoint uses LF between tokens. The comma form
+    # belongs to another display source; never normalize it into this record.
+    require(raw.endswith(b'\n') and b'\r' not in raw and b'\0' not in raw and
+            b',' not in raw, 'OPTION_SHAPE_UNSUPPORTED')
+    lines = raw[:-1].split(b'\n')
+    require(len(lines) <= 256 and lines[0] == b'rw' and
+            all(0 < len(line) <= 1024 for line in lines), 'OPTION_SHAPE_UNSUPPORTED')
     try:
         parsed = options(raw)
     except Invalid:
@@ -211,7 +230,7 @@ def _options(record, expected):
 
 def mb_summary(record: Read, expected: Context,
                options_record: Read) -> Observation[MbSummary]:
-    raw = _read(record, expected)
+    raw = _read(record, expected, 'ext4_mb_structs_summary')
     current_options = _options(options_record, expected)
     require(raw.endswith(b'\n') and b'\0' not in raw)
     lines = raw[:-1].split(b'\n')
@@ -236,11 +255,11 @@ def mb_summary(record: Read, expected: Context,
     if 'mb_optimize_scan' in current_options:
         require(current_options['mb_optimize_scan'] == str(bit),
                 'EFFECTIVE_OPTION_MISMATCH', status='FAILED')
-    return Observation(MbSummary(bit, counts[0], counts[1]))
+    return Observation(MbSummary(bit, counts[0], counts[1]), (record, options_record))
 
 
-def _journal_task(record, expected):
-    raw = _read(record, expected)
+def _journal_task(record, expected, slot):
+    raw = _read(record, expected, 'ext4_journal_task', slot)
     require(re.fullmatch(rb'[1-9][0-9]{0,9}\n', raw) is not None,
             'JOURNAL_TASK_NOT_VISIBLE')
     pid = int(raw[:-1])
@@ -250,7 +269,7 @@ def _journal_task(record, expected):
 
 def journal_priority(before: Read, call: IoprioCall, after: Read,
                      expected: Context) -> Observation[JournalPriority]:
-    pid = _journal_task(before, expected)  # Never accept who=0 as a fallback.
+    pid = _journal_task(before, expected, 'journal-before')  # Never fall back to who=0.
     require(type(call) is IoprioCall)
     _context(call.context, expected)
     require(type(call.which) is int and call.which == 1 and
@@ -259,19 +278,26 @@ def journal_priority(before: Read, call: IoprioCall, after: Read,
     require(_integer(call.errno, 0, 4095))
     require(call.errno == 0, 'GETTER_UNAVAILABLE', status='FAILED', errno=call.errno)
     require(call.native_finished is True, 'NATIVE_NOT_FINISHED', status='FAILED')
-    require(_journal_task(after, expected) == pid, 'CONTEXT_CHANGED', status='FAILED')
+    require(_journal_task(after, expected, 'journal-after') == pid,
+            'CONTEXT_CHANGED', status='FAILED')
     require(_integer(call.raw_value, 0, 65535), 'IOPRIO_VALUE_UNSUPPORTED')
     # Exact UAPI: class bits 15..13, hint bits 12..3, level bits 2..0.
     # NONE/0 (also the missing-io_context result) is not mount default BE/3.
-    # Unknown classes/hints stay unsupported instead of being masked away.
+    # Unknown classes/hints are retained and marked unsupported, never masked.
     priority_class = call.raw_value >> 13
     hint = (call.raw_value >> 3) & 1023
     level = call.raw_value & 7
-    require(priority_class in (1, 2, 3) and hint <= 7, 'IOPRIO_VALUE_UNSUPPORTED')
-    value = JournalPriority(pid, call.raw_value, priority_class, hint, level)
+    if call.raw_value == 0:
+        domain, value_reason = 'NONE_ZERO', None
+    elif priority_class in (1, 2, 3) and hint <= 7:
+        domain, value_reason = 'RT_BE_IDLE_HINT_0_7', None
+    else:
+        domain, value_reason = 'UNSUPPORTED_BITS', 'IOPRIO_VALUE_UNSUPPORTED'
+    value = JournalPriority(pid, call.raw_value, priority_class, hint, level,
+                            domain, value_reason)
     # Equal PIDs and contexts are necessary consistency checks, never a task
     # lease. D0 has not closed the held-source -> journal task lifetime proof.
-    return Observation(value, status='UNSUPPORTED', reason='JOURNAL_TASK_IDENTITY_UNPROVEN')
+    return Observation(value, (before, call, after), reason='JOURNAL_TASK_IDENTITY_UNPROVEN')
 
 
 def _mapping_claim(claim, expected):
@@ -305,4 +331,5 @@ def dummy_omission(options_record: Read, tune: TuneCall, mapping: MappingClaim,
     # Only the old live-feature shape is mapped. No policy from persistent
     # defaults, missing data, an encrypt bit, or a different/unknown feature set.
     require(masks == (60, 710, 1131), 'FEATURE_MAPPING_UNSUPPORTED')
-    return Observation(DummyOmission(masks), reason='CONDITIONAL_SOURCE_MAPPING_ONLY')
+    return Observation(DummyOmission(masks), (options_record, tune, mapping),
+                       reason='CONDITIONAL_SOURCE_MAPPING_ONLY')
