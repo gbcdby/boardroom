@@ -259,7 +259,7 @@ test("CS17/18 array keys and driver rows are fixed before another await", async 
   try { await seed(f); await native(f, async (view, m) => {
     const data = envelope(m); let first = true;
     await assert.rejects(collectLayoutMemoryInventory(snapshot(async (sql, params) => { const rows = await view.query(sql, params); if (!first) return rows;
-      first = false; return new Proxy(rows, { ownKeys: () => ["unknown", "length"] }); }), data.request, data.bytes), errorCode("unsupported_catalog"));
+      first = false; return new Proxy(rows, { ownKeys: () => ["unknown", "length"] }); }), data.request, data.bytes), errorCode("read_unavailable"));
     let changed = false;
     const result = await collectLayoutMemoryInventory(snapshot(async (sql, params) => { const rows = await view.query(sql, params);
       if (!changed && sql.includes("OFFSET") && rows.length) return new Proxy(rows, { ownKeys(target) { queueMicrotask(() => { changed = true; target[0]!.v0 = Buffer.from("changed-after-snapshot").toString("hex"); }); return Reflect.ownKeys(target); } }); return rows;
@@ -287,6 +287,109 @@ test("CS17/18 request, offset bytes, receiver, raw aliases and unknown errors st
     await assert.rejects(collectLayoutMemoryInventory(view, fresh.request, new Uint8Array(new Resizable(8, { maxByteLength: 9 }))), errorCode("invalid_input"));
     const detached = new Uint8Array(8); structuredClone(detached, { transfer: [detached.buffer] }); await assert.rejects(collectLayoutMemoryInventory(view, fresh.request, detached), errorCode("invalid_input"));
   }); } finally { await f.close(); }
+});
+
+test("CS02/17 query is captured before request reflection can replace it", async () => {
+  const f = await identityFixture();
+  try { await seed(f); await native(f, async (view, m) => {
+    const d = envelope(m); let original = 0, replacement = 0, reflections = 0;
+    const observed: DbReadSnapshot = { async query<T extends DbRow>(sql: string, params: readonly unknown[] = []): Promise<T[]> {
+      assert.equal(this, observed); original++; return view.query<T>(sql, params);
+    } };
+    const request = new Proxy(d.request, { ownKeys(target) {
+      reflections++; observed.query = async () => { replacement++; throw new Error("replacement must not run"); };
+      return Reflect.ownKeys(target);
+    } });
+    const result = await collectLayoutMemoryInventory(observed, request, d.bytes);
+    assert.equal(result.inventory.versions.length, 9); assert.equal(reflections, 1);
+    assert.ok(original > 1); assert.equal(replacement, 0);
+  }); } finally { await f.close(); }
+});
+
+test("CS09 query result container failures use read_unavailable", async t => {
+  const f = await identityFixture();
+  try { await native(f, async (view, m) => {
+    for (const stage of ["catalog", "data"] as const) await t.test(stage, async () => {
+      const d = envelope(m); let replaced = false;
+      const observed = snapshot(async (sql, params) => {
+        if (!replaced && (stage === "catalog" || sql.startsWith("SELECT CAST(COUNT(*) AS TEXT)"))) {
+          replaced = true; return {} as DbRow[];
+        }
+        return view.query(sql, params);
+      });
+      await assert.rejects(collectLayoutMemoryInventory(observed, d.request, d.bytes), errorCode("read_unavailable"));
+      assert.equal(replaced, true);
+    });
+  }); } finally { await f.close(); }
+});
+
+test("CS17/18 isolated descriptor guards reject inherited data and hooks", async t => {
+  if (process.env["COLLECTOR_DESCRIPTOR_CHILD"] !== "1") {
+    const environment: NodeJS.ProcessEnv = { ...process.env, COLLECTOR_DESCRIPTOR_CHILD: "1" }; delete environment["NODE_TEST_CONTEXT"];
+    const { stdout } = await promisify(execFile)(process.execPath, ["--test", "--test-name-pattern=CS17/18 isolated descriptor guards", fileURLToPath(import.meta.url)], { env: environment, timeout: 30_000, maxBuffer: 1_048_576 });
+    assert.match(stdout, /collector_descriptor_boundary_pass/); return;
+  }
+  const empty = new Uint8Array(), digest = sha256(empty);
+  const request = () => ({ contract: "layout-memory-collection-request/r1", source: { kind: "sqlite", databaseInstanceId: "a".repeat(32), identityDigest: "b".repeat(64) },
+    frozenManifest: { ref: `snapshots/${digest}/database-manifests.json`, sha256: digest, bytes: "0" }, storageId: "descriptor-control", invocationStartedAtNs: process.hrtime.bigint().toString() });
+  const restore = (key: string, descriptor: PropertyDescriptor | undefined) => {
+    Reflect.deleteProperty(Object.prototype, key);
+    if (descriptor) Object.defineProperty(Object.prototype, key, descriptor);
+  };
+  for (const inherited of ["value-data", "value-getter", "get", "set"] as const) await t.test(`request ${inherited}`, async () => {
+    let hooks = 0, getters = 0, queries = 0; const value = request();
+    if (inherited.startsWith("value")) Object.defineProperty(value, "contract", { __proto__: null, enumerable: true, configurable: true,
+      get() { getters++; return "layout-memory-collection-request/r1"; } } as PropertyDescriptor);
+    const key = inherited.startsWith("value") ? "value" : inherited, original = Object.getOwnPropertyDescriptor(Object.prototype, key);
+    const proxy = new Proxy(value, { ownKeys(target) {
+      Object.defineProperty(Object.prototype, key, inherited === "value-data"
+        ? { __proto__: null, configurable: true, value: "layout-memory-collection-request/r1" } as PropertyDescriptor
+        : { __proto__: null, configurable: true, get() { hooks++; throw new Error("inherited descriptor hook must not run"); } } as PropertyDescriptor);
+      return Reflect.ownKeys(target);
+    } });
+    let promise: ReturnType<typeof collectLayoutMemoryInventory>;
+    try { promise = collectLayoutMemoryInventory(snapshot(async () => { queries++; return []; }), proxy, empty); }
+    finally { restore(key, original); }
+    await assert.rejects(promise!, errorCode(inherited.startsWith("value") ? "invalid_input" : "manifest_invalid"));
+    assert.equal(hooks, 0); assert.equal(getters, 0); assert.equal(queries, 0);
+  });
+  for (const getter of [false, true]) await t.test(`query accessor with inherited value ${getter ? "getter" : "data"}`, async () => {
+    let hooks = 0, getters = 0, queries = 0;
+    const view = Object.create(null) as DbReadSnapshot;
+    Object.defineProperty(view, "query", { __proto__: null, get() { getters++; return async () => []; } } as PropertyDescriptor);
+    const original = Object.getOwnPropertyDescriptor(Object.prototype, "value"), replacement = async () => { queries++; return []; };
+    const input = request(); let promise: ReturnType<typeof collectLayoutMemoryInventory>;
+    Object.defineProperty(Object.prototype, "value", getter
+      ? { __proto__: null, configurable: true, get() { hooks++; return replacement; } } as PropertyDescriptor
+      : { __proto__: null, configurable: true, value: replacement } as PropertyDescriptor);
+    try { promise = collectLayoutMemoryInventory(view, input, empty); } finally { restore("value", original); }
+    await assert.rejects(promise!, errorCode("invalid_input")); assert.equal(hooks, 0); assert.equal(getters, 0); assert.equal(queries, 0);
+  });
+  const f = await identityFixture();
+  try { await seed(f); await native(f, async (view, m) => {
+    for (const stage of ["array", "catalog", "data"] as const) await t.test(`driver ${stage} accessor`, async () => {
+      const d = envelope(m), original = Object.getOwnPropertyDescriptor(Object.prototype, "value"); let installed = false, getters = 0, hooks = 0;
+      const observed = snapshot(async (sql, params) => {
+        const rows = await view.query(sql, params);
+        if (installed || stage === "data" && !sql.startsWith("SELECT CAST(COUNT(*) AS TEXT)")) return rows;
+        const target = stage === "array" ? rows : rows[0]!, key = stage === "array" ? "0" : stage === "catalog" ? "query_only" : "row_count";
+        const expected = Object.getOwnPropertyDescriptor(target, key)!.value;
+        Object.defineProperty(target, key, { __proto__: null, configurable: true, enumerable: true, get() { getters++; return expected; } } as PropertyDescriptor);
+        const proxy = new Proxy(target, { ownKeys(inner) {
+          installed = true; Object.defineProperty(Object.prototype, "value", { __proto__: null, configurable: true, get() { hooks++; return expected; } } as PropertyDescriptor);
+          return Reflect.ownKeys(inner);
+        } });
+        if (stage === "array") return proxy as DbRow[];
+        rows[0] = proxy as DbRow; return rows;
+      });
+      let failure: unknown;
+      try { await collectLayoutMemoryInventory(observed, d.request, d.bytes); } catch (error) { failure = error; }
+      finally { restore("value", original); }
+      assert.equal(installed, true); assert.equal(getters, 0); assert.equal(hooks, 0);
+      assert.ok(errorCode(stage === "array" ? "read_unavailable" : stage === "catalog" ? "unsupported_catalog" : "inventory_invalid")(failure));
+    });
+  }); } finally { await f.close(); }
+  process.stdout.write("collector_descriptor_boundary_pass\n");
 });
 
 test("CS15 one pending real query settles after deadline; native rejection retains precedence", async () => {

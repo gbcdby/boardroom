@@ -32,8 +32,8 @@ export class MemoryCollectionError extends Error {
   constructor(code: MemoryCollectionErrorCode) {
     const safe = errorCodes.includes(code) ? code : "invalid_input";
     super(`layout_memory_collection:${safe}`);
-    Object.defineProperty(this, "name", { value: "MemoryCollectionError" });
-    Object.defineProperty(this, "code", { value: safe, enumerable: true });
+    Object.defineProperty(this, "name", { __proto__: null, value: "MemoryCollectionError" } as PropertyDescriptor);
+    Object.defineProperty(this, "code", { __proto__: null, value: safe, enumerable: true } as PropertyDescriptor);
     failures.set(this, safe);
   }
 }
@@ -57,7 +57,13 @@ const integerColumns: readonly (readonly number[])[] = [[4, 6], [2, 3, 5], [6, 7
 const nullableColumns: readonly (readonly number[])[] = [[2, 3], [11], [4, 5, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24]];
 const rowLimits = [4096, 16384, 16384];
 const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
-function put(target: object, key: string, value: unknown) { Object.defineProperty(target, key, { value, enumerable: true }); }
+function put(target: object, key: string, value: unknown) {
+  Object.defineProperty(target, key, { __proto__: null, value, enumerable: true } as PropertyDescriptor);
+}
+function ownData(descriptor: PropertyDescriptor | undefined): descriptor is PropertyDescriptor & { value: unknown } {
+  return descriptor !== undefined && Object.hasOwn(descriptor, "value") && Object.hasOwn(descriptor, "writable")
+    && !Object.hasOwn(descriptor, "get") && !Object.hasOwn(descriptor, "set");
+}
 function append<T>(array: T[], value: T) { put(array, String(array.length), value); }
 function record(values: RecordValue): RecordValue {
   const result = Object.create(null) as RecordValue;
@@ -73,7 +79,7 @@ function ownRecord(value: unknown, fields: readonly string[], code: MemoryCollec
   for (const key of keys) {
     requireValue(typeof key === "string" && fields.includes(key), code);
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    requireValue(descriptor && "value" in descriptor && descriptor.enumerable, code);
+    requireValue(ownData(descriptor) && descriptor.enumerable, code);
     put(result, key, descriptor.value);
   }
   return result;
@@ -85,7 +91,7 @@ function ownArray(value: unknown, maximum: number, code: MemoryCollectionErrorCo
   for (const key of keys) {
     requireValue(typeof key === "string" && (key === "length" || unsigned.test(key)), code);
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    requireValue(descriptor && "value" in descriptor, code); descriptors.set(key, descriptor);
+    requireValue(ownData(descriptor), code); descriptors.set(key, descriptor);
   }
   const length: unknown = descriptors.get("length")?.value;
   requireValue(typeof length === "number" && Number.isSafeInteger(length) && length >= 0 && length <= maximum && keys.length === length + 1, code);
@@ -134,7 +140,7 @@ class Budget {
       this.charge(2 + Math.max(0, keys.length - 1)); const result = Object.create(null) as RecordValue;
       for (const key of keys) {
         requireValue(typeof key === "string", code); const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        requireValue(descriptor && "value" in descriptor && descriptor.enumerable, code);
+        requireValue(ownData(descriptor) && descriptor.enumerable, code);
         this.string(key, code); this.charge(1); put(result, key, this.copy(descriptor.value, code, depth + 1, ancestors));
       }
       return Object.freeze(result);
@@ -230,7 +236,7 @@ function fixedDataRows(rows: unknown[]): readonly RecordValue[] {
     const keys = Reflect.ownKeys(value); requireValue(keys.length <= 128, "inventory_invalid"); const row = Object.create(null) as RecordValue;
     for (const key of keys) {
       requireValue(typeof key === "string" && key.length <= 32, "inventory_invalid"); const d = Object.getOwnPropertyDescriptor(value, key);
-      requireValue(d && "value" in d && d.enumerable, "inventory_invalid"); const cell: unknown = d.value;
+      requireValue(ownData(d) && d.enumerable, "inventory_invalid"); const cell: unknown = d.value;
       requireValue(cell === null || typeof cell === "string" || typeof cell === "boolean" || typeof cell === "number" && Number.isSafeInteger(cell) && !Object.is(cell, -0), "inventory_invalid");
       if (typeof cell === "string") { requireValue(cell.length <= 32 * MiB, "budget_exceeded"); payload += Buffer.byteLength(cell); requireValue(payload <= 32 * MiB, "budget_exceeded"); }
       put(row, key, cell);
@@ -239,6 +245,11 @@ function fixedDataRows(rows: unknown[]): readonly RecordValue[] {
   }
   return Object.freeze(result);
 }
+function fixedQuery(snapshot: DbReadSnapshot): DbReadSnapshot["query"] {
+  const descriptor = Object.getOwnPropertyDescriptor(snapshot, "query");
+  requireValue(ownData(descriptor) && typeof descriptor.value === "function", "invalid_input");
+  return descriptor.value as DbReadSnapshot["query"];
+}
 class Reader {
   readonly receiver: DbReadSnapshot;
   readonly query: DbReadSnapshot["query"];
@@ -246,9 +257,8 @@ class Reader {
   readonly catalog = new Budget(MiB);
   calls = 0;
   nonPageCalls = 0;
-  constructor(snapshot: DbReadSnapshot, start: string) {
-    const d = Object.getOwnPropertyDescriptor(snapshot, "query"); requireValue(d && "value" in d && typeof d.value === "function", "invalid_input");
-    this.receiver = snapshot; this.query = d.value as DbReadSnapshot["query"];
+  constructor(snapshot: DbReadSnapshot, query: DbReadSnapshot["query"], start: string) {
+    this.receiver = snapshot; this.query = query;
     const time = BigInt(start); requireValue(time <= process.hrtime.bigint(), "invalid_input"); this.deadline = time + 120_000_000_000n; this.check();
   }
   check() { requireValue(process.hrtime.bigint() <= this.deadline, "budget_exceeded"); }
@@ -256,7 +266,7 @@ class Reader {
     this.check(); requireValue(++this.calls <= 512, "budget_exceeded"); if (!page) requireValue(++this.nonPageCalls <= 96, "budget_exceeded");
     const argumentsCopy = Object.freeze(params.map(v => Array.isArray(v) ? Object.freeze([...v]) : v)); let value: unknown;
     try { value = await invoke(this.query, this.receiver, [sql, argumentsCopy]); } catch { throw new MemoryCollectionError("read_unavailable"); }
-    this.check(); const rows = ownArray(value, page ? 128 : 250_000, metadata ? "unsupported_catalog" : "inventory_invalid");
+    this.check(); const rows = ownArray(value, page ? 128 : 250_000, "read_unavailable");
     const fixed = metadata ? this.catalog.copy(rows, "unsupported_catalog") : fixedDataRows(rows);
     return Object.freeze(record({ rows: fixed })) as { rows: unknown[] };
   }
@@ -605,7 +615,8 @@ function pgData(index: number, schema: string, kind: "count" | "capacity" | "pag
 export async function collectLayoutMemoryInventory(snapshot: DbReadSnapshot, request: unknown, frozenManifestBytes: Uint8Array): Promise<ReadonlyDeep<MemoryCollectionObservation>> {
   let phase: MemoryCollectionErrorCode = "invalid_input";
   try {
-    const fixed = fixedRequest(request), bytes = copyBytes(frozenManifestBytes), reader = new Reader(snapshot, fixed.invocationStartedAtNs);
+    const query = fixedQuery(snapshot), fixed = fixedRequest(request), bytes = copyBytes(frozenManifestBytes);
+    const reader = new Reader(snapshot, query, fixed.invocationStartedAtNs);
     phase = "manifest_invalid"; const manifest = fixedManifest(bytes, fixed); phase = "read_unavailable";
     let input: ReadonlyDeep<FrozenMemoryInputValue>, recheck: (() => Promise<void>) | undefined;
     if (fixed.source.kind === "sqlite") {
