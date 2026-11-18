@@ -270,7 +270,7 @@ pgTest("A12-C PostgreSQL unfinished calls retire before callback failure rollbac
 
 
 pgTest("A12-C PostgreSQL preserves facts-close retirement without retiring pure-mechanism factories", async t => {
-  for (const factsUsed of [true, false]) await t.test(`factsUsed=${factsUsed}`, async () => {
+  for (const factsUsed of [true, false]) await t.test(`factsUsed=${factsUsed}`, async t => {
     const f = await postgresAuditFixture(), query = Client.prototype.query, end = Client.prototype.end;
     const failure = Object.assign(new Error("actual source end completed then EIO"), { code: "EIO" });
     let writer: Client | undefined, captured: SourceLock | undefined, injected = false;
@@ -309,6 +309,20 @@ pgTest("A12-C PostgreSQL preserves facts-close retirement without retiring pure-
       const next = f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference));
       if (factsUsed) { await assert.rejects(next, { code: "maintenance_lost" }); await assert.rejects(f.mutex.assertHeld(), { code: "maintenance_lost" }); }
       else { assert.equal((await next).facts.actor.actorId, initial.facts.actor.actorId); await f.mutex.assertHeld(); }
+      // The facts-close injection invalidates the adapter. Its natural heartbeat
+      // may already retain that expected loss; release must preserve it while
+      // still closing the native mutex. Pure-mechanism and other close errors fail.
+      let releaseOutcome = "released";
+      try { await f.mutex.release(); }
+      catch (error) {
+        if (!factsUsed) throw error;
+        assert(error instanceof MaintenanceFailure);
+        assert.equal(error.code, "maintenance_lost");
+        assert.equal(error.message, new MaintenanceFailure("maintenance_lost").message);
+        releaseOutcome = "expected-monitor-loss";
+      }
+      t.diagnostic(`factsUsed=${factsUsed}; source-end injection confirmed; mutex release: ${releaseOutcome}`);
+      if (factsUsed) await assert.rejects(f.adapter.observe(), { code: "maintenance_lost" });
     } finally { Client.prototype.query = query; Client.prototype.end = end; await f.close(); }
   });
 });

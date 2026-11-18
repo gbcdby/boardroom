@@ -271,14 +271,31 @@ try {
   // AC-CORE-06：waiting / working 状态
   // =========================================================================
   // B 进入等待 → waiting；发送后返回 → working
+  const waitB3Started = performance.now();
+  let waitB3Completed = false;
   const waitB3 = callTool(agents.B.client, "wait_for_messages", { timeoutMs: 8000 });
-  await sleep(250);
-  const stWaiting = (await http(server.url, "GET", `/api/projects/${projectId}/members/${memberB}/status`))
-    .json.memberStatus;
-  check("AC-CORE-06", "B 等待中显示 waiting", stWaiting?.state === "waiting", `state=${stWaiting?.state}`);
+  // 固定 sleep 不证明请求已进入等待；沿用本次原 8000ms 界限观察实际 pending + 状态。
+  // 同时处理拒绝，确保下面断言失败后的 client.close 不掩盖原失败/最终汇总。
+  void waitB3.then(() => { waitB3Completed = true; }, () => { waitB3Completed = true; });
+  let waitingReady = false, beforeWorking;
+  while (!waitB3Completed && performance.now() - waitB3Started < 8000) {
+    const response = await fetch(`${server.url}/api/projects/${projectId}/members/${memberB}/status`, {
+      signal: AbortSignal.timeout(Math.max(1, Math.ceil(8000 - (performance.now() - waitB3Started)))),
+    });
+    const status = await response.json();
+    beforeWorking = { pending: server.mcpPendingWaitCount, state: status.memberStatus?.state,
+      completed: waitB3Completed, elapsedMs: Math.round(performance.now() - waitB3Started) };
+    waitingReady = response.ok && !waitB3Completed && beforeWorking.pending === 1
+      && beforeWorking.state === "waiting" && performance.now() - waitB3Started < 8000;
+    if (waitingReady) break;
+    await sleep(5);
+  }
+  check("AC-CORE-06", "B 等待中显示 waiting", waitingReady, JSON.stringify(beforeWorking));
   const m3 = await humanSendMessage(server.url, groupId, humanMemberId, `@Bob 触发 working`, [memberB]);
   const resB3 = await waitB3;
-  ensureMessage(resB3, m3.id);
+  check("AC-CORE-06", "本次挂起等待由目标消息实时唤醒",
+    resB3.status === "message" && resB3.drainedBacklog === false && Boolean(findMessage(resB3, m3.id)),
+    `status=${resB3.status}, drainedBacklog=${resB3.drainedBacklog}`);
   const stWorking = (await http(server.url, "GET", `/api/projects/${projectId}/members/${memberB}/status`))
     .json.memberStatus;
   check("AC-CORE-06", "B 处理消息时显示 working", stWorking?.state === "working", `state=${stWorking?.state}`);

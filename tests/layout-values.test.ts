@@ -144,3 +144,64 @@ test("LV-AC01/03/04: unsupported contracts remain distinct from malformed data a
     assert.notEqual(layoutValueDigest(parsePublicationRecipeValue(altered)), digestJson(values.recipe));
   }
 });
+
+test("LV-AC01: public parsers consume one complete key snapshot for objects and arrays", () => {
+  function driftingKeys<T extends object>(value: T) {
+    const target = Object.assign(value, { callback: () => { throw new Error("must never run"); } });
+    let enumerations = 0;
+    const descriptorKeys: PropertyKey[] = [];
+    const proxy = new Proxy(target, {
+      ownKeys(item) {
+        enumerations++;
+        return Reflect.ownKeys(item).filter(key => enumerations !== 1 || key !== "callback");
+      },
+      getOwnPropertyDescriptor(item, key) {
+        descriptorKeys.push(key);
+        return Reflect.getOwnPropertyDescriptor(item, key);
+      },
+    });
+    return { proxy, target, count: () => enumerations, descriptorKeys };
+  }
+  const input = fixture();
+  for (const [parser, value] of [[parseLayoutIntentValue, input.intent], [parsePublicationRecipeValue, input.recipe],
+    [parsePublicationBundleValue, input.bundle]] as const) {
+    const expected = parser(value);
+    const reflected = driftingKeys(structuredClone(value));
+    assert.deepEqual(parser(reflected.proxy), expected);
+    assert.equal(reflected.count(), 1);
+    assert.equal(reflected.descriptorKeys.includes("callback"), false);
+    fails(() => parser(reflected.target), "invalid_value");
+    fails(() => parser(Object.defineProperty(structuredClone(value), "hidden", { value: true })), "invalid_value");
+  }
+  const recipe = fixture().recipe;
+  const expected = parsePublicationRecipeValue(recipe);
+  const reflected = driftingKeys(recipe.targets);
+  recipe.targets = reflected.proxy;
+  assert.deepEqual(parsePublicationRecipeValue(recipe), expected);
+  assert.equal(reflected.count(), 1);
+  assert.equal(reflected.descriptorKeys.includes("callback"), false);
+  recipe.targets = reflected.target;
+  fails(() => parsePublicationRecipeValue(recipe), "invalid_value");
+
+  const missingDescriptor = new Proxy(fixture().recipe, {
+    getOwnPropertyDescriptor(item, key) { return key === "privateInputs" ? undefined : Reflect.getOwnPropertyDescriptor(item, key); },
+  });
+  fails(() => parsePublicationRecipeValue(missingDescriptor), "invalid_value");
+});
+
+test("LV-AC01: public parsers sanitize hostile reflection errors without inspecting caller error properties", () => {
+  let inspected = 0;
+  const thrownProxy = new Proxy({}, { getPrototypeOf() { throw new Error("private-reflection-marker"); } });
+  const modified = new LayoutValueError("invalid_value");
+  modified.message = "private-modified-error";
+  Object.assign(modified, { cause: "private-cause" });
+  Object.defineProperty(modified, "code", { get() { inspected++; throw new Error("private-code-getter"); } });
+  for (const parser of [parseLayoutIntentValue, parsePublicationRecipeValue, parsePublicationBundleValue]) {
+    for (const thrown of [thrownProxy, modified]) {
+      const input = new Proxy({}, { ownKeys() { throw thrown; } });
+      assert.throws(() => parser(input), (error: unknown) => error instanceof LayoutValueError
+        && error.code === "invalid_value" && error.message === "layout_internal_value:invalid_value" && !("cause" in error));
+    }
+  }
+  assert.equal(inspected, 0);
+});

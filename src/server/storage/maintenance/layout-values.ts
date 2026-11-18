@@ -10,6 +10,7 @@ type ErrorCode = "invalid_value" | "unsupported_shape" | "value_conflict" | "inc
   | "inventory_integrity" | "budget_exceeded";
 const errorCodes: readonly ErrorCode[] = ["invalid_value", "unsupported_shape", "value_conflict", "incomplete_inventory",
   "inventory_integrity", "budget_exceeded"];
+const failureCodes = new WeakMap<object, ErrorCode>();
 export class LayoutValueError extends Error {
   readonly code: ErrorCode;
   constructor(code: ErrorCode) {
@@ -17,6 +18,7 @@ export class LayoutValueError extends Error {
     super(`layout_internal_value:${safe}`);
     this.name = "LayoutValueError";
     this.code = safe;
+    failureCodes.set(this, safe);
   }
 }
 
@@ -63,17 +65,24 @@ export function copyLayoutInternalData(value: unknown, budget: "value" | "invent
     const keys = Reflect.ownKeys(item);
     if (keys.length > MAX_NODES + (array ? 1 : 0)) throw new LayoutValueError("budget_exceeded");
     if (keys.some(key => typeof key !== "string")) throw new LayoutValueError("invalid_value");
-    const descriptors = Object.getOwnPropertyDescriptors(item);
+    // Capture descriptors for this one key snapshot; never project a later
+    // enumeration onto stale keys and silently drop fields observed there.
+    const descriptors = new Map<string, PropertyDescriptor>();
+    for (const key of keys as string[]) {
+      const descriptor = Object.getOwnPropertyDescriptor(item, key);
+      if (!descriptor) throw new LayoutValueError("invalid_value");
+      descriptors.set(key, descriptor);
+    }
     ancestors.add(item);
     try {
       if (array) {
-        const length: unknown = descriptors.length?.value;
+        const length: unknown = descriptors.get("length")?.value;
         if (typeof length !== "number" || length > MAX_NODES) throw new LayoutValueError("budget_exceeded");
         if (keys.length !== length + 1) throw new LayoutValueError("invalid_value");
         charge(2 + Math.max(0, length - 1));
         const result: unknown[] = [];
         for (let index = 0; index < length; index++) {
-          const descriptor = descriptors[String(index)];
+          const descriptor = descriptors.get(String(index));
           if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) throw new LayoutValueError("invalid_value");
           result.push(visit(descriptor.value, depth + 1));
         }
@@ -82,7 +91,7 @@ export function copyLayoutInternalData(value: unknown, budget: "value" | "invent
       charge(2 + Math.max(0, keys.length - 1));
       const result: Record<string, unknown> = {};
       for (const key of keys as string[]) {
-        const descriptor = descriptors[key]!;
+        const descriptor = descriptors.get(key)!;
         if (!("value" in descriptor) || !descriptor.enumerable) throw new LayoutValueError("invalid_value");
         stringSize(key); charge(1);
         Object.defineProperty(result, key, { value: visit(descriptor.value, depth + 1), enumerable: true });
@@ -92,8 +101,9 @@ export function copyLayoutInternalData(value: unknown, budget: "value" | "invent
   }
   try { return visit(value, 0); }
   catch (error) {
-    if (error instanceof LayoutValueError) throw error;
-    throw new LayoutValueError("invalid_value");
+    // Thrown values can themselves be hostile Proxies or modified errors.
+    const code = error !== null && (typeof error === "object" || typeof error === "function") ? failureCodes.get(error) : undefined;
+    throw new LayoutValueError(code ?? "invalid_value");
   }
 }
 
