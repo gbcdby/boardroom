@@ -298,3 +298,294 @@ test("CS15 one pending real query settles after deadline; native rejection retai
     await assert.rejects(promise, errorCode(reject ? "read_unavailable" : "budget_exceeded")); assert.equal(calls, 1); assert.equal(active, false);
   } }); } finally { await f.close(); }
 });
+
+function nodeCount(value: unknown) {
+  let count = 0; const stack = [value];
+  while (stack.length) { const v = stack.pop(); count++; if (v !== null && typeof v === "object") for (const item of Object.values(v)) stack.push(item); }
+  return count;
+}
+test("CS13 exact 32MiB canonical input passes; one extra byte fails", async () => {
+  const f = await identityFixture();
+  try { await seed(f); await f.db.exec("UPDATE memory_summary_requests SET evidence=NULL"); await f.db.exec("UPDATE memory_summary_requests SET evidence='' WHERE id='summary-0'");
+    let base = 0; await native(f, async (view, m) => { const d = envelope(m); base = Buffer.byteLength(canonicalJson((await collectLayoutMemoryInventory(view, d.request, d.bytes)).input)); });
+    const extra = (33_554_432 - base) % 2, length = (33_554_432 - base - extra) / 2;
+    await f.db.exec("UPDATE memory_summary_requests SET evidence=? WHERE id='summary-0'", ["x".repeat(length)]);
+    await native(f, async (view, m) => { const d = envelope(m); d.request.storageId += "x".repeat(extra);
+      const result = await collectLayoutMemoryInventory(view, d.request, d.bytes); assert.equal(Buffer.byteLength(canonicalJson(result.input)), 33_554_432);
+      await assert.rejects(collectLayoutMemoryInventory(view, { ...d.request, storageId: d.request.storageId + "x" }, d.bytes), errorCode("budget_exceeded")); });
+  } finally { await f.close(); }
+});
+test("CS13 exactly 250000 input nodes of real complete history pass; one additional node fails", async () => {
+  const f = await identityFixture();
+  try { const agent = await f.repos.agents.create({ displayName: "bounded history", hostType: "codex-cli" });
+    await f.db.exec("INSERT INTO memory_documents VALUES('bounded','global',NULL,?,1,'',0,?,?,'human')", [agent.id, at, author]);
+    const insert = (count: number, nonNull: number) => f.db.exec("WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<?) INSERT INTO memory_versions SELECT printf('v-%05d',n),'bounded',n,n-1,'',0,?,?,'owner','human',printf('m-%05d',n),CASE WHEN n<=? THEN 'deleted-summary' ELSE NULL END,? FROM seq", [count, sha256(""), author, nonNull, at]);
+    await insert(1, 0); let fixed = 0;
+    await native(f, async (view, m) => { const d = envelope(m); fixed = nodeCount((await collectLayoutMemoryInventory(view, d.request, d.bytes)).input) - 39; });
+    const versions = Math.floor((250_000 - fixed) / 39), remaining = 250_000 - fixed - versions * 39;
+    await f.db.exec("DELETE FROM memory_versions"); await f.db.exec("UPDATE memory_documents SET version=?", [versions]); await insert(versions, remaining);
+    await native(f, async (view, m) => { const d = envelope(m), result = await collectLayoutMemoryInventory(view, d.request, d.bytes); assert.equal(nodeCount(result.input), 250_000); assert.equal(result.inventory.versions.length, versions); });
+    await f.db.exec("UPDATE memory_versions SET summary_request_id='deleted-summary' WHERE version=?", [remaining + 1]);
+    await native(f, async (view, m) => { const d = envelope(m); await assert.rejects(collectLayoutMemoryInventory(view, d.request, d.bytes), errorCode("budget_exceeded")); });
+  } finally { await f.close(); }
+});
+test("CS13 manifest 16MiB and 250000-node exact parser boundaries", async () => {
+  const f = await identityFixture();
+  try { await native(f, async (_view, original) => {
+    const schema = original.schema as { [key: string]: Json };
+    const rebuild = (extra: Json) => buildDatabaseManifests("sqlite", { ...schema, collectorBudget: extra }, original.tables, original.controlRows);
+    const check = async (m: DatabaseManifests, code: string, expected: number) => { let calls = 0; const d = envelope(m);
+      await assert.rejects(collectLayoutMemoryInventory(snapshot(async () => { calls++; throw new Error("parser-only mechanical stop"); }), d.request, d.bytes), errorCode(code)); assert.equal(calls, expected); };
+    const length = 16 * 1_048_576 - Buffer.byteLength(canonicalJson(rebuild(""))), exact = rebuild("x".repeat(length));
+    assert.equal(Buffer.byteLength(canonicalJson(exact)), 16 * 1_048_576); await check(exact, "read_unavailable", 1); await check(rebuild("x".repeat(length + 1)), "budget_exceeded", 0);
+    const zeros = Array.from({ length: 250_000 - nodeCount(rebuild([])) }, () => 0), nodes = rebuild(zeros); assert.equal(nodeCount(nodes), 250_000);
+    await check(nodes, "read_unavailable", 1); await check(rebuild([...zeros, 0]), "budget_exceeded", 0);
+  }); } finally { await f.close(); }
+});
+
+test("CS08/09/10 SQLite native types, UTF16 and temp/attached shadows", async t => {
+  const f = await identityFixture();
+  try { await seed(f); const file = path.join(f.dir, DATABASE_FILE_NAME);
+    await t.test("main qualification survives shadows", async () => { const db = new Database(file, { fileMustExist: true });
+      try { db.exec("CREATE TEMP TABLE memory_documents(wrong TEXT); CREATE TEMP TABLE pragma_table_xinfo(wrong TEXT); ATTACH DATABASE ':memory:' AS foreign_db; CREATE TABLE foreign_db.memory_versions(wrong TEXT)");
+        db.pragma("query_only=ON"); db.exec("BEGIN"); const d = envelope(readSqliteManifests(db));
+        assert.equal((await collectLayoutMemoryInventory(snapshot(async (sql, params) => db.prepare(sql).all(...params) as DbRow[]), d.request, d.bytes)).inventory.versions.length, 9); db.exec("COMMIT");
+      } finally { db.close(); } });
+    for (const [title, sql] of [["BLOB", "UPDATE memory_versions SET markdown=CAST('bad' AS BLOB) WHERE id='version-0-1'"],
+      ["REAL", "UPDATE memory_versions SET byte_length=1.5 WHERE id='version-0-1'"], ["invalid UTF8", "UPDATE memory_versions SET markdown=CAST(x'ff' AS TEXT),byte_length=1 WHERE id='version-0-1'"],
+      ["unsafe integer", "UPDATE memory_versions SET byte_length=9007199254740993 WHERE id='version-0-1'"]]) await t.test(title!, async () => {
+      await f.db.exec("UPDATE memory_versions SET markdown='',byte_length=0 WHERE id='version-0-1'"); await f.db.exec(sql!); let raw: unknown;
+      await native(f, async (view, m) => { const d = envelope(m); await assert.rejects(collectLayoutMemoryInventory(snapshot(async (s, p) => { const rows = await view.query(s, p);
+        if (s.includes('FROM main."memory_versions"') && s.includes("OFFSET")) raw ??= rows.find(r => r.v0 === Buffer.from("version-0-1").toString("hex").toUpperCase())?.v5; return rows;
+      }), d.request, d.bytes), errorCode("inventory_invalid")); }); if (title === "unsafe integer") assert.equal(raw, "9007199254740993"); });
+    await t.test("actual UTF16 is unsupported", async () => { const m = await native(f, async (_v, m) => m), d = envelope(m), db = new Database(path.join(f.dir, "utf16.sqlite"));
+      try { db.pragma("encoding='UTF-16le'"); db.exec("CREATE TABLE anchor(value TEXT)"); db.pragma("query_only=ON"); db.exec("BEGIN"); let calls = 0;
+        await assert.rejects(collectLayoutMemoryInventory(snapshot(async (sql, p) => { calls++; return db.prepare(sql).all(...p) as DbRow[]; }), d.request, d.bytes), errorCode("unsupported_catalog")); assert.equal(calls, 2); db.exec("ROLLBACK");
+      } finally { db.close(); } });
+  } finally { await f.close(); }
+});
+
+for (const engine of ["sqlite", "postgres"] as const) {
+  test(`CS39 ${engine} empty aggregates and exact empty terminators`, { skip: identitySkip(engine) }, async () => {
+    const f = await identityFixture(engine);
+    try { await native(f, async (view, m) => { const d = envelope(m); let columns = 0, pages = 0;
+      const result = await collectLayoutMemoryInventory(snapshot(async (sql, params) => { const rows = await view.query(sql, params);
+        if (/\b(?:SUM|sum)\(/.test(sql) && /FROM (?:ONLY|main\.)/.test(sql)) { assert.equal(rows[0]!.row_count, "0"); for (const [k, v] of Object.entries(rows[0]!)) if (/^[smz]\d+$/.test(k)) { assert.equal(v, null); if (k.startsWith("s")) columns++; } }
+        if (sql.includes("OFFSET")) { pages++; assert.deepEqual(params, [128, 0]); assert.equal(rows.length, 0); } return rows;
+      }), d.request, d.bytes); assert.equal(result.inventory.versions.length, 0); assert.equal(columns, 48); assert.equal(pages, 3);
+    }); } finally { await f.close(); }
+  });
+  test(`CS16 ${engine} true SQL and outer end failures cannot become owner success`, { skip: identitySkip(engine) }, async () => {
+    const f = await identityFixture(engine);
+    try { await seed(f); const m = await native(f, async (_v, m) => m), d = envelope(m);
+      await assert.rejects(f.db.readSnapshot(view => collectLayoutMemoryInventory(snapshot(async (sql, params) => { if (sql.includes("OFFSET")) await view.query("SELECT missing FROM collector_missing_relation"); return view.query(sql, params); }), d.request, d.bytes)), errorCode("read_unavailable"));
+      assert.equal(Number((await f.db.query("SELECT 1 AS n"))[0]!.n), 1); let observed = false;
+      await assert.rejects(f.db.readSnapshot(async view => { const fresh = envelope(m); const result = await collectLayoutMemoryInventory(view, fresh.request, fresh.bytes); observed = true;
+        if (engine === "sqlite") await view.query("ROLLBACK"); else await view.query("SELECT pg_catalog.pg_terminate_backend(pg_catalog.pg_backend_pid())"); return result; }));
+      assert.equal(observed, true); assert.equal(Number((await f.db.query("SELECT COUNT(*) AS n FROM memory_versions"))[0]!.n), 9);
+    } finally { await f.close(); }
+  });
+  test(`CS12 ${engine} actual marker differs from frozen original`, { skip: identitySkip(engine) }, async () => {
+    const f = await identityFixture(engine);
+    try { const m = await native(f, async (_v, m) => m), d = envelope(m);
+      if (engine === "sqlite") { const db = new Database(path.join(f.dir, DATABASE_FILE_NAME), { fileMustExist: true });
+        try { db.prepare("UPDATE storage_maintenance SET database_instance_id=?").run("b".repeat(32)); db.pragma("query_only=ON"); db.exec("BEGIN");
+          await assert.rejects(collectLayoutMemoryInventory(snapshot(async (sql, params) => db.prepare(sql).all(...params) as DbRow[]), d.request, d.bytes), errorCode("source_mismatch")); db.exec("ROLLBACK");
+        } finally { db.close(); }
+      } else { const schema = (m.schema as { scope: { name: string } }).scope.name, client = new Client({ connectionString: identityPgUrl }); await client.connect();
+        try { await client.query(`SET search_path TO ${qi(schema)}, pg_catalog`); await client.query("UPDATE storage_maintenance SET database_instance_id=$1", ["b".repeat(32)]); await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+          await assert.rejects(collectLayoutMemoryInventory(snapshot(async (sql, p) => (await client.query(postgresDialect.renderParameters(sql), [...p])).rows as DbRow[]), d.request, d.bytes), errorCode("source_mismatch"));
+        } finally { await client.query("ROLLBACK").catch(() => undefined); await client.end(); } }
+    } finally { await f.close(); }
+  });
+}
+test("CS12 physical equal-marker clone yields only an observation", async () => {
+  const f = await identityFixture();
+  try { await seed(f); const m = await native(f, async (_v, m) => m), d = envelope(m), source = new Database(path.join(f.dir, DATABASE_FILE_NAME), { readonly: true, fileMustExist: true });
+    const target = path.join(f.dir, "clone.sqlite"); try { await source.backup(target); } finally { source.close(); }
+    const clone = new Database(target, { readonly: true, fileMustExist: true });
+    try { clone.pragma("query_only=ON"); clone.exec("BEGIN"); const result = await collectLayoutMemoryInventory(snapshot(async (sql, p) => clone.prepare(sql).all(...p) as DbRow[]), d.request, d.bytes);
+      assert.deepEqual(Reflect.ownKeys(result).sort(), ["authority", "contract", "input", "inventory"]); assert.equal(result.authority, "observation-only"); assert.equal(result.inventory.versions.length, 9); clone.exec("COMMIT");
+    } finally { clone.close(); }
+  } finally { await f.close(); }
+});
+
+test("CS10/35/38/39 PG all frozen templates avoid source operators and CHECK; both old counterexamples execute", { skip: identitySkip("postgres") }, async () => {
+  const f = await identityFixture("postgres"), writer = new Client({ connectionString: identityPgUrl }); await writer.connect();
+  try { await seed(f); const m = await native(f, async (_v, m) => m), schema = (m.schema as { scope: { name: string } }).scope.name;
+    await writer.query(`CREATE FUNCTION ${qi(schema)}.collector_check() RETURNS pg_catalog.bool LANGUAGE plpgsql IMMUTABLE AS $b$ BEGIN PERFORM pg_catalog.pg_advisory_xact_lock(908181,702); RETURN true; END $b$`);
+    for (const table of [...names, "storage_maintenance"]) await writer.query(`ALTER TABLE ${qi(schema)}.${qi(table)} ADD CONSTRAINT collector_check CHECK (${qi(schema)}.collector_check())`);
+    const signatures = [["=", "oid", "oid"], ["=", "name", "name"], ["=", "name", "text"], ["=", "text", "text"], ["=", "int2", "int2"], ["=", "int2", "int4"], ["=", "int4", "int4"], ["=", "int8", "int8"], ["=", "xid8", "xid8"], [">", "int2", "int4"], [">", "int4", "int4"], ["<", "text", "text"], ["<", "oid", "oid"], ["<", "int2", "int2"], ["<", "int4", "int4"]];
+    for (const [i, [operator, left, right]] of signatures.entries()) { const fn = `${qi(schema)}.${qi(`collector_operator_${i}`)}`;
+      await writer.query(`CREATE FUNCTION ${fn}(pg_catalog.${left},pg_catalog.${right}) RETURNS pg_catalog.bool LANGUAGE plpgsql VOLATILE AS $b$ BEGIN PERFORM pg_catalog.pg_advisory_xact_lock(908181,701); RETURN $1 OPERATOR(pg_catalog.${operator}) $2; END $b$`);
+      await writer.query(`CREATE OPERATOR ${qi(schema)}.${operator} (LEFTARG=pg_catalog.${left},RIGHTARG=pg_catalog.${right},FUNCTION=${fn})`); }
+    const client = new Client({ connectionString: identityPgUrl }); await client.connect();
+    try { await client.query(`SET search_path TO ${qi(schema)}, pg_catalog`); await client.query("SET constraint_exclusion=on");
+      const advisory = async (id: number) => (await client.query("SELECT pg_catalog.count(*)::pg_catalog.text AS n FROM pg_catalog.pg_locks WHERE pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid() AND locktype OPERATOR(pg_catalog.=) 'advisory'::pg_catalog.text AND classid OPERATOR(pg_catalog.=) 908181::pg_catalog.oid AND objid OPERATOR(pg_catalog.=) $1::pg_catalog.oid AND granted", [id])).rows[0].n;
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); assert.equal(await advisory(701), "0");
+      await client.query("SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1", [schema]);
+      assert.equal(await advisory(701), "1"); await client.query("ROLLBACK");
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); assert.equal(await advisory(701), "0"); assert.equal(await advisory(702), "0");
+      const trace: string[] = [], capacities = new Map<string, DbRow>(), pages = new Map<string, DbRow[]>(), d = envelope(m);
+      const result = await collectLayoutMemoryInventory(snapshot(async (sql, params) => { trace.push(sql); assert.ok(Object.isFrozen(params));
+        for (const p of params) if (Array.isArray(p)) assert.ok(Object.isFrozen(p));
+        const rows = (await client.query(postgresDialect.renderParameters(sql), [...params])).rows as DbRow[];
+        const table = names.find(n => sql.includes(`FROM ONLY ${qi(schema)}.${qi(n)}`));
+        if (table && sql.includes("pg_catalog.sum(")) capacities.set(table, rows[0]!); if (table && sql.includes("OFFSET") && params[1] === 0) pages.set(table, rows); return rows;
+      }), d.request, d.bytes);
+      assert.equal(result.inventory.versions.length, 9); assertPgTemplates(trace, schema); assert.equal(trace.length, 78);
+      for (const table of result.input.tables) { const rows = pages.get(table.name)!, actual = capacities.get(table.name)!; assert.equal(actual.row_count, String(rows.length));
+        for (let i = 0; i < table.columns.length; i++) { const bytes = rows.map(r => r[`v${i}`] === null ? 0 : Buffer.byteLength(r[`v${i}`] as string));
+          assert.equal(actual[`s${i}`], String(bytes.reduce((a, b) => a + b, 0))); assert.equal(actual[`m${i}`], String(Math.max(...bytes))); assert.equal(actual[`z${i}`], String(rows.filter(r => r[`v${i}`] === null).length)); } }
+      assert.equal(await advisory(701), "0"); assert.equal(await advisory(702), "0");
+      await client.query(`SELECT pg_catalog.max(pg_catalog.octet_length(markdown::pg_catalog.text))::pg_catalog.text FROM ONLY ${qi(schema)}.memory_documents`);
+      assert.equal(await advisory(702), "1"); assert.equal(await advisory(701), "0");
+      const bare = trace.find(s => s.includes("OPERATOR(pg_catalog.=)"))!.replace("OPERATOR(pg_catalog.=)", "=");
+      assert.equal(acceptedPgSql.has(sha256(bare.replaceAll(qi(schema), "{{schema}}"))), false); await client.query("COMMIT");
+    } finally { await client.query("ROLLBACK").catch(() => undefined); await client.end(); }
+  } finally { await writer.end(); await f.close(); }
+});
+
+test("CS11/31/32/33/34/37 PG unsupported current catalog refuses before marker and target locks", { skip: identitySkip("postgres") }, async t => {
+  const f = await identityFixture("postgres"), client = new Client({ connectionString: identityPgUrl }); await client.connect();
+  try { await seed(f); const m = await native(f, async (_v, m) => m), prefix = qi((m.schema as { scope: { name: string } }).scope.name);
+    const cases: [string, string[], string[]][] = [
+      ["extra index", [`CREATE INDEX collector_extra ON ${prefix}.memory_documents(markdown)`], [`DROP INDEX ${prefix}.collector_extra`]],
+      ["expression index", [`CREATE INDEX collector_extra ON ${prefix}.memory_documents((pg_catalog.length(markdown)))`], [`DROP INDEX ${prefix}.collector_extra`]],
+      ["default", [`ALTER TABLE ${prefix}.memory_documents ALTER COLUMN markdown SET DEFAULT 'x'`], [`ALTER TABLE ${prefix}.memory_documents ALTER COLUMN markdown DROP DEFAULT`]],
+      ["nullable", [`ALTER TABLE ${prefix}.memory_documents ALTER COLUMN markdown DROP NOT NULL`], [`ALTER TABLE ${prefix}.memory_documents ALTER COLUMN markdown SET NOT NULL`]],
+      ["RLS", [`ALTER TABLE ${prefix}.memory_documents ENABLE ROW LEVEL SECURITY`], [`ALTER TABLE ${prefix}.memory_documents DISABLE ROW LEVEL SECURITY`]],
+      ["marker default", [`ALTER TABLE ${prefix}.storage_maintenance ALTER COLUMN fence_epoch SET DEFAULT 1`], [`ALTER TABLE ${prefix}.storage_maintenance ALTER COLUMN fence_epoch SET DEFAULT 0`]],
+      ["statistics", [`CREATE STATISTICS ${prefix}.collector_stats ON markdown,scope FROM ${prefix}.memory_documents`], [`DROP STATISTICS ${prefix}.collector_stats`]],
+      ["rewrite", [`CREATE RULE collector_rule AS ON UPDATE TO ${prefix}.memory_documents DO ALSO NOTHING`], [`DROP RULE collector_rule ON ${prefix}.memory_documents`]],
+      ["inheritance", [`CREATE TABLE ${prefix}.collector_child () INHERITS (${prefix}.memory_documents)`], [`DROP TABLE ${prefix}.collector_child`]],
+      ["reverse family", [`CREATE OPERATOR FAMILY ${prefix}.collector_family USING btree`, `ALTER OPERATOR FAMILY ${prefix}.collector_family USING btree ADD OPERATOR 3 pg_catalog.=(text,text)`], [`DROP OPERATOR FAMILY ${prefix}.collector_family USING btree`]],
+      // DROP COLUMN retains a dropped catalog attribute. Run this case last.
+      ["extra column", [`ALTER TABLE ${prefix}.memory_summary_requests ADD COLUMN collector_extra TEXT`], [`ALTER TABLE ${prefix}.memory_summary_requests DROP COLUMN collector_extra`]],
+    ];
+    for (const [title, setup, cleanup] of cases) await t.test(title, async () => { const baseline = envelope(m);
+      assert.equal((await f.db.readSnapshot(v => collectLayoutMemoryInventory(v, baseline.request, baseline.bytes))).inventory.versions.length, 9);
+      for (const sql of setup) await client.query(sql);
+      try { const trace: string[] = [], d = envelope(m);
+        await assert.rejects(f.db.readSnapshot(v => collectLayoutMemoryInventory(snapshot(async (sql, p) => { trace.push(sql); return v.query(sql, p); }), d.request, d.bytes)), errorCode("unsupported_catalog"));
+        assert.equal(trace.some(sql => sql.includes(`FROM ONLY ${prefix}.`) || sql.startsWith(`LOCK TABLE ONLY ${prefix}.`)), false);
+      } finally { for (const sql of cleanup) await client.query(sql); } });
+    await t.test("view before recursive locking", async () => { await client.query(`ALTER TABLE ${prefix}.memory_summary_requests RENAME TO collector_saved`); await client.query(`CREATE VIEW ${prefix}.memory_summary_requests AS SELECT * FROM ${prefix}.collector_saved`);
+      const trace: string[] = [], d = envelope(m); await assert.rejects(f.db.readSnapshot(v => collectLayoutMemoryInventory(snapshot(async (sql, p) => { trace.push(sql); return v.query(sql, p); }), d.request, d.bytes)), errorCode("unsupported_catalog"));
+      assert.equal(trace.some(sql => sql.startsWith(`LOCK TABLE ONLY ${prefix}.`)), false); assert.ok(trace.at(-1)!.includes("c.relkind")); });
+  } finally { await client.end(); await f.close(); }
+});
+
+test("CS21/22/23/27 PG stale RR detects equal empty replacement, namespace swaps and competing XID", { skip: identitySkip("postgres") }, async t => {
+  const f = await identityFixture("postgres"), writer = new Client({ connectionString: identityPgUrl }); await writer.connect();
+  try { const m = await native(f, async (_v, m) => m), schema = (m.schema as { scope: { name: string } }).scope.name, prefix = qi(schema);
+    const rejectOld = (change: () => Promise<void>, fourLocks = false) => f.db.readSnapshot(async view => {
+      if (fourLocks) for (const table of [...names, "storage_maintenance"]) await view.query(`LOCK TABLE ONLY ${prefix}.${qi(table)} IN ACCESS SHARE MODE NOWAIT`);
+      await change(); const trace: string[] = [], d = envelope(m);
+      await assert.rejects(collectLayoutMemoryInventory(snapshot(async (sql, p) => { trace.push(sql); return view.query(sql, p); }), d.request, d.bytes), errorCode("read_unavailable"));
+      assert.ok(trace.length <= 22); assert.equal(trace.some(sql => sql.includes(`FROM ONLY ${prefix}.`)), false);
+    });
+    await t.test("empty table OID replacement", async () => { await writer.query(`CREATE TABLE ${prefix}.collector_new (LIKE ${prefix}.memory_summary_requests INCLUDING ALL)`);
+      const oid = (await writer.query("SELECT $1::regclass::oid::text AS oid", [`${schema}.memory_summary_requests`])).rows[0].oid;
+      try { await rejectOld(async () => { await writer.query("BEGIN"); await writer.query(`ALTER TABLE ${prefix}.memory_summary_requests RENAME TO collector_saved`); await writer.query(`ALTER TABLE ${prefix}.collector_new RENAME TO memory_summary_requests`); await writer.query("COMMIT");
+        assert.notEqual((await writer.query("SELECT $1::regclass::oid::text AS oid", [`${schema}.memory_summary_requests`])).rows[0].oid, oid); assert.equal((await writer.query(`SELECT COUNT(*)::text AS n FROM ${prefix}.memory_summary_requests`)).rows[0].n, "0"); });
+      } finally { await writer.query(`DROP TABLE ${prefix}.memory_summary_requests`); await writer.query(`ALTER TABLE ${prefix}.collector_saved RENAME TO memory_summary_requests`); } });
+    await t.test("four target locks alone allow same-name namespace replacement", async () => { const saved = `${schema}_old`;
+      try { await rejectOld(async () => { await writer.query("BEGIN"); await writer.query(`ALTER SCHEMA ${prefix} RENAME TO ${qi(saved)}`); await writer.query(`CREATE SCHEMA ${prefix}`);
+        for (const table of [...names, "storage_maintenance"]) await writer.query(`CREATE TABLE ${prefix}.${qi(table)} (LIKE ${qi(saved)}.${qi(table)} INCLUDING ALL)`);
+        await writer.query(`INSERT INTO ${prefix}.storage_maintenance SELECT * FROM ${qi(saved)}.storage_maintenance`); await writer.query("COMMIT"); }, true);
+      } finally { await writer.query(`DROP SCHEMA ${prefix} CASCADE`); await writer.query(`ALTER SCHEMA ${qi(saved)} RENAME TO ${prefix}`); } });
+    await t.test("same OID changed column", async () => { try { await rejectOld(async () => { await writer.query(`ALTER TABLE ${prefix}.memory_documents ALTER COLUMN markdown DROP NOT NULL`); }); }
+      finally { await writer.query(`ALTER TABLE ${prefix}.memory_documents ALTER COLUMN markdown SET NOT NULL`); } });
+    await t.test("reader has an XID already", async () => { await f.db.readSnapshot(async view => { await view.query("SELECT pg_catalog.pg_current_xact_id()"); const d = envelope(m); let calls = 0;
+      await assert.rejects(collectLayoutMemoryInventory(snapshot(async (sql, p) => { calls++; return view.query(sql, p); }), d.request, d.bytes), errorCode("read_unavailable")); assert.equal(calls, 1); }); });
+    await t.test("XID allocation between catalog locks and gate", async () => { try { await f.db.readSnapshot(async view => { let locks = 0, dataCalls = 0; const d = envelope(m);
+      await assert.rejects(collectLayoutMemoryInventory(snapshot(async (sql, p) => { const rows = await view.query(sql, p);
+        if (sql.startsWith("LOCK TABLE ONLY pg_catalog.") && ++locks === 20) { await writer.query("BEGIN"); await writer.query("SELECT pg_catalog.pg_current_xact_id()"); }
+        if (sql.includes("FROM ONLY")) dataCalls++; return rows;
+      }), d.request, d.bytes), errorCode("read_unavailable")); assert.equal(dataCalls, 0); }); } finally { await writer.query("ROLLBACK"); } });
+  } finally { await writer.query("ROLLBACK").catch(() => undefined); await writer.end(); await f.close(); }
+});
+
+test("CS22/24/25/26/29 PG catalog locks block owned DDL until actual outer end; NOWAIT fails closed", { skip: identitySkip("postgres") }, async () => {
+  const f = await identityFixture("postgres"), writer = new Client({ connectionString: identityPgUrl }); await writer.connect();
+  try { await seed(f); const m = await native(f, async (_v, m) => m), schema = (m.schema as { scope: { name: string } }).scope.name, p = qi(schema);
+    await writer.query("SET lock_timeout='100ms'");
+    const statements = [`ALTER SCHEMA ${p} RENAME TO ${qi(schema + "_changed")}`, `ALTER TABLE ${p}.memory_documents ADD COLUMN collector_added TEXT`,
+      `ALTER TABLE ${p}.memory_documents ALTER COLUMN markdown TYPE varchar`, `ALTER TABLE ${p}.memory_documents ALTER COLUMN markdown SET DEFAULT 'changed'`,
+      `ALTER TABLE ${p}.memory_documents ENABLE ROW LEVEL SECURITY`, `CREATE INDEX collector_added ON ${p}.memory_documents(markdown)`,
+      `ALTER TABLE ${p}.memory_documents ADD CONSTRAINT collector_added CHECK (true)`, `CREATE TYPE ${p}.collector_added AS ENUM ('value')`,
+      `CREATE FUNCTION ${p}.collector_added() RETURNS bool LANGUAGE SQL IMMUTABLE AS 'SELECT true'`, `CREATE OPERATOR FAMILY ${p}.collector_added USING btree`,
+      `CREATE STATISTICS ${p}.collector_added ON markdown,scope FROM ${p}.memory_documents`, `CREATE RULE collector_added AS ON UPDATE TO ${p}.memory_documents DO ALSO NOTHING`];
+    const d = envelope(m); await f.db.readSnapshot(async view => { assert.equal((await collectLayoutMemoryInventory(view, d.request, d.bytes)).inventory.versions.length, 9);
+      for (const sql of statements) await assert.rejects(writer.query(sql), (e: unknown) => (e as { code?: string }).code === "55P03"); });
+    for (const sql of statements) { await writer.query("BEGIN"); try { await writer.query(sql); } finally { await writer.query("ROLLBACK"); } }
+    await writer.query("BEGIN"); await writer.query("LOCK TABLE pg_catalog.pg_namespace IN ROW EXCLUSIVE MODE");
+    try { const fresh = envelope(m); let calls = 0; await assert.rejects(f.db.readSnapshot(v => collectLayoutMemoryInventory(snapshot(async (sql, p) => { calls++; return v.query(sql, p); }), fresh.request, fresh.bytes)), errorCode("read_unavailable")); assert.equal(calls, 2); }
+    finally { await writer.query("ROLLBACK"); }
+  } finally { await writer.end(); await f.close(); }
+});
+test("CS26 PG SELECT-only role lacks required catalog SHARE permission", { skip: identitySkip("postgres") }, async () => {
+  const f = await identityFixture("postgres"), client = new Client({ connectionString: identityPgUrl }); await client.connect(); let role = "", schema = "";
+  try { const m = await native(f, async (_v, m) => m); schema = (m.schema as { scope: { name: string } }).scope.name; role = schema + "_reader";
+    await client.query(`CREATE ROLE ${qi(role)}`); await client.query(`GRANT USAGE ON SCHEMA ${qi(schema)} TO ${qi(role)}`); await client.query(`GRANT SELECT ON ALL TABLES IN SCHEMA ${qi(schema)} TO ${qi(role)}`);
+    await client.query(`SET ROLE ${qi(role)}`); await client.query(`SET search_path TO ${qi(schema)}, pg_catalog`); await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    let calls = 0; const d = envelope(m); await assert.rejects(collectLayoutMemoryInventory(snapshot(async (sql, p) => { calls++; return (await client.query(postgresDialect.renderParameters(sql), [...p])).rows as DbRow[]; }), d.request, d.bytes), errorCode("read_unavailable")); assert.equal(calls, 2);
+  } finally { await client.query("ROLLBACK").catch(() => undefined); await client.query("RESET ROLE");
+    if (role) { await client.query(`REVOKE ALL ON ALL TABLES IN SCHEMA ${qi(schema)} FROM ${qi(role)}`); await client.query(`REVOKE ALL ON SCHEMA ${qi(schema)} FROM ${qi(role)}`); await client.query(`DROP ROLE ${qi(role)}`); }
+    await client.end(); await f.close(); }
+});
+
+test("CS09/28/37/39 PG mechanical result controls stay separate from native qualification", { skip: identitySkip("postgres") }, async t => {
+  const f = await identityFixture("postgres");
+  try { await seed(f); const m = await native(f, async (_v, m) => m);
+    const mutations: [string, (sql: string, rows: DbRow[]) => DbRow[], string][] = [
+      ["server major", (s, r) => s.startsWith("WITH s AS") ? [{ ...r[0], server_version_num: "150015" }] : r, "unsupported_catalog"],
+      ["encoding", (s, r) => s.startsWith("WITH s AS") ? [{ ...r[0], server_encoding: "LATIN1" }] : r, "unsupported_catalog"],
+      ["actual namespace", (s, r) => s.startsWith("WITH s AS") ? [{ ...r[0], schema: "other_source" }] : r, "source_mismatch"],
+      ["uint64 overflow", (s, r) => s.startsWith("WITH s AS") ? [{ ...r[0], xmin: "18446744073709551616" }] : r, "read_unavailable"],
+      ["noncanonical xid", (s, r) => s.startsWith("WITH s AS") ? [{ ...r[0], xmax: "01" }] : r, "read_unavailable"],
+      ["epoch retained", (s, r) => s.startsWith("WITH s AS") ? [{ ...r[0], xmin: "4294967296", xmax: "4294967296", snapshot: "4294967296:4294967296:" }]
+        : s.startsWith("WITH before_assignment") ? [{ ...r[0], xmin: "4294967296", xmax: "4294967296", snapshot: "4294967296:4294967296:", assigned: "0" }] : r, "read_unavailable"],
+      ["beyond-safe-Number adjacent xid", (s, r) => s.startsWith("WITH s AS") ? [{ ...r[0], xmin: "9007199254740992", xmax: "9007199254740992", snapshot: "9007199254740992:9007199254740992:" }]
+        : s.startsWith("WITH before_assignment") ? [{ ...r[0], xmin: "9007199254740992", xmax: "9007199254740992", snapshot: "9007199254740992:9007199254740992:", assigned: "9007199254740993" }] : r, "read_unavailable"],
+      ["lock pid", (s, r) => s.startsWith("SELECT l.relation") ? [{ ...r[0], pid: "1" }, ...r.slice(1)] : r, "read_unavailable"],
+      ["end pid", (s, r) => s.startsWith("SELECT pg_catalog.current_setting") ? [{ ...r[0], pid: "1" }] : r, "read_unavailable"],
+      ["preflight length", (s, r) => s.startsWith("WITH bounded") ? [{ ...r[0], m0: "1000000" }] : r, "unsupported_catalog"],
+      ["catalog cumulative budget", (s, r) => s.startsWith("SELECT c.relname AS table_name") ? [{ ...r[0], attname: "x".repeat(1_048_576) }, ...r.slice(1)] : r, "budget_exceeded"],
+      ["capacity decimal", (s, r) => s.startsWith("SELECT pg_catalog.count") && s.includes("pg_catalog.sum(") ? [{ ...r[0], s0: "1.0" }] : r, "inventory_invalid"],
+      ["nonnull null count", (s, r) => s.startsWith("SELECT pg_catalog.count") && s.includes("pg_catalog.sum(") ? [{ ...r[0], z0: "1" }] : r, "inventory_invalid"],
+      ["missing capacity field", (s, r) => { if (!s.startsWith("SELECT pg_catalog.count") || !s.includes("pg_catalog.sum(")) return r;
+        const row = { ...r[0] }; delete row.s0; return [row]; }, "inventory_invalid"],
+      ["page extra alias", (s, r) => s.includes("OFFSET") && r.length ? [{ ...r[0], unknown: "extra" }, ...r.slice(1)] : r, "inventory_invalid"],
+      ["page reversed", (s, r) => s.includes("OFFSET") && r.length ? [...r].reverse() : r, "inventory_invalid"],
+    ];
+    for (const [title, mutate, code] of mutations) await t.test(title, async () => { const d = envelope(m);
+      await assert.rejects(f.db.readSnapshot(v => collectLayoutMemoryInventory(snapshot(async (s, p) => mutate(s, await v.query(s, p))), d.request, d.bytes)), errorCode(code)); });
+  } finally { await f.close(); }
+});
+
+test("CS18 isolated process final observation ignores inherited then and setters", { skip: identitySkip("postgres") }, async () => {
+  if (process.env["COLLECTOR_THEN_CHILD"] !== "1") {
+    const environment: NodeJS.ProcessEnv = { ...process.env, COLLECTOR_THEN_CHILD: "1" }; delete environment["NODE_TEST_CONTEXT"];
+    const { stdout } = await promisify(execFile)(process.execPath, ["--test", "--test-name-pattern=CS18 isolated process", fileURLToPath(import.meta.url)], { env: environment, timeout: 30_000, maxBuffer: 1_048_576 });
+    assert.match(stdout, /collector_then_boundary_pass/); return;
+  }
+  const f = await identityFixture("postgres");
+  try { await seed(f); await nativePostgres(f, async (view, m) => {
+    let reads = 0, writes = 0, installed = false;
+    const originals = new Map(["then", "input", "inventory"].map(k => [k, Object.getOwnPropertyDescriptor(Object.prototype, k)]));
+    const observed: DbReadSnapshot = { query<T extends DbRow>(sql: string, params: readonly unknown[] = []): Promise<T[]> {
+      return new Promise((resolve, reject) => { void view.query<T>(sql, params).then(rows => { resolve(rows);
+        if (sql.startsWith("SELECT pg_catalog.current_setting('server_version_num')")) { installed = true;
+          Object.defineProperty(Object.prototype, "then", { configurable: true, get() { reads++; return undefined; }, set() { writes++; } });
+          for (const k of ["input", "inventory"]) Object.defineProperty(Object.prototype, k, { configurable: true, set() { writes++; } }); }
+      }, reject); });
+    } };
+    const d = envelope(m); let result;
+    try { result = await collectLayoutMemoryInventory(observed, d.request, d.bytes); }
+    finally { for (const [k, descriptor] of originals) { if (descriptor) Object.defineProperty(Object.prototype, k, descriptor); else Reflect.deleteProperty(Object.prototype, k); } }
+    assert.equal(installed, true); assert.equal(reads, 0); assert.equal(writes, 0); assert.equal(Object.getPrototypeOf(result), null); assert.equal(result.inventory.versions.length, 9);
+    process.stdout.write("collector_then_boundary_pass\n");
+  }); } finally { await f.close(); }
+});
