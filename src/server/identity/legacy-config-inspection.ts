@@ -8,6 +8,7 @@ import { RUNTIME_BACKENDS, RUNTIME_CONFIG_VERSION, snapshotRuntimeConfig } from 
 import type { RuntimeAppliedConfig, RuntimeBackend, RuntimeBindingView, RuntimeConfig } from "../runtime/types.ts";
 import type { LegacyBindingInspection, LegacyConfigInspection, LegacyConfigSnapshotSource, LegacyInspectionIssue,
   LegacyProfileSource, LegacySnapshotKind, LegacySnapshotSelection } from "../../shared/legacy-config.ts";
+import { readLegacyConfigCapture } from "./legacy-config-capture.ts";
 
 const revision = z.number().int().positive();
 const configSchema = z.object({ model: z.string().nullable(), workdir: z.string().min(1), tools: z.array(z.string()).nullable(),
@@ -19,12 +20,6 @@ const snapshotSchema = z.object({ backend: z.enum(["claude-code", "codex-cli", "
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const stringOrNull = (value: unknown): string | null => value == null ? null : String(value);
 const key = (displayName: unknown, hostType: unknown): string => JSON.stringify([displayName, hostType]);
-function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  if (value !== null && typeof value === "object") return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
-    .map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
-  return JSON.stringify(value);
-}
 function validJson(raw: string | null, schema: z.ZodTypeAny, nullable = false): boolean {
   if (raw === null) return nullable;
   try { return schema.safeParse(JSON.parse(raw)).success; } catch { return false; }
@@ -61,16 +56,9 @@ export function createLegacyConfigInspector({ db, repos = createRepositories(db)
     // PG 的多表视图必须来自自己的 repeatable-read 只读事务，不能借用未知隔离级别的写事务。
     if (db.currentTransactionContext()) throw new InvalidArgumentError("legacy_inspection_requires_own_snapshot");
     return db.readSnapshot(async tx => {
-      const captured: Record<string, DbRow[]> = {};
-      for (const [table, order] of [["agents", "id"], ["agent_runtimes", "id"], ["agent_runtime_bindings", "id"],
-        ["agent_runner_states", "binding_id"], ["agent_runtime_members", "member_id"], ["members", "id"], ["projects", "id"],
-        ["groups", "id"], ["group_participants", "group_id, member_id"]] as const) {
-        captured[table] = await tx.query(`SELECT * FROM ${table} ORDER BY ${order}`);
-      }
-      const persistedAliases = Boolean((await tx.query("SELECT version FROM schema_migrations WHERE version = 14"))[0]);
-      captured["agent_legacy_aliases"] = persistedAliases ? await tx.query("SELECT * FROM agent_legacy_aliases ORDER BY display_name, host_type, agent_id, created_at, retired_at") : [];
-      const rows = (table: string) => captured[table]!;
-      const byId = (table: string) => new Map(rows(table).map(row => [String(row.id), row]));
+      const { rows: captured, persistedAliases, sourceDigest } = await readLegacyConfigCapture(tx);
+      const rows = (table: keyof typeof captured) => captured[table];
+      const byId = (table: keyof typeof captured) => new Map(rows(table).map(row => [String(row.id), row]));
       const agents = byId("agents"), runtimeRows = byId("agent_runtimes"), members = byId("members"), projects = byId("projects"), groups = byId("groups");
       const runners = new Map(rows("agent_runner_states").map(row => [String(row.binding_id), row]));
       const participants = new Set(rows("group_participants").map(row => key(row.group_id, row.member_id)));
@@ -218,7 +206,7 @@ export function createLegacyConfigInspector({ db, repos = createRepositories(db)
           bindingIds: bindings.filter(binding => binding.agentId === agentId).map(binding => binding.bindingId), source });
       }
       return { schemaVersion: "legacy-config-inspection/v1", authority: "legacy", readOnly: true, migrated: false,
-        observedAt: now().toISOString(), sourceDigest: hash(canonical(captured)), aliasCatalogState: persistedAliases ? "persisted" : "pre-migration",
+        observedAt: now().toISOString(), sourceDigest, aliasCatalogState: persistedAliases ? "persisted" : "pre-migration",
         code: issues.some(entry => entry.code === "migration_identity_ambiguous") ? "migration_identity_ambiguous"
           : issues.some(entry => entry.code === "legacy_config_invalid") ? "legacy_config_invalid" : null, profiles, bindings, issues };
     });
