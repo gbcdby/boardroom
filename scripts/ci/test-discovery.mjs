@@ -6,7 +6,7 @@ import { globSync, mkdirSync, writeFileSync } from "node:fs";
 import { availableParallelism } from "node:os";
 
 const partition = process.env.BOARDROOM_CI_TEST_PARTITION ?? "1/1";
-assert.ok(["1/1", "1/8", "2/8", "3/8", "4/8", "5/8", "6/8", "7/8", "8/8"].includes(partition), "unknown fixed partition");
+assert.ok(["1/1", ...Array.from({ length: 16 }, (_, index) => `${index + 1}/16`)].includes(partition), "unknown fixed partition");
 const glob = "tests/**/*.test.ts";
 const entries = globSync(glob).sort();
 assert.ok(entries.length > 0 && entries.length <= 1024, "test discovery must be nonempty and bounded");

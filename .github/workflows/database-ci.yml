@@ -152,7 +152,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: ['1/8', '2/8', '3/8', '4/8', '5/8', '6/8', '7/8', '8/8']
+        partition: ['1/16', '2/16', '3/16', '4/16', '5/16', '6/16', '7/16', '8/16', '9/16', '10/16', '11/16', '12/16', '13/16', '14/16', '15/16', '16/16']
     runs-on: ubuntu-24.04
     # CI231's outer 900s expired while the full suite still progressed.
     # Allow the bounded 26-minute suite transport plus preparation and post-suite

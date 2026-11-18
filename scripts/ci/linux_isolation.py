@@ -25,6 +25,7 @@ import tempfile
 import time
 
 ENTRIES = ('sqlite', 'full-suite')
+FULL_SUITE_PARTITIONS = tuple(f'{index}/16' for index in range(1, 17))
 # CI231 reached 2041 passing top-level tests before the old outer 900s limit.
 # Keep the full-suite budget separate from supervisor setup and final receipts.
 FULL_SUITE_SECONDS = 1200
@@ -45,7 +46,7 @@ class IsolationError(RuntimeError):
 
 
 def validated_partition(entry, partition):
-    if partition is not None and (entry != 'full-suite' or partition not in ('1/8', '2/8', '3/8', '4/8', '5/8', '6/8', '7/8', '8/8')):
+    if partition is not None and (entry != 'full-suite' or partition not in FULL_SUITE_PARTITIONS):
         raise IsolationError('Unknown fixed full-suite partition')
     return partition
 
@@ -62,7 +63,7 @@ def command_for(entry, partition=None):
         # runner owns its PG service/UID and runs one file at a time, avoiding
         # another test entry's concurrent exit in its same-UID source inventory.
         # No scheduling flag reaches nested Node. The unpartitioned entry stays at four.
-        script = 'test:ci:linux' + (':' + partition[0] + 'of8' if partition else '')
+        script = 'test:ci:linux' + (':' + partition.replace('/', 'of') if partition else '')
         return ("mkdir -p .agent-output/linux-ci-isolation/full-suite\n"
                 "node scripts/ci/test-discovery.mjs\n"
                 f"npm run {script} 2>&1 | tee .agent-output/linux-ci-isolation/full-suite/full-suite.tap")
