@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { Client } from "pg";
 import type { DbReadSnapshot, DbRow } from "../src/server/db/driver.ts";
 import { readM2RewriteFootprint, M2RewriteFootprintError } from "../src/server/identity/m2-rewrite-footprint.ts";
+import type { M2UniqueFootprint } from "../src/server/identity/m2-rewrite-footprint.ts";
 import { canonicalJson, sha256 } from "../src/server/storage/maintenance/canonical.ts";
 import { identityFixture, identityEngines, identityPgUrl, identitySkip } from "./helpers/identity-fixture.ts";
 
@@ -72,8 +73,11 @@ for (const engine of identityEngines) {
       });
       assert(count <= 16); assert.equal(pending, 0);
       assert.deepEqual(result.relations.map(r => [r.name, r.columns.length]), [["agent_runner_states", 22], ["agent_runtime_bindings", 14], ["agent_runtime_members", 8], ["storage_maintenance", 14], ["storage_source_clients", 16]]);
-      assert.equal(result.incomingForeignKeys.length, 3); assert.equal(result.migrations.length, 21);
-      assert.deepEqual(result.legacyBindingUniques.map(u => u.keys), [["runtime_id", "project_id", "group_id"], ["member_id", "group_id"]]);
+      const migrationContract: readonly { readonly version: number; readonly name: string; readonly checksum: string }[] = result.migrations;
+      const uniqueContract: readonly [M2UniqueFootprint, M2UniqueFootprint] = result.legacyBindingUniques;
+      assert.equal(result.incomingForeignKeys.length, 3); assert.equal(migrationContract.length, 21);
+      assert.equal(migrationContract[0]!.version, 1); assert.equal(migrationContract[20]!.version, 21);
+      assert.deepEqual(uniqueContract.map(u => u.keys), [["runtime_id", "project_id", "group_id"], ["member_id", "group_id"]]);
       assert(result.relations.some(r => r.indexes.some(i => i.metadata.name === "ix_bindings_member_seek")));
       const singleton = result.relations.find(r => r.name === "storage_maintenance")!.columns[0]!;
       assert.equal(singleton.not_null, engine === "sqlite" ? 0 : true);

@@ -41,13 +41,16 @@ export interface M2UniqueFootprint {
   readonly keys: readonly string[]; readonly constraintName: string | null;
   readonly indexName: string; readonly indexOid: string | null; readonly flags: Row;
 }
+export interface M2MigrationFootprint {
+  readonly version: number; readonly name: string; readonly checksum: string;
+}
 /** Structural evidence only: no SourceRef, writer permission or executable rewrite. */
 export interface M2RewriteFootprint {
   readonly kind: "m2-rewrite-footprint"; readonly dialect: Dialect;
   readonly namespace: { readonly name: string; readonly oid: string | null };
-  readonly migrations: readonly Row[]; readonly relations: readonly M2RelationFootprint[];
+  readonly migrations: readonly M2MigrationFootprint[]; readonly relations: readonly M2RelationFootprint[];
   readonly incomingForeignKeys: readonly M2ForeignKeyFootprint[];
-  readonly legacyBindingUniques: readonly M2UniqueFootprint[]; readonly digest: string;
+  readonly legacyBindingUniques: readonly [M2UniqueFootprint, M2UniqueFootprint]; readonly digest: string;
 }
 
 const COLUMNS = {
@@ -155,7 +158,7 @@ function reader(snapshot: DbReadSnapshot) {
   };
 }
 type Reader = ReturnType<typeof reader>;
-function baseline(rows: readonly Row[], dialect: Dialect): void {
+function baseline(rows: Row[], dialect: Dialect): asserts rows is (Row & M2MigrationFootprint)[] {
   const expected = migrations.filter(m => m.version <= 21).slice().sort((a, b) => a.version - b.version);
   if (rows.length !== 21 || expected.length !== 21 || expected.some((m, i) => m.version !== i + 1
     || rows[i]!.version !== m.version || rows[i]!.name !== m.name || rows[i]!.checksum !== checksumOf(migrationSql(m, dialect)))) fail("migration_baseline_mismatch");
@@ -202,12 +205,12 @@ function incoming(fks: readonly M2ForeignKeyFootprint[], namespace: string, dial
       && fk.initiallyDeferred === false && fk.local === true && fk.parent === "0" && fk.inheritanceCount === 0)).length !== 1)) fail("unexpected_inbound_fk");
   return result;
 }
-function keyRequirements(relations: readonly M2RelationFootprint[], dialect: Dialect): M2UniqueFootprint[] {
+function keyRequirements(relations: readonly M2RelationFootprint[], dialect: Dialect): readonly [M2UniqueFootprint, M2UniqueFootprint] {
   const binding = relations.find(r => r.name === "agent_runtime_bindings")!;
   const uniques = binding.indexes.filter(i => dialect === "sqlite" ? i.metadata.unique === 1 && i.metadata.origin !== "pk"
     : i.metadata.unique === true && i.metadata.primary !== true);
   if (uniques.length !== 2) fail("legacy_unique_mismatch");
-  const found = UNIQUE_KEYS.map(keys => {
+  const locate = (keys: readonly string[]): M2UniqueFootprint => {
     const candidates = uniques.filter(i => same(indexKeys(i, dialect) ?? [], keys));
     if (candidates.length !== 1) fail("legacy_unique_mismatch");
     const index = candidates[0]!;
@@ -222,7 +225,8 @@ function keyRequirements(relations: readonly M2RelationFootprint[], dialect: Dia
     }
     return { keys: [...keys], constraintName, indexName: str(index.metadata, "name"),
       indexOid: dialect === "postgres" ? str(index.metadata, "oid") : null, flags: index.metadata };
-  });
+  };
+  const found: [M2UniqueFootprint, M2UniqueFootprint] = [locate(UNIQUE_KEYS[0]), locate(UNIQUE_KEYS[1])];
   for (const relation of relations) {
     const primary = COLUMNS[relation.name as Table].split(" ")[0]!;
     if (dialect === "sqlite") {
