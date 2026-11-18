@@ -455,6 +455,37 @@ function isolationProcess(script: string, input: unknown): void {
   assert.equal(result.status, 0, result.stderr || result.stdout);
 }
 
+test("STD003: environment data Proxy cannot pollute checked prototypes after the final descriptor", () => {
+  isolationProcess(`
+    import assert from 'node:assert/strict'; import fs from 'node:fs';
+    import * as values from ${JSON.stringify(isolationUrl)};
+    const cases=JSON.parse(fs.readFileSync(0,'utf8'));
+    const original=Object.getOwnPropertyDescriptor(Array.prototype,Symbol.unscopables);
+    for(const c of cases) {
+      const clean=values[c.name](c.input);assert.equal(clean.ok,true,c.name+' clean');
+      const transparent=new Proxy(original.value,{});
+      let control;
+      try {Object.defineProperty(Array.prototype,Symbol.unscopables,{...original,value:transparent});control=values[c.name](c.input);}
+      finally {Object.defineProperty(Array.prototype,Symbol.unscopables,original);}
+      assert.deepEqual(control,clean,c.name+' transparent environment Proxy remains supported');
+      for(const timing of [1,2,3]) for(const target of [Object.prototype,Array.prototype]) {
+        let sweeps=0,hooks=0,actual;
+        const proxy=new Proxy(original.value,{
+          ownKeys(t){sweeps++;return Reflect.ownKeys(t)},
+          getOwnPropertyDescriptor(t,key){const d=Reflect.getOwnPropertyDescriptor(t,key);
+            if(sweeps===timing&&key==='values')Object.defineProperty(target,'toJSON',{
+              __proto__:null,configurable:true,get(){hooks++;return ()=>({changed:true})}});
+            return d;}
+        });
+        try {Object.defineProperty(Array.prototype,Symbol.unscopables,{...original,value:proxy});actual=values[c.name](c.input);}
+        finally {delete target.toJSON;Object.defineProperty(Array.prototype,Symbol.unscopables,original);}
+        assert.equal(hooks,0,c.name+'/'+timing+' inherited getter');
+        assert.deepEqual(actual,{ok:false,error:{code:'invalid_value'}},c.name+'/'+timing);
+      }
+    }
+  `, [{ name: "parseM2Value", input: { kind: "config-snapshot", value: legacySnapshot() } }, ...isolationCalls()]);
+});
+
 test("STD001 ISO-01: exact inherited field and C-SEM probes never invoke hooks or fill missing own fields", () => {
   isolationProcess(`
     import assert from 'node:assert/strict'; import fs from 'node:fs';

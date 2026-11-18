@@ -634,6 +634,43 @@ test("STD001 ISO-02/04/05/06: both row entries isolate reflection and JSON paths
   assert.equal(result.status, 0, result.stderr || result.stdout);
 });
 
+test("STD003: both row entries reject environment Proxy pollution before JSON or result freezing", () => {
+  const encodeCalls = [
+    { name: "encodeM2RowValue", input: { table: "config_snapshots", value: legacySnapshot() } },
+    { name: "encodeM2RowValue", input: { table: "agent_profiles", value: head } },
+  ];
+  const calls = [...encodeCalls, ...encodeCalls.map(c => ({ name: "decodeM2RowValue", input: success(encodeM2RowValue(c.input)) }))];
+  const script = `
+    import assert from 'node:assert/strict';import fs from 'node:fs';
+    import * as rows from ${JSON.stringify(new URL("../src/server/identity/m2-row-codecs.ts", import.meta.url).href)};
+    const cases=JSON.parse(fs.readFileSync(0,'utf8'));
+    const original=Object.getOwnPropertyDescriptor(Array.prototype,Symbol.unscopables);
+    for(const c of cases) {
+      const clean=rows[c.name](c.input);assert.equal(clean.ok,true,c.name+' clean');
+      let control;
+      try {Object.defineProperty(Array.prototype,Symbol.unscopables,{...original,value:new Proxy(original.value,{})});control=rows[c.name](c.input);}
+      finally {Object.defineProperty(Array.prototype,Symbol.unscopables,original);}
+      assert.deepEqual(control,clean,c.name+' transparent environment Proxy');
+      for(const timing of [1,2,3]) for(const target of [Object.prototype,Array.prototype]) {
+        let sweeps=0,hooks=0,actual;
+        const proxy=new Proxy(original.value,{
+          ownKeys(t){sweeps++;return Reflect.ownKeys(t)},
+          getOwnPropertyDescriptor(t,key){const d=Reflect.getOwnPropertyDescriptor(t,key);
+            if(sweeps===timing&&key==='values')Object.defineProperty(target,'toJSON',{
+              __proto__:null,configurable:true,get(){hooks++;return ()=>({changed:true})}});
+            return d;}
+        });
+        try {Object.defineProperty(Array.prototype,Symbol.unscopables,{...original,value:proxy});actual=rows[c.name](c.input);}
+        finally {delete target.toJSON;Object.defineProperty(Array.prototype,Symbol.unscopables,original);}
+        assert.equal(hooks,0,c.name+'/'+timing+' inherited getter');
+        assert.deepEqual(actual,{ok:false,error:{code:'invalid_value'}},c.name+'/'+timing);
+      }
+    }
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], { input: JSON.stringify(calls), encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
 test("STD001 ISO-03: row modules reject prototype pollution that predates their evaluation", () => {
   const calls = [{ name: "encodeM2RowValue", input: { table: "agent_profiles", value: head } },
     { name: "decodeM2RowValue", input: headProjection }];

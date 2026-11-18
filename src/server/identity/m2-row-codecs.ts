@@ -32,7 +32,7 @@ function prototypeState(previous?: PrototypeState): PrototypeState {
   const state: PrototypeState = new Map();
   const require = (condition: unknown): void => { if (!condition) fail("invalid_value"); };
   require(Object.getPrototypeOf(Object.prototype) === null && Object.getPrototypeOf(Array.prototype) === Object.prototype);
-  const inspect = (prototype: object, methods: readonly string[], kind: "object" | "array" | "unscopables") => {
+  const inspect = (prototype: object, methods: readonly string[], kind: "object" | "array" | "unscopables", expected: PrototypeState | undefined = previous) => {
     const keys = Reflect.ownKeys(prototype), descriptors = new Map<PropertyKey, PropertyDescriptor>();
     require(keys.length === methods.length + (kind === "object" ? 1 : kind === "array" ? 3 : 0));
     for (let index = 0; index < keys.length; index++) {
@@ -52,8 +52,8 @@ function prototypeState(previous?: PrototypeState): PrototypeState {
         require((method || kind === "array" && key === Symbol.iterator) && ownData(d)
           && typeof d.value === "function" && d.writable === true && d.enumerable === false && d.configurable === true);
       }
-      if (previous) {
-        const old = previous.get(prototype)?.get(key);
+      if (expected) {
+        const old = expected.get(prototype)?.get(key);
         if (!old) fail("invalid_value");
         for (const field of ["value", "writable", "get", "set", "enumerable", "configurable"] as const) {
           const present = Object.hasOwn(d, field);
@@ -74,6 +74,11 @@ function prototypeState(previous?: PrototypeState): PrototypeState {
   if (exclusions === null || typeof exclusions !== "object") fail("invalid_value");
   require(Object.getPrototypeOf(exclusions) === null);
   inspect(exclusions, UNSCOPABLES, "unscopables");
+  // The data object above may be a Proxy. Close its last reflection window using
+  // only the intrinsic roots, comparing against this call's captured descriptors.
+  require(Object.getPrototypeOf(Object.prototype) === null && Object.getPrototypeOf(Array.prototype) === Object.prototype);
+  inspect(Object.prototype, OBJECT_METHODS, "object", state);
+  inspect(Array.prototype, ARRAY_METHODS, "array", state);
   return state;
 }
 
