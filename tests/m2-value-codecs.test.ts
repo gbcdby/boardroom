@@ -435,3 +435,128 @@ test("PA-04: decoded JSON root is below its string leaf at the exact depth bound
   fail(check(59), "value_conflict"); // Parsed scalar depth 64: budget permits it, legacy shape still rejects arrays.
   fail(check(60), "budget_exceeded"); // Parsed scalar depth 65: rejected before JSON.parse.
 });
+
+function isolationCalls() {
+  return [
+    { name: "parseM2Value", input: { kind: "profile-content", value: profile() } },
+    { name: "parseM2Value", input: { kind: "config-snapshot", value: snapshot() } },
+    { name: "parseM2Value", input: { kind: "config-snapshot", value: legacySnapshot() } },
+    { name: "m2ValueDigest", input: { kind: "profile-content", body: profile() } },
+    { name: "checkM2SnapshotMappingValues", input: { snapshot: snapshot(), mapping: mapping() } },
+    { name: "checkM2DetachValues", input: { detach: detach(), profile: profileVersion(), binding: bindingVersion(),
+      requested: { snapshot: snapshot(1), mapping: null }, applied: { snapshot: snapshot(1), mapping: mapping(snapshot(1)) },
+      rootSelected: { snapshot: snapshot(1), mapping: mapping(snapshot(1)) } } },
+    ...authorityInputs().map(input => ({ name: "checkM2AuthorityValues", input })),
+  ];
+}
+const isolationUrl = new URL("../src/server/identity/m2-value-codecs.ts", import.meta.url).href;
+function isolationProcess(script: string, input: unknown): void {
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], { input: JSON.stringify(input), encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+}
+
+test("STD001 ISO-01: exact inherited field and C-SEM probes never invoke hooks or fill missing own fields", () => {
+  isolationProcess(`
+    import assert from 'node:assert/strict'; import fs from 'node:fs';
+    import {parseM2Value} from ${JSON.stringify(isolationUrl)};
+    const [profile,snapshot]=JSON.parse(fs.readFileSync(0,'utf8'));
+    assert.equal(parseM2Value({kind:'config-snapshot',value:snapshot}).ok,true);
+    for(const variant of ['instructions-data','instructions-getter','snapshot-toJSON']) {
+      const key=variant==='snapshot-toJSON'?'toJSON':'instructions';
+      const input=variant==='snapshot-toJSON'?{kind:'config-snapshot',value:snapshot}:{kind:'profile-content',value:{...profile}};
+      if(key==='instructions')delete input.value.instructions;
+      let hookCalls=0,trapCalls=0,actual;
+      const proxy=new Proxy(input,{ownKeys(target){trapCalls++;
+        Object.defineProperty(Object.prototype,key,variant==='instructions-data'
+          ?{__proto__:null,configurable:true,writable:true,value:'inherited-instructions'}
+          :{__proto__:null,configurable:true,get(){hookCalls++;return key==='toJSON'?function(){return {replaced:true}}:'inherited-instructions'}});
+        return Reflect.ownKeys(target);
+      }});
+      try {actual=parseM2Value(proxy)} finally {delete Object.prototype[key]}
+      assert.deepEqual(actual,{ok:false,error:{code:'invalid_value'}},variant);
+      assert.equal(hookCalls,0,variant+' must not execute inherited getter');assert.equal(trapCalls,1);
+    }
+  `, [profile(), snapshot()]);
+});
+
+test("STD001 ISO-02/05/06: every value entry rejects ambient pollution before consuming E1/P1 and accepts clean proxies", () => {
+  isolationProcess(`
+    import assert from 'node:assert/strict'; import fs from 'node:fs';
+    import * as values from ${JSON.stringify(isolationUrl)};
+    const cases=JSON.parse(fs.readFileSync(0,'utf8'));
+    for(const c of cases) {
+      const clean=values[c.name](c.input);assert.equal(clean.ok,true,c.name+' clean fixture');
+      const nullCopy=value=>value===null||typeof value!=='object'?value:Array.isArray(value)?value.map(nullCopy):
+        Object.assign(Object.create(null),Object.fromEntries(Object.entries(value).map(([k,v])=>[k,nullCopy(v)])));
+      assert.deepEqual(values[c.name](nullCopy(c.input)),clean,c.name+' null-prototype inputs');
+      let cleanTraps=0;
+      assert.deepEqual(values[c.name](new Proxy(c.input,{ownKeys(t){cleanTraps++;return Reflect.ownKeys(t)}})),clean);
+      assert.equal(cleanTraps,1,c.name+' clean single key snapshot');
+      for(const timing of ['before-call','getPrototypeOf','ownKeys','getOwnPropertyDescriptor']) {
+        let hooks=0,traps=0,actual;
+        const install=()=>Object.defineProperty(Object.prototype,'toJSON',{__proto__:null,configurable:true,get(){hooks++;return ()=>({replaced:true})}});
+        const handler={};
+        if(timing==='before-call')handler.ownKeys=t=>{traps++;return Reflect.ownKeys(t)};
+        else handler[timing]=(...args)=>{traps++;install();return Reflect[timing](...args)};
+        const input=new Proxy(c.input,handler);
+        try{if(timing==='before-call')install();actual=values[c.name](input)}finally{delete Object.prototype.toJSON}
+        assert.deepEqual(actual,{ok:false,error:{code:'invalid_value'}},c.name+'/'+timing);
+        assert.equal(hooks,0,c.name+'/'+timing+' getter');
+        if(timing==='before-call')assert.equal(traps,0,c.name+' must reject before reflecting input');
+      }
+    }
+  `, isolationCalls());
+});
+
+test("STD001 ISO-03: pollution before module evaluation is never adopted as a trusted baseline", () => {
+  for (const variant of ["instructions-data", "instructions-getter", "toJSON-getter"]) isolationProcess(`
+    import assert from 'node:assert/strict'; import fs from 'node:fs';
+    const cases=JSON.parse(fs.readFileSync(0,'utf8')),variant=${JSON.stringify(variant)};
+    const key=variant==='toJSON-getter'?'toJSON':'instructions';let hooks=0,results,loadHooks;
+    Object.defineProperty(Object.prototype,key,variant==='instructions-data'
+      ?{__proto__:null,configurable:true,writable:true,value:'preloaded-inherited'}
+      :{__proto__:null,configurable:true,get(){hooks++;return key==='toJSON'?()=>({replaced:true}):'preloaded-inherited'}});
+    try {
+      const values=await import(${JSON.stringify(isolationUrl)});loadHooks=hooks;
+      results=cases.map(c=>values[c.name](c.input));
+    } finally {delete Object.prototype[key]}
+    assert.equal(loadHooks,0,variant+' module evaluation must not invoke this hook');
+    assert.equal(hooks,0,variant+' calls must not invoke this hook');
+    for(const result of results)assert.deepEqual(result,{ok:false,error:{code:'invalid_value'}});
+  `, isolationCalls());
+});
+
+test("STD001 ISO-04: descriptor inheritance and array index setters cannot run during the own-data copy", () => {
+  const withTools = { ...profile(), legacyCompatibility: { tools: ["Read"], permissionMode: "auto" } };
+  isolationProcess(`
+    import assert from 'node:assert/strict'; import fs from 'node:fs';
+    import {parseM2Value} from ${JSON.stringify(isolationUrl)};
+    const fixture=JSON.parse(fs.readFileSync(0,'utf8'));assert.equal(parseM2Value({kind:'profile-content',value:fixture}).ok,true);
+    for(const variant of ['descriptor-value-data','descriptor-value-getter','descriptor-get','descriptor-set','array-index']) {
+      const value={...fixture};let hooks=0,ownGetter=0,actual;
+      if(variant.startsWith('descriptor-value'))Object.defineProperty(value,'instructions',{
+        __proto__:null,configurable:true,enumerable:true,get(){ownGetter++;return ''}});
+      const key=variant.startsWith('descriptor-value')?'value':variant==='array-index'?'0':variant.slice('descriptor-'.length);
+      const target=variant==='array-index'?Array.prototype:Object.prototype;
+      const input=new Proxy({kind:'profile-content',value},{ownKeys(t){
+        const descriptor=variant==='descriptor-value-data'?{__proto__:null,configurable:true,value:''}
+          :variant==='array-index'?{__proto__:null,configurable:true,set(v){hooks++;Object.defineProperty(this,'0',{__proto__:null,value:v,writable:true,enumerable:true,configurable:true})}}
+          :{__proto__:null,configurable:true,get(){hooks++;return variant==='descriptor-value-getter'?'':undefined}};
+        Object.defineProperty(target,key,descriptor);return Reflect.ownKeys(t);
+      }});
+      try{actual=parseM2Value(input)}finally{delete target[key]}
+      assert.equal(hooks,0,variant+' inherited hook');assert.equal(ownGetter,0,variant+' input getter');
+      assert.deepEqual(actual,{ok:false,error:{code:'invalid_value'}},variant);
+    }
+  `, withTools);
+});
+
+test("STD001 ISO-06: fixed C-SEM bytes retain string escapes, duplicate tools, nulls and field order", () => {
+  for (const backend of ["claude-code", "codex-cli", "dsh"]) for (const tools of [null, ["Read", "Read", "\ud800\n\r\t\"\\", "😀"]]) {
+    const value = { ...snapshot(), backend,
+      config: { model: "m\udfff", workdir: "/工作\r\n", tools, systemPrompt: "\b\f\u0000\"\\😀", permissionMode: "auto" } };
+    value.semanticDigest = hash(JSON.stringify({ backend, config: value.config, advancedStrategy: null }));
+    const { ref, ...body } = value; value.ref = { ...ref, contentDigest: hash(canonicalJson(body)) };
+    assert.deepEqual(ok(parseM2Value({ kind: "config-snapshot", value })).value, value);
+  }
+});

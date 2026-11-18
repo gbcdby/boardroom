@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { stripTypeScriptTypes } from "node:module";
+import { spawnSync } from "node:child_process";
 import { encodeM2RowValue, decodeM2RowValue } from "../src/server/identity/m2-row-codecs.ts";
 import { M2_COLUMN_CONTRACT, M2_FORMAT_REGISTRATION } from "../src/server/identity/m2-value-contracts.ts";
 import { canonicalJson } from "../src/server/storage/maintenance/canonical.ts";
@@ -337,6 +338,24 @@ test("PA-22 E02 allows a snapshot without mapping and emits only immediate compl
   rejected(encodeM2RowValue({ table: "runner-applied-references", value: { ...value, appliedSnapshotId: null } }), "value_conflict");
 });
 
+test("PA-01 execution projections distinguish invalid table fields from unknown names", async t => {
+  const fragments = [
+    { table: "execution-binding-references", value: { executionBindingId: "execution", groupBindingId: "binding", attachmentState: "attached",
+      detachSnapshotId: null, detachedAt: null, requestedSnapshotId: null, requestedMappingId: null } },
+    { table: "runner-applied-references", value: { bindingId: "execution", appliedSnapshotId: null, appliedMappingId: null } },
+  ];
+  for (const fragment of fragments) {
+    const projection = success(encodeM2RowValue(fragment));
+    assert.deepEqual(success(decodeM2RowValue(projection)).value, fragment.value);
+    const missing: Record<string, unknown> = { ...projection }; delete missing.table;
+    await t.test(`${fragment.table}: missing table`, () => rejected(decodeM2RowValue(missing), "invalid_value"));
+    for (const table of [null, 1, {}]) {
+      await t.test(`${fragment.table}: table=${JSON.stringify(table)}`, () => rejected(decodeM2RowValue({ ...projection, table }), "invalid_value"));
+    }
+    rejected(decodeM2RowValue({ ...projection, table: "future_execution_table" }), "unsupported_shape");
+  }
+});
+
 test("PA-02/03 row envelopes reject hostile data without invoking getters or mutating callers", async t => {
   const base = () => ({ table: "agent_profiles", value: { ...head } });
   let callbacks = 0;
@@ -552,4 +571,82 @@ test("PA-S1-08 data-only unregistered constants disable every complete R09 row w
 test("PA-24 row runtime exports contain only the two pure value functions", async () => {
   assert.deepEqual(Object.keys(await import("../src/server/identity/m2-row-codecs.ts")).sort(), ["decodeM2RowValue", "encodeM2RowValue"]);
   for (const field of ["registry", "budget", "callback", "SQL", "SourceLock", "permit", "active"]) rejected(encodeM2RowValue({ table: "agent_profiles", value: head, [field]: true }), "invalid_value");
+});
+
+test("STD001 ISO-02/04/05/06: both row entries isolate reflection and JSON paths without inherited hooks", () => {
+  const encodeCalls = [
+    { name: "encodeM2RowValue", input: { table: "agent_profiles", value: head } },
+    { name: "encodeM2RowValue", input: { table: "agent_profile_versions", value: { version: profileVersion(), compatRuntimeRevision: null } } },
+    { name: "encodeM2RowValue", input: { table: "config_snapshots", value: legacySnapshot() } },
+  ];
+  const calls = [...encodeCalls, ...encodeCalls.map(c => ({ name: "decodeM2RowValue", input: success(encodeM2RowValue(c.input)) }))];
+  const script = `
+    import assert from 'node:assert/strict'; import fs from 'node:fs';
+    import * as rows from ${JSON.stringify(new URL("../src/server/identity/m2-row-codecs.ts", import.meta.url).href)};
+    const cases=JSON.parse(fs.readFileSync(0,'utf8'));
+    for(const c of cases) {
+      const clean=rows[c.name](c.input);assert.equal(clean.ok,true,c.name+' clean');
+      const nullCopy=v=>v===null||typeof v!=='object'?v:Array.isArray(v)?v.map(nullCopy):Object.assign(Object.create(null),Object.fromEntries(Object.entries(v).map(([k,x])=>[k,nullCopy(x)])));
+      assert.deepEqual(rows[c.name](nullCopy(c.input)),clean);
+      let cleanTraps=0;
+      assert.deepEqual(rows[c.name](new Proxy(c.input,{ownKeys(t){cleanTraps++;return Reflect.ownKeys(t)}})),clean);
+      assert.equal(cleanTraps,1);
+      for(const timing of ['before-call','getPrototypeOf','ownKeys','getOwnPropertyDescriptor']) {
+        let hooks=0,traps=0,actual;
+        const install=()=>Object.defineProperty(Object.prototype,'toJSON',{__proto__:null,configurable:true,get(){hooks++;return ()=>({replaced:true})}});
+        const handler={};
+        if(timing==='before-call')handler.ownKeys=t=>{traps++;return Reflect.ownKeys(t)};
+        else handler[timing]=(...args)=>{traps++;install();return Reflect[timing](...args)};
+        const input=new Proxy(c.input,handler);
+        try{if(timing==='before-call')install();actual=rows[c.name](input)}finally{delete Object.prototype.toJSON}
+        assert.deepEqual(actual,{ok:false,error:{code:'invalid_value'}},c.name+'/'+timing);
+        assert.equal(hooks,0,c.name+'/'+timing+' getter');if(timing==='before-call')assert.equal(traps,0);
+      }
+      for(const key of ['get','set']) {
+        let hooks=0,actual;
+        const input=new Proxy(c.input,{ownKeys(t){Object.defineProperty(Object.prototype,key,{__proto__:null,configurable:true,get(){hooks++;return undefined}});return Reflect.ownKeys(t)}});
+        try{actual=rows[c.name](input)}finally{delete Object.prototype[key]}
+        assert.equal(hooks,0,c.name+'/'+key);assert.deepEqual(actual,{ok:false,error:{code:'invalid_value'}});
+      }
+    }
+    for(const name of ['encodeM2RowValue','decodeM2RowValue']) {
+      let hooks=0,ownGetter=0,actual;
+      const input=name==='encodeM2RowValue'?{table:'agent_profiles',value:{agentId:'agent',currentRevision:2,legacyRuntimeId:null,compatRuntimeRevision:null}}
+        :{contract:'m2-row-projection/r1',table:'agent_profiles',cells:{}};
+      Object.defineProperty(input,'table',{__proto__:null,configurable:true,enumerable:true,get(){ownGetter++;return 'agent_profiles'}});
+      const proxy=new Proxy(input,{ownKeys(t){Object.defineProperty(Object.prototype,'value',{__proto__:null,configurable:true,get(){hooks++;return 'agent_profiles'}});return Reflect.ownKeys(t)}});
+      try{actual=rows[name](proxy)}finally{delete Object.prototype.value}
+      assert.equal(hooks,0,name+' own descriptor value');assert.equal(ownGetter,0);
+      assert.deepEqual(actual,{ok:false,error:{code:'invalid_value'}});
+    }
+    const arrayCase=cases.find(c=>c.name==='encodeM2RowValue'&&c.input.table==='config_snapshots');
+    let arrayHooks=0,arrayResult;
+    const arrayInput=new Proxy(arrayCase.input,{ownKeys(t){
+      Object.defineProperty(Array.prototype,'0',{__proto__:null,configurable:true,set(value){arrayHooks++;
+        Object.defineProperty(this,'0',{__proto__:null,value,writable:true,enumerable:true,configurable:true})}});
+      return Reflect.ownKeys(t);
+    }});
+    try{arrayResult=rows.encodeM2RowValue(arrayInput)}finally{delete Array.prototype[0]}
+    assert.equal(arrayHooks,0,'row snapshot array index setter');
+    assert.deepEqual(arrayResult,{ok:false,error:{code:'invalid_value'}});
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], { input: JSON.stringify(calls), encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
+test("STD001 ISO-03: row modules reject prototype pollution that predates their evaluation", () => {
+  const calls = [{ name: "encodeM2RowValue", input: { table: "agent_profiles", value: head } },
+    { name: "decodeM2RowValue", input: headProjection }];
+  const script = `
+    import assert from 'node:assert/strict';import fs from 'node:fs';
+    const cases=JSON.parse(fs.readFileSync(0,'utf8'));let hooks=0,actual,loadHooks;
+    Object.defineProperty(Object.prototype,'toJSON',{__proto__:null,configurable:true,get(){hooks++;return ()=>({replaced:true})}});
+    try {const rows=await import(${JSON.stringify(new URL("../src/server/identity/m2-row-codecs.ts", import.meta.url).href)});
+      loadHooks=hooks;actual=cases.map(c=>rows[c.name](c.input));
+    } finally {delete Object.prototype.toJSON}
+    assert.equal(loadHooks,0);assert.equal(hooks,0);
+    for(const result of actual)assert.deepEqual(result,{ok:false,error:{code:'invalid_value'}});
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], { input: JSON.stringify(calls), encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
 });

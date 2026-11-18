@@ -16,12 +16,69 @@ import type { ReadonlyDeep, M2ValueErrorCode, M2ValueResult, M2ValueTypes, Parse
 
 const MAX_BYTES = 16_777_216, MAX_DEPTH = 64, MAX_NODES = 250_000;
 const failures = new WeakMap<object, M2ValueErrorCode>();
-class Failure extends Error { constructor(code: M2ValueErrorCode) { super("m2_value_failure"); failures.set(this, code); } }
-function fail(code: M2ValueErrorCode): never { throw new Failure(code); }
+function fail(code: M2ValueErrorCode): never { const error = Object.create(null) as object; failures.set(error, code); throw error; }
 function conflict(condition: boolean): asserts condition { if (!condition) fail("value_conflict"); }
 function frozen<T>(value: T): ReadonlyDeep<T> {
   if (value !== null && typeof value === "object") { for (const v of Object.values(value)) frozen(v); Object.freeze(value); }
   return value as ReadonlyDeep<T>;
+}
+// INPUT-ISOLATION-DELTA: fixed standard shapes, never a module-load trust snapshot.
+// E1/P1 allocate ordinary objects internally; admit ambient prototypes before they run.
+const OBJECT_METHODS = Object.freeze("constructor __defineGetter__ __defineSetter__ hasOwnProperty __lookupGetter__ __lookupSetter__ isPrototypeOf propertyIsEnumerable toString valueOf toLocaleString".split(" "));
+const ARRAY_METHODS = Object.freeze("constructor at concat copyWithin fill find findIndex findLast findLastIndex lastIndexOf pop push reverse shift unshift slice sort splice includes indexOf join keys entries values forEach filter flat flatMap map every some reduce reduceRight toReversed toSorted toSpliced with toLocaleString toString".split(" "));
+const UNSCOPABLES = Object.freeze("at copyWithin entries fill find findIndex findLast findLastIndex flat flatMap includes keys toReversed toSorted toSpliced values".split(" "));
+type PrototypeState = Map<object, Map<PropertyKey, PropertyDescriptor>>;
+function ownData(descriptor: PropertyDescriptor | undefined): descriptor is PropertyDescriptor & { value: unknown } {
+  return descriptor !== undefined && Object.hasOwn(descriptor, "value") && Object.hasOwn(descriptor, "writable")
+    && !Object.hasOwn(descriptor, "get") && !Object.hasOwn(descriptor, "set");
+}
+function prototypeState(previous?: PrototypeState): PrototypeState {
+  const state: PrototypeState = new Map();
+  const require = (condition: unknown): void => { if (!condition) fail("invalid_value"); };
+  require(Object.getPrototypeOf(Object.prototype) === null && Object.getPrototypeOf(Array.prototype) === Object.prototype);
+  const inspect = (prototype: object, methods: readonly string[], kind: "object" | "array" | "unscopables") => {
+    const keys = Reflect.ownKeys(prototype), descriptors = new Map<PropertyKey, PropertyDescriptor>();
+    require(keys.length === methods.length + (kind === "object" ? 1 : kind === "array" ? 3 : 0));
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index]!, d = Object.getOwnPropertyDescriptor(prototype, key);
+      if (!d || !Object.hasOwn(d, "enumerable") || !Object.hasOwn(d, "configurable")) fail("invalid_value");
+      const method = typeof key === "string" && methods.includes(key);
+      if (kind === "object" && key === "__proto__") {
+        require(!Object.hasOwn(d, "value") && !Object.hasOwn(d, "writable") && Object.hasOwn(d, "get") && Object.hasOwn(d, "set")
+          && typeof d.get === "function" && typeof d.set === "function" && d.enumerable === false && d.configurable === true);
+      } else if (kind === "array" && key === "length") {
+        require(ownData(d) && d.value === 0 && d.writable === true && d.enumerable === false && d.configurable === false);
+      } else if (kind === "array" && key === Symbol.unscopables) {
+        require(ownData(d) && d.value !== null && typeof d.value === "object" && d.writable === false && d.enumerable === false && d.configurable === true);
+      } else if (kind === "unscopables" && method) {
+        require(ownData(d) && d.value === true && d.writable === true && d.enumerable === true && d.configurable === true);
+      } else {
+        require((method || kind === "array" && key === Symbol.iterator) && ownData(d)
+          && typeof d.value === "function" && d.writable === true && d.enumerable === false && d.configurable === true);
+      }
+      if (previous) {
+        const old = previous.get(prototype)?.get(key);
+        if (!old) fail("invalid_value");
+        for (const field of ["value", "writable", "get", "set", "enumerable", "configurable"] as const) {
+          const present = Object.hasOwn(d, field);
+          require(present === Object.hasOwn(old, field) && (!present || Object.is(d[field], old[field])));
+        }
+      }
+      descriptors.set(key, d);
+    }
+    state.set(prototype, descriptors);
+    return descriptors;
+  };
+  inspect(Object.prototype, OBJECT_METHODS, "object");
+  const array = inspect(Array.prototype, ARRAY_METHODS, "array");
+  const iterator = array.get(Symbol.iterator), values = array.get("values"), unscopables = array.get(Symbol.unscopables);
+  if (!ownData(iterator) || !ownData(values) || !ownData(unscopables)) fail("invalid_value");
+  require(iterator.value === values.value);
+  const exclusions = unscopables.value;
+  if (exclusions === null || typeof exclusions !== "object") fail("invalid_value");
+  require(Object.getPrototypeOf(exclusions) === null);
+  inspect(exclusions, UNSCOPABLES, "unscopables");
+  return state;
 }
 class Budget {
   nodes = 0;
@@ -63,17 +120,20 @@ class Budget {
       ancestors.add(item);
       try {
         if (array) {
-          const length: unknown = descriptors.get("length")?.value;
+          const lengthDescriptor = descriptors.get("length");
+          if (!ownData(lengthDescriptor) || lengthDescriptor.enumerable !== false) fail("invalid_value");
+          const length: unknown = lengthDescriptor.value;
           if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0) fail("invalid_value");
           if (length > MAX_NODES) fail("budget_exceeded");
           if (keys.length !== length + 1) fail("invalid_value");
           charge(2 + Math.max(0, length - 1)); const out: unknown[] = [];
-          for (let i = 0; i < length; i++) { const d = descriptors.get(String(i)); if (!d || !("value" in d) || !d.enumerable) fail("invalid_value"); out.push(visit(d.value, depth + 1)); }
+          for (let i = 0; i < length; i++) { const d = descriptors.get(String(i)); if (!ownData(d) || d.enumerable !== true) fail("invalid_value");
+            Object.defineProperty(out, String(i), { __proto__: null, value: visit(d.value, depth + 1), enumerable: true, configurable: true, writable: true } as PropertyDescriptor); }
           return Object.freeze(out);
         }
-        charge(2 + Math.max(0, keys.length - 1)); const out: Record<string, unknown> = {};
-        for (const key of keys as string[]) { const d = descriptors.get(key)!; if (!("value" in d) || !d.enumerable) fail("invalid_value");
-          stringSize(key); charge(1); Object.defineProperty(out, key, { value: visit(d.value, depth + 1), enumerable: true }); }
+        charge(2 + Math.max(0, keys.length - 1)); const out = Object.create(null) as Record<string, unknown>;
+        for (const key of keys as string[]) { const d = descriptors.get(key)!; if (!ownData(d) || d.enumerable !== true) fail("invalid_value");
+          stringSize(key); charge(1); Object.defineProperty(out, key, { __proto__: null, value: visit(d.value, depth + 1), enumerable: true } as PropertyDescriptor); }
         return Object.freeze(out);
       } finally { ancestors.delete(item); }
     };
@@ -98,7 +158,12 @@ class Budget {
   }
 }
 function total<T>(input: unknown, body: (value: unknown, budget: Budget) => T): M2ValueResult<T> {
-  try { const budget = new Budget(); return frozen({ ok: true as const, classification: "value-consistent" as const, value: body(budget.copy(input), budget) }); }
+  try {
+    const environment = prototypeState(), budget = new Budget(), copy = budget.copy(input);
+    prototypeState(environment); // All caller reflection has returned; E1/P1 receive only isolated data.
+    const value = body(copy, budget); prototypeState(environment);
+    return frozen({ ok: true as const, classification: "value-consistent" as const, value });
+  }
   catch (error) { const code = error !== null && (typeof error === "object" || typeof error === "function") ? failures.get(error) : undefined;
     return frozen({ ok: false as const, error: { code: code ?? "invalid_value" } }); }
 }
@@ -262,8 +327,9 @@ const detachBodySchema = z.object({ attachment, profileRef, bindingRef, root: de
   readOnly: z.literal(true), runReady: z.literal(false) }).strict();
 const detachSchema = detachBodySchema.extend({ ref: detachRef }).strict();
 function semantic(backend: Backend, config: RuntimeConfig, advancedStrategy: Strategy | null) {
-  return hash(JSON.stringify({ backend, config: { model: config.model, workdir: config.workdir, tools: config.tools,
-    systemPrompt: config.systemPrompt, permissionMode: config.permissionMode }, advancedStrategy }));
+  // C-SEM keeps the exact legacy property order and primitive escaping without object toJSON lookup.
+  const tools = config.tools === null ? "null" : `[${config.tools.map(value => JSON.stringify(value)).join(",")}]`;
+  return hash(`{"backend":${JSON.stringify(backend)},"config":{"model":${JSON.stringify(config.model)},"workdir":${JSON.stringify(config.workdir)},"tools":${tools},"systemPrompt":${JSON.stringify(config.systemPrompt)},"permissionMode":${JSON.stringify(config.permissionMode)}},"advancedStrategy":${JSON.stringify(advancedStrategy)}}`);
 }
 function effectiveBasis(b: CurrentAdvancedBasis, p: ProfileRef, backend: Backend, cfg: RuntimeConfig) {
   conflict(same(b.profileRef, p) && b.backend === backend && b.ordinaryConfigDigest === hash(r3({ backend, config: cfg })));

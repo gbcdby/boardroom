@@ -18,6 +18,65 @@ function freeze<T>(value: T): T {
   return value;
 }
 
+// INPUT-ISOLATION-DELTA: fixed standard shapes, never a module-load trust snapshot.
+// E1/P1 allocate ordinary objects internally; admit ambient prototypes before they run.
+const OBJECT_METHODS = Object.freeze("constructor __defineGetter__ __defineSetter__ hasOwnProperty __lookupGetter__ __lookupSetter__ isPrototypeOf propertyIsEnumerable toString valueOf toLocaleString".split(" "));
+const ARRAY_METHODS = Object.freeze("constructor at concat copyWithin fill find findIndex findLast findLastIndex lastIndexOf pop push reverse shift unshift slice sort splice includes indexOf join keys entries values forEach filter flat flatMap map every some reduce reduceRight toReversed toSorted toSpliced with toLocaleString toString".split(" "));
+const UNSCOPABLES = Object.freeze("at copyWithin entries fill find findIndex findLast findLastIndex flat flatMap includes keys toReversed toSorted toSpliced values".split(" "));
+type PrototypeState = Map<object, Map<PropertyKey, PropertyDescriptor>>;
+function ownData(descriptor: PropertyDescriptor | undefined): descriptor is PropertyDescriptor & { value: unknown } {
+  return descriptor !== undefined && Object.hasOwn(descriptor, "value") && Object.hasOwn(descriptor, "writable")
+    && !Object.hasOwn(descriptor, "get") && !Object.hasOwn(descriptor, "set");
+}
+function prototypeState(previous?: PrototypeState): PrototypeState {
+  const state: PrototypeState = new Map();
+  const require = (condition: unknown): void => { if (!condition) fail("invalid_value"); };
+  require(Object.getPrototypeOf(Object.prototype) === null && Object.getPrototypeOf(Array.prototype) === Object.prototype);
+  const inspect = (prototype: object, methods: readonly string[], kind: "object" | "array" | "unscopables") => {
+    const keys = Reflect.ownKeys(prototype), descriptors = new Map<PropertyKey, PropertyDescriptor>();
+    require(keys.length === methods.length + (kind === "object" ? 1 : kind === "array" ? 3 : 0));
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index]!, d = Object.getOwnPropertyDescriptor(prototype, key);
+      if (!d || !Object.hasOwn(d, "enumerable") || !Object.hasOwn(d, "configurable")) fail("invalid_value");
+      const method = typeof key === "string" && methods.includes(key);
+      if (kind === "object" && key === "__proto__") {
+        require(!Object.hasOwn(d, "value") && !Object.hasOwn(d, "writable") && Object.hasOwn(d, "get") && Object.hasOwn(d, "set")
+          && typeof d.get === "function" && typeof d.set === "function" && d.enumerable === false && d.configurable === true);
+      } else if (kind === "array" && key === "length") {
+        require(ownData(d) && d.value === 0 && d.writable === true && d.enumerable === false && d.configurable === false);
+      } else if (kind === "array" && key === Symbol.unscopables) {
+        require(ownData(d) && d.value !== null && typeof d.value === "object" && d.writable === false && d.enumerable === false && d.configurable === true);
+      } else if (kind === "unscopables" && method) {
+        require(ownData(d) && d.value === true && d.writable === true && d.enumerable === true && d.configurable === true);
+      } else {
+        require((method || kind === "array" && key === Symbol.iterator) && ownData(d)
+          && typeof d.value === "function" && d.writable === true && d.enumerable === false && d.configurable === true);
+      }
+      if (previous) {
+        const old = previous.get(prototype)?.get(key);
+        if (!old) fail("invalid_value");
+        for (const field of ["value", "writable", "get", "set", "enumerable", "configurable"] as const) {
+          const present = Object.hasOwn(d, field);
+          require(present === Object.hasOwn(old, field) && (!present || Object.is(d[field], old[field])));
+        }
+      }
+      descriptors.set(key, d);
+    }
+    state.set(prototype, descriptors);
+    return descriptors;
+  };
+  inspect(Object.prototype, OBJECT_METHODS, "object");
+  const array = inspect(Array.prototype, ARRAY_METHODS, "array");
+  const iterator = array.get(Symbol.iterator), values = array.get("values"), unscopables = array.get(Symbol.unscopables);
+  if (!ownData(iterator) || !ownData(values) || !ownData(unscopables)) fail("invalid_value");
+  require(iterator.value === values.value);
+  const exclusions = unscopables.value;
+  if (exclusions === null || typeof exclusions !== "object") fail("invalid_value");
+  require(Object.getPrototypeOf(exclusions) === null);
+  inspect(exclusions, UNSCOPABLES, "unscopables");
+  return state;
+}
+
 /** 每次公开调用只创建一个预算；JSON 列和其固定 raw 子路径沿用它。 */
 class Budget {
   private bytes = 0;
@@ -52,25 +111,29 @@ class Budget {
       const keys = Reflect.ownKeys(value);
       requireValue(keys.every(key => typeof key === "string"));
       if (keys.length > 250001) fail("budget_exceeded");
-      const descriptors = new Map(keys.map(key => [key, Object.getOwnPropertyDescriptor(value, key)]));
+      const descriptors = new Map<PropertyKey, PropertyDescriptor>();
+      for (const key of keys) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key); requireValue(descriptor);
+        descriptors.set(key, descriptor);
+      }
       if (array) {
         const length = descriptors.get("length");
-        requireValue(length && "value" in length && Number.isSafeInteger(length.value) && length.value >= 0 && !Object.is(length.value, -0) && !length.enumerable);
+        requireValue(ownData(length) && typeof length.value === "number" && Number.isSafeInteger(length.value) && length.value >= 0 && !Object.is(length.value, -0) && length.enumerable === false);
         if (length.value > 250000) fail("budget_exceeded");
         requireValue(keys.length === length.value + 1); this.charge(2 + Math.max(0, length.value - 1));
         const out: Data[] = [];
         for (let i = 0; i < length.value; i++) {
-          const descriptor = descriptors.get(String(i)); requireValue(descriptor && "value" in descriptor && descriptor.enumerable);
-          out.push(this.copy(descriptor.value, depth + 1));
+          const descriptor = descriptors.get(String(i)); requireValue(ownData(descriptor) && descriptor.enumerable === true);
+          Object.defineProperty(out, String(i), { __proto__: null, value: this.copy(descriptor.value, depth + 1), enumerable: true, configurable: true, writable: true } as PropertyDescriptor);
         }
         return out;
       }
       this.charge(2 + Math.max(0, keys.length - 1));
-      const out: { [key: string]: Data } = {};
+      const out = Object.create(null) as { [key: string]: Data };
       for (const key of keys as string[]) {
-        const descriptor = descriptors.get(key); requireValue(descriptor && "value" in descriptor && descriptor.enumerable);
+        const descriptor = descriptors.get(key); requireValue(ownData(descriptor) && descriptor.enumerable === true);
         this.string(key); this.charge(1);
-        Object.defineProperty(out, key, { value: this.copy(descriptor.value, depth + 1), enumerable: true, configurable: true, writable: true });
+        Object.defineProperty(out, key, { __proto__: null, value: this.copy(descriptor.value, depth + 1), enumerable: true, configurable: true, writable: true } as PropertyDescriptor);
       }
       return out;
     } finally { this.path.delete(value); }
@@ -112,7 +175,12 @@ class Budget {
   }
 }
 function result<T>(input: unknown, body: (value: Data, budget: Budget) => T): M2ValueResult<T> {
-  try { const budget = new Budget(); return freeze({ ok: true, classification: "value-consistent", value: body(budget.copy(input), budget) }) as M2ValueResult<T>; }
+  try {
+    const environment = prototypeState(), budget = new Budget(), copy = budget.copy(input);
+    prototypeState(environment); // No caller object reaches JSON, value codecs or row projection.
+    const value = body(copy, budget); prototypeState(environment);
+    return freeze({ ok: true, classification: "value-consistent", value }) as M2ValueResult<T>;
+  }
   catch (error) {
     const code = error !== null && (typeof error === "object" || typeof error === "function") ? failures.get(error) : undefined;
     return freeze({ ok: false, error: { code: code ?? "invalid_value" } });
@@ -509,6 +577,7 @@ export function decodeM2RowValue(input: unknown): M2ValueResult<M2DecodedRow> {
     requireValue(data !== null && typeof data === "object" && !Array.isArray(data));
     const top = data as Obj; requireValue(typeof top.contract === "string");
     requireValue(top.contract === "m2-row-projection/r1" || top.contract === "m2-execution-reference-projection/r1", "unsupported_shape");
+    requireValue(typeof top.table === "string");
     const table = top.contract === "m2-execution-reference-projection/r1"
       ? top.table === "agent_runtime_bindings" ? "execution-binding-references" : top.table === "agent_runner_states" ? "runner-applied-references" : fail("unsupported_shape")
       : knownTable(top.table);
