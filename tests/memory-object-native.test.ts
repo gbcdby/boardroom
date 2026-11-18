@@ -417,6 +417,71 @@ test("#161 E3 strict values and real protection failures have no coercion or imp
   } finally { await rm(missing, { recursive: true, force: true }); }
 });
 
+test("#161 E3 Linux search-only external ancestors retain readable private roots and real identity checks", { skip: process.platform !== "linux" }, async () => {
+  const { file } = await buildMemoryNativeFixture(); const directory = await createMemoryRoot();
+  try { console.log(await runMemoryChild(file, directory, `
+    const n=createRequire(import.meta.url)(file),selected=path.join(directory,'memory');
+    fs.mkdirSync(selected,{mode:0o700});
+    for(const leaf of ['objects','objects/sha256','objects/.staging'])fs.mkdirSync(path.join(selected,leaf),{mode:0o700});
+    let root,alias;
+    try {
+      fs.chmodSync(directory,0o111);
+      assert.ok(fs.statSync(selected).isDirectory());
+      assert.throws(()=>fs.openSync(directory,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY),{code:'EACCES'});
+      root=n.fixtureOpenRoot(selected,'search-ancestor',1048576);
+      alias=n.fixtureOpenRoot(selected,'search-ancestor',1048576);
+      const descriptors=n.fixtureFdSnapshot(root);
+      const flags=descriptors.map(fd=>{
+        const target=fs.readlinkSync('/proc/self/fd/'+fd.fd);
+        const info=fs.readFileSync('/proc/self/fdinfo/'+fd.fd,'utf8');
+        const actual=Number.parseInt(/^flags:\\s+([0-7]+)$/m.exec(info)[1],8);
+        assert.ok(fs.fstatSync(fd.fd).isDirectory());
+        const privateDirectory=target===selected||target.startsWith(selected+'/');
+        assert.equal((actual&0x200000)!==0,!privateDirectory,'only external ancestors have O_PATH');
+        assert.equal(actual&3,0,'private directory content access remains read-only');
+        if(privateDirectory)assert.equal(fs.fstatSync(fd.fd).mode&0o7777,0o700);
+        return {target,flags:actual,privateDirectory};
+      });
+      assert.ok(flags.some(fd=>fd.target===directory&&!fd.privateDirectory));
+      assert.equal(flags.filter(fd=>fd.privateDirectory).length,4);
+      assert.equal(n.observeRoot(root).resources.fdOwned,descriptors.length);
+      const prepared=await n.prepare(root,'search-only parent');assert.equal(prepared.kind,'prepared-file');
+      assert.equal((await n.readVerify(alias,prepared.ref.contentSha256,prepared.ref.byteLength)).kind,'read');
+      assert.equal((await n.revalidatePrepared(prepared.file)).kind,'file-current');
+      assert.equal((fs.statSync(directory).mode&0o777).toString(8),'111');
+
+      // A different lexical path to the same live inode exercises reacquire's
+      // separate ancestor walk; neither O_PATH nor the registry accepts a symlink.
+      fs.chmodSync(directory,0o711);
+      const link=path.join(directory,'symlink-ancestor');
+      fs.symlinkSync(directory,link);fs.chmodSync(directory,0o111);
+      assert.throws(()=>n.fixtureOpenRoot(path.join(link,'memory'),'search-ancestor',1048576),/memory_native:/);
+      assert.equal((await n.revalidatePrepared(prepared.file)).kind,'file-current');
+
+      fs.chmodSync(directory,0o000);
+      assert.throws(()=>n.fixtureOpenRoot(selected,'search-ancestor',1048576),/memory_native:/);
+      const blocked=await n.prepare(root,'search denied');assert.equal(blocked.kind,'failed');
+      fs.chmodSync(directory,0o111);
+      fs.chmodSync(selected,0o755);
+      const unprotected=await n.prepare(root,'wrong private mode');
+      assert.equal(unprotected.kind,'failed');assert.equal(unprotected.primary.code,'root_changed');
+      fs.chmodSync(selected,0o700);
+
+      fs.chmodSync(directory,0o711);
+      fs.renameSync(selected,selected+'-original');fs.mkdirSync(selected,{mode:0o700});
+      const replaced=await n.prepare(root,'replacement');
+      assert.equal(replaced.kind,'failed');assert.equal(replaced.primary.code,'root_changed');
+      const closed=await n.closeRoot(root);assert.equal(closed.kind,'closed');
+      assert.deepEqual(fs.readdirSync(selected),[],'the replacement is never initialized or written');
+      assert.deepEqual(closed.resources,{pending:0,fdReserved:0,fdOwned:0,fdUnknown:0,nativeTasks:0,preparedFiles:0,bodyBytes:0});
+      console.log(JSON.stringify({searchOnlyAncestor:{flags,blocked:blocked.primary.code,unprotected:unprotected.primary.code,replaced:replaced.primary.code,closed}}));
+    } finally {
+      fs.chmodSync(directory,0o700);
+      if(root)await n.closeRoot(root);
+    }
+  `)); } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test("#161 E3 EEXIST verifies and synchronizes its own canonical; corrupt and wrong-type leaves are preserved", { skip: !supportedMemoryNativePlatform }, async () => {
   const { native, file } = await buildMemoryNativeFixture();
   const directory = await createMemoryRoot();

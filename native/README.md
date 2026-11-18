@@ -137,6 +137,8 @@ node --test --test-concurrency=1 tests/memory-object-native.test.ts
 
 目录固定为已存在的私有 root、`objects`、`objects/sha256`、`objects/.staging`，仅按 digest 创建两位 shard。Linux root 内部使用 openat2 的 BENEATH/NO_XDEV/NO_SYMLINKS/NO_MAGICLINKS；Darwin 使用相对 openat/NOFOLLOW 与实际身份/FS 核验。canonical 在 open 前拒绝非普通文件，打开仍固定 NONBLOCK/NOFOLLOW/CLOEXEC；FIFO 不等待写端。临时文件为 native 随机 O_EXCL/0600，发布仅用 renameat2 NOREPLACE 或 renameatx_np EXCL。EEXIST 自行核验并同步真实只读 canonical FD；Linux 使用 fsync，Darwin 使用 F_FULLFSYNC（含目录），没有普通 rename、覆盖或同步降级。
 
+按 [Linux 外祖先 flags 补充](https://github.com/gbcdby/boardroom/issues/161#issuecomment-6979534426)，选定 root 之前的外部祖先（含 `/`）使用 `O_PATH|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW`，只要求实际目录遍历权限。首次获取和异路径重新获取都按末段区分选定 root；root 本身及内部目录仍使用 `O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK`，保留当前 UID、0700、身份、文件系统与强同步要求。外祖先仍保留 openat2 的 BENEATH/NO_SYMLINKS/NO_MAGICLINKS、打开后的实际 S_ISDIR 与逐层身份后验；全部实际 FD 计入同一预算并显式关闭。没有读取、写入或同步 O_PATH 祖先，也不修改其权限。Darwin 原 flags 不变。Linux 控制实际核对 search-only 祖先、所持 FD flags、symlink/无 search 权限/私有根非 0700/根替换拒绝及资源归零；CI 的隔离目录权限保持原样。
+
 测试 fixture 是另编 translation unit，包含相同生产 C 文件；普通构建无法选择它。固定故障、hold、实际 FD 诊断及临时 root 获取仅存在于测试产物。`short-one` 只命中指定一次；`short-repeat` 是独立的固定测试 action，从指定序号起每次真实 read/write 请求最多 1 byte，直到实际普通预算耗尽，不修改计数或伪造成功。未知 close 和最后 env 退出的控制在专属 child 中运行并等待整个 child 实际退出。现有 Linux/macOS 完整测试 glob 会真实编译和执行该文件，Darwin 的实际只读 FD/目录 F_FULLFSYNC 和最后 Worker 生命周期仍必须由对应 CI 验证。
 
 fixture 的同步 FD hold 关闭同样登记真实 operation task 与 C 引用，root close 必须等它完成；root 已占有关闭任务时，fixture 返回固定 `owner_closing`，不并行触碰该 FD。填满边界的 invocation 持有 dispatch 与独立引用，直到 hold wrapper 注册或失败责任挂账后才释放。诊断快照只在账本锁内复制 FD、状态与固定 role；第 65 个 FD 的用例先证明已有真实 `open` 事件，再要求预算拒绝前后该计数不增加。

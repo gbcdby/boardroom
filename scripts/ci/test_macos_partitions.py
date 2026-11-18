@@ -26,12 +26,12 @@ class MacosPartitionContracts(unittest.TestCase):
         self.assertEqual(self.job['runs-on'], 'macos-26')
         self.assertEqual(self.job['timeout-minutes'], 15)
         self.assertEqual(self.job['strategy'], {'fail-fast': False, 'matrix': {'include': [
-            {'partition': '1/2', 'script': 'test:ci:macos:1of2'},
-            {'partition': '2/2', 'script': 'test:ci:macos:2of2'},
+            {'partition': f'{index}/8', 'script': f'test:ci:macos:{index}of8'}
+            for index in range(1, 9)
         ]}})
-        for index in (1, 2):
-            self.assertEqual(self.scripts[f'test:ci:macos:{index}of2'],
-                             f'node --test --test-shard={index}/2 "tests/**/*.test.ts"')
+        for index in range(1, 9):
+            self.assertEqual(self.scripts[f'test:ci:macos:{index}of8'],
+                             f'node --test --test-shard={index}/8 "tests/**/*.test.ts"')
         self.assertEqual(self.scripts['test'], 'node --test "tests/**/*.test.ts"')
         self.assertEqual(self.full['shell'], 'bash')
         self.assertEqual(self.full['env']['BOARDROOM_CI_TEST_PARTITION'], '${{ matrix.partition }}')
@@ -69,8 +69,8 @@ class MacosPartitionContracts(unittest.TestCase):
                                         env=dict(os.environ, PARTITIONS_RESULT=result), timeout=5)
                 self.assertEqual(actual.returncode == 0, result == 'success')
 
-    def test_actual_two_partitions_cover_once_keep_failure_and_do_not_shard_nested_runner(self):
-        names = [f'tests/file-{index:02d}.test.ts' for index in range(4)] + ['tests/nested/a.test.ts', 'tests/nested/b.test.ts']
+    def test_actual_eight_partitions_cover_once_keep_failure_and_do_not_shard_nested_runner(self):
+        names = [f'tests/file-{index:02d}.test.ts' for index in range(16)] + ['tests/nested/a.test.ts', 'tests/nested/b.test.ts']
         selected, receipts = [], []
         with tempfile.TemporaryDirectory(prefix='boardroom-macos-partitions-') as directory:
             for row in self.job['strategy']['matrix']['include']:
@@ -106,20 +106,26 @@ class MacosPartitionContracts(unittest.TestCase):
                 self.assertEqual({entry['partition'] for entry in observed}, {row['partition']})
                 entries = [entry['entry'] for entry in observed]
                 self.assertEqual(len(entries), len(set(entries)))
-                self.assertEqual(len(entries), 3)
+                partition_index = int(row['partition'].split('/')[0]) - 1
+                self.assertEqual(set(entries), set(names[partition_index::8]))
                 selected.append(set(entries))
-                if row['partition'] == '1/2':
+                if row['partition'] == '1/8':
                     self.assertEqual(actual.returncode, 0, actual.stdout)
                     self.assertEqual(sorted((root / 'nested.txt').read_text().splitlines()), ['a', 'b'])
-                else:
+                elif row['partition'] == '2/8':
                     self.assertNotEqual(actual.returncode, 0)
                     self.assertIn('deliberate macOS partition failure', actual.stdout)
                     self.assertIn(names[1], entries)
+                else:
+                    self.assertEqual(actual.returncode, 0, actual.stdout)
                 receipts.append({'partition': row['partition'], 'script': row['script'],
                                  'command': command, 'exit': actual.returncode, 'entries': sorted(entries)})
-        self.assertFalse(selected[0] & selected[1])
-        self.assertEqual(selected[0] | selected[1], set(names))
-        print(json.dumps({'proof': 'actual-two-partitions-and-nested-runner', 'receipts': receipts}))
+        for index, entries in enumerate(selected):
+            for other in selected[index + 1:]:
+                self.assertFalse(entries & other)
+        self.assertEqual(set().union(*selected), set(names))
+        self.assertEqual(sum(map(len, selected)), len(names))
+        print(json.dumps({'proof': 'actual-eight-partitions-and-nested-runner', 'receipts': receipts}))
 
 
 if __name__ == '__main__':

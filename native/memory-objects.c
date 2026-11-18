@@ -638,8 +638,14 @@ static bool mo_root_check(mo_op *op, mo_result *out) {
   }
   return true;
 }
-static bool mo_directory(mo_op *op, int parent, const char *leaf, bool inside, bool private_dir, int *slot, mo_result *out) {
-  int fd = mo_open(op, parent < 0 ? AT_FDCWD : mo_descriptor(op->root, parent), leaf, O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK, 0, inside, "object-directories", out);
+static bool mo_directory(mo_op *op, int parent, const char *leaf, bool inside, bool private_dir, bool external_ancestor, int *slot, mo_result *out) {
+  int flags = O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK;
+#ifdef __linux__
+  if (external_ancestor)flags = O_PATH|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW;
+#else
+  (void)external_ancestor;
+#endif
+  int fd = mo_open(op, parent < 0 ? AT_FDCWD : mo_descriptor(op->root, parent), leaf, flags, 0, inside, "object-directories", out);
   if (fd < 0)return false;
   *slot = fd;
   struct stat s;
@@ -754,7 +760,7 @@ static bool mo_shard(mo_op *op, bool create, mo_result *out) {
     }
     if (rc == 0 && !mo_sync(op, r->sha256, true, out))return false;
   }
-  return mo_directory(op, r->sha256, name, true, true, &op->shard, out);
+  return mo_directory(op, r->sha256, name, true, true, false, &op->shard, out);
 }
 static bool mo_canonical(mo_op *op, bool fill, mo_result *out) {
   struct stat path, held;
@@ -1278,7 +1284,7 @@ static MO_UNUSED napi_value mo_acquire_root(napi_env env, const mo_root_selectio
       int parent = -1;
       char *cursor = path+1, *save = NULL;
       int opened[32], used = 0;
-      if (mo_directory(&check, -1, "/", false, false, &parent, &result))opened[used++] = parent;
+      if (mo_directory(&check, -1, "/", false, false, true, &parent, &result))opened[used++] = parent;
       else error = result.first.code;
       for (char *leaf = error ? NULL : strtok_r(cursor, "/", &save);leaf;leaf = strtok_r(NULL, "/", &save)) {
         if (!strcmp(leaf, ".") || !strcmp(leaf, "..")) {
@@ -1286,7 +1292,9 @@ static MO_UNUSED napi_value mo_acquire_root(napi_env env, const mo_root_selectio
           break;
         }
         int next = -1;
-        if (!mo_directory(&check, parent, leaf, false, false, &next, &result)) {
+        /* The final component is the selected root, even before its private-mode check. */
+        bool external_ancestor = save != NULL && *save != '\0';
+        if (!mo_directory(&check, parent, leaf, false, false, external_ancestor, &next, &result)) {
           error = result.first.code;
           break;
         }
@@ -1349,7 +1357,7 @@ static MO_UNUSED napi_value mo_acquire_root(napi_env env, const mo_root_selectio
   };
   int parent = -1;
   char *save = NULL;
-  if (mo_directory(&acquire, -1, "/", false, false, &parent, &result)) {
+  if (mo_directory(&acquire, -1, "/", false, false, true, &parent, &result)) {
     r->dirs[r->dir_count++] =(mo_dir) {
       .slot = parent,.parent = -1,.identity = r->fds[parent].identity
     };
@@ -1359,7 +1367,9 @@ static MO_UNUSED napi_value mo_acquire_root(napi_env env, const mo_root_selectio
         break;
       }
       int next = -1;
-      if (!mo_directory(&acquire, parent, leaf, false, false, &next, &result))break;
+      /* Only components before the selected root may use search-only handles. */
+      bool external_ancestor = save != NULL && *save != '\0';
+      if (!mo_directory(&acquire, parent, leaf, false, false, external_ancestor, &next, &result))break;
       mo_dir *d = &r->dirs[r->dir_count++];
       *d =(mo_dir) {
         .slot = next,.parent = parent,.identity = r->fds[next].identity
@@ -1379,7 +1389,7 @@ static MO_UNUSED napi_value mo_acquire_root(napi_env env, const mo_root_selectio
   };
   for (unsigned i = 0;i < 3 && !result.first.code;i++) {
     int from = i == 0 ? r->root_dir : r->objects, next = -1;
-    if (!mo_directory(&acquire, from, names[i], true, true, &next, &result))break;
+    if (!mo_directory(&acquire, from, names[i], true, true, false, &next, &result))break;
     mo_dir *d = &r->dirs[r->dir_count++];
     *d =(mo_dir) {
       .slot = next,.parent = from,.identity = r->fds[next].identity,.private_dir = true

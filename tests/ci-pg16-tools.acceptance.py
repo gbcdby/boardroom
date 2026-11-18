@@ -17,13 +17,14 @@ from email.utils import formatdate
 
 
 SCRIPT = Path(os.environ.get("BOARDROOM_PG_TOOLS_SCRIPT", Path(__file__).resolve().parents[1] / "scripts/prepare-ci-pg16-tools.sh"))
-INSTALLED = "16.15-1.pgdg24.04+2"
+INSTALLED = "16.16-1.pgdg24.04+1"
 AVAILABLE = "16.15-0ubuntu0.24.04.1"
+NEWER_AVAILABLE = "16.16-0ubuntu0.24.04.1"
 PACKAGES = ("postgresql-16", "postgresql-client-16")
 
 
 class AptFixture:
-    def __init__(self, packages, *, bad_arch=False, bad_major=False):
+    def __init__(self, packages, *, bad_arch=False, bad_major=False, binary_versions=None):
         self.temp = tempfile.TemporaryDirectory(prefix="br-pg16-apt-")
         self.root = Path(self.temp.name)
         self.arch = subprocess.check_output(["dpkg", "--print-architecture"], text=True).strip()
@@ -41,10 +42,11 @@ class AptFixture:
             postinst.chmod(0o755)
             binary = build / "usr/lib/postgresql/16/bin"
             binary.mkdir(parents=True)
-            names = ("postgres", "initdb", "pg_ctl") if package == "postgresql-16" else ("pg_dump", "pg_restore")
+            names = ("postgres", "initdb", "pg_ctl") if package == "postgresql-16" else ("pg_dump", "pg_restore", "psql")
             for name in names:
                 tool = binary / name
-                tool.write_text(f"#!/bin/sh\nprintf '%s\\n' '{name} (PostgreSQL) {'17.0' if bad_major else version.split('-')[0]}'\n")
+                binary_version = (binary_versions or {}).get(name, "17.0" if bad_major else version.split("-")[0])
+                tool.write_text(f"#!/bin/sh\nprintf '%s\\n' '{name} (PostgreSQL) {binary_version}'\n")
                 tool.chmod(0o755)
             if package == "postgresql-16":
                 (build / "usr/share/postgresql/16").mkdir(parents=True)
@@ -123,14 +125,33 @@ class PostgreSQLToolsAcceptance(unittest.TestCase):
         result = fixture.prepare()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         output = dict(line.split("=", 1) for line in (fixture.root / "output").read_text().splitlines())
+        self.assertEqual(output["version"], AVAILABLE)
         binary = Path(output["bin"])
         self.assertTrue(binary.resolve().is_relative_to(fixture.root / "run"))
         self.assertEqual((fixture.root / "path").read_text().strip(), str(binary))
-        for name in ("postgres", "initdb", "pg_ctl", "pg_dump", "pg_restore"):
+        for name in ("postgres", "initdb", "pg_ctl", "pg_dump", "pg_restore", "psql"):
             self.assertIn("(PostgreSQL) 16.15", fixture.run(str(binary / name), "--version").stdout)
         downloaded = list((fixture.root / "run").rglob("*.deb"))
         self.assertEqual(len(downloaded), 2)
         self.assertEqual({fixture.run("dpkg-deb", "--field", str(archive), "Version").stdout.strip() for archive in downloaded}, {AVAILABLE})
+        # Exercise real APT selection without changing package state or running
+        # maintainer scripts. CI installs this exact validated client version.
+        downgrade = fixture.run("apt-get", "--simulate", "install", "--yes", "--no-install-recommends", "--no-remove", "--allow-downgrades", f"postgresql-client-16:{fixture.arch}={output['version']}")
+        self.assertIn("will be DOWNGRADED", downgrade.stdout)
+        self.assertIn(f"Inst postgresql-client-16 [{INSTALLED}] ({AVAILABLE}", downgrade.stdout)
+        self.assertNotIn("Inst postgresql-16 ", downgrade.stdout)
+
+    def test_newer_downloadable_minor_does_not_replace_supported_profile(self):
+        fixture = self.fixture([(package, version) for package in PACKAGES for version in (AVAILABLE, NEWER_AVAILABLE)])
+        result = fixture.prepare()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        output = dict(line.split("=", 1) for line in (fixture.root / "output").read_text().splitlines())
+        self.assertEqual(output["version"], AVAILABLE)
+        self.assertEqual({fixture.run("dpkg-deb", "--field", str(archive), "Version").stdout.strip() for archive in (fixture.root / "run").rglob("*.deb")}, {AVAILABLE})
+
+    def test_only_newer_minor_fails_without_using_installed_tools(self):
+        fixture = self.fixture([(package, NEWER_AVAILABLE) for package in PACKAGES])
+        self.assert_failed_without_tools(fixture, fixture.prepare())
 
     def test_no_repository_version_fails_without_using_installed_tools(self):
         fixture = self.fixture([])
@@ -153,6 +174,18 @@ class PostgreSQLToolsAcceptance(unittest.TestCase):
 
     def test_wrong_binary_major_fails(self):
         fixture = self.fixture([(package, AVAILABLE) for package in PACKAGES], bad_major=True)
+        self.assert_failed_without_tools(fixture, fixture.prepare())
+
+    def test_wrong_binary_minor_fails(self):
+        fixture = self.fixture([(package, AVAILABLE) for package in PACKAGES], binary_versions={"pg_restore": "16.16"})
+        self.assert_failed_without_tools(fixture, fixture.prepare())
+
+    def test_psql_is_checked_before_publishing_paths(self):
+        fixture = self.fixture([(package, AVAILABLE) for package in PACKAGES], binary_versions={"psql": "16.16"})
+        self.assert_failed_without_tools(fixture, fixture.prepare())
+
+    def test_binary_minor_prefix_is_not_the_supported_minor(self):
+        fixture = self.fixture([(package, AVAILABLE) for package in PACKAGES], binary_versions={"pg_dump": "16.150"})
         self.assert_failed_without_tools(fixture, fixture.prepare())
 
 
