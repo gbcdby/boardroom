@@ -207,6 +207,50 @@ class WholeSuitePartitionContracts(unittest.TestCase):
             self.assertEqual(actual.returncode, original.returncode)
             self.assertFalse((root / 'executed.txt').exists())
 
+    def test_original_node_modules_exclusion_matches_selection_and_observer(self):
+        import shutil
+        names = ['tests/a.test.ts', 'tests/nested/b.test.ts',
+                 'tests/node_modules.test.ts', 'tests/node_modules-extra/c.test.ts']
+        excluded = ['tests/node_modules/ignored.test.ts', 'tests/nested/node_modules/ignored.test.ts']
+        with tempfile.TemporaryDirectory(prefix='boardroom-original-glob-') as directory:
+            union = []
+            for index in range(1, len(names) + 1):
+                stage = Path(directory) / str(index); root = stage / ci.WORKSPACE
+                support = root / 'scripts/ci'; support.mkdir(parents=True)
+                for filename in self.support_files:
+                    shutil.copyfile(self.root / 'scripts/ci' / filename, support / filename)
+                for name in names + excluded:
+                    file = root / name; file.parent.mkdir(parents=True, exist_ok=True)
+                    file.write_text("import test from 'node:test';import {appendFileSync} from 'node:fs';"
+                        f"test({json.dumps(name)},()=>appendFileSync(process.env.BOARDROOM_ORIGINAL_GLOB_PROBE,"
+                        f"{json.dumps(name + chr(10))}));")
+                original_log = root / 'original.txt'
+                original = subprocess.run(['node', '--test', '--test-concurrency=1', 'tests/**/*.test.ts'],
+                    cwd=root, env=dict(os.environ, BOARDROOM_ORIGINAL_GLOB_PROBE=str(original_log)),
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(original.returncode, 0, original.stdout + original.stderr)
+                self.assertEqual(sorted(original_log.read_text().splitlines()), sorted(names))
+                request = LauncherContracts().request('full-suite') | {'partition': f'{index}/16'}
+                actual_log = root / 'actual.txt'
+                env = dict(os.environ, **ci.child_environment(request, stage),
+                           BOARDROOM_ORIGINAL_GLOB_PROBE=str(actual_log))
+                env['PATH'] = os.environ['PATH']
+                subprocess.run(['node', 'scripts/ci/test-discovery.mjs'], cwd=root, env=env,
+                               capture_output=True, text=True, timeout=10, check=True)
+                evidence = root / '.agent-output/linux-ci-isolation/full-suite'
+                discovery = json.loads((evidence / 'test-scheduler.json').read_text())
+                self.assertEqual(discovery['entries'], sorted(names))
+                actual = subprocess.run(['node', 'scripts/ci/run-linux-partition.mjs', f'{index}/16'],
+                    cwd=root, env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(actual.returncode, 0, actual.stdout + actual.stderr)
+                entries = actual_log.read_text().splitlines()
+                self.assertEqual(sorted(entries), discovery['selectedEntries'])
+                union.extend(entries)
+                manifests = [json.loads(p.read_text()) for p in (evidence / 'test-entrypoints').glob('slot-*/entrypoints.json')]
+                self.assertEqual(len(manifests), 1)
+                self.assertEqual(manifests[0]['entries'], sorted(names))
+            self.assertEqual(sorted(union), sorted(names))
+
     def verify_partition_execution(self, names, selection_mode):
         import shlex
         import shutil

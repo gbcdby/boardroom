@@ -55,7 +55,9 @@ export function planLinuxPartitions(entries, weights) {
 
 export function linuxTestSelection(partition) {
   const index = partition === '1/1' ? null : partitionIndex(partition);
-  const entries = globSync(TEST_GLOB).sort();
+  // Match Node's original createTestFileList exclusion, including nested
+  // dependencies. This is part of its glob semantics, not a failure filter.
+  const entries = globSync(TEST_GLOB, { exclude: name => name === 'node_modules' }).sort();
   const rawWeights = readFileSync(new URL('./linux-test-weights.json', import.meta.url));
   const weights = JSON.parse(rawWeights);
   assert.equal(weights.schema, 'boardroom-linux-test-estimates/v1');
