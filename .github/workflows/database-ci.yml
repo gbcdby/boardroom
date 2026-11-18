@@ -14,9 +14,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  macos-tests:
-    name: Node 24 · macOS arm64 / SQLite
+  macos-partitions:
+    name: macOS 全量 · ${{ matrix.partition }}
     runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - partition: '1/2'
+            script: test:ci:macos:1of2
+          - partition: '2/2'
+            script: test:ci:macos:2of2
     timeout-minutes: 15
     steps:
       - name: 检出本次验证候选
@@ -32,10 +40,12 @@ jobs:
           cache-dependency-path: package-lock.json
 
       - name: 记录 macOS 与 Node 环境
+        env:
+          BOARDROOM_CI_TEST_PARTITION: ${{ matrix.partition }}
         run: |
           mkdir -p .agent-output/macos-tests
           sw_vers | tee .agent-output/macos-tests/os.txt
-          node --input-type=module -e 'console.log(JSON.stringify({ platform: process.platform, architecture: process.arch, node: process.version, versions: process.versions, commit: process.env.GITHUB_SHA }, null, 2))' | tee .agent-output/macos-tests/environment.json
+          node --input-type=module -e 'console.log(JSON.stringify({ platform: process.platform, architecture: process.arch, node: process.version, versions: process.versions, commit: process.env.GITHUB_SHA, partition: process.env.BOARDROOM_CI_TEST_PARTITION }, null, 2))' | tee .agent-output/macos-tests/environment.json
 
       - name: 按锁文件安装依赖
         run: npm ci
@@ -54,6 +64,7 @@ jobs:
       - name: 全量测试（macOS / SQLite，不启用 PostgreSQL 门控用例）
         shell: bash
         env:
+          BOARDROOM_CI_TEST_PARTITION: ${{ matrix.partition }}
           # 只增加观察；绝对路径允许既有测试从不同 cwd 启动普通 Node 子进程。
           NODE_OPTIONS: >-
             --test-reporter=spec
@@ -61,17 +72,29 @@ jobs:
             --test-reporter=${{ github.workspace }}/scripts/ci/test-execution-reporter.mjs
             --test-reporter-destination=stdout
             --import=${{ github.workspace }}/scripts/ci/test-process-observer.mjs
-        run: npm test 2>&1 | tee .agent-output/macos-tests/full-suite.log
+        run: npm run ${{ matrix.script }} 2>&1 | tee .agent-output/macos-tests/full-suite.log
 
       - name: 保存环境与完整测试日志
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: macos-tests-${{ github.run_attempt }}
+          name: macos-tests-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: .agent-output/macos-tests/
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
+
+  macos-tests:
+    name: Node 24 · macOS arm64 / SQLite
+    needs: macos-partitions
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: 两个 macOS 原生分片与原前置检查必须成功
+        env:
+          PARTITIONS_RESULT: ${{ needs.macos-partitions.result }}
+        run: test "$PARTITIONS_RESULT" = success
 
   browser-dependencies:
     name: 浏览器同候选依赖准备
@@ -247,7 +270,9 @@ jobs:
         run: node scripts/ci/verify-pg-fixture.mjs
 
       - name: 核对原生测试分片覆盖与聚合失败门
-        run: python3 -B scripts/ci/test_linux_isolation.py WholeSuitePartitionContracts -v
+        run: |
+          python3 -B scripts/ci/test_linux_isolation.py WholeSuitePartitionContracts -v
+          python3 -B scripts/ci/test_macos_partitions.py -v
 
       - name: 类型检查
         run: npm run typecheck

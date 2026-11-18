@@ -21,6 +21,8 @@
     "e2e:memory": "node scripts/e2e-memory.mjs",
     "db:migrate": "node scripts/migrate-data.ts",
     "test": "node --test \"tests/**/*.test.ts\"",
+    "test:ci:macos:1of2": "node --test --test-shard=1/2 \"tests/**/*.test.ts\"",
+    "test:ci:macos:2of2": "node --test --test-shard=2/2 \"tests/**/*.test.ts\"",
     "test:ci:linux": "node --test --test-concurrency=4 \"tests/**/*.test.ts\"",
     "test:ci:linux:1of16": "node --test --test-concurrency=1 --test-shard=1/16 \"tests/**/*.test.ts\"",
     "test:ci:linux:2of16": "node --test --test-concurrency=1 --test-shard=2/16 \"tests/**/*.test.ts\"",
