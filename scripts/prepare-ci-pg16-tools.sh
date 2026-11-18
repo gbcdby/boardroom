@@ -22,13 +22,14 @@ server_versions=$(repository_versions "$server")
 client_versions=$(repository_versions "$client")
 selected_version=''
 while IFS= read -r version; do
-  [[ "$version" =~ ^([0-9]+:)?16\. ]] || continue
+  # Match the supported maintenance profile, not the newest installed minor.
+  [[ "$version" =~ ^([0-9]+:)?16\.15- ]] || continue
   grep -Fxq -- "$version" <<< "$client_versions" || continue
   if [[ -z "$selected_version" ]] || dpkg --compare-versions "$version" gt "$selected_version"; then
     selected_version=$version
   fi
 done <<< "$server_versions"
-[[ -n "$selected_version" ]] || fail "No downloadable PostgreSQL 16 server/client pair for $architecture in configured APT indexes"
+[[ -n "$selected_version" ]] || fail "No downloadable PostgreSQL 16.15 server/client pair for $architecture in configured APT indexes"
 printf 'Private PostgreSQL tools: version=%s architecture=%s\n' "$selected_version" "$architecture"
 
 restart_tools=$(mktemp -d "$RUNNER_TEMP/boardroom-pg16-restart-tools.XXXXXX")
@@ -53,14 +54,16 @@ done
 restart_bin="$restart_tools/usr/lib/postgresql/16/bin"
 test -f "$restart_tools/usr/share/postgresql/16/postgres.bki"
 test -d "$restart_tools/usr/lib/postgresql/16/lib"
-for tool in postgres initdb pg_ctl pg_dump pg_restore; do
+for tool in postgres initdb pg_ctl pg_dump pg_restore psql; do
   executable="$restart_bin/$tool"
   [[ -x "$executable" && "$(realpath "$executable")" == "$executable" ]] || fail "$tool is not a private executable"
   version_output=$("$executable" --version)
   printf '%s\n' "$version_output"
-  [[ "$version_output" =~ \(PostgreSQL\)\ 16\. ]] || fail "$tool is not PostgreSQL 16"
+  [[ "$version_output" =~ \(PostgreSQL\)\ 16\.15($|[[:space:]]) ]] || fail "$tool is not PostgreSQL 16.15"
 done
-# All later backup/restore consumers and the independent restart fixture use
-# this same package pair; publish paths only after successful validation.
+# The runner and independent restart fixture use these private tools. The
+# isolated full suite retains its fixed system path; CI installs the same
+# validated client package there. Publish only after all six tools pass.
 printf '%s\n' "$restart_bin" >> "$GITHUB_PATH"
 printf 'bin=%s\n' "$restart_bin" >> "$GITHUB_OUTPUT"
+printf 'version=%s\n' "$selected_version" >> "$GITHUB_OUTPUT"

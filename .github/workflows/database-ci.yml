@@ -21,10 +21,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - partition: '1/2'
-            script: test:ci:macos:1of2
-          - partition: '2/2'
-            script: test:ci:macos:2of2
+          - partition: '1/8'
+            script: test:ci:macos:1of8
+          - partition: '2/8'
+            script: test:ci:macos:2of8
+          - partition: '3/8'
+            script: test:ci:macos:3of8
+          - partition: '4/8'
+            script: test:ci:macos:4of8
+          - partition: '5/8'
+            script: test:ci:macos:5of8
+          - partition: '6/8'
+            script: test:ci:macos:6of8
+          - partition: '7/8'
+            script: test:ci:macos:7of8
+          - partition: '8/8'
+            script: test:ci:macos:8of8
     timeout-minutes: 15
     steps:
       - name: 检出本次验证候选
@@ -35,7 +47,7 @@ jobs:
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: '24'
+          node-version: '24.22.3'
           cache: npm
           cache-dependency-path: package-lock.json
 
@@ -91,7 +103,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
-      - name: 两个 macOS 原生分片与原前置检查必须成功
+      - name: 全部 macOS 原生分片与原前置检查必须成功
         env:
           PARTITIONS_RESULT: ${{ needs.macos-partitions.result }}
         run: test "$PARTITIONS_RESULT" = success
@@ -111,7 +123,7 @@ jobs:
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: '24'
+          node-version: '24.22.3'
           cache: npm
           cache-dependency-path: package-lock.json
 
@@ -243,26 +255,37 @@ jobs:
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: '24'
+          node-version: '24.22.3'
           cache: npm
           cache-dependency-path: package-lock.json
 
       - name: 按锁文件安装依赖
         run: npm ci
 
-      - name: 准备 PostgreSQL 16 原生备份与恢复工具
+      - name: 私有解包 PostgreSQL 16.15 重启验证工具（不运行 postinst 或宿主服务）
+        id: pg_restart_tools
+        shell: bash
         run: |
           sudo apt-get update
           apt-cache policy postgresql-client-16
-          sudo apt-get install --yes --no-install-recommends postgresql-client-16
-          echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
-          /usr/lib/postgresql/16/bin/pg_dump --version
-          /usr/lib/postgresql/16/bin/pg_restore --version
+          bash scripts/prepare-ci-pg16-tools.sh
 
-      - name: 私有解包 PostgreSQL 16 重启验证工具（不运行 postinst 或宿主服务）
-        id: pg_restart_tools
+      - name: 将隔离测试的系统客户端绑定到同版 PostgreSQL 16.15
         shell: bash
-        run: bash scripts/prepare-ci-pg16-tools.sh
+        env:
+          BOARDROOM_CI_PG16_VERSION: ${{ steps.pg_restart_tools.outputs.version }}
+        run: |
+          [[ "$BOARDROOM_CI_PG16_VERSION" =~ ^([0-9]+:)?16\.15- ]]
+          architecture=$(dpkg --print-architecture)
+          sudo apt-get install --yes --no-install-recommends --no-remove --allow-downgrades "postgresql-client-16:$architecture=$BOARDROOM_CI_PG16_VERSION"
+          for tool in pg_dump pg_restore psql; do
+            version_output=$("/usr/lib/postgresql/16/bin/$tool" --version)
+            printf '%s\n' "$version_output"
+            [[ "$version_output" =~ \(PostgreSQL\)\ 16\.15($|[[:space:]]) ]]
+          done
+
+      - name: 核对 PostgreSQL 16.15 工具选择与降级边界
+        run: python3 -B tests/ci-pg16-tools.acceptance.py
 
       - name: 核对自有 PostgreSQL 服务版本与静默 fixture 配置
         env:
@@ -518,7 +541,7 @@ jobs:
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: '24'
+          node-version: '24.22.3'
           cache: npm
           cache-dependency-path: package-lock.json
 

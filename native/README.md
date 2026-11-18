@@ -111,3 +111,40 @@ P3 测试分别记录真实临时文件 owner/getter 与完整 collector 的组�
 必要的原生负控覆盖短读的 256 次边界、无 EOF、全局 2 MiB、伪文件 close 未知、源 metadata 后验变化、目录 closedir 未知和失败子 owner 的身份/关闭双错。用于全局预算的固定伪源只能产生无 EOF 的 unavailable，不能充当真实 sysfs/健康或资格正控。真实运行环境无法打开 `/sys` 或无法绑定其设备/健康目录时，完整原件明确保持 unavailable，不把未知当成正常零值。fatal collector 错误和未知关闭即使被调用者 catch，scope 也会保留失败；首错和真正的 opaque cleanup owner 不因后续清理诊断丢失，已知资源继续收束。
 
 这些本机普通控制不代替 S 的固定组合检查、独立 REQ/STD、同候选 CI 或真实 qualification。对 statmount/mountinfo/process/config/health 的纯机械正控保留全部未证义务，不能签发成功 profile，也不能把 DM 构建或现场实验转成 P3 资格。
+
+## #161 E3：memory object 隔离机械内核
+
+`memory-objects.c` 是独立的 Node-API 8 组件。它实现真实目录与文件 owner、UTF-8/SHA256、不可覆盖发布、同 FD 核验、强同步和收尾；普通 addon **没有 root factory**，也未接入应用启动、source-client、LayoutWindow、数据库保存或 `objects_ready`。本段不表示已取得生产资格。工程范围依据 #161 [E3 接受记录](https://github.com/gbcdby/boardroom/issues/161#issuecomment-6975971607)、[调用预算补充](https://github.com/gbcdby/boardroom/issues/161#issuecomment-6976492513)及[结果解析补充](https://github.com/gbcdby/boardroom/issues/161#issuecomment-6977509921)。
+
+显式构建：
+
+```bash
+node scripts/build-memory-objects.mjs
+node --test --test-concurrency=1 tests/memory-object-native.test.ts
+```
+
+构建不接受参数，不受 `CC`、`CFLAGS` 或测试开关选择影响，不修改 postinstall、package 或 CI。固定 `/usr/bin/cc`、C11、Node-API 8 与仓库内 v24.22.1 headers；逐项核对四个 headers 和 LICENSE 的源 SHA。Linux 使用 shared/PIC/pthread/libdl，Darwin 使用 bundle/dynamic_lookup/pthread。固定产物是 `build/memory-objects/memory-objects-<platform>-<arch>.node`，当前用户、单链接、0700，通过临时文件原子替换。失败只清本组件临时文件。Linux/Darwin 缺编译器、headers 或实际 ABI 时构建及测试失败，不静默跳过。
+
+普通 JS 出口精确为 `abiInfo`、`prepare`、`readVerify`、`revalidatePrepared`、`closePrepared`、`closeRoot`、`observeRoot`。`abiInfo().rootFactory` 固定为 `not-installed`。所有 owner 必须属于本映像的私有 C registry，普通同形对象、复制值及其他 addon owner 均不签发权限。五个异步方法返回 Promise；拒绝与文件故障返回固定代码、首错、后续实际收尾错误和真实资源观察，`observeRoot` 的无效 owner 使用固定脱敏错误。
+
+结果使用自有 data property，避免继承 setter。五个异步方法的顶层结果还在首次 freeze 前加入不可枚举、不可写、不可配置的自有 `then: undefined`，避免 Promise 解析读取 `Object.prototype.then`。原型与枚举字段保持一致；嵌套 `MemoryObjectRef` 仍精确为四字段，能够通过 E2 的严格解析。普通 addon 不输出路径、正文错误片段、FD 数值或任意系统调用入口。
+
+同一实际 dev/ino 的 root 使用同一账本，存续期间 storageId 和最大正文长度不可改变。最多 8 个对象操作在途（包括 prepared 和未完成责任），最多 64 个实际 owned/reserved/unknown FD；每次 open/dup 先预留。每个正文最多 1 MiB，固定 64 KiB 读写块，每次操作最多 256 个普通调用，已有 FD 收尾另有最多 64 个 close 记录。普通预算耗尽后不再执行 fstat/unlink/sync；临时项未清理时，即使 `fdUnknown` 为零，原 operation/root 也保持 retained，不能返回 closed/prepared。close 错误不重试数字 FD，已关闭后复用的无关 FD 不会被旧 owner 再关闭。
+
+异步工作在 queue 前取得 C 与 NAPI 引用。短账本锁不跨越可调用 JS 的 Node-API 创建过程；同步 `async_hooks` 重入参与同一账本。root close 等待真实 staging/completion，控制 work 忙时让出线程池，每个 work 仅排队一次，在其 complete 后删除。后续控制 work 保留原关闭 invocation 的 120 秒截止时间；同 env/root 重复关闭合并，最多 8 个关闭等待环境通过原子预留登记，避免无界控制队列。这些收尾控制不发放新的对象槽或 FD 额度。Worker 退出使用 Node-API 8 async cleanup hook；清理覆盖本 env 的实际 C operation，包含未能交付 JS wrapper 的结果。单个 wrapper 的 GC 不关闭其他活 wrapper。旧 record 的代际与引用持续到旧 wrapper 消失，防止地址复用恢复旧权限。
+
+本映像在任何 root 获取前只 pin 一次：private anchor 的 `dladdr` 定位、`RTLD_NOLOAD` 取得已加载映像引用，再以固定注册符号核相同 image base。成功引用保留到进程退出，不在最后 Worker 退出时释放。失败在 root/文件 owner 产生前拒绝。这样 unknown 账本不会因最后一个 Worker 卸载 addon 而消失。
+
+目录固定为已存在的私有 root、`objects`、`objects/sha256`、`objects/.staging`，仅按 digest 创建两位 shard。Linux root 内部使用 openat2 的 BENEATH/NO_XDEV/NO_SYMLINKS/NO_MAGICLINKS；Darwin 使用相对 openat/NOFOLLOW 与实际身份/FS 核验。canonical 在 open 前拒绝非普通文件，打开仍固定 NONBLOCK/NOFOLLOW/CLOEXEC；FIFO 不等待写端。临时文件为 native 随机 O_EXCL/0600，发布仅用 renameat2 NOREPLACE 或 renameatx_np EXCL。EEXIST 自行核验并同步真实只读 canonical FD；Linux 使用 fsync，Darwin 使用 F_FULLFSYNC（含目录），没有普通 rename、覆盖或同步降级。
+
+按 [Linux 外祖先 flags 补充](https://github.com/gbcdby/boardroom/issues/161#issuecomment-6979534426)，选定 root 之前的外部祖先（含 `/`）使用 `O_PATH|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW`，只要求实际目录遍历权限。首次获取和异路径重新获取都按末段区分选定 root；root 本身及内部目录仍使用 `O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK`，保留当前 UID、0700、身份、文件系统与强同步要求。外祖先仍保留 openat2 的 BENEATH/NO_SYMLINKS/NO_MAGICLINKS、打开后的实际 S_ISDIR 与逐层身份后验；全部实际 FD 计入同一预算并显式关闭。没有读取、写入或同步 O_PATH 祖先，也不修改其权限。Darwin 原 flags 不变。Linux 控制实际核对 search-only 祖先、所持 FD flags、symlink/无 search 权限/私有根非 0700/根替换拒绝及资源归零；CI 的隔离目录权限保持原样。
+
+测试 fixture 是另编 translation unit，包含相同生产 C 文件；普通构建无法选择它。固定故障、hold、实际 FD 诊断及临时 root 获取仅存在于测试产物。`short-one` 只命中指定一次；`short-repeat` 是独立的固定测试 action，从指定序号起每次真实 read/write 请求最多 1 byte，直到实际普通预算耗尽，不修改计数或伪造成功。未知 close 和最后 env 退出的控制在专属 child 中运行并等待整个 child 实际退出。现有 Linux/macOS 完整测试 glob 会真实编译和执行该文件，Darwin 的实际只读 FD/目录 F_FULLFSYNC 和最后 Worker 生命周期仍必须由对应 CI 验证。
+
+fixture 的同步 FD hold 关闭同样登记真实 operation task 与 C 引用，root close 必须等它完成；root 已占有关闭任务时，fixture 返回固定 `owner_closing`，不并行触碰该 FD。填满边界的 invocation 持有 dispatch 与独立引用，直到 hold wrapper 注册或失败责任挂账后才释放。诊断快照只在账本锁内复制 FD、状态与固定 role；第 65 个 FD 的用例先证明已有真实 `open` 事件，再要求预算拒绝前后该计数不增加。
+
+分配负控明确是 `FAULT_INJECTED`，不是实际 OOM：`native-dispatch/fail-before` 的 occurrence 按每次 dispatch 中两个有序分配边界累计，先 C job calloc，再 `napi_create_promise`；1 保留 job 拒绝，2 拒绝同次 Promise 创建，后者进入与真实 Node-API 失败相同的固定 `napi_generic_failure` 分支。trace 分别为 `fixture-job-allocation` 和 `fixture-promise-allocation`，不能自选状态。该点的 hold 仍只作用于工作线程实际 dispatch。`native-complete/fail-before` 在实际 native 结束后、JS 结果构造前拒绝分配，走与真实构造错误相同的 retained 判定；hold 仍留在真实 native completion 前。异步固定错误通过 Node-API 的 uncaught-exception 递送机制报告，挂账先于递送，不假装返回成功结果。测试核实际 prepared/FD、新正文撤销、GC、Worker 退出及 unknown 责任。
+
+Node 24 的 Node-API 8 在禁用 JS 时可能返回 `napi_pending_exception`；只有 `napi_is_exception_pending` 查询成功且实际为 false，才按退出处理，真实 pending exception 仍是构造失败。canonical 前后 stat 比较 Linux `st_mtim/st_ctim` 或 Darwin `st_mtimespec/st_ctimespec` 的秒及纳秒，读取中同秒修改已读字节仍须拒绝。测试日志绑定当前 C/fixture 源、两个实际 addon 摘要、Node/NAPI、compiler、OS、UID 与实际文件系统类型。
+
+本组件不提供生产 source/window factory、真实 collector、数据库 commit/CAS、schema/guard 编号、迁移阶段推进、delegated child 或跨独立 registered client 的资源 realm。双进程发布测试只证明 noreplace 机械语义，不证明全 host 的 64 FD 配额；#152、FULL-Q 与整票资格门保持原要求。
