@@ -6,6 +6,7 @@ import { buildDatabaseManifests } from "./manifests.ts";
 import { ArtifactStore } from "./objects.ts";
 import { parseManifests, readSourceFiles } from "./parse.ts";
 import { buildSourceClientsRoster } from "./source-clients.ts";
+import { assertVerificationSourceClientBinding, replayConsumerSourceControls } from "./verification-source-client-binding.ts";
 import type { ArtifactRef, BlockerCode, PublicationEvidence, RestoreBundleManifest, RestorePayloadRole, SourceLock, SourceObservation } from "./types.ts";
 
 const same = (left: unknown, right: unknown) => canonicalJson(left) === canonicalJson(right);
@@ -28,7 +29,7 @@ export async function publishSnapshotBundle(store: ArtifactStore, lock: SourceLo
   requireValue(state.controlRootJson === canonicalJson(store.identity) && state.mutexIdentityJson !== null, "control_root_mismatch");
   const anchored = await store.readAnchoredJournal({ ref: state.journalRecordRef, sha256: state.journalDigest });
   const chain = await verifyJournalChain(store, anchored), head = chain.nodes.at(-1)!;
-  requireValue(head.record.formatVersion === 2 && head.record.event === "capture" && head.record.phase === "quiesced"
+  requireValue(head.record.formatVersion !== 1 && head.record.event === "capture" && head.record.phase === "quiesced"
     && head.record.frozen !== null && head.record.sourceClients !== null, "phase_conflict");
   const capture = captureReference(head), frozen = head.record.frozen, roster = head.record.sourceClients;
   requireValue(state.databaseInstanceId === capture.source.databaseInstanceId && state.fenceEpoch === capture.fenceEpoch
@@ -41,6 +42,14 @@ export async function publishSnapshotBundle(store: ArtifactStore, lock: SourceLo
   const files = await readSourceFiles(store, frozen.sourceFilesManifest);
   requireValue(files.rootBindings.every(binding => binding.hostIdentityDigest === store.identity.hostIdentityDigest), "source_changed");
   const assertRoster = async (observed: SourceObservation) => {
+    if (head.record.formatVersion === 3) {
+      let mutexIdentity: unknown;
+      try { mutexIdentity = JSON.parse(state.mutexIdentityJson!); }
+      catch { requireValue(false, "control_root_mismatch"); }
+      const replay = await replayConsumerSourceControls(store, chain, mutexIdentity);
+      await assertVerificationSourceClientBinding(lock, observed, head, observed.manifests, replay);
+      return;
+    }
     const live = await lock.observeSourceClients();
     requireValue(same(live.source, observed.source) && same(live.sourceIdentity, observed.sourceIdentity)
       && same(live.state, observed.state) && live.schemaManifestDigest === observed.manifests.schemaManifestDigest, "source_changed");

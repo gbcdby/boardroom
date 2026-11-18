@@ -20,6 +20,74 @@ async function fixture(encoding: "UTF-8" | "UTF-16le" | "UTF-16be" = "UTF-8") {
   } catch (error) { await f.close(); throw error; }
 }
 
+test("C3 SQLite ordinary locks preserve a literal undefined primary and both independent cleanup occurrences", async () => {
+  const f = await sqliteAuditFixture(false), exec = Database.prototype.exec, close = Database.prototype.close;
+  const cleanup = new Error("the same object thrown by two actual cleanup stages");
+  const before = await f.adapter.observeSourceClients(); let captured: SourceLock | undefined, rejected = false;
+  const stages: string[] = [];
+  try { try {
+    Database.prototype.exec = function(sql) {
+      const result = exec.call(this, sql);
+      if (this.name === f.file && !this.readonly && sql === "ROLLBACK") { stages.push("rollback"); throw cleanup; }
+      return result;
+    };
+    Database.prototype.close = function() {
+      const source = this.name === f.file && !this.readonly, result = close.call(this);
+      if (source) { stages.push("source-close"); throw cleanup; } return result;
+    };
+    try { await f.adapter.withSourceLock("control", async lock => { captured = lock; throw undefined; }); }
+    catch (error) { rejected = true; assert.equal(error, undefined); }
+    assert(rejected); assert.deepEqual(stages, ["rollback", "source-close"]);
+    const outcome = controlSqlOutcome(captured!);
+    assert.equal(outcome.failureObserved, true); assert.equal(outcome.originalError, undefined);
+    assert.equal(outcome.rollbackFailureObserved, true); assert.equal(outcome.rollbackError, cleanup);
+    assert.equal(outcome.closeFailureObserved, true); assert.equal(outcome.closeError, cleanup);
+    assert.equal(outcome.commitReturned, false); assert.equal(outcome.localSourceHandleClosed, true);
+    assert.deepEqual(outcome.cleanupEvents, [
+      { stage: "rollback-failure", error: cleanup }, { stage: "close-failure", error: cleanup },
+    ], "one object does not collapse two actual native cleanup calls");
+  } finally { Database.prototype.exec = exec; Database.prototype.close = close; }
+    assert.deepEqual(await f.adapter.observeSourceClients(), before);
+  } finally { await f.close(); }
+});
+
+test("C3 SQLite first seal and cancellation use complete fixed control transitions", async () => {
+  const f = await fixture();
+  try {
+    const db = new Database(f.file);
+    try { db.prepare("UPDATE storage_maintenance SET admission='draining',journal_record_ref=?,journal_digest=?,journal_sequence=1")
+      .run(f.v.f.enterRef.ref, f.v.f.enterRef.sha256); }
+    finally { db.close(); }
+    const before = await f.adapter.observeSourceClients();
+    await f.adapter.withSourceLock("control", lock => applyUntrustedControlSql(lock, f.v.input(f.v.capture)));
+    const sealed = await f.adapter.observeSourceClients();
+    assert.equal(sealed.state.admission, "sealed"); assert.equal(sealed.state.ownerGeneration, before.state.ownerGeneration);
+    assert.deepEqual(sealed.rows, before.rows);
+    await f.adapter.withSourceLock("control", lock => applyUntrustedControlSql(lock, f.v.input(f.v.zeroRef)));
+    await f.adapter.withSourceLock("control", lock => applyUntrustedControlSql(lock, f.v.input(f.v.intentRef)));
+    const pending = await f.adapter.observeSourceClients(); let terminalLock: SourceLock | undefined;
+    await f.adapter.withSourceLock("control", async lock => { terminalLock = lock; return applyUntrustedControlSql(lock, f.v.input(f.v.terminalRef)); });
+    const terminal = await f.adapter.observeSourceClients();
+    assert.deepEqual(terminal, { ...pending, state: { ...pending.state, admission: "open", fenceEpoch: pending.state.fenceEpoch + 1,
+      activeMigrationId: null, planDigest: null, journalRecordRef: f.v.terminalRef.ref, journalDigest: f.v.terminalRef.sha256, journalSequence: 5 } });
+    assert.equal(controlSqlOutcome(terminalLock!).status, "source-transaction-completed");
+  } finally { await f.close(); }
+});
+
+test("C3 SQLite unknown resolution cannot mistake a sibling of the attempted step for its successor", async () => {
+  const f = await fixture(); let attempted: SourceLock | undefined;
+  const primary = new Error("intentional rollback before the attempted registration commits");
+  try {
+    await assert.rejects(f.adapter.withSourceLock("control", async lock => {
+      attempted = lock; await applyUntrustedControlSql(lock, f.v.input(f.v.insertedRef)); throw primary;
+    }), error => error === primary);
+    await f.adapter.withSourceLock("control", lock => applyUntrustedControlSql(lock, f.v.input(f.v.zeroRef)));
+    await f.mutex.release();
+    assert.equal((await resolveUntrustedControlSql(f.adapter, attempted!, f.v.input(f.v.zeroRef))).classification, "unknown",
+      "the current legal branch shares the before anchor but does not contain this attempted step");
+  } finally { await f.close(); }
+});
+
 test("A12-C SQLite fixed INSERT and exact anchor share the real source transaction", async () => {
   const f = await fixture(); let captured: SourceLock | undefined;
   try {

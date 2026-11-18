@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import type { PlanPersistenceResult, PlanPreview } from "../scripts/storage-maintenance.ts";
+import type { PlanPersistenceResult, PlanPersistenceResultV2, PlanPreview } from "../scripts/storage-maintenance.ts";
 
 const cli = fileURLToPath(new URL("../scripts/storage-maintenance.ts", import.meta.url));
 const secret = "plan-cli-private-canary-DO-NOT-PRINT";
@@ -51,6 +51,45 @@ test("P152-PLAN-06/PERSIST-02: 不支持的命令与非法参数在读取坏配�
     assert.equal(malformed.status, 1); assert.equal(malformed.stdout, "");
     assert.match(malformed.stderr, /^\[config_invalid\] 无法完成/);
     for (const value of [secret, config, dir, "Error:", " at "]) assert.ok(!malformed.stderr.includes(value));
+    assert.deepEqual(await readdir(dir), ["config.json"]);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+function continuationArguments(command: "inspect" | "execute" | "resume" | "cancel", base: readonly string[], value: PlanPersistenceResultV2): string[] {
+  const result = [command, ...base.slice(1), "--migration-id", value.migrationId, "--plan-digest", value.planDigest,
+    "--plan-bytes", value.planRef.bytes, "--expected-source-kind", value.expectedSource.kind,
+    "--expected-database-instance-id", value.expectedSource.databaseInstanceId, "--expected-source-identity-digest", value.expectedSource.identityDigest];
+  if (command !== "inspect") result.push("--request-id", "cli-continuation", "--expected-phase", "none", "--expected-journal-digest", "none");
+  return result;
+}
+
+test("C3-AC45 CLI 新命令与 output-version 非法值在坏配置前严格拒绝", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "boardroom-controller-cli-args-"));
+  try {
+    const config = path.join(dir, "config.json"); await writeFile(config, `{broken:${secret}`);
+    const env = environment(config, path.join(dir, "home"));
+    const base = ["plan", "--expected-source-id", "selected", "--control-root", path.join(dir, "control"), "--target-root", path.join(dir, "target")];
+    const hash = "a".repeat(64), value: PlanPersistenceResultV2 = { formatVersion: 2, command: "persist-plan", result: "persisted",
+      persisted: true, executionAuthorized: false, source: { sourceId: "selected", databaseKind: "sqlite" }, migrationId: "cli-plan", planDigest: hash,
+      planRef: { ref: `plans/${hash}.json`, sha256: hash, bytes: "1" },
+      expectedSource: { kind: "sqlite", databaseInstanceId: "a".repeat(32), identityDigest: hash } };
+    const invalid: string[][] = [[...base, "--output-version", "2"], ["persist-plan", ...base.slice(1), "--output-version", "3"],
+      ["persist-plan", ...base.slice(1), "--output-version", "2", "--output-version", "2"]];
+    for (const command of ["inspect", "execute", "resume", "cancel"] as const) {
+      const valid = continuationArguments(command, base, value);
+      invalid.push([...valid, "--loader", secret], [...valid, "--inline-plan", secret], [...valid, "--backup-path", dir],
+        [...valid, "--expected-source-id", "duplicate"], [...valid, "--output-version", "2"], valid.slice(0, -2));
+      const bytes = [...valid]; bytes[bytes.indexOf("--plan-bytes") + 1] = "01"; invalid.push(bytes);
+      if (command === "inspect") invalid.push([...valid, "--request-id", "forbidden"], [...valid, "--expected-phase", "none"]);
+      else {
+        const mismatch = [...valid]; mismatch[mismatch.indexOf("--expected-journal-digest") + 1] = hash; invalid.push(mismatch);
+      }
+    }
+    for (const input of invalid) {
+      const result = run(input, dir, env);
+      assert.equal(result.status, 1); assert.equal(result.stdout, ""); assert.match(result.stderr, /^\[config_invalid\] 用法：/);
+      for (const hidden of [secret, config, dir]) assert.ok(!result.stderr.includes(hidden));
+    }
     assert.deepEqual(await readdir(dir), ["config.json"]);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
@@ -115,6 +154,52 @@ async function assertNoArtifacts(f: Awaited<ReturnType<typeof sqliteFixture>>) {
   for (const file of [f.control, f.target, path.join(f.dir, "home")]) await assert.rejects(stat(file), { code: "ENOENT" });
 }
 const platformTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
+
+platformTest("C3-AC45 persist-plan 显式 v2 精确安全输出可组成后续请求，默认与显式 v1 保持原合同", async () => {
+  const f = await sqliteFixture();
+  try {
+    const before = f.logical();
+    const explicitV1 = run(["persist-plan", ...f.args.slice(1), "--output-version", "1"], f.dir, f.env, true);
+    assert.equal(explicitV1.status, 0, explicitV1.stderr); readPersistence(explicitV1.stdout);
+    const result = run(["persist-plan", ...f.args.slice(1), "--output-version", "2"], f.dir, f.env, true);
+    assert.equal(result.status, 0, result.stderr); assert.equal(result.stderr, "");
+    const value = JSON.parse(result.stdout) as PlanPersistenceResultV2;
+    assert.deepEqual(Object.keys(value).sort(), ["formatVersion", "command", "result", "persisted", "executionAuthorized",
+      "source", "migrationId", "planDigest", "planRef", "expectedSource"].sort());
+    assert.equal(value.formatVersion, 2);
+    const { expectedSource, ...original } = value;
+    readPersistence(JSON.stringify({ ...original, formatVersion: 1 }));
+    assert.deepEqual(Object.keys(expectedSource).sort(), ["databaseInstanceId", "identityDigest", "kind"]);
+    const planBytes = await readFile(path.join(f.control, value.planRef.ref));
+    assert.equal(value.planRef.bytes, String(planBytes.length));
+    assert.deepEqual(expectedSource, JSON.parse(planBytes.toString()).source);
+    for (const hidden of [secret, f.dir, "postgres://", "sourceIdentity", "configDigest", "clientInventory"]) assert.ok(!result.stdout.includes(hidden));
+    // Prove the public values are sufficient for strict parsing; reject a wrong selected source before any service or adapter is loaded.
+    for (const command of ["inspect", "execute", "resume", "cancel"] as const) {
+      const args = continuationArguments(command, f.args, value); args[2] = `wrong-${secret}`;
+      const rejected = run(args, f.dir, f.env, true);
+      assert.equal(rejected.status, 1); assert.match(rejected.stderr, /^\[source_changed\]/);
+      const output = JSON.parse(rejected.stdout); assert.equal(output.result.status, "blocked"); assert.equal(output.failure.occurred, true);
+      for (const raw of [rejected.stdout, rejected.stderr]) for (const hidden of [secret, f.dir, "postgres://"]) assert.ok(!raw.includes(hidden));
+    }
+    assert.deepEqual(f.logical(), before);
+    await assert.rejects(stat(f.target), { code: "ENOENT" }); await assert.rejects(stat(path.join(f.dir, "home")), { code: "ENOENT" });
+  } finally { await f.close(); }
+});
+
+platformTest("C3-AC45 新命令选择的源丢失时不创建替代 SQLite 数据库", async () => {
+  const f = await sqliteFixture();
+  try {
+    const saved = run(["persist-plan", ...f.args.slice(1), "--output-version", "2"], f.dir, f.env, true);
+    assert.equal(saved.status, 0, saved.stderr); const value = JSON.parse(saved.stdout) as PlanPersistenceResultV2;
+    await rename(f.file, `${f.file}.moved`);
+    const result = run(continuationArguments("execute", f.args, value), f.dir, f.env, true);
+    assert.equal(result.status, 1); assert.match(result.stderr, /^\[(source_missing|legacy_migration_required)\]/);
+    const outcome = JSON.parse(result.stdout); assert.equal(outcome.result.status, "blocked");
+    await assert.rejects(stat(f.file), { code: "ENOENT" }); await assert.rejects(stat(f.target), { code: "ENOENT" });
+    for (const raw of [result.stdout, result.stderr]) for (const hidden of [secret, f.dir]) assert.ok(!raw.includes(hidden));
+  } finally { await f.close(); }
+});
 
 platformTest("P152-PLAN-01/02/05: 真实 SQLite CLI 读到已提交 WAL，保留全部逻辑值且只输出安全预览", async () => {
   const f = await sqliteFixture();

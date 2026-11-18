@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
+import filesystem from "node:fs/promises";
 import { mkdtemp, rm, stat, copyFile, rename } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { runMigrations } from "../src/server/db/migrate.ts";
 import { migrations } from "../src/server/db/migrations/index.ts";
@@ -87,6 +89,75 @@ platformTest("#152 native lock serializes all control CAS and backup captures co
     });
     assert.equal((await f.adapter.observe()).state.admission, "sealed");
   } finally { await mutex?.release(); writer.close(); await f.close(); }
+});
+
+platformTest("#152 SQLite verification keeps its original pending source owner and refuses late admission", async t => {
+  for (const ending of ["return", "throw-primary"] as const) await t.test(ending, async child => {
+    const f = await fixture(), originalCopy = filesystem.copyFile, primary = new Error("original source callback");
+    let mutex, release!: () => void, reached!: () => void, operation: Promise<unknown> | undefined, outer: Promise<void> | undefined;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { reached = resolve; });
+    let pendingFile = "", finished = false;
+    try {
+      mutex = await f.adapter.acquireMutex(f.store.identity, f.initial.state);
+      const planned = await f.adapter.withSourceLock("control", lock => enter(lock, f.store, mutex!.identity, 1, null));
+      await f.adapter.withSourceLock("control", lock => enter(lock, f.store, mutex!.identity, 2, planned));
+      const before = await f.adapter.observe(), attempt = await f.store.createAttempt(1), restore = path.join(attempt, "pending-restore");
+      pendingFile = path.join(restore, "restored.sqlite");
+      child.mock.method(filesystem, "copyFile", async (...args: Parameters<typeof originalCopy>) => {
+        const result = await originalCopy(...args);
+        if (args[1] === pendingFile) { reached(); await gate; throw undefined; }
+        return result;
+      });
+      syncBuiltinESMExports();
+      outer = f.adapter.withSourceLock("snapshot", async lock => {
+        const archive = path.join(attempt, "backup.sqlite"), backup = await lock.backup(archive);
+        operation = f.adapter.verifyDatabase(archive, backup.manifests, restore);
+        void operation.catch(() => undefined);
+        await entered;
+        if (ending === "throw-primary") throw primary;
+      });
+      void outer.then(() => { finished = true; }, () => { finished = true; });
+      await entered; await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(finished, false, "callback exit cannot retire its original in-flight verification");
+      const external = new Database(f.file); external.pragma("busy_timeout=1");
+      try { assert.throws(() => external.exec("BEGIN IMMEDIATE"), /locked/, "the original source transaction is still held"); }
+      finally { external.close(); }
+      await assert.rejects(f.adapter.verifyDatabase("late", before.manifests, path.join(attempt, "late")), { code: "maintenance_lost" });
+      release();
+      await assert.rejects(operation!, error => { assert.equal(error, undefined); return true; });
+      await assert.rejects(outer, error => { assert.equal(error, ending === "return" ? undefined : primary); return true; });
+      assert.deepEqual(await f.adapter.observe(), before);
+    } finally {
+      release(); if (outer) await Promise.allSettled([outer]);
+      child.mock.restoreAll(); syncBuiltinESMExports(); await mutex?.release(); await f.close();
+    }
+  });
+});
+
+platformTest("#152 SQLite handled verification cleanup failure stays sticky after the actual target close", async t => {
+  const f = await fixture(), close = Database.prototype.close;
+  let mutex, restored = "", closed = 0;
+  try {
+    mutex = await f.adapter.acquireMutex(f.store.identity, f.initial.state);
+    const planned = await f.adapter.withSourceLock("control", lock => enter(lock, f.store, mutex!.identity, 1, null));
+    await f.adapter.withSourceLock("control", lock => enter(lock, f.store, mutex!.identity, 2, planned));
+    const before = await f.adapter.observe(), attempt = await f.store.createAttempt(1), restore = path.join(attempt, "restore");
+    restored = path.join(restore, "restored.sqlite");
+    t.mock.method(Database.prototype, "close", function(this: Database.Database) {
+      const owned = this.name === restored, result = close.call(this);
+      if (owned) { assert.equal(this.open, false); closed++; throw undefined; }
+      return result;
+    });
+    await assert.rejects(f.adapter.withSourceLock("snapshot", async lock => {
+      const archive = path.join(attempt, "backup.sqlite"), backup = await lock.backup(archive);
+      await assert.rejects(f.adapter.verifyDatabase(archive, backup.manifests, restore), error => {
+        assert.equal(error, undefined); return true;
+      });
+      assert.equal(closed, 1, "the original native close really completed before its response failed");
+    }), error => { assert.equal(error, undefined); return true; });
+    assert.deepEqual(await f.adapter.observe(), before);
+  } finally { t.mock.restoreAll(); await mutex?.release(); await f.close(); }
 });
 
 platformTest("#152 unknown source file users stay blockers; renamed source never opens a replacement empty DB", async () => {

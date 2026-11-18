@@ -110,20 +110,52 @@ export async function createControllerOwner(options: MaintenanceServiceOptions, 
     : await createPostgresMaintenanceAdapter(descriptor, options.postgresVerification);
   return { descriptor, adapter, keys, stores: new Map(), unresolvedSourceErrors: new Set(), adapterClosed: false };
 }
-/** Real outer completion precedes this call; it never treats callback return as
- * COMMIT evidence. Even a failed release must not prevent other owned cleanup. */
-export async function finishControllerOwner(owner: ControllerOwner, mutex: OperationMutex | undefined,
+/** Existing C1/C2 wrappers retain their original safe auxiliary diagnostics.
+ * The concrete owner, pending set and resource cleanup are shared below. */
+export function finishControllerOwner(owner: ControllerOwner, mutex: OperationMutex | undefined,
   lock: SourceLock | undefined, failures: unknown[], subject: string): Promise<void> {
-  // Separate cleanup stages remain separate even if each throws undefined or
-  // the same Error object. Only propagation through nested callbacks is deduped.
-  const cleanupFailure = (error: unknown) => { failures.push(error); retainSourceErrors(owner, error); };
   try {
     const outcome = lock && controlSqlOutcome(lock);
     if (outcome?.rollbackFailureObserved)
       failures.push(new MaintenanceFailure("maintenance_lost", "source-rollback-failure"));
     if (outcome?.failureObserved && outcome.closeFailureObserved)
       failures.push(new MaintenanceFailure("maintenance_lost", "source-close-failure"));
+  } catch (error) { failures.push(error); retainSourceErrors(owner, error); }
+  return finishOwnedResources(owner, mutex, failures, subject);
+}
+
+/** Fixed C3 service exit: retain every original raw cleanup occurrence. There
+ * is no caller policy flag, alternate owner, resource retry or new authority. */
+export function finishControllerCommandOwner(owner: ControllerOwner, mutex: OperationMutex | undefined,
+  lock: SourceLock | undefined, failures: unknown[], subject: string): Promise<void> {
+  // Separate cleanup stages remain separate even if each throws undefined or
+  // the same Error object. Only propagation through nested callbacks is deduped.
+  const cleanupFailure = (error: unknown) => { failures.push(error); retainSourceErrors(owner, error); };
+  try {
+    const outcome = lock && controlSqlOutcome(lock);
+    if (outcome?.cleanupEvents) {
+      // A close-only exception can already be the original outer rejection.
+      // Identify that one propagation by its lifecycle position; every later
+      // occurrence remains independent even for the same object or undefined.
+      const firstPropagated = outcome.failureObserved === false && failures.length === 1
+        && outcome.cleanupEvents.length > 0 && Object.is(failures[0], outcome.cleanupEvents[0]!.error);
+      for (const [index, event] of outcome.cleanupEvents.entries())
+        if (index !== 0 || !firstPropagated) cleanupFailure(event.error);
+    } else {
+      if (outcome?.rollbackFailureObserved)
+        failures.push(new MaintenanceFailure("maintenance_lost", "source-rollback-failure"));
+      if (outcome?.failureObserved && outcome.closeFailureObserved)
+        failures.push(new MaintenanceFailure("maintenance_lost", "source-close-failure"));
+    }
   } catch (error) { cleanupFailure(error); }
+  return finishOwnedResources(owner, mutex, failures, subject);
+}
+
+/** Real outer completion precedes this call; it never treats callback return as
+ * COMMIT evidence. Even a failed release must not prevent other owned cleanup. */
+async function finishOwnedResources(owner: ControllerOwner, mutex: OperationMutex | undefined,
+  failures: unknown[], subject: string): Promise<void> {
+  const cleanupFailure = (error: unknown) => { failures.push(error); retainSourceErrors(owner, error); };
   // Publish the concrete in-flight close before the first await. Mutex release
   // alone must not let another entry bypass this owner's store/source cleanup.
   // Concurrent entrants await this same promise, including its rejection; they

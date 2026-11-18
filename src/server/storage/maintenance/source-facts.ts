@@ -6,10 +6,10 @@ import type { OwnedProcessIdentity } from "../../runtime/hosts/types.ts";
 import { verifyStorageDrainReceipt, type StorageDrainReceipt } from "../source-client.ts";
 import { canonicalJson, digestJson } from "./canonical.ts";
 import type { EventFacts, ProcessCheck } from "./control-candidate/schema.ts";
-import { validateHistoricalControllerProfile } from "./control-candidate/rows.ts";
+import { validateHistoricalControllerProfile, type RowContext } from "./control-candidate/rows.ts";
 import { darwinProcessObservation } from "./darwin.ts";
 import { MaintenanceFailure } from "./error.ts";
-import type { JournalRecord, SourceClientFact, SourceClientProcessFact, SourceClientsObservation, SourceRuntimeFact } from "./types.ts";
+import type { JournalRecord, SourceClientFact, SourceClientProcessFact, SourceClientRawRow, SourceClientsObservation, SourceRuntimeFact } from "./types.ts";
 
 export function unknownWriter(): never { throw new MaintenanceFailure("source_writer_unknown"); }
 export function factsObject(value: unknown): Record<string, unknown> {
@@ -157,24 +157,51 @@ function envelopeFor(row: Record<string, unknown>, sourceKind: SourceClientsObse
   return envelope;
 }
 
+/** Data assembled after the original reader checks its complete anchored chain.
+ * This value, like the function's result, grants no lock or writer capability. */
+export interface ControllerFactsContext {
+  readonly actor: EventFacts["actor"];
+  readonly head: JournalRecord;
+  readonly originRows: readonly SourceClientRawRow[] | null;
+  readonly registrations: ReadonlyMap<string, RowContext["registrations"] extends Map<string, infer R> ? R : never>;
+  readonly purpose: "producer" | "consumer";
+}
 export async function sourceClientFacts(observation: SourceClientsObservation, rows: readonly Record<string, unknown>[],
   receiptGeneration: number, validateSource: (value: unknown, observation: SourceClientsObservation) => void,
-  audit?: EventFacts["clients"], historicalControllerHead?: JournalRecord): Promise<SourceClientFact[]> {
+  audit?: EventFacts["clients"], controllers?: ControllerFactsContext): Promise<SourceClientFact[]> {
   const result: SourceClientFact[] = [];
   if (rows.length !== observation.rows.length) throw new MaintenanceFailure("source_changed");
   for (const [index, row] of rows.entries()) {
     if (row.entrypoint === "maintenance-controller" || row.build_id === "boardroom-maintenance-control-v1") {
-      // Only the actual private audit path supplies its already verified no-capture planned head.
-      if (!audit || !historicalControllerHead || historicalControllerHead.phase !== "planned" || observation.state.admission !== "draining"
-        || historicalControllerHead.fenceEpoch !== observation.state.fenceEpoch
-        || canonicalJson(historicalControllerHead.source) !== canonicalJson(observation.source)) return unknownWriter();
+      if (!audit || !controllers || controllers.head.fenceEpoch !== observation.state.fenceEpoch
+        || canonicalJson(controllers.head.source) !== canonicalJson(observation.source)) return unknownWriter();
       const raw = observation.rows[index]!, host = json(row.host_identity_json), identity = json(row.process_identity_json);
-      try { validateHistoricalControllerProfile(raw, row, observation.source, observation.state.fenceEpoch, { host, process: identity }); }
-      catch { return unknownWriter(); }
+      const registration = controllers.registrations.get(raw.client_id[1]);
+      if (registration) {
+        // Complete profile/creation bytes are also checked by validateRowsFacts after
+        // the native session/runtime collection. A registration alone is not authority.
+        if (raw.registered_epoch[1] !== String(observation.state.fenceEpoch) || registration.actorId !== identity.instanceId
+          || observation.state.admission !== "sealed" || !controllers.originRows) return unknownWriter();
+      } else {
+        if (controllers.originRows === null
+          ? controllers.head.phase !== "planned" || observation.state.admission !== "draining"
+          : !controllers.originRows.some(original => canonicalJson(original.client_id) === canonicalJson(raw.client_id))) return unknownWriter();
+        try { validateHistoricalControllerProfile(raw, row, observation.source, observation.state.fenceEpoch, { host, process: identity }); }
+        catch { return unknownWriter(); }
+      }
       const inspected = await inspectRegisteredSourceProcess(host, identity);
-      if (inspected.fact.status !== "exited") return unknownWriter();
-      result.push({ clientId: String(row.client_id), classification: "historical-controller", receipt: null, process: inspected.fact });
-      audit.push({ kind: "maintenance-controller", classification: "exited-actor", registration: "R0-historical",
+      const self = registration && canonicalJson(controllers.actor.clientId) === canonicalJson(raw.client_id);
+      if (self) {
+        if (inspected.fact.status !== "present" || inspected.fact.reason !== "identity_matches" || row.ended_at !== null
+          || canonicalJson(identity) !== canonicalJson(controllers.actor.process)
+          || canonicalJson(host) !== canonicalJson(controllers.actor.host)) return unknownWriter();
+      } else if (inspected.fact.status !== "exited") return unknownWriter();
+      // An exited but unended controller is a producer input for ended-observed.
+      // Final consumers need the anchored end and a current absent process, not PID reuse.
+      if (registration && !self && controllers.purpose === "consumer"
+        && (row.ended_at === null || inspected.fact.reason !== "process_absent")) return unknownWriter();
+      result.push({ clientId: String(row.client_id), classification: registration ? "current-controller" : "historical-controller", receipt: null, process: inspected.fact });
+      audit.push({ kind: "maintenance-controller", classification: self ? "active-actor" : "exited-actor", registration: registration ? "current-chain" : "R0-historical",
         subject: [...raw.client_id], rowDigest: digestJson({ formatVersion: 1, kind: "source-client-row", source: observation.source,
           textEncoding: observation.textEncoding, row: raw }),
         host: host as EventFacts["actor"]["host"], process: identity as EventFacts["actor"]["process"], processCheck: inspected.check });

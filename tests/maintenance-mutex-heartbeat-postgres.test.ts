@@ -8,6 +8,7 @@ import { Client, type ClientConfig, type QueryResult } from "pg";
 import ts from "typescript";
 import { canonicalJson } from "../src/server/storage/maintenance/canonical.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
+import { BootstrapAuditFactory } from "../src/server/storage/maintenance/native-audit.ts";
 import { assertPostgresServerCapability, stablePostgresSourceIdentity } from "../src/server/storage/maintenance/postgres-identity.ts";
 import { parsePostgresConnection } from "../src/server/storage/maintenance/postgres-tools.ts";
 import type { OperationMutex } from "../src/server/storage/maintenance/types.ts";
@@ -23,14 +24,22 @@ async function controlledHeartbeat() {
   const text = await readFile(new URL("../src/server/storage/maintenance/postgres.ts", import.meta.url), "utf8");
   const source = ts.createSourceFile("postgres.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const names = ["same", "safeError", "throwResourceFailures", "checkedReader", "assertOpen", "endSession", "connect", "readIdentity", "assertMutex", "acquireMutex"];
+  const stateNames = ["auditFactories", "publicMutexes", "publicBackup"];
+  const initialState = new Map<string, ts.VariableStatement>();
   const found = new Map<string, string>(); let invalidation: string | undefined;
   function visit(node: ts.Node) {
     if (ts.isFunctionDeclaration(node) && node.name && names.includes(node.name.text)) found.set(node.name.text, node.getText(source));
     if (ts.isVariableDeclaration(node) && node.name.getText(source) === "invalidate") invalidation = `const ${node.getText(source)};`;
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && stateNames.includes(node.name.text)) {
+      const statement = node.parent.parent;
+      assert.ok(ts.isVariableStatement(statement)); assert.equal(statement.declarationList.declarations.length, 1);
+      assert.equal(initialState.has(node.name.text), false); initialState.set(node.name.text, statement);
+    }
     ts.forEachChild(node, visit);
   }
-  visit(source); assert.equal(found.size, names.length); assert.ok(invalidation);
-  const body = ts.transpileModule(invalidation + "\n" + [...found.values()].join("\n"),
+  visit(source); assert.equal(found.size, names.length); assert.ok(invalidation); assert.equal(initialState.size, stateNames.length);
+  const body = ts.transpileModule(stateNames.map(name => initialState.get(name)!.getText(source)).join("\n")
+    + "\n" + invalidation + "\n" + [...found.values()].join("\n"),
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
   const sourceConnection = parsePostgresConnection({ kind: "postgres", connectionString: "postgresql://test@127.0.0.1/test" });
   assert.equal(sourceConnection.clientConfig.query_timeout, 15_000);
@@ -93,8 +102,11 @@ async function controlledHeartbeat() {
       return (endFault === "after" ? result.then(() => { throw closeFailure; }) : result) as never;
     }
   }
-  const factory = new Function("Client", "MaintenanceFailure", "canonicalJson", "createHash", "randomUUID", "assertPostgresServerCapability", "stablePostgresSourceIdentity", "expected", "sourceConnection", `
-    const sessions=new Set(), auditFactories=new WeakMap(), abort=new AbortController();
+  const factory = new Function("Client", "MaintenanceFailure", "BootstrapAuditFactory", "canonicalJson", "createHash", "randomUUID", "assertPostgresServerCapability", "stablePostgresSourceIdentity", "expected", "sourceConnection", `
+    const sessions=new Set(), abort=new AbortController();
+    // The exact acquire body binds its real private factory to this fixture's original owner.
+    // No source audit or registration is produced by these controlled-wire heartbeat cases.
+    const adapter={};
     const writerObservation={hasSubscribers:false},note=()=>{},sessionMetadata=()=>({});
     let closed=false,lost=false,mutex,lockActive=false,closingStarted=false,firstSourceIdentity,firstServerIdentity,mutexTimer;
     const maintenanceHostIdentityDigest=async()=> 'fixed-host';
@@ -103,7 +115,7 @@ async function controlledHeartbeat() {
     return {acquire:root=>acquireMutex(root,expected),guard:assertOpen,
       inspect:()=>({lost,sessions:sessions.size,mutexPresent:!!mutex,released:mutex?.released,ending:mutex?.session.ending}),
       shutdown:async()=>{clearInterval(mutexTimer);await Promise.allSettled([...sessions].map(item=>endSession(item,true)));}};
-  `)(ControlledClient, MaintenanceFailure, canonicalJson, createHash, randomUUID, assertPostgresServerCapability, stablePostgresSourceIdentity, expected, sourceConnection) as {
+  `)(ControlledClient, MaintenanceFailure, BootstrapAuditFactory, canonicalJson, createHash, randomUUID, assertPostgresServerCapability, stablePostgresSourceIdentity, expected, sourceConnection) as {
     acquire(root: unknown): Promise<OperationMutex>; guard(): void;
     inspect(): { lost: boolean; sessions: number; mutexPresent: boolean; released?: boolean; ending?: boolean };
     shutdown(): Promise<void>;

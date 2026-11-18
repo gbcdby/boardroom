@@ -5,7 +5,7 @@ import { hostname } from "node:os";
 import test from "node:test";
 import { canonicalJson } from "../src/server/storage/maintenance/canonical.ts";
 import { sameSourceClientCell, sameSourceClientRow } from "../src/server/storage/maintenance/source-client-equality.ts";
-import { compatibleSourceClientWindow, type SourceClientJournalAnchor, type SourceClientJournalProof,
+import { compatibleSourceClientWindow, compatibleOriginSourceClientWindow, type SourceClientJournalAnchor, type SourceClientJournalProof,
   type SourceClientObservationProof, type SourceClientRegistrationProof } from "../src/server/storage/maintenance/source-client-window.ts";
 import { verifyRestoreBundle } from "../src/server/storage/maintenance/verify-bundle.ts";
 import { verificationBundleFixture } from "./fixtures/maintenance-verify-bundle.ts";
@@ -99,6 +99,25 @@ const check = (previous: readonly Row[], live: readonly Row[],
     inspectProcess: overrides.inspectProcess ?? presentProcess,
   });
 };
+
+test("C3 current window starts at origin, checks empty encoding/proof and has no native override", async () => {
+  const identity = await realNativeIdentity(), live = { ...await row(), process_identity_json: canonicalJson(identity) };
+  const origin: SourceClientJournalAnchor = { ...journalAnchor, reference: previousAnchor, sequence: 6,
+    previous: { ...previousAnchor, ref: `journals/${migrationId}/5-${previousAnchor.sha256}.json` }, ownerGeneration: 2 };
+  const options = { originCapture: origin, textEncoding: { backend: "sqlite" as const, name: "UTF-8" as const },
+    fenceEpoch: 7, databaseInstanceId: "marker", source, migrationId, planDigest, currentSequence: 8,
+    anchors: [origin, journalAnchor, endedAnchor], proof: { registrations: [{ ...registrationProof(live), actorId: String(identity.instanceId) }], observations: [] } };
+  assert.equal(await compatibleOriginSourceClientWindow([], [live], options), true, "uses the actual current native identity; not source ownership");
+  assert.equal(await compatibleOriginSourceClientWindow([live], [live], { ...options, proof: { registrations: [], observations: [] } }), false,
+    "a selected capture containing current controllers cannot stand in for the immutable origin");
+  assert.equal(await compatibleOriginSourceClientWindow([], [live], { ...options, proof: { registrations: [], observations: [] } }), false);
+  assert.equal(await compatibleOriginSourceClientWindow([], [live], { ...options, inspectProcess: presentProcess } as typeof options), false,
+    "runtime rejection also covers a structurally cast caller override");
+  assert.equal(await compatibleOriginSourceClientWindow([], [], { ...options, proof: { registrations: [], observations: [] }, anchors: [] }), false);
+  assert.equal(await compatibleOriginSourceClientWindow([], [], { ...options, source: { ...source, kind: "postgres" },
+    textEncoding: { backend: "postgres", name: "LATIN1" }, proof: { registrations: [], observations: [] } }), false,
+    "empty/equal rows never certify unsupported v3 encoding");
+});
 
 async function fixtureRegistrationEnvelope(f: Awaited<ReturnType<typeof verificationBundleFixture>>): Promise<string> {
   const observed = await f.run(lock => lock.observe());

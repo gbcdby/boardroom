@@ -28,6 +28,39 @@ async function fixture(encoding: "UTF8" | "LATIN1" = "UTF8") {
 const sqlText = (value: unknown) => typeof value === "string" ? value : typeof value === "object" && value !== null && "text" in value ? String(value.text) : "";
 const database = (client: Client) => (client as unknown as { connectionParameters: { database: string } }).connectionParameters.database;
 
+pgTest("C3 PostgreSQL first seal and terminal atomically compare every control column", async () => {
+  const f = await fixture(), client = await f.connect("c3-fixed-transition-reader");
+  try {
+    await client.query("UPDATE storage_maintenance SET admission='draining',journal_record_ref=$1,journal_digest=$2,journal_sequence=1",
+      [f.v.f.enterRef.ref, f.v.f.enterRef.sha256]);
+    await f.adapter.withSourceLock("control", lock => applyUntrustedControlSql(lock, f.v.input(f.v.capture)));
+    await f.adapter.withSourceLock("control", lock => applyUntrustedControlSql(lock, f.v.input(f.v.zeroRef)));
+    await f.adapter.withSourceLock("control", lock => applyUntrustedControlSql(lock, f.v.input(f.v.intentRef)));
+    const pending = await f.adapter.observeSourceClients();
+    await f.adapter.withSourceLock("control", async lock => {
+      await applyUntrustedControlSql(lock, f.v.input(f.v.terminalRef));
+      const outside = (await client.query("SELECT admission,fence_epoch::text,active_migration_id,plan_digest,journal_record_ref FROM storage_maintenance")).rows[0];
+      assert.deepEqual(outside, { admission: "sealed", fence_epoch: String(pending.state.fenceEpoch),
+        active_migration_id: pending.state.activeMigrationId, plan_digest: pending.state.planDigest, journal_record_ref: pending.state.journalRecordRef });
+    });
+    const terminal = await f.adapter.observeSourceClients();
+    assert.deepEqual(terminal, { ...pending, state: { ...pending.state, admission: "open", fenceEpoch: pending.state.fenceEpoch + 1,
+      activeMigrationId: null, planDigest: null, journalRecordRef: f.v.terminalRef.ref, journalDigest: f.v.terminalRef.sha256, journalSequence: 5 } });
+  } finally { await f.closeClient(client); await f.close(); }
+});
+
+pgTest("C3 PostgreSQL resolution rejects a sibling lacking the exact attempted step", async () => {
+  const f = await fixture(); let attempted: SourceLock | undefined;
+  try {
+    await assert.rejects(f.adapter.withSourceLock("control", async lock => {
+      attempted = lock; await applyUntrustedControlSql(lock, f.v.input(f.v.insertedRef)); throw new Error("controlled rollback");
+    }));
+    await f.adapter.withSourceLock("control", lock => applyUntrustedControlSql(lock, f.v.input(f.v.zeroRef)));
+    await f.mutex.release();
+    assert.equal((await resolveUntrustedControlSql(f.adapter, attempted!, f.v.input(f.v.zeroRef))).classification, "unknown");
+  } finally { await f.close(); }
+});
+
 pgTest("A12-C PostgreSQL full row and anchor commit atomically while an independent reader sees the old view", async () => {
   const f = await fixture(), query = Client.prototype.query, outside = await f.connect("mechanism-independent-reader");
   let captured: SourceLock | undefined, sampled = false;

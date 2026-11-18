@@ -8,7 +8,7 @@ import { controlVector, historicalClient, successorVector, legacyVector } from "
 
 const invalid = (error: unknown) => error instanceof MaintenanceFailure && error.code === "journal_invalid";
 
-test("A12 STD-001: private decoder preserves the accepted event/phase/proof branches", () => {
+test("C3 AC16/36 / A12 STD-001: shared decoder preserves exact event/phase/proof branches", () => {
   const f = controlVector(), capture = f.pack("journal", f.captured), legacy = legacyVector();
   const successor = successorVector(f, { origin: capture, previous: capture, sequence: 3, before: [], after: [], clients: [], changes: [] });
   const cases = [
@@ -22,10 +22,17 @@ test("A12 STD-001: private decoder preserves the accepted event/phase/proof bran
     { ...successor, event: "takeover", phase: "snapshot_ready" },
     { ...successor, event: "ready", phase: "snapshot_ready", snapshot: legacy.receiptRef },
     legacy.bridge,
-    ...["planned", "quiesced", "snapshot_ready"].flatMap(phase => ["cancel_intent", "cancelled"].map(event => ({ ...f.enter, event, phase }))),
+    ...["quiesced", "snapshot_ready"].flatMap(phase => [
+      { ...successor, event: "cancel_intent", phase },
+      { ...successor, event: "cancelled", phase, fenceEpoch: 3, controlProof: {
+        formatVersion: 1, kind: "cancel-terminal-controls", originCapture: capture, originSourceClientsDigest: f.captured.frozen.sourceClientsDigest,
+        source: f.source, plan: f.planRef, migrationId: "a12", epochBefore: "2", epochAfter: "3", receiptGeneration: "7", textEncoding: f.encoding,
+        previousAnchor: capture, ownerGeneration: "7", targetSequence: "3", beforeRowsDigest: f.rowsDigest([]), afterRowsDigest: f.rowsDigest([]),
+        changes: [], facts: f.facts, successorRule: "open-next-epoch-clear-active-v1" } },
+    ]),
   ];
   for (const value of cases) assert.doesNotThrow(() => parseControlJournalCandidate(value), `${value.event}/${value.phase}`);
-  // Accepting a standalone cancellation shape does not let an advance consume it.
+  // The old untrusted null placeholder is explicitly superseded by the accepted C3 proof.
   const cancelled = { ...successor, event: "cancel_intent", controlProof: null };
   assert.throws(() => reconstructControlCandidates({ head: f.pack("journal", cancelled), objects: f.objects, controlRoot: f.root, mutexIdentity: f.mutex }), invalid);
 });
@@ -45,7 +52,10 @@ test("A12 STD-001: private decoder rejects locally impossible event/phase/proof 
     { ...f.enter, event: "takeover" },
     { ...successor, phase: "planned" },
     { ...successor, controlProof: null },
-    { ...successor, event: "cancel_intent" },
+    { ...successor, event: "cancel_intent", controlProof: null },
+    { ...successor, event: "cancel_intent", phase: "planned" },
+    { ...successor, event: "cancelled" },
+    ...["planned", "quiesced", "snapshot_ready"].flatMap(phase => ["cancel_intent", "cancelled"].map(event => ({ ...f.enter, event, phase }))),
     { ...successor, controlProof: f.captured.controlProof },
     { ...legacy.bridge, phase: "quiesced" },
   ];

@@ -5,7 +5,7 @@ import type { ArtifactRef, DatabaseManifests, MaintenanceCaptureRef, SnapshotRec
 import { equal, requireCandidate } from "./common.ts";
 import type { CandidateContents } from "./content.ts";
 import type { CandidateNode } from "./replay.ts";
-import { decodeRow } from "./rows.ts";
+import { decodeRow, supportedEncoding } from "./rows.ts";
 import { invariantSchema, type MaintenanceInvariant } from "./schema.ts";
 
 export interface CaptureExpectation { readonly rows: readonly SourceClientRawRow[]; readonly encoding: SourceClientsRosterV1["textEncoding"]; readonly invariant: MaintenanceInvariant | null }
@@ -29,7 +29,7 @@ function numberCell(value: unknown): string {
 }
 const columns = ["singleton", "database_instance_id", "control_root_json", "mutex_identity_json", "fence_epoch", "owner_generation", "admission",
   "active_migration_id", "plan_digest", "journal_record_ref", "journal_digest", "journal_sequence", "protocol_version", "guard_manifest_digest"].sort();
-function invariantFromManifests(manifests: DatabaseManifests, captured: CandidateNode, contents: CandidateContents, mutexIdentity: unknown): MaintenanceInvariant {
+export function invariantFromManifests(manifests: DatabaseManifests, captured: CandidateNode, controlRoot: unknown, mutexIdentity: unknown): MaintenanceInvariant {
   requireCandidate(manifests.controlRows.storage_maintenance.length === 1 && captured.record.frozen !== null);
   const row = manifests.controlRows.storage_maintenance[0]!;
   requireCandidate(equal(Object.keys(row).sort(), columns) && row.database_instance_id === captured.record.source.databaseInstanceId
@@ -37,21 +37,22 @@ function invariantFromManifests(manifests: DatabaseManifests, captured: Candidat
     && numberCell(row.owner_generation) === String(captured.record.ownerGeneration) && row.active_migration_id === captured.record.migrationId
     && row.plan_digest === captured.record.plan.sha256 && row.guard_manifest_digest === captured.record.frozen.guardManifestDigest
     && row.journal_record_ref === captured.reference.ref && row.journal_digest === captured.reference.sha256
-    && numberCell(row.journal_sequence) === String(captured.record.sequence) && row.control_root_json === canonicalJson(contents.root)
+    && numberCell(row.journal_sequence) === String(captured.record.sequence) && row.control_root_json === canonicalJson(controlRoot)
     && row.mutex_identity_json === canonicalJson(mutexIdentity));
   const parsed = invariantSchema.safeParse({ singleton: numberCell(row.singleton), databaseInstanceId: row.database_instance_id,
     controlRootJson: row.control_root_json, mutexIdentityJson: row.mutex_identity_json, fenceEpoch: numberCell(row.fence_epoch), admission: row.admission,
     activeMigrationId: row.active_migration_id, planDigest: row.plan_digest, protocolVersion: numberCell(row.protocol_version), guardManifestDigest: row.guard_manifest_digest });
   requireCandidate(parsed.success); return parsed.data;
 }
-function sourceRowsMatch(manifests: DatabaseManifests, expected: CaptureExpectation): boolean {
+/** A projection screen only; actual consumers also require the full typed/native binding. */
+export function sourceRowsMatch(manifests: DatabaseManifests, expected: CaptureExpectation): boolean {
   const actual = manifests.controlRows.storage_source_clients;
   requireCandidate(actual.length === expected.rows.length);
   const keys = ["client_id", "database_instance_id", "entrypoint", "build_id", "host_identity_json", "process_identity_json", "db_sessions_json",
     "registered_at", "last_observed_at", "drain_state", "drain_receipt_digest", "ended_at", "protocol_version", "registered_epoch", "observed_epoch", "drain_epoch"].sort();
   requireCandidate(actual.every(row => equal(Object.keys(row).sort(), keys) && typeof row.client_id === "string")
     && new Set(actual.map(row => row.client_id)).size === actual.length);
-  let decodedAll = true;
+  let decodedAll = supportedEncoding(expected.encoding);
   for (const raw of expected.rows) {
     const decoded = decodeRow(raw, expected.encoding);
     if (decoded === null) { decodedAll = false; continue; }
@@ -92,7 +93,7 @@ export function snapshotClosure(contents: CandidateContents, nodes: readonly Can
     && manifests.frozenBusinessManifestDigest === receipt.frozenBusinessManifestDigest && manifests.capturedControlManifestDigest === receipt.capturedControlManifestDigest
     && manifests.dialect === receipt.capture.source.kind && new Set(manifests.tables.map(table => table.name)).size === manifests.tables.length);
   for (const name of ["storage_maintenance", "storage_source_clients"] as const) requireCandidate(manifests.tables.find(table => table.name === name)?.count === String(manifests.controlRows[name].length));
-  const invariant = invariantFromManifests(manifests, captured, contents, mutexIdentity);
+  const invariant = invariantFromManifests(manifests, captured, contents.root, mutexIdentity);
   if (expected.invariant !== null) requireCandidate(equal(expected.invariant, invariant));
   const rawEncodingUnverified = !sourceRowsMatch(manifests, expected);
   const members = new Map<string, { role: string; object: ArtifactRef }>();

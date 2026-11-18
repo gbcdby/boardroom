@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import childProcess, { spawnSync } from "node:child_process";
 import { chmodSync, linkSync, lstatSync, mkdirSync, renameSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import promises, { readFile, readdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonicalJson, sha256 } from "../src/server/storage/maintenance/canonical.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
@@ -12,7 +13,7 @@ import type { SourceFileExtendedObservation, SourceFileNativeCall } from "../src
 import type { SourceFileRootObservation } from "../src/server/storage/maintenance/source-file-profile.ts";
 import type { ArtifactRef } from "../src/server/storage/maintenance/types.ts";
 import { readSourceFiles } from "../src/server/storage/maintenance/parse.ts";
-import { isolatedSourceFiles, sourceFilesFixture } from "./fixtures/maintenance-source-files.ts";
+import { isolatedSourceFiles, sourceFilesFixture, withNativeSourceRoot } from "./fixtures/maintenance-source-files.ts";
 
 const linuxTest = process.platform === "linux" ? test : test.skip;
 async function rejected(work: Promise<unknown>) {
@@ -64,6 +65,67 @@ linuxTest("#152 S fixture loads the real native owner bridge (no profile qualifi
     { cwd: process.cwd(), encoding: "utf8", timeout: 65_000 });
   assert.equal(result.error, undefined); assert.equal(result.status, 0, result.stderr);
 });
+linuxTest("#152 S shared fixture prepares the current native bridge once before actual owner use", async t => {
+  const original = childProcess.spawnSync;
+  const script = fileURLToPath(new URL("../scripts/build-maintenance-platform.mjs", import.meta.url));
+  const fixtures: Awaited<ReturnType<typeof sourceFilesFixture>>[] = [];
+  let builds = 0;
+  t.mock.method(childProcess, "spawnSync", function(...args: Parameters<typeof original>) {
+    if (args[0] === process.execPath && Array.isArray(args[1]) && args[1][0] === script) builds++;
+    return Reflect.apply(original, childProcess, args);
+  });
+  syncBuiltinESMExports();
+  try {
+    for (let index = 0; index < 2; index++) {
+      const f = await sourceFilesFixture(); fixtures.push(f);
+      await withNativeSourceRoot(f.sessions, handle => assert.equal(handle.kind, "directory"));
+      assert.equal(f.state.handles.size, 0);
+    }
+    assert.equal(builds, 1, "an existing addon is rebuilt, then the second fixture shares that completed preparation");
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    for (const f of fixtures) await f.close();
+  }
+});
+linuxTest("#152 S shared fixture preserves an actual compiler failure without retry or fixture creation", async t => {
+  const directory = await promises.mkdtemp(path.join(process.cwd(), ".agent-output-s-build-failure-"));
+  const originalFixture = new URL("./fixtures/maintenance-source-files.ts", import.meta.url);
+  const fixtureDirectory = path.join(directory, "tests", "fixtures"), nativeDirectory = path.join(directory, "native");
+  const addon = path.join(directory, "build", "maintenance-platform", "maintenance-source-files-linux-" + process.arch + ".node");
+  let creations = 0;
+  try {
+    await promises.mkdir(fixtureDirectory, { recursive: true });
+    await promises.mkdir(path.join(directory, "scripts"));
+    await promises.mkdir(nativeDirectory);
+    await promises.copyFile(new URL("../scripts/build-maintenance-platform.mjs", import.meta.url), path.join(directory, "scripts", "build-maintenance-platform.mjs"));
+    await promises.cp(new URL("../native/node-api", import.meta.url), path.join(nativeDirectory, "node-api"), { recursive: true });
+    await writeFile(path.join(nativeDirectory, "maintenance-source-files.c"), "#error controlled fixture compiler failure\n");
+    const code = (await readFile(originalFixture, "utf8")).replace(/from "(\.{1,2}\/[^"\n]+)"/g,
+      (_, relative: string) => "from " + JSON.stringify(new URL(relative, originalFixture).href));
+    const fixtureFile = path.join(fixtureDirectory, "maintenance-source-files.ts"); await writeFile(fixtureFile, code);
+    const fixture = await import(pathToFileURL(fixtureFile).href) as typeof import("./fixtures/maintenance-source-files.ts");
+    const mkdtemp = promises.mkdtemp;
+    t.mock.method(promises, "mkdtemp", ((...args: Parameters<typeof mkdtemp>) => {
+      if (String(args[0]).endsWith("maintenance-s-test-")) creations++;
+      return Reflect.apply(mkdtemp, promises, args);
+    }) as typeof mkdtemp);
+    syncBuiltinESMExports();
+    let first: unknown;
+    await assert.rejects(fixture.sourceFilesFixture(), error => {
+      first = error; assert(error instanceof Error);
+      assert.match(error.message, /source-files fixture native build failed \(1\/null\)/);
+      assert.match(error.message, /Linux source-file native compiler failed/); return true;
+    });
+    // A fresh build would now succeed, but this same failed initialization must
+    // remain failed. Only this test's private native input/output is changed.
+    await promises.copyFile(new URL("../native/maintenance-source-files.c", import.meta.url), path.join(nativeDirectory, "maintenance-source-files.c"));
+    await assert.rejects(fixture.sourceFilesFixture(), error => error === first);
+    assert.equal(creations, 0); await assert.rejects(promises.access(addon), { code: "ENOENT" });
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    await promises.rm(directory, { recursive: true, force: true });
+  }
+});
 linuxTest("#152 S captures exact streamed bytes, full roots and durable canonical payload closure", async () => {
   const copy = await isolatedSourceFiles(), f = await sourceFilesFixture();
   try {
@@ -77,6 +139,70 @@ linuxTest("#152 S captures exact streamed bytes, full roots and durable canonica
     assert.equal(f.state.handles.size, 0); assert.ok(f.state.maxHandles <= 7);
     await copy.module.verifyLiveSourceFiles(f.store, f.lock, f.mutex, f.reference, result.ref);
     assert.equal(f.state.handles.size, 0);
+  } finally { await f.close(); await copy.close(); }
+});
+
+linuxTest("C3 readonly S revalidates the full source without creating an attempt or publication", async t => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture();
+  try {
+    const captured = await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+    const before = (await readdir(f.store.root, { recursive: true })).sort(), frozen = await f.store.readBytes(captured.ref);
+    const windows = f.state.windows;
+    for (const method of ["createAttempt", "putJson", "putBytes", "putSourceFilePayload", "confirmDurable"] as const)
+      t.mock.method(ArtifactStore.prototype, method, () => { assert.fail("readonly S must not publish or create attempts"); });
+    await copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref);
+    assert(f.state.windows > windows, "the fixed entry actually reopens and scans native source windows");
+    assert.equal(f.state.handles.size, 0);
+    assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), before);
+    assert.deepEqual(await f.store.readBytes(captured.ref), frozen);
+    f.state.health = "1\n";
+    const failed = await rejected(copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref));
+    assert.equal(failed.error.code, "backup_capability_unavailable");
+    assert.equal(f.state.handles.size, 0);
+    assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), before);
+    f.state.health = "0\n";
+    writeFileSync(path.join(f.sessions, "nested", "binary"), "changed source bytes", { mode: 0o600 });
+    f.resetReadTimes();
+    const changed = await rejected(copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref));
+    assert.equal(changed.error.code, "source_changed");
+    assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), before);
+  } finally { t.mock.restoreAll(); await f.close(); await copy.close(); }
+});
+
+linuxTest("C3 readonly S enforces retained metadata and final diagnostic envelope budgets without attempts", async t => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture();
+  try {
+    const captured = await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+    const before = (await readdir(f.store.root, { recursive: true })).sort();
+    for (const [name, limits] of [
+      ["retained metadata", { "const MAX_MANIFEST_BYTES = 16 * 1024 * 1024": "const MAX_MANIFEST_BYTES = 2_000" }],
+      ["final envelope", { "Buffer.byteLength(encoded) <= MAX_MANIFEST_BYTES": "Buffer.byteLength(encoded) <= 1" }],
+    ] as const) await t.test(name, async () => {
+      const bounded = await isolatedSourceFiles(limits);
+      try {
+        const failed = await rejected(bounded.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref));
+        assert.equal(failed.error.code, "backup_capability_unavailable");
+        assert.match(String(failed.error.cause), /source-files-budget/);
+        assert.equal(f.state.handles.size, 0);
+        assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), before);
+      } finally { await bounded.close(); }
+    });
+  } finally { await f.close(); await copy.close(); }
+});
+
+linuxTest("C3 readonly S retains a thrown undefined and independent real-owner close failure", async () => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture(), closeError = new Error("readonly-child-close");
+  try {
+    const captured = await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+    const before = (await readdir(f.store.root, { recursive: true })).sort();
+    f.state.hook = (operation, file) => {
+      if (file.endsWith("/binary") && operation === "read") throw undefined;
+      if (file.endsWith("/binary") && operation === "closed") throw closeError;
+    };
+    const failed = await rejected(copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref));
+    assert.equal(failed.error.cause, undefined); assert(failed.error.closeErrors.includes(closeError));
+    assert.equal(failed.error.tcutReached, false); assert.equal(f.state.handles.size, 0);
+    assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), before);
   } finally { await f.close(); await copy.close(); }
 });
 linuxTest("#152 S private entry windows retain nested directory times and child atime in capture and live", async () => {

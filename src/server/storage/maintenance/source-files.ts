@@ -286,7 +286,8 @@ async function protectedIdentities(scan: Scan): Promise<void> {
     catch (error) { if ((error as NodeJS.ErrnoException | null)?.code !== "ENOENT") throw error; }
   }
 }
-async function initialScan(store: ArtifactStore, lock: SourceLock, mutex: OperationMutex, value: PersistedPlanRef): Promise<Scan> {
+async function initialScan(store: ArtifactStore, lock: SourceLock, mutex: OperationMutex, value: PersistedPlanRef,
+  mode: "record-attempt" | "read-only"): Promise<Scan> {
   const parsed = referenceSchema.safeParse(value); requireValue(parsed.success, "plan_stale");
   const reference = parsed.data;
   requireValue(reference.planDigest === reference.immutablePlan.sha256 && reference.controlRoot === store.root
@@ -332,7 +333,7 @@ async function initialScan(store: ArtifactStore, lock: SourceLock, mutex: Operat
     count: 0, keptBytes: 0, contentBytes: 0n, stage: "input", tcut: false, attempt: undefined };
   try {
     retain(scan, plan.fileRoots); await current(scan); stage(scan, "boundary"); await protectedIdentities(scan);
-    scan.attempt = await guarded.createAttempt(state.ownerGeneration);
+    if (mode === "record-attempt") scan.attempt = await guarded.createAttempt(state.ownerGeneration);
   } catch (error) { throw new SourceFilesFailure(error, scan.stage, scan.closeErrors, false); }
   return scan;
 }
@@ -489,7 +490,6 @@ function persistentManifest(manifest: SourceFilesManifest): unknown {
   }) };
 }
 async function writeAttempt(scan: Scan, successful: boolean): Promise<void> {
-  if (!scan.attempt) return;
   // Full per-entry window guards and root health stay private. Their retained
   // bytes share the traversal budget with Fs metadata; the final envelope is
   // also bounded before a buffer or diagnostic file is created.
@@ -498,6 +498,9 @@ async function writeAttempt(scan: Scan, successful: boolean): Promise<void> {
     tcutReached: scan.tcut, outcome: successful ? "pending-close" : "failed",
     objectsInspected: scan.count, contentBytes: String(scan.contentBytes), closeFailureCount: scan.closeErrors.length });
   requireValue(Buffer.byteLength(encoded) <= MAX_MANIFEST_BYTES, "backup_capability_unavailable", "source-files-budget");
+  // Read-only verification retains and bounds the same complete envelope, but
+  // never creates a diagnostic file or an attempt directory.
+  if (!scan.attempt) return;
   const bytes = Buffer.from(encoded);
   await scan.store.assertRoot();
   const directory = await pathFacts(scan.attempt);
@@ -512,11 +515,12 @@ async function writeAttempt(scan: Scan, successful: boolean): Promise<void> {
   if (failed) throw first;
 }
 async function run(store: ArtifactStore, lock: SourceLock, mutex: OperationMutex, reference: PersistedPlanRef,
-  existing?: ArtifactRef): Promise<{ ref: ArtifactRef; manifest: SourceFilesManifest }> {
+  existing?: ArtifactRef, mode: "record-attempt" | "read-only" = "record-attempt"): Promise<{ ref: ArtifactRef; manifest: SourceFilesManifest }> {
   let scan: Scan | undefined, result: { ref: ArtifactRef; manifest: SourceFilesManifest } | undefined;
   let failed = false, first: unknown;
   try {
-    scan = await initialScan(store, lock, mutex, reference);
+    requireValue(mode !== "read-only" || existing !== undefined, "snapshot_invalid");
+    scan = await initialScan(store, lock, mutex, reference, mode);
     let expected: SourceFilesManifest | undefined;
     if (existing) {
       requireValue(store.kindFor(existing) === "source-files" && existing.bytes.length <= 20
@@ -587,4 +591,12 @@ export async function captureSourceFiles(store: ArtifactStore, lock: SourceLock,
 export async function verifyLiveSourceFiles(store: ArtifactStore, lock: SourceLock, mutex: OperationMutex,
   plan: PersistedPlanRef, reference: ArtifactRef): Promise<void> {
   await run(store, lock, mutex, plan, reference);
+}
+
+/** Fixed read-only consumer entry. It runs the same native/profile/content and
+ * complete diagnostic budgets without creating attempts, payloads or permits.
+ * The caller still owns the original native lock and outer source-client window. */
+export async function verifyLiveSourceFilesReadOnly(store: ArtifactStore, lock: SourceLock, mutex: OperationMutex,
+  plan: PersistedPlanRef, reference: ArtifactRef): Promise<void> {
+  await run(store, lock, mutex, plan, reference, "read-only");
 }

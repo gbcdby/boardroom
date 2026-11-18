@@ -45,14 +45,14 @@ test("A12-R01/R13: strict planned shape cannot carry a permit, future reference 
   }
 });
 
-test("A12-R08: production v1/v2 reader is unchanged and still rejects private v3", () => {
+test("C3 AC16 / A12-R08: shared v3 decoding preserves the exact v1/v2 bytes and remains data only", () => {
   const { controlProof: _proof, sourceClients: _roster, ...base } = enter();
   const v1 = { ...base, formatVersion: 1 }, v2 = { ...base, formatVersion: 2, sourceClients: null };
   const original = [canonicalJson(v1), canonicalJson(v2)];
   assert.deepEqual(original.map(sha256), ["c1e9c62cc5b6322711c19bd126800f12a5e09a7d4396e0d6c5c0ed4bd05eca23", "862775302ce68051efb17b71318ea7631fa6001bfdf90c16ad36f2380395d757"]);
   assert.deepEqual(parseJournal(v1), v1);
   assert.deepEqual(parseJournal(v2), v2);
-  assert.throws(() => parseJournal(enter()), invalid);
+  assert.deepEqual(parseJournal(enter()), parseControlJournalCandidate(enter()));
   assert.deepEqual([canonicalJson(v1), canonicalJson(v2)], original);
   assert.throws(() => parseControlJournalCandidate(v1), invalid);
   assert.throws(() => parseControlJournalCandidate(v2), invalid);

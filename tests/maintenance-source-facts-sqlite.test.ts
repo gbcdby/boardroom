@@ -23,7 +23,7 @@ import { verifyJournalChain } from "../src/server/storage/maintenance/journal.ts
 import { buildSourceClientsRoster, sourceClientsDigest } from "../src/server/storage/maintenance/source-clients.ts";
 import { registerStorageSourceClient, storageReceiptDigest, type StorageClientLifecycle } from "../src/server/storage/source-client.ts";
 import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
-import type { JournalRecordV2, OperationMutex, SourceClientFactsWindow, SourceFilesManifest } from "../src/server/storage/maintenance/types.ts";
+import type { JournalRecordV2, JournalRecordV3, OperationMutex, SourceClientFactsWindow, SourceFilesManifest } from "../src/server/storage/maintenance/types.ts";
 import { withSqliteSourceCloseDiagnostics } from "./fixtures/maintenance-source-close-diagnostic.ts";
 import { historicalControllerProcess, historicalControllerRow } from "./fixtures/maintenance-controller-history.ts";
 
@@ -117,7 +117,7 @@ function mutateClient(file: string, edit: (row: Record<string, unknown>, envelop
 }
 
 /** Structural capture fixture only. These FID bytes do not assert any real Fs/provider qualification. */
-async function anchorStructuralCapture(f: Awaited<ReturnType<typeof fixture>>) {
+async function anchorStructuralCapture(f: Awaited<ReturnType<typeof fixture>>, format: 2 | 3 = 2) {
   const handle = { type: 1 as const, byteCount: 8 as const, hex: "0123456789abcdef" };
   const entries: SourceFilesManifest["entries"][number][] = [];
   for (const root of f.plan.fileRoots) {
@@ -145,10 +145,16 @@ async function anchorStructuralCapture(f: Awaited<ReturnType<typeof fixture>>) {
     const roster = buildSourceClientsRoster({ formatVersion: 1, kind: "source-clients-roster", source: raw.source,
       migrationId: f.plan.migrationId, plan: f.reference.immutablePlan, fenceEpoch: String(raw.state.fenceEpoch),
       receiptGeneration: String(raw.state.ownerGeneration), textEncoding: raw.textEncoding, rows: raw.rows });
-    const record: JournalRecordV2 = { ...entered, sequence: entered.sequence + 1, previous, phase: "quiesced", event: "capture", requestId: "structural-capture-only",
+    const base: JournalRecordV2 = { ...entered, sequence: entered.sequence + 1, previous, phase: "quiesced", event: "capture", requestId: "structural-capture-only",
       sourceClients: roster, frozen: { sourceFilesManifest: filesRef, schemaManifestDigest: full.manifests.schemaManifestDigest,
         frozenBusinessManifestDigest: full.manifests.frozenBusinessManifestDigest, guardManifestDigest: raw.state.guardManifestDigest,
         sourceClientsDigest: sourceClientsDigest(roster) } };
+    const audit = format === 3 ? await lock.readSourceClientAudit(f.reference) : undefined;
+    const record: JournalRecordV2 | JournalRecordV3 = audit ? { ...base, formatVersion: 3, controlProof: { formatVersion: 1, kind: "capture-controls",
+      maintenanceInvariant: { singleton: "1", databaseInstanceId: raw.source.databaseInstanceId, admission: "sealed",
+        fenceEpoch: String(raw.state.fenceEpoch), activeMigrationId: f.plan.migrationId, planDigest: f.reference.planDigest,
+        controlRootJson: raw.state.controlRootJson!, mutexIdentityJson: raw.state.mutexIdentityJson!, protocolVersion: "1",
+        guardManifestDigest: raw.state.guardManifestDigest }, facts: audit.facts } } : base;
     const head = await f.store.putJson("journal", record);
     await lock.anchor({ expected: raw.state, admission: "sealed", fenceEpoch: raw.state.fenceEpoch, ownerGeneration: raw.state.ownerGeneration,
       activeMigrationId: f.plan.migrationId, planDigest: f.reference.planDigest, controlRootIdentity: f.store.identity as never,
@@ -181,6 +187,53 @@ test("A12-B historical controller stays excluded after an anchored structural ca
     await assert.rejects(f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference)), { code: "source_changed" });
   } finally { await actor.close(); await f.close(); }
 });
+
+test("C3 SQLite native facts re-read v3 origin R0 without reissuing its historical identity", async () => {
+  const actor = await historicalControllerProcess();
+  const f = await fixture(false, "UTF-8", false, undefined, 2);
+  try {
+    const row = historicalControllerRow(f.plan.source, actor), db = new Database(f.file);
+    try {
+      const names = Object.keys(row);
+      db.prepare(`INSERT INTO storage_source_clients (${names.join(",")}) VALUES (${names.map(() => "?").join(",")})`).run(...Object.values(row));
+    } finally { db.close(); }
+    await actor.exit();
+    // Real source/native facts over a structural fixture. This does not assert
+    // earlier production issuance or Fs qualification; I03/I05 supply that history.
+    const captured = await anchorStructuralCapture(f, 3);
+    const audit = await f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference));
+    assert.equal(audit.origin.kind, "captured-generation");
+    assert.equal(audit.origin.receiptGeneration, 2);
+    assert.deepEqual(audit.origin.capture, captured.head);
+    assert.deepEqual(audit.observation.rows, captured.record.sourceClients!.rows);
+    assert.equal(audit.facts.actor.clientId, null);
+    assert.equal(audit.facts.clients.length, 1);
+    assert.equal(audit.facts.clients[0]!.kind, "maintenance-controller");
+    assert.equal(audit.facts.clients[0]!.classification, "exited-actor");
+    const changed = new Database(f.file);
+    try { changed.prepare("UPDATE storage_source_clients SET last_observed_at='unanchored drift' WHERE client_id=?").run(row.client_id); }
+    finally { changed.close(); }
+    await assert.rejects(f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference)), { code: "source_changed" });
+  } finally { await actor.close(); await f.close(); }
+});
+
+for (const encoding of ["UTF-8", "UTF-16le", "UTF-16be"] as const) {
+  test(`C3 SQLite native facts bind empty v3 origin with actual ${encoding} metadata`, async () => {
+    const f = await fixture(false, encoding);
+    try {
+      const captured = await anchorStructuralCapture(f, 3);
+      const audit = await f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference));
+      assert.deepEqual(audit.origin.capture, captured.head);
+      assert.deepEqual(audit.observation.textEncoding, { backend: "sqlite", name: encoding });
+      assert.deepEqual(audit.observation.rows, []);
+      assert.equal(audit.facts.actor.clientId, null);
+      await f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference, async window => {
+        assert.equal(window.origin.receiptGeneration, 1);
+        await window.assertCurrent();
+      }));
+    } finally { await f.close(); }
+  });
+}
 
 test("A11A SQLite facts use the actual planned anchor and expire when their callback exits", async () => {
   const f = await fixture(); let escaped: SourceClientFactsWindow | undefined;
@@ -479,6 +532,8 @@ test("A11A uses only the actually anchored first capture for old receipt generat
   const f = await fixture(true);
   try {
     const capture = await anchorStructuralCapture(f);
+    assert.equal(capture.record.formatVersion, 2);
+    if (capture.record.formatVersion !== 2) assert.fail("expected the unchanged legacy capture fixture");
     const record: JournalRecordV2 = { ...capture.record, sequence: 3, previous: capture.head, event: "takeover",
       requestId: "after-capture-takeover", ownerGeneration: 2, sourceClients: null, frozen: null };
     const takeover = await f.store.putJson("journal", record);

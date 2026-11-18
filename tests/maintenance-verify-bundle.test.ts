@@ -254,7 +254,7 @@ nativeTest("#152 V: an actual restored DB close failure retains its owner and fo
   const f = await verificationBundleFixture(), close = Database.prototype.close;
   const failure = Object.freeze(new Error("verification-target-close")); let target: Database.Database | undefined;
   try {
-    await f.run(async lock => {
+    await assert.rejects(f.run(async lock => {
       const refs = await f.publish(lock); let failed = false;
       t.mock.method(Database.prototype, "close", function(this: Database.Database) {
         if (this.name.endsWith("/database/restored.sqlite")) { target = this; throw failure; }
@@ -265,7 +265,7 @@ nativeTest("#152 V: an actual restored DB close failure retains its owner and fo
       assert.equal(failed, true); assert.equal(target?.open, true); await noVerification(f.store);
       assert.deepEqual((await lock.observe()).state, f.sealed.state);
       t.mock.restoreAll();
-    });
+    }), error => error === failure);
     await f.mutex.release(); await f.adapter.close(); assert.equal(target?.open, false);
   } finally { t.mock.restoreAll(); if (target?.open) close.call(target); await f.close(); }
 });

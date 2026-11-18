@@ -71,6 +71,16 @@ for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeT
         await t.test("duplicate table", () => assert.rejects(bind(rebuild(rows, [...archived.tables, table])), changed));
         await t.test("root invariant remains bound in the archived control row", () => assert.rejects(bind(buildDatabaseManifests(kind, archived.schema,
           archived.tables, { ...archived.controlRows, storage_maintenance: [{ ...archived.controlRows.storage_maintenance[0]!, mutex_identity_json: "{}" }] })), changed));
+        const maintenance = archived.tables.find(item => item.name === "storage_maintenance")!;
+        assert(Array.isArray(maintenance.columns));
+        for (const [name, replacement] of [
+          ["columns", { ...maintenance, columns: [...maintenance.columns].reverse() }],
+          ["count", { ...maintenance, count: "0" }], ["typed digest", { ...maintenance, digest: "f".repeat(64) }],
+        ] as const) await t.test(`maintenance table ${name}`, () => assert.rejects(bind(rebuild(rows,
+          archived.tables.map(item => item === maintenance ? replacement : item))), changed));
+        await t.test("live maintenance typed table cannot disagree with its native row", () => assert.rejects(bind(archived, lock,
+          { ...observed, manifests: buildDatabaseManifests(kind, observed.manifests.schema, observed.manifests.tables.map(item =>
+            item.name === "storage_maintenance" ? { ...item, digest: "f".repeat(64) } : item), observed.manifests.controlRows) }), changed));
         const variants: readonly [string, SourceClientsObservation][] = [
           ["source", { ...raw, source: { ...raw.source, databaseInstanceId: "f".repeat(32) } }],
           ["identity", { ...raw, sourceIdentity: { different: true } }],
@@ -105,7 +115,7 @@ for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeT
 
 // Pure fail-closed dispatch controls, explicitly not native PostgreSQL evidence.
 // The unsupported profile is rejected before a lock/decoder success can be used,
-// including an empty same-row replay whose unresolved list happens to be empty.
+// Empty captures and equal successors both retain the explicit encoding obligation.
 for (const encoding of ["LATIN1", "SQL_ASCII"]) for (const nonempty of [false, true]) for (const advance of [false, true]) test(
   `#248 v3 ${encoding}: ${nonempty ? "nonempty" : "empty"} ${advance ? "no-op successor" : "capture"} cannot clear the encoding obligation`, async () => {
     const f = controlVector({ backend: "postgres", encoding });
@@ -121,7 +131,7 @@ for (const encoding of ["LATIN1", "SQL_ASCII"]) for (const nonempty of [false, t
       nodes.push({ reference: f.pack("journal", next), record: parseVerificationJournal(next) });
     }
     const replay = replayVerificationControls(parsePlan(f.plan), nodes, { controlRoot: f.root, mutexIdentity: f.mutex });
-    assert.deepEqual(replay.unresolvedEncoding, advance || nonempty ? [encoding] : []);
+    assert.deepEqual(replay.unresolvedEncoding, [encoding]);
     await assert.rejects(assertVerificationSourceClientBinding({} as SourceLock, {} as SourceObservation, captured, {} as DatabaseManifests,
       { ...replay, unresolvedEncoding: [] }), /source_changed \(v3-source-clients-encoding-unverified\)/);
   });

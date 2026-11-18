@@ -75,9 +75,9 @@ platformTest("SQLite verification: real restored bytes succeed only after target
 platformTest("SQLite verification: rollback failure preserves primary and still closes the real target", async t => {
   const f = await fixture(); const exec = Database.prototype.exec, close = Database.prototype.close;
   const rollback = Object.freeze(new Error("verification-rollback"));
-  let restored: Database.Database | undefined, closes = 0;
+  let restored: Database.Database | undefined, closes = 0, original: unknown;
   try {
-    await f.adapter.withSourceLock("snapshot", async lock => {
+    const outer = await rejection(f.adapter.withSourceLock("snapshot", async lock => {
       const file = path.join(f.attempt, "backup.sqlite"), backup = await lock.backup(file);
       t.mock.method(Database.prototype, "exec", function(this: Database.Database, sql: string) {
         if (this.name.endsWith("/restored.sqlite") && sql === "ROLLBACK") { restored = this; throw rollback; }
@@ -88,11 +88,13 @@ platformTest("SQLite verification: rollback failure preserves primary and still 
         return close.call(this);
       });
       const error = await rejection(f.adapter.verifyDatabase(file, { ...backup.manifests, fullDataManifestDigest: "0".repeat(64) }, path.join(f.attempt, "restore")));
+      original = error;
       assert(error instanceof AggregateError); assert.equal(error.errors.length, 2);
       assert(first(error) instanceof MaintenanceFailure); assert.equal((first(error) as MaintenanceFailure).code, "snapshot_invalid");
       assert.equal(error.cause, error.errors[0]); assert.equal(error.errors[1], rollback);
       assert.equal(closes, 1); assert.equal(restored?.open, false);
-    });
+    }));
+    assert.equal(outer, original, "handled target cleanup failure remains owned by the outer source operation");
   } finally {
     t.mock.restoreAll(); if (restored?.open) close.call(restored); await f.close();
   }
@@ -104,7 +106,7 @@ for (const timing of ["before", "after"] as const) for (const undefinedError of 
     const injected = undefinedError ? undefined : Object.freeze(new Error(`verification-close-${timing}`));
     let restored: Database.Database | undefined, calls = 0;
     try {
-      await f.adapter.withSourceLock("snapshot", async lock => {
+      const outer = await rejection(f.adapter.withSourceLock("snapshot", async lock => {
         const file = path.join(f.attempt, "backup.sqlite"), backup = await lock.backup(file);
         t.mock.method(Database.prototype, "close", function(this: Database.Database) {
           if (this.name.endsWith("/restored.sqlite")) {
@@ -121,7 +123,8 @@ for (const timing of ["before", "after"] as const) for (const undefinedError of 
           await assert.rejects(access(next), { code: "ENOENT" }); assert.equal(calls, 1);
         }
         t.mock.restoreAll();
-      });
+      }));
+      assert.equal(outer, injected, "the outer source operation retains the exact target close failure, including undefined");
       await f.mutex.release(); await f.adapter.close();
       assert.equal(restored?.open, false); assert.equal(calls, 1);
     } finally { t.mock.restoreAll(); if (restored?.open) close.call(restored); await f.close(); }
@@ -131,9 +134,9 @@ for (const timing of ["before", "after"] as const) for (const undefinedError of 
 platformTest("SQLite verification: three failures keep ordering and explicit cleanup retains the owned DB", async t => {
   const f = await fixture(); const exec = Database.prototype.exec, close = Database.prototype.close;
   const closeError = Object.freeze(new Error("verification-close"));
-  let restored: Database.Database | undefined;
+  let restored: Database.Database | undefined, original: unknown;
   try {
-    await f.adapter.withSourceLock("snapshot", async lock => {
+    const outer = await rejection(f.adapter.withSourceLock("snapshot", async lock => {
       const file = path.join(f.attempt, "backup.sqlite"), backup = await lock.backup(file);
       t.mock.method(Database.prototype, "exec", function(this: Database.Database, sql: string) {
         if (this.name.endsWith("/restored.sqlite") && sql === "ROLLBACK") { restored = this; throw undefined; }
@@ -144,11 +147,13 @@ platformTest("SQLite verification: three failures keep ordering and explicit cle
         return close.call(this);
       });
       const error = await rejection(f.adapter.verifyDatabase(file, { ...backup.manifests, fullDataManifestDigest: "0".repeat(64) }, path.join(f.attempt, "restore")));
+      original = error;
       assert(error instanceof AggregateError); assert.equal(error.errors.length, 3);
       assert.equal((error.errors[0] as MaintenanceFailure).code, "snapshot_invalid");
       assert.equal(error.cause, error.errors[0]); assert.equal(error.errors[1], undefined); assert.equal(error.errors[2], closeError);
       assert.equal(restored?.open, true);
-    });
+    }));
+    assert.equal(outer, original, "the outer source operation retains the original aggregate without replacing its occurrences");
     await f.mutex.release();
     const retry = await rejection(f.adapter.close());
     assert(retry instanceof AggregateError); assert.deepEqual(retry.errors, [undefined, closeError]); assert.equal(restored?.open, true);

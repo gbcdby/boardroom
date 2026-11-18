@@ -70,6 +70,27 @@ test("#152 A10-R01/R02/R09 SQLite raw observation preserves all 16 original cell
   } finally { await f.close(); }
 });
 
+test("#152 C3 SQLite source rows have identical raw order for opposite physical insertion orders", async t => {
+  for (const encoding of ["UTF-8", "UTF-16le", "UTF-16be"] as const) await t.test(encoding, async () => {
+    const f = await fixture(encoding);
+    try {
+      // UTF-16le reverses the decoded ordering of these IDs; only original bytes
+      // determine the persisted roster and replay order.
+      const values = [
+        { client_id: "A", ended_at: "ended", entrypoint: "http", drain_epoch: 0n },
+        { client_id: "Ā", build_id: "different\0raw", observed_epoch: 0n },
+      ].sort((a, b) => bytes(a.client_id, encoding) < bytes(b.client_id, encoding) ? -1 : 1);
+      const inserted = [...values].reverse().map(value => seed(f.db, value));
+      const descending = await f.adapter.observeSourceClients();
+      assert.deepEqual(descending.rows, [...inserted].reverse().map(value => expected(value, encoding)));
+      f.db.exec("DELETE FROM storage_source_clients");
+      for (const value of values) seed(f.db, value);
+      const ascending = await f.adapter.observeSourceClients();
+      assert.deepEqual(ascending, descending, "complete raw rows, encoding, schema, source and state must be insertion-order independent");
+    } finally { await f.close(); }
+  });
+});
+
 test("#152 A10-R01/R03/R06/R08 SQLite three actual encodings preserve bytes through the unchanged real mutex and lock", async t => {
   for (const encoding of ["UTF-8", "UTF-16le", "UTF-16be"] as const) await t.test(encoding, async () => {
     const f = await fixture(encoding);

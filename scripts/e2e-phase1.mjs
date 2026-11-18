@@ -374,17 +374,48 @@ try {
   // 关键：等待必须**先于**发送进入挂起，才能区分「实时唤醒」与「积压补投」——
   // 第 7 条仍会持久化并建 pending 投递（不丢，后续 wait/read_history 可补投），
   // 但本次不应**实时唤醒**正在等待的 B（live wake 被 consecutive_limit 抑制）。
+  // 9.1 的 selfMsg 也消耗一次连续计数；用真实人消息开始独立场景，随后 ACK 可见积压。
+  const reset = await humanSendMessage(server.url, groupId, humanMemberId, "@Bob 开始独立防环验收", [memberB]);
+  for (const name of ["A", "B"]) {
+    const backlog = await callTool(agents[name].client, "wait_for_messages", { timeoutMs: 300 });
+    check("AC-CORE-09", `${name} 收到场景重置的人消息`, Boolean(findMessage(backlog, reset.id)), `status=${backlog.status}`);
+    await ackAll(agents[name].client, backlog);
+  }
   let wakes = 0;
   let seventhWoke = false;
+  let seventhMessageId;
   for (let i = 1; i <= 7; i += 1) {
+    const waitStarted = performance.now();
+    let completed = false;
     const w = callTool(agents.B.client, "wait_for_messages", { timeoutMs: 900 });
-    await sleep(80); // 让 B 的等待进入挂起
+    void w.then(() => { completed = true; }, () => { completed = true; });
+    let ready = false, beforeSend;
+    while (!completed && performance.now() - waitStarted < 900) {
+      const response = await fetch(`${server.url}/api/projects/${projectId}/members/${memberB}/status`, {
+        signal: AbortSignal.timeout(Math.max(1, Math.ceil(900 - (performance.now() - waitStarted)))),
+      });
+      const status = await response.json();
+      beforeSend = { pending: server.mcpPendingWaitCount, state: status.memberStatus?.state, completed,
+        elapsedMs: Math.round(performance.now() - waitStarted) };
+      ready = response.ok && !completed && beforeSend.pending === 1 && beforeSend.state === "waiting"
+        && performance.now() - waitStarted < 900;
+      if (ready) break;
+      await sleep(5);
+    }
+    check("AC-CORE-09", `第 ${i} 条发送前确认本次等待已完成初次积压扫描`, ready, JSON.stringify(beforeSend));
     const sent = await callTool(agents.A.client, "send_message", { text: `连续 @Bob #${i}`, mentions: [memberB] });
     const r = await w;
-    const got = Boolean(findMessage(r, sent.messageId));
+    const got = r.status === "message" && r.drainedBacklog === false && Boolean(findMessage(r, sent.messageId));
+    console.log(`  AC-CORE-09 round ${JSON.stringify({ round: i, messageId: sent.messageId,
+      status: r.status, drainedBacklog: r.drainedBacklog, liveTarget: got, beforeSend })}`);
+    if (i <= 6) check("AC-CORE-09", `第 ${i} 条目标消息实时唤醒`, got);
     if (got) wakes += 1;
     if (i === 7) {
       seventhWoke = got;
+      seventhMessageId = sent.messageId;
+      check("AC-CORE-09", "第 7 条不会唤醒原已挂起等待（原 900ms 超时）",
+        r.status === "timeout" && r.drainedBacklog === false && !findMessage(r, sent.messageId),
+        `status=${r.status}, drainedBacklog=${r.drainedBacklog}`);
       // 第 7 条即使未实时唤醒，也应可通过 read_history 读到（不丢）
       const rh = await callTool(agents.B.client, "read_history", { limit: 60 });
       const inHistory = (rh.messages ?? []).some((m) => m.id === sent.messageId);
@@ -394,9 +425,13 @@ try {
     await ackAll(agents.B.client, r);
   }
   check("AC-CORE-09", "连续自动回复上限生效：前 6 条实时唤醒、第 7 条不再实时唤醒",
-    wakes >= 5 && !seventhWoke, `wakes=${wakes}/7, 7thWoke=${seventhWoke}`);
-  // 清掉 B 已收到的连续消息
-  await ackAll(agents.B.client, await callTool(agents.B.client, "wait_for_messages", { timeoutMs: 300 }));
+    wakes === 6 && !seventhWoke, `wakes=${wakes}/7, 7thWoke=${seventhWoke}`);
+  // 主动新 wait 的积压补投与自动实时唤醒分开验收；抑制不能丢掉第 7 条。
+  const seventhBacklog = await callTool(agents.B.client, "wait_for_messages", { timeoutMs: 300 });
+  check("AC-CORE-09", "主动新等待合法补投被抑制的第 7 条",
+    seventhBacklog.status === "message" && seventhBacklog.drainedBacklog === true && Boolean(findMessage(seventhBacklog, seventhMessageId)),
+    `status=${seventhBacklog.status}, drainedBacklog=${seventhBacklog.drainedBacklog}`);
+  await ackAll(agents.B.client, seventhBacklog);
 
   // =========================================================================
   // AC-CORE-11 协议部分：人 + 两个 SDK 客户端双向 @、等待、断线重连

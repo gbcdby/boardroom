@@ -340,8 +340,15 @@ for (const kind of ["sqlite", "postgres"] as const) (kind === "sqlite" ? nativeT
         assert.equal(outcome.commitReturned, point.startsWith("close"));
         assert.equal(outcome.closeFailureObserved, point.startsWith("close"));
         assert.equal(outcome.localSourceHandleClosed, point !== "close-before");
-        assert.equal(Object.hasOwn(outcome, "originalError"), false);
-        assert.equal(Object.hasOwn(outcome, "closeError"), false);
+        assert.equal(outcome.failureObserved, point.startsWith("commit"));
+        assert.equal(outcome.originalError, point.startsWith("commit") ? failure : undefined);
+        assert.equal(outcome.rollbackFailureObserved, false); assert.equal(outcome.rollbackError, undefined);
+        assert.equal(outcome.closeError, point.startsWith("close") ? failure : undefined);
+        assert.deepEqual(outcome.cleanupEvents, point.startsWith("close") ? [{ stage: "close-failure", error: failure }] : []);
+        assert.equal(Object.isFrozen(outcome.cleanupEvents), true);
+        for (const event of outcome.cleanupEvents!) {
+          assert.equal(event.error, failure); assert.equal(Object.isFrozen(event), true);
+        }
         await assert.rejects(sourceLock.assertHeld(), { code: "maintenance_lost" });
         child.mock.restoreAll();
 

@@ -103,6 +103,12 @@ export const controlProofSchema = z.discriminatedUnion("kind", [
   z.object({ formatVersion: z.literal(1), kind: z.literal("capture-controls"), maintenanceInvariant: invariantSchema, facts: eventFactsSchema }).strict(),
   z.object({ ...successor, kind: z.literal("control-successor") }).strict(),
   z.object({ ...successor, kind: z.literal("legacy-first-capture-bridge"), legacy: z.object({ ready: ref, receipt: ref, manifests: ref }).strict() }).strict(),
+  z.object({ formatVersion: z.literal(1), kind: z.literal("cancel-terminal-controls"),
+    originCapture: ref, originSourceClientsDigest: hash, source, plan: ref, migrationId: id,
+    epochBefore: safePos, epochAfter: safePos, receiptGeneration: safePos, textEncoding: sourceClientsEncodingSchema,
+    previousAnchor: ref, ownerGeneration: safePos, targetSequence: safePos,
+    beforeRowsDigest: hash, afterRowsDigest: hash, changes: z.tuple([]), facts: eventFactsSchema,
+    successorRule: z.literal("open-next-epoch-clear-active-v1") }).strict(),
 ]);
 export type EventFacts = z.infer<typeof eventFactsSchema>;
 export type ClientFact = EventFacts["clients"][number];
@@ -110,6 +116,7 @@ export type RegisteredProcess = z.infer<typeof registeredProcess>;
 export type ProcessCheck = z.infer<typeof processCheck>;
 export type ControlProof = z.infer<typeof controlProofSchema>;
 export type SuccessorProof = Extract<ControlProof, { kind: "control-successor" | "legacy-first-capture-bridge" }>;
+export type CancelTerminalProof = Extract<ControlProof, { kind: "cancel-terminal-controls" }>;
 export type MaintenanceInvariant = z.infer<typeof invariantSchema>;
 
 function resourceKeyRange(key: string, platform: "linux" | "darwin"): void {

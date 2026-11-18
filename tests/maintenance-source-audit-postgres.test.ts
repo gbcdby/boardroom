@@ -6,6 +6,7 @@ import { postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgr
 import { registerExitedAuditClient } from "./fixtures/maintenance-audit-history-child.ts";
 import { checkFactsShape, eventFactsSchema } from "../src/server/storage/maintenance/control-candidate/schema.ts";
 import { storageReceiptDigest } from "../src/server/storage/source-client.ts";
+import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import type { SourceLock } from "../src/server/storage/maintenance/types.ts";
 const pgTest = process.env.AGENT_STUDIO_PG_TEST_URL ? test : test.skip;
 
@@ -221,7 +222,24 @@ pgTest("A12-B PostgreSQL strict inspection-close failure cannot fulfill the audi
   });
   try {
     await assert.rejects(f.adapter.withSourceLock("control", lock => lock.readSourceClientAudit(f.reference))
-      .then(value => { fulfilled = true; return value; }), { code: "maintenance_lost" });
-    assert(injected); assert.equal(fulfilled, false);
+      .then(value => { fulfilled = true; return value; }), error => error instanceof MaintenanceFailure
+        && error.code === "maintenance_lost"
+        && error.message === new MaintenanceFailure("maintenance_lost", "source-client-facts").message);
+    assert(injected); assert.equal(closes, 2); assert.equal(fulfilled, false);
+    // The injected uncertain close invalidates this adapter. A natural heartbeat
+    // may have retained that same loss before release; consume only that expected
+    // failure here so the fixture still verifies every session closes before DROP.
+    let releaseOutcome = "released";
+    try { await f.mutex.release(); }
+    catch (error) {
+      assert(error instanceof MaintenanceFailure);
+      assert.equal(error.code, "maintenance_lost");
+      assert.equal(error.message, new MaintenanceFailure("maintenance_lost").message);
+      releaseOutcome = "expected-monitor-loss";
+    }
+    t.diagnostic(`inspection-close injection confirmed; audit rejected; mutex release: ${releaseOutcome}`);
+    await assert.rejects(f.adapter.observe(), error => error instanceof MaintenanceFailure
+      && error.code === "maintenance_lost"
+      && error.message === new MaintenanceFailure("maintenance_lost").message);
   } finally { t.mock.restoreAll(); await f.close(); }
 });

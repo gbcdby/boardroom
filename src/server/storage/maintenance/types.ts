@@ -152,13 +152,14 @@ export interface JournalRecordV2 extends JournalRecordBase {
   readonly sourceClients: SourceClientsRosterV1 | null;
   readonly frozen: JournalFrozenV2 | null;
 }
-export type JournalRecord = JournalRecordV1 | JournalRecordV2;
-/** Explicit read-only V carrier; the default production writer/reader union stays v1/v2. */
+/** Strict v3 data. A decoded proof is never a native registration or source-lock permit. */
 export interface JournalRecordV3 extends Omit<JournalRecordV2, "formatVersion"> {
   readonly formatVersion: 3;
   readonly controlProof: import("./control-candidate/schema.ts").ControlProof | null;
 }
-export type VerificationJournalRecord = JournalRecord | JournalRecordV3;
+export type JournalRecord = JournalRecordV1 | JournalRecordV2 | JournalRecordV3;
+/** V shares the codec; its chain entry point separately enforces its quiesced-only purpose. */
+export type VerificationJournalRecord = JournalRecord;
 export type SourceFileIncarnation =
   | { readonly type: 248; readonly byteCount: 32; readonly hex: string }
   | { readonly type: 1; readonly byteCount: 8; readonly hex: string };
@@ -257,12 +258,24 @@ export interface ContinueRequest {
   readonly expectedJournalDigest: string | null;
   readonly requestId: string;
 }
-export type MaintenanceResult =
+export type MaintenanceOperation = "execute-migration" | "resume-migration" | "cancel-migration";
+/** Canonical values only. The actual service must independently bind source, plan and current head. */
+export interface MaintenanceCommand {
+  readonly operation: MaintenanceOperation;
+  readonly request: ContinueRequest;
+}
+export interface ObservedMaintenanceAnchor extends MaintenanceCaptureRef {
+  readonly phase: Phase;
+  readonly admission: "open" | "draining" | "sealed";
+  readonly authority: "observation-only";
+}
+export type MaintenanceResult = (
   | { readonly status: "blocked" | "recovery_required"; readonly lastVerifiedPhase: Phase | null; readonly blockers: readonly Blocker[] }
   | { readonly status: "paused"; readonly phase: "planned" | "quiesced"; readonly ref: MaintenanceRef }
   | { readonly status: "snapshot_ready"; readonly phase: "snapshot_ready"; readonly ref: MaintenanceRef; readonly snapshot: ArtifactRef }
   | { readonly status: "cancel_pending"; readonly phase: Phase; readonly ref: MaintenanceRef; readonly blockers: readonly Blocker[] }
-  | { readonly status: "cancelled"; readonly lastPhase: Phase; readonly terminalJournal: ArtifactRef; readonly openedFenceEpoch: number; readonly restartRequired: true };
+  | { readonly status: "cancelled"; readonly lastPhase: Phase; readonly terminalJournal: ArtifactRef; readonly openedFenceEpoch: number; readonly restartRequired: true }
+) & { readonly observedAnchor?: ObservedMaintenanceAnchor };
 
 /** Exact typed database manifest. Control rows are retained for per-field live comparison. */
 export interface DatabaseManifests {
@@ -299,7 +312,7 @@ export interface SourceClientProcessFact {
 }
 export interface SourceClientFact {
   readonly clientId: string;
-  readonly classification: "current-client" | "historical-client" | "historical-controller";
+  readonly classification: "current-client" | "historical-client" | "historical-controller" | "current-controller";
   readonly receipt: import("../source-client.ts").StorageDrainReceipt | null;
   readonly process: SourceClientProcessFact;
 }
