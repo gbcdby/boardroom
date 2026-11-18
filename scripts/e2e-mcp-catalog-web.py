@@ -362,12 +362,24 @@ def exercise(page, context, fixture, output, report, native):
 
     # A late GET is actual server data held past the logical deadline, never a manufactured successful payload.
     held = []
-    def late_read(route): held.append((route, route.fetch()))
+    holding = True
+    def late_read(route):
+        if route.request.method != "GET" or not holding:
+            route.continue_()
+            return
+        response = route.fetch()
+        # fetch() yields: an already entered handler may return after the window is sealed.
+        if holding: held.append((route, response))
+        else: route.fulfill(response=response)
     page.route(origin + COLLECTION, late_read); page.get_by_test_id("mcp-refresh").click()
     expect(page.get_by_test_id("mcp-read-error")).to_contain_text("读取超时", timeout=12000)
     expect(page.get_by_test_id("mcp-tool-0")).to_be_visible()
+    holding = False
     for route, response in held: route.fulfill(response=response)
-    page.unroute(origin + COLLECTION, late_read); refresh(page, origin)
+    held.clear()
+    # Keep the pass-through route until the existing page/context teardown. Do not toggle
+    # the last interception while reconciliation starts its exact-attempt GETs.
+    refresh(page, origin)
     expect(page.get_by_test_id("mcp-read-error")).to_have_count(0)
     before_rpc = fixture.command("stats")["methods"]
     before_requests = len(requests)
