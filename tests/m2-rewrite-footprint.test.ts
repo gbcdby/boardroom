@@ -273,7 +273,7 @@ for (const engine of identityEngines) {
         if (mode === "missing") await f.db.exec("DELETE FROM schema_migrations WHERE version=21");
         if (mode === "checksum") await f.db.exec("UPDATE schema_migrations SET checksum='wrong' WHERE version=21");
         if (mode === "name") await f.db.exec("UPDATE schema_migrations SET name='wrong' WHERE version=21");
-        if (mode === "new-version") await f.db.exec("INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES(22,'unreviewed','wrong','t')");
+        if (mode === "new-version") await f.db.exec("INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES(22,'unreviewed','wrong','2026-11-18T00:00:00.000Z')");
         if (mode === "empty-table") await f.db.exec("CREATE TABLE config_authority (unused TEXT)");
         if (mode === "case-table") await f.db.exec("CREATE TABLE Config_Authority (unused TEXT)");
         if (mode === "view") await f.db.exec("CREATE VIEW config_authority AS SELECT 'unused' AS value");
