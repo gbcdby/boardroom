@@ -18,6 +18,8 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 /** This isolated source exports only a pure ABI decoder. It neither replaces
  * the production binding/registry nor registers any synthetic root/profile. */
 interface PureNativeDecoders {
+  checkedBlockAttributes(value: unknown, source: any, device: any, calls: readonly SourceFileNativeCall[]): any;
+  checkedEnvironment(value: unknown, info: any): SourceFileRootEnvironment;
   checkedKernelReadFact(value: unknown, limit: number, samples?: 1 | 2): SourceFileContextFact<SourceFileKernelReadValue>;
   checkedAuxiliaryCalls(value: unknown, complete?: boolean, unavailableGraph?: boolean): readonly SourceFileNativeCall[];
   checkedEnumeration(value: unknown, index: number): readonly SourceFileNativeCall[];
@@ -29,7 +31,7 @@ async function withNativeDecoders(consume: (decode: PureNativeDecoders) => void)
     const source = (await readFile(original, "utf8")).replace('from "./error.ts"',
       `from ${JSON.stringify(pathToFileURL(path.join(root, "src/server/storage/maintenance/error.ts")).href)}`);
     const file = path.join(directory, "native-decoder.mts");
-    await writeFile(file, source + "\nexport { checkedKernelReadFact, checkedAuxiliaryCalls, checkedEnumeration };\n");
+    await writeFile(file, source + "\nexport { checkedKernelReadFact, checkedAuxiliaryCalls, checkedEnumeration, checkedBlockAttributes, checkedEnvironment };\n");
     const module = await import(pathToFileURL(file).href) as PureNativeDecoders;
     consume(module);
   } finally { await rm(directory, { recursive: true, force: true }); }
@@ -111,7 +113,9 @@ function profileParserFixture(): any {
     configuration: { tune: observed(Buffer.alloc(232)), options: read("rw,data=ordered,errors=remount-ro\n", 42n, 2), mbGroups: read("raw-mb-groups\n", 43n, 2),
       journalTaskBefore: read("333\n"), journalTaskAfter: read("333\n"), journalIoprio: observed({ which: 1n, who: 333n, rawValue: 16388n }) },
     device: { binding: observed(binding), dev, uevent, topology: observed({ nodes: [{ index: 0, major: 8n, minor: 1n, identity: deviceIdentity,
-      kernelName: binding.kernelName, resolved: binding.resolved, dev, uevent, holders: [], slaves: [] }], edges: [] }) },
+      kernelName: binding.kernelName, resolved: binding.resolved, dev, uevent, holders: [], slaves: [] }], edges: [] }),
+      blockAttributes: { readerRevision: 1, sourceNodeIndex: 0, ...Object.fromEntries(["size", "readOnly", "diskSequence"].map(name => [name,
+        { status: "unavailable", reason: "binding", value: null, calls: [] }])) } },
     health: { binding: observed({ sourceDevMajor: 8n, sourceDevMinor: 1n, device: deviceIdentity,
       health: { ...deviceIdentity, inode: 32n }, sbId: binding.sbId }),
       fields: healthNames.map((name, index) => ({ name, fact: read(index >= 11 ? "\n" : "0\n", BigInt(100 + index)) })) },
@@ -300,6 +304,177 @@ test("#152 P3 double samples independently require EOF, close and full bytes wit
     assert.equal(unavailable.calls[7]!.errno, 2n, "both real absence observations remain explicit, never a success value");
   });
 });
+
+/** Inert contract samples only: no native owner or production profile is registered. */
+function blockReaderFixture() {
+  const original = profileParserFixture(), device = original.environment.device;
+  const call = (operation: string, rc: bigint | null): SourceFileNativeCall => ({ operation, rc, errno: rc === null ? null : 0n });
+  const attributes: any = { readerRevision: 1, sourceNodeIndex: 0 };
+  for (const [field, label, bytes] of [["size", "block-size", "18446744073709551615\n"],
+    ["readOnly", "block-ro", "1\n"], ["diskSequence", "block-diskseq", "0\n"]]) {
+    const calls = ["", "-after"].flatMap(suffix => [call(`open-${label}${suffix}`, 8n),
+      call(`fstat-${label}-before${suffix}`, 0n), call(`fstatfs-${label}-before${suffix}`, 0n),
+      call(`read-${label}${suffix}`, BigInt(Buffer.byteLength(bytes!))), call(`read-${label}${suffix}`, 0n),
+      call(`fstatfs-${label}-after${suffix}`, 0n), call(`fstat-${label}-after${suffix}`, 0n), call(`close-${label}${suffix}`, 0n)]);
+    attributes[field!] = { status: "observed", reason: null, value: { bytes: Buffer.from(bytes!),
+      device: 7n, inode: 80n + BigInt(Object.keys(attributes).length), mode: 0o100444n, filesystemType: 0x62656572n }, calls };
+  }
+  device.binding.calls = [call("open-device-node-0", 4n), call("fstat-device-node-0-before", 0n), call("fstatfs-device-node-0-before", 0n),
+    call("readlink-device-node-0", BigInt(device.binding.value.resolved.length)), call("fstat-device-node-0-after", 0n),
+    call("fstatfs-device-node-0-after", 0n), call("readlink-device-node-0-after", BigInt(device.binding.value.resolved.length)), call("close-device-node-0", 0n)];
+  const prefix = [call("open-sysfs-root", 3n), call("fstat-sysfs-root", 0n), call("fstatfs-sysfs-root", 0n), ...device.binding.calls.slice(0, 4)];
+  const suffix = [...device.binding.calls.slice(4), call("close-sysfs-root", 0n)];
+  const phases = () => [0, 1].flatMap(phase => ["size", "readOnly", "diskSequence"].flatMap(field => {
+    const rows: SourceFileNativeCall[] = attributes[field].calls;
+    const split = rows.findIndex(row => row.operation === `open-${({ size: "block-size", readOnly: "block-ro", diskSequence: "block-diskseq" } as const)[field as "size"]}-after`);
+    return phase ? rows.slice(split) : rows.slice(0, split);
+  }));
+  return { attributes, source: original.metadata, device, ledger: () => [...prefix, ...phases(), ...suffix] };
+}
+
+test("#152 M04 three fixed raw readers decode exact two-phase samples without granting qualification", async () => {
+  await withNativeDecoders(decode => {
+    const value = blockReaderFixture(), ledger = decode.checkedAuxiliaryCalls(value.ledger(), true);
+    const result = decode.checkedBlockAttributes(value.attributes, value.source, value.device, ledger);
+    assert.equal(result.readerRevision, 1); assert.equal(result.sourceNodeIndex, 0);
+    assert.deepEqual(Object.keys(result), ["readerRevision", "sourceNodeIndex", "size", "readOnly", "diskSequence"]);
+    assert.equal(result.size.value.bytes.toString(), "18446744073709551615\n");
+    assert.equal(result.readOnly.value.bytes.toString(), "1\n"); assert.equal(result.diskSequence.value.bytes.toString(), "0\n");
+    assert.equal(new Set(["size", "readOnly", "diskSequence"].flatMap(field => result[field].calls.map((call: SourceFileNativeCall) => call.operation))).size, 42);
+    value.attributes.size.value.bytes.fill(0);
+    assert.equal(result.size.value.bytes.toString(), "18446744073709551615\n", "decoder buffers must detach from raw input");
+    assert.equal(Object.isFrozen(result), true); assert.equal(Object.hasOwn(result, "qualified"), false);
+  });
+});
+
+
+test("#152 M04 raw grammar, exact shapes and fixed field-phase projections reject ambiguous input", async () => {
+  await withNativeDecoders(decode => {
+    function run(value: ReturnType<typeof blockReaderFixture>, calls = value.ledger()) {
+      return decode.checkedBlockAttributes(value.attributes, value.source, value.device, decode.checkedAuxiliaryCalls(calls, true));
+    }
+    for (const field of ["size", "diskSequence", "readOnly"] as const) {
+      for (const bytes of field === "readOnly" ? ["0\n", "1\n"] : ["0\n", "1\n", "18446744073709551615\n"]) {
+        const value = blockReaderFixture(), fact = value.attributes[field];
+        fact.value.bytes = Buffer.from(bytes); fact.calls[3].rc = fact.calls[11].rc = BigInt(Buffer.byteLength(bytes));
+        assert.equal(run(value)[field].value.bytes.toString(), bytes);
+      }
+      for (const bytes of ["18446744073709551616\n", "00\n", "-1\n", "\n", "0\n\n", "1 \n", "\0\n", "\ufeff1\n", ...(field === "readOnly" ? ["2\n", "true\n"] : [])]) {
+        const value = blockReaderFixture(), fact = value.attributes[field];
+        fact.value.bytes = Buffer.from(bytes); fact.calls[3].rc = fact.calls[11].rc = BigInt(Buffer.byteLength(bytes));
+        assert.throws(() => run(value), { code: "backup_capability_unavailable" }, `${field}: ${JSON.stringify(bytes)}`);
+      }
+    }
+    let accessors = 0;
+    for (const mutation of ["revision", "node", "missing", "extra", "getter", "prototype", "sparse", "array-getter", "array-prototype",
+      "swap-facts", "missing-close", "missing-eof", "wrong-phase", "duplicate-read-placeholder", "wrong-reason", "ledger-different", "ledger-duplicate", "ledger-missing"]) {
+      const value = blockReaderFixture(); let calls: SourceFileNativeCall[] | undefined;
+      if (mutation === "revision") value.attributes.readerRevision = 2;
+      if (mutation === "node") value.attributes.sourceNodeIndex = 1;
+      if (mutation === "missing") delete value.attributes.size;
+      if (mutation === "extra") value.attributes.qualified = true;
+      if (mutation === "getter") Object.defineProperty(value.attributes, "size", { enumerable: true, get() { accessors++; throw Error("accessor executed"); } });
+      if (mutation === "prototype") Object.setPrototypeOf(value.attributes, { inherited: true });
+      if (mutation === "sparse") delete value.attributes.size.calls[3];
+      if (mutation === "array-getter") Object.defineProperty(value.attributes.size.calls, "3", { enumerable: true, get() { accessors++; throw Error("array accessor executed"); } });
+      if (mutation === "array-prototype") Object.setPrototypeOf(value.attributes.size.calls, Object.create(Array.prototype));
+      if (mutation === "swap-facts") [value.attributes.readOnly, value.attributes.diskSequence] = [value.attributes.diskSequence, value.attributes.readOnly];
+      if (mutation === "missing-close") value.attributes.size.calls.pop();
+      if (mutation === "missing-eof") value.attributes.size.calls.splice(12, 1);
+      if (mutation === "wrong-phase") value.attributes.size.calls[10].operation = "fstatfs-block-size-before";
+      if (mutation === "duplicate-read-placeholder") {
+        const fact = value.attributes.size; fact.status = "unavailable"; fact.reason = "binding"; fact.value = null;
+        fact.calls.forEach((call: any) => { call.rc = null; call.errno = null; });
+      }
+      if (mutation === "wrong-reason") { value.attributes.size.status = "unavailable"; value.attributes.size.reason = "unsupported"; value.attributes.size.value = null; }
+      if (mutation.startsWith("ledger-")) {
+        calls = value.ledger().map(call => ({ ...call })); const index = calls.findIndex(call => call.operation === "read-block-ro");
+        if (mutation === "ledger-different") calls[index] = { ...calls[index]!, rc: 1n };
+        if (mutation === "ledger-duplicate") calls.splice(index, 0, { ...calls[index]! });
+        if (mutation === "ledger-missing") calls.splice(index, 1);
+      }
+      // Shape/accessor rejection is checked before constructing any auxiliary
+      // projection from that untrusted shape, so this test cannot invoke it.
+      if (["missing", "getter", "sparse", "array-getter", "swap-facts"].includes(mutation)) calls = blockReaderFixture().ledger();
+      assert.throws(() => run(value, calls), { code: "backup_capability_unavailable" }, mutation);
+    }
+    assert.equal(accessors, 0);
+  });
+});
+
+test("#152 M04 source binding and original parent lifetime cannot be replaced by valid-looking raw facts", async () => {
+  await withNativeDecoders(decode => {
+    for (const mutation of ["source-dev", "major", "dev-text", "sysfs-device", "node-inode", "node-name", "node-resolved"]) {
+      const value = blockReaderFixture();
+      if (mutation === "source-dev") value.source.dev = 2050n;
+      if (mutation === "major") value.device.binding.value.sourceDevMajor = 9n;
+      if (mutation === "dev-text") value.device.dev.value.bytes = Buffer.from("8:2\n");
+      if (mutation === "sysfs-device") value.attributes.size.value.device = 8n;
+      if (mutation === "node-inode") value.device.topology.value.nodes[0].identity = { ...value.device.topology.value.nodes[0].identity, inode: 999n };
+      if (mutation === "node-name") value.device.topology.value.nodes[0].kernelName = Buffer.from("other");
+      if (mutation === "node-resolved") value.device.topology.value.nodes[0].resolved = Buffer.from("/sys/devices/other");
+      assert.throws(() => decode.checkedBlockAttributes(value.attributes, value.source, value.device,
+        decode.checkedAuxiliaryCalls(value.ledger(), true)), { code: "source_changed" }, mutation);
+    }
+    const local = blockReaderFixture(); local.device.topology = { status: "unavailable", reason: "enumeration", value: null, calls: [] };
+    assert.equal(decode.checkedBlockAttributes(local.attributes, local.source, local.device,
+      decode.checkedAuxiliaryCalls(local.ledger(), true)).size.status, "observed", "local raw observations do not claim complete topology");
+    for (const mutation of ["parent-closed", "anchor-closed", "same-fd-reopened-parent", "leaf-reuses-parent", "missing-close", "extra-byte-budget", "too-many-calls"]) {
+      const value = blockReaderFixture(), calls = value.ledger().map(call => ({ ...call }));
+      const begin = calls.findIndex(call => call.operation === "open-block-size");
+      if (mutation === "parent-closed" || mutation === "anchor-closed") {
+        const name = mutation === "parent-closed" ? "close-device-node-0" : "close-sysfs-root";
+        const [end] = calls.splice(calls.findIndex(call => call.operation === name), 1); calls.splice(begin, 0, end!);
+      }
+      if (mutation === "same-fd-reopened-parent") calls.splice(begin + 8, 0,
+        { operation: "close-device-node-0", rc: 0n, errno: 0n }, { operation: "open-device-node-0", rc: 4n, errno: 0n });
+      if (mutation === "leaf-reuses-parent") calls[begin]!.rc = 4n;
+      if (mutation === "missing-close") calls.splice(calls.findIndex(call => call.operation === "close-block-ro-after"), 1);
+      if (mutation === "extra-byte-budget") calls.find(call => call.operation === "read-block-diskseq-after")!.rc = 2097153n;
+      if (mutation === "too-many-calls") calls.push(...Array.from({ length: 32768 }, () => ({ operation: "open-block-size", rc: null, errno: null })));
+      assert.throws(() => decode.checkedAuxiliaryCalls(calls, true), { code: "backup_capability_unavailable" }, mutation);
+    }
+  });
+});
+
+test("#152 M04 stable unavailable diagnostics retain both actual errors and one shared read allowance", async () => {
+  await withNativeDecoders(decode => {
+    for (const errors of [[2n, 2n], [2n, 13n], [13n, 2n], [null, null]] as const) {
+      const value = blockReaderFixture(), fact = value.attributes.size;
+      fact.status = "unavailable"; fact.reason = errors[0] === null ? "binding" : "syscall"; fact.value = null;
+      fact.calls = ["", "-after"].flatMap((suffix, index) => ["open-block-size", "fstat-block-size-before", "fstatfs-block-size-before", "read-block-size", "fstatfs-block-size-after", "fstat-block-size-after", "close-block-size"]
+        .map((operation, i) => ({ operation: operation + suffix, rc: i === 0 && errors[index] !== null ? -1n : null, errno: i === 0 ? errors[index] : null })));
+      const result = decode.checkedBlockAttributes(value.attributes, value.source, value.device, decode.checkedAuxiliaryCalls(value.ledger(), true));
+      assert.equal(result.size.status, "unavailable"); assert.equal(result.size.value, null);
+      assert.deepEqual(result.size.calls.filter((call: SourceFileNativeCall) => call.operation.startsWith("open-")).map((call: SourceFileNativeCall) => call.errno), [...errors]);
+    }
+    const value = blockReaderFixture(), fact = value.attributes.size;
+    fact.status = "unavailable"; fact.reason = "budget"; fact.value = null;
+    for (const phase of [1, 0]) fact.calls.splice(phase * 8 + 3, 2,
+      ...Array.from({ length: 129 }, () => ({ operation: phase ? "read-block-size-after" : "read-block-size", rc: 1n, errno: 0n })));
+    assert.throws(() => decode.checkedBlockAttributes(value.attributes, value.source, value.device,
+      decode.checkedAuxiliaryCalls(value.ledger(), true)), { code: "backup_capability_unavailable" }, "the two phases cannot each claim a separate 256-read budget");
+  });
+});
+
+test("#152 M04 raw values and unknown reasons enter context binding without removing unproven obligations", async () => {
+  await withProfileParsers(parse => {
+    const fixture = profileParserFixture(); fixture.environment.device.blockAttributes = blockReaderFixture().attributes;
+    const initial = parse.analyzeEnvironment(fixture.context);
+    for (const mutation of ["raw", "status", "reason"]) {
+      const value = profileParserFixture(); value.environment.device.blockAttributes = blockReaderFixture().attributes;
+      if (mutation === "raw") value.environment.device.blockAttributes.readOnly.value.bytes = Buffer.from("0\n");
+      if (mutation !== "raw") value.environment.device.blockAttributes.size = { status: "unavailable", reason: mutation === "status" ? "binding" : "budget", value: null, calls: [] };
+      const changed = parse.analyzeEnvironment(value.context);
+      assert.notEqual(changed.contextBinding, initial.contextBinding); assert.notEqual(changed.windowBinding, initial.windowBinding);
+      assert.equal(changed.unresolved.length, 4); assert.ok(changed.unresolved.every(item => item.endsWith("UNPROVEN")));
+    }
+    fixture.environment.device.blockAttributes.size.calls[0].rc = 200n;
+    assert.equal(parse.analyzeEnvironment(fixture.context).contextBinding, initial.contextBinding, "call observations are not stable material");
+    assert.equal(Object.hasOwn(initial, "qualified"), false);
+  });
+});
+
 function enumerationFixture(): SourceFileNativeCall[] {
   const stage = (suffix: string) => ["holders", "slaves", "partitions"].flatMap(kind => [
     { operation: `open-${kind}-0${suffix}`, rc: 7n, errno: 0n },
@@ -378,7 +553,20 @@ type NativeBinding = {
 /** Test-only linkage uses an isolated package with byte-identical TS modules
  * and the normal fixed addon pathname. There is no production loader override,
  * registry replacement, caller proof or synthetic native owner. */
+const blockWrappers = ["fstatfs", "readlinkat", "read", "__read_chk", "close"];
 const fixedP3Variants = {
+  P3_TEST_BLOCK_READERS: { extra: [], wrappers: blockWrappers },
+  P3_TEST_BLOCK_INVALID_FORMAT: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: blockWrappers },
+  P3_TEST_BLOCK_BAD_CHANGE: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: blockWrappers },
+  P3_TEST_BLOCK_RAW_CHANGE: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: blockWrappers },
+  P3_TEST_BLOCK_IDENTITY_CHANGE: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: blockWrappers },
+  P3_TEST_BLOCK_ABSENT: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: blockWrappers },
+  P3_TEST_BLOCK_APPEAR: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: blockWrappers },
+  P3_TEST_BLOCK_DISAPPEAR: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: blockWrappers },
+  P3_TEST_BLOCK_BUDGET: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: blockWrappers },
+  P3_TEST_BLOCK_OVERSIZED: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: blockWrappers },
+  P3_TEST_BLOCK_CLOSE_FAILURE: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: blockWrappers },
+
   P3_TEST_CONTENT_OPEN_FAILURE: { extra: [], wrappers: [] },
   P3_TEST_CONTENT_CLOSE_FAILURE: { extra: [], wrappers: ["close"] },
   P3_TEST_SHORT_READS: { extra: [], wrappers: ["read", "__read_chk"] },
@@ -404,9 +592,26 @@ async function withFixedP3Package(
       await copyFile(path.join(root, "src/server/storage/maintenance", name), path.join(source, name));
     const addon = path.join(output, `maintenance-source-files-linux-${process.arch}.node`);
     const variant = fixedP3Variants[macro];
+    const blockRoot = path.join(directory, "m04-sysfs"), blockNode = path.join(blockRoot, "devices/m04-test-node");
+    const blockFixture = macro.startsWith("P3_TEST_BLOCK_");
+    if (blockFixture) {
+      await mkdir(path.join(blockNode, "holders"), { recursive: true }); await mkdir(path.join(blockNode, "slaves"));
+      await mkdir(path.join(blockRoot, "dev/block"), { recursive: true });
+      const { dev } = await stat(directory, { bigint: true });
+      const major = ((dev >> 8n) & 0xfffn) | ((dev >> 32n) & 0xfffff000n), minor = (dev & 0xffn) | ((dev >> 12n) & 0xffffff00n);
+      await symlink("../../devices/m04-test-node", path.join(blockRoot, `dev/block/${major}:${minor}`));
+      await writeFile(path.join(blockNode, "dev"), `${major}:${minor}\n`);
+      await writeFile(path.join(blockNode, "uevent"), "DEVNAME=m04-test-node\n");
+      const size = macro === "P3_TEST_BLOCK_BUDGET" ? "1".repeat(128) :
+        ["P3_TEST_BLOCK_INVALID_FORMAT", "P3_TEST_BLOCK_BAD_CHANGE"].includes(macro) ? "00\n" : "18446744073709551615\n";
+      await writeFile(path.join(blockNode, "size"), size); await writeFile(path.join(blockNode, "ro"), "1\n");
+      if (!["P3_TEST_BLOCK_ABSENT", "P3_TEST_BLOCK_APPEAR"].includes(macro))
+        await writeFile(path.join(blockNode, "diskseq"), macro === "P3_TEST_BLOCK_OVERSIZED" ? "1".repeat(4097) : "0\n");
+    }
     const build = spawnSync("/usr/bin/cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-DNAPI_VERSION=8",
       ...(compiler === "fortified" ? ["-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=3"] : []),
-      "-DNODE_GYP_MODULE_NAME=boardroom_source_file_fixed_p3", `-D${macro}`, ...variant.extra.map(name => `-D${name}`), "-shared", "-fPIC",
+      "-DNODE_GYP_MODULE_NAME=boardroom_source_file_fixed_p3", `-D${macro}`,
+      ...(blockFixture ? [`-DP3_TEST_BLOCK_ROOT=${JSON.stringify(blockRoot)}`] : []), ...variant.extra.map(name => `-D${name}`), "-shared", "-fPIC",
       "-I", path.join(root, "native/node-api/v24.22.1"), path.join(root, "native/maintenance-source-files.c"),
       path.join(root, "tests/fixtures/maintenance-source-file-getter-errors.c"), "-Wl,--wrap=ioctl", "-Wl,--wrap=syscall",
       ...variant.wrappers.map(name => `-Wl,--wrap=${name}`), "-o", addon], { encoding: "utf8", timeout: 30_000 });
@@ -417,9 +622,115 @@ async function withFixedP3Package(
     await consume({ directory, api, native });
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
+
+// All of these are explicitly synthetic sysfs observations over real owned
+// temporary files. They test the native reader lifecycle, never a source profile.
+for (const variant of ["P3_TEST_BLOCK_READERS", "P3_TEST_BLOCK_INVALID_FORMAT", "P3_TEST_BLOCK_ABSENT",
+  "P3_TEST_BLOCK_BUDGET", "P3_TEST_BLOCK_OVERSIZED"] as const) {
+  for (const compiler of variant === "P3_TEST_BLOCK_READERS" ? ["default", "fortified"] as const : ["default"] as const)
+  linuxTest(`#152 M04 fixed ${variant} keeps actual reads and closes in one bounded original node scope (${compiler})`, async () => {
+    await withFixedP3Package(variant, async ({ directory, api, native }) => {
+      const profile = await import(pathToFileURL(path.join(directory, "src/server/storage/maintenance/source-file-profile.ts")).href);
+      const source = path.join(directory, "source"); await mkdir(source, { mode: 0o700 });
+      await api.withNativeSourceRoot(source, handle => {
+        const raw = api.observeSourceFileRootContext(handle).environment, attrs = raw.device.blockAttributes;
+        assert.equal(raw.device.binding.status, "observed"); assert.equal(raw.device.topology.status, "observed");
+        assert.equal(attrs.readOnly.status, "observed");
+        if (variant === "P3_TEST_BLOCK_READERS") {
+          assert.equal(attrs.size.status, "observed"); assert.equal(attrs.diskSequence.status, "observed");
+          const reads = attrs.size.calls.filter(call => /^read-block-size(?:-after)?$/.test(call.operation));
+          assert.equal(reads.length, 44); assert.equal(reads.filter(call => call.rc === 0n).length, 2);
+          assert.ok(reads.every(call => call.rc === 0n || call.rc === 1n), "the wrapped real reads are short and both reach EOF");
+        } else if (variant === "P3_TEST_BLOCK_INVALID_FORMAT") {
+          assert.equal(attrs.size.status, "unavailable"); assert.equal(attrs.size.reason, "format"); assert.equal(attrs.size.value, null);
+          assert.ok(attrs.size.calls.every(call => call.rc !== null && call.rc >= 0n));
+        } else if (variant === "P3_TEST_BLOCK_ABSENT") {
+          assert.equal(attrs.diskSequence.status, "unavailable"); assert.equal(attrs.diskSequence.reason, "syscall");
+          assert.deepEqual(attrs.diskSequence.calls.filter(call => call.operation.startsWith("open-")).map(call => [call.rc, call.errno]),
+            [[-1n, BigInt(osConstants.errno.ENOENT)], [-1n, BigInt(osConstants.errno.ENOENT)]]);
+          assert.equal(attrs.diskSequence.calls.length, 14);
+        } else if (variant === "P3_TEST_BLOCK_BUDGET") {
+          assert.equal(attrs.size.status, "unavailable"); assert.equal(attrs.size.reason, "budget");
+          assert.equal(attrs.size.calls.filter(call => /^read-block-size(?:-after)?$/.test(call.operation) && call.rc !== null).length, 256);
+          assert.equal(attrs.size.calls.at(-1)!.rc, 0n);
+        } else {
+          assert.equal(attrs.diskSequence.status, "unavailable"); assert.equal(attrs.diskSequence.reason, "budget");
+          assert.equal(attrs.diskSequence.calls.filter(call => call.operation.startsWith("read-") && call.rc === 4097n).length, 2);
+          assert.equal(attrs.diskSequence.calls.at(-1)!.rc, 0n);
+        }
+        assert.equal(Object.hasOwn(raw, "qualified"), false);
+        assert.throws(() => profile.matchSourceFileProfile(handle), (error: any) => error.code === "backup_capability_unavailable" && error.message.includes("source-file-profile-unqualified"),
+        "observed ro=1 and stable diskseq cannot open the unchanged empty registry");
+        const before = raw.auxiliaryCalls.findIndex(call => call.operation === "open-device-node-0");
+        const after = raw.auxiliaryCalls.findIndex(call => call.operation === "close-device-node-0");
+        assert.ok(before >= 0 && after > before);
+        for (const [index, call] of raw.auxiliaryCalls.entries()) if (call.operation.includes("block-") && call.rc !== null)
+          assert.ok(index > before && index < after, call.operation);
+      });
+      const owner = native.openRoot(source);
+      try {
+        const first = native.observeEnvironment(owner) as SourceFileRootEnvironment;
+        assert.equal(first.abiVersion, 2);
+        if (variant === "P3_TEST_BLOCK_READERS") {
+          await writeFile(path.join(directory, "m04-sysfs/devices/m04-test-node/diskseq"), "1\n");
+          const second = native.observeEnvironment(owner) as SourceFileRootEnvironment;
+          assert.equal(first.device.blockAttributes.diskSequence.value?.bytes.toString(), "0\n");
+          assert.equal(second.device.blockAttributes.diskSequence.value?.bytes.toString(), "1\n",
+            "each actual call reopens and reads its original-node leaf; it cannot reuse an earlier window");
+        }
+      } finally { native.close(owner); }
+    }, compiler);
+  });
+}
+for (const variant of ["P3_TEST_BLOCK_RAW_CHANGE", "P3_TEST_BLOCK_BAD_CHANGE", "P3_TEST_BLOCK_IDENTITY_CHANGE", "P3_TEST_BLOCK_APPEAR", "P3_TEST_BLOCK_DISAPPEAR"] as const) {
+  linuxTest(`#152 M04 fixed ${variant} preserves observed change before stable-format or missing classification`, async () => {
+    await withFixedP3Package(variant, async ({ directory, api, native }) => {
+      const source = path.join(directory, "source"); await mkdir(source, { mode: 0o700 }); let first: any;
+      await assert.rejects(api.withNativeSourceRoot(source, handle => {
+        try { api.observeSourceFileRootContext(handle); assert.fail("fixed actual boundary change must reject"); }
+        catch (error) {
+          first = error; assert.equal(first.code, "ERR_SOURCE_IDENTITY"); assert.equal(first.syscall, "environment-changed");
+          assert.equal(first.errno, osConstants.errno.ESTALE);
+          assert.ok(first.cleanupCalls.some((call: SourceFileNativeCall) => call.operation === "close-block-diskseq-after"));
+        }
+        assert.throws(() => handle.observe(), { code: "maintenance_lost" });
+        assert.throws(() => native.rootInfo(first.nativeCleanupOwner));
+      }), error => error instanceof AggregateError && error.errors[0] === first && error.cause === first);
+    });
+  });
+}
+linuxTest("#152 M04 fixed leaf close failure preserves undefined primary and never recloses the reused integer", async () => {
+  await withFixedP3Package("P3_TEST_BLOCK_CLOSE_FAILURE", async ({ directory, api, native }) => {
+    const source = path.join(directory, "source"), sentinel = path.join(source, "sentinel");
+    await mkdir(source, { mode: 0o700 }); await writeFile(sentinel, "still owned", { mode: 0o600 });
+    let failure: any; const descriptors: number[] = [];
+    try {
+      await assert.rejects(api.withNativeSourceRoot(source, handle => {
+        try { api.observeSourceFileRootContext(handle); assert.fail("fixed actual close error must reject"); }
+        catch (error) {
+          failure = error; assert.equal(failure.code, "ERR_SOURCE_NATIVE_IO"); assert.equal(failure.errno, osConstants.errno.EIO);
+          assert.equal(failure.syscall, "environment-close");
+        }
+        const calls: SourceFileNativeCall[] = failure.cleanupCalls, unknown = calls.find(call => call.operation === "open-block-size")!.rc;
+        assert.ok(calls.some(call => call.operation === "close-block-size" && call.rc === -1n && call.errno === BigInt(osConstants.errno.EIO)));
+        assert.ok(calls.some(call => call.operation === "close-device-node-0" && call.rc === 0n));
+        for (let index = 0; index < 32; index++) {
+          const fd = openSync(sentinel, constants.O_RDONLY); descriptors.push(fd);
+          if (BigInt(fd) === unknown) break;
+        }
+        assert.ok(descriptors.some(fd => BigInt(fd) === unknown)); assert.throws(() => native.rootInfo(failure.nativeCleanupOwner));
+        assert.throws(() => handle.observe(), { code: "maintenance_lost" });
+        throw undefined;
+      }), error => error instanceof AggregateError && error.cause === undefined && error.errors[0] === undefined && error.errors.includes(failure));
+      for (const fd of descriptors) assert.equal(fstatSync(fd).size, 11);
+    } finally { for (const fd of descriptors) closeSync(fd); }
+  });
+});
+
 function rawContextFacts(raw: SourceFileRootEnvironment): SourceFileContextFact<unknown>[] {
   return [...Object.values(raw.process), ...Object.values(raw.kernel), ...Object.values(raw.mount), ...Object.values(raw.configuration),
-    ...Object.values(raw.device), raw.health.binding, ...raw.health.fields.map(field => field.fact)];
+    raw.device.binding, raw.device.dev, raw.device.uevent, raw.device.topology,
+    raw.device.blockAttributes.size, raw.device.blockAttributes.readOnly, raw.device.blockAttributes.diskSequence, raw.health.binding, ...raw.health.fields.map(field => field.fact)];
 }
 function rawKernelFacts(raw: SourceFileRootEnvironment): SourceFileContextFact<unknown>[] {
   const values = rawContextFacts(raw);
@@ -565,12 +876,57 @@ linuxTest("#152 P0 Linux source FD builds against fixed checked Node-API 8 heade
     assert.equal(typeof native[name], "function");
 });
 
+
+linuxTest("#152 M04 real source collector reports ABI 2 and two fresh fixed reader passes", async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "br-m04-real-source-"));
+  const native = createRequire(import.meta.url)(sourceFileNativePath) as NativeBinding;
+  const owner = native.openRoot(directory);
+  try {
+    const info = native.rootInfo(owner), first = native.observeEnvironment(owner) as SourceFileRootEnvironment;
+    assert.equal(info.abiVersion, 1); assert.equal(first.abiVersion, 2);
+    const second = native.observeEnvironment(owner) as SourceFileRootEnvironment;
+    for (const value of [first, second]) {
+      assert.equal(value.device.blockAttributes.readerRevision, 1); assert.equal(value.device.blockAttributes.sourceNodeIndex, 0);
+      for (const [field, label] of [["size", "block-size"], ["readOnly", "block-ro"], ["diskSequence", "block-diskseq"]] as const) {
+        const fact = value.device.blockAttributes[field];
+        assert.equal(fact.calls[0]!.operation, `open-${label}`);
+        assert.ok(fact.calls.some(call => call.operation === `open-${label}-after`));
+        assert.equal(fact.calls.at(-1)!.operation, `close-${label}-after`);
+        assert.ok(fact.reason !== "unsupported");
+        if (fact.calls.every(call => call.rc === null)) {
+          assert.equal(fact.status, "unavailable"); assert.equal(fact.calls.length, 14);
+          assert.ok(fact.calls.every(call => call.errno === null));
+          assert.ok(fact.reason === "binding" || fact.reason === "budget");
+        }
+        if (value.device.binding.status === "observed" && fact.reason !== "budget")
+          assert.notEqual(fact.calls[0]!.rc, null, "a real source node must trigger its fixed reader despite the empty registry");
+      }
+    }
+    assert.notEqual(first.device.blockAttributes, second.device.blockAttributes);
+    assert.notEqual(first.device.blockAttributes.size.calls, second.device.blockAttributes.size.calls);
+    await withNativeDecoders(decode => {
+      assert.equal(decode.checkedEnvironment(first, info).abiVersion, 2);
+      for (const mutate of [(value: any) => { value.abiVersion = 1; },
+        (value: any) => { delete value.device.blockAttributes; },
+        (value: any) => { value.device.blockAttributes.readerRevision = 2; },
+        (value: any) => { value.device.blockAttributes.sourceNodeIndex = 1; }]) {
+        const value = native.observeEnvironment(owner); mutate(value);
+        assert.throws(() => decode.checkedEnvironment(value, info), { code: "backup_capability_unavailable" });
+      }
+    });
+    t.diagnostic(first.device.blockAttributes.size.calls[0]!.rc !== null
+      ? "real source node0 reader acquisition OBSERVED; no qualification assertion"
+      : "real source node0 unavailable: fixed not-run records OBSERVED; actual leaf acquisition NOT_RUN");
+  } finally { native.close(owner); await rm(directory, { recursive: true, force: true }); }
+  assert.throws(() => native.observeEnvironment(owner), { code: "ERR_SOURCE_HANDLE" });
+});
+
 linuxTest("#152 P3 strict context consumes the real collector with complete typed unavailable facts", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "br-p3-real-context-"));
   try {
     await withNativeSourceRoot(tmp, handle => {
       const current = handle.observe(), context = observeSourceFileRootContext(handle), environment = context.environment;
-      assert.equal(context.info.abiVersion, 1); assert.equal(environment.abiVersion, 1);
+      assert.equal(context.info.abiVersion, 1); assert.equal(environment.abiVersion, 2);
       assert.equal(context.info.metadata.ino, current.ino); assert.equal(context.info.metadata.dev, current.dev);
       assert.deepEqual(environment.source.before, context.info.metadata);
       assert.deepEqual(environment.source.after, environment.source.before);
@@ -610,7 +966,7 @@ linuxTest("#152 P3 fixed content-open failure proves real file preflight rejects
     const bootstrap = native.openRoot(file);
     try {
       assert.equal(native.rootInfo(bootstrap).stage, "metadata-only");
-      assert.equal((native.observeEnvironment(bootstrap) as { abiVersion: number }).abiVersion, 1,
+      assert.equal((native.observeEnvironment(bootstrap) as { abiVersion: number }).abiVersion, 2,
         "fixed content fault does not intercept actual pseudo-file collection");
       assert.throws(() => native.openRootContent(bootstrap), (error: unknown) => {
         const failure = error as { code?: unknown; errno?: unknown; syscall?: unknown };

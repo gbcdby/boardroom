@@ -332,7 +332,7 @@ function analyzeEnvironment(context: SourceFileRootContext | SourceFileBootstrap
       superblockFlags: mount.superblockFlags, propagation: mount.propagation },
     unresolved: UNPROVEN };
   const contextMaterial = stableMaterial({ metadata, ordinary, mount, mountinfo, configuration,
-    device: observed(environment.device.binding), topology: observed(environment.device.topology),
+    device: observed(environment.device.binding), topology: observed(environment.device.topology), blockAttributes: environment.device.blockAttributes,
     health: observed(environment.health.binding), healthValues: health });
   const contextBinding = canonicalJson(typed(contextMaterial)), windowBinding = canonicalJson(typed({ contextMaterial, anchor }));
   return Object.freeze({ mount, health, configuration: typed(configuration), contextBinding, windowBinding, unresolved: UNPROVEN });
