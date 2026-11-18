@@ -85,7 +85,9 @@ async function projection(db: DbTransaction, engine: Engine, footprint: M2Rewrit
     const fields = relation.columns.flatMap((c, i) => engine === "sqlite"
       ? [`typeof(${quote(String(c.name))}) AS t${i}`, `CASE WHEN typeof(${quote(String(c.name))}) IN ('text','blob') THEN hex(${quote(String(c.name))}) ELSE ${quote(String(c.name))} END AS v${i}`]
       : [`pg_catalog.pg_typeof(${quote(String(c.name))})::pg_catalog.text AS t${i}`, `${quote(String(c.name))} AS v${i}`]);
-    values[relation.name] = await db.query(`SELECT ${engine === "sqlite" ? "rowid AS original_rowid," : ""}${fields.join(",")} FROM ${quote(footprint.namespace.name)}.${quote(relation.name)} ORDER BY 1`);
+    // reader 已核实五表首列分别为真实主键；PG 必须按主键值而非恒定的类型投影排序。
+    const orderBy = engine === "sqlite" ? "original_rowid" : quote(String(relation.columns[0]!.name));
+    values[relation.name] = await db.query(`SELECT ${engine === "sqlite" ? "rowid AS original_rowid," : ""}${fields.join(",")} FROM ${quote(footprint.namespace.name)}.${quote(relation.name)} ORDER BY ${orderBy}`);
   }
   for (const table of ["schema_migrations", "agent_runtimes", "projects", "groups", "agents", "members", "unrelated_domain"])
     values[table] = await db.query(`SELECT * FROM ${quote(footprint.namespace.name)}.${quote(table)} ORDER BY 1`);
