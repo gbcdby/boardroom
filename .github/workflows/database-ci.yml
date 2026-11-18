@@ -269,8 +269,9 @@ jobs:
           BOARDROOM_CI_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
         run: node scripts/ci/verify-pg-fixture.mjs
 
-      - name: 核对原生测试分片覆盖与聚合失败门
+      - name: 核对测试分片覆盖与聚合失败门
         run: |
+          node --test scripts/ci/test-linux-partition-plan.mjs
           python3 -B scripts/ci/test_linux_isolation.py WholeSuitePartitionContracts -v
           python3 -B scripts/ci/test_macos_partitions.py -v
 

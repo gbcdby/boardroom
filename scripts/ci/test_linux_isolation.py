@@ -164,6 +164,8 @@ class WholeSuiteBudgetContracts(unittest.TestCase):
 
 class WholeSuitePartitionContracts(unittest.TestCase):
     root = Path(ci.__file__).resolve().parents[2]
+    support_files = ('test-execution-reporter.mjs', 'test-process-observer.mjs', 'test-discovery.mjs',
+                     'linux-test-partitions.mjs', 'linux-test-weights.json', 'run-linux-partition.mjs')
 
     def workflow(self):
         # Read the actual workflow through the already locked Node YAML parser.
@@ -172,7 +174,7 @@ class WholeSuitePartitionContracts(unittest.TestCase):
                                 capture_output=True, text=True, timeout=10, check=True)
         return json.loads(result.stdout)
 
-    def test_all_native_partitions_cover_the_original_glob_once_and_keep_failure(self):
+    def test_all_balanced_partitions_cover_the_original_glob_once_and_keep_failure(self):
         import shlex
         import shutil
         package = json.loads((self.root / 'package.json').read_text())
@@ -190,7 +192,7 @@ class WholeSuitePartitionContracts(unittest.TestCase):
                 root.mkdir(parents=True)
                 observer = root / 'scripts/ci'
                 observer.mkdir(parents=True)
-                for filename in ('test-execution-reporter.mjs', 'test-process-observer.mjs', 'test-discovery.mjs'):
+                for filename in self.support_files:
                     shutil.copyfile(self.root / 'scripts/ci' / filename, observer / filename)
                 for i, name in enumerate(names):
                     file = root / name
@@ -204,7 +206,7 @@ class WholeSuitePartitionContracts(unittest.TestCase):
                         "await delay(60);"
                         + ("assert.fail('deliberate partition failure');" if i == 43 else "assert.ok(true);") + "});\n")
                 script = scripts[f'test:ci:linux:{index}of16']
-                self.assertEqual(script, f'node --test --test-concurrency=1 --test-shard={index}/16 "tests/**/*.test.ts"')
+                self.assertEqual(script, f'node scripts/ci/run-linux-partition.mjs {index}/16')
                 log = root / f'partition-{index}.txt'
                 intervals = root / f'partition-{index}-intervals.jsonl'
                 request = LauncherContracts().request('full-suite') | {'partition': f'{index}/16'}
@@ -242,7 +244,9 @@ class WholeSuitePartitionContracts(unittest.TestCase):
                 self.assertEqual(maximum, 1); self.assertEqual(active, set()); self.assertEqual(ended, set(entries))
                 if result.returncode:
                     self.assertIn('deliberate partition failure', result.stdout)
-                    self.assertEqual(index, 12)  # An actual two-digit partition must retain failure.
+                    self.assertIn(names[43], entries)
+                else:
+                    self.assertNotIn(names[43], entries)
                 selected.append(set(entries)); codes.append(result.returncode)
                 evidence = root / '.agent-output/linux-ci-isolation/full-suite'
                 discovery = json.loads((evidence / 'test-scheduler.json').read_text())
@@ -251,6 +255,8 @@ class WholeSuitePartitionContracts(unittest.TestCase):
                 self.assertEqual(discovery['configuredConcurrency'], 1)
                 self.assertEqual(discovery['result'], 'NOT_RUN')
                 self.assertEqual(discovery['entries'], sorted(names))
+                self.assertEqual(discovery['selectedEntries'], sorted(entries))
+                self.assertEqual(sorted(entry for shard in discovery['plan'] for entry in shard['entries']), sorted(names))
                 manifests = [json.loads(p.read_text()) for p in (evidence / 'test-entrypoints').glob('slot-*/entrypoints.json')]
                 self.assertEqual(len(manifests), 1)
                 self.assertEqual(manifests[0]['partition'], f'{index}/16')
@@ -264,7 +270,7 @@ class WholeSuitePartitionContracts(unittest.TestCase):
                 self.assertEqual(len(ready), len(entries))
                 process_exits = [event for event in observations if event['event'] == 'process-exit']
                 self.assertEqual(len(process_exits), len(entries))
-                self.assertEqual(any(event['code'] != 0 for event in process_exits), index == 12)
+                self.assertEqual(any(event['code'] != 0 for event in process_exits), names[43] in entries)
                 reporters = list((evidence / 'test-execution').glob('slot-*/runner-*.jsonl'))
                 self.assertEqual(len(reporters), 1)
                 reporter_events = [json.loads(line) for line in reporters[0].read_text().splitlines()]
@@ -278,7 +284,7 @@ class WholeSuitePartitionContracts(unittest.TestCase):
             for left in range(16):
                 for right in range(left + 1, 16):
                     self.assertFalse(selected[left] & selected[right])
-            print(json.dumps({'proof': 'actual-native-sixteen-partitions', 'files': len(names), 'receipts': receipts}))
+            print(json.dumps({'proof': 'actual-balanced-sixteen-partitions', 'files': len(names), 'receipts': receipts}))
 
     def test_fixed_partition_input_and_nested_node_scope(self):
         for index in range(1, 17):
@@ -334,7 +340,7 @@ class WholeSuitePartitionContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='boardroom-nested-partition-') as directory:
             stage = Path(directory); root = stage / ci.WORKSPACE
             observer = root / 'scripts/ci'; observer.mkdir(parents=True)
-            for filename in ('test-execution-reporter.mjs', 'test-process-observer.mjs'):
+            for filename in self.support_files:
                 shutil.copyfile(self.root / 'scripts/ci' / filename, observer / filename)
             (root / 'tests').mkdir(); (root / 'nested').mkdir()
             for name in ('a', 'b'):
@@ -350,10 +356,48 @@ class WholeSuitePartitionContracts(unittest.TestCase):
             env = dict(os.environ, **ci.child_environment(request, stage), BOARDROOM_NESTED_PROBE=str(root / 'nested.txt'))
             # Keep the actual local Node binary while exercising the original child context values.
             env['PATH'] = os.environ['PATH']
+            subprocess.run(['node', str(observer / 'test-discovery.mjs')], cwd=root, env=env,
+                           capture_output=True, text=True, timeout=10, check=True)
             result = subprocess.run(shlex.split(scripts['test:ci:linux:1of16']), cwd=root, env=env,
                                     capture_output=True, text=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(sorted((root / 'nested.txt').read_text().splitlines()), ['a', 'b'])
+
+    def test_partition_runner_rejects_missing_changed_or_empty_selection_without_running_tests(self):
+        import shutil
+        with tempfile.TemporaryDirectory(prefix='boardroom-partition-rejection-') as directory:
+            for scenario in ('missing', 'added-file', 'omitted-file', 'weights', 'candidate', 'partition', 'empty'):
+                with self.subTest(scenario=scenario):
+                    root = Path(directory) / scenario
+                    support = root / 'scripts/ci'; support.mkdir(parents=True)
+                    for filename in self.support_files:
+                        shutil.copyfile(self.root / 'scripts/ci' / filename, support / filename)
+                    (root / 'tests').mkdir()
+                    marker = root / 'executed.txt'
+                    fixture = "import {writeFileSync} from 'node:fs';writeFileSync('executed.txt','ran');"
+                    (root / 'tests/one.test.ts').write_text(fixture)
+                    partition = '2/16' if scenario == 'empty' else '1/16'
+                    env = dict(os.environ, GITHUB_SHA='a' * 40, BOARDROOM_CI_TEST_PARTITION=partition)
+                    if scenario != 'missing':
+                        subprocess.run(['node', 'scripts/ci/test-discovery.mjs'], cwd=root, env=env,
+                                       capture_output=True, text=True, timeout=10, check=True)
+                    record = root / '.agent-output/linux-ci-isolation/full-suite/test-scheduler.json'
+                    if scenario == 'added-file':
+                        (root / 'tests/new.test.ts').write_text(fixture)
+                    elif scenario in ('omitted-file', 'candidate'):
+                        value = json.loads(record.read_text())
+                        value['selectedEntries' if scenario == 'omitted-file' else 'candidate'] = [] if scenario == 'omitted-file' else 'b' * 40
+                        record.write_text(json.dumps(value))
+                    elif scenario == 'weights':
+                        value = json.loads((support / 'linux-test-weights.json').read_text())
+                        value['durationMs']['tests/one.test.ts'] = 2
+                        (support / 'linux-test-weights.json').write_text(json.dumps(value))
+                    elif scenario == 'partition':
+                        env['BOARDROOM_CI_TEST_PARTITION'] = '2/16'
+                    result = subprocess.run(['node', 'scripts/ci/run-linux-partition.mjs', partition], cwd=root, env=env,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(marker.exists(), 'invalid selection must fail before Node runs tests')
 
     def test_hosted_frontend_accepts_only_the_actual_partition_job(self):
         workflow = self.workflow()
