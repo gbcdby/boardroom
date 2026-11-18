@@ -151,6 +151,18 @@ class LoadDiagnostics {
   }
 }
 
+/** No MockTracker: its per-call history would retain SQL parameters/results. */
+function installLoadQueryDiagnostics(diagnostics: LoadDiagnostics): () => void {
+  const original = Object.getOwnPropertyDescriptor(PgClient.prototype, 'query');
+  assert.ok(original && typeof original.value === 'function', 'pg query must be an own data method');
+  const installed = { ...original, value: diagnostics.wrapQuery(original.value as typeof PgClient.prototype.query) };
+  Object.defineProperty(PgClient.prototype, 'query', installed);
+  return () => {
+    assert.deepEqual(Object.getOwnPropertyDescriptor(PgClient.prototype, 'query'), installed, 'pg query diagnostics installation owner changed');
+    Object.defineProperty(PgClient.prototype, 'query', original);
+  };
+}
+
 class MeasuredBudget extends CaptureBudget {
   readonly statements: string[] = [];
   readonly invokedAt = performance.now();
@@ -252,7 +264,9 @@ for (const engine of ['sqlite', 'postgres'] as const) {
   test(`${engine} ${profile} S5-AUDIT-16 固定 V1 与 10000 历史负载，每次补偿及真实 MCP 投递独立验限`,
     { skip: engine === 'postgres' ? pgUnavailable : false, timeout: 120000 }, async t => {
       const diagnostics = engine === 'postgres' ? new LoadDiagnostics() : undefined;
-      if (diagnostics) t.mock.method(PgClient.prototype, 'query', diagnostics.wrapQuery(PgClient.prototype.query));
+      // after runs even if the body/report fails, preserving the original body
+      // error when restoration also fails. There is only one hook per test.
+      if (diagnostics) t.after(installLoadQueryDiagnostics(diagnostics));
       const report = { schemaVersion: 1, engine, profile, node: process.version, platform: process.platform, transport: 'MCP SDK InMemoryTransport',
         limits: { mutationMs: 500, deliveryAndAckMs: 2000 }, status: 'RUNNING', error: null as string | null,
         fixture: { agents: 3, projects: 5, groupsPerProject: 5, membersPerGroup: 3, messageBodiesAreFixtureData: true },
