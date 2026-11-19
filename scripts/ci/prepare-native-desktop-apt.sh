@@ -14,7 +14,7 @@ packages=(openbox=3.6.1-12build5 x11-utils=7.7+6build2)
 acquire_options=(-o Acquire::Retries=2 -o Acquire::https::Timeout=15)
 
 run_stage() {
-  local stage=$1 deadline=$2 started finished command_exit log_exit effective_exit
+  local stage=$1 deadline=$2 started finished command_exit log_exit effective_exit evidence_exit=0
   local -a statuses
   shift 2
   started=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
@@ -33,10 +33,19 @@ run_stage() {
   log_exit=${statuses[1]}
   effective_exit=$command_exit
   if [ "$effective_exit" -eq 0 ]; then effective_exit=$log_exit; fi
-  finished=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-  printf '{"stage":"%s","startedAt":"%s","finishedAt":"%s","acquisitionDeadlineSeconds":%s,"commandExit":%s,"logExit":%s,"exit":%s}\n' \
-    "$stage" "$started" "$finished" "$deadline" "$command_exit" "$log_exit" "$effective_exit" \
-    > "$evidence_directory/apt-$stage.result.json"
+  # Post-command evidence errors must not let errexit replace the primary exit.
+  if finished=$(date -u +'%Y-%m-%dT%H:%M:%SZ'); then
+    if printf '{"stage":"%s","startedAt":"%s","finishedAt":"%s","acquisitionDeadlineSeconds":%s,"commandExit":%s,"logExit":%s,"exit":%s}\n' \
+      "$stage" "$started" "$finished" "$deadline" "$command_exit" "$log_exit" "$effective_exit" \
+      > "$evidence_directory/apt-$stage.result.json"; then
+      :
+    else evidence_exit=$?; fi
+  else evidence_exit=$?; fi
+  if [ "$evidence_exit" -ne 0 ]; then
+    # If stderr is also unavailable, the evidence failure remains a failing exit.
+    printf 'APT %s result evidence could not be persisted (exit %s)\n' "$stage" "$evidence_exit" >&2 || :
+    if [ "$effective_exit" -eq 0 ]; then effective_exit=$evidence_exit; fi
+  fi
   return "$effective_exit"
 }
 
