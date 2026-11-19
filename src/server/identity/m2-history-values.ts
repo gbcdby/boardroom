@@ -1,16 +1,17 @@
 import { createHash } from "node:crypto";
 import { M2_FORMAT_REGISTRATION } from "./m2-value-contracts.ts";
 import { M2_HISTORY_LIMITS, M2_HISTORY_REMAINING, M2_HISTORY_TABLES } from "./m2-history-contracts.ts";
+import { markUnknownHistoryFailure } from "./internal/m2-history-failure-identity.ts";
 import type { ComparisonObservation, HistoryColumn, HistoryErrorCode, HistoryObservation, HistoryObservationInput,
   HistoryRemaining, HistoryResult, RawCell, RawRow, RawTable } from "./m2-history-contracts.ts";
 
 // Stage1a is a total, primitive-string-only value boundary. No native/semantic closure is issued.
-class InvalidHistory {
-  code: HistoryErrorCode;
-  path: string[];
-  constructor(code: HistoryErrorCode, path: string[] = []) { this.code = code; this.path = path; }
+const knownFailures = new WeakMap<object, { code: HistoryErrorCode; path: string[] }>();
+function fail(code: HistoryErrorCode, path: string[] = []): never {
+  const token = {};
+  knownFailures.set(token, { code, path });
+  throw token;
 }
-function fail(code: HistoryErrorCode, path: string[] = []): never { throw new InvalidHistory(code, path); }
 function requireValue(ok: unknown, path: string[] = [], code: HistoryErrorCode = "invalid_value"): asserts ok {
   if (!ok) fail(code, path);
 }
@@ -23,8 +24,10 @@ function total<T>(input: unknown, work: (value: unknown) => T): HistoryResult<T>
     const value = read(input);
     return freeze({ ok: true, value: work(value) }) as HistoryResult<T>;
   } catch (error) {
-    const known = error instanceof InvalidHistory;
-    return freeze({ ok: false, error: { code: known ? error.code : "invalid_value", path: known ? error.path : [] } }) as HistoryResult<T>;
+    // Identity lookup never invokes an unknown Proxy's prototype or property traps.
+    const known = typeof error === "object" && error !== null ? knownFailures.get(error) : undefined;
+    const result = freeze({ ok: false, error: { code: known?.code ?? "invalid_value", path: known?.path ?? [] } }) as HistoryResult<T>;
+    return known ? result : markUnknownHistoryFailure(result);
   }
 }
 function codepointOrder(a: string, b: string): number {
@@ -37,10 +40,25 @@ function codepointOrder(a: string, b: string): number {
   return a.length - b.length;
 }
 function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  if (value !== null && typeof value === "object") return `{${Object.keys(value).sort(codepointOrder)
-    .map(k => `${JSON.stringify(k)}:${canonical((value as Record<string, unknown>)[k])}`).join(",")}}`;
-  return JSON.stringify(value);
+  // Keep the same scalar spelling and codepoint key order, but copy nested raw cells only
+  // once at the final join instead of rebuilding their full text at every ancestor.
+  const pieces: string[] = [];
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      pieces.push("[");
+      node.forEach((child, index) => { if (index) pieces.push(","); visit(child); });
+      pieces.push("]");
+    } else if (node !== null && typeof node === "object") {
+      pieces.push("{");
+      Object.keys(node).sort(codepointOrder).forEach((key, index) => {
+        if (index) pieces.push(",");
+        pieces.push(JSON.stringify(key), ":"); visit((node as Record<string, unknown>)[key]);
+      });
+      pieces.push("}");
+    } else pieces.push(JSON.stringify(node));
+  };
+  visit(value);
+  return pieces.join("");
 }
 function wellFormed(text: string): boolean {
   for (let i = 0; i < text.length; i++) {
