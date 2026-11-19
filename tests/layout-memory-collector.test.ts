@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -236,7 +236,15 @@ for (const engine of ["sqlite", "postgres"] as const) {
   });
 }
 
+function useMonotonicTestEpoch(t: TestContext) {
+  // Historical request timestamps must be nonnegative even on a young clock.
+  // Only the origin changes; both deadline probes still use real elapsed time.
+  const readNs = process.hrtime.bigint, origin = readNs();
+  t.mock.method(process.hrtime, "bigint", () => 300_000_000_000n + readNs() - origin);
+}
+
 test("CS02/12/13/17 strict request and manifest guards run before SQL", async t => {
+  useMonotonicTestEpoch(t);
   const f = await identityFixture();
   try { await native(f, async (_v, m) => { let calls = 0; const noRead = snapshot(async () => { calls++; throw new Error("must not read"); });
     const rebuilt = (tables = m.tables) => buildDatabaseManifests("sqlite", m.schema, tables, m.controlRows);
@@ -516,7 +524,8 @@ test("CS17/18 isolated legacy consumer windows reject inherited hooks", async ()
   process.stdout.write("collector_legacy_boundary_pass\n");
 });
 
-test("CS15 one pending real query settles after deadline; native rejection retains precedence", async () => {
+test("CS15 one pending real query settles after deadline; native rejection retains precedence", async t => {
+  useMonotonicTestEpoch(t);
   const f = await identityFixture();
   try { await native(f, async (view, m) => { for (const reject of [false, true]) { const d = envelope(m); d.request.invocationStartedAtNs = (process.hrtime.bigint() - 118_000_000_000n).toString();
     let calls = 0, active = false, settled = false;
