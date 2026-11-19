@@ -174,6 +174,61 @@ test("non-string inputs and unknown thrown proxies are not inspected", t => {
   assert.equal(Object.hasOwn(result.error, "cause"), false);
 });
 
+test("unknown failures inside the real old consumer keep their identity without reflecting the thrown value", t => {
+  for (const call of [parseM2HistoryCarrier, compareM2HistoryCarrier]) {
+    let prototypeTraps = 0, propertyTraps = 0;
+    const proxy = new Proxy({}, {
+      getPrototypeOf() { prototypeTraps++; return null; },
+      get() { propertyTraps++; throw new Error("private exception property"); },
+      ownKeys() { propertyTraps++; throw new Error("private exception keys"); },
+    });
+    for (const thrown of [proxy, Symbol("private downstream exception")]) {
+      const original = Buffer.byteLength;
+      let calls = 0;
+      const mock = t.mock.method(Buffer, "byteLength", (...args: Parameters<typeof Buffer.byteLength>) => {
+        // Outer scan and carrier length are the first two calls; the third is the real consumer's read.
+        if (++calls === 3) throw thrown;
+        return original(...args);
+      });
+      let result;
+      try { result = call("{}"); } finally { mock.mock.restore(); }
+      assert.equal(calls, 3);
+      assert.equal(prototypeTraps, 0);
+      assert.equal(propertyTraps, 0);
+      assert.equal(result.ok, false);
+      if (result.ok) throw new Error("expected downstream unknown failure");
+      assert.equal(result.error.code, "invalid_value");
+      assert.equal(result.error.rule, null);
+      assert.equal(result.error.location, null);
+      assert.deepEqual(result.error.conflicts, []);
+      assert.ok(Object.isFrozen(result.error));
+    }
+    // An ordinary known root-shape failure still gets its known rule/location on a later request.
+    const known = call("{}");
+    assert.equal(known.ok, false);
+    if (known.ok) throw new Error("expected known root-shape failure");
+    assert.equal(known.error.code, "invalid_value");
+    assert.equal(known.error.rule, "PC1B-RAW01");
+    assert.equal(known.error.location?.pathId, "input.root");
+  }
+});
+
+test("original public parser and comparison retain their exact unknown-failure DTO", t => {
+  for (const call of [parseM2HistoryObservation, compareM2HistoryPreservation]) {
+    let prototypeTraps = 0;
+    const proxy = new Proxy({}, { getPrototypeOf() { prototypeTraps++; return null; } });
+    const mock = t.mock.method(Buffer, "byteLength", () => { throw proxy; });
+    let result;
+    try { result = call("{}"); } finally { mock.mock.restore(); }
+    assert.equal(prototypeTraps, 0);
+    assert.deepEqual(result, { ok: false, error: { code: "invalid_value", path: [] } });
+    assert.deepEqual(Reflect.ownKeys(result), ["ok", "error"]);
+    if (result.ok) throw new Error("expected original total failure");
+    assert.deepEqual(Reflect.ownKeys(result.error), ["code", "path"]);
+    assert.ok(Object.isFrozen(result.error.path));
+  }
+});
+
 test("input/depth/node and actual returned-value limits remain explicit resource failures", () => {
   for (const input of [" ".repeat(16 * 1024 * 1024 + 1), "[".repeat(65) + "0" + "]".repeat(65),
     "[" + Array(250_001).fill("null").join(",") + "]"]) {
@@ -203,6 +258,40 @@ test("one request shares both comparison sides and the downstream sorting/encodi
   if (result.ok) throw new Error("expected cumulative resource limit");
   assert.equal(result.error.code, "resource_limit");
   assert.equal(result.error.conflicts[0]!.condition, "budget-exceeded");
+});
+
+test("nested canonical joins, metadata comparisons and final hashes share the same character budget", () => {
+  const observation = fixture("sqlite", "p1");
+  for (const table of observation.tables) if (table.name !== "config_authority") {
+    table.rows = []; table.count = "0";
+  }
+  observation.catalog = { ...observation.catalog, ref: "x".repeat(2_300_000) };
+  const oversized = comparison(observation, observation);
+  // This is a valid Stage1a value; its repeated encoding/compare/hash work exceeds C1's one budget.
+  assert.equal(compareM2HistoryPreservation(canonical(oversized)).ok, true);
+  const result = compareM2HistoryCarrier(JSON.stringify(oversized));
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error("expected cumulative downstream character limit");
+  assert.equal(result.error.code, "resource_limit");
+  observation.catalog = { ...observation.catalog, ref: "x".repeat(50_000) };
+  const bounded = comparison(observation, observation);
+  const expected = compareM2HistoryPreservation(canonical(bounded));
+  assert.equal(expected.ok, true);
+  assert.deepEqual(compareM2HistoryCarrier(JSON.stringify(bounded)), expected);
+});
+
+test("deep raw TEXT and Unicode references compare without repeatedly copying ancestor encodings", () => {
+  const observation = fixture("sqlite", "p1"), table = observation.tables.find(t => t.name === "agents")!;
+  table.rows[0]!.cells[1] = ["text", "20".repeat(300_000)];
+  observation.catalog = { ...observation.catalog, ref: '目录😀\u0001 \\ " \u2028' };
+  observation.physicalSourceRef = { ...observation.physicalSourceRef, artifactId: "源𐀀\ufeff𝄞" };
+  const input = comparison(observation, observation);
+  const expected = compareM2HistoryPreservation(canonical(input));
+  assert.equal(expected.ok, true);
+  if (!expected.ok) throw new Error("expected original typed comparison");
+  // Frozen before the flat-encoder change, with the original recursive consumer.
+  assert.equal(expected.value.beforeValueDigest, "e8af97dd22bb9f3f7e5dae451e3acee82742d9584c7a0c208abdf23e04b075c7");
+  assert.deepEqual(compareM2HistoryCarrier(JSON.stringify(input, null, 2)), expected);
 });
 
 test("owner errors use fixed catalog locations and original row/one-based column ordinals", () => {
