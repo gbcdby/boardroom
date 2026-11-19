@@ -44,7 +44,7 @@ test("自动补偿串行并合并同绑定待办，关闭等待真实在途结�
   assert.equal(closed, true);
 });
 
-test("DbDriver 共用真实只读 reader，拒绝重复装配，关闭后不再暴露私有记忆", async () => {
+test("DbDriver 共用真实只读 reader，拒绝重复装配，关闭后不再暴露私有记忆", { timeout: 10_000 }, async t => {
   const dir = await mkdtemp(path.join(tmpdir(), "boardroom-memory-runtime-"));
   const db = createDbDriver({ dataDir: dir });
   try {
@@ -61,11 +61,29 @@ test("DbDriver 共用真实只读 reader，拒绝重复装配，关闭后不再�
     assert.equal(first.reader, second.reader);
     assert.throws(() => registerMemoryRuntime(db, { database: { kind: "sqlite", sqlitePath: "/different-untrusted-path" } }), /already_configured/);
     const input = { memberId: member.id, projectId: project.id, membershipRevision: member.membershipRevision, bindingGeneration: "trusted-binding" };
-    const result = await second.reader.readOwn(input);
-    assert.equal(result.state, "available", JSON.stringify(result.errors));
-    assert.equal(result.entries[0]?.markdown, "仅属于这个 Agent");
+    // 此处验装配与真实读取；500/1000ms、熔断及迟到回复由 memory-reader.test.ts 使用真实时钟验。
+    // 仅冻结本次读取的父进程 timer，避免功能断言依赖 CI 冷启动速度；IPC 与子进程仍真实运行。
+    const schedule = globalThis.setTimeout, cancel = globalThis.clearTimeout;
+    let guard: ReturnType<typeof setTimeout> | undefined;
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      const result = await Promise.race([
+        second.reader.readOwn(input),
+        new Promise<never>((_resolve, reject) => {
+          guard = schedule(() => reject(new Error("真实只读 reader 在功能测试 5 秒真实等待上限内未返回")), 5000);
+        }),
+      ]);
+      assert.equal(result.state, "available", JSON.stringify(result.errors));
+      assert.equal(result.entries[0]?.markdown, "仅属于这个 Agent");
+    } finally {
+      if (guard) cancel(guard);
+      // 无论读取成功、报错或触及真实上限，关闭阶段都恢复生产的真实终止保护。
+      t.mock.timers.reset();
+    }
     await closeMemoryRuntime(db);
-    assert.equal((await first.reader.readOwn(input)).state, "unavailable");
+    const closed = await first.reader.readOwn(input);
+    assert.equal(closed.state, "unavailable");
+    assert.deepEqual(closed.entries, []);
     assert.deepEqual((await getMemoryRuntime(db).reader.readOwn(input)).entries, []);
     await closeMemoryRuntime(db);
   } finally { await closeMemoryRuntime(db); await db.close(); await rm(dir, { recursive: true, force: true }); }
