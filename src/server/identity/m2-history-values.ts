@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { M2_FORMAT_REGISTRATION } from "./m2-value-contracts.ts";
 import { M2_HISTORY_LIMITS, M2_HISTORY_REMAINING, M2_HISTORY_TABLES } from "./m2-history-contracts.ts";
 import { markUnknownHistoryFailure } from "./internal/m2-history-failure-identity.ts";
+import { sortHistoryFrames } from "./internal/m2-history-sort.ts";
 import type { ComparisonObservation, HistoryColumn, HistoryErrorCode, HistoryObservation, HistoryObservationInput,
   HistoryRemaining, HistoryResult, RawCell, RawRow, RawTable } from "./m2-history-contracts.ts";
 
@@ -195,7 +196,7 @@ const hash = (text: string) => createHash("sha256").update(text, "utf8").digest(
 const frame = (row: RawRow) => canonical([row.rowid, row.cells]);
 function frames(rows: RawRow[]): string[] {
   // The closed cell/rowid grammar is entirely ASCII: lexical string order is byte order.
-  return rows.map(frame).sort();
+  return sortHistoryFrames(rows.map(frame));
 }
 function remaining(backend: string): HistoryRemaining {
   return M2_HISTORY_REMAINING.map(check => ({ check, status: check === "sequence_exclusion" && backend === "sqlite" ? "not-applicable" : "unproven" }));

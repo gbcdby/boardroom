@@ -1220,8 +1220,16 @@ export function createMcpCore(options: McpCoreOptions): McpCore {
 
     async sendMessage(sessionId, params) {
       const binding = bindingFor(sessionId);
-      await withAccess(binding, "write", async () => {});
-      await (touchSession(binding.mcpSessionId));
+      await withAccess(binding, "write", async () => {
+        // 首次硬授权与紧接的心跳共用一次提交；整个心跳用保存点隔离 SQL 失败。
+        // 外层授权与 COMMIT 仍是硬错误，不能被 best-effort 心跳吞掉。
+        try {
+          await repos.transaction(() => withAccess(binding, "observe", () =>
+            repos.mcpSessions.heartbeat(binding.mcpSessionId, now().toISOString())));
+        } catch (error) {
+          log.warn("mcp_session_heartbeat_failed", { error, mcpSessionId: binding.mcpSessionId });
+        }
+      });
       const text = params.text;
       if (typeof text !== "string" || text.trim().length === 0) {
         throw invalidArgument("text 必填且不能为空");

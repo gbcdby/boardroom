@@ -1,4 +1,5 @@
 import { parseM2HistoryObservation, compareM2HistoryPreservation } from "../m2-history-values.ts";
+import { historyFrameSortCost } from "./m2-history-sort.ts";
 import { M2_HISTORY_LIMITS, M2_HISTORY_TABLES } from "../m2-history-contracts.ts";
 import type { ComparisonObservation, HistoryErrorCode, HistoryObservation, HistoryResult } from "../m2-history-contracts.ts";
 import type { ReadonlyDeep } from "../m2-value-contracts.ts";
@@ -40,6 +41,17 @@ const LIMITS = Object.freeze({ characters: 64 * 1024 * 1024, work: 4_000_000, ro
 // characters counts scalar stringify and key sorting. A complete canonical call adds one
 // read/write of its final flat join; ancestor arrays/objects do not recopy their children.
 type EncodingCost = { bytes: number; characters: number; work: number };
+// Private metering seam for the complete P0 request. Original wrappers still construct
+// their own Request; a composing caller supplies the one enclosing request's counters.
+export type HistoryCarrierEncodingCost = EncodingCost;
+export interface HistoryCarrierAccounting {
+  nodes: number;
+  rows: number;
+  readonly encodings: WeakMap<object, EncodingCost>;
+  units(count: number): void;
+  text(bytes: number, passes?: number): void;
+  fail(code?: CarrierCode): never;
+}
 const scalarEncoding = (bytes: number): EncodingCost => ({ bytes, characters: bytes * 2, work: 1 });
 function arrayEncoding(children: readonly EncodingCost[]): EncodingCost {
   const bytes = 2 + Math.max(0, children.length - 1) + children.reduce((sum, child) => sum + child.bytes, 0);
@@ -71,7 +83,7 @@ class Request {
     this.units(passes * Math.ceil(bytes / 64));
   }
 }
-function quotedBytes(text: string, request: Request): number {
+function quotedBytes(text: string, request: HistoryCarrierAccounting): number {
   let bytes = 2;
   for (let i = 0; i < text.length; i++) {
     // Bound the estimator's own scan before reading each chunk. One UTF-16 unit needs at
@@ -88,7 +100,7 @@ function quotedBytes(text: string, request: Request): number {
   }
   return bytes;
 }
-function canonical(value: unknown, request: Request): string {
+function canonical(value: unknown, request: HistoryCarrierAccounting): string {
   const pieces: string[] = [];
   let bytes = 0;
   const append = (piece: string, size = piece.length) => {
@@ -247,7 +259,7 @@ function readOuter(input: string, request: Request): unknown {
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
-function reserveConsumer(parsed: unknown, carrierBytes: number, comparison: boolean, request: Request): void {
+function reserveConsumer(parsed: unknown, carrierBytes: number, comparison: boolean, request: HistoryCarrierAccounting, boundedSort = false): void {
   // Reserve the real old consumer's work before calling it. These are encoding costs, not
   // validation results: the original parser/comparator remains the sole typed-row authority.
   const nodes = request.nodes;
@@ -332,11 +344,19 @@ function reserveConsumer(parsed: unknown, carrierBytes: number, comparison: bool
           request.text(key.bytes, 3);
         }
       }
-      // Conservative quadratic bound for the uninstrumented legacy string sort. All table/group
-      // sorts of a side fit this bound; two comparison sides debit the same request.
-      const comparisons = rows.length * rows.length;
-      request.units(comparisons);
-      request.text(2 * maxFrameBytes, comparisons);
+      // The actual row-frame consumer uses bounded merge sort. Disjoint audit groups fit
+      // the whole table's n*ceil(log2(n)) bound. Reserve both reference arrays and all moves
+      // before the consumer allocates/sorts; comparison sides still debit one request.
+      const sorting = historyFrameSortCost(rows.length);
+      if (boundedSort) {
+        request.units(sorting.comparisons + sorting.moves + sorting.slots);
+        request.text(2 * maxFrameBytes, sorting.comparisons);
+      } else {
+        // Preserve the public C1 carrier's existing conservative admission/error boundary.
+        // Its earlier per-node reserve also covers the bounded sort's reference allocation.
+        request.units(rows.length * rows.length);
+        request.text(2 * maxFrameBytes, rows.length * rows.length);
+      }
       if (comparison) request.text(allFrameBytes); // equalRows string equality, this side.
       else {
         const digest = arrayCost([encoding("m2-pc-table-rows/r1"), encoding(observation?.backend), encoding(table?.name),
@@ -419,4 +439,10 @@ export function parseM2HistoryCarrier(input: unknown): CarrierResult<HistoryObse
 }
 export function compareM2HistoryCarrier(input: unknown): CarrierResult<ComparisonObservation> {
   return consume(input, true, compareM2HistoryPreservation);
+}
+export function encodeHistoryCarrierValue(parsed: unknown, request: HistoryCarrierAccounting): string {
+  return canonical(parsed, request);
+}
+export function reserveHistoryObservationConsumer(parsed: unknown, carrierBytes: number, request: HistoryCarrierAccounting): void {
+  reserveConsumer(parsed, carrierBytes, false, request, true);
 }
