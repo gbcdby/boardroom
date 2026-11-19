@@ -11,6 +11,10 @@ type ErrorCode = "invalid_value" | "unsupported_shape" | "value_conflict" | "inc
 const errorCodes: readonly ErrorCode[] = ["invalid_value", "unsupported_shape", "value_conflict", "incomplete_inventory",
   "inventory_integrity", "budget_exceeded"];
 const failureCodes = new WeakMap<object, ErrorCode>();
+/** Fixed code from the original constructor only; unknown thrown objects are opaque. */
+export function getLayoutValueErrorCode(error: unknown): ErrorCode | undefined {
+  return error !== null && (typeof error === "object" || typeof error === "function") ? failureCodes.get(error) : undefined;
+}
 export class LayoutValueError extends Error {
   readonly code: ErrorCode;
   constructor(code: ErrorCode) {

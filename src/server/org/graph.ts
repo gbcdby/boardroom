@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { checkOrgGraphValues, type PlannedOrgNode } from "./graph-values.ts";
 import type { RepositorySet } from "../db/repositories.ts";
 import type { OrgNode } from "../db/types.ts";
 import { MEMBER_CAPTURE_BUDGET, type OrgGraphSnapshotV2 } from "./compensation-types.ts";
@@ -107,7 +108,7 @@ export async function validateParent(repos: RepositorySet, projectId: string, no
     id = boundedText(node.parent_id, 1024, true);
   }
 }
-type PlannedNode = { id: string; parentId: string | null; role: string };
+type PlannedNode = PlannedOrgNode;
 /** 同时覆盖目标节点和全部子边后验证；当前图中的逐边祖先检查不能证明恢复图无环。 */
 async function validateRestoredGraph(repos: RepositorySet, target: OrgGraphSnapshotV2): Promise<Map<string, PlannedNode>> {
   const nodes = new Map<string, PlannedNode>(), budget = CaptureBudget.current();
@@ -134,25 +135,14 @@ async function validateRestoredGraph(repos: RepositorySet, target: OrgGraphSnaps
     if (!child) conflict('需恢复的下级岗位已不存在或不属于同项目。');
     nodes.set(edge.nodeId, { ...child, parentId: edge.parentId });
   }
-  let roots = 0;
-  for (const node of nodes.values()) {
-    budget?.check();
-    if (!['top_manager', 'sub_manager', 'member'].includes(node.role) ||
-      (node.parentId === null) !== (node.role === 'top_manager')) conflict('恢复后的岗位根位置与角色不一致。');
-    if (node.parentId === null) roots++;
-    else if (!nodes.has(node.parentId)) conflict('恢复后的父岗位已不存在或属于其他项目。');
-  }
-  if (roots !== (nodes.size === 0 ? 0 : 1)) conflict('恢复后的组织必须只有一个根岗位。');
-  const complete = new Set<string>();
-  for (const node of nodes.values()) {
-    const visiting = new Set<string>();
-    let id: string | null = node.id;
-    while (id !== null && !complete.has(id)) {
-      budget?.check();
-      if (visiting.has(id)) conflict('恢复后的完整组织汇报线形成环。');
-      visiting.add(id); id = nodes.get(id)!.parentId;
+  const failure = checkOrgGraphValues(nodes, () => budget?.check());
+  if (failure) {
+    switch (failure.kind) {
+      case 'role-position': conflict('恢复后的岗位根位置与角色不一致。');
+      case 'missing-parent': conflict('恢复后的父岗位已不存在或属于其他项目。');
+      case 'root-count': conflict('恢复后的组织必须只有一个根岗位。');
+      case 'cycle': conflict('恢复后的完整组织汇报线形成环。');
     }
-    for (const visited of visiting) complete.add(visited);
   }
   return nodes;
 }

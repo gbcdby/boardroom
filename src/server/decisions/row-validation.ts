@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { DECISION_TABLE_BY_NAME } from './tables.ts';
 import { StorageInvalid } from './storage-error.ts';
 import { canonicalJson } from '../policy/canonical.ts';
+import { parseDecisionFrameJson } from './text-codec.ts';
+import type { DecisionDecodedFrame } from './text-codec.ts';
 
 export function storageInteger(value:unknown,field:string):number {
   if(typeof value!=='number' && !(typeof value==='string' && /^(0|[1-9][0-9]*)$/.test(value))) throw new StorageInvalid(field,'integer');
@@ -10,7 +12,7 @@ export function storageInteger(value:unknown,field:string):number {
   return n;
 }
 /** 完整 raw Row 边界；不改源值，不修复 TEXT，也不把 SQL CHECK 当授权。 */
-export function validateRawDecisionRow(table:string,row:Readonly<Record<string,unknown>>):void {
+export function validateRawDecisionRow(table:string,row:Readonly<Record<string,unknown>>,frame?:DecisionDecodedFrame):void {
   const spec=DECISION_TABLE_BY_NAME.get(table);
   const fail=(field:string,stage='row_shape'):never=>{throw new StorageInvalid(`${table}.${field}`,stage);};
   if(!spec || row===null || typeof row!=='object' || Array.isArray(row))return fail('*');
@@ -30,7 +32,9 @@ export function validateRawDecisionRow(table:string,row:Readonly<Record<string,u
   }
   if(table==='decision_legacy_records') {
     if(createHash('sha256').update(row.raw_text as string).digest('hex')!==row.raw_digest)return fail('raw_digest','digest');
-    let diagnostics:unknown;try{diagnostics=JSON.parse(row.diagnostics_json as string);}catch{return fail('diagnostics_json','json');}
+    let diagnostics:unknown;
+    if(frame!==undefined)diagnostics=parseDecisionFrameJson(frame,table,row,'diagnostics_json');
+    else try{diagnostics=JSON.parse(row.diagnostics_json as string);}catch{return fail('diagnostics_json','json');}
     if(!Array.isArray(diagnostics)||diagnostics.some(x=>typeof x!=='string')||canonicalJson(diagnostics)!==row.diagnostics_json)return fail('diagnostics_json','diagnostics');
   }
   if(table==='decision_action_requests') {

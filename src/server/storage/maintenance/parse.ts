@@ -1,10 +1,11 @@
 import path from "node:path";
 import { z } from "zod";
 import { canonicalJson, digestJson, parseCanonical } from "./canonical.ts";
-import { MaintenanceFailure } from "./error.ts";
+import { MaintenanceFailure, maintenanceFailureCode } from "./error.ts";
 import { counter, hash, id, ref, source, text } from "./parse-primitives.ts";
 import { sourceClientsRosterSchema } from "./source-clients.ts";
-import { checkFactsShape, controlProofSchema } from "./control-candidate/schema.ts";
+import { checkFactsShape, controlProofSchema, controlProofSchemaFor } from "./control-candidate/schema.ts";
+import { assertP0FSyntaxScope, reserveP0FNativeClone, reserveP0FNativeNodes, reserveP0FNativeShallow, type P0FArtifactSyntaxFrame } from '../../identity/internal/m2-p0-artifacts-frame.ts';
 import type { ArtifactStore } from "./objects.ts";
 import type { ActualRestoreVerification, ArtifactRef, DatabaseManifests, DurabilityCapability, JournalRecord, JournalRecordV1, JournalRecordV2, MaintenanceCommand, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceFilesManifest, VerificationJournalRecord } from "./types.ts";
 
@@ -85,18 +86,22 @@ const manifests = z.object({ formatVersion: z.literal(1), kind: z.literal("datab
   fullDataManifestDigest: hash, frozenBusinessManifestDigest: hash, capturedControlManifestDigest: hash }).strict();
 
 function parse<T>(schema: z.ZodTypeAny, value: unknown): T {
+  reserveP0FNativeClone(value);
   const parsed = schema.safeParse(value); if (!parsed.success) throw new MaintenanceFailure("journal_invalid"); return parsed.data as T;
 }
 export const parsePlan = (value: unknown): MigrationPlan => parse(plan, value);
 export const parseCapability = (value: unknown): DurabilityCapability => parse(capability, value);
 /** Strict shared structural decoding. Version edges and all runtime obligations are separate. */
-export function parseJournal(value: unknown): JournalRecord {
+export function parseJournal(value: unknown, syntaxFrame?: P0FArtifactSyntaxFrame): JournalRecord {
+  if (syntaxFrame !== undefined) assertP0FSyntaxScope(syntaxFrame, 'journal', value as object);
   canonicalJson(value);
   if (value === null || typeof value !== "object" || Array.isArray(value) || !("formatVersion" in value)
     || value.formatVersion !== 3) return parse<JournalRecordV1 | JournalRecordV2>(journal, value);
   const requireValue = (condition: unknown): void => {
     if (!condition) throw new MaintenanceFailure("journal_invalid", "verification-journal");
   };
+  // Rest body, version-normalized input, and the final shallow v3 result.
+  reserveP0FNativeShallow(value, 3);
   const { controlProof, ...body } = value as Record<string, unknown>;
   requireValue(Object.hasOwn(value, "controlProof"));
   const record = parse<JournalRecordV2>(journal, { ...body, formatVersion: 2 });
@@ -109,7 +114,8 @@ export function parseJournal(value: unknown): JournalRecord {
   requireValue(record.event === "capture" && record.phase === "quiesced"
     || record.event === "ready" && record.phase === "snapshot_ready"
     || ["observation", "takeover", "cancel_intent", "cancelled"].includes(record.event) && record.phase !== "planned");
-  const proof = controlProofSchema.safeParse(controlProof);
+  reserveP0FNativeClone(controlProof);
+  const proof = (syntaxFrame === undefined ? controlProofSchema : controlProofSchemaFor(syntaxFrame)).safeParse(controlProof);
   if (!proof.success) throw new MaintenanceFailure("journal_invalid", "verification-journal");
   if (proof.data.kind === "capture-controls") requireValue(record.event === "capture");
   requireValue((record.event === "cancelled") === (proof.data.kind === "cancel-terminal-controls"));
@@ -150,9 +156,13 @@ const pathSegment = (value: string) => value !== "" && value !== "." && value !=
 
 /** Structural decoding only; it does not observe a source or qualify a runtime provider. */
 export function parseSourceFiles(value: unknown): SourceFilesManifest {
+  reserveP0FNativeClone(value);
   const parsed = files.safeParse(value);
   if (!parsed.success) throw new MaintenanceFailure("snapshot_invalid");
   const manifest = parsed.data;
+  // Root-label projection and root [key, {root,binding}] metadata reuse the
+  // decoded objects, but allocate their own arrays/records before Map creation.
+  reserveP0FNativeNodes(2 + manifest.roots.length * 6, manifest.roots.length + manifest.entries.length);
   requireSourceFiles(manifest.rootBindings.length === manifest.roots.length
     && new Set(manifest.roots.map(item => item.label)).size === manifest.roots.length);
   const roots = new Map(manifest.roots.map((item, index) => {
@@ -189,10 +199,14 @@ export async function readSourceFiles(store: Pick<ArtifactStore, "kindFor" | "re
   requireSourceFiles(store.kindFor(reference) === "source-files");
   // Keep hash, control-root, lock and I/O failures outside the decoding catch.
   const bytes = await store.readBytes(reference);
+  return parseSourceFilesBytes(bytes);
+}
+/** Shared original-byte decoder; it performs no file access or qualification. */
+export function parseSourceFilesBytes(bytes: Uint8Array): SourceFilesManifest {
   let value: unknown;
   try { value = parseCanonical(bytes); }
   catch (error) {
-    if (error instanceof MaintenanceFailure && error.code === "journal_invalid") throw new MaintenanceFailure("snapshot_invalid");
+    if (maintenanceFailureCode(error) === "journal_invalid") throw new MaintenanceFailure("snapshot_invalid");
     throw error;
   }
   // TextDecoder may remove a UTF-8 BOM. The stored bytes themselves must be canonical.

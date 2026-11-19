@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
 import { MaintenanceFailure } from "./error.ts";
+import { reserveP0FNativeCanonical, reserveP0FNativeText, reuseP0FNativeCanonical,reuseP0FNativeDigest } from '../../identity/internal/m2-p0-artifacts-frame.ts';
 
 /** Version 1 canonical JSON: lexical UTF-16 keys, ordered arrays, no omitted/rounded fields. */
 export function canonicalJson(value: unknown): string {
+  const reused = reuseP0FNativeCanonical(value); if (reused !== undefined) return reused;
+  reserveP0FNativeCanonical(value);
   const seen = new Set<object>();
   function encode(item: unknown, depth: number): string {
     if (depth > 128) throw new MaintenanceFailure("journal_invalid");
+    const reused = reuseP0FNativeCanonical(item); if (reused !== undefined) return reused;
     if (item === null || typeof item === "string" || typeof item === "boolean") return JSON.stringify(item);
     if (typeof item === "number") {
       if (!Number.isFinite(item) || Object.is(item, -0) || Number.isInteger(item) && !Number.isSafeInteger(item))
@@ -31,8 +35,11 @@ export function canonicalJson(value: unknown): string {
   }
   return encode(value, 0);
 }
-export function sha256(bytes: string | Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }
-export function digestJson(value: unknown): string { return sha256(canonicalJson(value)); }
+export function sha256(bytes: string | Uint8Array): string {
+  if (typeof bytes === 'string') reserveP0FNativeText(bytes, true);
+  return createHash("sha256").update(bytes).digest("hex");
+}
+export function digestJson(value: unknown): string { const reused=reuseP0FNativeDigest(value);return reused===undefined?sha256(canonicalJson(value)):reused; }
 export function parseCanonical(bytes: Uint8Array): unknown {
   try {
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);

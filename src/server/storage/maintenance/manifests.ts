@@ -1,12 +1,20 @@
 import { createHash } from "node:crypto";
 import { canonicalJson, digestJson } from "./canonical.ts";
 import type { DatabaseManifests, Json } from "./types.ts";
+import { reserveP0FNativeNodes, reserveP0FNativeSort, reserveP0FNativeText,reuseP0FNativeRowDigest } from '../../identity/internal/m2-p0-artifacts-frame.ts';
 
 /** Preserve duplicate rows; each canonical typed row is length-framed before hashing. */
 export function digestRowMultiset(rows: readonly Json[]): { count: string; digest: string } {
-  const encoded = rows.map(canonicalJson).sort();
+  const reused=reuseP0FNativeRowDigest(rows);if(reused!==undefined)return reused;
+  reserveP0FNativeNodes(1, rows.length);
+  const encoded = rows.map(canonicalJson);
+  reserveP0FNativeSort(encoded); encoded.sort();
   const hash = createHash("sha256");
-  for (const row of encoded) hash.update(`${Buffer.byteLength(row)}:`).update(row);
+  for (const row of encoded) {
+    reserveP0FNativeText(row, true);
+    hash.update(`${Buffer.byteLength(row)}:`).update(row);
+  }
+  reserveP0FNativeNodes(5);
   return { count: String(rows.length), digest: hash.digest("hex") };
 }
 /** Shared formula, deliberately excludes only the two named controls from the frozen domain. */

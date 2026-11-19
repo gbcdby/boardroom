@@ -6,20 +6,26 @@ export const opaqueIdSchema = z.string().min(1).max(256).refine((value) => !/[\u
 export const revisionSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export const digestSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const credentialRefSchema = z.string().min(1).max(256).regex(/^[A-Za-z0-9_./:-]+$/);
+function allowedEndpoint(url: URL): boolean {
+  return (url.protocol === "http:" || url.protocol === "https:")
+    && !url.username && !url.password && !url.search && !url.hash;
+}
 const endpointSchema = z.string().min(1).max(8192).refine((value) => {
   try {
-    const url = new URL(value);
-    return (url.protocol === "http:" || url.protocol === "https:")
-      && !url.username && !url.password && !url.search && !url.hash;
+    return allowedEndpoint(new URL(value));
   } catch { return false; }
 });
-const connectionDeclarationSchema = z.object({
+// The owned-value boundary distinguishes invalid syntax without examining any
+// thrown value. The default reader above deliberately retains its old catch.
+const ownedEndpointSchema = z.string().min(1).max(8192).refine((value) =>
+  URL.canParse(value) && allowedEndpoint(new URL(value)));
+function declarationSchema(endpoint: z.ZodType<string>) { return z.object({
   connectionId: opaqueIdSchema,
   revision: revisionSchema,
   enabled: z.boolean(),
   transport: z.discriminatedUnion("type", [
     z.object({
-      type: z.literal("streamable-http"), endpoint: endpointSchema,
+      type: z.literal("streamable-http"), endpoint,
       credentialRef: credentialRefSchema.optional(),
     }).strict(),
     z.object({
@@ -28,7 +34,9 @@ const connectionDeclarationSchema = z.object({
       credentialRef: credentialRefSchema.optional(),
     }).strict(),
   ]),
-}).strict();
+}).strict(); }
+const connectionDeclarationSchema = declarationSchema(endpointSchema);
+const ownedConnectionDeclarationSchema = declarationSchema(ownedEndpointSchema);
 export type McpConnectionDeclaration = Readonly<z.infer<typeof connectionDeclarationSchema>>;
 
 /** 仅供可信配置持久化/协议边界消费；普通目录仍使用脱敏 ConnectionProjection。 */
@@ -51,7 +59,16 @@ export function parseData<S extends z.ZodTypeAny>(schema: S, input: unknown, cod
 
 /** 只检查声明并返回不含端点/argv/凭据引用的投影，不建立连接或执行命令。 */
 export function inspectMcpConnection(input: unknown): ConnectionProjection {
-  const connection = readMcpConnectionDeclaration(input);
+  return connectionProjection(readMcpConnectionDeclaration(input));
+}
+
+/** Same declaration and projection core for owned historical values; unknown
+ * URL failures propagate to their caller instead of becoming a data error. */
+export function inspectMcpConnectionOwnedValue(input: unknown): ConnectionProjection {
+  return connectionProjection(freezeData(parseData(ownedConnectionDeclarationSchema, input, "invalid_connection")));
+}
+
+function connectionProjection(connection: McpConnectionDeclaration): ConnectionProjection {
   return freezeData({
     connectionId: connection.connectionId, revision: connection.revision, enabled: connection.enabled,
     transport: connection.transport.type, configurationDigest: digestJson(connection),

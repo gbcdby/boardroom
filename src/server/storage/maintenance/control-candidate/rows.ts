@@ -11,6 +11,7 @@ import type { DatabaseManifests, JournalRecord, Json, MigrationPlan, SourceClien
 import type { UntrustedJournalCandidate } from "./codec.ts";
 import { compareText, equal, ordered, requireCandidate } from "./common.ts";
 import { fence, ownedIdentity, safePos, processDisposition, type ClientFact, type EventFacts, type SuccessorProof } from "./schema.ts";
+import { assertP0FSyntaxScope, assertP0FRow, assertP0FRowJson,bindP0FRowJsonEncoding, preflightP0FRowText, reserveP0FNativeClone, reserveP0FNativeNodes, reserveP0FNativeShallow,encodeP0FNativeShell, type P0FArtifactSyntaxFrame } from '../../../identity/internal/m2-p0-artifacts-frame.ts';
 
 type Encoding = SourceClientsRosterV1["textEncoding"];
 type Decoded = { -readonly [K in keyof SourceClientRawRow]: string | null };
@@ -24,6 +25,7 @@ export interface RowContext {
   readonly receiptGeneration: string;
   readonly registrations: Map<string, Registration>;
   readonly unresolvedEncoding: Set<string>;
+  readonly syntaxFrame?: P0FArtifactSyntaxFrame;
 }
 const text = z.string().min(1).max(4096).refine(value => !value.includes("\0"));
 const oldTime = text.refine(value => Number.isFinite(Date.parse(value)));
@@ -52,10 +54,13 @@ const pgSession = z.discriminatedUnion("owner", [
 ]);
 const nativeSession = z.object({ kind: z.literal("sqlite"), owner: z.literal("native-management"), connectionId: text, state: z.literal("closed"), nativeTransactions: transactions }).strict();
 const envelope = z.object({ formatVersion: z.literal(1), sourceIdentity: z.unknown(), sessions: z.array(z.unknown()), drainReceipt: receiptSchema.nullable() }).strict();
-function parse<T>(schema: z.ZodType<T>, value: unknown): T { const result = schema.safeParse(value); requireCandidate(result.success); return result.data; }
-function json(value: string | null): unknown {
+function parse<T>(schema: z.ZodType<T>, value: unknown): T { reserveP0FNativeClone(value); const result = schema.safeParse(value); requireCandidate(result.success); return result.data; }
+function json(value: string | null, frame?: P0FArtifactSyntaxFrame, row?: SourceClientRawRow,
+  column?: 'host_identity_json' | 'process_identity_json' | 'db_sessions_json'): unknown {
   requireCandidate(value !== null);
-  try { const decoded: unknown = JSON.parse(value); canonicalJson(decoded); return decoded; }
+  const decode = () => { const decoded: unknown = JSON.parse(value);if(frame!==undefined)bindP0FRowJsonEncoding(frame,row!,column!,decoded); canonicalJson(decoded); return decoded; };
+  if (frame !== undefined) { assertP0FRowJson(frame, row!, column!, value); return decode(); }
+  try { return decode(); }
   catch { requireCandidate(false); }
 }
 function object(value: unknown): Record<string, unknown> {
@@ -70,33 +75,43 @@ export function encodeText(value: string, encoding: Encoding): SourceClientTextC
   requireCandidate(!/[\uD800-\uDFFF]/u.test(value));
   const bytes = Buffer.from(value, encoding.name === "UTF-16le" || encoding.name === "UTF-16be" ? "utf16le" : "utf8");
   if (encoding.name === "UTF-16be") bytes.swap16();
-  return ["text", bytes.toString("hex")];
+  reserveP0FNativeNodes(3);
+  return encodeP0FNativeShell(["text", bytes.toString("hex")] as SourceClientTextCell);
 }
-export function decodeRow(row: SourceClientRawRow, encoding: Encoding): Decoded | null {
+export function decodeRow(row: SourceClientRawRow, encoding: Encoding, frame?: P0FArtifactSyntaxFrame): Decoded | null {
+  if (frame !== undefined) assertP0FRow(frame, row, encoding);
+  reserveP0FNativeClone(row);
   requireCandidate(sourceClientRawRowSchema.safeParse(row).success);
   if (!supportedEncoding(encoding)) return null;
+  reserveP0FNativeNodes(1 + 2 * sourceClientColumns.length);
   const result: Partial<Decoded> = {};
-  try {
+  const decode = () => {
     for (const key of Object.keys(row) as (keyof SourceClientRawRow)[]) {
       const cell = row[key];
       if (cell[0] === "null") result[key] = null;
       else if (cell[0] === "integer") result[key] = cell[1];
       else {
         const bytes = Buffer.from(cell[1], "hex"), name = encoding.backend === "postgres" ? "utf-8" : encoding.name;
+        if (frame !== undefined) preflightP0FRowText(frame, row, encoding, bytes);
         const value = new TextDecoder(name, { fatal: true, ignoreBOM: true }).decode(bytes);
         requireCandidate(equal(encodeText(value, encoding), cell)); result[key] = value;
       }
     }
-  } catch { requireCandidate(false); }
+  };
+  if (frame !== undefined) decode();
+  else try { decode(); } catch { requireCandidate(false); }
   return result as Decoded;
 }
 
 /** Supplied manifest/raw data only. Native callers must additionally bind the exact
  * columns and raw rows to their actual current source window. */
 export function bindSourceClientManifestRows(manifests: DatabaseManifests, rows: readonly SourceClientRawRow[], encoding: Encoding,
-  nativeColumns?: Json): { readonly kind: "untrusted-source-client-manifest-binding"; readonly rows: readonly Decoded[] } {
+  nativeColumns?: Json, syntaxFrame?: P0FArtifactSyntaxFrame): { readonly kind: "untrusted-source-client-manifest-binding"; readonly rows: readonly Decoded[] } {
+  if (syntaxFrame !== undefined) assertP0FSyntaxScope(syntaxFrame, 'rows', manifests);
   if (!supportedEncoding(encoding)) throw new MaintenanceFailure("source_changed", "v3-source-clients-encoding-unverified");
   requireCandidate(manifests.dialect === encoding.backend);
+  // filter/decoded arrays, indexed edges, and the client-id projection below.
+  reserveP0FNativeNodes(3 + rows.length, rows.length + manifests.controlRows.storage_source_clients.length);
   const tables = manifests.tables.filter(table => table.name === "storage_source_clients");
   requireCandidate(tables.length === 1);
   const table = tables[0]!;
@@ -109,33 +124,48 @@ export function bindSourceClientManifestRows(manifests: DatabaseManifests, rows:
       ? column.cid === String(index) && column.type === expected.sqlite && column.notnull === (expected.nullable || index === 0 ? "0" : "1")
       : column.position === String(index + 1) && column.type_oid === expected.postgres && column.not_null === !expected.nullable);
   }
-  const decoded = rows.map(raw => { const value = decodeRow(raw, encoding); requireCandidate(value !== null && sameSourceClientRow(value, value)); return value; });
+  const decoded = rows.map(raw => { const value = decodeRow(raw, encoding, syntaxFrame); requireCandidate(value !== null && sameSourceClientRow(value, value)); return value; });
   const indexed = new Map<string, Readonly<Record<string, Json>>>();
   for (const row of manifests.controlRows.storage_source_clients) {
     requireCandidate(sameSourceClientRow(row, row) && typeof row.client_id === "string" && !indexed.has(row.client_id)); indexed.set(row.client_id, row);
   }
   requireCandidate(indexed.size === decoded.length && new Set(decoded.map(row => row.client_id)).size === decoded.length);
   for (const row of decoded) { const actual = indexed.get(row.client_id!); requireCandidate(actual && sameSourceClientRow(row, actual)); }
-  const typed: Json[] = rows.map((row, index) => sourceClientColumns.map(column => encoding.backend === "sqlite"
-    ? [...row[column.name]] : encodePostgresCell(column.postgres, decoded[index]![column.name])));
+  let typedNodes = 1;
+  for (const row of rows) {
+    typedNodes++;
+    for (const column of sourceClientColumns) typedNodes += encoding.backend === 'sqlite' ? 1 + row[column.name].length : 3;
+  }
+  reserveP0FNativeNodes(typedNodes);
+  const typed: Json[] = rows.map((row, index) => encodeP0FNativeShell(sourceClientColumns.map(column => encodeP0FNativeShell(encoding.backend === "sqlite"
+    ? [...row[column.name]] : encodePostgresCell(column.postgres, decoded[index]![column.name])))));
   const expected = digestRowMultiset(typed);
   requireCandidate(table.count === expected.count && table.digest === expected.digest);
+  reserveP0FNativeNodes(4);
   return { kind: "untrusted-source-client-manifest-binding", rows: decoded };
 }
 function rowDigest(context: RowContext, row: SourceClientRawRow): string {
-  return digestJson({ formatVersion: 1, kind: "source-client-row", source: context.record.source, textEncoding: context.encoding, row });
+  reserveP0FNativeNodes(8);
+  return digestJson(encodeP0FNativeShell({ formatVersion: 1, kind: "source-client-row", source: context.record.source, textEncoding: context.encoding, row }));
 }
-function currentClient(row: SourceClientRawRow, epoch: number): boolean {
+function currentClient(row: Pick<SourceClientRawRow,'drain_epoch'|'registered_epoch'|'ended_at'>, epoch: number): boolean {
   return row.drain_epoch[0] === "integer" && row.drain_epoch[1] === String(epoch)
     || BigInt(row.registered_epoch[1]) === BigInt(epoch) - 1n && row.ended_at[0] === "null";
 }
+/** The existing epoch rule, exposed only as pure data for the private P0 cut.
+ * This does not validate an ordinary profile or make a native liveness claim. */
+export function sourceClientEpochClassification(row: Pick<SourceClientRawRow,'drain_epoch'|'registered_epoch'|'ended_at'>,
+  epoch: number): 'current-client'|'historical-client' {
+  return currentClient(row,epoch)?'current-client':'historical-client';
+}
 type PgRegistered = Omit<Extract<EventFacts["sessions"], { kind: "postgres-session-audit-v1" }>["registeredSessions"][number], "normalizedBackendStart" | "subject"> & { readonly subject: SourceClientTextCell };
 function ordinaryProfile(row: SourceClientRawRow, decoded: Decoded, fact: Exclude<ClientFact, { kind: "maintenance-controller" }>, context: RowContext): PgRegistered[] {
+  reserveP0FNativeNodes(1);
   const native = fact.kind === "native-management-client", registered: PgRegistered[] = [];
   requireCandidate(decoded.client_id !== null && decoded.client_id !== "" && decoded.database_instance_id === context.record.source.databaseInstanceId
     && decoded.build_id === (native ? "boardroom-native-management-v1" : "boardroom-storage-drain-v1")
     && (native ? decoded.entrypoint === "local-management" : ["http", "stdio", "owned-background"].includes(decoded.entrypoint!)));
-  const body = parse(envelope, json(decoded.db_sessions_json));
+  const body = parse(envelope, json(decoded.db_sessions_json, context.syntaxFrame, row, 'db_sessions_json'));
   if (context.record.source.kind === "sqlite") requireCandidate(equal(parse(sqliteIdentity, body.sourceIdentity), context.plan.sourceIdentity));
   else {
     const identity = parse(pgEnvelopeIdentity, body.sourceIdentity), expected = object(context.plan.sourceIdentity);
@@ -159,6 +189,7 @@ function ordinaryProfile(row: SourceClientRawRow, decoded: Decoded, fact: Exclud
         if (session.owner === "local-driver") requireCandidate(session.applicationName === name);
         for (const [backendIndex, item] of session.observedBackends.entries()) {
           requireCandidate(item.application_name === name);
+          reserveP0FNativeNodes(12);
           registered.push({ subject: row.client_id, sessionIndex, backendIndex, owner: session.owner, pid: item.pid, originalBackendStart: item.backend_start });
         }
       }
@@ -177,7 +208,7 @@ function ordinaryProfile(row: SourceClientRawRow, decoded: Decoded, fact: Exclud
     && receipt.databaseInstanceId === decoded.database_instance_id && String(receipt.registeredEpoch) === decoded.registered_epoch
     && String(receipt.drainEpoch) === decoded.drain_epoch && String(receipt.drainEpoch) === decoded.observed_epoch
     && receipt.drainEpoch === receipt.registeredEpoch + 1 && receipt.sourceIdentityDigest === digestJson(body.sourceIdentity)
-    && receipt.processIdentityDigest === digestJson(json(decoded.process_identity_json)));
+    && receipt.processIdentityDigest === digestJson(json(decoded.process_identity_json, context.syntaxFrame, row, 'process_identity_json')));
   if (current) requireCandidate(receipt.drainEpoch === context.fenceEpoch && String(receipt.ownerGeneration) === context.receiptGeneration
     && receipt.migrationId === context.record.migrationId && receipt.planDigest === context.record.plan.sha256);
   else requireCandidate(receipt.drainEpoch < context.fenceEpoch);
@@ -189,8 +220,8 @@ function ordinaryProfile(row: SourceClientRawRow, decoded: Decoded, fact: Exclud
 type ControllerDecoded = Pick<Decoded, "client_id" | "database_instance_id" | "entrypoint" | "build_id" | "drain_state"
   | "db_sessions_json" | "host_identity_json" | "process_identity_json">;
 function controllerRegistration(row: SourceClientRawRow, decoded: ControllerDecoded,
-  identity: { readonly host: unknown; readonly process: unknown }, source: SourceRef) {
-  const body = parse(registrationSchema, json(decoded.db_sessions_json));
+  identity: { readonly host: unknown; readonly process: unknown }, source: SourceRef, syntaxFrame?: P0FArtifactSyntaxFrame) {
+  const body = parse(registrationSchema, json(decoded.db_sessions_json, syntaxFrame, row, 'db_sessions_json'));
   requireCandidate(decoded.client_id !== null && decoded.client_id !== "" && decoded.database_instance_id === source.databaseInstanceId
     && decoded.entrypoint === "maintenance-controller" && decoded.build_id === "boardroom-maintenance-control-v1"
     && decoded.drain_state === "none" && row.drain_epoch[0] === "null" && row.drain_receipt_digest[0] === "null"
@@ -204,17 +235,18 @@ function controllerRegistration(row: SourceClientRawRow, decoded: ControllerDeco
 }
 /** Strict existing S6/S7 data rules only. This does not inspect a process or grant registration/ownership. */
 export function validateHistoricalControllerProfile(row: SourceClientRawRow, values: Readonly<Record<string, unknown>>,
-  source: SourceRef, fenceEpoch: number, identity: { readonly host: unknown; readonly process: unknown }): void {
+  source: SourceRef, fenceEpoch: number, identity: { readonly host: unknown; readonly process: unknown }, syntaxFrame?: P0FArtifactSyntaxFrame): void {
+  if(syntaxFrame!==undefined){assertP0FSyntaxScope(syntaxFrame,'rows',row);reserveP0FNativeNodes(51);}
   const keys = ["client_id", "database_instance_id", "entrypoint", "build_id", "drain_state", "db_sessions_json",
     "host_identity_json", "process_identity_json"] as const;
   const decoded = Object.fromEntries(keys.map(key => {
     const value = values[key]; requireCandidate(typeof value === "string"); return [key, value];
   })) as ControllerDecoded;
-  const body = controllerRegistration(row, decoded, identity, source);
+  const body = controllerRegistration(row, decoded, identity, source, syntaxFrame);
   requireCandidate(row.protocol_version[1] === "1" && BigInt(body.creation.fenceEpoch) < BigInt(fenceEpoch));
 }
 function controllerProfile(row: SourceClientRawRow, decoded: Decoded, fact: Extract<ClientFact, { kind: "maintenance-controller" }>, context: RowContext): void {
-  const body = controllerRegistration(row, decoded, fact, context.record.source), prior = context.registrations.get(row.client_id[1]);
+  const body = controllerRegistration(row, decoded, fact, context.record.source, context.syntaxFrame), prior = context.registrations.get(row.client_id[1]);
   if (prior) requireCandidate(fact.registration === "current-chain" && equal(prior.creation, body.creation) && prior.actorId === fact.process.instanceId
     && body.creation.fenceEpoch === String(context.fenceEpoch));
   else requireCandidate(fact.registration === "R0-historical" && BigInt(body.creation.fenceEpoch) < BigInt(context.fenceEpoch)
@@ -222,6 +254,8 @@ function controllerProfile(row: SourceClientRawRow, decoded: Decoded, fact: Extr
   if (fact.classification === "active-actor") requireCandidate(row.ended_at[0] === "null");
 }
 function runtimeRelations(facts: EventFacts): void {
+  // owner [key, reused object] tuples, results array and four-scalar projections.
+  reserveP0FNativeNodes(2 + facts.runtime.owners.length * 2 + facts.runtime.runners.length * 9, facts.runtime.owners.length);
   const owners = new Map(facts.runtime.owners.map(owner => [owner.memberId, owner]));
   for (const owner of owners.values()) {
     if (owner.bindingId === null) requireCandidate(owner.leaseOwner === null && owner.leaseExpiresAt === null);
@@ -233,6 +267,7 @@ function runtimeRelations(facts: EventFacts): void {
     requireCandidate(owner && owner.generation >= row.generation && (row.leaseOwner === null
       || owner.bindingId === row.bindingId && owner.generation === row.generation && owner.leaseOwner === row.leaseOwner));
     if (row.generation === 0) requireCandidate(row.leaseOwner === null && row.processIdentity === null && row.exitConfirmed === 1);
+    reserveP0FNativeNodes(2 + facts.clients.length);
     const exits = facts.clients.flatMap(client => client.kind === "maintenance-controller" ? [] : client.receipt?.ownedExits ?? [])
       .filter(exit => exit.fence.bindingId === row.bindingId && exit.fence.memberId === row.memberId && exit.fence.generation === row.generation);
     if (row.processIdentity === null) requireCandidate(row.inspection === null && row.leaseOwner === null && row.exitConfirmed === 1 && (row.generation === 0 || exits.length > 0));
@@ -248,12 +283,14 @@ function sessionSources(facts: EventFacts, context: RowContext, expected: readon
   if (sessions.kind === "postgres-session-audit-v1") {
     requireCandidate(identity.kind === "postgres" && sessions.databaseOid === identity.databaseOid && sessions.schemaOid === identity.schemaOid && sessions.descriptorDigest === identity.descriptorDigest);
     if (allDecoded) requireCandidate(sessions.registeredSessions.length === expected.length && sessions.registeredSessions.every((item, index) => {
+      reserveP0FNativeShallow(item);
       const { normalizedBackendStart: _normalized, ...original } = item; return equal(original, expected[index]);
     }));
     for (const item of sessions.registeredSessions) requireCandidate(facts.clients.some(client => client.kind !== "maintenance-controller" && equal(client.subject, item.subject)));
     return;
   }
   const source = parse(sqliteIdentity, identity);
+  reserveP0FNativeNodes(4);
   const paths = [source.sqlitePath, `${source.sqlitePath}-wal`, `${source.sqlitePath}-shm`];
   const main = sessions.sourceFiles[0]!;
   requireCandidate(main.presence === "present" && main.device === source.device && main.inode === source.inode
@@ -274,6 +311,7 @@ export function validateRowsFacts(rows: readonly SourceClientRawRow[], facts: Ev
   requireCandidate(facts.clients.length === rows.length && facts.beforeCount === String(rows.length));
   // Even an empty/equal table retains the unverified encoding obligation.
   if (!supportedEncoding(context.encoding)) context.unresolvedEncoding.add(context.encoding.name);
+  reserveP0FNativeNodes(1);
   const expected: PgRegistered[] = []; let allDecoded = true;
   for (const [index, row] of rows.entries()) {
     const fact = facts.clients[index]!;
@@ -291,9 +329,10 @@ export function validateRowsFacts(rows: readonly SourceClientRawRow[], facts: Ev
       else requireCandidate(fact.registration === "R0-historical" && BigInt(row.registered_epoch[1]) < BigInt(context.fenceEpoch) && fact.classification === "exited-actor");
       if (fact.classification === "active-actor") requireCandidate(row.ended_at[0] === "null");
     }
-    const decoded = decodeRow(row, context.encoding);
+    const decoded = decodeRow(row, context.encoding, context.syntaxFrame);
     if (decoded === null) { allDecoded = false; context.unresolvedEncoding.add(context.encoding.name); continue; }
-    requireCandidate(equal(json(decoded.host_identity_json), fact.host) && equal(json(decoded.process_identity_json), fact.process));
+    requireCandidate(equal(json(decoded.host_identity_json, context.syntaxFrame, row, 'host_identity_json'), fact.host)
+      && equal(json(decoded.process_identity_json, context.syntaxFrame, row, 'process_identity_json'), fact.process));
     if (fact.kind === "maintenance-controller") controllerProfile(row, decoded, fact, context);
     else expected.push(...ordinaryProfile(row, decoded, fact, context));
   }
@@ -303,6 +342,7 @@ export function validateRowsFacts(rows: readonly SourceClientRawRow[], facts: Ev
 }
 
 export function applyChanges(rows: readonly SourceClientRawRow[], proof: SuccessorProof, context: RowContext): readonly SourceClientRawRow[] {
+  reserveP0FNativeNodes(1 + rows.length * 2, rows.length);
   const next = new Map(rows.map(row => [row.client_id[1], row]));
   ordered(proof.changes, (a, b) => compareText(a.after.client_id[1], b.after.client_id[1]));
   const time = encodeText(proof.facts.observedAt, context.encoding);
@@ -313,13 +353,15 @@ export function applyChanges(rows: readonly SourceClientRawRow[], proof: Success
       requireCandidate(!next.has(key) && proof.facts.actor.clientId === null && change.actorId === proof.facts.actor.actorId
         && proof.facts.clients.every(client => client.process.instanceId !== change.actorId)
         && ![...context.registrations.values()].some(item => item.actorId === change.actorId));
+      reserveP0FNativeNodes(11);
       const creationValue = { migrationId: context.record.migrationId, plan: context.record.plan, fenceEpoch: String(context.fenceEpoch),
         ownerGeneration: String(context.record.ownerGeneration), previousAnchor: proof.previousAnchor, targetSequence: String(context.record.sequence) };
-      const row = change.after, decoded = decodeRow(row, context.encoding);
+      const row = change.after, decoded = decodeRow(row, context.encoding, context.syntaxFrame);
       requireCandidate(row.protocol_version[1] === "1" && row.registered_epoch[1] === String(context.fenceEpoch)
         && equal(row.observed_epoch, row.registered_epoch) && row.drain_epoch[0] === "null" && row.drain_receipt_digest[0] === "null" && row.ended_at[0] === "null");
       if (time !== null) requireCandidate(equal(row.registered_at, time) && equal(row.last_observed_at, time));
       if (decoded !== null) {
+        reserveP0FNativeNodes(13);
         const expected = { formatVersion: 1, kind: "maintenance-controller-registration", source: context.record.source,
           sourceIdentityDigest: context.record.source.identityDigest, creation: creationValue, sessionBinding: "per-source-lock-native-inventory-v1", drainReceipt: null };
         requireCandidate(decoded.client_id !== null && decoded.client_id !== "" && decoded.database_instance_id === context.record.source.databaseInstanceId
@@ -327,6 +369,7 @@ export function applyChanges(rows: readonly SourceClientRawRow[], proof: Success
           && decoded.host_identity_json === canonicalJson(proof.facts.actor.host) && decoded.process_identity_json === canonicalJson(proof.facts.actor.process)
           && decoded.db_sessions_json === canonicalJson(expected));
       } else context.unresolvedEncoding.add(context.encoding.name);
+      reserveP0FNativeNodes(4, 1);
       context.registrations.set(key, { creation: creationValue, actorId: change.actorId });
     } else {
       requireCandidate(equal(change.subject, change.before.client_id) && equal(change.subject, change.after.client_id)
@@ -343,5 +386,6 @@ export function applyChanges(rows: readonly SourceClientRawRow[], proof: Success
     }
     next.set(key, change.after);
   }
+  reserveP0FNativeNodes(1, next.size);
   return [...next.values()].sort((a, b) => compareText(a.client_id[1], b.client_id[1]));
 }

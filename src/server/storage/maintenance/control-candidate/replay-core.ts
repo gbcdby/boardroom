@@ -3,6 +3,7 @@ import type { ArtifactRef, JournalFrozenV2, MigrationPlan, SourceClientRawRow, S
 import { equal, requireCandidate } from "./common.ts";
 import { applyChanges, validateRowsFacts, type RowContext } from "./rows.ts";
 import type { CancelTerminalProof, ControlProof, MaintenanceInvariant, SuccessorProof } from "./schema.ts";
+import { assertP0FSyntaxScope, reserveP0FNativeNodes,encodeP0FNativeShell,reserveP0FNativeComparisons, type P0FArtifactSyntaxFrame } from '../../../identity/internal/m2-p0-artifacts-frame.ts';
 
 export interface ControlReplayNode { readonly reference: ArtifactRef; readonly record: VerificationJournalRecord }
 export interface ControlReplayState {
@@ -55,11 +56,15 @@ export function validateJournalSequence(nodes: readonly ControlReplayNode[]): Ca
     }
     if (record.event === "cancelled") { requireCandidate(cancellation === "pending"); cancellation = "terminal"; }
     requireCandidate((record.event === "capture") === (record.frozen !== null) && (record.event === "ready") === (record.snapshot !== null));
+    reserveP0FNativeNodes(1 + record.evidence.length, record.evidence.length);
     requireCandidate(new Set(record.evidence.map(item => item.ref)).size === record.evidence.length);
     if (record.formatVersion === 3) {
       if (record.event === "capture") requireCandidate(record.controlProof?.kind === (origin === null ? "capture-controls" : "control-successor"));
-      if (record.controlProof?.kind === "capture-controls") requireCandidate(record.event === "capture" && origin === null
-        && nodes.slice(0, index).every(item => ["enter", "observation"].includes(item.record.event)));
+      if (record.controlProof?.kind === "capture-controls") {
+        reserveP0FNativeNodes(1, index);
+        requireCandidate(record.event === "capture" && origin === null
+          && nodes.slice(0, index).every(item => ["enter", "observation"].includes(item.record.event)));
+      }
       if (record.controlProof?.kind === "legacy-first-capture-bridge") requireCandidate(previous?.record.formatVersion === 2
         && previous.record.phase === "snapshot_ready" && origin?.record.formatVersion === 2 && cancellation === "active");
     }
@@ -77,9 +82,11 @@ export function validateJournalSequence(nodes: readonly ControlReplayNode[]): Ca
   return cancellation;
 }
 export function rowsDigest(source: SourceRef, textEncoding: SourceClientsRosterV1["textEncoding"], rows: readonly SourceClientRawRow[]): string {
-  const sorted = [...rows].sort((a, b) => a.client_id[1] < b.client_id[1] ? -1 : a.client_id[1] > b.client_id[1] ? 1 : 0);
-  requireCandidate(sorted.every((row, index) => index === 0 || sorted[index - 1]!.client_id[1] !== row.client_id[1]));
-  return digestJson({ formatVersion: 1, kind: "source-clients-live-rows", source, textEncoding, rows: sorted });
+  reserveP0FNativeNodes(9, rows.length);
+  const sorted = [...rows].sort((a, b) => {reserveP0FNativeComparisons(a.client_id[1],b.client_id[1],2);return a.client_id[1] < b.client_id[1] ? -1 : a.client_id[1] > b.client_id[1] ? 1 : 0;});
+  requireCandidate(sorted.every((row, index) => {if(index===0)return true;reserveP0FNativeComparisons(sorted[index-1]!.client_id[1],row.client_id[1]);return sorted[index-1]!.client_id[1]!==row.client_id[1];}));
+  encodeP0FNativeShell(sorted);
+  return digestJson(encodeP0FNativeShell({ formatVersion: 1, kind: "source-clients-live-rows", source, textEncoding, rows: sorted }));
 }
 function successorBinding(proof: SuccessorProof, node: ControlReplayNode, previous: ControlReplayNode,
   origin: ControlReplayNode, roster: SourceClientsRosterV1): void {
@@ -105,7 +112,8 @@ function terminalBinding(proof: CancelTerminalProof, node: ControlReplayNode, pr
 /** Shared pure data rules. The caller must validate its finite chain and any legacy bridge.
  * Neither the state nor successful replay grants a native lock, registration or V permit. */
 export function applyControlNode(plan: MigrationPlan, node: ControlReplayNode, previous: ControlReplayNode | undefined,
-  origin: ControlReplayNode, roster: SourceClientsRosterV1, bindings: ControlReplayBindings, state: ControlReplayState): ControlProof {
+  origin: ControlReplayNode, roster: SourceClientsRosterV1, bindings: ControlReplayBindings, state: ControlReplayState, syntaxFrame?: P0FArtifactSyntaxFrame): ControlProof {
+  if (syntaxFrame !== undefined) assertP0FSyntaxScope(syntaxFrame, 'rows', plan);
   const record = node.record;
   requireCandidate(record.formatVersion === 3 && record.controlProof !== null);
   const proof = record.controlProof;
@@ -124,8 +132,9 @@ export function applyControlNode(plan: MigrationPlan, node: ControlReplayNode, p
   }
   requireCandidate(proof.facts.beforeCount === String(state.rows.length)
     && proof.facts.beforeRowsDigest === rowsDigest(record.source, roster.textEncoding, state.rows));
+  reserveP0FNativeNodes(syntaxFrame === undefined ? 10 : 13);
   const context: RowContext = { plan, record, fenceEpoch: Number(roster.fenceEpoch), encoding: roster.textEncoding, receiptGeneration: roster.receiptGeneration,
-    registrations: state.registrations, unresolvedEncoding: state.unresolvedEncoding };
+    registrations: state.registrations, unresolvedEncoding: state.unresolvedEncoding, ...(syntaxFrame === undefined ? {} : { syntaxFrame }) };
   validateRowsFacts(state.rows, proof.facts, context);
   if (proof.kind === "control-successor" || proof.kind === "legacy-first-capture-bridge") {
     state.rows = applyChanges(state.rows, proof, context);
@@ -135,12 +144,15 @@ export function applyControlNode(plan: MigrationPlan, node: ControlReplayNode, p
 }
 
 /** A V-only root is the first capture-controls. Legacy ready bridges remain elsewhere. */
-export function replayVerificationControls(plan: MigrationPlan, nodes: readonly ControlReplayNode[], bindings: ControlReplayBindings) {
+export function replayVerificationControls(plan: MigrationPlan, nodes: readonly ControlReplayNode[], bindings: ControlReplayBindings, syntaxFrame?: P0FArtifactSyntaxFrame) {
+  if (syntaxFrame !== undefined) assertP0FSyntaxScope(syntaxFrame, 'rows', plan);
   requireCandidate(validateJournalSequence(nodes) === "active");
   const firstCapture = nodes.findIndex(node => node.record.event === "capture"), origin = nodes[firstCapture];
+  reserveP0FNativeNodes(1, Math.max(0, firstCapture));
   requireCandidate(origin && origin.record.formatVersion === 3 && origin.record.sourceClients !== null
     && nodes.slice(0, firstCapture).every(node => node.record.phase === "planned" && ["enter", "observation"].includes(node.record.event)));
   const roster = origin.record.sourceClients;
+  reserveP0FNativeNodes(7);
   const state: ControlReplayState = { rows: roster.rows, invariant: null, registrations: new Map(), unresolvedEncoding: new Set() };
   const captures = new Map<string, { readonly rows: readonly SourceClientRawRow[]; readonly invariant: MaintenanceInvariant }>();
   const events: { readonly journal: ArtifactRef; readonly proof: ControlProof }[] = [];
@@ -148,12 +160,14 @@ export function replayVerificationControls(plan: MigrationPlan, nodes: readonly 
     const node = nodes[index]!, record = node.record;
     requireCandidate(record.formatVersion === 3 && record.phase === "quiesced" && ["capture", "observation", "takeover"].includes(record.event)
       && record.controlProof !== null && record.controlProof.kind !== "legacy-first-capture-bridge");
-    const proof = applyControlNode(plan, node, nodes[index - 1], origin, roster, bindings, state);
+    const proof = applyControlNode(plan, node, nodes[index - 1], origin, roster, bindings, state, syntaxFrame);
+    reserveP0FNativeNodes(3, 1);
     events.push({ journal: node.reference, proof });
     requireCandidate(state.invariant !== null);
-    if (record.event === "capture") captures.set(node.reference.ref, { rows: state.rows, invariant: state.invariant });
+    if (record.event === "capture") { reserveP0FNativeNodes(3, 1); captures.set(node.reference.ref, { rows: state.rows, invariant: state.invariant }); }
   }
   requireCandidate(state.invariant !== null);
+  reserveP0FNativeNodes(11 + state.unresolvedEncoding.size);
   return { kind: "untrusted-verification-controls" as const, originCapture: origin.reference, originalRoster: roster,
     expectedRows: state.rows, invariant: state.invariant, captures, events, unresolvedEncoding: [...state.unresolvedEncoding] };
 }

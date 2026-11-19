@@ -4,6 +4,7 @@ import { counter, hash, id, ref, source } from "../parse-primitives.ts";
 import { sourceClientRawRowSchema, sourceClientsEncodingSchema } from "../source-clients.ts";
 import type { SourceRef } from "../types.ts";
 import { compareNumber, compareText, equal, ordered, requireCandidate } from "./common.ts";
+import { preparseP0FInvariantJson, reserveP0FNativeNodes, type P0FArtifactSyntaxFrame } from '../../../identity/internal/m2-p0-artifacts-frame.ts';
 
 const text = z.string().min(1).max(4096).refine(value => !value.includes("\0"));
 export const uint = z.string().regex(/^(0|[1-9][0-9]*)$/);
@@ -84,13 +85,16 @@ export const eventFactsSchema = z.object({ formatVersion: z.literal(1), kind: z.
   observedAt: time, actor, beforeCount: uint, beforeRowsDigest: hash, clients: z.array(client), runtime,
   sessions: z.discriminatedUnion("kind", [postgres, linux, darwin]),
 }).strict();
-const canonicalObjectText = z.string().min(1).refine(value => !value.includes("\0")).refine(value => {
-  try { const item: unknown = JSON.parse(value); return item !== null && typeof item === "object" && !Array.isArray(item) && canonicalJson(item) === value; }
+const canonicalObjectTextFor = (frame?: P0FArtifactSyntaxFrame) => z.string().min(1).refine(value => !value.includes("\0")).refine(value => {
+  const decode = () => { const item: unknown = JSON.parse(value); return item !== null && typeof item === "object" && !Array.isArray(item) && canonicalJson(item) === value; };
+  if (frame !== undefined) { preparseP0FInvariantJson(frame, value); return decode(); }
+  try { return decode(); }
   catch { return false; }
 });
-export const invariantSchema = z.object({ singleton: z.literal("1"), databaseInstanceId: source.shape.databaseInstanceId,
-  controlRootJson: canonicalObjectText, mutexIdentityJson: canonicalObjectText, fenceEpoch: safePos, admission: z.literal("sealed"),
+export const invariantSchemaFor = (frame?: P0FArtifactSyntaxFrame) => z.object({ singleton: z.literal("1"), databaseInstanceId: source.shape.databaseInstanceId,
+  controlRootJson: canonicalObjectTextFor(frame), mutexIdentityJson: canonicalObjectTextFor(frame), fenceEpoch: safePos, admission: z.literal("sealed"),
   activeMigrationId: id, planDigest: hash, protocolVersion: z.literal("1"), guardManifestDigest: hash }).strict();
+export const invariantSchema = invariantSchemaFor();
 const rowChange = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("maintenance-registration"), before: z.null(), after: sourceClientRawRowSchema, actorId: z.string().uuid() }).strict(),
   z.object({ kind: z.literal("client-observation"), before: sourceClientRawRowSchema, after: sourceClientRawRowSchema, subject: rowKey, effect: z.enum(["observed", "ended-observed"]) }).strict(),
@@ -99,8 +103,8 @@ const successor = { formatVersion: z.literal(1), originCapture: ref, originSourc
   fenceEpoch: safePos, receiptGeneration: safePos, textEncoding: sourceClientsEncodingSchema, previousAnchor: ref,
   fromGeneration: safePos, toGeneration: safePos, targetSequence: safePos, beforeRowsDigest: hash, afterRowsDigest: hash,
   changes: z.array(rowChange), facts: eventFactsSchema };
-export const controlProofSchema = z.discriminatedUnion("kind", [
-  z.object({ formatVersion: z.literal(1), kind: z.literal("capture-controls"), maintenanceInvariant: invariantSchema, facts: eventFactsSchema }).strict(),
+export const controlProofSchemaFor = (frame?: P0FArtifactSyntaxFrame) => z.discriminatedUnion("kind", [
+  z.object({ formatVersion: z.literal(1), kind: z.literal("capture-controls"), maintenanceInvariant: frame === undefined ? invariantSchema : invariantSchemaFor(frame), facts: eventFactsSchema }).strict(),
   z.object({ ...successor, kind: z.literal("control-successor") }).strict(),
   z.object({ ...successor, kind: z.literal("legacy-first-capture-bridge"), legacy: z.object({ ready: ref, receipt: ref, manifests: ref }).strict() }).strict(),
   z.object({ formatVersion: z.literal(1), kind: z.literal("cancel-terminal-controls"),
@@ -110,6 +114,7 @@ export const controlProofSchema = z.discriminatedUnion("kind", [
     beforeRowsDigest: hash, afterRowsDigest: hash, changes: z.tuple([]), facts: eventFactsSchema,
     successorRule: z.literal("open-next-epoch-clear-active-v1") }).strict(),
 ]);
+export const controlProofSchema = controlProofSchemaFor();
 export type EventFacts = z.infer<typeof eventFactsSchema>;
 export type ClientFact = EventFacts["clients"][number];
 export type RegisteredProcess = z.infer<typeof registeredProcess>;
@@ -121,6 +126,7 @@ export type MaintenanceInvariant = z.infer<typeof invariantSchema>;
 
 function resourceKeyRange(key: string, platform: "linux" | "darwin"): void {
   if (key.startsWith("map:")) {
+    reserveP0FNativeNodes(1 + (platform === 'linux' ? 5 : 3));
     const parts = key.split(":"), first = BigInt(parts[1]!), second = BigInt(parts[2]!);
     // Preserve each native key: Darwin emits begin/size; Linux emits start/end.
     if (platform === "darwin") requireCandidate(second > 0n && first + second <= (1n << 64n) - 1n);
@@ -197,6 +203,7 @@ export function checkFactsShape(facts: EventFacts, sourceRef: SourceRef): void {
     for (const item of sessions.registeredSessions) requireCandidate(!sessions.activity.some(active => active.pid === item.pid && active.backendStart === item.normalizedBackendStart));
     return;
   }
+  reserveP0FNativeNodes(3);
   requireCandidate(sourceRef.kind === "sqlite" && equal(sessions.observer, { host: actor.host, process: actor.process }));
   ordered(sessions.ownedResources, (a, b) => compareText(a.key, b.key));
   for (const item of sessions.ownedResources) resourceKeyRange(item.key, sessions.kind === "sqlite-linux-session-audit-v1" ? "linux" : "darwin");

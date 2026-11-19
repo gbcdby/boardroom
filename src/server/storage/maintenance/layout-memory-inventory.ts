@@ -2,7 +2,7 @@ import { z } from "zod";
 import { canonicalJson, digestJson, sha256 } from "./canonical.ts";
 import { digestRowMultiset } from "./manifests.ts";
 import { hash, ref, source } from "./parse-primitives.ts";
-import { copyLayoutInternalData, LayoutValueError } from "./layout-values.ts";
+import { copyLayoutInternalData, getLayoutValueErrorCode, LayoutValueError } from "./layout-values.ts";
 import type { ReadonlyDeep } from "./layout-values.ts";
 import type { ArtifactRef, Json, SourceRef } from "./types.ts";
 
@@ -68,11 +68,135 @@ function typed<T>(schema: z.ZodType<T>, value: unknown, code: LayoutValueError["
   return result.data;
 }
 function author(raw: string) {
-  try { return typed(authorSchema, copyLayoutInternalData(JSON.parse(raw), "inventory")); }
+  try { return validateMemoryAuthorValue(copyLayoutInternalData(JSON.parse(raw), "inventory")); }
   catch (error) {
-    if (error instanceof LayoutValueError && error.code === "budget_exceeded") throw error;
+    if (getLayoutValueErrorCode(error) === "budget_exceeded") throw error;
     throw new LayoutValueError("inventory_integrity");
   }
+}
+
+/** Shared shape only. P0 supplies the exact value read by its owning JSON guard;
+ * the original raw consumer above retains its legacy parser/error behavior. */
+export function validateMemoryAuthorValue(value: unknown): z.infer<typeof authorSchema> { return typed(authorSchema, value); }
+
+export type MemoryScalarRow = Readonly<Record<string, string | number | null>>;
+export type MemoryRowsInput = Readonly<{
+  documents: readonly Readonly<{ row: MemoryScalarRow; author: unknown }>[];
+  versions: readonly Readonly<{ row: MemoryScalarRow; author: unknown }>[];
+  summaries: readonly MemoryScalarRow[];
+}>;
+type MemoryDocumentCore = Omit<InventoryDocumentValue, 'sourceRowDigest'> & {
+  readonly row: MemoryScalarRow; readonly authorValue: z.infer<typeof authorSchema>; readonly body: Buffer; readonly bodySha256: string;
+};
+type MemoryVersionCore = Omit<InventoryVersionValue, 'sourceRowDigest' | 'object' | 'relativePath'> & {
+  readonly row: MemoryScalarRow; readonly authorValue: z.infer<typeof authorSchema>; readonly body: Buffer; readonly bodySha256: string;
+};
+const memoryRowFailures = new WeakMap<object, Readonly<{ row: MemoryScalarRow; column: string }>>();
+export function getMemoryRowFailure(error: unknown): Readonly<{ row: MemoryScalarRow; column: string }> | undefined {
+  return error !== null && (typeof error === 'object' || typeof error === 'function') ? memoryRowFailures.get(error) : undefined;
+}
+function memoryRow<T>(row: MemoryScalarRow, column: string, run: () => T): T {
+  try { return run(); }
+  catch (error) {
+    if (getLayoutValueErrorCode(error) !== undefined && !memoryRowFailures.has(error as object))
+      memoryRowFailures.set(error as object, Object.freeze({ row, column }));
+    throw error;
+  }
+}
+function memoryRequire(condition: unknown, row: MemoryScalarRow, column: string, code: LayoutValueError['code'] = 'inventory_integrity'): asserts condition {
+  if (!condition) memoryRow(row, column, () => requireValue(false, code));
+}
+function typedMemoryRow<T>(schema: z.ZodType<T>, value: unknown, row: MemoryScalarRow, columns: Readonly<Record<string, string>>): T {
+  const result = schema.safeParse(value);
+  if (result.success) return result.data;
+  // These issues are the schema's own returned diagnostics, not a thrown value.
+  // Only its fixed first-level field selects a compiled source column.
+  const field = result.error.issues[0]?.path[0];
+  const column = typeof field === 'string' && Object.hasOwn(columns, field) ? columns[field]! : 'id';
+  return memoryRow(row, column, () => { throw new LayoutValueError('inventory_integrity'); });
+}
+
+/** Complete legacy row/version/body/author/summary core, without storage IDs,
+ * artifact refs, frozen-manifest claims or a repository. The inventory builder
+ * and P0 each call this on their actual decoded rows, once per invocation. */
+export function validateLegacyMemoryRows(input: MemoryRowsInput): Readonly<{
+  documents: readonly MemoryDocumentCore[]; versions: readonly MemoryVersionCore[];
+}> {
+  requireValue(input.documents.length <= MAX_DOCUMENTS && input.versions.length <= MAX_VERSIONS
+    && input.summaries.length <= MAX_SUMMARIES, 'budget_exceeded');
+  const documents = input.documents.map(({ row, author: decoded }) => {
+    const values = typedMemoryRow(documentSchema.omit({ sourceRowDigest: true }), {
+      documentId: row.id, legacyKey: { scope: row.scope, projectId: row.project_id, agentId: row.agent_id }, documentKind: 'note',
+      currentVersion: row.version, updatedAt: row.updated_at, updatedByRaw: row.updated_by, source: row.source,
+    }, row, { documentId: 'id', legacyKey: 'scope', currentVersion: 'version', updatedAt: 'updated_at', updatedByRaw: 'updated_by', source: 'source' });
+    const authorValue = memoryRow(row, 'updated_by', () => validateMemoryAuthorValue(decoded));
+    const body = memoryRow(row, 'markdown', () => { requireValue(typeof row.markdown === 'string'); return bodyBytes(row.markdown); });
+    memoryRequire(body.length === row.byte_length, row, 'byte_length');
+    return { ...values, row, authorValue, body, bodySha256: sha256(body) };
+  });
+  const versions = input.versions.map(({ row, author: decoded }) => {
+    const values = typedMemoryRow(versionSchema.omit({ sourceRowDigest: true, object: true, relativePath: true }), {
+      versionId: row.id, documentId: row.document_id, version: row.version, parentVersion: row.parent_version,
+      actorId: row.actor_id, clientMutationId: row.client_mutation_id, summaryRequestId: row.summary_request_id,
+      authorRaw: row.author, source: row.source, createdAt: row.created_at,
+    }, row, { versionId: 'id', documentId: 'document_id', version: 'version', parentVersion: 'parent_version', actorId: 'actor_id',
+      clientMutationId: 'client_mutation_id', summaryRequestId: 'summary_request_id', authorRaw: 'author', source: 'source', createdAt: 'created_at' });
+    const authorValue = memoryRow(row, 'author', () => validateMemoryAuthorValue(decoded));
+    const body = memoryRow(row, 'markdown', () => { requireValue(typeof row.markdown === 'string'); return bodyBytes(row.markdown); });
+    const bodySha256 = sha256(body);
+    memoryRequire(body.length === row.byte_length, row, 'byte_length');
+    memoryRequire(bodySha256 === row.content_sha256, row, 'content_sha256');
+    return { ...values, row, authorValue, body, bodySha256 };
+  });
+  const byDocument = new Map<string, MemoryDocumentCore>(), keys = new Set<string>();
+  for (const document of documents) {
+    memoryRequire(!byDocument.has(document.documentId), document.row, 'id'); byDocument.set(document.documentId, document);
+    const key = JSON.stringify([document.legacyKey.scope, document.legacyKey.projectId, document.legacyKey.agentId]);
+    memoryRequire(!keys.has(key), document.row, 'scope'); keys.add(key);
+  }
+  const sorted = [...versions].sort((a, b) => compare(a.documentId, b.documentId) || a.version - b.version || compare(a.versionId, b.versionId));
+  const heads = new Map<string, MemoryVersionCore>(), ids = new Set<string>(), mutations = new Set<string>(), bodies = new Map<string, Buffer>();
+  for (const version of sorted) {
+    memoryRequire(!ids.has(version.versionId), version.row, 'id'); ids.add(version.versionId);
+    const document = byDocument.get(version.documentId);
+    memoryRequire(document, version.row, 'document_id', 'incomplete_inventory');
+    const expected = (heads.get(version.documentId)?.version ?? 0) + 1;
+    memoryRequire(version.version === expected && version.version <= document.currentVersion
+      && version.parentVersion === version.version - 1, version.row, 'version', 'incomplete_inventory');
+    const mutation = JSON.stringify([version.documentId, version.actorId, version.clientMutationId]);
+    memoryRequire(!mutations.has(mutation), version.row, 'client_mutation_id'); mutations.add(mutation);
+    memoryRequire(version.authorValue.actorId === version.actorId, version.row, 'author');
+    const prior = bodies.get(version.bodySha256);
+    memoryRequire(!prior || prior.length === version.body.length && prior.equals(version.body), version.row, 'markdown');
+    if (!prior) bodies.set(version.bodySha256, version.body);
+    heads.set(version.documentId, version);
+  }
+  for (const document of documents) {
+    const head = heads.get(document.documentId);
+    memoryRequire(head && head.version === document.currentVersion, document.row, 'version', 'incomplete_inventory');
+    // The strict author grammar has exactly four scalar fields. Field equality
+    // is the same canonical-value equation without encoding a second JSON tree.
+    memoryRequire(head.source === document.source && head.authorValue.kind === document.authorValue.kind
+      && head.authorValue.actorId === document.authorValue.actorId && head.authorValue.agentId === document.authorValue.agentId
+      && head.authorValue.displayName === document.authorValue.displayName, document.row, 'updated_by');
+    memoryRequire(head.bodySha256 === document.bodySha256 && head.body.length === document.body.length && head.body.equals(document.body), document.row, 'markdown');
+  }
+  const summaryIds = new Set<string>(), summaryKeys = new Set<string>();
+  for (const row of input.summaries) {
+    const id = memoryRow(row, 'id', () => typed(memoryId, row.id));
+    memoryRequire(!summaryIds.has(id), row, 'id'); summaryIds.add(id);
+    const key = JSON.stringify([row.project_id, row.agent_id, row.trigger_key]);
+    memoryRequire(!summaryKeys.has(key), row, 'trigger_key'); summaryKeys.add(key);
+    memoryRow(row, 'base_version', () => typed(counter, row.base_version));
+    memoryRow(row, 'revision', () => typed(counter.positive(), row.revision));
+    for (const field of ['completed_task_revision', 'result_version']) if (row[field] !== null)
+      memoryRow(row, field, () => typed(counter.positive(), row[field]));
+    memoryRow(row, 'state', () => typed(z.enum(['pending', 'running', 'completed', 'failed', 'conflicted', 'cancelled']), row.state));
+    memoryRow(row, 'trigger', () => typed(z.enum(['task_completed', 'message_threshold', 'session_end', 'retry']), row.trigger));
+    for (const field of ['created_at', 'started_at', 'finished_at']) if (row[field] !== null)
+      memoryRow(row, field, () => typed(timestamp, row[field]));
+  }
+  return { documents, versions };
 }
 function bodyBytes(markdown: string): Buffer {
   requireValue(Buffer.byteLength(markdown, "utf8") <= MAX_BODY_BYTES, "budget_exceeded");
@@ -208,18 +332,18 @@ export function buildLayoutMemoryInventory(value: unknown): ReadonlyDeep<LayoutM
       return Object.fromEntries(row.map((cell, column) => [tableColumns[index]![column]!, decodeCell(cell, input.dialect, index, column)]));
     }));
   }
-  const documents: InventoryDocumentValue[] = decoded[0]!.map((row, index) => typed(documentSchema, {
+  const checked = validateLegacyMemoryRows({
+    documents: decoded[0]!.map(row => ({ row, author: author(row.updated_by as string) })),
+    versions: decoded[1]!.map(row => ({ row, author: author(row.author as string) })), summaries: decoded[2]!,
+  });
+  const documents: InventoryDocumentValue[] = checked.documents.map(({ row }, index) => typed(documentSchema, {
     documentId: row.id, legacyKey: { scope: row.scope, projectId: row.project_id, agentId: row.agent_id }, documentKind: "note",
     currentVersion: row.version, updatedAt: row.updated_at, updatedByRaw: row.updated_by, source: row.source,
     sourceRowDigest: digestJson(input.tables[0]!.rows[index]),
   }));
   const objectBytes = new Map<string, { ref: PlannedMemoryObjectRefValue; bytes: Buffer }>();
   let total = 0n;
-  const versions: InventoryVersionValue[] = decoded[1]!.map((row, index) => {
-    requireValue(typeof row.markdown === "string");
-    const bytes = bodyBytes(row.markdown);
-    const digest = sha256(bytes);
-    requireValue(bytes.length === row.byte_length && digest === row.content_sha256);
+  const versions: InventoryVersionValue[] = checked.versions.map(({ row, body: bytes, bodySha256: digest }, index) => {
     const object: PlannedMemoryObjectRefValue = { objectFormat: "utf8-sha256-v1", storageId: input.storageId, contentSha256: digest, byteLength: bytes.length };
     const prior = objectBytes.get(digest);
     // Equality remains byte-for-byte even when the content digest is shared.
@@ -231,30 +355,8 @@ export function buildLayoutMemoryInventory(value: unknown): ReadonlyDeep<LayoutM
       summaryRequestId: row.summary_request_id, authorRaw: row.author, source: row.source, createdAt: row.created_at,
       sourceRowDigest: digestJson(input.tables[1]!.rows[index]) });
   });
-  for (const row of decoded[0]!) {
-    requireValue(typeof row.markdown === "string");
-    const bytes = bodyBytes(row.markdown);
-    requireValue(bytes.length === row.byte_length);
-    const head = versions.find(version => version.documentId === row.id && version.version === row.version);
-    requireValue(head, "incomplete_inventory");
-    requireValue(head.object.contentSha256 === sha256(bytes) && head.object.byteLength === bytes.length
-      && objectBytes.get(head.object.contentSha256)!.bytes.equals(bytes));
-  }
-  const summaryIds = new Set<string>();
-  const summaryKeys = new Set<string>();
-  for (const row of decoded[2]!) {
-    const id = typed(memoryId, row.id);
-    requireValue(!summaryIds.has(id)); summaryIds.add(id);
-    const key = canonicalJson([row.project_id, row.agent_id, row.trigger_key]);
-    requireValue(!summaryKeys.has(key)); summaryKeys.add(key);
-    typed(counter, row.base_version); typed(counter.positive(), row.revision);
-    for (const field of ["completed_task_revision", "result_version"]) if (row[field] !== null) typed(counter.positive(), row[field]);
-    typed(z.enum(["pending", "running", "completed", "failed", "conflicted", "cancelled"]), row.state);
-    typed(z.enum(["task_completed", "message_threshold", "session_end", "retry"]), row.trigger);
-    for (const field of ["created_at", "started_at", "finished_at"]) if (row[field] !== null) typed(timestamp, row[field]);
-    // message_ids/error/evidence stay original TEXT in the frozen table digest.
-    // summary_request_id has no FK: do not recreate or require a deleted request.
-  }
+  // message_ids/error/evidence stay original TEXT in the frozen table digest.
+  // summary_request_id has no FK: the shared core does not resurrect a request.
   documents.sort((left, right) => compare(left.documentId, right.documentId));
   versions.sort((left, right) => compare(left.documentId, right.documentId) || left.version - right.version || compare(left.versionId, right.versionId));
   const objects = [...objectBytes.values()].map(entry => entry.ref).sort((left, right) => compare(left.contentSha256, right.contentSha256) || left.byteLength - right.byteLength);
