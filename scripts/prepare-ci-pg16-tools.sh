@@ -35,6 +35,7 @@ printf 'Private PostgreSQL tools: version=%s architecture=%s\n' "$selected_versi
 restart_tools=$(mktemp -d "$RUNNER_TEMP/boardroom-pg16-restart-tools.XXXXXX")
 restart_tools=$(realpath "$restart_tools")
 restart_debs=$(mktemp -d "$RUNNER_TEMP/boardroom-pg16-restart-debs.XXXXXX")
+restart_debs=$(realpath "$restart_debs")
 # Keep normal APT authentication and fail on any download error. No installation,
 # dependency closure, maintainer scripts or host/default cluster is involved.
 (
@@ -49,6 +50,7 @@ for package in postgresql-16 postgresql-client-16; do
   [[ "$(dpkg-deb --field "$archive" Version)" == "$selected_version" ]] || fail "Unexpected version in $archive"
   [[ "$(dpkg-deb --field "$archive" Architecture)" == "$architecture" ]] || fail "Unexpected architecture in $archive"
   dpkg-deb --extract "$archive" "$restart_tools"
+  if [[ "$package" == postgresql-client-16 ]]; then client_archive=$archive; fi
 done
 
 restart_bin="$restart_tools/usr/lib/postgresql/16/bin"
@@ -61,9 +63,17 @@ for tool in postgres initdb pg_ctl pg_dump pg_restore psql; do
   printf '%s\n' "$version_output"
   [[ "$version_output" =~ \(PostgreSQL\)\ 16\.15($|[[:space:]]) ]] || fail "$tool is not PostgreSQL 16.15"
 done
+# Keep the exact authenticated archive for the system-client install. The
+# consumer rechecks this handoff; it must not fetch the same package again.
+[[ "$client_archive" != *$'\n'* && "$client_archive" != *$'\r'* ]] || fail "Unexpected client archive path"
+client_bytes=$(stat -c %s -- "$client_archive")
+client_sha256=$(sha256sum -- "$client_archive")
+client_sha256=${client_sha256%% *}
 # The runner and independent restart fixture use these private tools. The
 # isolated full suite retains its fixed system path; CI installs the same
 # validated client package there. Publish only after all six tools pass.
 printf '%s\n' "$restart_bin" >> "$GITHUB_PATH"
 printf 'bin=%s\n' "$restart_bin" >> "$GITHUB_OUTPUT"
 printf 'version=%s\n' "$selected_version" >> "$GITHUB_OUTPUT"
+printf 'client_archive=%s\nclient_bytes=%s\nclient_sha256=%s\nclient_package=postgresql-client-16\narchitecture=%s\n' \
+  "$client_archive" "$client_bytes" "$client_sha256" "$architecture" >> "$GITHUB_OUTPUT"

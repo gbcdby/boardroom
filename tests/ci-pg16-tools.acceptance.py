@@ -10,6 +10,7 @@ No system package state, sources, services or keyrings are changed.
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ from email.utils import formatdate
 
 
 SCRIPT = Path(os.environ.get("BOARDROOM_PG_TOOLS_SCRIPT", Path(__file__).resolve().parents[1] / "scripts/prepare-ci-pg16-tools.sh"))
+VERIFY_SCRIPT = Path(__file__).resolve().parents[1] / "scripts/verify-ci-pg16-client.sh"
 INSTALLED = "16.16-1.pgdg24.04+1"
 AVAILABLE = "16.15-0ubuntu0.24.04.1"
 NEWER_AVAILABLE = "16.16-0ubuntu0.24.04.1"
@@ -95,6 +97,19 @@ Acquire::Languages "none";
     def prepare(self):
         return self.run("bash", "-euo", "pipefail", str(SCRIPT), check=False)
 
+    def client_handoff(self):
+        output = dict(line.split("=", 1) for line in (self.root / "output").read_text().splitlines())
+        self.env.update(BOARDROOM_CI_PG16_VERSION=output["version"],
+                        BOARDROOM_CI_PG16_CLIENT_ARCHIVE=output["client_archive"],
+                        BOARDROOM_CI_PG16_CLIENT_BYTES=output["client_bytes"],
+                        BOARDROOM_CI_PG16_CLIENT_SHA256=output["client_sha256"],
+                        BOARDROOM_CI_PG16_CLIENT_PACKAGE=output["client_package"],
+                        BOARDROOM_CI_PG16_ARCHITECTURE=output["architecture"])
+        return Path(output["client_archive"])
+
+    def verify_client(self):
+        return self.run("bash", "-euo", "pipefail", str(VERIFY_SCRIPT), check=False)
+
     def assert_unchanged(self, case):
         case.assertEqual((self.root / "status").read_text(), self.status)
         case.assertFalse((self.root / "postinst-ran").exists())
@@ -148,6 +163,82 @@ class PostgreSQLToolsAcceptance(unittest.TestCase):
         output = dict(line.split("=", 1) for line in (fixture.root / "output").read_text().splitlines())
         self.assertEqual(output["version"], AVAILABLE)
         self.assertEqual({fixture.run("dpkg-deb", "--field", str(archive), "Version").stdout.strip() for archive in (fixture.root / "run").rglob("*.deb")}, {AVAILABLE})
+
+    def test_verified_client_remains_installable_without_repository_archive(self):
+        fixture = self.fixture([(package, AVAILABLE) for package in PACKAGES])
+        prepared = fixture.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+        archive = fixture.client_handoff()
+        self.assertEqual(fixture.env["BOARDROOM_CI_PG16_CLIENT_BYTES"], str(archive.stat().st_size))
+        self.assertEqual(fixture.env["BOARDROOM_CI_PG16_CLIENT_SHA256"], hashlib.sha256(archive.read_bytes()).hexdigest())
+        next((fixture.root / "repo/pool").glob("postgresql-client-16_*.deb")).unlink()
+        verification = fixture.verify_client()
+        self.assertEqual(verification.returncode, 0, verification.stderr)
+        self.assertEqual(verification.stdout.strip(), str(archive.resolve()))
+        # Unlike simulation, download-only actually tries to acquire missing
+        # archives, but never changes package state or executes maintainer scripts.
+        fetched = fixture.run("apt-get", "--download-only", "install", "--yes", "--no-install-recommends",
+                              "--no-remove", "--allow-downgrades", str(archive))
+        self.assertIn("0 B", fetched.stdout)
+        simulated = fixture.run("apt-get", "--simulate", "install", "--yes", "--no-install-recommends",
+                                "--no-remove", "--allow-downgrades", str(archive))
+        self.assertIn(f"Inst postgresql-client-16 [{INSTALLED}] ({AVAILABLE}", simulated.stdout)
+        self.assertNotIn("Inst postgresql-16 ", simulated.stdout)
+
+    def test_client_handoff_rejects_wrong_expected_fields(self):
+        fixture = self.fixture([(package, AVAILABLE) for package in PACKAGES])
+        self.assertEqual(fixture.prepare().returncode, 0)
+        fixture.client_handoff()
+        for key, value in {"BOARDROOM_CI_PG16_VERSION": NEWER_AVAILABLE,
+                           "BOARDROOM_CI_PG16_CLIENT_PACKAGE": "postgresql-16",
+                           "BOARDROOM_CI_PG16_ARCHITECTURE": "arm64" if fixture.arch != "arm64" else "amd64",
+                           "BOARDROOM_CI_PG16_CLIENT_BYTES": "1",
+                           "BOARDROOM_CI_PG16_CLIENT_SHA256": "0" * 64}.items():
+            with self.subTest(field=key):
+                original = fixture.env[key]
+                fixture.env[key] = value
+                rejected = fixture.verify_client()
+                fixture.env[key] = original
+                self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+                self.assertEqual(rejected.stdout, "")
+
+    def test_client_handoff_rejects_changed_bytes_and_unsafe_paths(self):
+        fixture = self.fixture([(package, AVAILABLE) for package in PACKAGES])
+        self.assertEqual(fixture.prepare().returncode, 0)
+        archive = fixture.client_handoff()
+        original = archive.read_bytes()
+        outside = fixture.root / archive.name
+        outside.write_bytes(original)
+        symlink = archive.with_name("symlink.deb")
+        symlink.symlink_to(archive)
+        alias_directory = fixture.root / "run/boardroom-pg16-restart-debs.alias"
+        alias_directory.symlink_to(archive.parent, target_is_directory=True)
+        for candidate in (archive.relative_to(fixture.root), outside, symlink, alias_directory / archive.name, archive.parent):
+            with self.subTest(path=str(candidate)):
+                fixture.env["BOARDROOM_CI_PG16_CLIENT_ARCHIVE"] = str(candidate)
+                self.assertNotEqual(fixture.verify_client().returncode, 0)
+        fixture.env["BOARDROOM_CI_PG16_CLIENT_ARCHIVE"] = str(archive)
+        for changed in (original + b"x", bytes([original[0] ^ 1]) + original[1:]):
+            archive.write_bytes(changed)
+            rejected = fixture.verify_client()
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(rejected.stdout, "")
+
+    def test_client_handoff_rechecks_archive_metadata_after_digest(self):
+        for kind in ("package", "version", "architecture"):
+            with self.subTest(kind=kind):
+                fixture = self.fixture([(package, AVAILABLE) for package in PACKAGES])
+                self.assertEqual(fixture.prepare().returncode, 0)
+                archive = fixture.client_handoff()
+                version = "16.2-1ubuntu4" if kind == "version" else AVAILABLE
+                alternative = self.fixture([(package, version) for package in PACKAGES], bad_arch=kind == "architecture")
+                package = "postgresql-16" if kind == "package" else "postgresql-client-16"
+                shutil.copyfile(next((alternative.root / "repo/pool").glob(f"{package}_*.deb")), archive)
+                fixture.env["BOARDROOM_CI_PG16_CLIENT_BYTES"] = str(archive.stat().st_size)
+                fixture.env["BOARDROOM_CI_PG16_CLIENT_SHA256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+                rejected = fixture.verify_client()
+                self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+                self.assertEqual(rejected.stdout, "")
 
     def test_only_newer_minor_fails_without_using_installed_tools(self):
         fixture = self.fixture([(package, NEWER_AVAILABLE) for package in PACKAGES])

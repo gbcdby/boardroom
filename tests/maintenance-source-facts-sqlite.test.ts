@@ -26,6 +26,7 @@ import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-sou
 import type { JournalRecordV2, JournalRecordV3, OperationMutex, SourceClientFactsWindow, SourceFilesManifest } from "../src/server/storage/maintenance/types.ts";
 import { withSqliteSourceCloseDiagnostics } from "./fixtures/maintenance-source-close-diagnostic.ts";
 import { historicalControllerProcess, historicalControllerRow } from "./fixtures/maintenance-controller-history.ts";
+import { withSelfMapsDiagnostics } from "./fixtures/maintenance-self-maps-diagnostic.ts";
 
 async function fixture(withClient = false, encoding: "UTF-8" | "UTF-16le" | "UTF-16be" = "UTF-8", nativeChild = false,
   setup?: (driver: SqliteDriver, directory: string) => Promise<Partial<StorageClientLifecycle>>, initialGeneration = 1) {
@@ -73,7 +74,10 @@ async function fixture(withClient = false, encoding: "UTF-8" | "UTF-16le" | "UTF
     }
     const options = { environment, originalCwd: directory, expectedSourceId: environment.inventory.selectedSourceId!,
       controlRoot: path.join(dataDir, "control"), targetRoot: path.join(directory, "target") };
-    const plan = await planMigration(options, adapter), reference = await persistMigrationPlan(plan, options, adapter);
+    const { plan, reference } = await withSelfMapsDiagnostics(async () => {
+      const plan = await planMigration(options, adapter), reference = await persistMigrationPlan(plan, options, adapter);
+      return { plan, reference };
+    });
     const store = await ArtifactStore.open(reference.controlRoot, plan.source);
     mutex = await adapter.acquireMutex(store.identity, (await adapter.observe()).state);
     const head = await adapter.withSourceLock("control", async lock => {
