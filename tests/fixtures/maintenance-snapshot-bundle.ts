@@ -13,7 +13,9 @@ import type { JournalRecordV2, MaintenanceAdapter, OperationMutex, SourceFileEnt
  * fixed test data: this fixture does not scan/qualify a provider or authorize a production Jq. */
 export async function snapshotBundleFixture(kind: "sqlite" | "postgres" = "sqlite",
   options: { changeCapture?: (record: JournalRecordV2) => JournalRecordV2 } = {}) {
-  const f = await enterFixture(kind);
+  // A real payload exists even when this protocol fixture has no selected config.
+  // Seed it before P is persisted, through the existing managed-session input.
+  const f = await enterFixture(kind, { sessions: true });
   let writer: Database.Database | undefined, adapter: MaintenanceAdapter | undefined, mutex: OperationMutex | undefined;
   const close = async () => {
     try { await mutex?.release(); }
@@ -58,6 +60,11 @@ export async function snapshotBundleFixture(kind: "sqlite" | "postgres" = "sqlit
       };
       await visit("");
     }
+    const payloadEntry = entries.find(entry => entry.sourceRoot === "managed-sessions"
+      && entry.sourceRelativePath === "nested/capture-binary" && entry.kind === "file");
+    assert(payloadEntry, "the persisted fixture must include its real managed-session file");
+    const sourcePayload = payloadEntry.payload;
+    assert(sourcePayload && BigInt(sourcePayload.bytes) > 0n, "corruption tests require actual nonempty original bytes");
     const files: SourceFilesManifest = { formatVersion: 2, kind: "source-files", source: f.plan.source, roots: f.plan.fileRoots,
       rootBindings, entries, sourceMembershipExclusions: ["database-files", "entire-maintenance-control-root", "all-maintenance-artifacts"] };
     const filesRef = await store.putJson("source-files", files);
@@ -83,6 +90,6 @@ export async function snapshotBundleFixture(kind: "sqlite" | "postgres" = "sqlit
     });
     const sealed = await adapter.observe(), held = adapter;
     const run = <T>(consume: (lock: SourceLock) => Promise<T>): Promise<T> => held.withSourceLock("snapshot", consume);
-    return { ...f, adapter, mutex, store, files, filesRef, capture, sealed, writer, run, close };
+    return { ...f, adapter, mutex, store, files, filesRef, sourcePayload, capture, sealed, writer, run, close };
   } catch (error) { await close(); throw error; }
 }

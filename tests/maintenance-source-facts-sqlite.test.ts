@@ -785,11 +785,21 @@ test("A11A empty SQLite roster still rejects a real unregistered source handle",
 });
 
 test("A11A SQLite uses both real lock modes without DML or new source artifacts", async () => {
-  const f = await fixture(true);
+  let contentFile = "";
+  const f = await fixture(true, "UTF-8", false, async (_driver, directory) => {
+    // Ordinary owned source-directory bytes, not a selected config or an Fs qualification.
+    // This existing setup callback runs before the plan is persisted.
+    contentFile = path.join(directory, "source-content-witness.bin");
+    await writeFile(contentFile, Buffer.from([0, 0xff, 0x80, 1, 10]), { mode: 0o600 });
+    return {};
+  });
   try {
     for (const mode of ["control", "snapshot"] as const) {
       if (mode === "snapshot") await anchorStructuralCapture(f);
-      const before = await f.adapter.observe(), config = await readFile(f.environment.configFile!);
+      const before = await f.adapter.observe(), content = await readFile(contentFile), configFile = f.environment.configFile;
+      assert(content.length > 0, "both lock modes must preserve actual nonempty source-directory bytes");
+      const config = configFile === null ? null : await readFile(configFile);
+      if (configFile === null) await assert.rejects(readFile(path.join(f.directory, "config.json")), { code: "ENOENT" });
       await withSqliteSourceCloseDiagnostics(mode, f.file, f.adapter, () => f.adapter.withSourceLock(mode, async lock => {
         const assertCompetitorBlocked = () => new Promise<void>((resolve, reject) => {
           const competitor = spawn(process.execPath, ["--input-type=module", "-e", `
@@ -810,7 +820,11 @@ test("A11A SQLite uses both real lock modes without DML or new source artifacts"
       }));
       const after = await f.adapter.observe();
       assert.deepEqual(after.manifests, before.manifests); assert.deepEqual(after.state, before.state); assert.deepEqual(after.clients, before.clients);
-      assert.deepEqual(await readFile(f.environment.configFile!), config);
+      assert.deepEqual(await readFile(contentFile), content);
+      if (configFile === null) {
+        assert.equal(f.environment.configFile, null);
+        await assert.rejects(readFile(path.join(f.directory, "config.json")), { code: "ENOENT" });
+      } else assert.deepEqual(await readFile(configFile), config);
     }
   } finally { await f.close(); }
 });

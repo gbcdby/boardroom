@@ -91,7 +91,7 @@ nativeTest("#152 snapshot B/U: real head, business and complete raw roster misma
 nativeTest("#152 snapshot B/U: corrupted original Fs payload rejects before native backup or target writes", async t => {
   const f = await snapshotBundleFixture();
   try {
-    const payload = f.files.entries.find(entry => entry.kind === "file")!.payload!;
+    const payload = f.sourcePayload;
     await writeFile(f.store.pathFor(payload), Buffer.alloc(Number(payload.bytes), 0));
     const before = await names(f.store); let backups = 0;
     await assert.rejects(f.run(async lock => {
