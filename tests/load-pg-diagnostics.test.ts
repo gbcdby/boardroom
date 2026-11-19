@@ -39,8 +39,70 @@ function harness(monitor = new Monitor()) {
   return { diagnostics, monitor, client };
 }
 
+// The public snapshot cannot prove that an evicted object is no longer strongly
+// held. Inspect only the private test helper's actual slots for this memory gate.
+type RingView<T> = { events: Array<{ value: T; bytes: number } | undefined>; head: number; count: number;
+  bytes: number; dropped: number; maxEvents: number; maxBytes: number; push(value: T): void; values(): T[] };
+function smallRing<T>(maxEvents: number, maxBytes: number): RingView<T> {
+  const trace = new LoadDiagnostics() as unknown as { events: { constructor: new (count: number, bytes: number) => RingView<T> } };
+  return new trace.events.constructor(maxEvents, maxBytes);
+}
+function assertStored<T>(ring: RingView<T>, expected: T[], dropped: number) {
+  const stored = ring.events.filter((entry): entry is { value: T; bytes: number } => entry !== undefined);
+  const actualBytes = stored.reduce((sum, entry) => sum + Buffer.byteLength(JSON.stringify(entry.value)), 0);
+  assert.deepEqual(ring.values(), expected, 'last-N order is preserved');
+  assert.equal(ring.count, expected.length);
+  assert.equal(ring.dropped, dropped);
+  assert.equal(stored.length, expected.length, 'no evicted entry remains strongly held in an array slot');
+  assert.ok(stored.every(entry => expected.includes(entry.value)));
+  assert.ok(actualBytes <= ring.maxBytes, 'actual strong references obey the byte limit');
+  assert.equal(actualBytes, ring.bytes, 'reported bytes equal all physically retained records');
+  assert.ok(ring.events.length <= ring.maxEvents);
+  for (let index = 0; index < ring.events.length; index++) {
+    const live = Array.from({ length: ring.count }, (_, offset) => (ring.head + offset) % ring.maxEvents).includes(index);
+    if (live) assert.notEqual(ring.events[index], undefined);
+    else assert.equal(ring.events[index], undefined, 'every non-live slot releases its record reference');
+  }
+  return { strongEntries: stored.length, actualBytes, dropped };
+}
+
+test('PGLOAD-OBS-02 R2: byte eviction releases every removed slot through consecutive eviction and wrap', () => {
+  const ring = smallRing<string>(5, 17);
+  assertStored(ring, [], 0);
+  for (const value of ['a', 'b', 'c', 'd', 'e']) ring.push(value);
+  assertStored(ring, ['a', 'b', 'c', 'd', 'e'], 0);
+  const large = 'x'.repeat(12); // JSON bytes: 14; one 3-byte entry fits exactly alongside it.
+  ring.push(large);
+  assertStored(ring, ['e', large], 4);
+  ring.push('z');
+  assertStored(ring, [large, 'z'], 5);
+  ring.push('h');
+  assertStored(ring, ['z', 'h'], 6);
+  for (const value of ['i', 'j', 'k']) ring.push(value);
+  assertStored(ring, ['z', 'h', 'i', 'j', 'k'], 6);
+  ring.push('l');
+  assertStored(ring, ['h', 'i', 'j', 'k', 'l'], 7);
+  ring.push(large);
+  assertStored(ring, ['l', large], 11);
+  ring.push('q'.repeat(16)); // The oversized new value must not evict any existing record.
+  assertStored(ring, ['l', large], 12);
+});
+
+test('PGLOAD-OBS-02 R2: count eviction preserves only the newest objects over repeated wraps', () => {
+  const ring = smallRing<{ id: number }>(3, 1024);
+  const values = Array.from({ length: 12 }, (_, id) => ({ id }));
+  assertStored(ring, [], 0);
+  values.forEach((value, index) => {
+    ring.push(value);
+    assertStored(ring, values.slice(0, index + 1).slice(-3), Math.max(0, index - 2));
+  });
+});
+
 test('PGLOAD-OBS-02: only the current in-flight mutation gets 50/100/150 ms opportunities', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const advance = async (ms: number) => { now += ms; t.mock.timers.tick(ms); await tick(); };
   const { diagnostics, monitor, client } = harness();
   await diagnostics.prepareMonitor('postgresql://private-canary');
   assert.equal(monitor.config?.connectionTimeoutMillis, 250);
@@ -49,16 +111,17 @@ test('PGLOAD-OBS-02: only the current in-flight mutation gets 50/100/150 ms oppo
   const result = deferred<unknown>();
   const query = diagnostics.wrapQuery((() => result.promise) as unknown as typeof PgClient.prototype.query);
   assert.equal(diagnostics.run('mutation', 1000, 0, () => Reflect.apply(query, client, [lock, ['parameter-canary']])), result.promise);
-  t.mock.timers.tick(49); await tick();
+  await advance(49);
   assert.equal(monitor.calls.length, 2);
-  for (const ms of [1, 50, 50]) { t.mock.timers.tick(ms); await tick(); }
+  for (const ms of [1, 50, 50]) await advance(ms);
   assert.equal(monitor.calls.length, 5);
   result.resolve({}); await tick();
-  t.mock.timers.tick(500); await tick();
+  await advance(500);
   await diagnostics.close();
   const observed = diagnostics.snapshot().server!;
   assert.equal(observed.snapshotCount, 3);
   assert.deepEqual(observed.samples.map(value => value.opportunityMs), [50, 100, 150]);
+  assert.deepEqual(observed.samples.map(value => value.sentAtMs), [50, 100, 150]);
   assert.equal(observed.pendingTimers, 0);
   assert.equal(observed.cleanup.transportEnded, true);
   assert.equal(observed.cleanup.pendingSettled, true);
@@ -147,6 +210,10 @@ test('PGLOAD-OBS-02/04: 36 snapshots, 180 rows, 8 blockers, byte caps and canary
   assert.equal(server.scheduledOpportunities, 36); assert.equal(server.limitSkips, 1);
   assert.equal(monitor.calls.length, 38);
   assert.ok(server.retainedBytes <= 128 * 1024); assert.ok(server.dropCount > 0);
+  const ring = (diagnostics as unknown as { server: { samples: RingView<(typeof server.samples)[number]> } }).server.samples;
+  const retained = assertStored(ring, server.samples, server.dropCount);
+  t.diagnostic(JSON.stringify({ snapshots: server.snapshotCount, rows: server.rowCount, cap: server.limits.retainedBytes,
+    reportedBytes: server.retainedBytes, publicSamples: server.samples.length, ...retained }));
   for (const sample of server.samples) {
     assert.ok(Buffer.byteLength(JSON.stringify(sample)) <= 8192);
     assert.equal(sample.rows.length, 5);

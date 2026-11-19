@@ -17,7 +17,7 @@ type QueryObservation = { startedAt: number; data: DiagnosticEvent; custom: bool
 
 /** Same last-N algorithm for the existing client trace and the smaller server log. */
 class LastN<T> {
-  private readonly events: Array<{ value: T; bytes: number }> = [];
+  private readonly events: Array<{ value: T; bytes: number } | undefined> = [];
   private head = 0; private count = 0;
   bytes = 0; dropped = 0;
   readonly maxEvents: number; readonly maxBytes: number;
@@ -26,7 +26,9 @@ class LastN<T> {
     const bytes = Buffer.byteLength(JSON.stringify(value));
     if (bytes > this.maxBytes) { this.dropped++; return; }
     while (this.count && (this.count === this.maxEvents || this.bytes + bytes > this.maxBytes)) {
-      this.bytes -= this.events[this.head]!.bytes; this.head = (this.head + 1) % this.maxEvents;
+      this.bytes -= this.events[this.head]!.bytes;
+      this.events[this.head] = undefined; // Release the evicted record even if this slot is not overwritten next.
+      this.head = (this.head + 1) % this.maxEvents;
       this.count--; this.dropped++;
     }
     this.events[(this.head + this.count) % this.maxEvents] = { value, bytes }; this.count++; this.bytes += bytes;
