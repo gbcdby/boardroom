@@ -13,7 +13,7 @@ import { inspectMaintenance } from "./inspect.ts";
 import { captureReference } from "./journal.ts";
 import type { JournalNode, UntrustedRequestPrefix } from "./journal.ts";
 import { ArtifactStore } from "./objects.ts";
-import { loadPersistedPlan, observeCapturePlanBindings } from "./plan.ts";
+import { loadPersistedPlan, observeCapturePlanSelection } from "./plan.ts";
 import { maintenanceFilesystem } from "./platform.ts";
 import { SourceFilesFailure } from "./source-files.ts";
 import type { MaintenanceResult, MaintenanceServiceOptions, ObservedMaintenanceAnchor, OperationMutex, SourceLock } from "./types.ts";
@@ -94,7 +94,7 @@ export async function runMaintenanceServiceCommand(options: MaintenanceServiceOp
     // not require the old frozen image. New enter independently revalidates its
     // new plan in the original first source lock.
     const observed = initial.state.admission === "open" && initial.state.journalSequence > 0 ? initial
-      : await observeCapturePlanBindings(plan, options, adapter);
+      : await observeCapturePlanSelection(plan, options, adapter);
     const store = await ArtifactStore.open(request.plan.controlRoot, request.expectedSource);
     rememberControllerStore(owner, store); await maintenanceFilesystem(store.root);
     if (descriptor.kind === "sqlite") await maintenanceFilesystem(path.dirname(descriptor.sqlitePath));
@@ -123,7 +123,7 @@ export async function runMaintenanceServiceCommand(options: MaintenanceServiceOp
       lastObserved = anchor(next.node); return next;
     };
     const start: Start = await withWindow("control", async lock => {
-      const begun = await beginControllerCommand(adapter, held, lock, command); scope = begun.scope;
+      const begun = await beginControllerCommand(adapter, held, lock, command, options); scope = begun.scope;
       const current = await assertControllerCommandWindow(scope, lock); remember(current);
       if (begun.prefix.status !== "new") return { mode: "replay", result: await replayPrefix(scope, lock, begun.prefix, current) };
       const chain = current.chain, head = chain?.nodes.at(-1);

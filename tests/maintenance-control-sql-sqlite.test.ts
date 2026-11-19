@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
-import { sqliteAuditFixture } from "./fixtures/maintenance-source-audit.ts";
+import { protocolSqliteAuditFixture as sqliteAuditFixture } from "./fixtures/maintenance-source-audit.ts";
 import { controlSeedColumns, controlSqlVector } from "./fixtures/maintenance-control-sql.ts";
 import { applyUntrustedControlSql, controlSqlOutcome, resolveUntrustedControlSql } from "../src/server/storage/maintenance/control-sql.ts";
 import type { SourceLock } from "../src/server/storage/maintenance/types.ts";

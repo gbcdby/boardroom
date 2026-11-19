@@ -6,14 +6,14 @@ import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { sha256, digestJson } from "../src/server/storage/maintenance/canonical.ts";
-import { inspectMaintenance } from "../src/server/storage/maintenance/inspect.ts";
-import { runMaintenanceServiceCommand } from "../src/server/storage/maintenance/service.ts";
-import { enterMaintenance, stageControllerEnter } from "../src/server/storage/maintenance/enter.ts";
+import { inspectMaintenance } from "./fixtures/maintenance-preview-graph.ts";
+import { runMaintenanceServiceCommand } from "./fixtures/maintenance-preview-graph.ts";
+import { enterMaintenance, stageControllerEnter } from "./fixtures/maintenance-preview-graph.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { maintenanceRequestDigest, parseJournal, parseReceipt } from "../src/server/storage/maintenance/parse.ts";
 import { assertControllerLockCompleted, beginControllerCommand } from "../src/server/storage/maintenance/controller-write.ts";
 import { captureReference, verifyJournalChain } from "../src/server/storage/maintenance/journal.ts";
-import { enterFixture } from "./fixtures/maintenance-enter.ts";
+import { protocolEnterFixture as enterFixture } from "./fixtures/maintenance-enter.ts";
 import { runActualMaintenanceCli, serviceFixture, startServiceChild } from "./fixtures/maintenance-service.ts";
 import type { InspectMaintenanceCommand } from "../src/server/storage/maintenance/controller-command.ts";
 import type { ControllerCommandScope } from "../src/server/storage/maintenance/controller-write.ts";
@@ -135,7 +135,7 @@ nativeTest("#152 C3 public enter SQLite: actual original command scope commits o
     let scope: ControllerCommandScope | undefined, firstLock: SourceLock | undefined;
     const transactionView = await adapter.withSourceLock("control", async lock => {
       firstLock = lock;
-      const begun = await beginControllerCommand(adapter, held, lock, command); scope = begun.scope;
+      const begun = await beginControllerCommand(adapter, held, lock, command, f.options); scope = begun.scope;
       assert.equal(begun.prefix.status, "new");
       return stageControllerEnter(begun.scope, lock, f.options);
     });
@@ -164,7 +164,7 @@ nativeTest("#152 C3 public enter SQLite: copied command scope cannot publish or 
     mutex = await adapter.acquireMutex(store.identity, (await adapter.observe()).state);
     const held = mutex, before = await adapter.observe(), files = await inventory(store.root);
     await adapter.withSourceLock("control", async lock => {
-      const { scope } = await beginControllerCommand(adapter, held, lock, { operation: "execute-migration", request: f.request });
+      const { scope } = await beginControllerCommand(adapter, held, lock, { operation: "execute-migration", request: f.request }, f.options);
       await assert.rejects(stageControllerEnter({ ...scope }, lock, f.options), { code: "maintenance_lost" });
     });
     assert.deepEqual(await adapter.observe(), before); assert.deepEqual(await inventory(store.root), files);
@@ -401,7 +401,7 @@ sourceFileTest("#152 C3 guard SQLite: a forgotten whole consumer retains its ori
 });
 
 nativeTest("#152 C3 actual CLI SQLite: production execute, read-only replay/inspect, and planned cancel retain exact public values", async () => {
-  const f = await enterFixture("sqlite", { drainClient: true });
+  const f = await enterFixture("sqlite", { drainClient: true, configSource: "none" });
   try {
     const request = { ...f.request, requestId: "actual-cli-public-execute" };
     const executed = runActualMaintenanceCli(f, "execute", request);

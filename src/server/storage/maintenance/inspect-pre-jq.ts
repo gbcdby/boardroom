@@ -4,7 +4,7 @@ import { MaintenanceFailure } from "./error.ts";
 import { captureReference, verifyJournalChain } from "./journal.ts";
 import { ArtifactStore } from "./objects.ts";
 import { hash, id, ref, source, text } from "./parse-primitives.ts";
-import { loadPersistedPlan, revalidatePlan } from "./plan.ts";
+import { loadPersistedPlan, observeCapturePlanSelection, revalidatePlan } from "./plan.ts";
 import type { ContinueRequest, MaintenanceAdapter, MaintenanceResult, MaintenanceServiceOptions, OperationMutex,
   SourceLock } from "./types.ts";
 
@@ -34,7 +34,7 @@ export async function inspectPreJq(options: MaintenanceServiceOptions, adapter: 
     const request = parsed.data;
     const plan = await loadPersistedPlan(request.plan, request.expectedSource);
     await mutex.assertHeld(); await lock.assertHeld();
-    await revalidatePlan(plan, options, adapter);
+    await observeCapturePlanSelection(plan, options, adapter);
     const store = await ArtifactStore.open(request.plan.controlRoot, request.expectedSource);
     const initial = await lock.observeSourceClients(), state = initial.state;
     requireValue(same(initial.source, plan.source) && same(initial.sourceIdentity, plan.sourceIdentity), "source_changed");
@@ -89,7 +89,8 @@ export async function inspectPreJq(options: MaintenanceServiceOptions, adapter: 
       await window.assertCurrent();
       await revalidatePlan(plan, options, adapter); await assertCurrent();
     });
-    // The facts callback's own fresh/close checks must finish before this final classification.
+    // This diagnostic preview has no frozen-source or writer authority. Complete its
+    // own readonly configuration observation after the facts callback's real close.
     await revalidatePlan(plan, options, adapter);
     try {
       const finalHead = await store.readAnchoredJournal({ ref: state.journalRecordRef, sha256: state.journalDigest });

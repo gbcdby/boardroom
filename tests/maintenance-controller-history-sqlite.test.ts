@@ -4,15 +4,15 @@ import path from "node:path";
 import filesystem from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import Database from "better-sqlite3";
-import { sqliteAuditFixture } from "./fixtures/maintenance-source-audit.ts";
+import { protocolSqliteAuditFixture as sqliteAuditFixture } from "./fixtures/maintenance-source-audit.ts";
 import { assertControllerPendingFailures, assertVerifiedConsumerFailure, controllerWriterFixture, historicalControllerProcess, historicalControllerRow } from "./fixtures/maintenance-controller-history.ts";
 import { readyRevalidationFixture } from "./fixtures/maintenance-ready-revalidation.ts";
 import { canonicalJson } from "../src/server/storage/maintenance/canonical.ts";
 import { verifySnapshotClosure } from "../src/server/storage/maintenance/journal.ts";
-import { planMigration, persistMigrationPlan } from "../src/server/storage/maintenance/plan.ts";
+import { planMigration, persistMigrationPlan } from "./fixtures/maintenance-preview-graph.ts";
 import { inspectRegisteredSourceProcess } from "../src/server/storage/maintenance/source-facts.ts";
 import type { ControllerCommandScope } from "../src/server/storage/maintenance/controller-write.ts";
-import { beginControllerCommand, commitControllerStep } from "../src/server/storage/maintenance/controller-write.ts";
+import { assertControllerSourcePlanBindings, beginControllerCommand, commitControllerStep } from "../src/server/storage/maintenance/controller-write.ts";
 import type { SourceLock } from "../src/server/storage/maintenance/types.ts";
 
 // Only these new capture/restore engineering fixtures use the Linux source-FD bridge.
@@ -40,7 +40,7 @@ captureTest("C3 SQLite original factory registers only through three real commit
       const result = close.call(this); if (source) events.push("source-closed"); return result; };
     const first = await f.adapter.withSourceLock("control", async lock => {
       locks.push(lock);
-      const begun = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request });
+      const begun = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }, f.options);
       scope = begun.scope; assert.equal(begun.prefix.status, "new");
       await assert.rejects(f.writer.commitControllerStep({ ...scope }, lock, { kind: "first-capture" }), { code: "maintenance_lost" });
       return f.writer.commitControllerStep(scope, lock, { kind: "first-capture" });
@@ -73,10 +73,12 @@ test("C3 SQLite production writer rejects copied native owners and the actual em
     expectedPhase: "planned" as const, expectedJournalDigest: f.head.sha256, requestId: "c3-unqualified" } };
   try {
     await assert.rejects(f.adapter.withSourceLock("control", async lock => {
-      await assert.rejects(beginControllerCommand({ ...f.adapter }, f.mutex, lock, command), { code: "maintenance_lost" });
-      await assert.rejects(beginControllerCommand(f.adapter, { ...f.mutex }, lock, command), { code: "maintenance_lost" });
-      await assert.rejects(beginControllerCommand(f.adapter, f.mutex, { ...lock }, command), { code: "maintenance_lost" });
-      const { scope } = await beginControllerCommand(f.adapter, f.mutex, lock, command);
+      await assert.rejects(beginControllerCommand({ ...f.adapter }, f.mutex, lock, command, f.options), { code: "maintenance_lost" });
+      await assert.rejects(beginControllerCommand(f.adapter, { ...f.mutex }, lock, command, f.options), { code: "maintenance_lost" });
+      await assert.rejects(beginControllerCommand(f.adapter, f.mutex, { ...lock }, command, f.options), { code: "maintenance_lost" });
+      const { scope } = await beginControllerCommand(f.adapter, f.mutex, lock, command, f.options);
+      await assert.rejects(assertControllerSourcePlanBindings({ ...scope }, lock), { code: "maintenance_lost" });
+      await assert.rejects(assertControllerSourcePlanBindings(scope, { ...lock }), { code: "maintenance_lost" });
       await commitControllerStep(scope, lock, { kind: "first-capture" });
     }), { code: "backup_capability_unavailable" });
     assert.deepEqual(await f.adapter.observeSourceClients(), before, "no first seal, registration or head change without actual P/S qualification");
@@ -92,7 +94,7 @@ captureTest("C3 SQLite a forgotten controller Promise keeps its original source 
   try {
     const outer = f.adapter.withSourceLock("control", async lock => {
       sourceLock = lock;
-      const { scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request });
+      const { scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }, f.options);
       operation = f.writer.commitControllerStep(scope, lock, { kind: "first-capture" });
       void operation.catch(() => {}); await reached;
     });
@@ -125,7 +127,7 @@ captureTest("C3 SQLite actual writer distinguishes lost COMMIT response from sou
       try {
         await f.adapter.withSourceLock("control", async lock => {
           original = lock;
-          ({ scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }));
+          ({ scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }, f.options));
           return f.writer.commitControllerStep(scope, lock, { kind: "first-capture" });
         });
       } catch (error) { rejected = true; assert.equal(error, primary); }
@@ -154,7 +156,7 @@ captureTest("C3 SQLite legacy capture keeps v2 bytes and rows through public-sco
   const before = await f.adapter.observeSourceClients(); let scope: ControllerCommandScope | undefined;
   try {
     const takeover = await f.adapter.withSourceLock("control", async lock => {
-      const begun = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "cancel-migration", request: f.request });
+      const begun = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "cancel-migration", request: f.request }, f.options);
       scope = begun.scope; return f.writer.commitControllerStep(scope, lock, { kind: "takeover" });
     });
     const intent = await f.adapter.withSourceLock("control", lock => f.writer.commitControllerStep(scope!, lock, { kind: "cancel-intent" }));
@@ -260,7 +262,7 @@ captureTest("C3 SQLite new private archive owner really restores anchored legacy
     const old = await verifySnapshotClosure(f.store, oldHead);
     const receipt = await f.store.readJson(old.receiptRef, "receipt"), verification = await f.store.readJson(old.receipt.verification, "verification");
     await f.adapter.withSourceLock("control", async lock => {
-      ({ scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }));
+      ({ scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }, f.options));
     });
     Database.prototype.pragma = function(this: Database.Database, ...args: Parameters<typeof pragma>) {
       const value = Reflect.apply(pragma, this, args);
@@ -301,7 +303,7 @@ captureTest("C3 SQLite anchored archive selection refuses caller paths before an
   try {
     const before = await f.adapter.observe();
     await f.adapter.withSourceLock("control", async lock => {
-      ({ scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }));
+      ({ scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }, f.options));
     });
     Database.prototype.pragma = function(this: Database.Database, ...args: Parameters<typeof pragma>) {
       if (args[0] === "integrity_check") restored++;
@@ -326,7 +328,7 @@ captureTest("C3 SQLite a real archive input close failure preserves undefined an
     const head = await f.store.readAnchoredJournal({ ref: before.state.journalRecordRef!, sha256: before.state.journalDigest! });
     const closure = await verifySnapshotClosure(f.store, head), archive = f.store.pathFor(closure.receipt.database);
     await f.adapter.withSourceLock("control", async lock => {
-      ({ scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }));
+      ({ scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }, f.options));
     });
     Database.prototype.pragma = function(this: Database.Database, ...args: Parameters<typeof pragma>) {
       const result = Reflect.apply(pragma, this, args);
@@ -366,7 +368,7 @@ captureTest("C3 SQLite a new execute scope binds the exact cancelled terminal be
   let held = f.mutex, scope: ControllerCommandScope | undefined;
   try {
     await f.adapter.withSourceLock("control", async lock => {
-      ({ scope } = await f.writer.beginControllerCommand(f.adapter, held, lock, { operation: "cancel-migration", request: f.request }));
+      ({ scope } = await f.writer.beginControllerCommand(f.adapter, held, lock, { operation: "cancel-migration", request: f.request }, f.options));
       return f.writer.commitControllerStep(scope, lock, { kind: "takeover" });
     });
     await f.adapter.withSourceLock("control", lock => f.writer.commitControllerStep(scope!, lock, { kind: "cancel-intent" }));
@@ -378,7 +380,7 @@ captureTest("C3 SQLite a new execute scope binds the exact cancelled terminal be
     await f.adapter.withSourceLock("control", async lock => {
       const command = { operation: "execute-migration" as const, request: { plan: reference, expectedSource: plan.source,
         expectedPhase: null, expectedJournalDigest: null, requestId: "next-epoch-enter" } };
-      const next = await f.writer.beginControllerCommand(f.adapter, held, lock, command);
+      const next = await f.writer.beginControllerCommand(f.adapter, held, lock, command, f.options);
       assert.equal(next.prefix.status, "new");
       const context = await f.writer.assertControllerEnterWindow(next.scope, lock);
       assert.deepEqual(context.head, terminal.node.reference);

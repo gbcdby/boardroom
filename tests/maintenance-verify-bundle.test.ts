@@ -238,7 +238,7 @@ for (const fault of ["payload", "mutex"] as const) nativeTest(`#152 V: ${fault} 
       t.mock.method(f.adapter, "verifyDatabase", async (...args: Parameters<typeof verify>) => {
         const result = await verify(...args); restores++;
         if (fault === "payload") {
-          const payload = f.files.entries.find(entry => entry.kind === "file")!.payload!;
+          const payload = f.sourcePayload;
           await writeFile(f.store.pathFor(payload), Buffer.alloc(Number(payload.bytes), 0));
         } else await f.mutex.release();
         return result;

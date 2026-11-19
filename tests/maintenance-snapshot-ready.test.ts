@@ -163,7 +163,7 @@ for (const fault of ["payload", "verification"] as const) nativeTest(`#152 R: ${
     const input = await f.prepare();
     await assert.rejects(f.run(async lock => {
       const anchor = lock.anchor.bind(lock);
-      const victim = fault === "verification" ? input.verification : f.files.entries.find(entry => entry.kind === "file")!.payload!;
+      const victim = fault === "verification" ? input.verification : f.sourcePayload;
       t.mock.method(lock, "anchor", async (...args: Parameters<typeof anchor>) => { anchors++; return anchor(...args); });
       t.mock.method(ArtifactStore.prototype, "putJson", async function(this: ArtifactStore, ...args: Parameters<typeof put>) {
         const result = await Reflect.apply(put, this, args);

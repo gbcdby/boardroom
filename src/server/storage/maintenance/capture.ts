@@ -8,7 +8,7 @@ import type { JournalNode, VerifiedJournalChain } from "./journal.ts";
 import { ArtifactStore } from "./objects.ts";
 import { hash, id, ref, source, text } from "./parse-primitives.ts";
 import { parseJournal, readSourceFiles } from "./parse.ts";
-import { loadPersistedPlan, observeCapturePlanBindings } from "./plan.ts";
+import { loadPersistedPlan, observeCapturePlanBindings, observeCapturePlanSelection } from "./plan.ts";
 import { maintenanceFilesystem } from "./platform.ts";
 import { buildSourceClientsRoster } from "./source-clients.ts";
 import { assertCapturedSourceClientBinding } from "./source-client-binding.ts";
@@ -214,7 +214,7 @@ async function runCapture(options: MaintenanceServiceOptions, value: ContinueReq
   let result: MaintenanceResult | CaptureSnapshotAttempt | undefined;
   try {
     await awaitControllerAdmission(owner);
-    const observed = await observeCapturePlanBindings(plan, options, adapter);
+    const observed = await observeCapturePlanSelection(plan, options, adapter);
     const initialStore = await ArtifactStore.open(request.plan.controlRoot, request.expectedSource);
     rememberControllerStore(owner, initialStore); await maintenanceFilesystem(initialStore.root);
     if (descriptor.kind === "sqlite") await maintenanceFilesystem(path.dirname(descriptor.sqlitePath));
@@ -232,7 +232,7 @@ async function runCapture(options: MaintenanceServiceOptions, value: ContinueReq
         let active = true;
         try {
           await awaitControllerAdmission(owner);
-          await observeCapturePlanBindings(plan, options, adapter);
+          await observeCapturePlanSelection(plan, options, adapter);
           const initial = await lock.observe(), raw = await lock.observeSourceClients(), expected = initial.state;
           bindObservation(initial, raw, plan);
           requireValue(expected.activeMigrationId === plan.migrationId && expected.planDigest === request.plan.planDigest, "plan_stale");
@@ -261,7 +261,12 @@ async function runCapture(options: MaintenanceServiceOptions, value: ContinueReq
     const withFacts = <T>(window: LockedWindow, prefix: Prefix,
       consume: (facts: SourceClientFactsWindow) => Promise<T>): Promise<T> =>
       window.lock.withSourceClientFacts(request.plan, async facts => {
-        try { assertOrigin(facts, window.raw, prefix); return await consume(facts); }
+        try {
+          assertOrigin(facts, window.raw, prefix);
+          await facts.assertCurrent(); await observeCapturePlanBindings(plan, options, adapter);
+          await window.assertFull();
+          return await consume(facts);
+        }
         catch (error) { recordControllerFailure(owner, failures, error); throw error; }
       });
 

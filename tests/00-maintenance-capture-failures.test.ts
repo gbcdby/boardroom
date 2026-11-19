@@ -15,7 +15,6 @@ import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-sou
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { verifyJournalChain, verifySnapshotClosure } from "../src/server/storage/maintenance/journal.ts";
 import { digestJson } from "../src/server/storage/maintenance/canonical.ts";
-import { enterMaintenance } from "../src/server/storage/maintenance/enter.ts";
 import { captureMaintenance } from "../src/server/storage/maintenance/capture.ts";
 import type { ContinueRequest, OperationMutex } from "../src/server/storage/maintenance/types.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
@@ -24,7 +23,7 @@ import { publishSnapshotBundle } from "../src/server/storage/maintenance/snapsho
 import { verifyRestoreBundle } from "../src/server/storage/maintenance/verify-bundle.ts";
 import { stageSnapshotReady } from "../src/server/storage/maintenance/snapshot-ready.ts";
 import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";
-import { finishControllerOwner } from "../src/server/storage/maintenance/controller-owner.ts";
+import { finishControllerOwner } from "./fixtures/maintenance-capture.ts";
 import type { ControllerOwner } from "../src/server/storage/maintenance/controller-owner.ts";
 
 // The positive S fixture uses the actual Linux ordinary source-FD bridge. It is
@@ -163,19 +162,25 @@ for (const kind of ["sqlite", "postgres"] as const) {
       });
   });
   nativeTest("#152 C1 " + kind + ": unknown S close retains original owner across capture and enter", async () => {
-    const f = await captureFixture(kind); let closes = 0, newOwners = 0;
+    const f = await captureFixture(kind); let closes = 0, newOwners = 0, injected = 0;
     const failure = new Error("synthetic response loss after actual owned native close");
     try {
       const before = await f.observe();
       f.profile.state.hook = (stage, file) => {
-        if (stage === "closed" && file === f.configFile) { closes++; if (closes === 1) throw failure; }
+        if (stage === "closed" && file === f.configFile) {
+          assert.deepEqual(f.state.events, ["capture-begin"], "fault must occur in the actual S capture owner");
+          closes++; if (closes === 1) { injected++; throw failure; }
+        }
       };
       await assert.rejects(f.capture(f.options, f.request));
+      assert.equal(injected, 1); assert.deepEqual(f.state.events, ["capture-begin"]);
       assert(closes >= 1); const completedCloses = closes; assert.equal(f.profile.state.handles.size, 0);
-      f.profile.state.hook = () => {}; f.state.events.length = 0;
+      f.profile.state.hook = (stage, file) => { if (stage === "closed" && file === f.configFile) closes++; };
+      f.state.events.length = 0;
       f.state.onOwner = () => { newOwners++; };
       await assert.rejects(f.capture(f.options, f.request));
-      await assert.rejects(enterMaintenance(f.options, { ...f.request, requestId: "first-enter",
+      // Both real entry copies must use the same original owner/pending module.
+      await assert.rejects(f.enter(f.options, { ...f.request, requestId: "first-enter",
         expectedPhase: null, expectedJournalDigest: null }));
       assert.equal(newOwners, 0); assert.equal(closes, completedCloses); assert.deepEqual(f.state.events, []);
       assert.deepEqual(await f.observe(), before);

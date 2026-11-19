@@ -11,13 +11,14 @@ import { migrations } from "../../src/server/db/migrations/index.ts";
 import { resolveBoardroomEnvironment } from "../../src/server/environment.ts";
 import { createSqliteMaintenanceAdapter } from "../../src/server/storage/maintenance/sqlite.ts";
 import { createPostgresMaintenanceAdapter } from "../../src/server/storage/maintenance/postgres.ts";
-import { planMigration, persistMigrationPlan } from "../../src/server/storage/maintenance/plan.ts";
+import { createPreviewGraph, planMigration, persistMigrationPlan } from "./maintenance-preview-graph.ts";
 import { registerStorageSourceClient } from "../../src/server/storage/source-client.ts";
 import type { ContinueRequest, MaintenanceServiceOptions } from "../../src/server/storage/maintenance/types.ts";
 
 /** Only bootstraps a private source and persists P; never seeds a journal, phase, or DB anchor. */
 export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite",
-  fixtureOptions: { sqliteEncoding?: "UTF-8" | "UTF-16le" | "UTF-16be"; directory?: string; sessions?: boolean; drainClient?: boolean } = {}) {
+  fixtureOptions: { sqliteEncoding?: "UTF-8" | "UTF-16le" | "UTF-16be"; directory?: string; sessions?: boolean; drainClient?: boolean;
+    configSource?: "file" | "none" } = {}) {
   // Use the checkout filesystem for durable positive fixtures. Some Linux runners mount /tmp
   // as tmpfs, which is intentionally outside the production filesystem support policy.
   const directory = await realpath(fixtureOptions.directory ?? await mkdtemp(path.join(path.dirname(process.cwd()), "br-enter-")));
@@ -27,6 +28,7 @@ export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite",
   const clients = new Set<Client>();
   let sourceClient: Awaited<ReturnType<typeof registerStorageSourceClient>> | undefined;
   let sourceDriver: SqliteDriver | PostgresDriver | undefined;
+  let preview: Awaited<ReturnType<typeof createPreviewGraph>> | undefined;
   const connect = async () => {
     assert(sourceUrl); const client = new Client({ connectionString: sourceUrl });
     client.on("error", () => {}); clients.add(client); await client.connect(); return client;
@@ -63,9 +65,10 @@ export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite",
         assert.equal(remaining, "0", "every owned backend must actually exit before DROP");
         await admin.query(`DROP DATABASE "${database}"`);
       }
-    } finally { await admin?.end(); await rm(directory, { recursive: true, force: true }); }
+    } finally { await admin?.end(); await preview?.close(); await rm(directory, { recursive: true, force: true }); }
   };
   try {
+    preview = await createPreviewGraph(directory, fixtureOptions.configSource === "none" ? "production" : "qualified-linux");
     if (kind === "sqlite") {
       const db = new Database(file);
       try {
@@ -88,9 +91,12 @@ export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite",
       try { await driver.connect(); await driver.exec("CREATE TABLE enter_observation(value TEXT)"); await driver.exec("INSERT INTO enter_observation VALUES('original business bytes')"); await driver.migrate(migrations); }
       finally { await driver.close(); }
     }
-    await writeFile(configFile, JSON.stringify({ dataDir, ...(kind === "postgres" ? { dbDriver: "postgres", pgConnectionString: sourceUrl } : {}) }), { mode: 0o600 });
+    if (fixtureOptions.configSource !== "none")
+      await writeFile(configFile, JSON.stringify({ dataDir, ...(kind === "postgres" ? { dbDriver: "postgres", pgConnectionString: sourceUrl } : {}) }), { mode: 0o600 });
     const environment = await resolveBoardroomEnvironment({ cwd: directory, homeDir: directory,
-      env: { AGENT_STUDIO_CONFIG: configFile, BOARDROOM_HOME: path.join(directory, "home") } });
+      env: { ...(fixtureOptions.configSource === "none"
+        ? { AGENT_STUDIO_DATA_DIR: dataDir, ...(kind === "postgres" ? { AGENT_STUDIO_DB_DRIVER: "postgres", AGENT_STUDIO_PG_CONNECTION_STRING: sourceUrl } : {}) }
+        : { AGENT_STUDIO_CONFIG: configFile }), BOARDROOM_HOME: path.join(directory, "home") } });
     const descriptor = environment.databaseDescriptor;
     if (fixtureOptions.sessions) {
       const sessions = path.join(environment.runtimeRoot, "sessions");
@@ -135,8 +141,16 @@ export async function enterFixture(kind: "sqlite" | "postgres" = "sqlite",
       assert.equal(initial.state.admission, "open"); assert.equal(initial.state.journalRecordRef, null);
       const request: ContinueRequest = { plan: reference, expectedSource: plan.source, expectedPhase: null, expectedJournalDigest: null, requestId: "first-enter" };
       const observe = async () => { const a = await createAdapter(); try { return await a.observe(); } finally { await a.close(); } };
-      return { kind, directory, dataDir, file, configFile, database, descriptor, options, plan, reference, request, initial,
+      return { kind, directory, dataDir, file, configFile, database, descriptor, options, plan, reference, request, initial, preview,
         createAdapter, observe, query, exec, connect, closeClient, sourceClient, close };
     } finally { await adapter.close(); }
   } catch (error) { await close(); throw error; }
+}
+
+/** Generic entry/phase tests explicitly retain null-config protocol coverage on
+ * Darwin. Non-null Linux preview and production capability refusals are separate
+ * exercised branches; this does not give Darwin the Linux CFP2 qualification. */
+export function protocolEnterFixture(kind: Parameters<typeof enterFixture>[0] = "sqlite",
+  options: Parameters<typeof enterFixture>[1] = {}) {
+  return enterFixture(kind, { configSource: process.platform === "darwin" ? "none" : "file", ...options });
 }

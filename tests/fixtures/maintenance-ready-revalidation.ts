@@ -44,7 +44,7 @@ export async function readyRevalidationFixture() {
     let scope: ControllerCommandScope | undefined;
     const select = async () => {
       await heldAdapter.withSourceLock("control", async lock => {
-        const begun = await writer.beginControllerCommand(heldAdapter, heldMutex, lock, { operation: "resume-migration", request: source.request });
+        const begun = await writer.beginControllerCommand(heldAdapter, heldMutex, lock, { operation: "resume-migration", request: source.request }, source.options);
         scope = begun.scope; return writer.commitControllerStep(scope, lock, { kind: "first-capture" });
       });
       await heldAdapter.withSourceLock("control", lock => writer.commitControllerStep(scope!, lock, { kind: "takeover" }));

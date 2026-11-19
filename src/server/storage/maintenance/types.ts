@@ -187,6 +187,17 @@ export type SourceRootBinding = SourceRootBindingBase & (
         readonly sourceStateDigest: string;
         readonly blockEffectsObservation: "not-observed-at-runtime";
       } }
+  | { readonly profile: "linux-native-ext4-fid-fsuuid-source-prepare-v1"; readonly filesystemType: "ext4";
+      readonly anchorHandle: Extract<SourceFileIncarnation, { type: 1 }>;
+      readonly readEvidence: {
+        readonly policy: "application-source-preservation-with-prepare-v1";
+        readonly kernelDiagnosticPolicy: "ext4-last-mounted-v1";
+        readonly profileEntryDigest: string;
+        readonly qualificationDigest: string;
+        readonly runtimeEnvironmentDigest: string;
+        readonly sourceStateDigest: string;
+        readonly blockEffectsObservation: "not-observed-at-runtime";
+      } }
 );
 interface SourceFileEntryBase { readonly sourceRoot: string; readonly sourceRelativePath: string }
 export type SourceFileEntry = SourceFileEntryBase & (

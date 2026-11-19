@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Client, type QueryResult } from "pg";
-import { postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgres.ts";
+import { protocolPostgresAuditFixture as postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgres.ts";
 import { controlSeedColumns, controlSqlVector } from "./fixtures/maintenance-control-sql.ts";
 import { applyUntrustedControlSql, controlSqlOutcome, resolveUntrustedControlSql } from "../src/server/storage/maintenance/control-sql.ts";
 import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";

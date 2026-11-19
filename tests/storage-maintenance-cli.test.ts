@@ -94,7 +94,7 @@ test("C3-AC45 CLI 新命令与 output-version 非法值在坏配置前严格拒�
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-async function sqliteFixture() {
+async function sqliteFixture(configSource: "file" | "none" = "file") {
   const [{ default: Database }, { runMigrations }, { migrations }, { resolveBoardroomEnvironment }, { readSqliteManifests }] = await Promise.all([
     import("better-sqlite3"), import("../src/server/db/migrate.ts"), import("../src/server/db/migrations/index.ts"),
     import("../src/server/environment.ts"), import("../src/server/storage/maintenance/sqlite-manifests.ts"),
@@ -111,9 +111,14 @@ async function sqliteFixture() {
     writer.prepare("INSERT INTO plan_cli_observation VALUES(?,?)").run("checkpointed", "old row");
     writer.pragma("wal_checkpoint(TRUNCATE)");
     writer.prepare("INSERT INTO plan_cli_observation VALUES(?,?)").run("wal-only", secret);
-    await writeFile(config, JSON.stringify({ dataDir, dbDriver: "sqlite", pgConnectionString: `postgres://unused:${secret}@unused.invalid/not-a-source` }), { mode: 0o600 });
+    if (configSource === "file") await writeFile(config, JSON.stringify({ dataDir, dbDriver: "sqlite", pgConnectionString: `postgres://unused:${secret}@unused.invalid/not-a-source` }), { mode: 0o600 });
     const env = environment(config, path.join(dir, "home"));
+    if (configSource === "none") {
+      delete env["AGENT_STUDIO_CONFIG"]; env["AGENT_STUDIO_DATA_DIR"] = dataDir;
+      env["AGENT_STUDIO_PG_CONNECTION_STRING"] = `postgres://unused:${secret}@unused.invalid/not-a-source`;
+    }
     const resolved = await resolveBoardroomEnvironment({ cwd: dir, env });
+    assert.equal(resolved.configFile === null, configSource === "none");
     assert.equal(resolved.startupState, "legacy_found");
     assert.ok(resolved.inventory.selectedSourceId);
     const control = path.join(dataDir, "maintenance-control"), target = path.join(dir, "target");
@@ -155,8 +160,28 @@ async function assertNoArtifacts(f: Awaited<ReturnType<typeof sqliteFixture>>) {
 }
 const platformTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
 
+platformTest("P152-CFP2: production CLI refuses non-null config without qualification and creates no plan or phase", async () => {
+  if (process.platform === "linux") {
+    const { sourceFilesFixture } = await import("./fixtures/maintenance-source-files.ts");
+    const builder = await sourceFilesFixture(); await builder.close();
+  }
+  const f = await sqliteFixture("file");
+  const state = () => ({ logical: f.logical(), maintenance: f.writer.prepare("SELECT * FROM storage_maintenance").all(),
+    clients: f.writer.prepare("SELECT * FROM storage_source_clients").all() });
+  try {
+    const before = state(), files = await readdir(f.dataDir);
+    for (const command of ["plan", "persist-plan"]) {
+      const result = run([command, ...f.args.slice(1)], f.dir, f.env, true);
+      assert.equal(result.status, 1); assert.equal(result.stdout, "");
+      assert.match(result.stderr, /^\[backup_capability_unavailable\]/);
+      for (const hidden of [secret, f.dir]) assert(!result.stderr.includes(hidden));
+      assert.deepEqual(state(), before); assert.deepEqual(await readdir(f.dataDir), files); await assertNoArtifacts(f);
+    }
+  } finally { await f.close(); }
+});
+
 platformTest("C3-AC45 persist-plan 显式 v2 精确安全输出可组成后续请求，默认与显式 v1 保持原合同", async () => {
-  const f = await sqliteFixture();
+  const f = await sqliteFixture("none");
   try {
     const before = f.logical();
     const explicitV1 = run(["persist-plan", ...f.args.slice(1), "--output-version", "1"], f.dir, f.env, true);
@@ -188,7 +213,7 @@ platformTest("C3-AC45 persist-plan 显式 v2 精确安全输出可组成后续�
 });
 
 platformTest("C3-AC45 新命令选择的源丢失时不创建替代 SQLite 数据库", async () => {
-  const f = await sqliteFixture();
+  const f = await sqliteFixture("none");
   try {
     const saved = run(["persist-plan", ...f.args.slice(1), "--output-version", "2"], f.dir, f.env, true);
     assert.equal(saved.status, 0, saved.stderr); const value = JSON.parse(saved.stdout) as PlanPersistenceResultV2;
@@ -202,7 +227,7 @@ platformTest("C3-AC45 新命令选择的源丢失时不创建替代 SQLite 数�
 });
 
 platformTest("P152-PLAN-01/02/05: 真实 SQLite CLI 读到已提交 WAL，保留全部逻辑值且只输出安全预览", async () => {
-  const f = await sqliteFixture();
+  const f = await sqliteFixture("none");
   try {
     const before = f.logical(), files = await readdir(f.dataDir);
     assert.ok((await stat(`${f.file}-wal`)).size > 0);
@@ -224,7 +249,7 @@ platformTest("P152-PLAN-01/02/05: 真实 SQLite CLI 读到已提交 WAL，保留
 });
 
 platformTest("P152-PERSIST-01: 显式 SQLite CLI 保存不可变计划并回读，源与目标不进入维护", async () => {
-  const f = await sqliteFixture();
+  const f = await sqliteFixture("none");
   const state = () => ({ logical: f.logical(), maintenance: f.writer.prepare("SELECT * FROM storage_maintenance").all(),
     clients: f.writer.prepare("SELECT * FROM storage_source_clients").all() });
   try {
@@ -267,7 +292,7 @@ platformTest("P152-PERSIST-01: 显式 SQLite CLI 保存不可变计划并回读�
 });
 
 platformTest("P152-PERSIST-03: 错来源、保护路径及未知控制根拒绝，既有内容不被修复", async () => {
-  const f = await sqliteFixture();
+  const f = await sqliteFixture("none");
   try {
     const before = f.logical(), args = ["persist-plan", ...f.args.slice(1)];
     const wrongSource = [...args]; wrongSource[2] = `wrong-${secret}`;
@@ -295,7 +320,7 @@ platformTest("P152-PERSIST-03: 错来源、保护路径及未知控制根拒绝�
 });
 
 platformTest("P152-PERSIST-04: 他源控制根与篡改的不可变计划拒绝，不授予执行资格", async () => {
-  const f = await sqliteFixture(), other = await sqliteFixture();
+  const f = await sqliteFixture("none"), other = await sqliteFixture("none");
   try {
     const before = f.logical(), otherBefore = other.logical();
     const saved = run(["persist-plan", ...f.args.slice(1)], f.dir, f.env, true);
@@ -323,7 +348,7 @@ platformTest("P152-PERSIST-04: 他源控制根与篡改的不可变计划拒绝�
 
 for (const [id, stage] of [["05", "回读"], ["07", "关闭"]] as const)
 platformTest(`P152-PERSIST-${id}: 保存后${stage}异常退出且保留真实计划，不声称成功或自动回滚（scoped harness）`, async () => {
-  const f = await sqliteFixture();
+  const f = await sqliteFixture("none");
   try {
     const before = f.logical();
     // Child-local faults after the real read or native close; no product injection API or fake PG.
@@ -363,7 +388,7 @@ platformTest(`P152-PERSIST-${id}: 保存后${stage}异常退出且保留真实�
 });
 
 platformTest("P152-PLAN-04: 错来源与保护路径严格拒绝，不修复、不建计划或空目标库", async () => {
-  const f = await sqliteFixture();
+  const f = await sqliteFixture("none");
   try {
     const before = f.logical();
     const wrongSource = [...f.args]; wrongSource[2] = `wrong-${secret}`;
@@ -379,7 +404,7 @@ platformTest("P152-PLAN-04: 错来源与保护路径严格拒绝，不修复、�
 });
 
 platformTest("P152-PLAN-01/04: 绝对目录别名支持只读预览，仍拒绝源重叠与控制目标碰撞", async () => {
-  const f = await sqliteFixture();
+  const f = await sqliteFixture("none");
   try {
     const alias = path.join(f.dir, "location-alias");
     await symlink(await realpath(f.dir), alias, "dir");
@@ -407,7 +432,7 @@ platformTest("P152-PLAN-01/04: 绝对目录别名支持只读预览，仍拒绝�
 
 platformTest("P152-PLAN-04: 预检 ID 对应的源缺失或被替换时，CLI 不创建或接纳替代源", async t => {
   for (const replaced of [false, true]) await t.test(replaced ? "replaced" : "missing", async () => {
-    const f = await sqliteFixture();
+    const f = await sqliteFixture("none");
     try {
       const moved = `${f.file}.moved`;
       await rename(f.file, moved);
@@ -422,7 +447,7 @@ platformTest("P152-PLAN-04: 预检 ID 对应的源缺失或被替换时，CLI �
 });
 
 platformTest("P152-PLAN-04: 坏 guard 保持拒绝，不执行 schema 迁移或修复", async () => {
-  const f = await sqliteFixture();
+  const f = await sqliteFixture("none");
   try {
     const guard = f.writer.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name LIKE 'br_storage_%' LIMIT 1").get() as { name: string };
     f.writer.exec(`DROP TRIGGER "${guard.name.replaceAll('"', '""')}"`);
@@ -437,7 +462,7 @@ platformTest("P152-PLAN-04: 坏 guard 保持拒绝，不执行 schema 迁移或�
 });
 
 platformTest("P152-PLAN-01/04: 多个隐式旧源拒绝；明确 data-dir 后仍核原 source ID", async () => {
-  const f = await sqliteFixture();
+  const f = await sqliteFixture("file");
   try {
     const { default: Database } = await import("better-sqlite3");
     const otherCwd = path.join(f.dir, "other-source"), otherData = path.join(otherCwd, "data");
@@ -461,7 +486,7 @@ platformTest("P152-PLAN-01/04: 多个隐式旧源拒绝；明确 data-dir 后仍
 });
 
 platformTest("P152-PLAN-03/05: PG 配置拒绝不会回落已有 SQLite 或泄漏连接输入", async () => {
-  const f = await sqliteFixture();
+  const f = await sqliteFixture("file");
   try {
     const before = f.logical();
     await writeFile(f.config, JSON.stringify({ dataDir: f.dataDir, dbDriver: "postgres", pgConnectionString: secret }), { mode: 0o600 });
@@ -505,6 +530,20 @@ test("P152-PLAN-03/PERSIST-06: 真实 PG16 CLI 预览与显式保存回读，无
     const resolved = await resolveBoardroomEnvironment({ cwd: dir, env }); assert.ok(resolved.inventory.selectedSourceId);
     adapter = await createPostgresMaintenanceAdapter({ kind: "postgres", connectionString: sourceUrl.toString() }, undefined);
     const before = await adapter.observe();
+    for (const command of ["plan", "persist-plan"]) {
+      const rejected = run([command, "--expected-source-id", resolved.inventory.selectedSourceId,
+        "--control-root", control, "--target-root", target], dir, env, true);
+      assert.equal(rejected.status, 1); assert.equal(rejected.stdout, "");
+      assert.match(rejected.stderr, /^\[backup_capability_unavailable\]/);
+      assert.deepEqual(await adapter.observe(), before);
+      for (const root of [control, target]) await assert.rejects(stat(root), { code: "ENOENT" });
+    }
+    // The unchanged public plan/persistence protocol is also exercised with a
+    // genuinely absent configuration file; no production qualification is injected.
+    await rm(config); delete env["AGENT_STUDIO_CONFIG"];
+    env["AGENT_STUDIO_DATA_DIR"] = dataDir; env["AGENT_STUDIO_DB_DRIVER"] = "postgres";
+    env["AGENT_STUDIO_PG_CONNECTION_STRING"] = sourceUrl.toString();
+    assert.equal((await resolveBoardroomEnvironment({ cwd: dir, env })).configFile, null);
     const result = run(["plan", "--expected-source-id", resolved.inventory.selectedSourceId, "--control-root", control, "--target-root", target], dir, env, true);
     assert.equal(result.status, 0, result.stderr); assert.equal(result.stderr, "");
     const preview = readPreview(result.stdout);

@@ -12,9 +12,9 @@ import { observePlannedPath } from "./plan.ts";
 import { syncMaintenanceHandle } from "./platform.ts";
 import { withNativeSourceRoot } from "./source-file-native.ts";
 import type { SourceFileHandle, SourceFileExtendedMetadata, SourceFileExtendedObservation,
-  SourceFileStatxObservation, SourceFileUniqueStatxObservation } from "./source-file-native.ts";
-import { matchSourceFileProfile } from "./source-file-profile.ts";
-import type { SourceFileRootObservation } from "./source-file-profile.ts";
+  SourceFileStatxObservation, SourceFileUniqueStatxObservation, SourceFileExpectedProfile } from "./source-file-native.ts";
+import { matchSourceFileProfile, SOURCE_PREPARE_PROFILE } from "./source-file-profile.ts";
+import type { QualifiedSourceFileProfile, SourceFileRootObservation } from "./source-file-profile.ts";
 import type { ArtifactRef, BlockerCode, FileRoot, Json, MigrationPlan, OperationMutex, PersistedPlanRef,
   SourceFileEntry, SourceFilesManifest, SourceLock, SourceObservation, SourceClientsObservation, SourceRootBinding } from "./types.ts";
 
@@ -49,6 +49,9 @@ const PROFILE = "linux-native-ext4-fid-fsuuid-source-state-v1";
 // not silently create a new successful window over unresolved local resources;
 // no numeric descriptor is re-closed or adopted. Trusted recovery is separate.
 const uncertainAuxiliaries = new Map<string, Set<object>>();
+// A new CFP2 FD/profile object cannot erase a failure under the identical
+// actual source lock. A trusted recovery must obtain its own lock/window.
+const failedSourceWindows = new WeakMap<SourceLock, SourceFilesFailure>();
 function retainUncertainAuxiliary(scan: Scan, owner: object): void {
   const key = canonicalJson(scan.store.identity);
   let owners = uncertainAuxiliaries.get(key);
@@ -110,6 +113,7 @@ interface WindowEvidence {
   // Null means no complete after observation was retained. Never substitute
   // the before observation when reading, validation or the budget has failed.
   after: Json | null;
+  tail?: Json;
 }
 interface EntryWindowEvidence extends WindowEvidence { readonly sourceRelativePath: string; }
 function snapshot(handle: SourceFileHandle): Snapshot {
@@ -183,10 +187,15 @@ interface Scan {
   readonly reference: PersistedPlanRef; readonly plan: MigrationPlan;
   readonly initial: SourceObservation; readonly raw: SourceClientsObservation;
   readonly start: number; readonly forbidden: Set<string>; readonly seen: Set<string>;
+  readonly mode: "record-attempt" | "read-only";
+  readonly syncedDirectories: Set<string>;
+  readonly expectedBindings: Map<FileRoot["label"], SourceRootBinding>;
+  readonly windows: { review(): Promise<void>; closeOrdinary(): Promise<void>; closeTail(): Promise<void> }[];
   readonly entries: SourceFileEntry[]; readonly bindings: SourceRootBinding[];
   readonly closeErrors: unknown[]; readonly stages: { stage: Stage; at: string }[];
   readonly rootsEvidence: WindowEvidence[]; readonly entriesEvidence: EntryWindowEvidence[];
   count: number; keptBytes: number; contentBytes: bigint; stage: Stage; tcut: boolean;
+  preparePolicy: boolean;
   attempt: string | undefined;
 }
 function stage(scan: Scan, value: Stage): void {
@@ -208,19 +217,20 @@ async function current(scan: Scan): Promise<void> {
 async function child<T>(scan: Scan, owner: SourceFileHandle, consume: () => Promise<T>): Promise<T> {
   let failed = false, first: unknown, result: T | undefined;
   try { result = await consume(); } catch (error) { failed = true; first = error; }
-  try { owner.close(); } catch (error) {
+  try { await owner.closeAsync(); } catch (error) {
     scan.closeErrors.push(error);
     if (!failed) { failed = true; first = error; scan.stage = "close"; }
   }
   if (failed) throw first;
   return result!;
 }
-async function nativeScope<T>(scan: Scan, file: string, consume: (handle: SourceFileHandle) => Promise<T>): Promise<T> {
+async function nativeScope<T>(scan: Scan, file: string, consume: (handle: SourceFileHandle) => Promise<T>,
+  expected?: SourceFileExpectedProfile): Promise<T> {
   let completed = false;
   try {
     return await withNativeSourceRoot(file, async handle => {
       const value = await consume(handle); completed = true; return value;
-    });
+    }, expected);
   } catch (error) {
     // A callback result is not evidence that its native scope actually closed.
     // The scope aggregate keeps its primary first, even when that value is undefined.
@@ -287,7 +297,7 @@ async function protectedIdentities(scan: Scan): Promise<void> {
   }
 }
 async function initialScan(store: ArtifactStore, lock: SourceLock, mutex: OperationMutex, value: PersistedPlanRef,
-  mode: "record-attempt" | "read-only"): Promise<Scan> {
+  mode: "record-attempt" | "read-only", start: number): Promise<Scan> {
   const parsed = referenceSchema.safeParse(value); requireValue(parsed.success, "plan_stale");
   const reference = parsed.data;
   requireValue(reference.planDigest === reference.immutablePlan.sha256 && reference.controlRoot === store.root
@@ -328,9 +338,10 @@ async function initialScan(store: ArtifactStore, lock: SourceLock, mutex: Operat
     requireValue(!forbiddenPaths.some(file => overlaps(root.path, file))
       && !plan.fileRoots.some(other => other !== root && overlaps(root.path, other.path)), "source_changed");
   }
-  const scan: Scan = { store: guarded, lock, mutex, reference, plan, initial, raw, start: performance.now(), forbidden: new Set(), seen: new Set(),
+  const scan: Scan = { store: guarded, lock, mutex, reference, plan, initial, raw, start, mode, forbidden: new Set(), seen: new Set(),
+    syncedDirectories: new Set(), expectedBindings: new Map(), windows: [],
     entries: [], bindings: [], closeErrors: [], stages: [], rootsEvidence: [], entriesEvidence: [],
-    count: 0, keptBytes: 0, contentBytes: 0n, stage: "input", tcut: false, attempt: undefined };
+    count: 0, keptBytes: 0, contentBytes: 0n, stage: "input", tcut: false, preparePolicy: false, attempt: undefined };
   try {
     retain(scan, plan.fileRoots); await current(scan); stage(scan, "boundary"); await protectedIdentities(scan);
     if (mode === "record-attempt") scan.attempt = await guarded.createAttempt(state.ownerGeneration);
@@ -360,9 +371,72 @@ async function readPayload(scan: Scan, handle: SourceFileHandle, before: Snapsho
   const sha256 = hash.digest("hex"), result = { ref: "snapshots/" + sha256 + "/source-file-payload.bin", sha256, bytes: String(offset) };
   requireValue(offset === expected && (!payload || same(payload, result)), "snapshot_invalid"); return result;
 }
+interface RootProtocol {
+  readonly profile: QualifiedSourceFileProfile;
+  readonly root: SourceFileHandle;
+  afterRoot?: SourceFileRootObservation;
+}
+async function synchronizeDirectory(scan: Scan, owner: SourceFileHandle, before: Snapshot): Promise<void> {
+  requireValue(owner.kind === "directory" && sameSnapshot(before, snapshot(owner)));
+  const key = String(before.unique.uniqueMountId) + ":" + keyOf(before.metadata);
+  if (scan.mode === "record-attempt" && !scan.syncedDirectories.has(key)) {
+    await held(scan); await owner.synchronize();
+    scan.syncedDirectories.add(key); await held(scan);
+  }
+  requireValue(sameSnapshot(before, snapshot(owner)));
+}
+/** R/V are separate open file descriptions. Every fresh F ends before R and
+ * the last V sync; no later regular owner is opened by a parent/root caller. */
+async function readCurrentFile(scan: Scan, owner: SourceFileHandle, before: Snapshot, file: string,
+  capture: boolean, protocol: RootProtocol, evidence: EntryWindowEvidence,
+  parent?: { handle: SourceFileHandle; before: Snapshot; file: string }): Promise<ArtifactRef> {
+  let verifier: SourceFileHandle | undefined, failed = false, first: unknown, result: ArtifactRef | undefined;
+  const postcheck = async (handle: SourceFileHandle) => {
+    const after = snapshot(handle); requireValue(sameSnapshot(before, after));
+    await assertPath(file, before.metadata);
+    if (parent) { requireValue(sameSnapshot(parent.before, snapshot(parent.handle))); await assertPath(parent.file, parent.before.metadata); }
+    return after;
+  };
+  try {
+    await held(scan);
+    if (scan.mode === "record-attempt") {
+      verifier = owner.reopenFile(); requireValue(sameSnapshot(before, snapshot(verifier)));
+      await held(scan); await owner.synchronize(); await held(scan);
+    }
+    result = await readPayload(scan, owner, before, capture);
+    await held(scan);
+    const fresh = owner.reopenFile();
+    await child(scan, fresh, async () => { await postcheck(fresh); });
+    const after = await postcheck(owner), material = serial(after);
+    retain(scan, material); evidence.after = material;
+    if (owner === protocol.root) protocol.afterRoot = protocol.profile.afterContent();
+    await held(scan); await owner.closeAsync(); await held(scan);
+    if (verifier) {
+      await verifier.synchronize(); await held(scan); await postcheck(verifier);
+      if (owner === protocol.root) {
+        const currentProfile = matchSourceFileProfile(verifier);
+        requireValue(currentProfile.profile === protocol.profile.profile
+          && currentProfile.profileEntryDigest === protocol.profile.profileEntryDigest
+          && currentProfile.qualificationDigest === protocol.profile.qualificationDigest);
+        protocol.afterRoot = currentProfile.afterContent();
+      }
+    }
+  } catch (error) { failed = true; first = error; }
+  // closeAsync retains the original in-flight promise. Reaching this cleanup
+  // after an earlier successful close cannot issue another close syscall.
+  for (const handle of [owner, verifier]) if (handle) {
+    try { await handle.closeAsync(); }
+    catch (error) {
+      if (!scan.closeErrors.some(value => Object.is(value, error))) scan.closeErrors.push(error);
+      if (!failed) { failed = true; first = error; scan.stage = "close"; }
+    }
+  }
+  if (failed) throw first;
+  await held(scan); return result!;
+}
 async function visit(scan: Scan, root: FileRoot, owner: SourceFileHandle, relative: string,
   anchor: Snapshot, capture: boolean, rows: { relative: string; tuple: Json }[], depth: number,
-  parent?: { handle: SourceFileHandle; before: Snapshot; file: string }): Promise<SourceFileEntry> {
+  parent?: { handle: SourceFileHandle; before: Snapshot; file: string }, protocol?: RootProtocol): Promise<SourceFileEntry> {
   await held(scan); requireValue(depth <= MAX_DEPTH, "backup_capability_unavailable", "source-files-depth");
   scan.count++; budget(scan); const file = path.join(root.path, relative), before = snapshot(owner);
   const evidence: EntryWindowEvidence = { sourceRoot: root.label, sourceRelativePath: relative, before: serial(before), after: null };
@@ -373,7 +447,8 @@ async function visit(scan: Scan, root: FileRoot, owner: SourceFileHandle, relati
   const tuple = stableTuple(file, relative, before), identity = pathIdentity(file, before.metadata);
   let entry: SourceFileEntry;
   if (owner.kind === "file") {
-    const payload = await readPayload(scan, owner, before, capture);
+    const payload = protocol ? await readCurrentFile(scan, owner, before, file, capture, protocol, evidence, parent)
+      : await readPayload(scan, owner, before, capture);
     const change = { mtimeNs: String(before.metadata.mtimeNs), ctimeNs: String(before.metadata.ctimeNs),
       observedBirthtimeNs: before.legacy.birthtimeNs === null ? null : String(before.legacy.birthtimeNs) };
     entry = { sourceRoot: root.label, sourceRelativePath: relative, kind: "file", identity, mode: modeOf(before.metadata),
@@ -393,11 +468,14 @@ async function visit(scan: Scan, root: FileRoot, owner: SourceFileHandle, relati
       const found = await child(scan, opened, async () => {
         const observed = snapshot(opened); requireValue(sameMetadata(observed.metadata, facts));
         const result = await visit(scan, root, opened, relative ? relative + "/" + name : name, anchor, capture, rows, depth + 1,
-          { handle: owner, before, file });
+          { handle: owner, before, file }, protocol);
         // Re-resolve precisely this basename from the still-held original parent.
         // This verification owner never supplies the captured content bytes.
-        const currentOwner = owner.openChild(name, opened.kind);
-        await child(scan, currentOwner, async () => { requireValue(sameSnapshot(observed, snapshot(currentOwner))); });
+        if (!protocol || opened.kind === "directory") {
+          const currentOwner = owner.openChild(name, opened.kind);
+          await child(scan, currentOwner, async () => { requireValue(sameSnapshot(observed, snapshot(currentOwner))); });
+          if (protocol) await synchronizeDirectory(scan, opened, observed);
+        }
         return result;
       });
       requireValue(found.kind !== "absent");
@@ -405,29 +483,38 @@ async function visit(scan: Scan, root: FileRoot, owner: SourceFileHandle, relati
     }
     requireValue(same(members, names(owner))); tuple.members = membership;
   }
-  const after = snapshot(owner), afterEvidence = serial(after);
-  retain(scan, afterEvidence); evidence.after = afterEvidence;
-  requireValue(sameSnapshot(before, after)); await assertPath(file, before.metadata);
-  if (parent) { requireValue(sameSnapshot(parent.before, snapshot(parent.handle))); await assertPath(parent.file, parent.before.metadata); }
+  if (!protocol || owner.kind === "directory") {
+    const after = snapshot(owner), afterEvidence = serial(after);
+    retain(scan, afterEvidence); evidence.after = afterEvidence;
+    requireValue(sameSnapshot(before, after)); await assertPath(file, before.metadata);
+    if (parent) { requireValue(sameSnapshot(parent.before, snapshot(parent.handle))); await assertPath(parent.file, parent.before.metadata); }
+  }
   retain(scan, entry); retain(scan, tuple); scan.entries.push(entry); rows.push({ relative, tuple });
   await held(scan); return entry;
 }
 
-async function scanRoot(scan: Scan, root: FileRoot, capture: boolean): Promise<void> {
+async function scanRoot(scan: Scan, root: FileRoot, capture: boolean, next: () => Promise<void>): Promise<void> {
   await current(scan); requireValue(same(await observePlannedPath(root.path), root.expected));
   const anchorPath = root.expected.existingAncestor.path, parentPath = path.dirname(anchorPath);
   requireValue(anchorPath !== parentPath, "backup_capability_unavailable", "source-files-root-boundary");
+  let continued = false, parentTransferred = false;
+  const frozen = scan.expectedBindings.get(root.label);
+  const expected = frozen && (frozen.profile === PROFILE || frozen.profile === SOURCE_PREPARE_PROFILE) ? { profile: frozen.profile,
+    profileEntryDigest: frozen.readEvidence.profileEntryDigest, qualificationDigest: frozen.readEvidence.qualificationDigest } : undefined;
   stage(scan, "profile");
   await nativeScope(scan, parentPath, async parent => {
-    // The parent only guards pathname membership. It never supplies the file
-    // root's profile, UUID/FID, bytes, or rootBinding anchor.
+    // A cross-filesystem prefix only guards membership. It never supplies the
+    // source profile or becomes a same-filesystem carrier by assertion.
     const parentBefore = parent.observe(), parentFacts = await pathFacts(parentPath);
     requireValue(parent.kind === "directory" && parentBefore.dev === parentFacts.dev && parentBefore.ino === parentFacts.ino);
     await nativeScope(scan, anchorPath, async anchorOwner => {
       requireValue(root.label === "config" ? anchorOwner.kind === "file" && root.expected.absentSegments.length === 0
         : anchorOwner.kind === "directory", "plan_stale");
-      const profile = matchSourceFileProfile(anchorOwner);
-      requireValue(profile.profile === PROFILE && /^[a-f0-9]{64}$/.test(profile.profileEntryDigest)
+      const profile = matchSourceFileProfile(anchorOwner), modern = profile.profile === SOURCE_PREPARE_PROFILE;
+      if (modern) scan.preparePolicy = true;
+      if (expected) requireValue(profile.profile === expected.profile && profile.profileEntryDigest === expected.profileEntryDigest
+        && profile.qualificationDigest === expected.qualificationDigest);
+      requireValue((profile.profile === PROFILE || modern) && /^[a-f0-9]{64}$/.test(profile.profileEntryDigest)
         && /^[a-f0-9]{64}$/.test(profile.qualificationDigest), "backup_capability_unavailable");
       const beforeContext = profile.beforeContent();
       const evidence: WindowEvidence = { sourceRoot: root.label, before: serial(beforeContext), after: null };
@@ -438,6 +525,10 @@ async function scanRoot(scan: Scan, root: FileRoot, capture: boolean): Promise<v
         && !scan.forbidden.has(keyOf(anchor.metadata)));
       await assertPath(anchorPath, anchor.metadata);
       const rows: { relative: string; tuple: Json }[] = [];
+      const protocol: RootProtocol | undefined = modern ? { profile, root: anchorOwner } : undefined;
+      // M exists before the last ordinary R/D release. Retaining it is an
+      // actual O_PATH open, not a copied observation or a late content reopen.
+      const tail = modern ? profile.retainMetadata() : undefined;
       stage(scan, "scan");
       if (root.expected.absentSegments.length) {
         requireValue(anchorOwner.kind === "directory");
@@ -450,41 +541,103 @@ async function scanRoot(scan: Scan, root: FileRoot, capture: boolean): Promise<v
           mode: null, size: null, payload: null, sourceWitness: null };
         scan.count++; retain(scan, tuple); retain(scan, absent); rows.push({ relative: "", tuple }); scan.entries.push(absent);
         requireValue(same(beforeNames, names(anchorOwner)) && sameSnapshot(anchor, snapshot(anchorOwner)));
-      } else await visit(scan, root, anchorOwner, "", anchor, capture, rows, 0);
-      requireValue(same(await observePlannedPath(root.path), root.expected));
-      // A root may itself be a mount point. Its fresh root lookup permits that
-      // explicit boundary; child lookup below it always remains NO_XDEV.
-      await nativeScope(scan, anchorPath, async currentOwner => { requireValue(sameSnapshot(anchor, snapshot(currentOwner))); });
-      await assertPath(anchorPath, anchor.metadata);
-      stage(scan, "health"); const afterContext = profile.afterContent();
-      const afterEvidence = serial(afterContext); retain(scan, afterEvidence); evidence.after = afterEvidence;
-      rootObservationMatches(afterContext, anchor);
-      requireValue(same(serial(beforeContext.mount), serial(afterContext.mount))
-        && same(healthMaterial(beforeContext.health), healthMaterial(afterContext.health)));
-      requireValue(same(serial(parentBefore), serial(parent.observe())));
-      const parentAfter = await pathFacts(parentPath);
-      requireValue(["dev", "ino", "mode", "uid", "gid", "nlink", "size", "atimeNs", "mtimeNs", "ctimeNs"].every(
-        field => parentFacts[field as keyof BigIntStats] === parentAfter[field as keyof BigIntStats]));
-      rows.sort((left, right) => left.relative < right.relative ? -1 : left.relative > right.relative ? 1 : 0);
-      const sourceStateDigest = digestJson({ formatVersion: 1, kind: "source-files-root-state", sourceRoot: root.label,
-        rootPath: root.path, entries: rows.map(row => row.tuple) });
-      const binding: SourceRootBinding = { sourceRoot: root.label, profile: PROFILE, filesystemType: "ext4",
-        hostIdentityDigest: scan.store.identity.hostIdentityDigest, filesystemUuidHex: anchor.uuid,
-        anchorPath, anchorKind: anchorOwner.kind, anchorHandle: anchor.incarnation,
-        readEvidence: { policy: "application-source-preservation-v1", kernelDiagnosticPolicy: "ext4-last-mounted-v1",
+      } else await visit(scan, root, anchorOwner, "", anchor, capture, rows, 0, undefined, protocol);
+      const parentCurrent = async () => {
+        requireValue(same(serial(parentBefore), serial(parent.observe())));
+        const after = await pathFacts(parentPath);
+        requireValue(metadataFields.every(field => parentFacts[field] === after[field]));
+      };
+      const rootCurrent = async () => {
+        requireValue(same(await observePlannedPath(root.path), root.expected));
+        await assertPath(anchorPath, anchor.metadata);
+      };
+      const observeAfter = (afterContext: SourceFileRootObservation) => {
+        const afterEvidence = serial(afterContext); retain(scan, afterEvidence); evidence.after = afterEvidence;
+        rootObservationMatches(afterContext, anchor);
+        requireValue(same(serial(beforeContext.mount), serial(afterContext.mount))
+          && same(healthMaterial(beforeContext.health), healthMaterial(afterContext.health)));
+      };
+      const bind = (runtimeEnvironmentDigest: string) => {
+        rows.sort((left, right) => left.relative < right.relative ? -1 : left.relative > right.relative ? 1 : 0);
+        const sourceStateDigest = digestJson({ formatVersion: 1, kind: "source-files-root-state", sourceRoot: root.label,
+          rootPath: root.path, entries: rows.map(row => row.tuple) });
+        const common = { sourceRoot: root.label, filesystemType: "ext4" as const,
+          hostIdentityDigest: scan.store.identity.hostIdentityDigest, filesystemUuidHex: anchor.uuid,
+          anchorPath, anchorKind: anchorOwner.kind, anchorHandle: anchor.incarnation };
+        const readEvidence = { kernelDiagnosticPolicy: "ext4-last-mounted-v1" as const,
           profileEntryDigest: profile.profileEntryDigest, qualificationDigest: profile.qualificationDigest,
-          runtimeEnvironmentDigest: afterContext.runtimeEnvironmentDigest, sourceStateDigest,
-          blockEffectsObservation: "not-observed-at-runtime" } };
-      retain(scan, binding); scan.bindings.push(binding);
-      stage(scan, "close");
-    });
-    requireValue(same(serial(parentBefore), serial(parent.observe())));
+          runtimeEnvironmentDigest, sourceStateDigest, blockEffectsObservation: "not-observed-at-runtime" as const };
+        const binding: SourceRootBinding = modern
+          ? { ...common, profile: SOURCE_PREPARE_PROFILE, readEvidence: { ...readEvidence, policy: "application-source-preservation-with-prepare-v1" } }
+          : { ...common, profile: PROFILE, readEvidence: { ...readEvidence, policy: "application-source-preservation-v1" } };
+        retain(scan, binding); scan.bindings.push(binding);
+      };
+      if (!protocol || !tail) {
+        await rootCurrent();
+        await nativeScope(scan, anchorPath, async fresh => { requireValue(sameSnapshot(anchor, snapshot(fresh))); });
+        stage(scan, "health"); const after = profile.afterContent(); observeAfter(after);
+        await parentCurrent(); bind(after.runtimeEnvironmentDigest); stage(scan, "close");
+        return;
+      }
+      scan.windows.push({
+        async review() {
+          await held(scan); await rootCurrent(); await parentCurrent();
+          if (anchorOwner.kind === "directory") {
+            // Explicit root mount boundaries remain allowed; descendants still
+            // use the native BENEATH/NO_XDEV child path.
+            await nativeScope(scan, anchorPath, async fresh => { requireValue(sameSnapshot(anchor, snapshot(fresh))); });
+          }
+        },
+        async closeOrdinary() {
+          await held(scan); await rootCurrent(); await parentCurrent();
+          const parentSnapshot = parentBefore.dev === anchor.metadata.dev && parentBefore.fsType === anchor.metadata.fsType
+            ? snapshot(parent) : undefined;
+          const sameFilesystemParent = parentSnapshot !== undefined && sameMount(anchor, parentSnapshot);
+          if (anchorOwner.kind === "directory") await synchronizeDirectory(scan, anchorOwner, anchor);
+          if (sameFilesystemParent) await synchronizeDirectory(scan, parent, parentSnapshot!);
+          if (anchorOwner.kind === "file") requireValue(sameFilesystemParent, "backup_capability_unavailable", "source-files-carrier-mount");
+          stage(scan, "health");
+          const after = anchorOwner.kind === "directory" ? profile.afterContent() : protocol.afterRoot;
+          requireValue(after); observeAfter(after); await rootCurrent(); await parentCurrent();
+          // D/Dp's only sync and all F checks have ended. Moving this exact
+          // readable descriptor to A creates no open/dup and is not a close.
+          tail.transferCarrier(anchorOwner.kind === "file" ? parent : anchorOwner);
+          if (anchorOwner.kind === "file") parentTransferred = true;
+          else {
+            try { await parent.closeAsync(); }
+            catch (error) { scan.closeErrors.push(error); scan.stage = "close"; throw error; }
+            parentTransferred = true; // The old scope no longer owns a live Dp.
+          }
+          await held(scan);
+        },
+        async closeTail() {
+          // Every root's ordinary R/V/F/D/Dp has now settled. Only the actual
+          // metadata M and transferred A remain live for this final context.
+          await held(scan); stage(scan, "health");
+          const observed = profile.afterSourceClosed(tail), material = serial(observed);
+          retain(scan, material); evidence.tail = material;
+          requireValue(sameMetadata(anchor.metadata, observed.metadata)
+            && same(serial(beforeContext.mount), serial(observed.mount))
+            && same(healthMaterial(beforeContext.health), healthMaterial(observed.health)));
+          await rootCurrent(); stage(scan, "close");
+          try { await tail.closeAsync(); }
+          catch (error) { scan.closeErrors.push(error); throw error; }
+          await held(scan); bind(observed.runtimeEnvironmentDigest);
+        },
+      });
+      // At most two source roots. Nest only their scopes, then finish every
+      // ordinary owner before any tail; a shared D/Dp sync occurs once after
+      // all selected children and all fresh directory checks have completed.
+      continued = true; await next();
+    }, expected);
+    if (!parentTransferred) requireValue(same(serial(parentBefore), serial(parent.observe())));
   });
   stage(scan, "source-postcheck"); await current(scan);
+  if (!continued) await next();
 }
 function persistentManifest(manifest: SourceFilesManifest): unknown {
   return { ...manifest, rootBindings: manifest.rootBindings.map(binding => {
-    requireValue(binding.profile === PROFILE, "backup_capability_unavailable", "source-files-profile");
+    requireValue(binding.profile === PROFILE || binding.profile === SOURCE_PREPARE_PROFILE, "backup_capability_unavailable", "source-files-profile");
     const { runtimeEnvironmentDigest: _, ...stable } = binding.readEvidence;
     return { ...binding, readEvidence: stable };
   }) };
@@ -516,11 +669,14 @@ async function writeAttempt(scan: Scan, successful: boolean): Promise<void> {
 }
 async function run(store: ArtifactStore, lock: SourceLock, mutex: OperationMutex, reference: PersistedPlanRef,
   existing?: ArtifactRef, mode: "record-attempt" | "read-only" = "record-attempt"): Promise<{ ref: ArtifactRef; manifest: SourceFilesManifest }> {
+  const start = performance.now();
+  const previous = failedSourceWindows.get(lock);
+  if (previous) throw previous;
   let scan: Scan | undefined, result: { ref: ArtifactRef; manifest: SourceFilesManifest } | undefined;
   let failed = false, first: unknown;
   try {
     requireValue(mode !== "read-only" || existing !== undefined, "snapshot_invalid");
-    scan = await initialScan(store, lock, mutex, reference, mode);
+    scan = await initialScan(store, lock, mutex, reference, mode, start);
     let expected: SourceFilesManifest | undefined;
     if (existing) {
       requireValue(store.kindFor(existing) === "source-files" && existing.bytes.length <= 20
@@ -528,6 +684,10 @@ async function run(store: ArtifactStore, lock: SourceLock, mutex: OperationMutex
       expected = await readSourceFiles(scan.store, existing);
       requireValue(same(expected.source, scan.plan.source) && same(expected.roots, scan.plan.fileRoots), "source_changed");
       persistentManifest(expected);
+      for (const binding of expected.rootBindings) {
+        scan.expectedBindings.set(binding.sourceRoot, binding);
+        if (binding.profile === SOURCE_PREPARE_PROFILE) scan.preparePolicy = true;
+      }
       requireValue(expected.entries.length <= MAX_ENTRIES, "backup_capability_unavailable", "source-files-budget");
       let archivedBytes = 0n;
       for (const entry of expected.entries) if (entry.payload) {
@@ -538,7 +698,17 @@ async function run(store: ArtifactStore, lock: SourceLock, mutex: OperationMutex
         await held(scan); await scan.store.verifyFile(entry.payload);
       }
     }
-    for (const root of scan.plan.fileRoots) await scanRoot(scan, root, !existing);
+    const currentScan = scan;
+    const roots = async (index: number): Promise<void> => {
+      const root = currentScan.plan.fileRoots[index];
+      if (root) return scanRoot(currentScan, root, !existing, () => roots(index + 1));
+      for (const window of currentScan.windows) await window.review();
+      for (const window of currentScan.windows) await window.closeOrdinary();
+      for (const window of currentScan.windows) await window.closeTail();
+    };
+    await roots(0);
+    scan.bindings.sort((left, right) => currentScan.plan.fileRoots.findIndex(root => root.label === left.sourceRoot)
+      - currentScan.plan.fileRoots.findIndex(root => root.label === right.sourceRoot));
     // Deterministic code-unit order, independent of readdir return order and DFS shape.
     scan.entries.sort((left, right) => {
       const a = left.sourceRoot + "/" + left.sourceRelativePath, b = right.sourceRoot + "/" + right.sourceRelativePath;
@@ -570,12 +740,17 @@ async function run(store: ArtifactStore, lock: SourceLock, mutex: OperationMutex
     }
   }
   if (failed) {
-    if (first instanceof SourceFilesFailure) throw first;
+    if (first instanceof SourceFilesFailure) {
+      if (scan?.preparePolicy) failedSourceWindows.set(lock, first);
+      throw first;
+    }
     const closeErrors = scan?.closeErrors ?? [];
     if (first instanceof AggregateError) {
       closeErrors.push(...first.errors.slice(1)); first = first.errors[0];
     }
-    throw new SourceFilesFailure(first, scan?.stage ?? "input", closeErrors, scan?.tcut ?? false);
+    const failure = new SourceFilesFailure(first, scan?.stage ?? "input", closeErrors, scan?.tcut ?? false);
+    if (scan?.preparePolicy) failedSourceWindows.set(lock, failure);
+    throw failure;
   }
   return result!;
 }

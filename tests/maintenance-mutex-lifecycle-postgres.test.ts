@@ -7,7 +7,7 @@ import path from "node:path";
 import ts from "typescript";
 import { inspect } from "node:util";
 import { Client, type QueryResult } from "pg";
-import { postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgres.ts";
+import { protocolPostgresAuditFixture as postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgres.ts";
 import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import * as controlSql from "../src/server/storage/maintenance/control-sql.ts";

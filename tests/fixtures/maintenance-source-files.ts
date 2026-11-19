@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { withNativeSourceRoot as nativeRoot } from "../../src/server/storage/maintenance/source-file-native.ts";
-import type { SourceFileHandle, SourceFileExtendedObservation, SourceFileStatxObservation } from "../../src/server/storage/maintenance/source-file-native.ts";
+import type { SourceFileHandle, SourceFileExtendedObservation, SourceFileStatxObservation, SourceFileMetadataTail, SourceFileExpectedProfile } from "../../src/server/storage/maintenance/source-file-native.ts";
 import { ArtifactStore } from "../../src/server/storage/maintenance/objects.ts";
 import { canonicalJson, digestJson } from "../../src/server/storage/maintenance/canonical.ts";
 import { MaintenanceFailure } from "../../src/server/storage/maintenance/error.ts";
@@ -33,9 +33,12 @@ interface State {
   maxHandles: number;
   health: string;
   mountDelta: bigint;
+  prepare: boolean;
 }
+export const SOURCE_PREPARE_PROFILE = "linux-native-ext4-fid-fsuuid-source-prepare-v1" as const;
 const states = new Map<string, State>();
-const owners = new WeakMap<FixtureHandle, { state: State; file: string; active: () => boolean }>();
+const owners = new WeakMap<FixtureHandle, { state: State; file: string; active: () => boolean; transfer: () => () => Promise<void> }>();
+const fixtureTails = new WeakMap<FixtureHandle, Set<SourceFileMetadataTail>>();
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 let nativePreparation: Promise<void> | undefined;
 function prepareNativeFixture(): Promise<void> {
@@ -60,6 +63,7 @@ function stateFor(file: string): State {
 }
 function wrap(raw: SourceFileHandle, file: string, state: State, active: () => boolean, root: boolean): FixtureHandle {
   let closed = false;
+  let closing: Promise<void> | undefined;
   const call = (operation: string, value?: unknown) => {
     if (closed || !active()) throw new MaintenanceFailure("maintenance_lost", "fixture-owner");
     state.events.push(operation + ":" + path.relative(state.directory, file)); state.hook(operation, file, value);
@@ -94,6 +98,15 @@ function wrap(raw: SourceFileHandle, file: string, state: State, active: () => b
     },
     readAt(offset, length) { call("read", { offset, length }); return raw.readAt(offset, length); },
     readDirectory() { call("enumerate"); return raw.readDirectory(); },
+    reopenFile() { call("reopen-file"); return wrap(raw.reopenFile(), file, state, active, root); },
+    async synchronize() { call("synchronize"); await raw.synchronize(); call("synchronized"); },
+    closeAsync() {
+      if (closing) return closing;
+      call("closing");
+      return closing = raw.closeAsync().finally(() => { closed = true; state.handles.delete(handle); }).then(() => {
+        state.events.push("closed:" + path.relative(state.directory, file)); state.hook("closed", file);
+      });
+    },
     close() {
       call("closing");
       // Close the real owner even when a test requests a synthetic unknown-close
@@ -102,13 +115,20 @@ function wrap(raw: SourceFileHandle, file: string, state: State, active: () => b
       state.events.push("closed:" + path.relative(state.directory, file)); state.hook("closed", file);
     },
   };
-  owners.set(handle, { state, file, active: () => active() && !closed });
+  owners.set(handle, { state, file, active: () => active() && !closed, transfer: () => {
+    call("transfer-carrier"); closed = true; state.handles.delete(handle);
+    return () => closing ??= raw.closeAsync().then(() => { state.events.push("closed-carrier:" + path.relative(state.directory, file)); state.hook("closed-carrier", file); });
+  } });
   state.handles.add(handle); state.maxHandles = Math.max(state.maxHandles, state.handles.size);
   if (root) state.roots.add(handle);
   return handle;
 }
-export async function withNativeSourceRoot<T>(file: string, consume: (handle: FixtureHandle) => Promise<T> | T): Promise<T> {
+export async function withNativeSourceRoot<T>(file: string, consume: (handle: FixtureHandle) => Promise<T> | T,
+  expected?: SourceFileExpectedProfile): Promise<T> {
   const state = stateFor(file), kind = lstatSync(file).isDirectory() ? "directory" : "file";
+  if (expected && (expected.profile !== (state.prepare ? SOURCE_PREPARE_PROFILE : "linux-native-ext4-fid-fsuuid-source-state-v1")
+    || expected.profileEntryDigest !== digest("fixture-profile-only") || expected.qualificationDigest !== digest("no-qualification")))
+    throw new MaintenanceFailure("source_changed", "fixture-frozen-profile-before-open");
   let active = true;
   return nativeRoot(kind === "directory" ? file : path.dirname(file), async native => {
     const raw = kind === "directory" ? native : native.openChild(path.basename(file), "file");
@@ -117,12 +137,19 @@ export async function withNativeSourceRoot<T>(file: string, consume: (handle: Fi
     try { result = await consume(root); } catch (error) { failed = true; first = error; }
     const closeErrors: unknown[] = [];
     try { if (state.handles.has(root)) root.close(); } catch (error) { closeErrors.push(error); }
+    const tails = [...fixtureTails.get(root) ?? []];
+    if (!failed && tails.length) { failed = true; first = new MaintenanceFailure("maintenance_lost", "fixture-unclosed-tail"); }
+    for (const tail of tails) try { await tail.closeAsync(); } catch (error) { closeErrors.push(error); }
     active = false;
     if (closeErrors.length) throw new AggregateError(failed ? [first, ...closeErrors] : closeErrors,
       "fixture-source-close", { cause: failed ? first : closeErrors[0] });
     if (failed) throw first;
     return result!;
   });
+}
+export function withNativeSourcePreviewFile<T>(file: string, consume: (handle: FixtureHandle) => Promise<T> | T): Promise<T> {
+  if (!stateFor(file).prepare) return Promise.reject(new MaintenanceFailure("backup_capability_unavailable", "fixture-preview-profile"));
+  return withNativeSourceRoot(file, consume);
 }
 const healthNames = ["errors_count", "first_error_errcode", "last_error_errcode", "first_error_ino", "last_error_ino",
   "first_error_block", "last_error_block", "first_error_line", "last_error_line", "first_error_time", "last_error_time",
@@ -146,9 +173,47 @@ export function matchSourceFileProfile(root: FixtureHandle) {
       runtimeEnvironmentDigest: digest("fixture-window-" + (++state.windows)) };
     state.hook("profile:" + stage + "-result", file, result); return result;
   };
-  return { profile: "linux-native-ext4-fid-fsuuid-source-state-v1" as const, source: root.observe(),
+  const tails = new WeakMap<object, { context: ReturnType<typeof observe>; closeCarrier?: () => Promise<void> }>();
+  return { profile: state.prepare ? SOURCE_PREPARE_PROFILE : "linux-native-ext4-fid-fsuuid-source-state-v1" as const, source: root.observe(),
     profileEntryDigest: digest("fixture-profile-only"), qualificationDigest: digest("no-qualification"),
-    observe: () => observe("observe"), beforeContent: () => observe("before"), afterContent: () => observe("after") };
+    observe: () => observe("observe"), beforeContent: () => observe("before"), afterContent: () => observe("after"),
+    // TEST ONLY: health/profile/tail observations are synthetic. R/V/F still
+    // use real native owners; the native M/A transfer is separately exercised
+    // in maintenance-source-file-prepare-native.test.ts, never qualified here.
+    retainMetadata(): SourceFileMetadataTail {
+      const value: { context: ReturnType<typeof observe>; closeCarrier?: () => Promise<void> } = { context: observe("metadata-tail") };
+      let closing: Promise<void> | undefined;
+      const tail: SourceFileMetadataTail = {
+        transferCarrier(carrier) {
+          const actual = owners.get(carrier as FixtureHandle);
+          if (!actual || actual.state !== state || value.closeCarrier) throw new Error("fixture-tail-carrier");
+          value.closeCarrier = actual.transfer();
+        },
+        observe() { throw new Error("synthetic tail is observed only by its fixture profile"); },
+        closeAsync() {
+          return closing ??= Promise.resolve().then(async () => {
+            try { await value.closeCarrier?.(); }
+            finally {
+              fixtureTails.get(root)?.delete(tail);
+              state.events.push("closed-metadata:" + path.relative(state.directory, file)); state.hook("closed-metadata", file);
+            }
+          });
+        },
+      };
+      let ownedTails = fixtureTails.get(root);
+      if (!ownedTails) { ownedTails = new Set(); fixtureTails.set(root, ownedTails); }
+      ownedTails.add(tail);
+      tails.set(tail, value); return tail;
+    },
+    afterSourceClosed(tail: SourceFileMetadataTail) {
+      const value = tails.get(tail); if (!value?.closeCarrier) throw new Error("fixture-tail-unattached");
+      state.events.push("profile:tail"); state.hook("profile:tail", file);
+      if (state.health !== "0\n") throw new MaintenanceFailure("backup_capability_unavailable", "fixture-health");
+      const current = lstatSync(file, { bigint: true }), metadata = { ...value.context.root.before };
+      for (const name of ["dev", "ino", "mode", "uid", "gid", "nlink", "size", "atimeNs", "mtimeNs", "ctimeNs"] as const) metadata[name] = current[name];
+      return { metadata, mount: value.context.mount, health: value.context.health,
+        runtimeEnvironmentDigest: digest("fixture-tail-" + (++state.windows)) };
+    } };
 }
 
 /** Isolate only the native/profile imports. Production source is otherwise exact;
@@ -171,7 +236,21 @@ export async function isolatedSourceFiles(limits: Readonly<Record<string, string
   catch (error) { await rm(directory, { recursive: true, force: true }); throw error; }
 }
 
-export async function sourceFilesFixture(options: { sessions?: "present" | "absent"; config?: boolean } = {}) {
+export async function isolatedSourcePreview() {
+  const source = fileURLToPath(new URL("../../src/server/storage/maintenance/source-file-preview.ts", import.meta.url));
+  const fixture = import.meta.url;
+  const code = (await readFile(source, "utf8"))
+    .replaceAll('from "./source-file-native.ts"', `from ${JSON.stringify(fixture)}`)
+    .replaceAll('from "./source-file-profile.ts"', `from ${JSON.stringify(fixture)}`)
+    .replace(/from "(\.\/[^"\n]+)"/g, (_, name: string) => `from ${JSON.stringify(pathToFileURL(path.resolve(path.dirname(source), name)).href)}`);
+  const directory = await mkdtemp(path.join(process.cwd(), ".agent-output-preview-copy-"));
+  const target = path.join(directory, "preview.ts"); await writeFile(target, code, { mode: 0o600 });
+  try { return { module: await import(pathToFileURL(target).href) as typeof import("../../src/server/storage/maintenance/source-file-preview.ts"),
+    close: () => rm(directory, { recursive: true, force: true }) }; }
+  catch (error) { await rm(directory, { recursive: true, force: true }); throw error; }
+}
+
+export async function sourceFilesFixture(options: { sessions?: "present" | "absent"; config?: boolean; prepare?: boolean } = {}) {
   await prepareNativeFixture();
   const directory = await mkdtemp(path.join(process.cwd(), "maintenance-s-test-"));
   chmodSync(directory, 0o700);
@@ -218,7 +297,7 @@ export async function sourceFilesFixture(options: { sessions?: "present" | "abse
     anchor: async () => { throw new Error("S must not anchor"); }, backup: async () => { throw new Error("S must not back up a DB"); } };
   const mutex: OperationMutex = { identity: mutexIdentity, assertHeld, release: async () => { held = false; } };
   const state: State = { directory, handles: new Set(), roots: new WeakSet(), events: [], identities: new Map(), attributes: new Map(), flags: new Map(),
-    hook: () => {}, windows: 0, maxHandles: 0, health: "0\n", mountDelta: 0n };
+    hook: () => {}, windows: 0, maxHandles: 0, health: "0\n", mountDelta: 0n, prepare: false };
   states.set(directory, state);
   const resetReadTimes = () => {
     // P2 has no O_NOATIME promise. This fixture prepares ordinary relatime data
@@ -232,6 +311,7 @@ export async function sourceFilesFixture(options: { sessions?: "present" | "abse
     utimesSync(directory, new Date("2035-01-01"), new Date("2025-01-01"));
   };
   resetReadTimes();
+  state.prepare = options.prepare === true;
   return { directory, config, sessions, database, expected, store, plan, reference, lock, mutex, state, resetReadTimes,
     loseLock: () => { held = false; }, changeObservation: (change: (value: SourceObservation) => SourceObservation) => { observation = change(observation); },
     close: async () => { states.delete(directory); await rm(directory, { recursive: true, force: true }); } };

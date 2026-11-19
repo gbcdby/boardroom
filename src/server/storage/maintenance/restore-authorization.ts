@@ -1,6 +1,7 @@
 import { canonicalJson, digestJson } from "./canonical.ts";
 import { notePendingControllerOperationFailure } from "./control-sql.ts";
-import { assertControllerCommandWindow, assertControllerLockCompleted, type ControllerCommandScope } from "./controller-write.ts";
+import { assertControllerCommandWindow, assertControllerLockCompleted, assertControllerSourcePlanBindings,
+  type ControllerCommandScope } from "./controller-write.ts";
 import { supportedEncoding } from "./control-candidate/rows.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { captureReference, verifyRestoreBundleClosure } from "./journal.ts";
@@ -276,11 +277,13 @@ export function prepareControllerSnapshot(scope: ControllerCommandScope, lock: S
     const completed = await lock.withSourceClientFacts(context.command.request.plan, async facts => {
       assertOpen(scope, lock);
       requireValue(same(facts.observation, context.observation) && same(facts.origin.head, context.head), "source_changed");
+      await assertControllerSourcePlanBindings(scope, lock);
       await verifyLiveSourceFiles(context.store, lock, context.mutex, context.command.request.plan, frozen.sourceFilesManifest);
       await facts.assertCurrent();
       const bundle = await publishSnapshotBundle(context.store, lock);
       const verification = await verifyRestoreBundle(context.store, context.adapter, lock, bundle.bundle, bundle.publication);
       await verifyLiveSourceFiles(context.store, lock, context.mutex, context.command.request.plan, frozen.sourceFilesManifest);
+      await assertControllerSourcePlanBindings(scope, lock);
       await currentWindow(scope, lock, context); await facts.assertCurrent();
       return freeze({ ...bundle, verification });
     });
@@ -311,8 +314,10 @@ async function readyWindow(scope: ControllerCommandScope, lock: SourceLock, mode
   const checkRuntime = async () => {
     await lock.withSourceClientFacts(context.command.request.plan, async facts => {
       requireValue(same(facts.observation, context.observation) && same(facts.origin.head, context.head), "source_changed");
+      await assertControllerSourcePlanBindings(scope, lock);
       await check();
       await inspectFiles(context.store, lock, context.mutex, context.command.request.plan, initial.snapshot.receipt.sourceFilesManifest);
+      await assertControllerSourcePlanBindings(scope, lock);
       await facts.assertCurrent(); await check();
     });
   };
@@ -376,7 +381,9 @@ export function consumeControllerRestoreAuthorization(scope: ControllerCommandSc
         && same(binding.snapshot.chain.nodes.find(node => node.record.event === "ready")?.reference, owned.ready), "snapshot_invalid");
       await lock.withSourceClientFacts(context.command.request.plan, async facts => {
         requireValue(same(facts.observation, context.observation), "source_changed");
+        await assertControllerSourcePlanBindings(scope, lock);
         await verifyLiveSourceFiles(context.store, lock, context.mutex, context.command.request.plan, binding.snapshot.receipt.sourceFilesManifest);
+        await assertControllerSourcePlanBindings(scope, lock);
         await binding.assertCurrent(); await facts.assertCurrent(); await currentWindow(scope, lock, context);
       });
       return freeze({ kind: "legacy-ready-bridge", ready: owned.ready, receipt: owned.receipt, manifests: owned.manifests });
@@ -403,6 +410,7 @@ export function consumeControllerRestoreAuthorization(scope: ControllerCommandSc
     };
     const receipt = await lock.withSourceClientFacts(context.command.request.plan, async facts => {
       requireValue(same(facts.observation, context.observation), "source_changed");
+      await assertControllerSourcePlanBindings(scope, lock);
       await assertCurrent();
       await verifyLiveSourceFiles(context.store, lock, context.mutex, context.command.request.plan, closure.bundle.sourceFilesManifest);
       const guarded = await ArtifactStore.open(context.store.root, initial.source, { assertCurrent: async () => {
@@ -420,6 +428,7 @@ export function consumeControllerRestoreAuthorization(scope: ControllerCommandSc
       const reference = await guarded.putJson("receipt", body); await guarded.confirmDurable(reference);
       requireValue(same(parseReceipt(await guarded.readJson(reference, "receipt")), body), "snapshot_invalid");
       await verifyLiveSourceFiles(context.store, lock, context.mutex, context.command.request.plan, closure.bundle.sourceFilesManifest);
+      await assertControllerSourcePlanBindings(scope, lock);
       await assertCurrent(); await facts.assertCurrent();
       return reference;
     });

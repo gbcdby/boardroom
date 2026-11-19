@@ -5,29 +5,38 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { enterFixture } from "./maintenance-enter.ts";
 import { sourceFilesFixture } from "./maintenance-source-files.ts";
-import { enterMaintenance } from "../../src/server/storage/maintenance/enter.ts";
+import { attachPreviewModules, enterMaintenance } from "./maintenance-preview-graph.ts";
 import * as ownerModule from "../../src/server/storage/maintenance/controller-owner.ts";
 import { ArtifactStore } from "../../src/server/storage/maintenance/objects.ts";
 import { verifyJournalChain } from "../../src/server/storage/maintenance/journal.ts";
 import { digestJson } from "../../src/server/storage/maintenance/canonical.ts";
 import { parseJournal } from "../../src/server/storage/maintenance/parse.ts";
 import type { ContinueRequest, OperationMutex, PersistedPlanRef, SourceLock } from "../../src/server/storage/maintenance/types.ts";
-export { awaitControllerAdmission, finishControllerOwner, recordControllerFailure, rememberControllerStore } from "../../src/server/storage/maintenance/controller-owner.ts";
 
 type SourceModule = typeof import("../../src/server/storage/maintenance/source-files.ts");
 interface State {
   readonly source: SourceModule;
+  readonly owners: typeof ownerModule;
   readonly events: string[];
   hook: (stage: string) => Promise<void> | void;
   onLock?: (lock: SourceLock) => void;
   onOwner?: (owner: Awaited<ReturnType<typeof ownerModule.createControllerOwner>>) => void;
 }
 const states = new Map<string, State>();
+const ownerModules = new WeakMap<ownerModule.ControllerOwner, typeof ownerModule>();
+function ownersFor(owner: ownerModule.ControllerOwner) {
+  const module = ownerModules.get(owner); assert(module, "original fixture owner is required"); return module;
+}
+export const awaitControllerAdmission: typeof ownerModule.awaitControllerAdmission = (...args) => ownersFor(args[0]).awaitControllerAdmission(...args);
+export const finishControllerOwner: typeof ownerModule.finishControllerOwner = (...args) => ownersFor(args[0]).finishControllerOwner(...args);
+export const recordControllerFailure: typeof ownerModule.recordControllerFailure = (...args) => ownersFor(args[0]).recordControllerFailure(...args);
+export const rememberControllerStore: typeof ownerModule.rememberControllerStore = (...args) => ownersFor(args[0]).rememberControllerStore(...args);
 /** Negative tests may observe/fault the real private owner and lock. Production
  * capture imports the concrete factory directly and has no such hook. */
 export async function createControllerOwner(...args: Parameters<typeof ownerModule.createControllerOwner>) {
-  const owner = await ownerModule.createControllerOwner(...args), state = states.get(args[1].controlRoot.path);
+  const state = states.get(args[1].controlRoot.path);
   assert(state);
+  const owner = await state.owners.createControllerOwner(...args); ownerModules.set(owner, state.owners);
   const withLock = owner.adapter.withSourceLock;
   owner.adapter.withSourceLock = function<T>(kind: "control" | "snapshot", consume: (lock: SourceLock) => Promise<T>): Promise<T> {
     return withLock.call(owner.adapter, kind, async lock => {
@@ -66,6 +75,7 @@ export async function captureFixture(kind: "sqlite" | "postgres" = "sqlite",
   try { process.chdir(path.dirname(previous)); profile = await sourceFilesFixture(); }
   finally { process.chdir(previous); }
   let fixture: Awaited<ReturnType<typeof enterFixture>> | undefined, isolated: string | undefined;
+  let capturePreview: Awaited<ReturnType<typeof attachPreviewModules>> | undefined;
   try {
     fixture = await enterFixture(kind, { ...options, directory: profile.directory, drainClient: true });
     if (options.changeBusinessBeforeEnter)
@@ -84,7 +94,13 @@ export async function captureFixture(kind: "sqlite" | "postgres" = "sqlite",
     sourceCode = absoluteImports(sourceCode.replaceAll('from "./source-file-native.ts"', "from " + JSON.stringify(profileFixture))
       .replaceAll('from "./source-file-profile.ts"', "from " + JSON.stringify(profileFixture)), source);
     const isolatedSource = path.join(isolated, "source-files.ts"); await writeFile(isolatedSource, sourceCode, { mode: 0o600 });
-    const state: State = { source: await import(pathToFileURL(isolatedSource).href) as SourceModule, events: [], hook: () => {} };
+    const sourceOwners = fileURLToPath(new URL("../../src/server/storage/maintenance/controller-owner.ts", import.meta.url));
+    const isolatedOwners = path.join(isolated, "controller-owner.ts");
+    await writeFile(isolatedOwners, absoluteImports((await readFile(sourceOwners, "utf8"))
+      .replaceAll('from "./source-files.ts"', "from " + JSON.stringify(pathToFileURL(isolatedSource).href)), sourceOwners), { mode: 0o600 });
+    capturePreview = await attachPreviewModules(isolated, fixture.directory, pathToFileURL(isolatedSource).href);
+    const state: State = { source: await import(pathToFileURL(isolatedSource).href) as SourceModule,
+      owners: await import(pathToFileURL(isolatedOwners).href) as typeof ownerModule, events: [], hook: () => {} };
     states.set(fixture.reference.controlRoot, state);
     const sourceCapture = fileURLToPath(new URL("../../src/server/storage/maintenance/capture.ts", import.meta.url));
     const captureCode = absoluteImports((await readFile(sourceCapture, "utf8"))
@@ -94,6 +110,7 @@ export async function captureFixture(kind: "sqlite" | "postgres" = "sqlite",
     const capture = await import(pathToFileURL(isolatedCapture).href) as typeof import("../../src/server/storage/maintenance/capture.ts");
     const sourceEnter = fileURLToPath(new URL("../../src/server/storage/maintenance/enter.ts", import.meta.url));
     const enterCode = absoluteImports((await readFile(sourceEnter, "utf8"))
+      .replaceAll('from "./plan.ts"', "from " + JSON.stringify(pathToFileURL(path.join(isolated, "plan.ts")).href))
       .replaceAll('from "./controller-owner.ts"', "from " + JSON.stringify(import.meta.url)), sourceEnter);
     const isolatedEnter = path.join(isolated, "enter.ts"); await writeFile(isolatedEnter, enterCode, { mode: 0o600 });
     const enter = await import(pathToFileURL(isolatedEnter).href) as typeof import("../../src/server/storage/maintenance/enter.ts");
@@ -147,12 +164,21 @@ export async function captureFixture(kind: "sqlite" | "postgres" = "sqlite",
       advance, enter: enter.enterMaintenance,
       async close() {
         states.delete(f.reference.controlRoot);
-        try { await f.close(); } finally { await p.close(); await rm(dir, { recursive: true, force: true }); }
+        const failures: unknown[] = [];
+        for (const close of [() => capturePreview?.close(), () => f.close(), () => p.close(),
+          () => rm(dir, { recursive: true, force: true })]) {
+          try { await close(); } catch (error) { failures.push(error); }
+        }
+        if (failures.length === 1) throw failures[0];
+        if (failures.length) throw new AggregateError(failures, "capture fixture cleanup failed", { cause: failures[0] });
       } };
   } catch (error) {
-    try { await fixture?.close(); } finally {
-      await profile.close(); if (isolated) await rm(isolated, { recursive: true, force: true });
+    const failures: unknown[] = [error];
+    for (const close of [() => capturePreview?.close(), () => fixture?.close(), () => profile.close(),
+      () => isolated && rm(isolated, { recursive: true, force: true })]) {
+      try { await close(); } catch (failure) { failures.push(failure); }
     }
-    throw error;
+    if (failures.length === 1) throw error;
+    throw new AggregateError(failures, "capture fixture initialization failed", { cause: error });
   }
 }

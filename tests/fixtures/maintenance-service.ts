@@ -9,6 +9,7 @@ import { recoveryFixture } from "./maintenance-capture-recovery.ts";
 import type { enterFixture } from "./maintenance-enter.ts";
 import type { ControllerOwner } from "../../src/server/storage/maintenance/controller-owner.ts";
 import type { ControllerCommandScope } from "../../src/server/storage/maintenance/controller-write.ts";
+import { attachPreviewModules } from "./maintenance-preview-graph.ts";
 import type { ArtifactStore } from "../../src/server/storage/maintenance/objects.ts";
 import type { ContinueRequest, MaintenanceCommand, MaintenanceResult, MaintenanceServiceOptions, OperationMutex, SourceLock } from "../../src/server/storage/maintenance/types.ts";
 
@@ -53,8 +54,13 @@ export function runActualMaintenanceCli(source: Pick<Awaited<ReturnType<typeof e
   const env = { ...process.env };
   for (const key of Object.keys(env))
     if (key.startsWith("AGENT_STUDIO_") || ["BOARDROOM_HOME", "NODE_OPTIONS", "NODE_PATH"].includes(key)) delete env[key];
+  const descriptor = source.options.environment.databaseDescriptor;
   const result = spawnSync(process.execPath, args, { cwd: source.directory,
-    env: { ...env, HOME: source.directory, AGENT_STUDIO_CONFIG: source.configFile, BOARDROOM_HOME: path.join(source.directory, "home") },
+    env: { ...env, HOME: source.directory,
+      ...(source.options.environment.configFile === null
+        ? descriptor.kind === "postgres" ? { AGENT_STUDIO_DB_DRIVER: "postgres", AGENT_STUDIO_PG_CONNECTION_STRING: descriptor.connectionString } : {}
+        : { AGENT_STUDIO_CONFIG: source.configFile }),
+      BOARDROOM_HOME: path.join(source.directory, "home") },
     encoding: "utf8", timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
   assert.equal(result.error, undefined); assert.equal(result.signal, null); return result;
 }
@@ -147,13 +153,17 @@ export async function startServiceChild(source: { directory: string; moduleDirec
   const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", `
     import { attachServiceChildGraph } from ${JSON.stringify(import.meta.url)};
     import { attachSourceFileFixture } from ${JSON.stringify(pathToFileURL(profilePath).href)};
+    import { attachPreviewDirectory } from ${JSON.stringify(pathToFileURL(path.join(directory, "preview-source-profile.ts")).href)};
     let done = false, stopping = false;
     process.on('message', value => { if (value === 'stop') { stopping = true; if (done && process.connected) process.disconnect(); } });
     process.once('message', async value => {
       try {
         attachSourceFileFixture(${JSON.stringify(source.directory)});
+        const preview = await attachPreviewDirectory(${JSON.stringify(source.directory)});
         const service = await attachServiceChildGraph(${JSON.stringify(directory)}, value.command.request.plan.controlRoot);
-        const result = await service.runMaintenanceServiceCommand(value.options, value.command);
+        let result;
+        try { result = await service.runMaintenanceServiceCommand(value.options, value.command); }
+        finally { preview.close(); }
         done = true;
         process.send({ kind: 'result', result, pid: process.pid }, () => { if (stopping && process.connected) process.disconnect(); });
       } catch (error) {
@@ -208,6 +218,7 @@ export async function serviceFixture(kind: "sqlite" | "postgres" = "sqlite",
   assert.equal(process.platform, "linux", "this engineering Fs fixture uses the actual Linux source-FD bridge");
   const source = await recoveryFixture(kind, options);
   let directory: string | undefined;
+  let preview: Awaited<ReturnType<typeof attachPreviewModules>> | undefined;
   let admin: Client | undefined, target: { name: string; oid: string | null } | undefined;
   let serviceOptions: MaintenanceServiceOptions = source.options;
   const dropTarget = async () => {
@@ -237,12 +248,14 @@ export async function serviceFixture(kind: "sqlite" | "postgres" = "sqlite",
   };
   const names = new Set(["service.ts", "cancel.ts", "verified-maintenance.ts", "controller-owner.ts", "enter.ts", "inspect.ts",
     "controller-write.ts", "control-sql.ts", "control-sql-write.ts", "sqlite.ts", "postgres.ts", "snapshot-bundle.ts",
-    "verify-bundle.ts", "snapshot-ready.ts", "verification-source-client-binding.ts", "restore-authorization.ts", "source-files.ts"]);
+    "verify-bundle.ts", "snapshot-ready.ts", "verification-source-client-binding.ts", "restore-authorization.ts", "source-files.ts",
+    "plan.ts", "source-file-preview.ts"]);
   try {
     await freshVerificationTarget();
     directory = await mkdtemp(path.join(process.cwd(), ".agent-output-c3-service-"));
     const copyDirectory = directory;
     for (const name of names) {
+      if (name === "plan.ts" || name === "source-file-preview.ts") continue;
       const original = fileURLToPath(new URL("../../src/server/storage/maintenance/" + name, import.meta.url));
       let code = await readFile(original, "utf8");
       if (name === "source-files.ts") {
@@ -260,6 +273,8 @@ export async function serviceFixture(kind: "sqlite" | "postgres" = "sqlite",
         .replace(/import\("(\.{1,2}\/[^"\n]+)"\)/g, (_, relative: string) => "import(" + JSON.stringify(target(relative)) + ")");
       await writeFile(path.join(copyDirectory, name), code, { mode: 0o600 });
     }
+    preview = await attachPreviewModules(copyDirectory, source.directory,
+      pathToFileURL(path.join(copyDirectory, "source-files.ts")).href);
     // Observe the actual factory return without modifying it or adding a
     // production hook. Every private check continues to use the original object.
     const writerUrl = pathToFileURL(path.join(copyDirectory, "controller-write.ts")).href;
@@ -280,7 +295,7 @@ export async function serviceFixture(kind: "sqlite" | "postgres" = "sqlite",
       get options() { return serviceOptions; }, freshVerificationTarget,
       async close() {
         const failures: unknown[] = [];
-        for (const cleanup of [dropTarget, () => admin?.end(), () => source.close(), () => rm(copyDirectory, { recursive: true, force: true })])
+        for (const cleanup of [dropTarget, () => admin?.end(), () => preview?.close(), () => source.close(), () => rm(copyDirectory, { recursive: true, force: true })])
           try { await cleanup(); } catch (error) { failures.push(error); }
         states.delete(source.reference.controlRoot);
         if (failures.length === 1) throw failures[0];
@@ -288,7 +303,7 @@ export async function serviceFixture(kind: "sqlite" | "postgres" = "sqlite",
       } };
   } catch (error) {
     const failures: unknown[] = [error];
-    for (const cleanup of [dropTarget, () => admin?.end(), () => source.close(), () => directory && rm(directory, { recursive: true, force: true })])
+    for (const cleanup of [dropTarget, () => admin?.end(), () => preview?.close(), () => source.close(), () => directory && rm(directory, { recursive: true, force: true })])
       try { await cleanup(); } catch (failure) { failures.push(failure); }
     states.delete(source.reference.controlRoot);
     if (failures.length === 1) throw error;

@@ -12,7 +12,7 @@ import { BootstrapAuditFactory } from "../src/server/storage/maintenance/native-
 import { assertPostgresServerCapability, stablePostgresSourceIdentity } from "../src/server/storage/maintenance/postgres-identity.ts";
 import { parsePostgresConnection } from "../src/server/storage/maintenance/postgres-tools.ts";
 import type { OperationMutex } from "../src/server/storage/maintenance/types.ts";
-import { postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgres.ts";
+import { protocolPostgresAuditFixture as postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgres.ts";
 
 const pgTest = process.env.AGENT_STUDIO_PG_TEST_URL ? test : test.skip;
 const sqlText = (value: unknown) => typeof value === "string" ? value : typeof value === "object" && value !== null && "text" in value ? String(value.text) : "";

@@ -3,14 +3,14 @@ import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { serviceFixture } from "./fixtures/maintenance-service.ts";
-import { enterFixture } from "./fixtures/maintenance-enter.ts";
-import { enterMaintenance } from "../src/server/storage/maintenance/enter.ts";
-import { runMaintenanceServiceCommand } from "../src/server/storage/maintenance/service.ts";
+import { protocolEnterFixture as enterFixture } from "./fixtures/maintenance-enter.ts";
+import { enterMaintenance } from "./fixtures/maintenance-preview-graph.ts";
+import { runMaintenanceServiceCommand } from "./fixtures/maintenance-preview-graph.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { maintenanceRequestDigest } from "../src/server/storage/maintenance/parse.ts";
 import { captureReference, verifyJournalChain } from "../src/server/storage/maintenance/journal.ts";
 import { sha256 } from "../src/server/storage/maintenance/canonical.ts";
-import { planMigration, persistMigrationPlan } from "../src/server/storage/maintenance/plan.ts";
+import { planMigration, persistMigrationPlan } from "./fixtures/maintenance-preview-graph.ts";
 
 const nativeTest = ["linux", "darwin"].includes(process.platform) ? test : test.skip;
 const sourceFileTest = process.platform === "linux" ? test : test.skip;

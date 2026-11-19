@@ -5,6 +5,7 @@ import { MaintenanceFailure } from "./error.ts";
 import { createSqliteMaintenanceAdapter } from "./sqlite.ts";
 import { createPostgresMaintenanceAdapter } from "./postgres.ts";
 import { postgresDescriptorDigest } from "./postgres-tools.ts";
+import { SourceFilesFailure } from "./source-files.ts";
 import type { DatabaseDescriptor } from "../../environment.ts";
 import type { ArtifactStore } from "./objects.ts";
 import type { Json, MaintenanceAdapter, MaintenanceServiceOptions, MigrationPlan, OperationMutex, SourceLock } from "./types.ts";
@@ -17,6 +18,7 @@ export interface ControllerOwner {
   readonly keys: readonly string[];
   readonly stores: Map<string, ArtifactStore>;
   readonly unresolvedSourceErrors: Set<object>;
+  readonly sourceFailures: Set<object>;
   adapterClosed: boolean;
   closing?: Promise<void>;
 }
@@ -42,12 +44,21 @@ function throwFailures(errors: readonly unknown[], subject: string): never {
   if (errors.length === 1) throw errors[0];
   throw new AggregateError(errors, "storage_maintenance: " + subject, { cause: errors[0] });
 }
+function unknownNativeCleanup(error: object): boolean {
+  if (!Object.hasOwn(error, "nativeCleanupOwner")) return false;
+  const calls = Object.getOwnPropertyDescriptor(error, "cleanupCalls")?.value as unknown;
+  if (!Array.isArray(calls)) return true;
+  return calls.some(call => call && typeof call === "object" && typeof call.operation === "string"
+    && (call.operation.startsWith("close-") || call.operation === "closedir-source") && call.rc === -1n);
+}
 /** These are caught real errors, not caller proof. Keep the original S/native
  * error graph (and its real nativeCleanupOwner) alive. No numeric FD is retried. */
 function retainSourceErrors(owner: ControllerOwner, error: unknown, seen = new Set<object>()): void {
   if (error === null || typeof error !== "object" || seen.has(error)) return;
   seen.add(error);
-  if (Object.hasOwn(error, "nativeCleanupOwner")
+  if (error instanceof SourceFilesFailure || "code" in error && typeof error.code === "string" && error.code.startsWith("ERR_SOURCE_"))
+    owner.sourceFailures.add(error);
+  if (unknownNativeCleanup(error)
     || "closeErrors" in error && Array.isArray(error.closeErrors) && error.closeErrors.length > 0)
     owner.unresolvedSourceErrors.add(error);
   if (error instanceof AggregateError) for (const item of error.errors) retainSourceErrors(owner, item, seen);
@@ -90,6 +101,7 @@ async function finishPending(owner: ControllerOwner): Promise<void> {
  * This only settles original concrete owners; it grants no source/lock proof. */
 export async function awaitControllerAdmission(owner: ControllerOwner): Promise<void> {
   for (;;) {
+    if (owner.sourceFailures.size) throwFailures([...owner.sourceFailures], "source failure remains observed");
     if (owner.adapterClosed || owner.closing || pending.has(owner))
       throw new MaintenanceFailure("maintenance_lost", "controller-owner-closing");
     const previous = [...pending].filter(other => other !== owner && owner.keys.some(key => other.keys.includes(key)));
@@ -108,7 +120,7 @@ export async function createControllerOwner(options: MaintenanceServiceOptions, 
   for (const owner of pending) if (keys.some(key => owner.keys.includes(key))) await finishPending(owner);
   const adapter = descriptor.kind === "sqlite" ? await createSqliteMaintenanceAdapter(descriptor)
     : await createPostgresMaintenanceAdapter(descriptor, options.postgresVerification);
-  return { descriptor, adapter, keys, stores: new Map(), unresolvedSourceErrors: new Set(), adapterClosed: false };
+  return { descriptor, adapter, keys, stores: new Map(), unresolvedSourceErrors: new Set(), sourceFailures: new Set(), adapterClosed: false };
 }
 /** Existing C1/C2 wrappers retain their original safe auxiliary diagnostics.
  * The concrete owner, pending set and resource cleanup are shared below. */

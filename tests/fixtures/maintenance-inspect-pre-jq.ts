@@ -9,7 +9,7 @@ import { SqliteDriver } from "../../src/server/db/drivers/sqlite.ts";
 import { resolveBoardroomEnvironment } from "../../src/server/environment.ts";
 import { canonicalJson, digestJson, sha256 } from "../../src/server/storage/maintenance/canonical.ts";
 import { ArtifactStore } from "../../src/server/storage/maintenance/objects.ts";
-import { planMigration, persistMigrationPlan } from "../../src/server/storage/maintenance/plan.ts";
+import { createPreviewGraph, planMigration, persistMigrationPlan } from "./maintenance-preview-graph.ts";
 import { createSqliteMaintenanceAdapter } from "../../src/server/storage/maintenance/sqlite.ts";
 import { buildSourceClientsRoster, sourceClientsDigest } from "../../src/server/storage/maintenance/source-clients.ts";
 import { registerStorageSourceClient, storageReceiptDigest } from "../../src/server/storage/source-client.ts";
@@ -17,7 +17,8 @@ import type { ArtifactRef, ContinueRequest, JournalRecordV2, MaintenanceServiceO
 import { postgresAuditFixture } from "./maintenance-source-audit-postgres.ts";
 
 /** Actual registration, native locks and committed planned anchor; no capture/Fs producer. */
-export async function sqliteInspectFixture(commitFault?: "before" | "after", generation = 1) {
+export async function sqliteInspectFixture(commitFault?: "before" | "after", generation = 1,
+  configSource: "file" | "none" = "file") {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), "br-inspect-prejq-")));
   const dataDir = path.join(directory, "data"); await mkdir(dataDir);
   const file = path.join(dataDir, "agent-studio.db"), configFile = path.join(directory, "config.json");
@@ -28,14 +29,17 @@ export async function sqliteInspectFixture(commitFault?: "before" | "after", gen
     if (generation > 1) initial.prepare("UPDATE storage_maintenance SET owner_generation=?,fence_epoch=?")
       .run(generation - 1, 2 * (generation - 1));
   } finally { initial.close(); }
-  await writeFile(configFile, JSON.stringify({ dataDir }));
+  if (configSource === "file") await writeFile(configFile, JSON.stringify({ dataDir }));
   const environment = await resolveBoardroomEnvironment({ cwd: directory, homeDir: directory,
-    env: { AGENT_STUDIO_CONFIG: configFile, BOARDROOM_HOME: path.join(directory, "home") } });
+    env: { ...(configSource === "file" ? { AGENT_STUDIO_CONFIG: configFile } : { AGENT_STUDIO_DATA_DIR: dataDir }),
+      BOARDROOM_HOME: path.join(directory, "home") } });
   assert.equal(environment.databaseDescriptor.kind, "sqlite");
   const adapter = await createSqliteMaintenanceAdapter(environment.databaseDescriptor as never);
   let mutex: OperationMutex | undefined;
   let client: Awaited<ReturnType<typeof registerStorageSourceClient>> | undefined;
+  let preview: Awaited<ReturnType<typeof createPreviewGraph>> | undefined;
   try {
+    preview = await createPreviewGraph(directory, configSource === "none" ? "production" : "qualified-linux");
     const driver = new SqliteDriver({ dataDir }); await driver.connect();
     client = await registerStorageSourceClient({ db: driver, database: environment.databaseDescriptor, entrypoint: "http" });
     await client.bind({ stopNewWork() {}, async disconnectSessions() {}, async closeMemory() {},
@@ -79,21 +83,22 @@ export async function sqliteInspectFixture(commitFault?: "before" | "after", gen
     else if (commitFailed) throw commitFailure;
     if (commitFault !== "before") { await client.refresh(); await client.waitForDrain(); }
     return { directory, dataDir, file, configFile, options, adapter, mutex, client, plan, reference, store, head: head!, enterRequest,
-      commitFailed, commitFailure,
-      async close() { await client!.close(); await mutex!.release(); await adapter.close(); await rm(directory, { recursive: true }); } };
+      commitFailed, commitFailure, preview,
+      async close() { await client!.close(); await mutex!.release(); await adapter.close(); await preview!.close(); await rm(directory, { recursive: true }); } };
   } catch (error) {
-    await client?.close(); await mutex?.release(); await adapter.close(); await rm(directory, { recursive: true }); throw error;
+    await client?.close(); await mutex?.release(); await adapter.close(); await preview?.close(); await rm(directory, { recursive: true }); throw error;
   }
 }
 
-export async function postgresInspectFixture() {
-  const fixture = await postgresAuditFixture();
-  const environment = await resolveBoardroomEnvironment({ cwd: fixture.directory, homeDir: fixture.directory,
-    env: { AGENT_STUDIO_CONFIG: fixture.plan.originalConfigPath!, BOARDROOM_HOME: path.join(fixture.directory, "home") } });
-  const options: MaintenanceServiceOptions = { environment, originalCwd: fixture.directory,
-    expectedSourceId: environment.inventory.selectedSourceId!, controlRoot: fixture.reference.controlRoot,
-    targetRoot: fixture.plan.targetRoot.path };
-  return { ...fixture, options };
+export async function postgresInspectFixture(configSource: "file" | "none" = "file") {
+  return postgresAuditFixture("UTF8", { configSource });
+}
+
+export function protocolSqliteInspectFixture(commitFault?: "before" | "after", generation = 1) {
+  return sqliteInspectFixture(commitFault, generation, process.platform === "darwin" ? "none" : "file");
+}
+export function protocolPostgresInspectFixture() {
+  return postgresInspectFixture(process.platform === "darwin" ? "none" : "file");
 }
 
 export function inspectRequest(fixture: { reference: ContinueRequest["plan"]; plan: { source: ContinueRequest["expectedSource"] }; head: ArtifactRef }): ContinueRequest {
