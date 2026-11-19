@@ -6,7 +6,8 @@ import { equal, requireCandidate } from "./common.ts";
 import type { CandidateContents } from "./content.ts";
 import type { CandidateNode } from "./replay.ts";
 import { decodeRow, supportedEncoding } from "./rows.ts";
-import { invariantSchema, type MaintenanceInvariant } from "./schema.ts";
+import { invariantSchema, invariantSchemaFor, type MaintenanceInvariant } from "./schema.ts";
+import { assertP0FSyntaxScope, reserveP0FNativeNodes,reserveP0FNativeKeyListSort, type P0FArtifactSyntaxFrame } from '../../../identity/internal/m2-p0-artifacts-frame.ts';
 
 export interface CaptureExpectation { readonly rows: readonly SourceClientRawRow[]; readonly encoding: SourceClientsRosterV1["textEncoding"]; readonly invariant: MaintenanceInvariant | null }
 export interface SnapshotClosure {
@@ -29,9 +30,11 @@ function numberCell(value: unknown): string {
 }
 const columns = ["singleton", "database_instance_id", "control_root_json", "mutex_identity_json", "fence_epoch", "owner_generation", "admission",
   "active_migration_id", "plan_digest", "journal_record_ref", "journal_digest", "journal_sequence", "protocol_version", "guard_manifest_digest"].sort();
-export function invariantFromManifests(manifests: DatabaseManifests, captured: CandidateNode, controlRoot: unknown, mutexIdentity: unknown): MaintenanceInvariant {
+export function invariantFromManifests(manifests: DatabaseManifests, captured: CandidateNode, controlRoot: unknown, mutexIdentity: unknown, syntaxFrame?: P0FArtifactSyntaxFrame): MaintenanceInvariant {
+  if (syntaxFrame !== undefined) assertP0FSyntaxScope(syntaxFrame, 'manifests', manifests);
   requireCandidate(manifests.controlRows.storage_maintenance.length === 1 && captured.record.frozen !== null);
   const row = manifests.controlRows.storage_maintenance[0]!;
+  reserveP0FNativeKeyListSort(row);
   requireCandidate(equal(Object.keys(row).sort(), columns) && row.database_instance_id === captured.record.source.databaseInstanceId
     && row.admission === "sealed" && numberCell(row.fence_epoch) === String(captured.record.fenceEpoch)
     && numberCell(row.owner_generation) === String(captured.record.ownerGeneration) && row.active_migration_id === captured.record.migrationId
@@ -39,7 +42,9 @@ export function invariantFromManifests(manifests: DatabaseManifests, captured: C
     && row.journal_record_ref === captured.reference.ref && row.journal_digest === captured.reference.sha256
     && numberCell(row.journal_sequence) === String(captured.record.sequence) && row.control_root_json === canonicalJson(controlRoot)
     && row.mutex_identity_json === canonicalJson(mutexIdentity));
-  const parsed = invariantSchema.safeParse({ singleton: numberCell(row.singleton), databaseInstanceId: row.database_instance_id,
+  // Ten scalar fields: one temporary object and the strict schema's new clone.
+  reserveP0FNativeNodes((1 + 10 * 2) * 2);
+  const parsed = (syntaxFrame === undefined ? invariantSchema : invariantSchemaFor(syntaxFrame)).safeParse({ singleton: numberCell(row.singleton), databaseInstanceId: row.database_instance_id,
     controlRootJson: row.control_root_json, mutexIdentityJson: row.mutex_identity_json, fenceEpoch: numberCell(row.fence_epoch), admission: row.admission,
     activeMigrationId: row.active_migration_id, planDigest: row.plan_digest, protocolVersion: numberCell(row.protocol_version), guardManifestDigest: row.guard_manifest_digest });
   requireCandidate(parsed.success); return parsed.data;

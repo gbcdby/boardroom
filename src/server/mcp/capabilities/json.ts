@@ -8,12 +8,17 @@ export interface ReadonlyJsonObject { readonly [key: string]: ReadonlyJsonValue 
 export type DeepReadonly<T> = T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
 
 /** 错误只包含固定代码；不回显 URL、命令、凭据或上游正文。 */
+const capabilityInputErrors = new WeakMap<object, string>();
+export function capabilityInputErrorCode(value: unknown): string | undefined {
+  return value !== null && (typeof value === "object" || typeof value === "function") ? capabilityInputErrors.get(value) : undefined;
+}
 export class CapabilityInputError extends Error {
   readonly code: string;
   constructor(code: string) {
     super(code);
     this.name = "CapabilityInputError";
     this.code = code;
+    capabilityInputErrors.set(this, code);
   }
 }
 

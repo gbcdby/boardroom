@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { canonicalJson, normalizePolicyAction } from '../policy/canonical.ts';
 import { policyActionSchema } from '../policy/schemas.ts';
 import type { DecisionTextColumn } from './types.ts';
+import { DECISION_TABLE_NAMES } from './tables.ts';
 
 const s = z.string();
 const id = z.string().min(1).max(200);
@@ -129,7 +130,7 @@ const schemas: Record<DecisionTextColumn,z.ZodTypeAny> = {
 };
 export const TEXT_COLUMNS = Object.freeze(Object.keys(schemas) as DecisionTextColumn[]);
 export { StorageInvalid } from './storage-error.ts';
-import { StorageInvalid } from './storage-error.ts';
+import { StorageInvalid, withStorageInvalidRow } from './storage-error.ts';
 import { validateRawDecisionRow } from './row-validation.ts';
 const fail = (column:string,stage:string):never => { throw new StorageInvalid(column,stage); };
 export function encode(column:DecisionTextColumn,value:unknown):string {
@@ -144,8 +145,100 @@ export function decode(column:DecisionTextColumn,raw:string):unknown {
   if (typeof raw !== 'string') return fail(column,'raw_not_text');
   let value:unknown;
   try { value=JSON.parse(raw); } catch { return fail(column,'invalid_json'); }
+  return decodedCanonicalValue(column,raw,value);
+}
+function decodedCanonicalValue(column:DecisionTextColumn,raw:string,value:unknown):unknown {
   if (encode(column,value) !== raw) return fail(column,'noncanonical_text');
   return value;
+}
+
+type DecodedRow = Readonly<Record<string,unknown>>;
+type DecodedGraph = Readonly<Record<string,readonly DecodedRow[]>>;
+declare const decodedFrameBrand: unique symbol;
+/** A private pass-local cache of actual decoder values, never a verified-graph flag. */
+export interface DecisionDecodedFrame { readonly [decodedFrameBrand]: true; }
+interface DecodedFrameState {
+  readonly graph: DecodedGraph;
+  readonly request: object;
+  readonly view: object;
+  readonly pass: object;
+  readonly rows: WeakMap<DecodedRow,string>;
+  readonly decoded: WeakMap<DecodedRow,Map<DecisionTextColumn,unknown>>;
+  readonly derived: WeakMap<object,Map<string,unknown>>;
+}
+const decodedFrames = new WeakMap<DecisionDecodedFrame,DecodedFrameState>();
+function frameState(frame:DecisionDecodedFrame):DecodedFrameState {
+  const state=decodedFrames.get(frame);
+  if(!state)return fail('decision_storage','decoded_frame');
+  return state;
+}
+function freezeDecoded<T>(value:T):T {
+  if(value!==null&&typeof value==='object') {
+    for(const entry of Object.values(value))freezeDecoded(entry);
+    Object.freeze(value);
+  }
+  return value;
+}
+/** Called only for the owned frozen scalar graph of a particular authenticated
+ * P0 context. Creating a frame does not validate a row or any graph relation. */
+export function createDecisionDecodedFrame(graph:DecodedGraph,request:object,view:object,pass:object):DecisionDecodedFrame {
+  if(!Object.isFrozen(graph))return fail('decision_storage','decoded_frame');
+  const rows=new WeakMap<DecodedRow,string>();
+  for(const [table,entries] of Object.entries(graph)) {
+    if(!Array.isArray(entries)||!Object.isFrozen(entries))return fail('decision_storage','decoded_frame');
+    const decisionTable=DECISION_TABLE_NAMES.includes(table);
+    for(const row of entries) {
+      if(row===null||typeof row!=='object'||!Object.isFrozen(row))return fail('decision_storage','decoded_frame');
+      if(decisionTable)rows.set(row,table);
+    }
+  }
+  const frame=Object.freeze({}) as DecisionDecodedFrame;
+  decodedFrames.set(frame,{graph,request,view,pass,rows,decoded:new WeakMap(),derived:new WeakMap()});
+  return frame;
+}
+export function assertDecisionDecodedFrame(frame:DecisionDecodedFrame,graph:DecodedGraph,request:object,view:object,pass:object):void {
+  const state=frameState(frame);
+  if(state.graph!==graph||state.request!==request||state.view!==view||state.pass!==pass)return fail('decision_storage','decoded_frame');
+}
+export function assertDecisionFrameGraph(frame:DecisionDecodedFrame,graph:DecodedGraph):void {
+  if(frameState(frame).graph!==graph)return fail('decision_storage','decoded_frame');
+}
+function frameRow(frame:DecisionDecodedFrame,table:string,row:DecodedRow):DecodedFrameState {
+  const state=frameState(frame);
+  if(state.rows.get(row)!==table)return fail('decision_storage','decoded_frame');
+  return state;
+}
+/** Native failures in the finite frame are not evidence of malformed data.
+ * A has already checked the registered grammar; the actual legacy parse still
+ * executes, without re-certifying an unknown throw as StorageInvalid. */
+export function parseDecisionFrameJson(frame:DecisionDecodedFrame,table:string,row:DecodedRow,field:string):unknown {
+  frameRow(frame,table,row);
+  const raw=row[field];
+  if(typeof raw!=='string')return fail(`${table}.${field}`,'raw_not_text');
+  return JSON.parse(raw);
+}
+/** The only cache writer calls the real decoder on this exact frozen row. No
+ * caller-supplied parsed value, schema result or success flag can enter it. */
+export function decodeDecisionRow(column:DecisionTextColumn,row:DecodedRow,frame?:DecisionDecodedFrame):unknown {
+  const split=column.indexOf('.'),table=column.slice(0,split),field=column.slice(split+1);
+  if(frame===undefined)return decode(column,row[field] as string);
+  const state=frameRow(frame,table,row);
+  let values=state.decoded.get(row);
+  if(values?.has(column))return values.get(column);
+  const value=freezeDecoded(decodedCanonicalValue(column,row[field] as string,parseDecisionFrameJson(frame,table,row,field)));
+  if(!values){values=new Map();state.decoded.set(row,values);}
+  values.set(column,value);
+  return value;
+}
+function decodedDerived<T>(frame:DecisionDecodedFrame|undefined,value:object,key:string,compute:()=>T):T {
+  if(frame===undefined)return compute();
+  const state=frameState(frame);
+  let values=state.derived.get(value);
+  if(values?.has(key))return values.get(key) as T;
+  const result=freezeDecoded(compute());
+  if(!values){values=new Map();state.derived.set(value,values);}
+  values.set(key,result);
+  return result;
 }
 export function hashDomain(domain:string,value:unknown):string {
   return createHash('sha256').update(`${domain}\n${canonicalJson(value)}`,'utf8').digest('hex');
@@ -155,18 +248,20 @@ export function candidateDigest(candidate:unknown):string { return hashDomain('b
 export function permissionDigest(snapshot:unknown):string { return hashDomain('boardroom.decision-permissions.v1',snapshot); }
 
 /** Row validation is pure and never changes the original source row or its TEXT. */
-export function validateCopyRow(table:string,row:Readonly<Record<string,unknown>>):void {
-  validateRawDecisionRow(table,row);
+export function validateCopyRow(table:string,row:Readonly<Record<string,unknown>>,frame?:DecisionDecodedFrame):void {
+  if(frame!==undefined)frameRow(frame,table,row);
+  validateRawDecisionRow(table,row,frame);
   const decoded:Record<string,unknown>={};
   for (const key of TEXT_COLUMNS.filter(x => x.startsWith(`${table}.`))) {
     const col=key.slice(table.length+1);
-    decoded[col]=decode(key,row[col] as string);
+    decoded[col]=decodeDecisionRow(key,row,frame);
   }
   const check=(condition:boolean,field:string) => { if(!condition)fail(`${table}.${field}`,'binding_or_digest'); };
   if (table === 'decision_action_requests') {
-    const action=reviewAction.parse(decoded.action_json), envelope=candidateEnvelope.parse(decoded.candidate_envelope_json);
-    check(normalizePolicyAction(action).actionDigest === row.action_digest,'action_digest');
-    check(candidateDigest(envelope) === row.candidate_digest && action.candidateDigest === row.candidate_digest,'candidate_digest');
+    const action=frame===undefined?reviewAction.parse(decoded.action_json):decoded.action_json as z.infer<typeof reviewAction>;
+    const envelope=frame===undefined?candidateEnvelope.parse(decoded.candidate_envelope_json):decoded.candidate_envelope_json as z.infer<typeof candidateEnvelope>;
+    check(decodedDerived(frame,action,'normalized-action',()=>normalizePolicyAction(action)).actionDigest === row.action_digest,'action_digest');
+    check(decodedDerived(frame,envelope,'candidate-digest',()=>candidateDigest(envelope)) === row.candidate_digest && action.candidateDigest === row.candidate_digest,'candidate_digest');
     check(action.projectId === row.project_id && action.subjectRef.id === row.round_id &&
       action.expectedSubjectRevisions[0]?.subjectRef.id === row.round_id &&
       action.expectedSubjectRevisions[1]?.subjectRef.id === row.task_id &&
@@ -176,19 +271,19 @@ export function validateCopyRow(table:string,row:Readonly<Record<string,unknown>
     check(envelope.projectId === row.project_id && envelope.taskId === row.task_id && envelope.roundId === row.round_id,'candidate_envelope_json');
   }
   if (table === 'decision_records' || table === 'decision_resolutions') {
-    const obs=observationSchema.parse(decoded.policy_evaluation_json);
-    check(obs.fullEvaluation.actionDigest === row.action_digest && normalizePolicyAction(obs.fullEvaluation.action).actionDigest === row.action_digest,'policy_evaluation_json');
+    const obs=frame===undefined?observationSchema.parse(decoded.policy_evaluation_json):decoded.policy_evaluation_json as z.infer<typeof observationSchema>;
+    check(obs.fullEvaluation.actionDigest === row.action_digest && decodedDerived(frame,obs.fullEvaluation.action,'normalized-action',()=>normalizePolicyAction(obs.fullEvaluation.action)).actionDigest === row.action_digest,'policy_evaluation_json');
     check(obs.fullEvaluation.action.projectId === row.project_id && obs.fullEvaluation.action.subjectRef.id === row.round_id,'policy_evaluation_json');
   }
   if (table === 'decision_resolutions') {
-    const p=permission.parse(decoded.permission_snapshot_json);
-    check(permissionDigest(p) === row.permission_snapshot_digest,'permission_snapshot_digest');
+    const p=frame===undefined?permission.parse(decoded.permission_snapshot_json):decoded.permission_snapshot_json as z.infer<typeof permission>;
+    check(decodedDerived(frame,p,'permission-digest',()=>permissionDigest(p)) === row.permission_snapshot_digest,'permission_snapshot_digest');
     check(p.projectId === row.project_id && p.taskId === row.task_id && p.roundId === row.round_id &&
       p.actor.kind === row.actor_kind && p.actor.id === row.actor_id && p.actualPath === row.actual_execution_path,'permission_snapshot_json');
   }
   if (table === 'decision_user_events') {
-    const c=uiCommand.parse(decoded.command_json);
-    check(commandDigest(c.command) === row.request_digest && c.clientMutationId === row.client_mutation_id &&
+    const c=frame===undefined?uiCommand.parse(decoded.command_json):decoded.command_json as z.infer<typeof uiCommand>;
+    check(decodedDerived(frame,c.command,'command-digest',()=>commandDigest(c.command)) === row.request_digest && c.clientMutationId === row.client_mutation_id &&
       c.kind === row.command_kind && c.command.actor.kind === row.actor_kind && c.command.actor.id === row.actor_id &&
       c.command.projectId === row.project_id && c.command.taskId === row.task_id && c.command.roundId === row.round_id,'command_json');
     if(c.command.operation === 'resolve') check(c.command.input.decisionRef.decisionId === row.decision_id &&
@@ -197,7 +292,7 @@ export function validateCopyRow(table:string,row:Readonly<Record<string,unknown>
     else check(row.choice_id === 'approve','choice_id');
   }
   if (table === 'decision_command_receipts') {
-    const r=response.parse(decoded.response_json), c=r.receipt;
+    const r=frame===undefined?response.parse(decoded.response_json):decoded.response_json as z.infer<typeof response>, c=r.receipt;
     check(c.receiptId === row.id && c.requestDigest === row.request_digest && c.operation === row.operation &&
       c.actor.kind === row.actor_kind && c.actor.id === row.actor_id && c.result === row.result_state &&
       c.httpStatus === Number(row.http_status) && c.resultDecisionRef.decisionId === row.result_decision_id &&
@@ -207,7 +302,7 @@ export function validateCopyRow(table:string,row:Readonly<Record<string,unknown>
   }
 }
 /** 不可变 execution 的逻辑快照；完整原行由上游 raw validator 校验。 */
-function executionValueFromRow(row:Readonly<Record<string,unknown>>):z.infer<typeof execution> {
+function executionValueFromRow(row:Readonly<Record<string,unknown>>,frame?:DecisionDecodedFrame):z.infer<typeof execution> {
   const revision=(field:string):number => {
     const raw=row[field];
     if(typeof raw!=='number' && !(typeof raw==='string' && /^[1-9][0-9]*$/.test(raw)))
@@ -221,10 +316,10 @@ function executionValueFromRow(row:Readonly<Record<string,unknown>>):z.infer<typ
   if(row.status==='succeeded') {
     value={...base,before:{taskRevision:revision('before_task_revision'),roundRevision:revision('before_round_revision')},
       after:{taskRevision:revision('after_task_revision'),roundRevision:revision('after_round_revision')},
-      taskHistoryId:row.task_history_id,workEventIds:decode('decision_executions.work_event_ids_json',row.work_event_ids_json as string)};
+      taskHistoryId:row.task_history_id,workEventIds:decodeDecisionRow('decision_executions.work_event_ids_json',row,frame)};
   } else if(row.status==='not_required') {
     if(['before_task_revision','before_round_revision','after_task_revision','after_round_revision','task_history_id'].some(k=>row[k]!==null)||
-      canonicalJson(decode('decision_executions.work_event_ids_json',row.work_event_ids_json as string))!=='[]')
+      canonicalJson(decodeDecisionRow('decision_executions.work_event_ids_json',row,frame))!=='[]')
       return fail('decision_executions.status','no_effect_row_has_effect');
   }
   const parsed=execution.safeParse(value);
@@ -234,8 +329,10 @@ function executionValueFromRow(row:Readonly<Record<string,unknown>>):z.infer<typ
 /** Extra cross-row rules supplement SQL FK checks; history is never reauthorized.
  * B3 binds execution values to action/receipt; it does not load actual Task,
  * history or WorkEvent source rows, or claim complete production M1 validation. */
-export function validateDecisionBindings(rows:Readonly<Record<string,readonly Readonly<Record<string,unknown>>[]>>):void {
-  for (const [table,entries] of Object.entries(rows)) for(const row of entries)validateCopyRow(table,row);
+export function validateDecisionBindings(rows:Readonly<Record<string,readonly Readonly<Record<string,unknown>>[]>>,frame?:DecisionDecodedFrame):void {
+  if(frame!==undefined)assertDecisionFrameGraph(frame,rows);
+  const copyEntries=frame===undefined?Object.entries(rows):DECISION_TABLE_NAMES.map(table=>[table,rows[table]??[]] as const);
+  for (const [table,entries] of copyEntries) for(const row of entries)withStorageInvalidRow(row, () => {validateCopyRow(table,row,frame);});
   const receipts=new Map((rows.decision_command_receipts ?? []).map(x=>[x.id,x]));
   const records=new Map((rows.decision_records ?? []).map(x=>[x.id,x]));
   const actions=new Map((rows.decision_action_requests ?? []).map(x=>[x.id,x]));
@@ -244,22 +341,23 @@ export function validateDecisionBindings(rows:Readonly<Record<string,readonly Re
   const executionIds=new Map((rows.decision_executions ?? []).map(x=>[x.id,x]));
   const initiations=new Map((rows.decision_local_initiations ?? []).map(x=>[x.id,x]));
   const events=new Map((rows.decision_user_events ?? []).map(x=>[x.id,x]));
-  for(const r of rows.decision_records ?? []) {
+  for(const r of rows.decision_records ?? []) withStorageInvalidRow(r, () => {
     const a=actions.get(r.action_request_id);
     if(!a || a.action_digest !== r.action_digest)fail('decision_records.action_request_id','missing_or_changed_action');
     const complete=resolutions.has(r.id)&&executions.has(r.id);
     if((r.status === 'resolved') !== complete || (r.status !== 'resolved' && (resolutions.has(r.id)||executions.has(r.id))))
       fail('decision_records.status','terminal_graph_incomplete');
-  }
-  for(const h of rows.decision_review_heads ?? []) {
+  });
+  for(const h of rows.decision_review_heads ?? []) withStorageInvalidRow(h, () => {
     const r=records.get(h.current_decision_id);
     if(!r || Number(r.generation)!==Number(h.head_revision) || ['project_id','task_id','round_id'].some(k=>r[k]!==h[k]))
       fail('decision_review_heads.current_decision_id','head_slot_or_generation');
-  }
-  for(const r of rows.decision_resolutions ?? []) {
+  });
+  for(const r of rows.decision_resolutions ?? []) withStorageInvalidRow(r, () => {
     const c=receipts.get(r.command_receipt_id);
     if(!c)fail('decision_resolutions.command_receipt_id','missing_receipt');
-    const snapshot=response.parse(decode('decision_command_receipts.response_json',c!.response_json as string));
+    const value=decodeDecisionRow('decision_command_receipts.response_json',c!,frame);
+    const snapshot=frame===undefined?response.parse(value):value as z.infer<typeof response>;
     const command=snapshot.receipt.command;
     const inputRef=snapshot.receipt.inputDecisionRef;
     const resolvedInput={decisionId:r.decision_id,revision:Number(r.input_decision_revision),actionDigest:r.action_digest,projectId:r.project_id};
@@ -267,7 +365,7 @@ export function validateDecisionBindings(rows:Readonly<Record<string,readonly Re
     // denotes this resolution's original input. Native resolve always has one.
     if((command.operation==='resolve'||inputRef!==null) && canonicalJson(inputRef)!==canonicalJson(resolvedInput))
       fail('decision_command_receipts.inputDecisionRef','resolution_input_binding');
-    if(!('reason' in command.input) || command.input.reason !== decode('decision_resolutions.reason_json',r.reason_json as string) ||
+    if(!('reason' in command.input) || command.input.reason !== decodeDecisionRow('decision_resolutions.reason_json',r,frame) ||
       snapshot.receipt.requestDigest !== r.request_digest || snapshot.receipt.resolutionId !== r.id)
       fail('decision_resolutions.reason_json','receipt_reason_or_fingerprint');
     const e=executions.get(r.decision_id);
@@ -276,10 +374,11 @@ export function validateDecisionBindings(rows:Readonly<Record<string,readonly Re
     const record=records.get(r.decision_id),actionRow=record&&actions.get(record.action_request_id);
     if(!record || !actionRow || ['project_id','task_id','round_id'].some(k=>e![k]!==r[k]||record[k]!==r[k]||actionRow[k]!==r[k]))
       fail('decision_executions.decision_id','execution_slot_binding');
-    const logicalExecution=executionValueFromRow(e!);
+    const logicalExecution=executionValueFromRow(e!,frame);
     if(canonicalJson(logicalExecution)!==canonicalJson(snapshot.receipt.execution))
       fail('decision_executions','receipt_execution_values');
-    const action=reviewAction.parse(decode('decision_action_requests.action_json',actionRow!.action_json as string));
+    const actionValue=decodeDecisionRow('decision_action_requests.action_json',actionRow!,frame);
+    const action=frame===undefined?reviewAction.parse(actionValue):actionValue as z.infer<typeof reviewAction>;
     if(command.operation==='legacy-decide' && (command.input.expectedTaskRevision!==Number(actionRow!.expected_task_revision)||command.input.expectedRoundRevision!==Number(actionRow!.expected_round_revision)))
       fail('decision_command_receipts.command','legacy_input_revisions');
     if(logicalExecution.status==='succeeded') {
@@ -303,9 +402,9 @@ export function validateDecisionBindings(rows:Readonly<Record<string,readonly Re
         if(!equal(i![key],r[key])||!equal(event![key],r[key]))fail('decision_resolutions.initiation_id','source_binding');
       }
     } else if(r.initiation_id!==null || r.authority==='human')fail('decision_resolutions.authority','false_human_source');
-  }
-  for(const p of rows.decision_review_projections ?? [])if(p.source_kind==='live') {
+  });
+  for(const p of rows.decision_review_projections ?? [])withStorageInvalidRow(p, () => {if(p.source_kind==='live') {
     const e=executionIds.get(p.execution_id);
     if(!e || e.status!=='succeeded' || e.choice_id!=='approve')fail('decision_review_projections.execution_id','not_applied');
-  }
+  }});
 }

@@ -1,17 +1,23 @@
 import path from "node:path";
 import { z } from "zod";
 import { canonicalJson, digestJson, parseCanonical } from "./canonical.ts";
-import { MaintenanceFailure } from "./error.ts";
+import { MaintenanceFailure, maintenanceFailureCode } from "./error.ts";
 import { counter, hash, id, ref, source, text } from "./parse-primitives.ts";
 import { sourceClientsRosterSchema } from "./source-clients.ts";
-import { checkFactsShape, controlProofSchema } from "./control-candidate/schema.ts";
+import { checkFactsShape, controlProofSchema, controlProofSchemaFor } from "./control-candidate/schema.ts";
+import { assertP0FSyntaxScope, reserveP0FNativeClone, reserveP0FNativeManifestsClone, reserveP0FNativeNodes, reserveP0FNativeShallow,reserveP0FNativeMetadata,reserveP0FNativeSplit, type P0FArtifactSyntaxFrame } from '../../identity/internal/m2-p0-artifacts-frame.ts';
 import type { ArtifactStore } from "./objects.ts";
 import type { ActualRestoreVerification, ArtifactRef, DatabaseManifests, DurabilityCapability, JournalRecord, JournalRecordV1, JournalRecordV2, MaintenanceCommand, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceFilesManifest, VerificationJournalRecord } from "./types.ts";
 
 const blockerCode = z.enum(["source_changed", "source_missing", "plan_stale", "target_conflict", "control_root_mismatch",
   "source_writer_unknown", "source_writer_active", "drain_incomplete", "maintenance_busy", "maintenance_lost", "schema_guard_incomplete",
   "journal_invalid", "snapshot_invalid", "restore_verification_unavailable", "unsupported_durability", "backup_capability_unavailable", "request_conflict", "phase_conflict"]);
-const json: z.ZodType<unknown> = z.lazy(() => z.union([z.null(), z.boolean(), z.number().finite(), z.string(), z.array(json), z.record(json)]));
+// The recursive grammar is fixed. Only the lazy reference is recursive; parsing
+// a value does not allocate another project-owned list of schema alternatives.
+const json: z.ZodType<unknown> = z.lazy(() => jsonGrammar);
+const jsonGrammar = z.union([z.null(), z.boolean(), z.number().finite(), z.string(), z.array(json), z.record(json)]);
+const proofEvents=Object.freeze(["observation", "takeover", "cancel_intent", "cancelled"]);
+const stableSuccessorEvents=Object.freeze(["capture", "ready", "cancel_intent"]);
 const identity = z.object({ path: text, device: z.string().regex(/^\d+$/), inode: z.string().regex(/^\d+$/) }).strict();
 const capabilityBase = { formatVersion: z.literal(1), kind: z.literal("capability"), node: text,
   rootIdentity: identity.extend({ hostIdentityDigest: hash }).strict(), powerLossTested: z.literal(false), probeDigest: hash };
@@ -85,18 +91,22 @@ const manifests = z.object({ formatVersion: z.literal(1), kind: z.literal("datab
   fullDataManifestDigest: hash, frozenBusinessManifestDigest: hash, capturedControlManifestDigest: hash }).strict();
 
 function parse<T>(schema: z.ZodTypeAny, value: unknown): T {
+  reserveP0FNativeClone(value);
   const parsed = schema.safeParse(value); if (!parsed.success) throw new MaintenanceFailure("journal_invalid"); return parsed.data as T;
 }
 export const parsePlan = (value: unknown): MigrationPlan => parse(plan, value);
 export const parseCapability = (value: unknown): DurabilityCapability => parse(capability, value);
 /** Strict shared structural decoding. Version edges and all runtime obligations are separate. */
-export function parseJournal(value: unknown): JournalRecord {
+export function parseJournal(value: unknown, syntaxFrame?: P0FArtifactSyntaxFrame): JournalRecord {
+  if (syntaxFrame !== undefined) assertP0FSyntaxScope(syntaxFrame, 'journal', value as object);
   canonicalJson(value);
   if (value === null || typeof value !== "object" || Array.isArray(value) || !("formatVersion" in value)
     || value.formatVersion !== 3) return parse<JournalRecordV1 | JournalRecordV2>(journal, value);
   const requireValue = (condition: unknown): void => {
     if (!condition) throw new MaintenanceFailure("journal_invalid", "verification-journal");
   };
+  // Rest body, version-normalized input, and the final shallow v3 result.
+  reserveP0FNativeShallow(value, 3);
   const { controlProof, ...body } = value as Record<string, unknown>;
   requireValue(Object.hasOwn(value, "controlProof"));
   const record = parse<JournalRecordV2>(journal, { ...body, formatVersion: 2 });
@@ -108,13 +118,14 @@ export function parseJournal(value: unknown): JournalRecord {
   }
   requireValue(record.event === "capture" && record.phase === "quiesced"
     || record.event === "ready" && record.phase === "snapshot_ready"
-    || ["observation", "takeover", "cancel_intent", "cancelled"].includes(record.event) && record.phase !== "planned");
-  const proof = controlProofSchema.safeParse(controlProof);
+    || proofEvents.includes(record.event) && record.phase !== "planned");
+  reserveP0FNativeClone(controlProof);
+  const proof = (syntaxFrame === undefined ? controlProofSchema : controlProofSchemaFor(syntaxFrame)).safeParse(controlProof);
   if (!proof.success) throw new MaintenanceFailure("journal_invalid", "verification-journal");
   if (proof.data.kind === "capture-controls") requireValue(record.event === "capture");
   requireValue((record.event === "cancelled") === (proof.data.kind === "cancel-terminal-controls"));
   if (record.event === "cancel_intent") requireValue(proof.data.kind === "control-successor");
-  if (proof.data.kind === "control-successor" && ["capture", "ready", "cancel_intent"].includes(record.event))
+  if (proof.data.kind === "control-successor" && stableSuccessorEvents.includes(record.event))
     requireValue(proof.data.changes.length === 0 && proof.data.beforeRowsDigest === proof.data.afterRowsDigest);
   if (proof.data.kind === "legacy-first-capture-bridge") requireValue(record.phase === "snapshot_ready" && record.event === "observation"
     && proof.data.changes.length === 0 && proof.data.beforeRowsDigest === proof.data.afterRowsDigest);
@@ -150,11 +161,16 @@ const pathSegment = (value: string) => value !== "" && value !== "." && value !=
 
 /** Structural decoding only; it does not observe a source or qualify a runtime provider. */
 export function parseSourceFiles(value: unknown): SourceFilesManifest {
+  reserveP0FNativeClone(value);
   const parsed = files.safeParse(value);
   if (!parsed.success) throw new MaintenanceFailure("snapshot_invalid");
   const manifest = parsed.data;
+  // Root-label projection and root [key, {root,binding}] metadata reuse the
+  // decoded objects, but allocate their own arrays/records before Map creation.
+  reserveP0FNativeNodes(2 + manifest.roots.length * 6, manifest.roots.length + manifest.entries.length);
   requireSourceFiles(manifest.rootBindings.length === manifest.roots.length
-    && new Set(manifest.roots.map(item => item.label)).size === manifest.roots.length);
+    && (reserveP0FNativeMetadata(2+manifest.roots.length*2),new Set(manifest.roots.map(item => item.label))).size === manifest.roots.length);
+  reserveP0FNativeMetadata(2+manifest.roots.length*5); // Map/list shells, list/pair metadata and {root,binding}; Map bindings prepaid above
   const roots = new Map(manifest.roots.map((item, index) => {
     const binding = manifest.rootBindings[index]!;
     requireSourceFiles(binding.sourceRoot === item.label && canonicalSourcePath(item.path) && item.expected.path === item.path
@@ -163,10 +179,10 @@ export function parseSourceFiles(value: unknown): SourceFilesManifest {
       && path.posix.join(binding.anchorPath, ...item.expected.absentSegments) === item.path);
     return [item.label as string, { root: item, binding }] as const;
   }));
-  const entries = new Map<string, (typeof manifest.entries)[number]>();
+  reserveP0FNativeMetadata(1);const entries = new Map<string, (typeof manifest.entries)[number]>();
   for (const entry of manifest.entries) {
     const owned = roots.get(entry.sourceRoot), key = `${entry.sourceRoot}/${entry.sourceRelativePath}`;
-    requireSourceFiles(owned && !entries.has(key) && (entry.sourceRelativePath === "" || entry.sourceRelativePath.split("/").every(pathSegment)));
+    requireSourceFiles(owned && !entries.has(key) && (entry.sourceRelativePath === "" || (reserveP0FNativeSplit(entry.sourceRelativePath,'/'),entry.sourceRelativePath.split("/")).every(pathSegment)));
     entries.set(key, entry);
     if (entry.kind === "absent") requireSourceFiles(entry.sourceRelativePath === "");
     else requireSourceFiles(entry.identity.path === path.posix.join(owned.root.path, entry.sourceRelativePath)
@@ -189,10 +205,14 @@ export async function readSourceFiles(store: Pick<ArtifactStore, "kindFor" | "re
   requireSourceFiles(store.kindFor(reference) === "source-files");
   // Keep hash, control-root, lock and I/O failures outside the decoding catch.
   const bytes = await store.readBytes(reference);
+  return parseSourceFilesBytes(bytes);
+}
+/** Shared original-byte decoder; it performs no file access or qualification. */
+export function parseSourceFilesBytes(bytes: Uint8Array): SourceFilesManifest {
   let value: unknown;
   try { value = parseCanonical(bytes); }
   catch (error) {
-    if (error instanceof MaintenanceFailure && error.code === "journal_invalid") throw new MaintenanceFailure("snapshot_invalid");
+    if (maintenanceFailureCode(error) === "journal_invalid") throw new MaintenanceFailure("snapshot_invalid");
     throw error;
   }
   // TextDecoder may remove a UTF-8 BOM. The stored bytes themselves must be canonical.
@@ -203,4 +223,13 @@ export const parseBundle = (value: unknown): RestoreBundleManifest => parse(bund
 export const parsePublication = (value: unknown): PublicationEvidence => parse(publication, value);
 export const parseVerification = (value: unknown): ActualRestoreVerification => parse(verification, value);
 export const parseReceipt = (value: unknown): SnapshotReceipt => parse(receipt, value);
-export const parseManifests = (value: unknown): DatabaseManifests => parse(manifests, value);
+export function parseManifests(value: unknown): DatabaseManifests {
+  const unchanged=reserveP0FNativeManifestsClone(value);
+  const parsed=manifests.safeParse(value);
+  if(!parsed.success)throw new MaintenanceFailure("journal_invalid");
+  // This exact schema has no transforms/defaults. Only generic z.record can
+  // normalize an admitted JSON value (by dropping __proto__); the reservation
+  // seam checks that exception over every generic branch. Always run safeParse.
+  // Without the exact active frame ownership, retain the original Zod clone.
+  return (unchanged?value:parsed.data) as DatabaseManifests;
+}

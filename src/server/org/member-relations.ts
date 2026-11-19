@@ -341,6 +341,13 @@ export async function applyMemberCompensation(repos: RepositorySet, input: {
 
 /** 快照 shape 校验不读取历史正文，拒绝跨项目/重复关系/无代际等不完整输入。 */
 export function validateMemberSnapshot(value: unknown, projectId: string, memberId: string): MemberRelationsSnapshotV2 {
+  const snapshot = validateMemberSnapshotValue(value, projectId, memberId);
+  assertCompleteAuditFields(snapshot); return snapshot;
+}
+
+/** Historical structure only. The original live writer still applies its complete
+ * field-size gate in validateMemberSnapshot; archived values gain no write authority. */
+export function validateMemberSnapshotValue(value: unknown, projectId: string, memberId: string): MemberRelationsSnapshotV2 {
   const bad = (): never => { throw new RepositoryError('invalid_argument', '成员关系快照缺失、重复或范围不一致。'); };
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return bad();
   const s = value as MemberRelationsSnapshotV2;
@@ -377,5 +384,5 @@ export function validateMemberSnapshot(value: unknown, projectId: string, member
   for (const t of s.tasks) if (t.currentReviewRoundId !== null && !s.invalidatedRounds.some(r => r.roundId === t.currentReviewRoundId && r.taskId === t.taskId)) bad();
   if (s.settings !== null && (s.settings.projectId !== projectId || !Number.isSafeInteger(s.settings.revision) || s.settings.revision < 1 || s.settings.defaultReviewerMemberId !== null && typeof s.settings.defaultReviewerMemberId !== 'string')) bad();
   if (s.settings !== null) nullable(s.settings.defaultReviewerMemberId);
-  assertCompleteAuditFields(s); return s;
+  return s;
 }

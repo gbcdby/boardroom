@@ -3,20 +3,33 @@ import { isDeepStrictEqual } from "node:util";
 import { appendAuditEntry, assertCompleteAuditFields, auditActorFrom, isReversible, type AuditRow } from "./audit.ts";
 import type { RepoCtx, RepositorySet } from "./db/repositories.ts";
 import type { Member, OrgNode } from "./db/types.ts";
-import { RepositoryError } from "./db/errors.ts";
+import { getRepositoryErrorCode, RepositoryError } from "./db/errors.ts";
 import { newId } from "./db/ids.ts";
 import { MEMBER_CAPTURE_BUDGET, type MemberRelationsSnapshotV2, type OrgGraphSnapshotV2, type OrgMutationAccess, type ReversalMetadataV2, type RestartRequired } from "./org/compensation-types.ts";
 import { conflict, withOrgMutation } from "./org/boundary.ts";
 import { applyOrgGraph } from "./org/graph.ts";
 import { captureAssignment, statusSnapshot, type AssignmentSnapshotV2, type StatusSnapshotV2 } from "./org/mutations.ts";
 import { boundedText, CaptureBudget } from "./org/capture-budget.ts";
-import { applyMemberCompensation, discoverMemberRelations, validateMemberSnapshot, watchFromSnapshots } from "./org/member-relations.ts";
+import { applyMemberCompensation, discoverMemberRelations, validateMemberSnapshot, validateMemberSnapshotValue, watchFromSnapshots } from "./org/member-relations.ts";
 
 type ObjectValue = Record<string, unknown>;
 type Snapshot = OrgGraphSnapshotV2 | AssignmentSnapshotV2 | StatusSnapshotV2 | MemberRelationsSnapshotV2;
 type ChainAudit = Pick<AuditRow, 'id' | 'projectId' | 'action' | 'targetKind' | 'targetId' | 'detail' | 'reversedAt' | 'reversedByAuditId'>;
 type AuditHeader = Omit<ChainAudit, 'detail'>;
 type SnapshotAudit = ChainAudit & Pick<AuditRow, 'before' | 'after' | 'targetName'>;
+export type AuditChainValue = Readonly<{ row: ChainAudit; detail: unknown }>;
+const snapshotFailures = new WeakMap<object, Readonly<{ row: ChainAudit; column: 'before' | 'after' }>>();
+export function getAuditSnapshotFailure(error: unknown): Readonly<{ row: ChainAudit; column: 'before' | 'after' }> | undefined {
+  return error !== null && (typeof error === 'object' || typeof error === 'function') ? snapshotFailures.get(error) : undefined;
+}
+function snapshotColumn<T>(row: ChainAudit, column: 'before' | 'after', run: () => T): T {
+  try { return run(); }
+  catch (error) {
+    if (getRepositoryErrorCode(error) !== undefined && !snapshotFailures.has(error as object))
+      snapshotFailures.set(error as object, Object.freeze({ row, column }));
+    throw error;
+  }
+}
 function invalid(message = "审计快照字段不完整或与事件范围不一致。"): never { throw new RepositoryError("invalid_argument", message); }
 function broken(): never { throw new RepositoryError("chain_broken", "审计补偿链缺失、循环或前驱不一致，不能推测恢复。"); }
 function object(value: unknown): value is ObjectValue { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -73,11 +86,11 @@ function validMember(value: unknown, row: ChainAudit, assignment = false): value
     ref(value.nodeId) && ["manager", "normal"].includes(String(value.role)) && ["active", "disabled", "pending"].includes(String(value.status)) &&
     ["human", "agent"].includes(String(value.kind)) && ref(value.agentId) && text(value.displayName) && text(value.createdAt) && text(value.updatedAt);
 }
-function validateV2(value: unknown, row: ChainAudit, rootAction: string): Snapshot {
+function validateV2(value: unknown, row: ChainAudit, rootAction: string, memberValue: typeof validateMemberSnapshot): Snapshot {
   if (!object(value) || value.projectId !== row.projectId || value.targetId !== row.targetId) invalid();
   if (value.schema === 'member-relations/v2') {
     if (!['member.add', 'member.remove'].includes(rootAction) || row.targetKind !== 'member') invalid();
-    return validateMemberSnapshot(value, row.projectId, row.targetId);
+    return memberValue(value, row.projectId, row.targetId);
   }
   if (value.schema === "org-graph/v2") {
     if (!["org.node_create", "org.node_update", "org.node_delete"].includes(rootAction) || row.targetKind !== "node") invalid();
@@ -119,8 +132,17 @@ function validateV2(value: unknown, row: ChainAudit, rootAction: string): Snapsh
 }
 function snapshotPair(row: SnapshotAudit, rootAction: string): { before: Snapshot; after: Snapshot } {
   const before = decode(row.before), after = decode(row.after);
+  return snapshotPairValues(row, rootAction, before, after, validateMemberSnapshot);
+}
+/** Pure historical value counterpart. No caller-selected validator, budget or IO. */
+export function validateAuditSnapshotPairValues(row: ChainAudit, rootAction: string, before: unknown, after: unknown): { before: Snapshot; after: Snapshot } {
+  return snapshotPairValues(row, rootAction, before, after, validateMemberSnapshotValue);
+}
+function snapshotPairValues(row: ChainAudit, rootAction: string, before: unknown, after: unknown,
+  memberValue: typeof validateMemberSnapshot): { before: Snapshot; after: Snapshot } {
   if (object(before) && typeof before.schema === "string") {
-    const pair = { before: validateV2(before, row, rootAction), after: validateV2(after, row, rootAction) };
+    const pair = { before: snapshotColumn(row, 'before', () => validateV2(before, row, rootAction, memberValue)),
+      after: snapshotColumn(row, 'after', () => validateV2(after, row, rootAction, memberValue)) };
     if (pair.before.schema !== pair.after.schema) invalid();
     if (pair.before.schema === "org-graph/v2" && pair.after.schema === "org-graph/v2") {
       if (!isDeepStrictEqual(pair.before.childEdges.map(c => c.nodeId), pair.after.childEdges.map(c => c.nodeId)) ||
@@ -139,7 +161,9 @@ function snapshotPair(row: SnapshotAudit, rootAction: string): { before: Snapsho
   }
   // 兼容旧单纯状态/占岗；绝不把旧 member 单行当完整成员关系恢复。
   const normalizedRow = { ...row, action: rootAction };
-  if (!validMember(before, normalizedRow, true) || !validMember(after, normalizedRow, true) || before.id !== after.id || before.agentId !== after.agentId || before.kind !== after.kind) invalid();
+  if (!validMember(before, normalizedRow, true)) return snapshotColumn(row, 'before', () => invalid());
+  if (!validMember(after, normalizedRow, true) || before.id !== after.id || before.agentId !== after.agentId || before.kind !== after.kind)
+    return snapshotColumn(row, 'after', () => invalid());
   if (["org.assign", "org.auto_place"].includes(rootAction)) {
     const assignment = (m: Member): AssignmentSnapshotV2 => ({ schema: "org-assignment/v2", projectId: row.projectId, targetId: row.targetId,
       assignments: [{ memberId: m.id, nodeId: m.nodeId, legacyRole: m.role, membershipRevision: m.membershipRevision ?? 1 }] });
@@ -153,18 +177,33 @@ function snapshotPair(row: SnapshotAudit, rootAction: string): { before: Snapsho
 }
 function sameTarget(a: ChainAudit, b: ChainAudit): boolean { return a.projectId === b.projectId && a.targetKind === b.targetKind && a.targetId === b.targetId; }
 function metadata(row: ChainAudit): ReversalMetadataV2 | null {
-  const detail = decode(row.detail);
+  return auditReversalMetadataValue(decode(row.detail));
+}
+export function auditReversalMetadataValue(detail: unknown): ReversalMetadataV2 | null {
   if (!object(detail) || detail.reversal === undefined) return null;
   const r = detail.reversal;
   if (!object(r) || r.version !== 2 || !text(r.rootAuditId) || !text(r.rootAction) || !ref(r.undoesAuditId) || !["forward", "undo", "redo"].includes(String(r.direction))) broken();
   return r as unknown as ReversalMetadataV2;
 }
 async function chain(repos: RepositorySet, row: ChainAudit): Promise<ReversalMetadataV2> {
-  const initial = metadata(row); const seen = new Set<string>(); let current = row; let count = 0;
+  const steps = auditChainSteps({ row, detail: decode(row.detail) });
+  let step = steps.next();
+  while (!step.done) {
+    const previous = await readChainAudit(repos.context, row.projectId, step.value);
+    step = steps.next(previous ? { row: previous, detail: decode(previous.detail) } : null);
+  }
+  return step.value;
+}
+
+/** The original async consumer and P0's actual row index drive this same finite
+ * transition kernel. Yielded IDs are data requests, never a resolver capability. */
+export function* auditChainSteps(first: AuditChainValue): Generator<string, ReversalMetadataV2, AuditChainValue | null> {
+  const row = first.row, initial = auditReversalMetadataValue(first.detail);
+  const seen = new Set<string>(); let packet = first; let current = row; let count = 0;
   while (true) {
     if (++count > 1000 || seen.has(current.id) || !sameTarget(row, current)) broken();
     seen.add(current.id);
-    const m = metadata(current);
+    const m = auditReversalMetadataValue(packet.detail);
     if (m && initial && (m.rootAuditId !== initial.rootAuditId || m.rootAction !== initial.rootAction)) broken();
     if (current.action !== "org.revoke" && current.action !== "member.revoke") {
       if (!isReversible(current.action) || m && (m.rootAuditId !== current.id || m.rootAction !== current.action || m.undoesAuditId !== null || m.direction !== "forward")) broken();
@@ -174,16 +213,17 @@ async function chain(repos: RepositorySet, row: ChainAudit): Promise<ReversalMet
     let previousId: string | null = m?.undoesAuditId ?? null;
     if (m && (m.direction === "forward" || !previousId)) broken();
     if (!m) {
-      const d = decode(current.detail);
+      const d = packet.detail;
       if (object(d) && text(d.undoes)) previousId = d.undoes;
       else previousId = current.reversedByAuditId;
     }
     if (!previousId) broken();
-    const previous = await readChainAudit(repos.context, row.projectId, previousId);
+    const next = yield previousId;
+    const previous = next?.row;
     if (!previous || !sameTarget(row, previous) || previous.reversedAt === null || previous.reversedByAuditId !== current.id) broken();
-    const pm = metadata(previous);
+    const pm = auditReversalMetadataValue(next!.detail);
     if (m && pm && m.direction !== (pm.direction === "undo" ? "redo" : "undo")) broken();
-    current = previous;
+    current = previous; packet = next!;
   }
 }
 async function applyAssignment(repos: RepositorySet, expected: AssignmentSnapshotV2, target: AssignmentSnapshotV2, at: string) {

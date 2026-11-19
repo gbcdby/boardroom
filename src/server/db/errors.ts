@@ -5,6 +5,18 @@
  * 而不是静默丢弃数据。repository 层把 SQLite 的底层错误归一到这些类型。
  */
 
+const repositoryFailureCodes = new WeakMap<object, RepositoryErrorCode>();
+const registeredRepositoryCodes: ReadonlySet<string> = new Set([
+  'not_found', 'conflict', 'invalid_reference', 'invalid_argument', 'write_failed', 'mutation_scope_changed',
+  'confirmation_changed', 'workspace_changed', 'member_removed', 'compensation_conflict', 'legacy_incomplete_snapshot',
+  'migration_identity_ambiguous', 'chain_broken', 'audit_snapshot_too_large', 'audit_capture_budget_exceeded', 'archived',
+]);
+
+/** Identity-only lookup for finite value adapters; never reflects on an unknown throw. */
+export function getRepositoryErrorCode(error: unknown): RepositoryErrorCode | undefined {
+  return error !== null && (typeof error === 'object' || typeof error === 'function') ? repositoryFailureCodes.get(error) : undefined;
+}
+
 /** 持久化层所有业务错误的基类；code 供上层分支处理。 */
 export class RepositoryError extends Error {
   override readonly name: string = "RepositoryError";
@@ -13,6 +25,7 @@ export class RepositoryError extends Error {
   constructor(code: RepositoryErrorCode, message: string, cause?: unknown) {
     super(message, cause === undefined ? undefined : { cause });
     this.code = code;
+    if (registeredRepositoryCodes.has(code)) repositoryFailureCodes.set(this, code);
   }
 }
 

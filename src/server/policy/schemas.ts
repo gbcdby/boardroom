@@ -3,6 +3,11 @@ import { POLICY_ACTION_KINDS, POLICY_SCHEMA_VERSION, POLICY_SUBJECT_KINDS } from
 import type { PolicyAction, PolicySubjectRef } from "../../shared/policy.ts";
 
 export type PolicyInputErrorCode = "action_input_invalid" | "policy_input_invalid" | "context_input_invalid";
+const policyInputErrors = new WeakMap<object, PolicyInputErrorCode>();
+/** Private value adapters identify only errors constructed here; unknown throws are never reflected on. */
+export function policyInputErrorCode(value: unknown): PolicyInputErrorCode | undefined {
+  return value !== null && (typeof value === "object" || typeof value === "function") ? policyInputErrors.get(value) : undefined;
+}
 export class PolicyInputError extends Error {
   readonly code: PolicyInputErrorCode;
   readonly fields: readonly string[];
@@ -12,6 +17,7 @@ export class PolicyInputError extends Error {
     this.name = "PolicyInputError";
     this.code = code;
     this.fields = stableFields;
+    policyInputErrors.set(this, code);
   }
 }
 

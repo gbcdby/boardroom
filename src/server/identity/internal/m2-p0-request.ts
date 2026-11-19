@@ -159,6 +159,85 @@ function ownerSite(state: P0State, observation: Record<string, unknown>, path: r
   return makeP0Site(state, { depth: 2, phase: "original-graph", location: { ...location, table: contract?.name as P0Table ?? null,
     rowOrdinal, columnOrdinal, pathId: columnOrdinal === null ? "observation.root" : "row.cell" } });
 }
+// #153/7010276882: discriminate only the fixed, known future branches after this
+// request's scanner. This is no second parse, budget or semantic success path.
+function knownBranchRef(state: P0State, value: unknown): void {
+  const item = object(state, value, ["ref", "sha256", "bytes"]);
+  expect(state, typeof item.ref === "string" && item.ref.length > 0
+    && typeof item.sha256 === "string" && hash.test(item.sha256)
+    && typeof item.bytes === "string" && item.bytes.length <= 20 && /^(?:0|[1-9][0-9]*)$/.test(item.bytes), "unsupported_shape");
+  chargeState(state, { work: 3, bytes: (item.ref as string).length * 2 + 84 });
+}
+function knownBranchOrigin(state: P0State, value: unknown): void {
+  const origin = object(state, value, ["sourceHistory", "importManifest"]);
+  knownBranchRef(state, origin.sourceHistory);
+  if (origin.importManifest !== null) knownBranchRef(state, origin.importManifest);
+}
+function knownBranchEnvelope(state: P0State, envelope: Record<string, unknown>): void {
+  expect(state, Array.isArray(envelope.artifacts) && Array.isArray(envelope.evidence), "unsupported_shape");
+  expect(state, envelope.artifacts.length <= P0_LIMITS.artifacts && envelope.evidence.length <= P0_LIMITS.evidence, "resource_limit");
+  for (const entry of envelope.artifacts) {
+    const artifact = object(state, entry, ["kind", "artifact", "bytesHex"]);
+    expect(state, typeof artifact.kind === "string" && artifact.kind.length > 0 && typeof artifact.bytesHex === "string", "unsupported_shape");
+    knownBranchRef(state, artifact.artifact);
+  }
+  for (const entry of envelope.evidence) {
+    const selected = object(state, entry, ["kind", "artifact", "evidence"]);
+    expect(state, typeof selected.kind === "string" && selected.kind.length > 0, "unsupported_shape");
+    knownBranchRef(state, selected.artifact);
+    const evidence = object(state, selected.evidence, ["artifactId", "digest"]);
+    expect(state, typeof evidence.artifactId === "string" && evidence.artifactId.length > 0
+      && typeof evidence.digest === "string" && hash.test(evidence.digest), "unsupported_shape");
+  }
+  if (envelope.proposedDeletion !== null) {
+    const deletion = object(state, envelope.proposedDeletion, ["rows"]);
+    expect(state, Array.isArray(deletion.rows), "unsupported_shape");
+    for (const item of deletion.rows) {
+      const selector = object(state, item, ["table", "key", "rowid"]);
+      expect(state, typeof selector.table === "string" && Array.isArray(selector.key)
+        && (selector.rowid === null || typeof selector.rowid === "string"), "unsupported_shape");
+    }
+  }
+}
+function knownP1Observation(state: P0State, value: unknown): void {
+  const observation = object(state, value, ["contract", "backend", "phase", "configFormat", "source",
+    "physicalSourceRef", "snapshotReceiptRef", "catalog", "textEncoding", "tables", "sequences"]);
+  expect(state, observation.phase === "p1", "unsupported_shape");
+  const site = makeP0Site(state, { depth: 2, phase: "input", location: {
+    inputPart: "observation", artifactOrdinal: null, table: null, rowOrdinal: null,
+    columnOrdinal: null, pathId: "observation.root" } });
+  reserveOwnedObservationShape(state, observation, site);
+  try { validateHistoryObservationValue(observation); }
+  catch (error) {
+    if (!historyValueFailure(error)) throw error;
+    throwP0(state, { code: "unsupported_shape", rule: "PC1B-RAW01", site });
+  }
+}
+function unimplementedBranch(state: P0State): never {
+  throwP0(state, { code: "semantic_unsupported", rule: "PC1B-RAW01", condition: "undefined-grammar" });
+}
+function otherKnownGraph(state: P0State, envelope: Record<string, unknown>): void {
+  chargeState(state, { work: 1 });
+  const value = envelope.graph;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return;
+  const kind = (value as Record<string, unknown>).kind;
+  if (kind === "p1-source-cut") {
+    knownBranchEnvelope(state, envelope);
+    const graph = object(state, value, ["kind", "cut", "origin"]);
+    knownBranchRef(state, graph.cut); knownBranchOrigin(state, graph.origin); unimplementedBranch(state);
+  }
+  if (kind === "p1-source-history") {
+    knownBranchEnvelope(state, envelope);
+    const graph = object(state, value, ["kind", "observation", "snapshotLink", "origin"]);
+    knownP1Observation(state, graph.observation); knownBranchRef(state, graph.snapshotLink);
+    knownBranchOrigin(state, graph.origin); unimplementedBranch(state);
+  }
+  if (kind === "layout-history") {
+    knownBranchEnvelope(state, envelope);
+    const graph = object(state, value, ["kind", "history", "origin"]);
+    knownBranchRef(state, graph.history); knownBranchOrigin(state, graph.origin); unimplementedBranch(state);
+  }
+}
 export function createP0Request(input: unknown): P0Result<P0Request> {
   if (typeof input !== "string") return Object.freeze({ ok: false, error: fixedError("unsupported_shape") });
   const state = newP0State();
@@ -166,10 +245,16 @@ export function createP0Request(input: unknown): P0Result<P0Request> {
     const parsed = scanP0Json(state, input, state.rootSite, { policy: "reference", outer: true });
     const envelope = object(state, parsed, ["contract", "graph", "artifacts", "evidence", "proposedDeletion"]);
     expect(state, envelope.contract === "m2-history-closure-input/r2", "unsupported_shape");
+    otherKnownGraph(state, envelope);
     const graph = object(state, envelope.graph, ["kind", "observation", "origin"]);
-    expect(state, graph.kind === "m2-observation" && graph.origin === null, "unsupported_shape");
+    expect(state, graph.kind === "m2-observation", "unsupported_shape");
     expect(state, graph.observation !== null && typeof graph.observation === "object" && !Array.isArray(graph.observation), "unsupported_shape");
     const observation = graph.observation as Record<string, unknown>;
+    if (observation.phase === "p1") {
+      knownBranchEnvelope(state, envelope); knownP1Observation(state, observation);
+      knownBranchOrigin(state, graph.origin); unimplementedBranch(state);
+    }
+    expect(state, graph.origin === null, "unsupported_shape");
     expect(state, observation.phase === "p0", "unsupported_shape");
     expect(state, observation.backend === "sqlite" || observation.backend === "postgres", "unsupported_shape");
     selections(state, envelope.artifacts, envelope.evidence);
