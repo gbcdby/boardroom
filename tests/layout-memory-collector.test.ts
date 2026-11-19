@@ -350,7 +350,7 @@ test("CS17/18 isolated descriptor guards reject inherited data and hooks", async
     let promise: ReturnType<typeof collectLayoutMemoryInventory>;
     try { promise = collectLayoutMemoryInventory(snapshot(async () => { queries++; return []; }), proxy, empty); }
     finally { restore(key, original); }
-    await assert.rejects(promise!, errorCode(inherited.startsWith("value") ? "invalid_input" : "manifest_invalid"));
+    await assert.rejects(promise!, errorCode("invalid_input"));
     assert.equal(hooks, 0); assert.equal(getters, 0); assert.equal(queries, 0);
   });
   for (const getter of [false, true]) await t.test(`query accessor with inherited value ${getter ? "getter" : "data"}`, async () => {
@@ -390,6 +390,124 @@ test("CS17/18 isolated descriptor guards reject inherited data and hooks", async
     });
   }); } finally { await f.close(); }
   process.stdout.write("collector_descriptor_boundary_pass\n");
+});
+
+test("CS17/18 isolated legacy consumer windows reject inherited hooks", async () => {
+  if (process.env["COLLECTOR_LEGACY_CHILD"] !== "1") {
+    const environment: NodeJS.ProcessEnv = { ...process.env, COLLECTOR_LEGACY_CHILD: "1" }; delete environment["NODE_TEST_CONTEXT"];
+    const { stdout } = await promisify(execFile)(process.execPath, ["--test", "--test-name-pattern=CS17/18 isolated legacy consumer", fileURLToPath(import.meta.url)], { env: environment, timeout: 30_000, maxBuffer: 1_048_576 });
+    assert.match(stdout, /collector_legacy_boundary_pass/); return;
+  }
+  const f = await identityFixture();
+  try { await nativeSqlite(f, async (view, m) => {
+    for (const mode of ["clean", "first-catalog-get", "last-page-get", "last-page-microtask", "last-page-restored", "last-count-index"] as const) {
+      let calls = 0, reflections = 0, hooks = 0;
+      const owner = mode === "last-count-index" ? Array.prototype : Object.prototype;
+      const key = mode === "last-count-index" ? "1" : "get", original = Object.getOwnPropertyDescriptor(owner, key);
+      const arrayLength = Object.getOwnPropertyDescriptor(Array.prototype, "length")!;
+      const observed = snapshot(async (sql, params) => {
+        calls++; const rows = await view.query(sql, params);
+        if (reflections === 0 && (mode === "first-catalog-get" && sql === "PRAGMA query_only"
+          || sql.includes('"memory_summary_requests"') && (mode.startsWith("last-page") && sql.includes("OFFSET")
+            || mode === "last-count-index" && sql.startsWith("SELECT CAST(COUNT(*) AS TEXT)")))) {
+          return new Proxy(rows, { ownKeys(target) {
+            reflections++;
+            const install = () => Object.defineProperty(owner, key, mode === "last-count-index"
+              ? { __proto__: null, configurable: true, set() { hooks++; throw new Error("inherited array setter must not execute"); } } as PropertyDescriptor
+              : { __proto__: null, configurable: true, get() { hooks++; throw new Error("legacy inherited descriptor getter must not execute"); } } as PropertyDescriptor);
+            if (mode === "last-page-microtask") queueMicrotask(install); else install();
+            if (mode === "last-page-restored") Reflect.deleteProperty(owner, key);
+            return Reflect.ownKeys(target);
+          } });
+        }
+        return rows;
+      });
+      const d = envelope(m); let result, failure: unknown;
+      try { result = await collectLayoutMemoryInventory(observed, d.request, d.bytes); } catch (error) { failure = error; }
+      finally {
+        Reflect.deleteProperty(owner, key); if (original) Object.defineProperty(owner, key, original);
+        Object.defineProperty(Array.prototype, "length", arrayLength);
+      }
+      assert.equal(hooks, 0, `${mode}: inherited hook`);
+      if (mode === "clean" || mode === "last-page-restored") {
+        assert.equal(calls, 17); assert.ok(result); assert.equal(Object.getPrototypeOf(result), null); assert.equal(result.inventory.versions.length, 0);
+      } else {
+        assert.equal(reflections, 1); assert.ok(errorCode("read_unavailable")(failure));
+      }
+    }
+    for (const stage of ["before", "query", "request", "source", "artifact"] as const) {
+      for (const key of ["get", "set", "toJSON", "collectorInheritedData"] as const) {
+        let calls = 0, hooks = 0, reflections = 0;
+        const d = envelope(m), original = Object.getOwnPropertyDescriptor(Object.prototype, key);
+        const install = () => Object.defineProperty(Object.prototype, key, key === "collectorInheritedData"
+          ? { __proto__: null, configurable: true, value: "not-an-own-field" } as PropertyDescriptor
+          : { __proto__: null, configurable: true, get() { hooks++; throw new Error("entry inherited hook must not execute"); } } as PropertyDescriptor);
+        const observed = { async query<T extends DbRow>(sql: string, params: readonly unknown[] = []): Promise<T[]> { calls++; return view.query<T>(sql, params); } };
+        let input: unknown = d.request, source: DbReadSnapshot = observed;
+        if (stage === "query") source = new Proxy(observed, { getOwnPropertyDescriptor(target, field) {
+          reflections++; const descriptor = Reflect.getOwnPropertyDescriptor(target, field)!;
+          const result = { __proto__: null, value: descriptor.value, writable: descriptor.writable, enumerable: descriptor.enumerable, configurable: descriptor.configurable } as PropertyDescriptor;
+          install(); return result;
+        } });
+        else if (stage !== "before") {
+          const target = stage === "source" ? d.request.source : stage === "artifact" ? d.request.frozenManifest : d.request;
+          const proxy = new Proxy(target, { ownKeys(inner) { reflections++; install(); return Reflect.ownKeys(inner); } });
+          if (stage === "source") d.request.source = proxy as typeof d.request.source;
+          else if (stage === "artifact") d.request.frozenManifest = proxy as typeof d.request.frozenManifest;
+          else input = proxy;
+        }
+        if (stage === "before") install();
+        let failure: unknown;
+        try { await collectLayoutMemoryInventory(source, input, d.bytes); } catch (error) { failure = error; }
+        finally { Reflect.deleteProperty(Object.prototype, key); if (original) Object.defineProperty(Object.prototype, key, original); }
+        assert.equal(hooks, 0, `${stage}/${key}: hook`); assert.equal(calls, 0, `${stage}/${key}: query`);
+        assert.equal(reflections, stage === "before" ? 0 : 1, `${stage}/${key}: reflection`);
+        assert.ok(errorCode("invalid_input")(failure), `${stage}/${key}: fixed entry error`);
+      }
+    }
+    for (const mode of ["clean-proxy", "replace-query", "object-last-hook", "array-last-hook"] as const) {
+      const original = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.unscopables)!;
+      const arrayLength = Object.getOwnPropertyDescriptor(Array.prototype, "length")!;
+      const exclusions = original.value as object, last = Reflect.ownKeys(exclusions).at(-1)!;
+      const owner = mode === "array-last-hook" ? Array.prototype : Object.prototype, key = mode === "array-last-hook" ? "0" : "get";
+      const inherited = Object.getOwnPropertyDescriptor(owner, key);
+      let calls = 0, replacements = 0, hooks = 0, reflections = 0;
+      const observed: DbReadSnapshot = { async query<T extends DbRow>(sql: string, params: readonly unknown[] = []): Promise<T[]> {
+        assert.equal(this, observed); calls++; return view.query<T>(sql, params);
+      } };
+      const proxy = new Proxy(exclusions, { getOwnPropertyDescriptor(target, field) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, field)!;
+        const result = { __proto__: null, value: descriptor.value, writable: descriptor.writable, enumerable: descriptor.enumerable, configurable: descriptor.configurable } as PropertyDescriptor;
+        if (field === last) {
+          reflections++;
+          if (mode === "replace-query") observed.query = async () => { replacements++; throw new Error("environment replacement query must not run"); };
+          else if (mode === "object-last-hook" || mode === "array-last-hook") Object.defineProperty(owner, key, mode === "array-last-hook"
+            ? { __proto__: null, configurable: true, set() { hooks++; throw new Error("last environment setter must not execute"); } } as PropertyDescriptor
+            : { __proto__: null, configurable: true, get() { hooks++; throw new Error("last environment getter must not execute"); } } as PropertyDescriptor);
+        }
+        return result;
+      } });
+      Object.defineProperty(Array.prototype, Symbol.unscopables, { __proto__: null, value: proxy, writable: false, enumerable: false, configurable: true } as PropertyDescriptor);
+      const d = envelope(m); let result, failure: unknown;
+      const restore = () => {
+        Reflect.deleteProperty(owner, key); if (inherited) Object.defineProperty(owner, key, inherited);
+        Object.defineProperty(Array.prototype, "length", arrayLength);
+        Object.defineProperty(Array.prototype, Symbol.unscopables, original);
+      };
+      try {
+        const pending = collectLayoutMemoryInventory(observed, d.request, d.bytes);
+        // Entry rejection completes synchronously. Restore before yielding so
+        // node:test itself cannot consume the deliberately polluted index.
+        if (mode === "object-last-hook" || mode === "array-last-hook") restore();
+        result = await pending;
+      } catch (error) { failure = error; }
+      finally { restore(); }
+      assert.ok(reflections > 0); assert.equal(hooks, 0); assert.equal(replacements, 0);
+      if (mode === "object-last-hook" || mode === "array-last-hook") { assert.equal(calls, 0); assert.ok(errorCode("invalid_input")(failure)); }
+      else { assert.equal(calls, 17); assert.ok(result); assert.equal(Object.getPrototypeOf(result), null); }
+    }
+  }); } finally { await f.close(); }
+  process.stdout.write("collector_legacy_boundary_pass\n");
 });
 
 test("CS15 one pending real query settles after deadline; native rejection retains precedence", async () => {

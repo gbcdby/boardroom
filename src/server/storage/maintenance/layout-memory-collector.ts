@@ -64,6 +64,72 @@ function ownData(descriptor: PropertyDescriptor | undefined): descriptor is Prop
   return descriptor !== undefined && Object.hasOwn(descriptor, "value") && Object.hasOwn(descriptor, "writable")
     && !Object.hasOwn(descriptor, "get") && !Object.hasOwn(descriptor, "set");
 }
+// INPUT-ISOLATION-DELTA: fixed Node 24 shapes, not module-load trust.
+// Legacy consumers allocate ordinary objects; only synchronous windows admit them.
+const OBJECT_METHODS = Object.freeze("constructor __defineGetter__ __defineSetter__ hasOwnProperty __lookupGetter__ __lookupSetter__ isPrototypeOf propertyIsEnumerable toString valueOf toLocaleString".split(" "));
+const ARRAY_METHODS = Object.freeze("constructor at concat copyWithin fill find findIndex findLast findLastIndex lastIndexOf pop push reverse shift unshift slice sort splice includes indexOf join keys entries values forEach filter flat flatMap map every some reduce reduceRight toReversed toSorted toSpliced with toLocaleString toString".split(" "));
+const UNSCOPABLES = Object.freeze("at copyWithin entries fill find findIndex findLast findLastIndex flat flatMap includes keys toReversed toSorted toSpliced values".split(" "));
+type PrototypeState = Map<object, Map<PropertyKey, PropertyDescriptor>>;
+function prototypeState(previous: PrototypeState | undefined, code: MemoryCollectionErrorCode): PrototypeState {
+  const environmentFailure: () => never = (): never => { throw new MemoryCollectionError(code); };
+  const state: PrototypeState = new Map();
+  const require = (condition: unknown): void => { if (!condition) environmentFailure(); };
+  require(Object.getPrototypeOf(Object.prototype) === null && Object.getPrototypeOf(Array.prototype) === Object.prototype);
+  const inspect = (prototype: object, methods: readonly string[], kind: "object" | "array" | "unscopables", expected: PrototypeState | undefined = previous) => {
+    const keys = Reflect.ownKeys(prototype), descriptors = new Map<PropertyKey, PropertyDescriptor>();
+    require(keys.length === methods.length + (kind === "object" ? 1 : kind === "array" ? 3 : 0));
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index]!, d = Object.getOwnPropertyDescriptor(prototype, key);
+      if (!d || !Object.hasOwn(d, "enumerable") || !Object.hasOwn(d, "configurable")) environmentFailure();
+      const method = typeof key === "string" && methods.includes(key);
+      if (kind === "object" && key === "__proto__") {
+        require(!Object.hasOwn(d, "value") && !Object.hasOwn(d, "writable") && Object.hasOwn(d, "get") && Object.hasOwn(d, "set")
+          && typeof d.get === "function" && typeof d.set === "function" && d.enumerable === false && d.configurable === true);
+      } else if (kind === "array" && key === "length") {
+        require(ownData(d) && d.value === 0 && d.writable === true && d.enumerable === false && d.configurable === false);
+      } else if (kind === "array" && key === Symbol.unscopables) {
+        require(ownData(d) && d.value !== null && typeof d.value === "object" && d.writable === false && d.enumerable === false && d.configurable === true);
+      } else if (kind === "unscopables" && method) {
+        require(ownData(d) && d.value === true && d.writable === true && d.enumerable === true && d.configurable === true);
+      } else {
+        require((method || kind === "array" && key === Symbol.iterator) && ownData(d)
+          && typeof d.value === "function" && d.writable === true && d.enumerable === false && d.configurable === true);
+      }
+      if (expected) {
+        const old = expected.get(prototype)?.get(key);
+        if (!old) environmentFailure();
+        for (const field of ["value", "writable", "get", "set", "enumerable", "configurable"] as const) {
+          const present = Object.hasOwn(d, field);
+          require(present === Object.hasOwn(old, field) && (!present || Object.is(d[field], old[field])));
+        }
+      }
+      descriptors.set(key, d);
+    }
+    state.set(prototype, descriptors);
+    return descriptors;
+  };
+  inspect(Object.prototype, OBJECT_METHODS, "object");
+  const array = inspect(Array.prototype, ARRAY_METHODS, "array");
+  const iterator = array.get(Symbol.iterator), values = array.get("values"), unscopables = array.get(Symbol.unscopables);
+  if (!ownData(iterator) || !ownData(values) || !ownData(unscopables)) environmentFailure();
+  require(iterator.value === values.value);
+  const exclusions = unscopables.value;
+  if (exclusions === null || typeof exclusions !== "object") environmentFailure();
+  require(Object.getPrototypeOf(exclusions) === null);
+  inspect(exclusions, UNSCOPABLES, "unscopables");
+  // The data object above may be a Proxy. Close its last reflection window using
+  // only the intrinsic roots, comparing against this call's captured descriptors.
+  require(Object.getPrototypeOf(Object.prototype) === null && Object.getPrototypeOf(Array.prototype) === Object.prototype);
+  inspect(Object.prototype, OBJECT_METHODS, "object", state);
+  inspect(Array.prototype, ARRAY_METHODS, "array", state);
+  return state;
+}
+function legacy<T>(environment: PrototypeState, code: MemoryCollectionErrorCode, body: () => T): T {
+  prototypeState(environment, code);
+  const value = body();
+  prototypeState(environment, code);
+  return value;
+}
 function append<T>(array: T[], value: T) { put(array, String(array.length), value); }
 function record(values: RecordValue): RecordValue {
   const result = Object.create(null) as RecordValue;
@@ -253,14 +319,16 @@ function fixedQuery(snapshot: DbReadSnapshot): DbReadSnapshot["query"] {
 class Reader {
   readonly receiver: DbReadSnapshot;
   readonly query: DbReadSnapshot["query"];
+  readonly environment: PrototypeState;
   readonly deadline: bigint;
   readonly catalog = new Budget(MiB);
   calls = 0;
   nonPageCalls = 0;
-  constructor(snapshot: DbReadSnapshot, query: DbReadSnapshot["query"], start: string) {
-    this.receiver = snapshot; this.query = query;
+  constructor(snapshot: DbReadSnapshot, query: DbReadSnapshot["query"], start: string, environment: PrototypeState) {
+    this.receiver = snapshot; this.query = query; this.environment = environment;
     const time = BigInt(start); requireValue(time <= process.hrtime.bigint(), "invalid_input"); this.deadline = time + 120_000_000_000n; this.check();
   }
+  legacy<T>(body: () => T): T { return legacy(this.environment, "read_unavailable", body); }
   check() { requireValue(process.hrtime.bigint() <= this.deadline, "budget_exceeded"); }
   async run(sql: string, params: readonly unknown[] = [], metadata = false, page = false): Promise<{ rows: unknown[] }> {
     this.check(); requireValue(++this.calls <= 512, "budget_exceeded"); if (!page) requireValue(++this.nonPageCalls <= 96, "budget_exceeded");
@@ -300,7 +368,7 @@ async function sqliteCatalog(reader: Reader, request: MemoryCollectionRequestVal
       const c = ownRecord(raw, ["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"], "unsupported_catalog");
       return record({ cid: sqliteInt(c.cid), name: c.name, type: c.type, notnull: sqliteInt(c.notnull), dflt_value: c.dflt_value, pk: sqliteInt(c.pk), hidden: sqliteInt(c.hidden) });
     });
-    requireValue(canonicalJson(normal) === canonicalJson(m.tables.find(t => t.name === name)!.columns), "unsupported_catalog");
+    requireValue(reader.legacy(() => canonicalJson(normal) === canonicalJson(m.tables.find(t => t.name === name)!.columns)), "unsupported_catalog");
   }
   const marker = onlyRow((await reader.run('SELECT typeof(singleton) AS singleton_type,CAST(singleton AS TEXT) AS singleton,typeof(database_instance_id) AS id_type,database_instance_id FROM main."storage_maintenance" LIMIT 2')).rows,
     ["singleton_type", "singleton", "id_type", "database_instance_id"], "source_mismatch");
@@ -312,7 +380,7 @@ function sqliteCapacity(index: number) {
     const c = quote(name), kind = integerColumns[index]!.includes(n) ? "integer" : "text";
     const length = `CASE WHEN typeof(${c}) = 'text' THEN length(CAST(${c} AS BLOB)) WHEN typeof(${c}) = 'integer' THEN length(CAST(${c} AS TEXT)) ELSE 0 END`;
     const payload = `CASE WHEN typeof(${c}) = 'text' THEN 2 * length(CAST(${c} AS BLOB)) WHEN typeof(${c}) = 'integer' THEN length(CAST(${c} AS TEXT)) ELSE 0 END`;
-    fields.push(`CAST(SUM(${payload}) AS TEXT) AS s${n}`, `CAST(MAX(${length}) AS TEXT) AS m${n}`, `CAST(SUM(CASE WHEN ${c} IS NULL THEN 1 ELSE 0 END) AS TEXT) AS z${n}`, `CAST(SUM(CASE WHEN typeof(${c}) = '${kind}' OR ${c} IS NULL THEN 0 ELSE 1 END) AS TEXT) AS b${n}`);
+    for (const field of [`CAST(SUM(${payload}) AS TEXT) AS s${n}`, `CAST(MAX(${length}) AS TEXT) AS m${n}`, `CAST(SUM(CASE WHEN ${c} IS NULL THEN 1 ELSE 0 END) AS TEXT) AS z${n}`, `CAST(SUM(CASE WHEN typeof(${c}) = '${kind}' OR ${c} IS NULL THEN 0 ELSE 1 END) AS TEXT) AS b${n}`]) append(fields, field);
   }
   return `SELECT ${fields.join(",")} FROM main.${quote(tableNames[index]!)}`;
 }
@@ -370,7 +438,7 @@ async function collectRows(reader: Reader, request: MemoryCollectionRequestValue
         requireValue(!previous || Buffer.compare(previous, key) < 0, "inventory_invalid"); previous = key; append(rows, cells);
       }
     }
-    const digest = digestRowMultiset(rows as unknown as Json[]);
+    const digest = reader.legacy(() => digestRowMultiset(rows as unknown as Json[]));
     requireValue(digest.count === tables[n]!.expectedCount && digest.digest === tables[n]!.expectedDigest, "inventory_invalid");
     Object.freeze(rows); Object.freeze(tables[n]!.columns); Object.freeze(tables[n]);
   }
@@ -494,7 +562,7 @@ function pgAggregates(fields: readonly string[], prefix = ""): string {
     const c = prefix + quote(name);
     const payload = `CASE WHEN ${c} IS NULL THEN 0::pg_catalog.int4 ELSE pg_catalog.octet_length(${c}::pg_catalog.text) END`;
     const nulls = `CASE WHEN ${c} IS NULL THEN 1::pg_catalog.int4 ELSE 0::pg_catalog.int4 END`;
-    parts.push(`pg_catalog.sum(${payload})::pg_catalog.text AS ${quote(`s${n}`)}`, `pg_catalog.max(${payload})::pg_catalog.text AS ${quote(`m${n}`)}`, `pg_catalog.sum(${nulls})::pg_catalog.text AS ${quote(`z${n}`)}`);
+    for (const part of [`pg_catalog.sum(${payload})::pg_catalog.text AS ${quote(`s${n}`)}`, `pg_catalog.max(${payload})::pg_catalog.text AS ${quote(`m${n}`)}`, `pg_catalog.sum(${nulls})::pg_catalog.text AS ${quote(`z${n}`)}`]) append(parts, part);
   }
   return parts.join(",");
 }
@@ -531,7 +599,7 @@ async function pgCatalogSection(reader: Reader, section: PgSection, params: read
   }
   const raw = (await reader.run(`${section.query} LIMIT ${section.maximumRows + 1}`, params, true)).rows;
   requireValue(raw.length === section.maximumRows, "unsupported_catalog"); const rows = raw.map(row => ownRecord(row, section.fields, "unsupported_catalog"));
-  if (section.sha256) requireValue(sha256(canonicalJson(rows)) === section.sha256, "unsupported_catalog");
+  if (section.sha256) requireValue(reader.legacy(() => sha256(canonicalJson(rows))) === section.sha256, "unsupported_catalog");
   return Object.freeze(record({ rows })) as { rows: RecordValue[] };
 }
 function pgOid(value: unknown): string { const n = decimal(value, "unsupported_catalog", 10); requireValue(n > 0n && n <= 4294967295n, "unsupported_catalog"); return String(n); }
@@ -560,7 +628,7 @@ async function postgresCatalog(reader: Reader, request: MemoryCollectionRequestV
     requireValue(typeof row.relname === "string" && targetNames.includes(row.relname) && !relationByName.has(row.relname) && !relationIds.includes(oid)
       && (!namespace || namespace === ns) && row.relkind === "r" && row.relpersistence === "p" && row.am === "2" && row.relispartition === false
       && row.relrowsecurity === false && row.relforcerowsecurity === false, "unsupported_catalog");
-    namespace = ns; relationByName.set(row.relname, oid); relationIds.push(oid);
+    namespace = ns; relationByName.set(row.relname, oid); append(relationIds, oid);
   }
   const blocked = onlyRow((await reader.run(pgFixed.blockedObjects, [relationIds, relationIds, relationIds, relationIds, relationIds], true)).rows,
     ["rules", "statistics", "inheritance", "index_attribute_options"], "unsupported_catalog");
@@ -570,11 +638,12 @@ async function postgresCatalog(reader: Reader, request: MemoryCollectionRequestV
     procedures: [pgBuiltinIds.procedures], types: [pgBuiltinIds.types], collations: [pgBuiltinIds.collations], casts: [["20", "23", "25"]], aggregates: [] };
   for (const name of Object.keys(pgSections).filter(n => n !== "relations")) {
     const rows = (await pgCatalogSection(reader, pgSections[name]!, params[name]!)).rows;
-    if (name === "columns") pgProfile(rows, pgExpectedColumns, "default_node"); if (name === "indexes") pgProfile(rows, pgExpectedIndexes, "predicate");
+    if (name === "columns") reader.legacy(() => pgProfile(rows, pgExpectedColumns, "default_node"));
+    if (name === "indexes") reader.legacy(() => pgProfile(rows, pgExpectedIndexes, "predicate"));
   }
   const catalogs = (await pgCatalogSection(reader, pgSupplements.catalogIdentities!, [pgCatalogNames])).rows;
   const catalogOids: string[] = [], remainingCatalogs = new Set<string>(pgCatalogNames);
-  for (const row of catalogs) { const oid = pgOid(row.oid); requireValue(typeof row.name === "string" && remainingCatalogs.delete(row.name) && !catalogOids.includes(oid), "unsupported_catalog"); catalogOids.push(oid); }
+  for (const row of catalogs) { const oid = pgOid(row.oid); requireValue(typeof row.name === "string" && remainingCatalogs.delete(row.name) && !catalogOids.includes(oid), "unsupported_catalog"); append(catalogOids, oid); }
   const indexes = (await pgCatalogSection(reader, pgSupplements.indexIdentities!, [relationIds])).rows;
   const indexByOid = new Map<string, RecordValue>(), remainingIndexes = new Set(pgExpectedIndexes.map(r => r.name));
   for (const row of indexes) {
@@ -615,9 +684,10 @@ function pgData(index: number, schema: string, kind: "count" | "capacity" | "pag
 export async function collectLayoutMemoryInventory(snapshot: DbReadSnapshot, request: unknown, frozenManifestBytes: Uint8Array): Promise<ReadonlyDeep<MemoryCollectionObservation>> {
   let phase: MemoryCollectionErrorCode = "invalid_input";
   try {
-    const query = fixedQuery(snapshot), fixed = fixedRequest(request), bytes = copyBytes(frozenManifestBytes);
-    const reader = new Reader(snapshot, query, fixed.invocationStartedAtNs);
-    phase = "manifest_invalid"; const manifest = fixedManifest(bytes, fixed); phase = "read_unavailable";
+    const query = fixedQuery(snapshot), environment = prototypeState(undefined, "invalid_input");
+    const fixed = fixedRequest(request), bytes = copyBytes(frozenManifestBytes);
+    const reader = new Reader(snapshot, query, fixed.invocationStartedAtNs, environment);
+    phase = "manifest_invalid"; const manifest = legacy(environment, "invalid_input", () => fixedManifest(bytes, fixed)); phase = "read_unavailable";
     let input: ReadonlyDeep<FrozenMemoryInputValue>, recheck: (() => Promise<void>) | undefined;
     if (fixed.source.kind === "sqlite") {
       await sqliteCatalog(reader, fixed, manifest);
@@ -626,7 +696,7 @@ export async function collectLayoutMemoryInventory(snapshot: DbReadSnapshot, req
       const pg = await postgresCatalog(reader, fixed, manifest); recheck = pg.recheck;
       input = await collectRows(reader, fixed, manifest, n => pgData(n, pg.schema, "count"), n => pgData(n, pg.schema, "capacity"), n => pgData(n, pg.schema, "page"));
     }
-    reader.check(); phase = "inventory_invalid"; const inventory = buildLayoutMemoryInventory(input); reader.check(); phase = "read_unavailable";
+    reader.check(); phase = "inventory_invalid"; const inventory = reader.legacy(() => buildLayoutMemoryInventory(input)); reader.check(); phase = "read_unavailable";
     if (recheck) await recheck();
     const result = record({ contract: "layout-memory-collection-observation/r1", authority: "observation-only", input, inventory });
     reader.check(); return Object.freeze(result) as unknown as ReadonlyDeep<MemoryCollectionObservation>;
