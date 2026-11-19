@@ -2,8 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { AsyncLocalStorage } from 'node:async_hooks';
-import { Client as PgClient } from 'pg';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createMcpCore } from '../src/server/mcp/core.ts';
@@ -17,7 +15,8 @@ import { newId } from '../src/server/db/ids.ts';
 import type { RepositorySet } from '../src/server/db/repositories.ts';
 import type { DbDriver } from '../src/server/db/driver.ts';
 import type { Group, Member, Project } from '../src/server/db/types.ts';
-import { memoryFixture, pgUnavailable } from './helpers/memory-fixture.ts';
+import { memoryFixture, memoryPgUrl, pgUnavailable } from './helpers/memory-fixture.ts';
+import { LoadDiagnostics, installLoadQueryDiagnostics, finishLoadReport, type LoadBranch } from './helpers/load-pg-diagnostics.ts';
 
 /**
  * S5-AUDIT-16 独立负载门禁：不要与全量单测多进程争抢 CPU 后比较固定 NFR。
@@ -29,139 +28,6 @@ type Payload = { ok: boolean; [key: string]: unknown };
 const logger = createLogger({ level: 'error', write() {} });
 const access = { actor: ownerActor() };
 const rounded = (n: number) => Number(n.toFixed(3));
-
-type LoadBranch = 'wait' | 'mutation' | 'heartbeat' | 'traffic';
-type LoadOrigin = { branch: LoadBranch; historyMessages: number; step: number; branchId: number };
-type QueryCategory = 'begin' | 'commit' | 'rollback' | 'rollback-savepoint' | 'savepoint' | 'release-savepoint'
-  | 'project-lock' | 'lock-timeout-100' | 'lock-timeout-200' | 'statement-timeout-200' | 'statement-timeout-250' | 'other';
-type DiagnosticEvent = {
-  event: 'query-start' | 'query-end' | 'query-end-unobserved' | 'branch-start' | 'branch-end';
-  origin?: LoadOrigin; queryId?: number; clientId?: number; backendPid?: number | null; category?: QueryCategory;
-  outcome?: 'fulfilled' | 'rejected' | 'sync-throw'; elapsedMs?: number; sqlState?: string | null;
-};
-type QueryObservation = { startedAt: number; data: DiagnosticEvent; custom: boolean };
-
-/** 仅此接受门的被动 last-N 观察；不是 PG 锁图，也不把异步来源认定为锁拥有者。 */
-class LoadDiagnostics {
-  private readonly origin = new AsyncLocalStorage<LoadOrigin>();
-  private readonly clients = new WeakMap<object, number>();
-  private readonly events: Array<{ value: DiagnosticEvent & { sequence: number; atMs: number }; bytes: number }> = [];
-  private readonly startedAt = performance.now();
-  private readonly wallStartedAt = new Date().toISOString();
-  private head = 0; private count = 0; private bytes = 0; private sequence = 0;
-  private queryId = 0; private clientId = 0; private branchId = 0;
-  private dropped = 0; private errors = 0; private unobservedEnds = 0;
-  private readonly maxEvents = 4096;
-  private readonly maxBytes = 4 * 1024 * 1024;
-  private record(data: DiagnosticEvent): void {
-    try {
-      const value = { ...data, sequence: ++this.sequence, atMs: rounded(performance.now() - this.startedAt) };
-      const bytes = Buffer.byteLength(JSON.stringify(value));
-      if (bytes > this.maxBytes) { this.dropped++; return; }
-      while (this.count && (this.count === this.maxEvents || this.bytes + bytes > this.maxBytes)) {
-        this.bytes -= this.events[this.head]!.bytes; this.head = (this.head + 1) % this.maxEvents;
-        this.count--; this.dropped++;
-      }
-      this.events[(this.head + this.count) % this.maxEvents] = { value, bytes }; this.count++; this.bytes += bytes;
-    } catch { this.errors++; }
-  }
-  private state(error: unknown): string | null {
-    try {
-      const code: unknown = error && typeof error === 'object' ? Object.getOwnPropertyDescriptor(error, 'code')?.value : undefined;
-      return code === '55P03' || code === '57014' || code === '40P01' || code === '25P02' ? code : null;
-    } catch { return null; }
-  }
-  private start(client: object, input: unknown): QueryObservation | undefined {
-    try {
-      const text: unknown = typeof input === 'string' ? input
-        : input && typeof input === 'object' ? Object.getOwnPropertyDescriptor(input, 'text')?.value : undefined;
-      const sql = typeof text === 'string' ? text.slice(0, 256).trim() : '';
-      let category: QueryCategory = 'other';
-      if (/^BEGIN\b/i.test(sql)) category = 'begin';
-      else if (/^COMMIT\b/i.test(sql)) category = 'commit';
-      else if (/^ROLLBACK TO\b/i.test(sql)) category = 'rollback-savepoint';
-      else if (/^ROLLBACK\b/i.test(sql)) category = 'rollback';
-      else if (/^SAVEPOINT\b/i.test(sql)) category = 'savepoint';
-      else if (/^RELEASE SAVEPOINT\b/i.test(sql)) category = 'release-savepoint';
-      else if (/^UPDATE projects SET updated_at = updated_at WHERE id = /i.test(sql)) category = 'project-lock';
-      else if (/^SET LOCAL lock_timeout = '100ms'$/i.test(sql)) category = 'lock-timeout-100';
-      else if (/^SET LOCAL lock_timeout = '200ms'$/i.test(sql)) category = 'lock-timeout-200';
-      else if (/^SET LOCAL statement_timeout = '200ms'$/i.test(sql)) category = 'statement-timeout-200';
-      else if (/^SET LOCAL statement_timeout = '250ms'$/i.test(sql)) category = 'statement-timeout-250';
-      let clientId = this.clients.get(client);
-      if (clientId === undefined) { clientId = ++this.clientId; this.clients.set(client, clientId); }
-      const pid: unknown = Object.getOwnPropertyDescriptor(client, 'processID')?.value;
-      const origin = this.origin.getStore();
-      const data: DiagnosticEvent = { event: 'query-start', queryId: ++this.queryId, clientId, category,
-        backendPid: typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0 ? pid : null,
-        ...(origin ? { origin } : {}) };
-      const custom = Boolean(input && typeof input === 'object' && typeof Object.getOwnPropertyDescriptor(input, 'submit')?.value === 'function');
-      const observed = { startedAt: performance.now(), data, custom }; this.record(data); return observed;
-    } catch { this.errors++; return undefined; }
-  }
-  private end(observed: QueryObservation | undefined, outcome: NonNullable<DiagnosticEvent['outcome']>, error?: unknown): void {
-    try {
-      if (observed) this.record({ ...observed.data, event: 'query-end', outcome,
-        elapsedMs: rounded(performance.now() - observed.startedAt), sqlState: this.state(error) });
-    } catch { this.errors++; }
-  }
-  wrapQuery(original: typeof PgClient.prototype.query): typeof PgClient.prototype.query {
-    const trace = this;
-    return function(this: PgClient, ...args: unknown[]) {
-      const observed = trace.start(this, args[0]);
-      let result: unknown;
-      try { result = Reflect.apply(original, this, args); }
-      catch (error) { trace.end(observed, 'sync-throw', error); throw error; }
-      // Do not replace callback/config arguments or custom Query objects. The
-      // ordinary driver's native Promise is observed without replacing it.
-      try {
-        if (result instanceof Promise && !observed?.custom) {
-          void Promise.prototype.then.call(result, () => trace.end(observed, 'fulfilled'), (error: unknown) => trace.end(observed, 'rejected', error));
-        } else {
-          trace.unobservedEnds++;
-          if (observed) trace.record({ ...observed.data, event: 'query-end-unobserved' });
-        }
-      } catch { trace.errors++; }
-      return result;
-    } as typeof PgClient.prototype.query;
-  }
-  run<T>(branch: LoadBranch, historyMessages: number, step: number, body: () => Promise<T>): Promise<T> {
-    const origin = { branch, historyMessages, step, branchId: ++this.branchId }, startedAt = performance.now();
-    try { this.record({ event: 'branch-start', origin }); } catch { this.errors++; }
-    const finish = (outcome: NonNullable<DiagnosticEvent['outcome']>, error?: unknown) => {
-      try { this.record({ event: 'branch-end', origin, outcome, elapsedMs: rounded(performance.now() - startedAt), sqlState: this.state(error) }); }
-      catch { this.errors++; }
-    };
-    let result: Promise<T>;
-    try { result = this.origin.run(origin, body); }
-    catch (error) { finish('sync-throw', error); throw error; }
-    try { void Promise.prototype.then.call(result, () => finish('fulfilled'), (error: unknown) => finish('rejected', error)); }
-    catch { this.errors++; }
-    return result;
-  }
-  snapshot() {
-    try {
-      const events = Array.from({ length: this.count }, (_, index) => this.events[(this.head + index) % this.maxEvents]!.value);
-      return { schema: 'load-pg-query-observation/v1', wallStartedAt: this.wallStartedAt,
-        maxEvents: this.maxEvents, maxBytes: this.maxBytes, retainedBytes: this.bytes, dropCount: this.dropped,
-        diagnosticErrors: this.errors, unobservedQueryEnds: this.unobservedEnds,
-        firstRetainedAtMs: events[0]?.atMs ?? null, observedUntilMs: rounded(performance.now() - this.startedAt),
-        semantics: 'client query elapsed includes local queue/network/server; origin is inherited ancestry, not lock ownership; callback/custom/non-Promise ends are unobserved; pre-query gaps unattributed; no lock graph', events };
-    } catch { return { schema: 'load-pg-query-observation/v1', diagnosticUnavailable: true, diagnosticErrors: ++this.errors }; }
-  }
-}
-
-/** No MockTracker: its per-call history would retain SQL parameters/results. */
-function installLoadQueryDiagnostics(diagnostics: LoadDiagnostics): () => void {
-  const original = Object.getOwnPropertyDescriptor(PgClient.prototype, 'query');
-  assert.ok(original && typeof original.value === 'function', 'pg query must be an own data method');
-  const installed = { ...original, value: diagnostics.wrapQuery(original.value as typeof PgClient.prototype.query) };
-  Object.defineProperty(PgClient.prototype, 'query', installed);
-  return () => {
-    assert.deepEqual(Object.getOwnPropertyDescriptor(PgClient.prototype, 'query'), installed, 'pg query diagnostics installation owner changed');
-    Object.defineProperty(PgClient.prototype, 'query', original);
-  };
-}
 
 class MeasuredBudget extends CaptureBudget {
   readonly statements: string[] = [];
@@ -266,7 +132,10 @@ for (const engine of ['sqlite', 'postgres'] as const) {
       const diagnostics = engine === 'postgres' ? new LoadDiagnostics() : undefined;
       // after runs even if the body/report fails, preserving the original body
       // error when restoration also fails. There is only one hook per test.
-      if (diagnostics) t.after(installLoadQueryDiagnostics(diagnostics));
+      if (diagnostics) {
+        const restore = installLoadQueryDiagnostics(diagnostics);
+        t.after(async () => { try { await diagnostics.close(); } finally { restore(); } });
+      }
       const report = { schemaVersion: 1, engine, profile, node: process.version, platform: process.platform, transport: 'MCP SDK InMemoryTransport',
         limits: { mutationMs: 500, deliveryAndAckMs: 2000 }, status: 'RUNNING', error: null as string | null,
         fixture: { agents: 3, projects: 5, groupsPerProject: 5, membersPerGroup: 3, messageBodiesAreFixtureData: true },
@@ -278,6 +147,7 @@ for (const engine of ['sqlite', 'postgres'] as const) {
         pgDiagnostics: null as ReturnType<LoadDiagnostics['snapshot']> | null,
         phases: [] as Array<Record<string, unknown>>, operations: [] as Array<Record<string, unknown>> };
       try {
+        await diagnostics?.prepareMonitor(memoryPgUrl!);
         await memoryFixture(async (repos, db) => {
           const projects = await createLoad(repos), target = projects[0]!, survivor = projects[1]!;
           const targetId = target.members[2]!.id, service = createOrgMutationService({ repos }), compensation = createAuditCompensationService({ repos });
@@ -377,10 +247,13 @@ for (const engine of ['sqlite', 'postgres'] as const) {
         report.status = 'PASS';
       } catch (error) { report.status = 'FAIL'; report.error = error instanceof Error ? `${error.name}: ${error.message}` : String(error); throw error; }
       finally {
-        report.pgDiagnostics = diagnostics?.snapshot() ?? null;
-        const directory = path.resolve('.agent-output/lifecycle-load');
-        await mkdir(directory, { recursive: true });
-        await writeFile(path.join(directory, `${engine}${unmentioned ? '-unmentioned-history' : ''}.json`), `${JSON.stringify(report, null, 2)}\n`);
+        // All original measurements are complete before monitor teardown/report I/O.
+        await finishLoadReport(diagnostics, async () => {
+          report.pgDiagnostics = diagnostics?.snapshot() ?? null;
+          const directory = path.resolve('.agent-output/lifecycle-load');
+          await mkdir(directory, { recursive: true });
+          await writeFile(path.join(directory, `${engine}${unmentioned ? '-unmentioned-history' : ''}.json`), `${JSON.stringify(report, null, 2)}\n`);
+        }, report.status === 'FAIL', () => t.diagnostic('load report write failed; monitor cleanup was attempted and query restoration runs in after'));
       }
     });
  }
