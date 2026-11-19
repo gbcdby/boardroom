@@ -274,10 +274,14 @@ jobs:
         shell: bash
         env:
           BOARDROOM_CI_PG16_VERSION: ${{ steps.pg_restart_tools.outputs.version }}
+          BOARDROOM_CI_PG16_CLIENT_ARCHIVE: ${{ steps.pg_restart_tools.outputs.client_archive }}
+          BOARDROOM_CI_PG16_CLIENT_BYTES: ${{ steps.pg_restart_tools.outputs.client_bytes }}
+          BOARDROOM_CI_PG16_CLIENT_SHA256: ${{ steps.pg_restart_tools.outputs.client_sha256 }}
+          BOARDROOM_CI_PG16_CLIENT_PACKAGE: ${{ steps.pg_restart_tools.outputs.client_package }}
+          BOARDROOM_CI_PG16_ARCHITECTURE: ${{ steps.pg_restart_tools.outputs.architecture }}
         run: |
-          [[ "$BOARDROOM_CI_PG16_VERSION" =~ ^([0-9]+:)?16\.15- ]]
-          architecture=$(dpkg --print-architecture)
-          sudo apt-get install --yes --no-install-recommends --no-remove --allow-downgrades "postgresql-client-16:$architecture=$BOARDROOM_CI_PG16_VERSION"
+          client_archive=$(bash scripts/verify-ci-pg16-client.sh)
+          sudo apt-get install --yes --no-install-recommends --no-remove --allow-downgrades "$client_archive"
           for tool in pg_dump pg_restore psql; do
             version_output=$("/usr/lib/postgresql/16/bin/$tool" --version)
             printf '%s\n' "$version_output"
