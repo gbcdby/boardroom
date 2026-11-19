@@ -130,33 +130,39 @@ test('CI273-KEEP-01: the original Chromium APT step prepares HTTPS before instal
   assert.equal(browser.container.image, 'mcr.microsoft.com/playwright/python:v1.62.0-noble@sha256:aa81288e738725378becba5b3e06cb0f3a7f012a610e87e8d767a090ea3f740d');
   const run: string = browser.steps.find((step: { name: string }) => step.name === '提交后资源刷新、断线对账与草稿真实浏览器验证').run;
   const helper = run.indexOf('node scripts/ci/ubuntu-apt-https.ts --apt-root /etc/apt');
-  const update = run.indexOf('apt-get -o Acquire::Retries=0 update');
-  const install = run.indexOf('apt-get -o Acquire::Retries=0 install -y --no-install-recommends openbox=3.6.1-12build5 x11-utils=7.7+6build2');
-  assert.ok(helper >= 0 && helper < update && update < install);
-  assert.match(run, /apt-update\.log/); assert.match(run, /apt-install\.log/);
+  const prepare = run.indexOf('bash scripts/ci/prepare-native-desktop-apt.sh .agent-output/resource-web-e2e/native-desktop');
+  assert.ok(helper >= 0 && helper < prepare && prepare < run.indexOf('command -v Xvfb openbox xprop xauth'));
+  const preparation = readFileSync(new URL('../scripts/ci/prepare-native-desktop-apt.sh', import.meta.url), 'utf8');
+  assert.match(preparation, /apt-\$stage\.log/);
+  assert.match(preparation, /openbox=3\.6\.1-12build5 x11-utils=7\.7\+6build2/);
   assert.match(run, /dpkg-query -W/); assert.match(run, /packages\.tsv/);
   assert.match(run, /scripts\/e2e-resource-web\.py --native-desktop/);
-  assert.ok(!/allow-unauthenticated|allow-insecure|trusted=yes|Verify-Peer=false|Verify-Host=false/.test(run));
+  assert.ok(!/allow-unauthenticated|allow-insecure|trusted=yes|Verify-Peer=false|Verify-Host=false/.test(run + preparation));
 });
 
-test('CI273-KEEP-01: captured APT output cannot hide helper, update or install failures', t => {
+test('CI273-KEEP-01: captured output cannot hide source preparation or any APT stage failure', t => {
   const browser = parseDocument(readFileSync(new URL('../.github/workflows/database-ci.yml', import.meta.url), 'utf8')).toJS().jobs['managed-web-browser'];
   const run: string = browser.steps.find((step: { name: string }) => step.name === '提交后资源刷新、断线对账与草稿真实浏览器验证').run;
-  for (const [failed, code, calls] of [['helper', 53, []], ['update', 41, ['update']], ['install', 42, ['update', 'install']]] as const) {
+  for (const [failed, code, calls] of [['helper', 53, []], ['update', 41, ['update']],
+    ['download', 42, ['update', 'download']], ['install', 43, ['update', 'download', 'install']]] as const) {
     const f = fixture(t), bin = path.join(f.root, 'bin'); mkdirSync(bin);
-    // These owned command substitutes exercise the real bash step. No host APT,
-    // source helper or browser script is invoked in this fail-propagation test.
+    mkdirSync(path.join(f.root, 'scripts/ci'), { recursive: true });
+    writeFileSync(path.join(f.root, 'scripts/ci/prepare-native-desktop-apt.sh'),
+      readFileSync(new URL('../scripts/ci/prepare-native-desktop-apt.sh', import.meta.url)));
+    // Exercise the real workflow and preparation script with owned commands.
+    // No host APT, source configuration or browser process is changed.
     writeFileSync(path.join(bin, 'node'), `#!/bin/sh\nexit ${failed === 'helper' ? code : 0}\n`);
     writeFileSync(path.join(bin, 'apt-get'), '#!/bin/sh\n'
-      + 'printf "%s\\n" "$*" >> apt-calls.txt\n'
-      + `case "$*" in *" ${failed}"*) echo expected-apt-failure; exit ${code};; esac\nexit 0\n`);
-    for (const command of ['node', 'apt-get']) chmodSync(path.join(bin, command), 0o755);
+      + 'case " $* " in *" update "*) stage=update;; *" --download-only "*) stage=download;; *) stage=install;; esac\n'
+      + 'printf "%s\\n" "$stage" >> apt-calls.txt\n'
+      + `if [ "$stage" = '${failed}' ]; then echo expected-apt-failure; exit ${code}; fi\nexit 0\n`);
+    writeFileSync(path.join(bin, 'timeout'), '#!/bin/sh\nshift 3\nexec "$@"\n');
+    for (const command of ['node', 'apt-get', 'timeout']) chmodSync(path.join(bin, command), 0o755);
     const result = spawnSync('bash', ['-e', '-c', run], { cwd: f.root, encoding: 'utf8', timeout: 5_000,
       env: { PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` } });
     assert.ifError(result.error); assert.equal(result.status, code, result.stdout + result.stderr);
     const actual = existsSync(path.join(f.root, 'apt-calls.txt')) ? readFileSync(path.join(f.root, 'apt-calls.txt'), 'utf8').trim().split('\n') : [];
-    assert.equal(actual.length, calls.length);
-    calls.forEach((call, index) => assert.match(actual[index]!, new RegExp(`^-o Acquire::Retries=0 ${call}(?: |$)`)));
+    assert.deepEqual(actual, calls);
     if (failed !== 'helper') assert.match(readFileSync(path.join(f.root, `.agent-output/resource-web-e2e/native-desktop/apt-${failed}.log`), 'utf8'), /expected-apt-failure/);
     assert.equal(existsSync(path.join(f.root, '.agent-output/resource-web-e2e/native-desktop/packages.tsv')), false);
   }
