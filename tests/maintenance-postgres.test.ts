@@ -802,12 +802,36 @@ async function wrappedAdapter(f: Fixture, script: string): Promise<MaintenanceAd
   finally { if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath; }
 }
 
+async function releaseInvalidatedMutex(t: TestContext, mutex: OperationMutex): Promise<void> {
+  await assert.rejects(mutex.assertHeld(), { code: "maintenance_lost" });
+  try { await mutex.release(); }
+  catch (error) {
+    // Backup failure already invalidated this owner. A natural heartbeat may
+    // retain that loss before release; every other cleanup error still fails.
+    assert.ok(error instanceof MaintenanceFailure);
+    assert.equal(error.code, "maintenance_lost");
+    assert.equal(error.message, "storage_maintenance: maintenance_lost (source)");
+    t.diagnostic("failed native dump: original mutex heartbeat reported source loss during release");
+  }
+}
+
 pgTest("#152 PG missing/failed native dump stays sealed and never leaks tool stderr", async t => {
   const f = await fixture(t, "pg-dump-capability", false);
   let adapter: MaintenanceAdapter | undefined;
-  const readSourceState = async () => {
+  const readMutexPid = async () => {
     const reader = await f.connectSource();
     try {
+      const rows = (await reader.query(`SELECT pid FROM pg_catalog.pg_locks
+        WHERE locktype='advisory' AND mode='ExclusiveLock' AND granted
+        AND database=(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database())`)).rows;
+      assert.equal(rows.length, 1); assert.equal(typeof rows[0].pid, "number"); return rows[0].pid as number;
+    } finally { await reader.end(); }
+  };
+  const readSourceState = async (releasedPid: number) => {
+    const reader = await f.connectSource();
+    try {
+      assert.equal((await reader.query("SELECT pid FROM pg_catalog.pg_stat_activity WHERE pid=$1", [releasedPid])).rowCount,
+        0, "release must close its original mutex session before adapter.close");
       await reader.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
       const state = await readPostgresMaintenanceState(reader, { required: true });
       await reader.query("COMMIT"); return state;
@@ -818,19 +842,21 @@ pgTest("#152 PG missing/failed native dump stays sealed and never leaks tool std
     try { process.env.PATH = f.directory; adapter = await createPostgresMaintenanceAdapter(f.source, f.target); }
     finally { if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath; }
     let mutex = await acquire(adapter, f); await seal(adapter, f, mutex);
+    const missingPid = await readMutexPid();
     const beforeMissing = (await adapter.observe()).state; assert.equal(beforeMissing.admission, "sealed");
     await assert.rejects(adapter.withSourceLock("snapshot", lock => lock.backup(join(f.directory, "missing.dump"))), /backup_capability_unavailable/);
     await assert.rejects(adapter.observe(), { code: "maintenance_lost" });
-    await mutex.release(); await adapter.close();
-    assert.deepEqual(await readSourceState(), beforeMissing);
+    await releaseInvalidatedMutex(t, mutex);
+    assert.deepEqual(await readSourceState(missingPid), beforeMissing); await adapter.close();
     adapter = await wrappedAdapter(f, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'pg_dump (PostgreSQL) 16.0\\n'; exit 0; fi\nprintf 'secret-test-canary postgres://user:password@fixture' >&2\nexit 1\n");
     mutex = await acquire(adapter, f);
+    const failedPid = await readMutexPid();
     const beforeFailed = (await adapter.observe()).state; assert.equal(beforeFailed.admission, "sealed");
     await assert.rejects(adapter.withSourceLock("snapshot", lock => lock.backup(join(f.directory, "failed.dump"))),
       (error: unknown) => /backup_capability_unavailable/.test(String(error)) && !/secret-test-canary|password|postgres:\/\//.test(String(error)));
     await assert.rejects(adapter.observe(), { code: "maintenance_lost" });
-    await mutex.release(); await adapter.close();
-    assert.deepEqual(await readSourceState(), beforeFailed);
+    await releaseInvalidatedMutex(t, mutex);
+    assert.deepEqual(await readSourceState(failedPid), beforeFailed); await adapter.close();
   } finally { await adapter?.close(); await f.close(); }
 });
 
