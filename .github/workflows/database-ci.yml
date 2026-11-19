@@ -637,8 +637,10 @@ jobs:
           mkdir -p .agent-output/resource-web-e2e/native-desktop
           # 仅本次 browser 容器；不改其他脚本、job、时限或现有桌面。
           export DEBIAN_FRONTEND=noninteractive
-          apt-get -o Acquire::Retries=0 update
-          apt-get -o Acquire::Retries=0 install -y --no-install-recommends openbox=3.6.1-12build5 x11-utils=7.7+6build2
+          node scripts/ci/ubuntu-apt-https.ts --apt-root /etc/apt --evidence .agent-output/resource-web-e2e/native-desktop/apt-sources
+          set -o pipefail
+          apt-get -o Acquire::Retries=0 update 2>&1 | tee .agent-output/resource-web-e2e/native-desktop/apt-update.log
+          apt-get -o Acquire::Retries=0 install -y --no-install-recommends openbox=3.6.1-12build5 x11-utils=7.7+6build2 2>&1 | tee .agent-output/resource-web-e2e/native-desktop/apt-install.log
           command -v Xvfb openbox xprop xauth
           dpkg-query -W -f='${Package}\t${Version}\n' xvfb openbox x11-utils xauth > .agent-output/resource-web-e2e/native-desktop/packages.tsv
           .agent-output/browser-venv/bin/python scripts/e2e-resource-web.py --native-desktop

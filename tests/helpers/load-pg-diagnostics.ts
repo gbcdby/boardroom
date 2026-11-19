@@ -5,6 +5,7 @@ import { Client as PgClient, type ClientConfig, type QueryResult } from 'pg';
 const rounded = (n: number) => Number(n.toFixed(3));
 
 export type LoadBranch = 'wait' | 'mutation' | 'heartbeat' | 'traffic';
+export type LoadServerTarget = 'first-project-lock' | 'mutation-commit';
 type LoadOrigin = { branch: LoadBranch; historyMessages: number; step: number; branchId: number };
 type QueryCategory = 'begin' | 'commit' | 'rollback' | 'rollback-savepoint' | 'savepoint' | 'release-savepoint'
   | 'project-lock' | 'lock-timeout-100' | 'lock-timeout-200' | 'statement-timeout-200' | 'statement-timeout-250' | 'other';
@@ -33,6 +34,21 @@ class LastN<T> {
     }
     this.events[(this.head + this.count) % this.maxEvents] = { value, bytes }; this.count++; this.bytes += bytes;
   }
+  replace(previous: T, value: T): void {
+    // A pending opportunity becomes a returned sample without retaining two
+    // copies. Move the updated record to the end and reapply the same bounds.
+    for (let offset = 0; offset < this.count; offset++) {
+      const index = (this.head + offset) % this.maxEvents, entry = this.events[index]!;
+      if (entry.value !== previous) continue;
+      this.bytes -= entry.bytes;
+      for (let next = offset; next < this.count - 1; next++) {
+        this.events[(this.head + next) % this.maxEvents] = this.events[(this.head + next + 1) % this.maxEvents];
+      }
+      this.events[(this.head + this.count - 1) % this.maxEvents] = undefined;
+      this.count--; break;
+    }
+    this.push(value);
+  }
   values(): T[] { return Array.from({ length: this.count }, (_, index) => this.events[(this.head + index) % this.maxEvents]!.value); }
 }
 
@@ -49,8 +65,9 @@ export class LoadDiagnostics {
   private readonly maxBytes = 4 * 1024 * 1024;
   private readonly events = new LastN<DiagnosticEvent & { sequence: number; atMs: number }>(this.maxEvents, this.maxBytes);
   private readonly server: ServerObserver;
-  constructor(createMonitor: (config: ClientConfig) => PgClient = config => new PgClient(config)) {
-    this.server = new ServerObserver(this.startedAt, createMonitor);
+  constructor(createMonitor: (config: ClientConfig) => PgClient = config => new PgClient(config),
+    serverTarget: LoadServerTarget = 'first-project-lock') {
+    this.server = new ServerObserver(this.startedAt, createMonitor, serverTarget);
   }
   prepareMonitor(connectionString: string): Promise<void> { return this.server.prepare(connectionString); }
   close(): Promise<void> { return this.server.close(); }
@@ -236,10 +253,17 @@ type ServerRow = { pid: number; clientId: number; observedAt: string | null; bac
   blockingPids: number[]; unknownBlockerPids: number[]; blockersTruncated: boolean; blockersKnown: boolean;
   visibility: 'observed' | 'unknown'; backendLifetime: 'first-observed' | 'matches' | 'changed' | 'unknown';
   queryIdAtSend: number | null; queryIdAtReturn: number | null; queryUnchanged: boolean };
-type ServerSample = { queryId: number; clientId: number; backendPid: number; origin: LoadOrigin;
+type TargetCategory = 'project-lock' | 'commit';
+type ServerSample = { queryId: number; clientId: number; backendPid: number; origin: LoadOrigin; category: TargetCategory;
   opportunityMs: number; requestedAtMs: number; sentAtMs: number; returnedAtMs: number;
   targetSettledAtMs: number | null; timerLatenessMs: number; late: boolean; censored: boolean;
   outcome: 'fulfilled' | 'rejected'; sqlState: string | null; missingPids: number[]; rowsTruncated: boolean; rows: ServerRow[] };
+type CancellationReason = 'query-settled' | 'operation-ended' | 'operation-replaced' | 'backend-ended' | 'monitor-unavailable' | 'closed';
+type OpportunityDisposition = 'sample-attempted' | 'skipped-busy' | 'skipped-stale' | 'cancelled';
+type OpportunityRecord = { queryId: number; clientId: number; backendPid: number; origin: LoadOrigin; category: TargetCategory;
+  opportunityMs: number; dueAtMs: number; firedAtMs: number | null; cancelledAtMs: number | null; latenessMs: number;
+  disposition: OpportunityDisposition; cancellationReason: CancellationReason | null; targetSettledAtMs: number | null;
+  sample?: ServerSample };
 
 /** Private to this acceptance diagnostic; it owns exactly one independent Client. */
 class ServerObserver {
@@ -247,8 +271,11 @@ class ServerObserver {
   private readonly createMonitor: (config: ClientConfig) => PgClient;
   private readonly startedAt: number;
   private readonly backends = new Map<number, Backend>();
-  private readonly samples = new LastN<ServerSample>(serverLimits.snapshots, serverLimits.retainedBytes);
-  private readonly timers = new Set<ReturnType<typeof setTimeout>>();
+  // One record per opportunity, updated when its sample returns. The
+  // opportunity ledger and samples share both existing retention limits.
+  private readonly records = new LastN<OpportunityRecord>(serverLimits.snapshots, serverLimits.retainedBytes);
+  private readonly timers = new Map<ReturnType<typeof setTimeout>, { target: QueryObservation; opportunityMs: number }>();
+  private readonly serverTarget: LoadServerTarget;
   private target: QueryObservation | undefined;
   private operation: number | undefined;
   private operationScheduled = false;
@@ -264,19 +291,43 @@ class ServerObserver {
   private late = 0; private errors = 0; private pidEvictions = 0;
   private cleanup = { attempted: false, transportEnded: false, pendingSettled: true, endSettled: false,
     forced: false, deadlineExceeded: false, verified: false, backendExit: 'not-read-back' as const, elapsedMs: 0 };
-  constructor(startedAt: number, createMonitor: (config: ClientConfig) => PgClient) {
-    this.startedAt = startedAt; this.createMonitor = createMonitor;
+  constructor(startedAt: number, createMonitor: (config: ClientConfig) => PgClient, serverTarget: LoadServerTarget) {
+    this.startedAt = startedAt; this.createMonitor = createMonitor; this.serverTarget = serverTarget;
   }
   isMonitor(client: object): boolean { return client === this.monitor; }
   private at(value = performance.now()): number { return rounded(value - this.startedAt); }
-  private cancelTimers(): void {
+  private retainOpportunity(target: QueryObservation, opportunityMs: number, firedAt: number | null,
+    cancelledAt: number | null, disposition: OpportunityDisposition, cancellationReason: CancellationReason | null,
+    sample?: ServerSample, previous?: OpportunityRecord): OpportunityRecord | undefined {
+    try {
+      const data = target.data, actedAt = firedAt ?? cancelledAt!;
+      const value: OpportunityRecord = { queryId: data.queryId!, clientId: data.clientId!, backendPid: data.backendPid!,
+        origin: data.origin!, category: data.category as TargetCategory, opportunityMs,
+        dueAtMs: this.at(target.startedAt + opportunityMs), firedAtMs: firedAt === null ? null : this.at(firedAt),
+        cancelledAtMs: cancelledAt === null ? null : this.at(cancelledAt),
+        latenessMs: rounded(Math.max(0, actedAt - target.startedAt - opportunityMs)), disposition, cancellationReason,
+        targetSettledAtMs: target.settledAt === undefined ? null : this.at(target.settledAt), ...(sample ? { sample } : {}) };
+      // The old per-snapshot cap now also covers the opportunity metadata.
+      while (Buffer.byteLength(JSON.stringify(value)) > serverLimits.snapshotBytes && value.sample?.rows.length) {
+        value.sample.rows.pop(); value.sample.rowsTruncated = true; value.sample.censored = true;
+      }
+      if (previous) this.records.replace(previous, value);
+      else this.records.push(value);
+      return value;
+    } catch { this.errors++; return undefined; }
+  }
+  private cancelTimers(reason: CancellationReason): void {
     this.cancelled += this.timers.size;
-    for (const timer of this.timers) clearTimeout(timer);
+    const cancelledAt = performance.now();
+    for (const [timer, opportunity] of this.timers) {
+      clearTimeout(timer);
+      this.retainOpportunity(opportunity.target, opportunity.opportunityMs, null, cancelledAt, 'cancelled', reason);
+    }
     this.timers.clear();
   }
   private unavailable(reason: typeof this.reason, error?: unknown): void {
     this.available = false; this.reason = reason; this.errorState = serverError(error);
-    this.errors++; this.cancelTimers();
+    this.errors++; this.cancelTimers('monitor-unavailable');
   }
   private track<T>(promise: Promise<T>): Promise<T> {
     const pending = promise.then(() => {}, () => {});
@@ -320,10 +371,10 @@ class ServerObserver {
     } catch (error) { this.unavailable(this.reason, error); await this.close(); }
   }
   beginOperation(branchId: number): void {
-    this.cancelTimers(); this.target = undefined; this.operation = branchId; this.operationScheduled = false;
+    this.cancelTimers('operation-replaced'); this.target = undefined; this.operation = branchId; this.operationScheduled = false;
   }
   endOperation(branchId: number): void {
-    if (this.operation === branchId) { this.operation = undefined; this.cancelTimers(); }
+    if (this.operation === branchId) { this.operation = undefined; this.cancelTimers('operation-ended'); }
   }
   noteClient(client: object, observed: QueryObservation): void {
     const data = observed.data;
@@ -338,7 +389,7 @@ class ServerObserver {
     const backend: Backend = { client: client as PgClient, clientId: data.clientId, pid: data.backendPid,
       lastQuery: observed, backendStart: null, onEnd: () => {
         if (this.backends.get(backend.clientId) === backend) this.backends.delete(backend.clientId);
-        if (this.target?.data.clientId === backend.clientId) this.cancelTimers();
+        if (this.target?.data.clientId === backend.clientId) this.cancelTimers('backend-ended');
       } };
     backend.client.once('end', backend.onEnd); this.backends.set(backend.clientId, backend);
   }
@@ -349,7 +400,8 @@ class ServerObserver {
   }
   queryStarted(target: QueryObservation): void {
     const data = target.data;
-    if (this.closed || !this.available || data.category !== 'project-lock' || data.origin?.branch !== 'mutation'
+    const category: TargetCategory = this.serverTarget === 'mutation-commit' ? 'commit' : 'project-lock';
+    if (this.closed || !this.available || data.category !== category || data.origin?.branch !== 'mutation'
       || this.operation !== data.origin.branchId || !data.backendPid || this.operationScheduled) return;
     this.operationScheduled = true;
     if (this.scheduled + 3 > serverLimits.snapshots) { this.limitSkips++; return; }
@@ -357,15 +409,21 @@ class ServerObserver {
     for (const opportunity of serverLimits.opportunityMs) {
       const timer = setTimeout(() => {
         this.timers.delete(timer);
-        if (!this.available || !this.current(target)) { this.staleSkips++; return; }
-        if (this.pending) { this.busySkips++; return; }
-        void this.sample(target, opportunity);
+        const firedAt = performance.now();
+        if (!this.available || !this.current(target)) {
+          this.staleSkips++; this.retainOpportunity(target, opportunity, firedAt, null, 'skipped-stale', null); return;
+        }
+        if (this.pending) {
+          this.busySkips++; this.retainOpportunity(target, opportunity, firedAt, null, 'skipped-busy', null); return;
+        }
+        const record = this.retainOpportunity(target, opportunity, firedAt, null, 'sample-attempted', null);
+        void this.sample(target, opportunity, firedAt, record);
       }, Math.max(0, Math.ceil(target.startedAt + opportunity - performance.now())));
-      this.timers.add(timer);
+      this.timers.set(timer, { target, opportunityMs: opportunity });
     }
   }
-  queryEnded(target: QueryObservation): void { if (this.target === target) this.cancelTimers(); }
-  private async sample(target: QueryObservation, opportunityMs: number): Promise<void> {
+  queryEnded(target: QueryObservation): void { if (this.target === target) this.cancelTimers('query-settled'); }
+  private async sample(target: QueryObservation, opportunityMs: number, firedAt: number, record: OpportunityRecord | undefined): Promise<void> {
     const sent = performance.now(), data = target.data;
     const selected = [...this.backends.values()].slice(0, serverLimits.pids)
       .map(backend => ({ backend, queryId: backend.lastQuery.data.queryId ?? null }));
@@ -410,6 +468,7 @@ class ServerObserver {
       this.rows += rows.length;
       const missingPids = selectedPids.filter(value => !rows.some(row => row.pid === value));
       const value: ServerSample = { queryId: data.queryId!, clientId: data.clientId!, backendPid: data.backendPid!, origin: data.origin!,
+        category: data.category as TargetCategory,
         opportunityMs, requestedAtMs: this.at(target.startedAt + opportunityMs), sentAtMs: this.at(sent), returnedAtMs: this.at(),
         targetSettledAtMs: target.settledAt === undefined ? null : this.at(target.settledAt),
         timerLatenessMs: rounded(Math.max(0, sent - target.startedAt - opportunityMs)), late,
@@ -417,15 +476,12 @@ class ServerObserver {
           || !row.blockersKnown || !row.observedAt || row.blockersTruncated || row.unknownBlockerPids.length > 0
           || row.backendLifetime === 'unknown' || row.backendLifetime === 'changed' || !row.queryUnchanged),
         outcome: failed ? 'rejected' : 'fulfilled', sqlState, missingPids, rowsTruncated: rawRows.length > serverLimits.pids, rows };
-      while (Buffer.byteLength(JSON.stringify(value)) > serverLimits.snapshotBytes && value.rows.length) {
-        value.rows.pop(); value.rowsTruncated = true; value.censored = true;
-      }
-      this.samples.push(value);
+      this.retainOpportunity(target, opportunityMs, firedAt, null, 'sample-attempted', null, value, record);
     } catch { this.errors++; }
   }
   close(): Promise<void> {
     if (this.closing) return this.closing;
-    this.closed = true; this.available = false; this.cancelTimers();
+    this.closed = true; this.available = false; this.cancelTimers('closed');
     for (const backend of this.backends.values()) backend.client.removeListener('end', backend.onEnd);
     this.backends.clear();
     this.closing = this.finishClose().catch(() => {
@@ -458,14 +514,18 @@ class ServerObserver {
     this.cleanup.verified = this.cleanup.transportEnded && this.cleanup.pendingSettled && this.cleanup.endSettled;
   }
   snapshot() {
-    return { schema: 'load-pg-server-observation/v1', limits: serverLimits, available: this.available, closed: this.closed, reason: this.reason,
+    const records = this.records.values();
+    const samples = records.flatMap(record => record.sample ? [record.sample] : []);
+    return { schema: 'load-pg-server-observation/v2', target: this.serverTarget,
+      limits: serverLimits, available: this.available, closed: this.closed, reason: this.reason,
       sqlState: this.errorState, scheduledOpportunities: this.scheduled, snapshotCount: this.snapshots, rowCount: this.rows,
-      setupQueryCount: this.setupQueries, cleanupQueryCount: 0, retainedBytes: this.samples.bytes, dropCount: this.samples.dropped,
+      setupQueryCount: this.setupQueries, cleanupQueryCount: 0, retainedBytes: this.records.bytes, dropCount: this.records.dropped,
+      retainedOpportunityCount: records.length, retainedSampleCount: samples.length,
       busySkips: this.busySkips, limitSkips: this.limitSkips, staleSkips: this.staleSkips, cancelledTimers: this.cancelled,
       lateCount: this.late, diagnosticErrors: this.errors, pidEvictions: this.pidEvictions, pendingTimers: this.timers.size,
       queryPending: !!this.pending, cleanup: { ...this.cleanup },
-      semantics: 'sparse autocommit server samples; unavailable/null/missing/late/truncated data remain unknown; direct blockers can be waiters; origin is ancestry, never ownership; no out-of-set expansion; first-observed lifetime is not a prior lifetime proof; timings retain observer CPU/scheduling/lock-manager interference; no cleanup SQL or backend-exit readback',
-      samples: this.samples.values() };
+      semantics: 'sparse autocommit server samples; opportunities and samples share the original last-N/byte cap; overdue cancellation is not an observed server wait; unavailable/null/missing/late/truncated data remain unknown; direct blockers can be waiters; origin is ancestry, never ownership; no out-of-set expansion; first-observed lifetime is not a prior lifetime proof; timings retain observer CPU/scheduling/lock-manager interference; no cleanup SQL or backend-exit readback',
+      opportunities: records.map(({ sample: _sample, ...opportunity }) => opportunity), samples };
   }
 }
 
