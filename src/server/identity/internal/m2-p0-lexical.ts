@@ -45,11 +45,13 @@ export function scanP0Json(state: P0State, text: string, site: P0Site, options: 
   if (text.length > P0_LIMITS.outerBytes) return limit();
   // Reserve the first size scan before performing it. UTF-8 bytes are never fewer
   // than UTF-16 code units; add the exact difference before any JSON token decoding.
-  chargeState(state, { bytes: text.length * 5, work: 1 }, site);
+  chargeState(state, { bytes: text.length * 3, work: 1 }, site);
   const bytes = Buffer.byteLength(text, "utf8");
   if (bytes > P0_LIMITS.outerBytes) return limit();
-  // Includes size measurement, scanner, token decoding/well-formedness and JSON.parse.
-  chargeState(state, { bytes: (bytes - text.length) * 5 }, site);
+  // Three actual full passes: UTF-8 measurement, scanner and the one final parse.
+  // Value strings are checked in the scanner, with no slice/parse/second Unicode pass.
+  // Only object keys need separate decoding for duplicate detection; charged below.
+  chargeState(state, { bytes: (bytes - text.length) * 3 }, site);
   let at = 0, maximumDepth = baseDepth;
   const node = (depth: number): void => {
     if (depth > P0_LIMITS.depth) limit();
@@ -57,40 +59,63 @@ export function scanP0Json(state: P0State, text: string, site: P0Site, options: 
     chargeState(state, { nodes: 1, work: 1 }, site);
   };
   const space = (): void => { while (at < text.length && (text[at] === " " || text[at] === "\t" || text[at] === "\r" || text[at] === "\n")) at++; };
-  const string = (): string => {
+  const string = (decodeKey: boolean): string | undefined => {
     if (text[at++] !== '"') return fail();
     const start = at - 1;
-    let complete = false;
+    let complete = false, pendingHigh = false;
     while (at < text.length) {
       const char = text[at++]!;
       if (char === '"') { complete = true; break; }
-      if (char.charCodeAt(0) < 32) return fail();
+      let code = char.charCodeAt(0);
+      if (code < 32) return fail();
       if (char === "\\") {
         const escape = text[at++];
         if (escape === "u") {
-          if (!/^[0-9a-fA-F]{4}$/.test(text.slice(at, at + 4))) return fail();
-          at += 4;
-        } else if (escape === undefined || !'"\\/bfnrt'.includes(escape)) return fail();
+          // Consume each source hex digit once in this scanner pass. No copied
+          // substring, second regex traversal or parseInt traversal is needed.
+          code = 0;
+          for (let digit = 0; digit < 4; digit++) {
+            const hex = text.charCodeAt(at++);
+            let nibble: number;
+            if (hex >= 0x30 && hex <= 0x39) nibble = hex - 0x30;
+            else if (hex >= 0x41 && hex <= 0x46) nibble = hex - 0x41 + 10;
+            else if (hex >= 0x61 && hex <= 0x66) nibble = hex - 0x61 + 10;
+            else return fail();
+            code = code * 16 + nibble;
+          }
+        } else {
+          if (escape === undefined || !'"\\/bfnrt'.includes(escape)) return fail();
+          code = 0; // Every permitted non-u escape decodes to a non-surrogate.
+        }
+      }
+      // Check decoded UTF-16 units as they are scanned, including a pair split
+      // across raw and escaped spelling. Semantic TEXT keeps its owner's policy.
+      if (options.outer) {
+        if (pendingHigh) {
+          if (code < 0xdc00 || code > 0xdfff) return fail();
+          pendingHigh = false;
+        } else if (code >= 0xd800 && code <= 0xdbff) pendingHigh = true;
+        else if (code >= 0xdc00 && code <= 0xdfff) return fail();
       }
     }
-    if (!complete) return fail();
+    if (!complete || pendingHigh) return fail();
     chargeState(state, { work: 1 + Math.ceil((at - start) / 64) }, site);
-    const decoded: string = JSON.parse(text.slice(start, at));
-    // Semantic TEXT may contain escaped lone surrogates where its original owner codec allows them.
-    if (options.outer && !wellFormedP0(decoded)) return fail();
-    return decoded;
+    if (!decodeKey) return undefined;
+    // UTF-8 upper bound times slice, native parse and the two Set key operations.
+    chargeState(state, { bytes: (at - start) * 3 * 4, work: 1 }, site);
+    return JSON.parse(text.slice(start, at)) as string;
   };
   const value = (depth: number): void => {
     space(); node(depth);
-    if (text[at] === '"') { string(); return; }
+    if (text[at] === '"') { string(false); return; }
     if (text[at] === "{") {
       at++; space();
       const keys = options.policy === "legacy-display" ? null : new Set<string>();
       if (text[at] === "}") { at++; return; }
       for (;;) {
         // Both the decoded key and its value are JSON nodes, including repeated legacy keys.
-        node(depth + 1); const key = string();
-        if (keys?.has(key)) return fail(); keys?.add(key);
+        node(depth + 1); const key = string(keys !== null);
+        if (keys?.has(key!)) return fail(); keys?.add(key!);
         space(); if (text[at++] !== ":") return fail();
         value(depth + 1); space();
         const separator = text[at++];

@@ -1,21 +1,13 @@
+import { failHistoryValue as fail, requireHistoryValue as requireValue, historyObject as object,
+  validateHistoryObservationValue as observation, historyValueFailure } from "./internal/m2-history-observation-core.ts";
 import { createHash } from "node:crypto";
-import { M2_FORMAT_REGISTRATION } from "./m2-value-contracts.ts";
 import { M2_HISTORY_LIMITS, M2_HISTORY_REMAINING, M2_HISTORY_TABLES } from "./m2-history-contracts.ts";
 import { markUnknownHistoryFailure } from "./internal/m2-history-failure-identity.ts";
 import { sortHistoryFrames } from "./internal/m2-history-sort.ts";
-import type { ComparisonObservation, HistoryColumn, HistoryErrorCode, HistoryObservation, HistoryObservationInput,
-  HistoryRemaining, HistoryResult, RawCell, RawRow, RawTable } from "./m2-history-contracts.ts";
+import type { ComparisonObservation, HistoryObservation,
+  HistoryRemaining, HistoryResult, RawRow, RawTable } from "./m2-history-contracts.ts";
 
 // Stage1a is a total, primitive-string-only value boundary. No native/semantic closure is issued.
-const knownFailures = new WeakMap<object, { code: HistoryErrorCode; path: string[] }>();
-function fail(code: HistoryErrorCode, path: string[] = []): never {
-  const token = {};
-  knownFailures.set(token, { code, path });
-  throw token;
-}
-function requireValue(ok: unknown, path: string[] = [], code: HistoryErrorCode = "invalid_value"): asserts ok {
-  if (!ok) fail(code, path);
-}
 function freeze<T>(value: T): T {
   if (value !== null && typeof value === "object") { for (const child of Object.values(value)) freeze(child); Object.freeze(value); }
   return value;
@@ -26,7 +18,7 @@ function total<T>(input: unknown, work: (value: unknown) => T): HistoryResult<T>
     return freeze({ ok: true, value: work(value) }) as HistoryResult<T>;
   } catch (error) {
     // Identity lookup never invokes an unknown Proxy's prototype or property traps.
-    const known = typeof error === "object" && error !== null ? knownFailures.get(error) : undefined;
+    const known = historyValueFailure(error);
     const result = freeze({ ok: false, error: { code: known?.code ?? "invalid_value", path: known?.path ?? [] } }) as HistoryResult<T>;
     return known ? result : markUnknownHistoryFailure(result);
   }
@@ -106,91 +98,6 @@ function read(input: unknown): unknown {
   // Equality also rejects duplicate keys, escapes/whitespace and noncanonical numeric spellings.
   requireValue(canonical(parsed) === input);
   return parsed;
-}
-function object(value: unknown, keys: readonly string[], path: string[]): Record<string, unknown> {
-  requireValue(value !== null && typeof value === "object" && !Array.isArray(value), path);
-  const result = value as Record<string, unknown>, own = Object.keys(result);
-  requireValue(own.length === keys.length && keys.every(k => Object.hasOwn(result, k)), path);
-  return result;
-}
-function string(value: unknown, path: string[], expression?: RegExp): asserts value is string {
-  requireValue(typeof value === "string" && (expression ? expression.test(value) : value.length > 0), path);
-}
-const HASH = /^[0-9a-f]{64}$/, DECIMAL = /^(?:0|[1-9][0-9]*)$/, HEX = /^(?:[0-9a-f]{2})*$/;
-function int64(value: unknown, path: string[]): asserts value is string {
-  string(value, path, /^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$/);
-  requireValue(value.length <= 20, path);
-  const n = BigInt(value); requireValue(n >= -9223372036854775808n && n <= 9223372036854775807n, path);
-}
-function artifact(value: unknown, path: string[]): void {
-  const v = object(value, ["ref", "sha256", "bytes"], path);
-  string(v.ref, path); string(v.sha256, path, HASH); string(v.bytes, path, DECIMAL);
-}
-function evidence(value: unknown, path: string[]): void {
-  const v = object(value, ["artifactId", "digest"], path); string(v.artifactId, path); string(v.digest, path, HASH);
-}
-function cell(value: unknown, backend: string, column: HistoryColumn, path: string[]): asserts value is RawCell {
-  requireValue(Array.isArray(value), path);
-  const tag: unknown = value[0];
-  if (tag === "null") { requireValue(value.length === 1, path); return; }
-  if (backend === "postgres") {
-    requireValue(tag === "pg-binary", path); requireValue(value.length === 3, path);
-    requireValue(value[1] === column.postgresTypeOid, path, "column_contract_mismatch");
-    string(value[2], path, HEX);
-    if (value[1] !== "25") requireValue(value[2].length === (value[1] === "23" ? 8 : 16), path);
-    return;
-  }
-  requireValue(value.length === 2, path);
-  if (tag === "integer") int64(value[1], path);
-  else if (tag === "text" || tag === "blob") string(value[1], path, HEX);
-  else if (tag === "real64be") string(value[1], path, /^[0-9a-f]{16}$/);
-  else fail("unsupported_shape", path);
-}
-function observation(input: unknown): HistoryObservationInput {
-  const v = object(input, ["contract", "backend", "phase", "configFormat", "source", "physicalSourceRef", "snapshotReceiptRef", "catalog", "textEncoding", "tables", "sequences"], []);
-  requireValue(v.contract === "m2-history-observation/r1", ["contract"], "unsupported_shape");
-  requireValue(v.backend === "sqlite" || v.backend === "postgres", ["backend"], "unsupported_shape");
-  requireValue(v.phase === "p0" || v.phase === "p1" || v.phase === "p1-bootstrap", ["phase"], "unsupported_shape");
-  requireValue(typeof v.configFormat === "number" && Number.isSafeInteger(v.configFormat), ["configFormat"]);
-  requireValue(M2_FORMAT_REGISTRATION.state === "registered-stage1" && M2_FORMAT_REGISTRATION.schemaMigration === 22
-    && v.configFormat === M2_FORMAT_REGISTRATION.configFormat, ["configFormat"], "format_unregistered");
-  const source = object(v.source, ["kind", "databaseInstanceId", "identityDigest"], ["source"]);
-  requireValue(source.kind === v.backend, ["source", "kind"]); string(source.databaseInstanceId, ["source"], /^[0-9a-f]{32}$/); string(source.identityDigest, ["source"], HASH);
-  evidence(v.physicalSourceRef, ["physicalSourceRef"]); evidence(v.snapshotReceiptRef, ["snapshotReceiptRef"]); artifact(v.catalog, ["catalog"]);
-  const encoding = object(v.textEncoding, ["backend", "name"], ["textEncoding"]);
-  requireValue(encoding.backend === v.backend, ["textEncoding"]); string(encoding.name, ["textEncoding"]);
-  const contracts = M2_HISTORY_TABLES.filter(t => v.phase !== "p0" || t.columnsP0.length > 0);
-  requireValue(Array.isArray(v.tables) && v.tables.length === contracts.length, ["tables"], "incomplete_universe");
-  for (let t = 0; t < contracts.length; t++) {
-    const contract = contracts[t]!, path = ["tables", contract.name];
-    const table = object(v.tables[t], ["name", "columnContract", "columnContractValueDigest", "columns", "count", "rows"], path);
-    requireValue(table.name === contract.name, path, "incomplete_universe");
-    artifact(table.columnContract, [...path, "columnContract"]); string(table.columnContractValueDigest, path, HASH);
-    const columns = v.phase === "p0" ? contract.columnsP0 : contract.columnsP1;
-    requireValue(Array.isArray(table.columns) && table.columns.length === columns.length
-      && columns.every((c, i) => (table.columns as unknown[])[i] === c.name), path, "column_contract_mismatch");
-    requireValue(Array.isArray(table.rows), [...path, "rows"]);
-    requireValue(table.count === String(table.rows.length), [...path, "count"]);
-    if (contract.name === "config_authority") requireValue(table.rows.length === (v.phase === "p1" ? 1 : 0), path);
-    for (let r = 0; r < table.rows.length; r++) {
-      const rowPath = [...path, "rows", String(r)], row = object(table.rows[r], ["rowid", "cells"], rowPath);
-      if (v.backend === "sqlite") int64(row.rowid, [...rowPath, "rowid"]); else requireValue(row.rowid === null, [...rowPath, "rowid"]);
-      requireValue(Array.isArray(row.cells) && row.cells.length === columns.length, rowPath, "column_contract_mismatch");
-      for (let c = 0; c < columns.length; c++) cell(row.cells[c], v.backend, columns[c]!, [...rowPath, "cells", String(c)]);
-      if (v.backend === "sqlite" && contract.sqliteRowidAlias !== null) {
-        const alias = row.cells[columns.findIndex(c => c.name === contract.sqliteRowidAlias)] as RawCell;
-        requireValue(alias[0] === "integer" && alias[1] === row.rowid, [...rowPath, "rowid"]);
-      }
-    }
-  }
-  requireValue(Array.isArray(v.sequences) && v.sequences.length === (v.backend === "sqlite" ? 0 : 1), ["sequences"], "incomplete_universe");
-  if (v.backend === "postgres") {
-    const s = object(v.sequences[0], ["contract", "name", "relationIdentity", "lastValue", "isCalled"], ["sequences"]);
-    requireValue(s.contract === "m2-pc-pg-sequence-observation/r1" && s.name === "schema_migrations_version_seq", ["sequences"], "unsupported_shape");
-    artifact(s.relationIdentity, ["sequences", "relationIdentity"]); int64(s.lastValue, ["sequences", "lastValue"]);
-    requireValue(typeof s.isCalled === "boolean", ["sequences", "isCalled"]);
-  }
-  return v as unknown as HistoryObservationInput;
 }
 const hash = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
 const frame = (row: RawRow) => canonical([row.rowid, row.cells]);

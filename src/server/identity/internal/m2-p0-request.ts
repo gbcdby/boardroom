@@ -1,7 +1,6 @@
 import { M2_HISTORY_TABLES } from "../m2-history-contracts.ts";
-import { parseM2HistoryObservation } from "../m2-history-values.ts";
-import { isUnknownHistoryFailure } from "./m2-history-failure-identity.ts";
-import { encodeHistoryCarrierValue, reserveHistoryObservationConsumer } from "./m2-history-carrier.ts";
+import { validateHistoryObservationValue, historyValueFailure } from "./m2-history-observation-core.ts";
+import { encodeHistoryCarrierValue } from "./m2-history-carrier.ts";
 import type { HistoryCarrierAccounting } from "./m2-history-carrier.ts";
 import { bindP0State, catchP0, chargeState, fixedError, makeP0Site, newP0State, p0State, P0_LIMITS, throwP0 } from "./m2-p0-budget.ts";
 import type { P0State } from "./m2-p0-budget.ts";
@@ -121,6 +120,29 @@ export function canonicalP0(request: P0Request, value: unknown, site?: P0Site): 
   const state = p0State(request), count = countAndCheck(state, value, site);
   return encodeHistoryCarrierValue(value, accounting(state, count, site));
 }
+// The scanner already owns a frozen, well-formed exact-integer tree. Reserve only
+// the shared typed grammar, not a second parse, carrier encoding or unused table digests.
+// Retain the prior consumer's bound of four string reads and 12 operations/node.
+// The UTF-8 size scan is separately prepaid (at most three bytes per UTF-16 unit).
+function reserveOwnedObservationShape(state: P0State, value: unknown, site: P0Site): void {
+  let nodes = 0, stringBytes = 0;
+  const string = (text: string): void => {
+    chargeState(state, { bytes: text.length * 3 }, site);
+    stringBytes += Buffer.byteLength(text, "utf8");
+  };
+  const visit = (node: unknown): void => {
+    chargeState(state, { work: 1 }, site); nodes++;
+    if (typeof node === "string") string(node);
+    else if (Array.isArray(node)) node.forEach(visit);
+    else if (node !== null && typeof node === "object") for (const key of Object.keys(node)) {
+      chargeState(state, { work: 1 }, site); nodes++; string(key); visit((node as Record<string, unknown>)[key]);
+    }
+  };
+  visit(value);
+  // Fixed punctuation/short tags and repeated phase/contract checks are bounded
+  // by four bytes/node plus the original finite 72-table overhead.
+  chargeState(state, { work: nodes * 12 + 72 * 72, bytes: stringBytes * 4 + nodes * 4 + 72 * 72 }, site);
+}
 function ownerSite(state: P0State, observation: Record<string, unknown>, path: readonly string[]): P0Site {
   const location: P0Location = { inputPart: "observation", artifactOrdinal: null, table: null,
     rowOrdinal: null, columnOrdinal: null, pathId: "observation.root" };
@@ -169,16 +191,16 @@ export function createP0Request(input: unknown): P0Result<P0Request> {
       ref(state, (sequence as Record<string, unknown>).relationIdentity);
     }
     rawDeletion(state, envelope.proposedDeletion, observation.backend);
-    const site = ownerSite(state, observation, []), count = countAndCheck(state, observation, site);
-    const meter = accounting(state, count, site), carrier = encodeHistoryCarrierValue(observation, meter);
-    reserveHistoryObservationConsumer(observation, Buffer.byteLength(carrier), meter);
-    const result = parseM2HistoryObservation(carrier);
-    if (isUnknownHistoryFailure(result)) return Object.freeze({ ok: false, error: fixedError() });
-    if (!result.ok) {
-      const code = result.error.code === "budget_exceeded" ? "resource_limit"
-        : result.error.code === "incomplete_universe" || result.error.code === "column_contract_mismatch" ? "source_contract_mismatch"
-        : result.error.code === "row_mismatch" ? "semantic_invariant_failed" : result.error.code;
-      throwP0(state, { code, rule: "PC1B-RAW01", site: ownerSite(state, observation, result.error.path) });
+    const site = ownerSite(state, observation, []);
+    reserveOwnedObservationShape(state, observation, site);
+    try { validateHistoryObservationValue(observation); }
+    catch (error) {
+      const known = historyValueFailure(error);
+      if (!known) throw error;
+      const code = known.code === "budget_exceeded" ? "resource_limit"
+        : known.code === "incomplete_universe" || known.code === "column_contract_mismatch" ? "source_contract_mismatch"
+        : known.code === "row_mismatch" ? "semantic_invariant_failed" : known.code;
+      throwP0(state, { code, rule: "PC1B-RAW01", site: ownerSite(state, observation, known.path) });
     }
     const value = parsed as P0Input;
     const handles: P0Row[] = [];
