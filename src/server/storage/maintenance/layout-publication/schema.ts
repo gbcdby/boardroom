@@ -3,14 +3,14 @@ import { z } from "zod";
 import { hash, id, ref as originalRef, source } from "../parse-primitives.ts";
 
 // Private encodings of the accepted R3 E1 payloads. These are not format registrations.
-export const ref = originalRef.refine(value => !value.ref.includes("\0"));
+const decimal = z.string().regex(/^(0|[1-9][0-9]*)$/).max(20);
+export const ref = originalRef.extend({ bytes: decimal }).refine(value => !value.ref.includes("\0"));
 const scalarString = (min: number, max: number) => z.string().refine(value => {
   const length = [...value].length;
   return length >= min && length <= max;
 });
 export const path = z.string().min(1).max(4096).refine(value => value.startsWith("/")
   && !value.startsWith("//") && !value.includes("\0") && posix.normalize(value) === value);
-const decimal = z.string().regex(/^(0|[1-9][0-9]*)$/);
 const uint64 = decimal.max(20).refine(value => value.length <= 20 && /^(0|[1-9][0-9]*)$/.test(value)
   && BigInt(value) <= 18_446_744_073_709_551_615n);
 const inode = uint64.refine(value => value !== "0");

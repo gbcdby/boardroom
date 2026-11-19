@@ -373,6 +373,40 @@ test("E1-AC08: every local typed edge, source, root role and binding relation is
   }), "semantic_unsupported", "E1_INPUT");
 });
 
+// R-E1-REQ-001: R3 Decimal is a canonical decimal string of at most 20 digits,
+// including refs whose external objects remain unproven by this finite projection.
+const decimalRefPositions: [string, (values: Fixture) => Fixture][] = [
+  ["control.profile", values => values.rootBindings.control.profile],
+  ["roots.sourceProfile", values => values.rootBindings.roots[0].sourceProfile],
+  ["parents.sourceProfile", values => values.rootBindings.parents[0].sourceProfile],
+  ["window.predecessor", values => values.rootBindings.binding.window.predecessor],
+];
+for (const [name, select] of decimalRefPositions) for (const length of [20, 21, 64]) {
+  test(`E1-AC02/08 R-E1-REQ-001: ${name}.bytes at ${length} digits`, () => {
+    const input = mutate(values => { select(values).bytes = "1".repeat(length); });
+    if (length === 20) success(input);
+    else rejected(input, "invalid_value", "E1_BINDING");
+  });
+}
+for (const field of ["systemIdentifier", "databaseOid", "schemaOid"]) for (const length of [20, 21]) {
+  test(`E1-AC06 R-E1-REQ-001: PostgreSQL ${field} at ${length} digits`, () => {
+    const input = mutate((values, input) => {
+      values.plan.sourceIdentity[field] = "1".repeat(length);
+      const source = { ...values.plan.source, identityDigest: digestJson(values.plan.sourceIdentity) };
+      // Preserve the full typed graph so only the Decimal boundary can reject it.
+      for (const slot of ["plan", "seed", "original", "database", "rendererInputs"]) values[slot].source = source;
+      values.intent.origin.source = values.rootBindings.binding.source = values.rootBindings.binding.targetSource = source;
+      input.targetSource = input.originHistory.source = source;
+      input.originHistory.completion.sourceIdentityDigest = source.identityDigest;
+    }, "postgres-retain-database-present");
+    if (length === 20) {
+      const output = success(input);
+      assert.equal(output.source.identityDigest, digestJson(unpack(input).plan.sourceIdentity));
+      assert.deepEqual(output.targetSource, output.source);
+    } else rejected(input, "invalid_value", "E1_BINDING");
+  });
+}
+
 test("E1-AC06/09/10/11: consumers reparse all files, and PG namespaces stay explicit with activation unproven", () => {
   for (const fixture of fixtures.vectors) {
     const { input } = vector(fixture.name), result = success(input), values = unpack(input);
