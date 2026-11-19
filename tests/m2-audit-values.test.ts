@@ -337,6 +337,63 @@ test("error ordinals retain the original row index and one-based fixed catalog c
   assert.equal(id.rule, "PC1B-RAW01");
 });
 
+test("C2 R2 preserves empty historical TEXT audit IDs accepted by the original consumers", async () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec(decisionsMigration.up.match(/CREATE TABLE audit_log_decision_rebuild \([\s\S]*?\n\);/)![0].replace("audit_log_decision_rebuild", "audit_log"));
+    const ctx: RepoCtx = { query: async <T>(sql: string, params: readonly unknown[] = []) => db.prepare(sql).all(...params) as T[],
+      one: async <T>(sql: string, params: readonly unknown[] = []) => db.prepare(sql).get(...params) as T | undefined,
+      exec: async (sql, params = []) => db.prepare(sql).run(...params).changes, withTransaction: async fn => fn() };
+    const repo = createAuditRepository(ctx);
+    const returned = await appendAuditEntry(repo, { scope: "user", projectId: null, actor: { kind: "human", name: "historical actor" },
+      action: "configuration.takeover", targetKind: "agent", targetId: "historical-agent", targetName: "original name", changed: ["old"] },
+    { id: "", createdAt: "2026-11-19T00:00:00Z" });
+    const stored = await repo.getUser("");
+    assert.equal(returned.id, ""); assert.ok(stored); assert.equal(stored.id, ""); assert.equal(auditView(stored).id, "");
+    assert.equal((db.prepare("SELECT typeof(id) AS t FROM audit_log").get() as { t: string }).t, "text");
+    const input = fixture(), record = db.prepare("SELECT rowid AS original_rowid,* FROM audit_log").safeIntegers(true).get() as Record<string, string | bigint | null>;
+    input.previousAudit.table.rows = [{ rowid: String(record.original_rowid), cells: input.previousAudit.table.columns.map(c => toRaw(record[c] as string | null)) }];
+    input.previousAudit.table.count = "1";
+    const original = JSON.stringify(input);
+    assert.deepEqual(success(input).additions, expectedProjection);
+    assert.equal(JSON.stringify(input), original);
+  } finally { db.close(); }
+  for (const backend of ["sqlite", "postgres"] as const) {
+    const input = fixture(backend), empty: RawCell = backend === "sqlite" ? ["text", ""] : ["pg-binary", "25", ""];
+    input.previousAudit.table.rows[0]!.cells[0] = empty;
+    assert.equal(success(input).additions.count, "6");
+    input.previousAudit.table.rows[1]!.cells[0] = empty;
+    failed(project(input), "semantic_invariant_failed");
+  }
+  for (const cell of [["null"], ["blob", ""], ["integer", "0"]] as RawCell[]) {
+    const input = fixture(); input.previousAudit.table.rows[0]!.cells[0] = cell;
+    failed(project(input), "unsupported_shape");
+  }
+  const newEmpty = fixture(); newEmpty.seed.agents[0]!.auditId = ""; failed(project(newEmpty), "invalid_value");
+  const occupied = fixture(); occupied.seed.agents[0]!.auditId = fromRaw(occupied.previousAudit.table.rows[0]!.cells[0]!)!;
+  failed(project(occupied), "semantic_invariant_failed");
+});
+
+test("C2 R2 counts every object key token in the shared node budget without rejecting duplicate display keys", () => {
+  const object = (pairs: number) => "{" + Array(pairs).fill('"a":0').join(",") + "}";
+  for (const backend of ["sqlite", "postgres"] as const) {
+    const below = object(124980), result = observeLegacyAuditChangedSyntax(syntaxInput(below, backend));
+    assert.equal(result.ok, true); if (result.ok) assert.equal(result.value.syntax, "json");
+    assert.deepEqual(parseJsonColumn(below), { a: 0 });
+    const over = object(125000); assert.equal(Buffer.byteLength(over), 750001);
+    failed(observeLegacyAuditChangedSyntax(syntaxInput(over, backend)), "resource_limit");
+    // Outer tokens are 13 (SQLite) / 14 (PG). Each inner pair is two tokens plus its root container.
+    const maximumPairs = backend === "sqlite" ? 124993 : 124992;
+    assert.equal(observeLegacyAuditChangedSyntax(syntaxInput(object(maximumPairs), backend)).ok, true);
+    failed(observeLegacyAuditChangedSyntax(syntaxInput(object(maximumPairs + 1), backend)), "resource_limit");
+  }
+  const small = '{"a":1,"\\u0061":2}';
+  assert.equal(observeLegacyAuditChangedSyntax(syntaxInput(small)).ok, true);
+  assert.deepEqual(parseJsonColumn(small), { a: 2 });
+  assert.equal(observeLegacyAuditChangedSyntax(syntaxInput("[".repeat(60) + '{"a":0}' + "]".repeat(60))).ok, true);
+  failed(observeLegacyAuditChangedSyntax(syntaxInput("[".repeat(61) + '{"a":0}' + "]".repeat(61))), "resource_limit");
+});
+
 test("C2 projects the frozen nonempty six-Agent input to all seventeen exact columns", () => {
   const serialized = JSON.stringify(projectionInput), before = JSON.stringify(projectionInput);
   const result = projectM2TakeoverAuditAdditions(serialized);

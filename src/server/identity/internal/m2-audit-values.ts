@@ -187,7 +187,8 @@ function oldAudit(value: unknown, identity: SourceRef, r: AuditRequest): { ids: 
     const cells = array(row.cells, r); r.require(cells.length === AUDIT_COLUMNS.length, "source_contract_mismatch");
     cells.forEach((cell, c) => { r.at("audit_log", i, c); rawCell(cell, identity.kind, false, r); });
     r.at("audit_log", i, 0);
-    const id = textCell(cells[0] as unknown[], identity.kind, false, r); r.require(id.length > 0);
+    // Historical audit TEXT IDs include the empty string; new seed IDs keep their separate nonempty domain.
+    const id = textCell(cells[0] as unknown[], identity.kind, false, r);
     r.at("audit_log", i, 0, "PC1B-KEY01");
     r.units(1); r.text(id.length * 3); r.require(!ids.has(id), "semantic_invariant_failed"); ids.add(id);
   });

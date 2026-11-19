@@ -189,6 +189,9 @@ function scan(text: string, strict: boolean, rootDepth: number, r: AuditRequest)
       ws(); if (text[at] === end) { at++; return object ? "object" : "array"; }
       for (;;) {
         if (object) {
+          // A key is a JSON string token at the same child depth as its value.
+          // Charge before scanning it, including duplicate keys in historical display JSON.
+          r.allocateNodes(1, depth + 1);
           const key = string();
           if (keys) {
             r.units(1); r.text(key!.length * 3);
