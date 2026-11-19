@@ -33,8 +33,8 @@ class Monitor extends EventEmitter {
   client() { return this as unknown as PgClient; }
 }
 
-function harness(monitor = new Monitor()) {
-  const diagnostics = new LoadDiagnostics(config => { monitor.config = config; return monitor.client(); });
+function harness(monitor = new Monitor(), target: 'first-project-lock' | 'mutation-commit' = 'first-project-lock') {
+  const diagnostics = new LoadDiagnostics(config => { monitor.config = config; return monitor.client(); }, target);
   const client = Object.assign(new EventEmitter(), { processID: 42 }) as unknown as PgClient;
   return { diagnostics, monitor, client };
 }
@@ -42,7 +42,7 @@ function harness(monitor = new Monitor()) {
 // The public snapshot cannot prove that an evicted object is no longer strongly
 // held. Inspect only the private test helper's actual slots for this memory gate.
 type RingView<T> = { events: Array<{ value: T; bytes: number } | undefined>; head: number; count: number;
-  bytes: number; dropped: number; maxEvents: number; maxBytes: number; push(value: T): void; values(): T[] };
+  bytes: number; dropped: number; maxEvents: number; maxBytes: number; push(value: T): void; replace(previous: T, value: T): void; values(): T[] };
 function smallRing<T>(maxEvents: number, maxBytes: number): RingView<T> {
   const trace = new LoadDiagnostics() as unknown as { events: { constructor: new (count: number, bytes: number) => RingView<T> } };
   return new trace.events.constructor(maxEvents, maxBytes);
@@ -98,6 +98,18 @@ test('PGLOAD-OBS-02 R2: count eviction preserves only the newest objects over re
   });
 });
 
+test('CI273-PG-02: upgrading a pending record releases its old slot and keeps the shared byte/count caps', () => {
+  const ring = smallRing<string>(3, 17);
+  for (const value of ['a', 'b', 'p']) ring.push(value);
+  const sample = 'x'.repeat(12); // 14 JSON bytes; only one 3-byte record can remain alongside it.
+  ring.replace('a', sample);
+  assertStored(ring, ['p', sample], 1);
+  ring.replace('p', 'q');
+  assertStored(ring, [sample, 'q'], 1);
+  ring.replace('already-evicted', 'z');
+  assertStored(ring, ['q', 'z'], 2);
+});
+
 test('PGLOAD-OBS-02: only the current in-flight mutation gets 50/100/150 ms opportunities', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   let now = 0;
@@ -119,6 +131,7 @@ test('PGLOAD-OBS-02: only the current in-flight mutation gets 50/100/150 ms oppo
   await advance(500);
   await diagnostics.close();
   const observed = diagnostics.snapshot().server!;
+  assert.equal(observed.target, 'first-project-lock');
   assert.equal(observed.snapshotCount, 3);
   assert.deepEqual(observed.samples.map(value => value.opportunityMs), [50, 100, 150]);
   assert.deepEqual(observed.samples.map(value => value.sentAtMs), [50, 100, 150]);
@@ -126,6 +139,136 @@ test('PGLOAD-OBS-02: only the current in-flight mutation gets 50/100/150 ms oppo
   assert.equal(observed.cleanup.transportEnded, true);
   assert.equal(observed.cleanup.pendingSettled, true);
   assert.ok(!JSON.stringify(diagnostics.snapshot()).includes('canary'));
+});
+
+test('CI273-PG-01: commit mode reserves the three opportunities for COMMIT after a fast first lock', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const advance = async (ms: number) => { now += ms; t.mock.timers.tick(ms); await tick(); };
+  const { diagnostics, monitor, client } = harness(new Monitor(), 'mutation-commit');
+  await diagnostics.prepareMonitor('private-canary');
+  const locked = deferred<unknown>(), committed = deferred<unknown>();
+  const query = diagnostics.wrapQuery(((sql: string) => sql === lock ? locked.promise : committed.promise) as typeof PgClient.prototype.query);
+  const operation = diagnostics.run('mutation', 10000, 3, async () => {
+    await Reflect.apply(query, client, [lock]);
+    return Reflect.apply(query, client, ['COMMIT']);
+  });
+  await advance(20); locked.resolve({}); await tick();
+  for (let index = 0; index < 3; index++) await advance(50);
+  committed.resolve({ command: 'COMMIT' }); await operation; await tick(); await diagnostics.close();
+  const server = diagnostics.snapshot().server;
+  assert.equal(server.snapshotCount, 3, 'the first lock must not consume COMMIT sampling');
+  assert.equal(server.scheduledOpportunities, 3);
+  assert.equal(server.target, 'mutation-commit');
+  assert.deepEqual(server.samples.map(value => value.sentAtMs), [70, 120, 170]);
+  assert.ok(server.samples.every(value => value.category === 'commit' && value.origin.step === 3));
+  assert.deepEqual(server.opportunities.map(value => value.dueAtMs), [70, 120, 170]);
+  assert.deepEqual(server.opportunities.map(value => value.firedAtMs), [70, 120, 170]);
+  assert.ok(server.opportunities.every(value => value.disposition === 'sample-attempted'
+    && value.queryId === server.samples[0]!.queryId && value.origin.branch === 'mutation'));
+  assert.equal(monitor.calls.length, 5);
+});
+
+test('CI273-PG-01: cancellation distinguishes early settlement from overdue timers without sampling afterwards', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const { diagnostics, monitor, client } = harness(new Monitor(), 'mutation-commit');
+  await diagnostics.prepareMonitor('private-canary');
+  for (const [step, settledAt] of [[0, 20], [1, 220]] as const) {
+    const committed = deferred<unknown>();
+    const query = diagnostics.wrapQuery((() => committed.promise) as typeof PgClient.prototype.query);
+    diagnostics.run('mutation', 10000, step, () => Reflect.apply(query, client, ['COMMIT']));
+    // Advance only the monotonic clock: callbacks have not been scheduled yet.
+    now = settledAt; committed.resolve({}); await tick();
+  }
+  const opportunities = diagnostics.snapshot().server.opportunities;
+  assert.equal(opportunities.length, 6);
+  assert.deepEqual(opportunities.map(value => value.dueAtMs), [50, 100, 150, 70, 120, 170]);
+  assert.deepEqual(opportunities.map(value => value.cancelledAtMs), [20, 20, 20, 220, 220, 220]);
+  assert.deepEqual(opportunities.map(value => value.latenessMs), [0, 0, 0, 150, 100, 50]);
+  assert.ok(opportunities.every(value => value.firedAtMs === null && value.disposition === 'cancelled'
+    && value.cancellationReason === 'query-settled'));
+  t.mock.timers.tick(500); await tick(); await diagnostics.close();
+  assert.equal(monitor.calls.length, 2, 'cancelled opportunities never catch up with SQL');
+  assert.equal(diagnostics.snapshot().server.snapshotCount, 0);
+});
+
+test('CI273-PG-01: a late callback records its due time and real firing independently of sample return', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const { diagnostics, monitor, client } = harness(new Monitor(), 'mutation-commit');
+  await diagnostics.prepareMonitor('private-canary');
+  const committed = deferred<unknown>(), sampled = deferred<{ rows: Record<string, unknown>[] }>();
+  monitor.samples = () => sampled.promise;
+  const query = diagnostics.wrapQuery((() => committed.promise) as typeof PgClient.prototype.query);
+  diagnostics.run('mutation', 10000, 3, () => Reflect.apply(query, client, ['COMMIT']));
+  now = 80; t.mock.timers.tick(50); await tick();
+  now = 90; sampled.resolve({ rows: [row(42, { wait_event_type: 'IO', wait_event: 'WALSync', blocking_pids: [] })] }); await tick();
+  now = 91; committed.resolve({}); await tick(); await diagnostics.close();
+  const server = diagnostics.snapshot().server;
+  const opportunity = server.opportunities.find(value => value.disposition === 'sample-attempted')!;
+  assert.equal(opportunity.dueAtMs, 50); assert.equal(opportunity.firedAtMs, 80);
+  assert.equal(opportunity.cancelledAtMs, null); assert.equal(opportunity.latenessMs, 30);
+  assert.equal(server.samples[0]?.returnedAtMs, 90);
+  assert.equal(server.samples[0]?.timerLatenessMs, 30);
+  assert.equal(server.samples[0]?.rows[0]?.waitEvent, 'WALSync');
+  assert.equal(server.opportunities.length, 3);
+});
+
+test('CI273-PG-01: a fired opportunity is retained while its observer response is still pending', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const { diagnostics, monitor, client } = harness(new Monitor(), 'mutation-commit');
+  await diagnostics.prepareMonitor('private-canary');
+  const committed = deferred<unknown>(), sampled = deferred<{ rows: Record<string, unknown>[] }>();
+  monitor.samples = () => sampled.promise;
+  const query = diagnostics.wrapQuery((() => committed.promise) as typeof PgClient.prototype.query);
+  diagnostics.run('mutation', 10000, 3, () => Reflect.apply(query, client, ['COMMIT']));
+  now = 50; t.mock.timers.tick(50); await tick();
+  const pending = diagnostics.snapshot().server;
+  assert.equal(pending.queryPending, true); assert.equal(pending.samples.length, 0);
+  assert.equal(pending.opportunities.length, 1, 'a missing observer response must not erase the actual firing');
+  assert.equal(pending.opportunities[0]?.dueAtMs, 50); assert.equal(pending.opportunities[0]?.firedAtMs, 50);
+  sampled.resolve({ rows: [row(42)] }); await tick();
+  const completed = diagnostics.snapshot().server;
+  assert.equal(completed.opportunities.length, 1, 'the returned sample replaces the same opportunity record');
+  assert.equal(completed.samples.length, 1);
+  committed.resolve({}); await tick(); await diagnostics.close();
+});
+
+test('CI273-PG-02: commit mode ignores other branches and cannot exceed the original cumulative opportunity budget', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { diagnostics, monitor, client } = harness(new Monitor(), 'mutation-commit');
+  await diagnostics.prepareMonitor('private-canary');
+  const immediate = diagnostics.wrapQuery((() => Promise.resolve({})) as unknown as typeof PgClient.prototype.query);
+  for (const branch of ['wait', 'heartbeat', 'traffic'] as const) {
+    await diagnostics.run(branch, 10000, 0, () => Reflect.apply(immediate, client, ['COMMIT']));
+  }
+  assert.equal(diagnostics.snapshot().server.scheduledOpportunities, 0);
+  for (let step = 0; step < 13; step++) {
+    const committed = deferred<unknown>();
+    const query = diagnostics.wrapQuery(((sql: string) => sql === lock ? Promise.resolve({}) : committed.promise) as typeof PgClient.prototype.query);
+    const operation = diagnostics.run('mutation', 10000, step, async () => {
+      await Reflect.apply(query, client, [lock]); return Reflect.apply(query, client, ['COMMIT']);
+    });
+    await tick();
+    for (let sample = 0; sample < 3; sample++) { t.mock.timers.tick(50); await tick(); }
+    committed.resolve({}); await operation; await tick();
+  }
+  await diagnostics.close();
+  const server = diagnostics.snapshot().server;
+  assert.equal(server.scheduledOpportunities, 36); assert.equal(server.snapshotCount, 36);
+  assert.equal(server.limitSkips, 1); assert.equal(monitor.calls.length, 38);
+  assert.equal(server.pendingTimers, 0); assert.equal(server.queryPending, false);
+  assert.ok(server.opportunities.every(value => value.category === 'commit' && value.origin.branch === 'mutation'));
+  assert.ok(server.retainedOpportunityCount <= 36 && server.retainedBytes <= 128 * 1024);
+  assert.deepEqual(server.limits, { opportunityMs: [50, 100, 150], snapshots: 36, rows: 180,
+    pids: 5, blockersPerRow: 8, snapshotBytes: 8192, retainedBytes: 128 * 1024,
+    connectMs: 250, statementMs: 50, setupQueries: 2, cleanupQueries: 0, cleanupMs: 250 });
 });
 
 test('PGLOAD-OBS-05: wrapper preserves callback/config/custom/Promise/synchronous throw identity', async () => {
@@ -210,8 +353,14 @@ test('PGLOAD-OBS-02/04: 36 snapshots, 180 rows, 8 blockers, byte caps and canary
   assert.equal(server.scheduledOpportunities, 36); assert.equal(server.limitSkips, 1);
   assert.equal(monitor.calls.length, 38);
   assert.ok(server.retainedBytes <= 128 * 1024); assert.ok(server.dropCount > 0);
-  const ring = (diagnostics as unknown as { server: { samples: RingView<(typeof server.samples)[number]> } }).server.samples;
-  const retained = assertStored(ring, server.samples, server.dropCount);
+  type RetainedRecord = { sample?: (typeof server.samples)[number] };
+  const ring = (diagnostics as unknown as { server: { records: RingView<RetainedRecord> } }).server.records;
+  const records = ring.values();
+  const retained = assertStored(ring, records, server.dropCount);
+  assert.equal(retained.actualBytes, server.retainedBytes, 'opportunities and samples use one byte budget');
+  assert.deepEqual(records.flatMap(record => record.sample ? [record.sample] : []), server.samples);
+  assert.equal(records.length, server.opportunities.length);
+  assert.ok(records.every(record => Buffer.byteLength(JSON.stringify(record)) <= 8192));
   t.diagnostic(JSON.stringify({ snapshots: server.snapshotCount, rows: server.rowCount, cap: server.limits.retainedBytes,
     reportedBytes: server.retainedBytes, publicSamples: server.samples.length, ...retained }));
   for (const sample of server.samples) {

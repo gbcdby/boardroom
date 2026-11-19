@@ -129,7 +129,10 @@ for (const engine of ['sqlite', 'postgres'] as const) {
   const unmentioned = profile === 'unmentioned-history';
   test(`${engine} ${profile} S5-AUDIT-16 固定 V1 与 10000 历史负载，每次补偿及真实 MCP 投递独立验限`,
     { skip: engine === 'postgres' ? pgUnavailable : false, timeout: 120000 }, async t => {
-      const diagnostics = engine === 'postgres' ? new LoadDiagnostics() : undefined;
+      // Preserve the first-lock profile while observing the acked-history
+      // COMMIT window with the same single-observer, per-report budget.
+      const diagnostics = engine === 'postgres'
+        ? new LoadDiagnostics(undefined, unmentioned ? 'first-project-lock' : 'mutation-commit') : undefined;
       // after runs even if the body/report fails, preserving the original body
       // error when restoration also fails. There is only one hook per test.
       if (diagnostics) {
