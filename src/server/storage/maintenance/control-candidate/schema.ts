@@ -4,7 +4,7 @@ import { counter, hash, id, ref, source } from "../parse-primitives.ts";
 import { sourceClientRawRowSchema, sourceClientsEncodingSchema } from "../source-clients.ts";
 import type { SourceRef } from "../types.ts";
 import { compareNumber, compareText, equal, ordered, requireCandidate } from "./common.ts";
-import { preparseP0FInvariantJson, reserveP0FNativeNodes, type P0FArtifactSyntaxFrame } from '../../../identity/internal/m2-p0-artifacts-frame.ts';
+import { preparseP0FInvariantJson, reserveP0FNativeNodes,reserveP0FNativeSplit, type P0FArtifactSyntaxFrame } from '../../../identity/internal/m2-p0-artifacts-frame.ts';
 
 const text = z.string().min(1).max(4096).refine(value => !value.includes("\0"));
 export const uint = z.string().regex(/^(0|[1-9][0-9]*)$/);
@@ -127,6 +127,7 @@ export type MaintenanceInvariant = z.infer<typeof invariantSchema>;
 function resourceKeyRange(key: string, platform: "linux" | "darwin"): void {
   if (key.startsWith("map:")) {
     reserveP0FNativeNodes(1 + (platform === 'linux' ? 5 : 3));
+    reserveP0FNativeSplit(key,':');
     const parts = key.split(":"), first = BigInt(parts[1]!), second = BigInt(parts[2]!);
     // Preserve each native key: Darwin emits begin/size; Linux emits start/end.
     if (platform === "darwin") requireCandidate(second > 0n && first + second <= (1n << 64n) - 1n);

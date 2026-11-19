@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import { createP0Request, chargeP0, p0Usage, withP0Guard } from '../src/server/identity/internal/m2-p0.ts';
 import { fState } from '../src/server/identity/internal/m2-p0-artifacts-common.ts';
 import { beginP0FArtifactPass, endP0FArtifactPass, p0FCodecSyntaxFrame, withP0FNativeConsumer,
-  encodeP0FNativeShell,type P0FArtifactSyntaxFrame } from '../src/server/identity/internal/m2-p0-artifacts-frame.ts';
+  encodeP0FNativeShell,bindP0FJournalContext,assertP0FJournalContext,releaseP0FJournalContext,reserveP0FJournalMetadata,type P0FArtifactSyntaxFrame } from '../src/server/identity/internal/m2-p0-artifacts-frame.ts';
+import {runP0Journal,createP0FJournalContext} from '../src/server/identity/internal/m2-p0-artifacts-math.ts';
+import {JOURNAL_VALUE_MATH} from '../src/server/storage/maintenance/journal-values.ts';
+import type {JournalValueContext} from '../src/server/storage/maintenance/journal-values.ts';
 import { canonicalJson,digestJson } from '../src/server/storage/maintenance/canonical.ts';
 import { digestRowMultiset } from '../src/server/storage/maintenance/manifests.ts';
 import type { Json } from '../src/server/storage/maintenance/types.ts';
@@ -13,7 +16,7 @@ import { p0Fixture } from './helpers/m2-p0-a-fixture.ts';
 
 function owned() {
   const made = createP0Request(JSON.stringify(p0Fixture())); assert(made.ok);
-  const request = made.value, f = fState(request), plan = controlVector().plan;
+  const request = made.value, f = fState(request), plan = parsePlan(controlVector().plan);
   f.freeze(plan); beginP0FArtifactPass(f, request.original);
   return {request, f, plan, frame: p0FCodecSyntaxFrame(f, plan)};
 }
@@ -149,4 +152,86 @@ test('F encoding size data: a cached primitive needs no new tuple but an unseen 
     const rejected=withP0Guard(a.request,()=>a.f.size('unseen scalar'));
     assert(!rejected.ok);assert.equal(rejected.error.code,'resource_limit');
   }finally{endP0FArtifactPass(a.f);}
+});
+
+test('F encoding scalar data: null and booleans use fixed tokens while numeric stringify remains prepaid',()=>{
+  const a=owned(),stringify=JSON.stringify;let calls=0;
+  try{
+    chargeP0(a.request,{bytes:67_108_864-p0Usage(a.request).bytes});
+    JSON.stringify=function(value:unknown,...rest:unknown[]){calls++;return Reflect.apply(stringify,JSON,[value,...rest]);} as typeof JSON.stringify;
+    assert.equal(a.f.canonical(null),'null');assert.equal(a.f.canonical(true),'true');assert.equal(a.f.canonical(false),'false');assert.equal(calls,0);
+    const rejected=withP0Guard(a.request,()=>a.f.canonical(1.25));
+    assert(!rejected.ok);assert.equal(rejected.error.code,'resource_limit');assert.equal(calls,0);
+  }finally{JSON.stringify=stringify;endP0FArtifactPass(a.f);}
+});
+
+test('F native fallback metadata: the four-key native object prepays all 21 explicit units',()=>{
+  for(const left of [0,20,21]){
+    const a=owned(),value={d:4,c:3,b:2,a:1};const keys=Object.keys;let produced=0;
+    try{
+      a.f.freeze(value);a.f.reserveCanonical(value); // cache only the cost data, never an encoding or semantic result
+      chargeP0(a.request,{tuples:250_000-p0Usage(a.request).tuples-left});
+      Object.keys=function(target:object){if(target===value)produced++;return keys(target);};
+      const result=withP0Guard(a.request,()=>withP0FNativeConsumer(a.frame,()=>canonicalJson(value)));
+      if(left<21){assert(!result.ok);assert.equal(result.error.code,'resource_limit');assert.equal(produced,0);}
+      else{assert(result.ok);assert.equal(result.value,'{"a":1,"b":2,"c":3,"d":4}');assert.equal(produced,1);assert.equal(p0Usage(a.request).tuples,250_000);}
+    }finally{Object.keys=keys;endP0FArtifactPass(a.f);}
+  }
+});
+
+test('F native fallback sort preserves original UTF16 bytes without a native sort target',()=>{
+  const a=owned(),prefix='common-'.repeat(200);
+  const value=Object.fromEntries(['2','10','\ue000','\u{10000}','\ud800','\udc00',prefix+'z',prefix+'a','\0\t\n"\\'].map((key,i)=>[key,i]));
+  const expected=canonicalJson(value),sort=Array.prototype.sort;
+  try{
+    Array.prototype.sort=function(){throw new Error('unexpected native sort in F fallback');};
+    assert.equal(withP0FNativeConsumer(a.frame,()=>canonicalJson(value)),expected);
+  }finally{Array.prototype.sort=sort;endP0FArtifactPass(a.f);}
+});
+
+test('F journal context is exact-pass bound, nested-request isolated, revoked explicitly, and never ambient',()=>{
+  const a=owned(),b=owned(),root=controlVector().root;
+  const ordinary:JournalValueContext={root:root.path,identity:root,math:JOURNAL_VALUE_MATH};
+  const first=createP0FJournalContext(a.f,a.frame,root),second=createP0FJournalContext(b.f,b.frame,root);
+  try{
+    assert.throws(()=>createP0FJournalContext(a.f,b.frame,root));
+    assert.throws(()=>bindP0FJournalContext(b.frame,first));
+    assertP0FJournalContext(a.frame,first);assertP0FJournalContext(b.frame,second);
+    assert.throws(()=>assertP0FJournalContext(b.frame,first));
+    let beforeA=p0Usage(a.request),beforeB=p0Usage(b.request);
+    reserveP0FJournalMetadata(first,7);assert.equal(p0Usage(a.request).tuples-beforeA.tuples,7);assert.deepEqual(p0Usage(b.request),beforeB);
+    beforeA=p0Usage(a.request);reserveP0FJournalMetadata(second,5);assert.deepEqual(p0Usage(a.request),beforeA);assert.equal(p0Usage(b.request).tuples-beforeB.tuples,5);
+    const marker={};assert.throws(()=>{try{reserveP0FJournalMetadata(second,1);throw marker;}finally{releaseP0FJournalContext(second);}},e=>e===marker);
+    assert.throws(()=>reserveP0FJournalMetadata(second,1));assert.throws(()=>bindP0FJournalContext(b.frame,second));assertP0FJournalContext(a.frame,first);
+    beforeA=p0Usage(a.request);beforeB=p0Usage(b.request);
+    reserveP0FJournalMetadata(ordinary,1_000_000);parsePlan(a.plan);
+    assert.deepEqual(p0Usage(a.request),beforeA);assert.deepEqual(p0Usage(b.request),beforeB);
+    endP0FArtifactPass(a.f);assert.throws(()=>reserveP0FJournalMetadata(first,1));
+  }finally{releaseP0FJournalContext(first);releaseP0FJournalContext(second);endP0FArtifactPass(a.f);endP0FArtifactPass(b.f);}
+});
+
+test('F journal binding refuses zero and one-short before publishing either actual index entry',()=>{
+  for(const left of [0,1]){
+    const a=owned(),root=controlVector().root,context=Object.freeze({root:root.path,identity:root,math:JOURNAL_VALUE_MATH});
+    const set=WeakMap.prototype.set,add=WeakSet.prototype.add;let bindings=0;
+    try{
+      chargeP0(a.request,{tuples:250_000-p0Usage(a.request).tuples-left});
+      WeakMap.prototype.set=function(key:object,value:unknown){if(key===context)bindings++;return set.call(this,key,value);};
+      WeakSet.prototype.add=function(value:object){if(value===context)bindings++;return add.call(this,value);};
+      const result=withP0Guard(a.request,()=>bindP0FJournalContext(a.frame,context));
+      assert(!result.ok);assert.equal(result.error.code,'resource_limit');assert.equal(bindings,0);
+    }finally{WeakMap.prototype.set=set;WeakSet.prototype.add=add;endP0FArtifactPass(a.f);}
+  }
+});
+
+test('the closed journal driver revokes its real context on unknown throws without inspecting the error',()=>{
+  const a=owned(),root=controlVector().root,freeze=Object.freeze,select=a.f.select;let context:JournalValueContext|undefined,traps=0;
+  const unknown=new Proxy({}, {get(){traps++;throw null;},ownKeys(){traps++;throw null;},getPrototypeOf(){traps++;throw null;}});
+  try{
+    Object.freeze=function(value:unknown){if(value!==null&&typeof value==='object'&&Object.hasOwn(value,'math'))context=value as JournalValueContext;return freeze(value);} as typeof Object.freeze;
+    a.f.select=()=>{throw unknown;};
+    assert.throws(()=>runP0Journal(a.f,a.plan,root,{ref:'absent',sha256:'0'.repeat(64),bytes:'0'}),e=>e===unknown);
+    a.f.select=select;Object.freeze=freeze;assert(context);assert.throws(()=>reserveP0FJournalMetadata(context!,1));assert.equal(traps,0);
+    const after=p0Usage(a.request);parsePlan(a.plan);assert.deepEqual(p0Usage(a.request),after);
+  }finally{a.f.select=select;Object.freeze=freeze;endP0FArtifactPass(a.f);}
 });

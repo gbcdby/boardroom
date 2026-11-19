@@ -5,7 +5,7 @@ import { MaintenanceFailure, maintenanceFailureCode } from "./error.ts";
 import { counter, hash, id, ref, source, text } from "./parse-primitives.ts";
 import { sourceClientsRosterSchema } from "./source-clients.ts";
 import { checkFactsShape, controlProofSchema, controlProofSchemaFor } from "./control-candidate/schema.ts";
-import { assertP0FSyntaxScope, reserveP0FNativeClone, reserveP0FNativeNodes, reserveP0FNativeShallow, type P0FArtifactSyntaxFrame } from '../../identity/internal/m2-p0-artifacts-frame.ts';
+import { assertP0FSyntaxScope, reserveP0FNativeClone, reserveP0FNativeNodes, reserveP0FNativeShallow,reserveP0FNativeMetadata,reserveP0FNativeSplit, type P0FArtifactSyntaxFrame } from '../../identity/internal/m2-p0-artifacts-frame.ts';
 import type { ArtifactStore } from "./objects.ts";
 import type { ActualRestoreVerification, ArtifactRef, DatabaseManifests, DurabilityCapability, JournalRecord, JournalRecordV1, JournalRecordV2, MaintenanceCommand, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceFilesManifest, VerificationJournalRecord } from "./types.ts";
 
@@ -164,7 +164,8 @@ export function parseSourceFiles(value: unknown): SourceFilesManifest {
   // decoded objects, but allocate their own arrays/records before Map creation.
   reserveP0FNativeNodes(2 + manifest.roots.length * 6, manifest.roots.length + manifest.entries.length);
   requireSourceFiles(manifest.rootBindings.length === manifest.roots.length
-    && new Set(manifest.roots.map(item => item.label)).size === manifest.roots.length);
+    && (reserveP0FNativeMetadata(2+manifest.roots.length*2),new Set(manifest.roots.map(item => item.label))).size === manifest.roots.length);
+  reserveP0FNativeMetadata(2+manifest.roots.length*5); // Map/list shells, list/pair metadata and {root,binding}; Map bindings prepaid above
   const roots = new Map(manifest.roots.map((item, index) => {
     const binding = manifest.rootBindings[index]!;
     requireSourceFiles(binding.sourceRoot === item.label && canonicalSourcePath(item.path) && item.expected.path === item.path
@@ -173,10 +174,10 @@ export function parseSourceFiles(value: unknown): SourceFilesManifest {
       && path.posix.join(binding.anchorPath, ...item.expected.absentSegments) === item.path);
     return [item.label as string, { root: item, binding }] as const;
   }));
-  const entries = new Map<string, (typeof manifest.entries)[number]>();
+  reserveP0FNativeMetadata(1);const entries = new Map<string, (typeof manifest.entries)[number]>();
   for (const entry of manifest.entries) {
     const owned = roots.get(entry.sourceRoot), key = `${entry.sourceRoot}/${entry.sourceRelativePath}`;
-    requireSourceFiles(owned && !entries.has(key) && (entry.sourceRelativePath === "" || entry.sourceRelativePath.split("/").every(pathSegment)));
+    requireSourceFiles(owned && !entries.has(key) && (entry.sourceRelativePath === "" || (reserveP0FNativeSplit(entry.sourceRelativePath,'/'),entry.sourceRelativePath.split("/")).every(pathSegment)));
     entries.set(key, entry);
     if (entry.kind === "absent") requireSourceFiles(entry.sourceRelativePath === "");
     else requireSourceFiles(entry.identity.path === path.posix.join(owned.root.path, entry.sourceRelativePath)

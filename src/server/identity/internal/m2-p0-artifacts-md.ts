@@ -8,6 +8,11 @@ import {F_COLUMNS,F_SQLITE_CATALOG_DIGEST,F_MIGRATIONS} from './m2-p0-artifacts-
 import type {FixedColumn} from './m2-p0-artifacts-catalog.ts';
 import type {FState,FObject} from './m2-p0-artifacts-common.ts';
 
+const sqliteMetadataKeys=Object.freeze(['cid','name','type','notnull','dflt_value','pk','hidden']);
+const sqliteSchemaKeys=Object.freeze(['catalog','migrations']);
+const pgSchemaKeys=Object.freeze(['profile','serverMajor','scope','typeProfile','namespace','relations','columns','constraints','indexes','functions','triggers','internalTriggers','defaultPrivileges','environment','requiredRoles','migrationIdentitySequence','migrations']);
+const pgScopeKeys=Object.freeze(['kind','name','clusterRolesIncluded']);
+
 const floor=(a:bigint,b:bigint)=>{const q=a/b;return a%b<0n?q-1n:q;};
 /** Exact frozen MD02 PG16 UTC/ISO,YMD binary timestamp bridge, including BC/infinity. */
 export function pgTimestampValue(f:FState,us:bigint):string{
@@ -71,7 +76,7 @@ export function buildMdValue(f:FState,dialect:'sqlite'|'postgres',schema:Json,ta
   if(prior&&prior.dialect===dialect&&prior.schema===schema&&prior.controls===controlRows)return prior.result;
   // Shallow JSON wrappers/ordered and filtered arrays are new; their immutable
   // schema/table/control subtrees are retained rather than cloned.
-  f.charge(tables.length,0,tables.length,45);
+  f.charge(tables.length,0,tables.length+2,45); // the two filter shells; their total slots are at most tables.length
   const ordered=sortedByText(f,tables,t=>t.name),isControl=(t:{name:string})=>{f.charge(2,t.name.length*4);return t.name==='storage_maintenance'||t.name==='storage_source_clients';};
   f.freeze(ordered);
   const schemaManifestDigest=f.digest(schema);
@@ -130,7 +135,7 @@ export function checkPgColumnMetadata(f:FState,meta:FObject,owner:FObject,col:FO
   f.require(meta.collation===null?meta.collation_schema===null:typeof meta.collation==='string'&&typeof meta.collation_schema==='string');
 }
 function sqliteColumnMetadata(f:FState,meta:FObject,column:FixedColumn,ordinal:number):void{
-  f.object(meta,['cid','name','type','notnull','dflt_value','pk','hidden']);f.charge(7,64);
+  f.object(meta,sqliteMetadataKeys);f.charge(7,64);
   const same=(value:unknown,expected:string)=>typeof value==='string'&&f.sameText(value,expected);
   f.require(same(meta.cid,String(ordinal))&&same(meta.name,column[0])&&same(meta.type,column[1])
     &&same(meta.notnull,column[2]?'1':'0')&&same(meta.pk,String(column[3]))&&same(meta.hidden,'0')
@@ -149,16 +154,16 @@ export function compareP0Manifests(f:FState,md:DatabaseManifests,columns:readonl
   const o=f.request.input.graph.observation;f.require(md.dialect===o.backend);const schema=f.object(md.schema);
   requireSupportedOutputObservation(f);
   const migrations=f.request.original.rows('schema_migrations');f.require(migrations.length===21);
-  f.charge(migrations.length,0,migrations.length,1);
+  f.charge(migrations.length,0,migrations.length+1,1);
   const ordered=[...migrations].sort((a,b)=>{const x=readP0Int64(f.request,a,'version')!,y=readP0Int64(f.request,b,'version')!;return x<y?-1:x>y?1:0;});
   f.charge(ordered.length,0,ordered.length,1+ordered.length*(1+4*2));
   const applied=ordered.map((r,i)=>{const v=readP0Int64(f.request,r,'version'),name=readP0Text(f.request,r,'name'),checksum=readP0Text(f.request,r,'checksum'),expected=F_MIGRATIONS[o.backend][i]!;f.require(v===BigInt(expected.version)&&name===expected.name&&checksum===expected.checksum);
     const cell=r.raw.cells[3]!,applied_at=o.backend==='sqlite'?readP0Text(f.request,r,'applied_at'):(pgCell(f,r,'applied_at',cell,'1184') as [string,string])[1];return {version:String(v),name,checksum,applied_at};});
   f.require(f.equal(schema.migrations,applied));
-  if(o.backend==='sqlite'){f.object(schema,['catalog','migrations']);f.require(f.digest(schema.catalog)===F_SQLITE_CATALOG_DIGEST);}
+  if(o.backend==='sqlite'){f.object(schema,sqliteSchemaKeys);f.require(f.digest(schema.catalog)===F_SQLITE_CATALOG_DIGEST);}
   else {
-    f.object(schema,['profile','serverMajor','scope','typeProfile','namespace','relations','columns','constraints','indexes','functions','triggers','internalTriggers','defaultPrivileges','environment','requiredRoles','migrationIdentitySequence','migrations']);
-    const scope=f.object(schema.scope,['kind','name','clusterRolesIncluded']),namespace=f.array(schema.namespace),environment=f.object(schema.environment),database=f.array(environment.database);
+    f.object(schema,pgSchemaKeys);
+    const scope=f.object(schema.scope,pgScopeKeys),namespace=f.array(schema.namespace),environment=f.object(schema.environment),database=f.array(environment.database);
     f.require(schema.profile==='boardroom-pg16-closed-schema-v1'&&schema.serverMajor===16&&scope.kind==='schema'&&scope.clusterRolesIncluded===false&&namespace.length===1&&f.object(namespace[0]).name===scope.name&&database.length===1&&f.object(database[0]).encoding==='UTF8');
     const relations=f.array(schema.relations);f.require(relations.length===o.tables.length);
     for(const [i,relation] of relations.entries())f.require(f.object(relation).name===o.tables[i]!.name);
@@ -168,7 +173,7 @@ export function compareP0Manifests(f:FState,md:DatabaseManifests,columns:readonl
   f.charge(md.tables.length);let tableKeyBytes=0;for(const table of md.tables)tableKeyBytes+=table.name.length*2;
   f.charge(md.tables.length,tableKeyBytes,md.tables.length+1);const tableMap=new Map<string,DatabaseManifests['tables'][number]>();
   for(const table of md.tables)tableMap.set(table.name,table);f.require(tableMap.size===md.tables.length);
-  f.charge(3,0,0,6);
+  f.charge(3,0,o.tables.length+1,6); // projected table index shell and one slot per original table
   const prior=originalManifestData.get(f);
   const projected:DatabaseManifests['tables'][number][]=[];
   const controls:{storage_maintenance:Record<string,Json>[];storage_source_clients:Record<string,Json>[]}={storage_maintenance:[],storage_source_clients:[]};

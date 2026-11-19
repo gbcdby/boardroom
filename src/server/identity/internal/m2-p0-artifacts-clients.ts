@@ -10,6 +10,8 @@ import { fState } from './m2-p0-artifacts-common.ts';
 import type { FState } from './m2-p0-artifacts-common.ts';
 import { beginP0FArtifactPass,endP0FArtifactPass,p0FRowsSyntaxFrame,preparseP0FRowJson,withP0FNativeConsumer } from './m2-p0-artifacts-frame.ts';
 
+const controllerValueKeys=Object.freeze(['client_id','database_instance_id','entrypoint','build_id','drain_state','db_sessions_json','host_identity_json','process_identity_json']);
+
 interface OriginalCut { readonly journal:ArtifactRef; readonly source:SourceRef; readonly record:VerificationJournalRecord }
 const cuts=new WeakMap<P0Request,OriginalCut>();
 export type P0OriginalClientClassification = Readonly<{subject:SourceClientTextCell;kind:'ordinary-client'|'native-management-client'|'maintenance-controller'|'legacy-client';
@@ -23,7 +25,7 @@ export function rememberP0OriginalClientCut(f:FState,closure:SnapshotValueClosur
   let selected:VerificationJournalRecord|undefined;
   for(const node of closure.chain.nodes){f.charge(1);if(f.refEqual(node.reference,closure.receipt.capture.journal)){f.require(selected===undefined);selected=node.record;}}
   f.require(selected&&selected.event==='capture'&&selected.formatVersion!==1);
-  f.charge(1,0,1,4);const data:OriginalCut={journal:closure.receipt.capture.journal,source:closure.receipt.capture.source,record:selected};
+  f.charge(1,0,2,4);const data:OriginalCut={journal:closure.receipt.capture.journal,source:closure.receipt.capture.source,record:selected};
   f.freeze(data);cuts.set(f.request,data);
 }
 function legacyRow(f:FState,row:P0Row):SourceClientRawRow{
@@ -64,7 +66,7 @@ function historicalControllerReads(f:FState,cut:OriginalCut,raw:SourceClientRawR
 }
 function legacyController(f:FState,cut:OriginalCut,row:P0Row,raw:SourceClientRawRow):'historical-profile'|'unresolved-controller'{
   const encoding=f.request.input.graph.observation.textEncoding;
-  f.charge(1,0,1,1);
+  f.charge(1,0,2,1);
   const frame=p0FRowsSyntaxFrame(f,raw,[raw],encoding);
   try{
     // The original registration helper owns the complete source/profile byte
@@ -73,7 +75,7 @@ function legacyController(f:FState,cut:OriginalCut,row:P0Row,raw:SourceClientRaw
     const process=preparseP0FRowJson(frame,raw,'process_identity_json').value;
     const registration=preparseP0FRowJson(frame,raw,'db_sessions_json').value;
     f.charge(8,0,0,17);const values:Record<string,unknown>={};
-    for(const key of ['client_id','database_instance_id','entrypoint','build_id','drain_state','db_sessions_json','host_identity_json','process_identity_json'])values[key]=readP0Text(f.request,row,key);
+    for(const key of controllerValueKeys)values[key]=readP0Text(f.request,row,key);
     historicalControllerReads(f,cut,raw,values,registration,host,process);
     f.charge(3,0,0,3);
     withP0FNativeConsumer(frame,()=>validateHistoricalControllerProfile(raw,values,cut.source,cut.record.fenceEpoch,{host,process},frame));

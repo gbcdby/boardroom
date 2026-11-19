@@ -109,9 +109,15 @@ try {
   assert.equal(messages.messages.length, 2);
   for (const message of messages.messages) await worker.call("acknowledge_message", { messageId: message.id });
   const deadline = Date.now() + 3000;
+  // 自动补扫失败留待下个安全点；ACK/HTTP 列表查询不触发补扫。
+  // 只补一个真实 wait，沿用同一三秒窗口，不增加消息或后台重试。
+  const safetyPoint = await worker.call("wait_for_messages", { timeoutMs: 100 });
+  assert.deepEqual(safetyPoint.messages, [], "后继安全点不能重投已经 ACK 的来源消息");
   let threshold;
   while (!threshold && Date.now() < deadline) {
-    threshold = (await http("GET", `${own}/summary-requests`)).requests.find(r => r.trigger === "message_threshold");
+    const requests = (await http("GET", `${own}/summary-requests`)).requests.filter(r => r.trigger === "message_threshold");
+    assert.ok(requests.length <= 1, "相同两条来源不能重复生成阈值总结请求");
+    threshold = requests[0];
     if (!threshold) await delay(20);
   }
   assert.ok(threshold, "真实 MCP 投递后补扫应创建阈值总结请求");

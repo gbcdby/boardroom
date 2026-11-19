@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { MaintenanceFailure } from "./error.ts";
-import { reserveP0FNativeCanonical, reserveP0FNativeText, reuseP0FNativeCanonical,reuseP0FNativeDigest } from '../../identity/internal/m2-p0-artifacts-frame.ts';
+import { reserveP0FNativeCanonical, reserveP0FNativeText, reuseP0FNativeCanonical,reuseP0FNativeDigest,checkP0FNativePrototype,sortP0FNativeKeys } from '../../identity/internal/m2-p0-artifacts-frame.ts';
 
 /** Version 1 canonical JSON: lexical UTF-16 keys, ordered arrays, no omitted/rounded fields. */
 export function canonicalJson(value: unknown): string {
@@ -23,8 +23,9 @@ export function canonicalJson(value: unknown): string {
         if (Object.keys(item).length !== item.length) throw new MaintenanceFailure("journal_invalid");
         return `[${item.map(entry => encode(entry, depth + 1)).join(",")}]`;
       }
-      if (![Object.prototype, null].includes(Object.getPrototypeOf(item))) throw new MaintenanceFailure("journal_invalid");
-      const keys = Object.keys(item).sort();
+      const nativePrototype=checkP0FNativePrototype(item);
+      if (nativePrototype===undefined?![Object.prototype, null].includes(Object.getPrototypeOf(item)):!nativePrototype) throw new MaintenanceFailure("journal_invalid");
+      const keys = Object.keys(item);if(!sortP0FNativeKeys(keys))keys.sort();
       if (Reflect.ownKeys(item).length !== keys.length) throw new MaintenanceFailure("journal_invalid");
       return `{${keys.map(key => {
         const descriptor = Object.getOwnPropertyDescriptor(item, key)!;

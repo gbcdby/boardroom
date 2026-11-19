@@ -10,6 +10,8 @@ import { chargeP0, createP0TupleIndex, failP0, p0ArtifactSite, parseP0Json } fro
 import type { P0Code, P0Request, P0SelectedArtifact, P0Site, P0TupleIndex } from "./m2-p0.ts";
 import { p0FJournalSyntaxFrame, p0FCodecSyntaxFrame, withP0FNativeConsumer } from './m2-p0-artifacts-frame.ts';
 
+const referenceKeys=Object.freeze(['ref','sha256','bytes']);
+
 const registered = new Set(["pc-observation","pc-catalog","pc-column-contract","pc-typed-table","pc-typed-row","pc-dependency-domain","pc-pg-sequence-relation","m2-physical-source",
   "plan","journal","source-files","source-file-payload","database-snapshot","database-manifests","capability","restore-bundle","publication","verification","receipt"]);
 const pc = new Set(["pc-observation","pc-catalog","pc-column-contract","pc-typed-table","pc-typed-row","pc-dependency-domain","pc-pg-sequence-relation","m2-physical-source"]);
@@ -111,7 +113,7 @@ export class FState {
   sameText(a:string,b:string):boolean{this.charge(1,Math.min(a.length,b.length)*2);return a===b;}
   utf8Bytes(text:string):number{this.charge(1,text.length*2);return Buffer.byteLength(text);}
   reference(value:unknown):ArtifactRef{
-    const v=this.object(value,['ref','sha256','bytes']);
+    const v=this.object(value,referenceKeys);
     this.require(typeof v.ref==='string'&&v.ref.length>0&&typeof v.sha256==='string'&&typeof v.bytes==='string');
     this.charge(3,(v.ref.length+v.sha256.length+v.bytes.length)*2);
     this.require(/^[a-f0-9]{64}$/.test(v.sha256)&&v.bytes.length<=20&&/^(0|[1-9][0-9]*)$/.test(v.bytes));
@@ -162,7 +164,7 @@ export class FState {
     const entry=this.select(reference,kind);if(Object.hasOwn(entry,'decoded'))return entry.decoded as ReturnType<typeof decodeJournalParsed<K>>;
     const value=this.json(entry),size=this.size(value);
     const version=this.object(value).formatVersion;
-    this.require(kind==='journal'?[1,2,3].includes(version as number):version===(kind==='source-files'?2:1),'format_unregistered','format-mismatch');
+    this.require(kind==='journal'?(version===1||version===2||version===3):version===(kind==='source-files'?2:1),'format_unregistered','format-mismatch');
     if(kind==='source-files'){
       const v=this.object(value),n=this.array(v.entries).length,r=this.array(v.roots).length;
       this.charge(n*(r+2)+r*r,size.text*3); // source path/member scans; bounded cross-root checks
@@ -260,21 +262,24 @@ export class FState {
         // JSON.stringify scans the primitive and materializes its quoted result.
         result.bytes=size.text+size.encoded*2;
       }else{
-        const array=Array.isArray(item);let count=0,fields=0,maxKey=0;
+        const array=Array.isArray(item);let count=0,fields=0;
         // The estimator walks existing properties; it does not allocate the
         // original algorithm's key/map/sort arrays before reserving them.
         for(const key in item)if(Object.hasOwn(item,key)){
           this.charge(1);count++;
           const child=(item as FObject)[key],part=cost(child);result.work+=part.work;result.bytes+=part.bytes;result.tuples+=part.tuples;
           if(!array){
-            const quoted=this.size(key).encoded;maxKey=Math.max(maxKey,key.length);
+            const quoted=this.size(key).encoded;
             result.bytes+=key.length*2+quoted*2; // stringify(key)
             fields+=quoted+1+this.size(child).encoded;
           }
         }
-        result.work+=count;result.tuples+=count*(array?2:3)+1; // Object.keys, ownKeys, map, seen
+        // Each real native node adds one seen binding. The temporary key and
+        // result lists each own a shell and their slots; objects also own an
+        // ownKeys list and one explicit descriptor record per key. The F-only
+        // key sorter works in the original list and pays its actual reads.
+        result.work+=count;result.tuples+=array?count*2+3:count*4+4;
         if(!array){
-          result.work+=count*count;result.bytes+=count*count*maxKey*2;
           result.bytes+=fields*4; // each key:value template reads and emits
         }
         const joined=Math.max(0,size.encoded-2);
@@ -288,7 +293,7 @@ export class FState {
     const size=this.size(value),reserved=cost(value);
     // One resulting text equality is included; native hashing charges its own
     // UTF-8 conversion/read at sha256. Cached costs still debit every invocation.
-    this.charge(reserved.work,reserved.bytes+size.encoded*2,reserved.tuples);return size;
+    this.charge(reserved.work,reserved.bytes+size.encoded*2,reserved.tuples+1);return size; // outer seen Set
   }
   encode(value:unknown):FEncoding{
     if(value!==null&&typeof value==='object'&&this.immutable.has(value)){const old=this.encodings.get(value);if(old!==undefined){this.charge(1);return old;}}
@@ -298,7 +303,8 @@ export class FState {
       if(typeof value==='number'){this.charge(1,64);this.require(Number.isFinite(value)&&!Object.is(value,-0)&&(!Number.isInteger(value)||Number.isSafeInteger(value)));}
       const old=this.atoms.get(value);if(old!==undefined)return old;
       this.charge(1,0,2); // scalar record and one primitive-data cache binding
-      const flat=JSON.stringify(value),result:FEncoding={kind:'scalar',flat,bytes:flat.length,nodes:1,text:0,encoded:flat.length,sortWork:0,sortBytes:0};
+      const flat=value===null?'null':typeof value==='boolean'?(value?'true':'false'):JSON.stringify(value);
+      const result:FEncoding={kind:'scalar',flat,bytes:flat.length,nodes:1,text:0,encoded:flat.length,sortWork:0,sortBytes:0};
       this.atoms.set(value,result);return result;
     }
     let result:FEncoding;
@@ -406,7 +412,10 @@ export class FState {
         }
         if(!token(item.kind==='object'?'}':']'))return false;
       }
-      if(item.source===undefined&&!staged.has(item)){
+      // A scalar already owns its complete canonical flat token. All consumers
+      // can read that same token without a second source-span/index record.
+      // Every token still participates in the complete original-wire match.
+      if(!(item.kind==='scalar'&&item.flat!==undefined)&&item.source===undefined&&!staged.has(item)){
         // One span record contains its target; no extra [encoding, span] array.
         this.charge(1,0,3);pending.push({encoding:item,bytes,text,byteStart,unitStart,unitEnd:unitAt});staged.add(item);
       }
@@ -456,7 +465,12 @@ export class FState {
   hashEncoding(hash:ReturnType<typeof createHash>,value:FEncoding):void{
     this.charge(1);
     if(value.source!==undefined){const s=value.source;this.charge(1,0,1);hash.update(s.bytes.subarray(s.byteStart,s.byteStart+value.bytes));return;}
-    if(value.flat!==undefined){hash.update(value.flat);return;}
+    if(value.flat!==undefined){
+      // A scalar without a redundant source span now follows this real string
+      // path. Prepay its UTF16 read and UTF8 encoding; the caller separately
+      // reserved the complete SHA input. No Buffer view was produced here.
+      this.charge(1,value.flat.length*2+value.bytes);hash.update(value.flat);return;
+    }
     if(value.kind==='cell'){
       hash.update('[');hash.update(value.tagText!);
       if(value.cell!.length===2){this.charge(1);hash.update(',"');hash.update(value.cell![1]!);hash.update('"');}

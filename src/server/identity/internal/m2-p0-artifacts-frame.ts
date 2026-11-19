@@ -7,6 +7,7 @@ import { assertP0FState } from './m2-p0-artifacts-common.ts';
 import type { FState } from './m2-p0-artifacts-common.ts';
 import type { SourceClientRawRow, SourceClientsRosterV1 } from '../../storage/maintenance/types.ts';
 import type { Json } from '../../storage/maintenance/types.ts';
+import type { JournalValueContext } from '../../storage/maintenance/journal-values.ts';
 import { rowDigest } from './m2-p0-artifacts-md.ts';
 
 declare const frameBrand: unique symbol;
@@ -17,12 +18,15 @@ interface Pass { readonly view: P0View; }
 interface Frame {
   readonly f: FState; readonly pass: Pass; readonly scope: object;
   readonly role: 'journal' | 'manifests' | 'rows' | 'codec';
-  readonly texts: readonly unknown[];
+  readonly firstText: unknown; readonly secondText: unknown;
   readonly rows: WeakSet<object>; readonly encoding: Encoding | null;
   readonly rowJson: WeakMap<object, Map<JsonColumn, { readonly text: string; readonly nodes: number;readonly value:unknown }>>;
 }
 const passes = new WeakMap<FState, Pass>();
 const frames = new WeakMap<P0FArtifactSyntaxFrame, Frame>();
+const journalContexts = new WeakMap<JournalValueContext,P0FArtifactSyntaxFrame>();
+const knownJournalContexts = new WeakSet<JournalValueContext>();
+const noRows:readonly SourceClientRawRow[]=Object.freeze([]);
 const unknownFrame = Object.freeze({});
 // Only synchronous fixed consumers enter this stack. It never survives an await
 // or generator step; finally restores the prior authenticated frame on every throw.
@@ -36,6 +40,43 @@ export function withP0FNativeConsumer<T>(frame: P0FArtifactSyntaxFrame, consume:
 function nativeState(): FState | undefined { return nativeFrame === undefined ? undefined : state(nativeFrame).f; }
 /** Cost seams only: the original consumer still makes every semantic decision. */
 export function reserveP0FNativeNodes(nodes: number, tuples = 0): void { nativeState()?.charge(nodes, 0, tuples, nodes); }
+/** Explicit project-owned metadata only, separate from semantic JSON nodes. */
+export function reserveP0FNativeMetadata(tuples:number):void { nativeState()?.charge(tuples,0,tuples); }
+export function reserveP0FNativeWork(work:number):void { nativeState()?.charge(work); }
+export function reserveP0FNativeKeyList(value:object):void {
+  const f=nativeState();if(!f)return;
+  let count=0;for(const key in value)if(Object.hasOwn(value,key)){f.charge(1);count++;}
+  f.charge(count+1,0,count+1);
+}
+export function reserveP0FNativeSplit(text:string,separator:'/'|':'):void {
+  const f=nativeState();if(!f)return;
+  f.charge(1,text.length*2);let count=1;const code=separator.charCodeAt(0);
+  for(let i=0;i<text.length;i++)if(text.charCodeAt(i)===code)count++;
+  f.charge(count+1,0,count+1);
+}
+export function reserveP0FNativeSetBinding<T>(set:ReadonlySet<T>,value:T):void {
+  const f=nativeState();if(f)f.charge(1,0,set.has(value)?0:1);
+}
+export function reserveP0FNativeMapBinding<K>(map:ReadonlyMap<K,unknown>,key:K):void {
+  const f=nativeState();if(f)f.charge(1,0,map.has(key)?0:1);
+}
+/** F fallback preserves the original prototype test without its temporary list. */
+export function checkP0FNativePrototype(value:object):boolean|undefined {
+  const f=nativeState();if(!f)return undefined;
+  f.charge(1);const prototype=Object.getPrototypeOf(value);
+  return prototype===Object.prototype||prototype===null;
+}
+/** The already reserved key-list is also the sort storage. No native scratch
+ * allocation is assumed free; UTF16 comparisons and moves are prepaid here. */
+export function sortP0FNativeKeys(keys:string[]):boolean {
+  const f=nativeState();if(!f)return false;
+  for(let i=1;i<keys.length;i++){
+    f.charge(1);const key=keys[i]!;let at=i;
+    while(at>0&&f.compareText(keys[at-1]!,key)>0){f.charge(1);keys[at]=keys[at-1]!;at--;}
+    f.charge(1);keys[at]=key;
+  }
+  return true;
+}
 export function reserveP0FNativeClone(value: unknown): void {
   const f = nativeState(); if (!f) return;
   const size = f.size(value); f.charge(size.nodes * 8, size.text * 2, 0, size.nodes);
@@ -110,7 +151,7 @@ export function reserveP0FNativeKeyListSort(value:object):void{
   const f=nativeState();if(!f)return;
   let count=0,maximum=0;
   for(const key in value)if(Object.hasOwn(value,key)){f.charge(1);count++;maximum=Math.max(maximum,key.length);}
-  f.charge(1+count+count*count,count*count*maximum*4,count,1+count);
+  f.charge(1+count+count*count,count*count*maximum*4,count+1,1+count);
 }
 
 export function beginP0FArtifactPass(f: FState, view: P0View): void {
@@ -129,30 +170,62 @@ function ownedScope(f: FState, scope: object): Pass {
   if (!pass || !f.immutable.has(scope)) throw unknownFrame;
   return pass;
 }
-function create(f: FState, scope: object, role: Frame['role'], texts: readonly unknown[],
-  rows: readonly SourceClientRawRow[] = [], encoding: Encoding | null = null): P0FArtifactSyntaxFrame {
+function create(f: FState, scope: object, role: Frame['role'], firstText:unknown=undefined,secondText:unknown=undefined,
+  rows: readonly SourceClientRawRow[] = noRows, encoding: Encoding | null = null): P0FArtifactSyntaxFrame {
   const pass = ownedScope(f, scope);
-  f.charge(rows.length + 6, 0, rows.length + 6);
+  f.charge(rows.length + 5, 0, rows.length + 5);
   for (const row of rows) if (!f.immutable.has(row)) throw unknownFrame;
   const frame = Object.freeze({}) as P0FArtifactSyntaxFrame;
-  frames.set(frame, { f, pass, scope, role, texts, rows: new WeakSet(rows), encoding, rowJson: new WeakMap() });
+  frames.set(frame, { f, pass, scope, role, firstText,secondText, rows: new WeakSet(rows), encoding, rowJson: new WeakMap() });
   return frame;
 }
 export function p0FJournalSyntaxFrame(f: FState, value: object): P0FArtifactSyntaxFrame {
   ownedScope(f, value);
   const record = value as { controlProof?: { kind?: unknown; maintenanceInvariant?: { controlRootJson?: unknown; mutexIdentityJson?: unknown } } };
   const invariant = record.controlProof?.kind === 'capture-controls' ? record.controlProof.maintenanceInvariant : undefined;
-  return create(f, value, 'journal', [invariant?.controlRootJson, invariant?.mutexIdentityJson]);
+  return create(f, value, 'journal', invariant?.controlRootJson, invariant?.mutexIdentityJson);
 }
-export function p0FCodecSyntaxFrame(f: FState, value: object): P0FArtifactSyntaxFrame { return create(f, value, 'codec', []); }
+export function p0FCodecSyntaxFrame(f: FState, value: object): P0FArtifactSyntaxFrame { return create(f, value, 'codec'); }
 export function p0FManifestSyntaxFrame(f: FState, value: object): P0FArtifactSyntaxFrame {
   ownedScope(f, value);
   const md = value as { controlRows: { storage_maintenance: readonly Record<string, unknown>[] } };
   const row = md.controlRows.storage_maintenance[0];
-  return create(f, value, 'manifests', [row?.control_root_json, row?.mutex_identity_json]);
+  return create(f, value, 'manifests', row?.control_root_json, row?.mutex_identity_json);
 }
 export function p0FRowsSyntaxFrame(f: FState, scope: object, rows: readonly SourceClientRawRow[], encoding: Encoding): P0FArtifactSyntaxFrame {
-  return create(f, scope, 'rows', [], rows, encoding);
+  return create(f, scope, 'rows', undefined,undefined, rows, encoding);
+}
+/** The math owner constructs its one fixed context; this module only binds
+ * opaque data identities and never imports or accepts a replacement validator. */
+export function assertP0FJournalFrame(frame:P0FArtifactSyntaxFrame,f:FState):void {
+  const s=state(frame);if(s.role!=='codec'||s.f!==f)throw unknownFrame;
+}
+export function bindP0FJournalContext(frame:P0FArtifactSyntaxFrame,context:JournalValueContext):void {
+  const s=state(frame);if(s.role!=='codec'||knownJournalContexts.has(context)||!Object.isFrozen(context))throw unknownFrame;
+  s.f.charge(2,0,2);
+  journalContexts.set(context,frame);knownJournalContexts.add(context);
+}
+export function assertP0FJournalContext(frame:P0FArtifactSyntaxFrame,context:JournalValueContext):void {
+  state(frame);if(journalContexts.get(context)!==frame)throw unknownFrame;
+}
+export function releaseP0FJournalContext(context:JournalValueContext):void { journalContexts.delete(context); }
+export function reserveP0FJournalMetadata(context:JournalValueContext,tuples:number):void {
+  const frame=journalContexts.get(context);
+  if(frame===undefined){if(knownJournalContexts.has(context))throw unknownFrame;return;}
+  state(frame).f.charge(tuples,0,tuples);
+}
+export function reserveP0FJournalProjection(context:JournalValueContext,nodes:number):void {
+  const frame=journalContexts.get(context);
+  if(frame===undefined){if(knownJournalContexts.has(context))throw unknownFrame;return;}
+  state(frame).f.charge(nodes,0,0,nodes);
+}
+/** Prepay the exact temporary slash-token list before String.split. */
+export function reserveP0FJournalPathParts(context:JournalValueContext,text:string):void {
+  const frame=journalContexts.get(context);
+  if(frame===undefined){if(knownJournalContexts.has(context))throw unknownFrame;return;}
+  const f=state(frame).f;f.charge(1,text.length*2);let count=1;
+  for(let i=0;i<text.length;i++)if(text.charCodeAt(i)===47)count++;
+  f.charge(count+1,0,count+1);
 }
 export function assertP0FSyntaxScope(frame: P0FArtifactSyntaxFrame, role: Frame['role'], scope: object): void {
   const s = state(frame); if (s.role !== role || s.scope !== scope) throw unknownFrame;
@@ -193,9 +266,9 @@ export function preparseP0FRowJson(frame: P0FArtifactSyntaxFrame, row: SourceCli
   const value = parseP0Json(f.request, text, p0NestedSite(f.request, f.currentSite, 8), 'reference');
   f.freeze(value);f.encode(value);
   let known = s.rowJson.get(row);
-  if (!known) { f.charge(1, 0, 1); known = new Map(); s.rowJson.set(row, known); }
+  if (!known) { f.charge(1, 0, 2); known = new Map(); s.rowJson.set(row, known); }
   const nodes = f.size(value).nodes;
-  f.charge(1, 0, 1, 10); known.set(column, { text, nodes,value }); return { value, text };
+  f.charge(1, 0, known.has(column)?2:3, 10); known.set(column, { text, nodes,value }); return { value, text };
 }
 export function assertP0FRowJson(frame: P0FArtifactSyntaxFrame, row: SourceClientRawRow, column: JsonColumn, text: string): void {
   const s = rowState(frame, row), expected = s.rowJson.get(row)?.get(column);
@@ -213,7 +286,8 @@ export function bindP0FRowJsonEncoding(frame:P0FArtifactSyntaxFrame,row:SourceCl
 }
 export function preparseP0FInvariantJson(frame: P0FArtifactSyntaxFrame, text: string): void {
   const s = state(frame); const f: FState = s.f;
-  if (s.role === 'rows' || !s.texts.some(value => typeof value === 'string' && f.sameText(value, text))) throw unknownFrame;
+  if (s.role === 'rows' || !(typeof s.firstText==='string'&&f.sameText(s.firstText,text)
+    ||typeof s.secondText==='string'&&f.sameText(s.secondText,text))) throw unknownFrame;
   f.require(f.currentSite);
   // Only A's private syntax token becomes the old known malformed rejection.
   // Resource failures and arbitrary native exceptions retain their identities.
