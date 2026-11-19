@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { hostname } from "node:os";
 import { readFile, readlink, stat } from "node:fs/promises";
 import Database from "better-sqlite3";
-import { sqliteAuditFixture } from "./fixtures/maintenance-source-audit.ts";
+import { protocolSqliteAuditFixture as sqliteAuditFixture } from "./fixtures/maintenance-source-audit.ts";
 import { registerExitedAuditClient } from "./fixtures/maintenance-audit-history-child.ts";
 import { eventFactsSchema, checkFactsShape } from "../src/server/storage/maintenance/control-candidate/schema.ts";
 import { storageReceiptDigest } from "../src/server/storage/source-client.ts";

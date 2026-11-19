@@ -1,10 +1,11 @@
 import { MaintenanceFailure } from "./error.ts";
 import { canonicalJson, digestJson } from "./canonical.ts";
 import { SOURCE_FILE_HEALTH_NAMES, assertSourceFileRootActive, observeSourceFileRootContext,
-  observeSourceFileBootstrap, promoteSourceFileBootstrap } from "./source-file-native.ts";
+  observeSourceFileBootstrap, promoteSourceFileBootstrap, retainSourceFileMetadata, assertSourceFileTailFor } from "./source-file-native.ts";
 import type { SourceFileHandle, SourceFileMetadata, SourceFileExtendedObservation, SourceFileUniqueStatxObservation,
   SourceFileKernelReadValue, SourceFileNativeCall, SourceFileHealthName, SourceFileContextFact,
-  SourceFileRootEnvironment, SourceFileExtendedMetadata, SourceFileRootContext, SourceFileBootstrapContext } from "./source-file-native.ts";
+  SourceFileRootEnvironment, SourceFileExtendedMetadata, SourceFileRootContext, SourceFileBootstrapContext,
+  SourceFileMetadataTail, SourceFileExpectedProfile } from "./source-file-native.ts";
 
 export interface SourceFileKernelRead extends SourceFileKernelReadValue {
   readonly calls: readonly SourceFileNativeCall[];
@@ -32,20 +33,32 @@ export interface SourceFileRootObservation {
 /** Successful contexts can only originate from the private owner and the fixed
  * registry below. The current build deliberately has no qualified entries. */
 export interface QualifiedSourceFileProfile {
-  readonly profile: "linux-native-ext4-fid-fsuuid-source-state-v1";
+  readonly profile: "linux-native-ext4-fid-fsuuid-source-state-v1" | "linux-native-ext4-fid-fsuuid-source-prepare-v1";
   readonly source: SourceFileMetadata;
   readonly profileEntryDigest: string;
   readonly qualificationDigest: string;
   observe(): SourceFileRootObservation;
   beforeContent(): SourceFileRootObservation;
   afterContent(): SourceFileRootObservation;
+  retainMetadata(): SourceFileMetadataTail;
+  afterSourceClosed(tail: SourceFileMetadataTail): SourceFileTailObservation;
 }
 const PROFILE = "linux-native-ext4-fid-fsuuid-source-state-v1" as const;
+export const SOURCE_PREPARE_PROFILE = "linux-native-ext4-fid-fsuuid-source-prepare-v1" as const;
+export interface SourceFileTailObservation {
+  readonly metadata: SourceFileExtendedMetadata;
+  readonly mount: SourceFileMountBinding;
+  readonly health: SourceFileRootObservation["health"];
+  readonly runtimeEnvironmentDigest: string;
+}
+const PREPARE_PROTOCOLS = Object.freeze({ capture: "closed-file-prepare-2", live: "closed-file-prepare-2",
+  readOnly: "closed-file-observe-2", tail: "metadata-transfer-carrier-1" });
 interface FixedProfileEntry {
-  readonly profile: typeof PROFILE;
+  readonly profile: typeof PROFILE | typeof SOURCE_PREPARE_PROFILE;
   readonly requiredConfiguration: unknown;
   readonly profileEvidence: unknown;
   readonly qualificationEvidence: unknown;
+  readonly protocols?: typeof PREPARE_PROTOCOLS;
 }
 // Adding an entry requires a new, independently reviewed source candidate and
 // real qualification material. This is not a registration API or test hook.
@@ -341,10 +354,12 @@ function selectEntry(context: SourceFileRootContext | SourceFileBootstrapContext
   requireValue(FIXED_PROFILES.length > 0, "source-file-profile-unqualified");
   const analysis = analyzeEnvironment(context);
   requireValue(analysis.unresolved.length === 0, "source-file-full-configuration-unproven");
-  const matches = FIXED_PROFILES.filter(entry => entry.profile === PROFILE
+  const matches = FIXED_PROFILES.filter(entry => (entry.profile === PROFILE || entry.profile === SOURCE_PREPARE_PROFILE)
     && canonicalJson(entry.requiredConfiguration) === canonicalJson(analysis.configuration));
   requireValue(matches.length === 1, "source-file-profile-match-count");
   const entry = matches[0]!;
+  if (entry.profile === SOURCE_PREPARE_PROFILE)
+    requireValue(canonicalJson(entry.protocols) === canonicalJson(PREPARE_PROTOCOLS), "source-file-complete-protocols");
   // Canonical whole materials, never a caller's or entry author's asserted hash.
   canonicalJson(entry.profileEvidence); canonicalJson(entry.qualificationEvidence);
   return { entry, analysis };
@@ -353,6 +368,7 @@ interface ProfileState {
   readonly root: SourceFileHandle;
   readonly entry: FixedProfileEntry;
   readonly baseline: string;
+  readonly contextBaseline: string;
   readonly profileEntryDigest: string;
   readonly qualificationDigest: string;
   failed: boolean;
@@ -383,30 +399,63 @@ function observeWindow(profile: object, phase: "observe" | "before-content" | "a
   }
 }
 class SourceProfile implements QualifiedSourceFileProfile {
-  readonly profile = PROFILE;
+  readonly profile: QualifiedSourceFileProfile["profile"];
   readonly source: SourceFileMetadata;
   readonly profileEntryDigest: string;
   readonly qualificationDigest: string;
   constructor(root: SourceFileHandle, context: SourceFileRootContext, entry: FixedProfileEntry, analysis: EnvironmentAnalysis) {
+    this.profile = entry.profile;
     const metadata = context.info.metadata;
     this.source = Object.freeze({ kind: metadata.kind, dev: metadata.dev, ino: metadata.ino, mode: metadata.mode, uid: metadata.uid,
       nlink: metadata.nlink, size: metadata.size, fsType: metadata.fsType, mtimeNs: metadata.mtimeNs, ctimeNs: metadata.ctimeNs });
-    this.profileEntryDigest = digestJson({ profile: PROFILE, requiredConfiguration: entry.requiredConfiguration, evidence: entry.profileEvidence });
-    this.qualificationDigest = digestJson({ profileEntryDigest: this.profileEntryDigest, evidence: entry.qualificationEvidence });
-    contexts.set(this, { root, entry, baseline: analysis.windowBinding, profileEntryDigest: this.profileEntryDigest,
+    const digests = entryDigests(entry);
+    this.profileEntryDigest = digests.profileEntryDigest;
+    this.qualificationDigest = digests.qualificationDigest;
+    contexts.set(this, { root, entry, baseline: analysis.windowBinding, contextBaseline: analysis.contextBinding, profileEntryDigest: this.profileEntryDigest,
       qualificationDigest: this.qualificationDigest, failed: false, failure: undefined });
     Object.freeze(this);
   }
   observe(): SourceFileRootObservation { return observeWindow(this, "observe"); }
   beforeContent(): SourceFileRootObservation { return observeWindow(this, "before-content"); }
   afterContent(): SourceFileRootObservation { return observeWindow(this, "after-content"); }
+  retainMetadata(): SourceFileMetadataTail {
+    const state = contexts.get(this);
+    if (!state || state.failed || this.profile !== SOURCE_PREPARE_PROFILE)
+      throw state?.failure ?? new MaintenanceFailure("maintenance_lost", "source-file-tail-profile");
+    return retainSourceFileMetadata(state.root);
+  }
+  afterSourceClosed(tail: SourceFileMetadataTail): SourceFileTailObservation {
+    const state = contexts.get(this);
+    if (!state || state.failed || this.profile !== SOURCE_PREPARE_PROFILE)
+      throw state?.failure ?? new MaintenanceFailure("maintenance_lost", "source-file-tail-profile");
+    try {
+      assertSourceFileTailFor(tail, state.root);
+      const current = tail.observe(), selected = selectEntry(current);
+      requireSame(selected.entry === state.entry && selected.analysis.contextBinding === state.contextBaseline);
+      return detached({ metadata: current.info.metadata, mount: selected.analysis.mount, health: selected.analysis.health,
+        runtimeEnvironmentDigest: digestJson({ domain: "boardroom-source-file-runtime-context-v1", phase: "after-source-close", material: typed(current) }) });
+    } catch (error) { state.failed = true; state.failure = failure(error); throw state.failure; }
+  }
 }
 Object.freeze(SourceProfile.prototype);
 /** Package-internal fixed factory initialization. The token is minted only by
  * withNativeSourceRoot; no external proof can obtain or promote this owner. */
-export function initializeSourceFileBootstrap(token: object): SourceFileHandle {
+function entryDigests(entry: FixedProfileEntry): SourceFileExpectedProfile {
+  const profileEntryDigest = digestJson({ profile: entry.profile, requiredConfiguration: entry.requiredConfiguration, evidence: entry.profileEvidence,
+    ...(entry.profile === SOURCE_PREPARE_PROFILE ? { protocols: PREPARE_PROTOCOLS } : {}) });
+  return { profile: entry.profile, profileEntryDigest, qualificationDigest: digestJson({ profileEntryDigest, evidence: entry.qualificationEvidence }) };
+}
+export function assertExpectedSourceFileProfile(current: SourceFileExpectedProfile, expected: SourceFileExpectedProfile): void {
+  requireSame(current.profile === expected.profile && current.profileEntryDigest === expected.profileEntryDigest
+    && current.qualificationDigest === expected.qualificationDigest);
+}
+function initializeBootstrap(token: object, expected: SourceFileExpectedProfile | undefined, preview: boolean): SourceFileHandle {
   try {
     const bootstrap = observeSourceFileBootstrap(token), initial = selectEntry(bootstrap);
+    if (preview) requireValue(initial.entry.profile === SOURCE_PREPARE_PROFILE, "source-file-preview-profile");
+    // A mismatched frozen profile must fail while the source is still O_PATH,
+    // before openRootContent creates the first ordinary regular R.
+    if (expected) assertExpectedSourceFileProfile(entryDigests(initial.entry), expected);
     const root = promoteSourceFileBootstrap(token), current = observeSourceFileRootContext(root), selected = selectEntry(current);
     requireSame(initial.entry === selected.entry
       && initial.analysis.contextBinding === selected.analysis.contextBinding
@@ -414,6 +463,12 @@ export function initializeSourceFileBootstrap(token: object): SourceFileHandle {
     const profile = new SourceProfile(root, current, selected.entry, selected.analysis); profilesByRoot.set(root, profile);
     return root;
   } catch (error) { throw failure(error); }
+}
+export function initializeSourceFileBootstrap(token: object, expected?: SourceFileExpectedProfile): SourceFileHandle {
+  return initializeBootstrap(token, expected, false);
+}
+export function initializeSourceFilePreviewBootstrap(token: object): SourceFileHandle {
+  return initializeBootstrap(token, undefined, true);
 }
 /** The only public matcher input is a genuine live root. No observation,
  * callback, proof, registry, digest or success flag is accepted. */

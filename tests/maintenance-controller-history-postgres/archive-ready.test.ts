@@ -20,7 +20,7 @@ pgCaptureTest("C3 PostgreSQL new archive owner restores exact legacy ready into 
     const closure = await verifySnapshotClosure(f.store, head);
     const oldReceipt = await f.store.readJson(closure.receiptRef, "receipt"), oldVerification = await f.store.readJson(closure.receipt.verification, "verification");
     await f.adapter.withSourceLock("control", async lock => {
-      ({ scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }));
+      ({ scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }, f.options));
     });
     const view = await f.adapter.withSourceLock("snapshot", async lock => {
       const result = await f.consumers.revalidateControllerReady(scope!, lock);

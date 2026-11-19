@@ -1095,9 +1095,10 @@ linuxTest("#152 P3 native directory enumeration rejects invalid UTF-8 instead of
     await writeFile(path.join(tmp, "中文"), "ok", { mode: 0o600 });
     await withNativeSourceRoot(tmp, handle => assert.deepEqual(handle.readDirectory(), ["中文"]));
     await writeFile(Buffer.concat([Buffer.from(tmp + "/"), Buffer.from([0xff])]), "raw", { mode: 0o600 });
-    await withNativeSourceRoot(tmp, handle => {
+    await assert.rejects(withNativeSourceRoot(tmp, handle => {
       assert.throws(() => handle.readDirectory(), { code: "ERR_SOURCE_DIRECTORY" });
-    });
+    }), error => error instanceof AggregateError && error.errors.length === 1 && error.errors[0].code === "ERR_SOURCE_DIRECTORY",
+    "catching the actual directory read error cannot turn the native window into success");
   } finally { await rm(tmp, { recursive: true, force: true }); }
 });
 
@@ -1249,12 +1250,12 @@ linuxTest("#152 P2 native stale owner and changed ordinary permissions cannot yi
       assert.throws(() => native.observeExtended({}), { code: "ERR_SOURCE_HANDLE" });
       assert.ok(native.observeExtended(current));
     } finally { native.close(current); }
-    await withNativeSourceRoot(tmp, handle => {
+    await assert.rejects(withNativeSourceRoot(tmp, handle => {
       const changed = chmod(tmp, 0o777);
       return changed.then(() => {
         assert.throws(() => handle.observeExtended(), { code: "ERR_SOURCE_IDENTITY" });
       });
-    });
+    }), error => error instanceof AggregateError && error.errors.length === 1 && error.errors[0].code === "ERR_SOURCE_IDENTITY");
   } finally { await chmod(tmp, 0o700); await rm(tmp, { recursive: true, force: true }); }
 });
 
@@ -1344,12 +1345,15 @@ linuxTest("#152 P0 real native openat2 rejects symlink, hardlink, leaf escape an
     await withNativeSourceRoot(source, async rootHandle => {
       for (const name of ["", ".", "..", "../escape", "a/b", "a\0b", "x".repeat(4097)])
         assert.throws(() => rootHandle.openChild(name, "file"));
-      assert.throws(() => rootHandle.openChild("alias", "file"));
-      assert.throws(() => rootHandle.openChild("multi", "file"));
-      assert.throws(() => rootHandle.openChild("sym", "file"));
-      assert.throws(() => rootHandle.openChild("ordinary", "directory"));
       assert.throws(() => rootHandle.readAt(0n, 1));
     });
+    for (const [leaf, kind] of [["alias", "file"], ["multi", "file"], ["sym", "file"], ["ordinary", "directory"]] as const) {
+      let original: unknown;
+      await assert.rejects(withNativeSourceRoot(source, rootHandle => {
+        assert.throws(() => rootHandle.openChild(leaf, kind), error => { original = error; return true; });
+      }), error => error instanceof AggregateError && error.errors.length === 1 && error.errors[0] === original,
+      "each real failed lookup runs in its own scope; an earlier sticky failure cannot mask the case");
+    }
     await symlink(source, path.join(tmp, "source-link"));
     await assert.rejects(withNativeSourceRoot(path.join(tmp, "source-link"), async () => {}),
       error => error instanceof Error);

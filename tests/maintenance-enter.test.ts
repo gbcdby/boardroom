@@ -7,15 +7,15 @@ import path from "node:path";
 import { inspect } from "node:util";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { enterFixture } from "./fixtures/maintenance-enter.ts";
-import { enterMaintenance } from "../src/server/storage/maintenance/enter.ts";
+import { protocolEnterFixture as enterFixture } from "./fixtures/maintenance-enter.ts";
+import { assertProtocolNonNullRefusal, enterMaintenance } from "./fixtures/maintenance-preview-graph.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { verifyJournalChain } from "../src/server/storage/maintenance/journal.ts";
 import { SqliteDriver } from "../src/server/db/drivers/sqlite.ts";
 import { PostgresDriver } from "../src/server/db/drivers/postgres.ts";
 import { openNativeManagementSource } from "../src/server/storage/native-management-admission.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
-import { persistMigrationPlan, planMigration } from "../src/server/storage/maintenance/plan.ts";
+import { persistMigrationPlan, planMigration } from "./fixtures/maintenance-preview-graph.ts";
 import type { ContinueRequest } from "../src/server/storage/maintenance/types.ts";
 
 const supported = ["linux", "darwin"].includes(process.platform);
@@ -95,8 +95,13 @@ for (const kind of ["sqlite", "postgres"] as const) {
       await assert.rejects(enterMaintenance(f.options, f.request), /snapshot_invalid/); await writeFile(planPath, bytes);
       await rename(planPath, `${planPath}.missing`);
       await assert.rejects(enterMaintenance(f.options, f.request), { code: "ENOENT" }); await rename(`${planPath}.missing`, planPath);
-      const config = await readFile(f.configFile); await writeFile(f.configFile, Buffer.concat([config, Buffer.from(" ")]));
-      await assert.rejects(enterMaintenance(f.options, f.request), { code: "plan_stale" }); await writeFile(f.configFile, config);
+      if (process.platform === "darwin") {
+        const adapter = await f.createAdapter();
+        try { await assertProtocolNonNullRefusal(f.options, adapter); } finally { await adapter.close(); }
+      } else {
+        const config = await readFile(f.configFile); await writeFile(f.configFile, Buffer.concat([config, Buffer.from(" ")]));
+        await assert.rejects(enterMaintenance(f.options, f.request), { code: "plan_stale" }); await writeFile(f.configFile, config);
+      }
       await f.exec("CREATE INDEX changed_enter_schema ON enter_observation(value)");
       await assert.rejects(enterMaintenance(f.options, f.request), { code: "plan_stale" }); await f.exec("DROP INDEX changed_enter_schema");
       await mkdir(f.options.targetRoot);

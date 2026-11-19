@@ -115,6 +115,10 @@ typedef struct {
   bool root;
   bool metadata_only;
   bool content_attempted;
+  bool busy;
+  bool tail;
+  bool close_started;
+  bool close_start_failed;
   bool invalid;
   bool close_unknown;
   bool parent_close_unknown;
@@ -205,7 +209,7 @@ static bool lookup_owner(napi_env env, napi_value value, source_owner **out) {
     napi_unwrap(env, value, (void **)out) == napi_ok && *out;
 }
 static bool live_owner(napi_env env, napi_value value, source_owner **out) {
-  return lookup_owner(env, value, out) && (*out)->fd >= 0 && !(*out)->close_unknown &&
+  return lookup_owner(env, value, out) && !(*out)->busy && (*out)->fd >= 0 && !(*out)->close_unknown &&
     !(*out)->parent_close_unknown && !(*out)->invalid;
 }
 static bool get_owner(napi_env env, napi_value value, source_owner **out) {
@@ -225,10 +229,11 @@ static int close_slot(napi_env env, int *fd, bool *unknown, int *saved_error,
   return error;
 }
 static int close_resources(napi_env env, source_owner *owner, napi_value calls) {
+  owner->close_started = true;
   const int first = close_slot(env, &owner->parent_fd, &owner->parent_close_unknown,
-    &owner->parent_close_error, calls, "close-bootstrap-parent");
+    &owner->parent_close_error, calls, owner->tail ? "close-tail-carrier" : "close-bootstrap-parent");
   const int second = close_slot(env, &owner->fd, &owner->close_unknown,
-    &owner->close_error, calls, "close-source");
+    &owner->close_error, calls, owner->tail ? "close-tail-metadata" : "close-source");
   return first ? first : second ? second : owner->unresolved_aux_count ? EIO : 0;
 }
 static napi_value owner_error_calls(napi_env env, napi_value handle, source_owner *owner,
@@ -396,6 +401,11 @@ static napi_value open_root_content(napi_env env, napi_callback_info info) {
     return owner_error(env, value, content, error == ESTALE ? "ERR_SOURCE_IDENTITY" : "ERR_SOURCE_NATIVE_IO", "root-content-after", error);
   }
   content->initial = actual; content->legacy_mount_id = legacy; content->unique_mount_id = unique;
+  content->parent_fd = fcntl(bootstrap->parent_fd, F_DUPFD_CLOEXEC, 0);
+  if (content->parent_fd < 0)
+    return owner_error(env, value, content, "ERR_SOURCE_NATIVE_IO", "retain-content-parent", errno);
+  content->parent_initial = parent;
+  memcpy(content->leaf, bootstrap->leaf, strlen(bootstrap->leaf) + 1);
   return value;
 }
 static napi_value open_child(napi_env env, napi_callback_info info) {
@@ -417,7 +427,99 @@ static napi_value open_child(napi_env env, napi_callback_info info) {
     return owner_error(env, value, child, "ERR_SOURCE_NATIVE_IO", "child-after-stat", errno);
   if (!valid_metadata(&child->initial, directory) || !valid_metadata(&parent_after, true))
     return owner_error(env, value, child, "ERR_SOURCE_IDENTITY", "child-after-identity", ESTALE);
+  if (!directory) {
+    child->parent_fd = fcntl(parent->fd, F_DUPFD_CLOEXEC, 0);
+    if (child->parent_fd < 0)
+      return owner_error(env, value, child, "ERR_SOURCE_NATIVE_IO", "retain-child-parent", errno);
+    child->parent_initial = parent_after;
+    memcpy(child->leaf, name, strlen(name) + 1);
+  }
   return value;
+}
+/* An independent open description from the original retained parent. Never
+ * dup the source file, follow /proc/self/fd, or accept an external descriptor. */
+static napi_value reopen_file(napi_env env, napi_callback_info info) {
+  size_t count = 1; napi_value args[1]; source_owner *original;
+  if (napi_get_cb_info(env, info, &count, args, NULL, NULL) != napi_ok || count != 1 ||
+      !get_owner(env, args[0], &original) || original->directory || original->parent_fd < 0 || !original->leaf[0])
+    return throw_code(env, "ERR_SOURCE_HANDLE", "Expected live file with its original parent");
+  struct stat held, parent, found;
+  if (fstat(original->fd, &held) || fstat(original->parent_fd, &parent) ||
+      fstatat(original->parent_fd, original->leaf, &found, AT_SYMLINK_NOFOLLOW)) return os_error(env, "reopen-before");
+  if (!same_metadata(&original->initial, &held) || !same_metadata(&held, &found) ||
+      !same_metadata(&original->parent_initial, &parent))
+    return throw_code(env, "ERR_SOURCE_IDENTITY", "Source changed before independent reopen");
+  source_owner *peer; napi_value result = new_owner(env, &peer);
+  if (!result) return NULL;
+  peer->root = original->root;
+  peer->fd = strict_openat(original->parent_fd, original->leaf, false, original->root);
+  if (peer->fd < 0) return owner_error(env, result, peer, "ERR_SOURCE_NATIVE_IO", "openat2-file-peer", errno);
+  struct stat after, current_parent, current_path;
+  if (fstat(peer->fd, &after) || fstat(original->parent_fd, &current_parent) ||
+      fstatat(original->parent_fd, original->leaf, &current_path, AT_SYMLINK_NOFOLLOW))
+    return owner_error(env, result, peer, "ERR_SOURCE_NATIVE_IO", "reopen-after", errno);
+  if (!valid_metadata(&after, false) || !same_metadata(&held, &after) || !same_metadata(&held, &current_path) ||
+      !same_metadata(&parent, &current_parent))
+    return owner_error(env, result, peer, "ERR_SOURCE_IDENTITY", "reopen-binding", ESTALE);
+  peer->parent_fd = fcntl(original->parent_fd, F_DUPFD_CLOEXEC, 0);
+  if (peer->parent_fd < 0) return owner_error(env, result, peer, "ERR_SOURCE_NATIVE_IO", "retain-peer-parent", errno);
+  peer->initial = after; peer->parent_initial = current_parent;
+  memcpy(peer->leaf, original->leaf, strlen(original->leaf) + 1);
+  return result;
+}
+static napi_value retain_metadata(napi_env env, napi_callback_info info) {
+  size_t count = 1; napi_value args[1]; source_owner *source;
+  if (napi_get_cb_info(env, info, &count, args, NULL, NULL) != napi_ok || count != 1 ||
+      !get_owner(env, args[0], &source) || (!source->directory && source->parent_fd < 0))
+    return throw_code(env, "ERR_SOURCE_HANDLE", "Expected actual source for metadata tail");
+  source_owner *tail; napi_value result = new_owner(env, &tail);
+  if (!result) return NULL;
+  tail->tail = true; tail->root = true; tail->metadata_only = true; tail->directory = source->directory;
+  struct open_how how = { .flags = O_PATH | O_CLOEXEC | O_NOFOLLOW,
+    .resolve = RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS |
+      (source->root ? 0 : RESOLVE_BENEATH | RESOLVE_NO_XDEV) };
+  tail->fd = (int)syscall(SYS_openat2, source->directory ? source->fd : source->parent_fd,
+    source->directory ? "." : source->leaf, &how, sizeof(how));
+  if (tail->fd < 0) return owner_error(env, result, tail, "ERR_SOURCE_NATIVE_IO", "openat2-tail-metadata", errno);
+  struct stat current;
+  if (fstat(tail->fd, &tail->initial) || fstat(source->fd, &current))
+    return owner_error(env, result, tail, "ERR_SOURCE_NATIVE_IO", "tail-metadata-stat", errno);
+  if (!same_metadata(&source->initial, &current) || !same_metadata(&current, &tail->initial))
+    return owner_error(env, result, tail, "ERR_SOURCE_IDENTITY", "tail-metadata-binding", ESTALE);
+  uint64_t legacy, unique;
+  if (!mount_pair(tail->fd, &tail->initial, &tail->legacy_mount_id, &tail->unique_mount_id) ||
+      !mount_pair(source->fd, &current, &legacy, &unique))
+    return owner_error(env, result, tail, "ERR_SOURCE_NATIVE_IO", "tail-metadata-mount", errno);
+  if (legacy != tail->legacy_mount_id || unique != tail->unique_mount_id)
+    return owner_error(env, result, tail, "ERR_SOURCE_IDENTITY", "tail-metadata-mount", ESTALE);
+  tail->parent_initial = source->directory ? current : source->parent_initial;
+  if (!source->directory) memcpy(tail->leaf, source->leaf, strlen(source->leaf) + 1);
+  return result;
+}
+/* The old directory owner loses its descriptor atomically on the JS thread.
+ * This is a transfer, not close(), dup(), a late open, or evidence of release. */
+static napi_value transfer_carrier(napi_env env, napi_callback_info info) {
+  size_t count = 2; napi_value args[2], result; source_owner *tail, *carrier;
+  if (napi_get_cb_info(env, info, &count, args, NULL, NULL) != napi_ok || count != 2 ||
+      !live_owner(env, args[0], &tail) || !tail->tail || tail->parent_fd >= 0 ||
+      !get_owner(env, args[1], &carrier) || !carrier->directory || carrier->parent_fd >= 0)
+    return throw_code(env, "ERR_SOURCE_HANDLE", "Expected live metadata tail and unique readable carrier");
+  struct stat source, directory; uint64_t legacy, unique;
+  if (fstat(tail->fd, &source) || fstat(carrier->fd, &directory)) return os_error(env, "tail-transfer-stat");
+  if (!same_metadata(&tail->initial, &source) || !same_metadata(&tail->parent_initial, &directory) ||
+      source.st_dev != directory.st_dev || !valid_metadata(&directory, true))
+    return throw_code(env, "ERR_SOURCE_IDENTITY", "Tail carrier identity changed");
+  if (!mount_pair(carrier->fd, &directory, &legacy, &unique)) return os_error(env, "tail-transfer-mount");
+  if (legacy != tail->legacy_mount_id || unique != tail->unique_mount_id)
+    return throw_code(env, "ERR_SOURCE_IDENTITY", "Tail carrier mount changed");
+  if (!tail->directory) {
+    struct stat found;
+    if (fstatat(carrier->fd, tail->leaf, &found, AT_SYMLINK_NOFOLLOW)) return os_error(env, "tail-transfer-path");
+    if (!same_metadata(&source, &found)) return throw_code(env, "ERR_SOURCE_IDENTITY", "Tail source path changed");
+  }
+  if (napi_get_undefined(env, &result) != napi_ok) return NULL;
+  tail->parent_fd = carrier->fd; carrier->fd = -1; carrier->invalid = true;
+  return result;
 }
 static bool set_big(napi_env env, napi_value object, const char *name, uint64_t value) {
   napi_value data;
@@ -1732,6 +1834,10 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
       (owner->metadata_only && !same_metadata(&owner->parent_initial, &carrier_before)))
     return p3_environment_failure(&c, args[0], metadata_error ? "ERR_SOURCE_NATIVE_IO" : "ERR_SOURCE_IDENTITY",
       "environment-source-before", metadata_error ? metadata_error : ESTALE);
+  uint64_t carrier_legacy_before = 0, carrier_unique_before = 0, carrier_legacy_after = 0, carrier_unique_after = 0;
+  if (owner->tail && (!mount_pair(carrier, &carrier_before, &carrier_legacy_before, &carrier_unique_before) ||
+      carrier_legacy_before != owner->legacy_mount_id || carrier_unique_before != owner->unique_mount_id))
+    return p3_environment_failure(&c, args[0], "ERR_SOURCE_IDENTITY", "tail-carrier-mount-before", ESTALE);
 
   c.proc_fd = p3_anchor(&c, "/proc", "proc-root", PROC_SUPER_MAGIC, c.proc_calls, &c.proc_owned);
   c.sys_fd = p3_anchor(&c, "/sys", "sysfs-root", SYSFS_MAGIC, c.sys_calls, &c.sys_owned);
@@ -1839,6 +1945,8 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
     metadata_calls, &after, &fs_after, &metadata_error);
   const bool carrier_after_ok = p3_source_metadata(&c, carrier, carrier_directory, true, true,
     carrier_calls, &carrier_after, &carrier_fs_after, &metadata_error);
+  if (owner->tail && (!carrier_after_ok || !mount_pair(carrier, &carrier_after, &carrier_legacy_after, &carrier_unique_after) ||
+      carrier_legacy_before != carrier_legacy_after || carrier_unique_before != carrier_unique_after)) p3_changed(&c);
   if (source_after_ok && carrier_after_ok && (!same_metadata(&before, &after) || fs_before.f_type != fs_after.f_type ||
       !same_metadata(&carrier_before, &carrier_after) || carrier_fs.f_type != carrier_fs_after.f_type)) p3_changed(&c);
   if (c.changed || c.close_failed_at || !source_after_ok || !carrier_after_ok || c.failed) {
@@ -1853,15 +1961,22 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
   napi_value result = p3_object(&c), source = p3_object(&c), filesystem_carrier = p3_object(&c),
     process = p3_object(&c), kernel = p3_object(&c), mount_group = p3_object(&c), configuration = p3_object(&c),
     device = p3_object(&c), block_attributes = p3_object(&c), health = p3_object(&c), health_fields = p3_array(&c), version;
-  if (napi_create_uint32(env, 2, &version) != napi_ok || !p3_property(&c, result, "abiVersion", version) ||
+  if (napi_create_uint32(env, owner->tail ? 3 : 2, &version) != napi_ok || !p3_property(&c, result, "abiVersion", version) ||
       !set_text(env, result, "rootKind", owner->directory ? "directory" : "file") ||
       !set_text(env, result, "rootStage", owner->metadata_only ? "metadata-only" : "readable")) c.failed = true;
   (void)p3_property(&c, source, "before", extended_metadata(env, &before, &fs_before, owner->directory));
   (void)p3_property(&c, source, "after", extended_metadata(env, &after, &fs_after, owner->directory));
   (void)p3_property(&c, source, "metadataCalls", metadata_calls); (void)p3_property(&c, source, "carrierCalls", carrier_calls);
-  if (!set_text(env, filesystem_carrier, "role", owner->metadata_only ? "bootstrap-parent" : "root")) c.failed = true;
+  if (!set_text(env, filesystem_carrier, "role", owner->tail ? "tail-carrier" : owner->metadata_only ? "bootstrap-parent" : "root")) c.failed = true;
   (void)p3_property(&c, filesystem_carrier, "before", extended_metadata(env, &carrier_before, &carrier_fs, carrier_directory));
   (void)p3_property(&c, filesystem_carrier, "after", extended_metadata(env, &carrier_after, &carrier_fs_after, carrier_directory));
+  if (owner->tail) {
+    napi_value binding = p3_object(&c), first = p3_object(&c), last = p3_object(&c);
+    if (!set_big(env, first, "legacyMountId", carrier_legacy_before) || !set_big(env, first, "uniqueMountId", carrier_unique_before) ||
+        !set_big(env, last, "legacyMountId", carrier_legacy_after) || !set_big(env, last, "uniqueMountId", carrier_unique_after)) c.failed = true;
+    (void)p3_property(&c, binding, "before", first); (void)p3_property(&c, binding, "after", last);
+    (void)p3_property(&c, filesystem_carrier, "mount", binding);
+  }
   (void)p3_property(&c, source, "filesystemCarrier", filesystem_carrier);
   (void)p3_property(&c, process, "identity", identity_value); (void)p3_property(&c, process, "threadStatus", thread_status.result);
   (void)p3_property(&c, process, "processStat", process_stat.result); (void)p3_property(&c, process, "namespaces", namespaces_value);
@@ -2002,7 +2117,10 @@ static napi_value read_directory(napi_env env, napi_callback_info info) {
 static napi_value close_owner(napi_env env, napi_callback_info info) {
   size_t count = 1; napi_value args[1]; source_owner *owner;
   if (napi_get_cb_info(env, info, &count, args, NULL, NULL) != napi_ok || count != 1 ||
-      !lookup_owner(env, args[0], &owner) || (owner->fd < 0 && owner->parent_fd < 0))
+      !lookup_owner(env, args[0], &owner))
+    return throw_code(env, "ERR_SOURCE_HANDLE", "Source handle already closed or unknown");
+  if (owner->busy) return throw_code(env, "ERR_SOURCE_BUSY", "Source operation has not settled");
+  if (owner->fd < 0 && owner->parent_fd < 0)
     return throw_code(env, "ERR_SOURCE_HANDLE", "Source handle already closed or unknown");
   napi_value calls;
   if (napi_create_array(env, &calls) != napi_ok) return NULL;
@@ -2012,12 +2130,152 @@ static napi_value close_owner(napi_env env, napi_callback_info info) {
   if (napi_get_undefined(env, &result) != napi_ok) return NULL;
   return result;
 }
+
+/* CFP2: only these fixed operations run on the Node worker pool. The strong
+ * reference owns the actual wrapped descriptor through completion; busy is
+ * changed only on the JS thread, and all other entrypoints reject it before
+ * touching fields the worker may change. No cancellation or GC is completion. */
+typedef struct {
+  source_owner *owner;
+  napi_ref reference;
+  napi_async_work work;
+  napi_deferred deferred;
+  bool closing;
+  bool source_ran, parent_ran;
+  int source_rc, source_error, parent_rc, parent_error, error;
+} source_work;
+
+static void worker_close_slot(int *fd, bool *unknown, int *saved,
+                              bool *ran, int *rc, int *error) {
+  if (*fd < 0 || *unknown) { *error = *saved; return; }
+  *unknown = true; *ran = true;
+  errno = 0; *rc = close(*fd); *error = *rc ? errno : 0;
+  if (!*rc) { *fd = -1; *unknown = false; }
+  else *saved = *error;
+}
+static void source_work_execute(napi_env env, void *data) {
+  (void)env; source_work *work = data; source_owner *owner = work->owner;
+  if (!work->closing) {
+    work->source_ran = true; errno = 0;
+    work->source_rc = fsync(owner->fd);
+    work->error = work->source_error = work->source_rc ? errno : 0;
+    return;
+  }
+  /* Keep this owner's namespace carrier until its source release has ended. */
+  owner->close_started = true;
+  if (owner->tail) worker_close_slot(&owner->parent_fd, &owner->parent_close_unknown, &owner->parent_close_error,
+    &work->parent_ran, &work->parent_rc, &work->parent_error);
+  worker_close_slot(&owner->fd, &owner->close_unknown, &owner->close_error,
+    &work->source_ran, &work->source_rc, &work->source_error);
+  if (!owner->tail) worker_close_slot(&owner->parent_fd, &owner->parent_close_unknown, &owner->parent_close_error,
+    &work->parent_ran, &work->parent_rc, &work->parent_error);
+  work->error = owner->tail && work->parent_error ? work->parent_error : work->source_error ? work->source_error : work->parent_error ? work->parent_error :
+    owner->unresolved_aux_count ? EIO : 0;
+}
+static napi_value source_work_error(napi_env env, napi_value handle, source_work *work, const char *stage) {
+  napi_value result, calls, field, message;
+  work->owner->invalid = true;
+  if (napi_create_string_utf8(env, "Source-file native operation failed", NAPI_AUTO_LENGTH, &message) == napi_ok &&
+        napi_create_error(env, NULL, message, &result) == napi_ok &&
+        napi_create_array(env, &calls) == napi_ok) {
+      if (work->closing && work->owner->tail) (void)append_call(env, calls, "close-tail-carrier", work->parent_ran,
+        work->parent_rc, work->parent_error);
+      (void)append_call(env, calls, work->closing ? work->owner->tail ? "close-tail-metadata" : "close-source" : "fsync-source", work->source_ran,
+        work->source_rc, work->source_error);
+      if (work->closing && !work->owner->tail) (void)append_call(env, calls, "close-bootstrap-parent", work->parent_ran,
+        work->parent_rc, work->parent_error);
+      if (napi_create_string_utf8(env, "ERR_SOURCE_NATIVE_IO", NAPI_AUTO_LENGTH, &field) == napi_ok)
+        (void)napi_set_named_property(env, result, "code", field);
+      if (napi_create_string_utf8(env, stage, NAPI_AUTO_LENGTH, &field) == napi_ok)
+        (void)napi_set_named_property(env, result, "syscall", field);
+      if (napi_create_int32(env, work->error, &field) == napi_ok) (void)napi_set_named_property(env, result, "errno", field);
+      if (napi_create_int32(env, -1, &field) == napi_ok) (void)napi_set_named_property(env, result, "rc", field);
+      (void)napi_set_named_property(env, result, "cleanupCalls", calls);
+      (void)napi_set_named_property(env, result, "nativeCleanupOwner", handle);
+      return result;
+  }
+  return NULL;
+}
+static void source_work_complete(napi_env env, napi_status status, void *data) {
+  source_work *work = data; napi_value result, handle;
+  work->owner->busy = false;
+  if (status != napi_ok && !work->error) work->error = EIO;
+  if (!work->error) {
+    if (napi_get_undefined(env, &result) == napi_ok) (void)napi_resolve_deferred(env, work->deferred, result);
+  } else if (napi_get_reference_value(env, work->reference, &handle) == napi_ok &&
+      (result = source_work_error(env, handle, work, work->closing ? "close-source" : "fsync-source")))
+    (void)napi_reject_deferred(env, work->deferred, result);
+  (void)napi_delete_reference(env, work->reference);
+  (void)napi_delete_async_work(env, work->work);
+  free(work);
+}
+static napi_value start_source_work(napi_env env, napi_callback_info info, bool closing) {
+  size_t count = 1; napi_value args[1], name, promise; source_owner *owner;
+  if (napi_get_cb_info(env, info, &count, args, NULL, NULL) != napi_ok || count != 1 ||
+      !lookup_owner(env, args[0], &owner))
+    return throw_code(env, "ERR_SOURCE_HANDLE", "Expected actual source owner");
+  if (owner->busy) return throw_code(env, "ERR_SOURCE_BUSY", "Source operation has not settled");
+  if (closing ? owner->fd < 0 && owner->parent_fd < 0 :
+      owner->fd < 0 || owner->metadata_only || owner->close_unknown || owner->invalid)
+    return throw_code(env, "ERR_SOURCE_HANDLE", "Source owner cannot start this operation");
+  source_work *work = calloc(1, sizeof(*work));
+  if (!work) {
+    if (closing) owner->close_start_failed = true;
+    return throw_code(env, "ERR_SOURCE_ALLOC", "Source work allocation failed");
+  }
+  work->owner = owner; work->closing = closing;
+  if (napi_create_string_utf8(env, closing ? "source-close" : "source-fsync", NAPI_AUTO_LENGTH, &name) != napi_ok ||
+      napi_create_reference(env, args[0], 1, &work->reference) != napi_ok ||
+      napi_create_promise(env, &work->deferred, &promise) != napi_ok ||
+      napi_create_async_work(env, NULL, name, source_work_execute, source_work_complete, work, &work->work) != napi_ok) {
+    if (closing) owner->close_start_failed = true;
+    if (work->reference) (void)napi_delete_reference(env, work->reference);
+    free(work); return throw_code(env, "ERR_SOURCE_ALLOC", "Source work creation failed");
+  }
+  owner->busy = true;
+  if (napi_queue_async_work(env, work->work) != napi_ok) {
+    if (closing) owner->close_start_failed = true;
+    owner->busy = false;
+    source_work_complete(env, napi_generic_failure, work);
+  }
+  return promise;
+}
+static napi_value synchronize_owner(napi_env env, napi_callback_info info) { return start_source_work(env, info, false); }
+static napi_value close_owner_async(napi_env env, napi_callback_info info) { return start_source_work(env, info, true); }
+/* Allocation/creation/queue failure has not necessarily executed close. Only
+ * this native owner can distinguish that fact. A failed startup may therefore
+ * finish its original slots synchronously, without allocating another worker.
+ * An attempted/unknown close is never repeated, and busy still means in flight.
+ * true is returned only after all actual owned resources are known closed. */
+static napi_value close_owner_unstarted(napi_env env, napi_callback_info info) {
+  size_t count = 1; napi_value args[1], result; source_owner *owner;
+  if (napi_get_cb_info(env, info, &count, args, NULL, NULL) != napi_ok || count != 1 ||
+      !lookup_owner(env, args[0], &owner))
+    return throw_code(env, "ERR_SOURCE_HANDLE", "Expected actual source owner");
+  if (owner->busy) return throw_code(env, "ERR_SOURCE_BUSY", "Source operation has not settled");
+  if (owner->close_start_failed && !owner->close_started) {
+    source_work cleanup = {0}; cleanup.owner = owner; cleanup.closing = true;
+    source_work_execute(env, &cleanup);
+    if (cleanup.error) {
+      result = source_work_error(env, args[0], &cleanup, "close-unstarted");
+      if (result) (void)napi_throw(env, result);
+      return NULL;
+    }
+  }
+  const bool closed = owner->fd < 0 && owner->parent_fd < 0 && !owner->close_unknown &&
+    !owner->parent_close_unknown && owner->unresolved_aux_count == 0;
+  if (napi_get_boolean(env, closed, &result) != napi_ok) return NULL;
+  return result;
+}
 static napi_value init(napi_env env, napi_value exports) {
   const napi_property_descriptor methods[] = {
     { "openRoot", NULL, open_root, NULL, NULL, NULL, napi_default, NULL },
     { "rootInfo", NULL, root_info, NULL, NULL, NULL, napi_default, NULL },
     { "openRootContent", NULL, open_root_content, NULL, NULL, NULL, napi_default, NULL },
     { "openChild", NULL, open_child, NULL, NULL, NULL, napi_default, NULL },
+    { "reopenFile", NULL, reopen_file, NULL, NULL, NULL, napi_default, NULL },
+    { "retainMetadata", NULL, retain_metadata, NULL, NULL, NULL, napi_default, NULL },
+    { "transferCarrier", NULL, transfer_carrier, NULL, NULL, NULL, napi_default, NULL },
     { "observe", NULL, observe, NULL, NULL, NULL, napi_default, NULL },
     { "observeStatx", NULL, observe_statx, NULL, NULL, NULL, napi_default, NULL },
     { "observeStatxUnique", NULL, observe_statx_unique, NULL, NULL, NULL, napi_default, NULL },
@@ -2026,6 +2284,9 @@ static napi_value init(napi_env env, napi_value exports) {
     { "readAt", NULL, read_at, NULL, NULL, NULL, napi_default, NULL },
     { "readDirectory", NULL, read_directory, NULL, NULL, NULL, napi_default, NULL },
     { "close", NULL, close_owner, NULL, NULL, NULL, napi_default, NULL },
+    { "synchronize", NULL, synchronize_owner, NULL, NULL, NULL, napi_default, NULL },
+    { "closeAsync", NULL, close_owner_async, NULL, NULL, NULL, napi_default, NULL },
+    { "closeUnstarted", NULL, close_owner_unstarted, NULL, NULL, NULL, napi_default, NULL },
   };
   if (napi_define_properties(env, exports, sizeof(methods)/sizeof(methods[0]), methods) != napi_ok)
     return NULL;

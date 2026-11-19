@@ -141,7 +141,7 @@ export async function assertControllerPendingFailures(kind: "sqlite" | "postgres
   let original: SourceLock | undefined, operation: Promise<unknown> | undefined, outer: Promise<void> | undefined;
   try {
     const { scope } = await f.adapter.withSourceLock("control", lock => f.writer.beginControllerCommand(f.adapter, f.mutex, lock,
-      { operation: "resume-migration", request: f.request }));
+      { operation: "resume-migration", request: f.request }, f.options));
     const before = await f.adapter.observe(), rows = await f.adapter.observeSourceClients();
     const files = (await readdir(f.store.root, { recursive: true })).sort();
     if (variant === "control-writer") f.state.hook = async stage => { if (stage === "capture-begin") { entered(); await gate; throw later; } };
@@ -220,7 +220,7 @@ export async function assertVerifiedConsumerFailure(kind: "sqlite" | "postgres",
   let throws = 0, consumed = 0;
   const exercise = async () => {
     const { scope } = await f.adapter.withSourceLock("control", lock => f.writer.beginControllerCommand(f.adapter, f.mutex, lock,
-      { operation: "resume-migration", request: f.request }));
+      { operation: "resume-migration", request: f.request }, f.options));
     const before = await f.adapter.observe(), rows = await f.adapter.observeSourceClients();
     outer = f.adapter.withSourceLock("snapshot", async lock => {
       original = lock;

@@ -14,7 +14,7 @@ import { migrations } from "../src/server/db/migrations/index.ts";
 import { resolveBoardroomEnvironment } from "../src/server/environment.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";
-import { loadPersistedPlan, persistMigrationPlan, planMigration, revalidatePlan } from "../src/server/storage/maintenance/plan.ts";
+import { createPreviewGraph, loadPersistedPlan, persistMigrationPlan, planMigration, revalidatePlan } from "./fixtures/maintenance-preview-graph.ts";
 import type { MaintenanceAdapter, OperationMutex } from "../src/server/storage/maintenance/types.ts";
 
 const execute = promisify(execFile);
@@ -135,6 +135,8 @@ async function isolatedCluster(binaryDirectory: string) {
 test("#152 PG real private-cluster restarts preserve sealed source/plan binding, retire old handles and recheck execution capabilities (native prerequisites)",
   { skip: toolsDirectory === undefined, timeout: 180_000 }, async () => {
     const cluster = await isolatedCluster(toolsDirectory!);
+    const configSource = process.platform === "darwin" ? "none" : "file";
+    const preview = await createPreviewGraph(cluster.directory, configSource === "none" ? "production" : "qualified-linux");
     const adapters: MaintenanceAdapter[] = [];
     const createAdapter = async () => {
       const adapter = await createPostgresMaintenanceAdapter({ kind: "postgres", connectionString: cluster.url("source") },
@@ -154,9 +156,9 @@ test("#152 PG real private-cluster restarts preserve sealed source/plan binding,
       finally { await seed.end(); }
       const dataDir = join(cluster.directory, "data"), configFile = join(cluster.directory, "config.json");
       await mkdir(dataDir);
-      await writeFile(configFile, JSON.stringify({ dataDir, dbDriver: "postgres", pgConnectionString: cluster.url("source") }), { mode: 0o600 });
+      if (configSource === "file") await writeFile(configFile, JSON.stringify({ dataDir, dbDriver: "postgres", pgConnectionString: cluster.url("source") }), { mode: 0o600 });
       const environment = await resolveBoardroomEnvironment({ cwd: cluster.directory, homeDir: cluster.directory,
-        env: { AGENT_STUDIO_CONFIG: configFile, BOARDROOM_HOME: join(cluster.directory, "home") } });
+        env: { ...(configSource === "file" ? { AGENT_STUDIO_CONFIG: configFile } : { AGENT_STUDIO_DATA_DIR: dataDir, AGENT_STUDIO_DB_DRIVER: "postgres", AGENT_STUDIO_PG_CONNECTION_STRING: cluster.url("source") }), BOARDROOM_HOME: join(cluster.directory, "home") } });
       const options = { environment, originalCwd: cluster.directory, expectedSourceId: environment.inventory.selectedSourceId!,
         controlRoot: join(dataDir, "maintenance-control"), targetRoot: join(cluster.directory, "future-target") };
       const before = await createAdapter(), idleOld = await createAdapter();
@@ -222,5 +224,5 @@ test("#152 PG real private-cluster restarts preserve sealed source/plan binding,
       console.log(JSON.stringify({ proof: "owned-postgres-child-exit-and-real-restart", sourceBindingPreserved: true,
         oldMutexAndIdleAdapterRejected: true, samePlanAndRootReopened: true, actualDumpAndRestoreAfterRestart: true,
         freshFsyncOffRejected: true, nativeCancelReopenedNewEpoch: true, serviceResumeCancelCertified: false }));
-    } finally { await Promise.all(adapters.map(adapter => adapter.close())); await cluster.close(); }
+    } finally { await Promise.all(adapters.map(adapter => adapter.close())); await preview.close(); await cluster.close(); }
   });

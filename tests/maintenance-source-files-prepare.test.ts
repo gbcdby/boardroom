@@ -1,0 +1,68 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readdir } from "node:fs/promises";
+import { isolatedSourceFiles, sourceFilesFixture, SOURCE_PREPARE_PROFILE } from "./fixtures/maintenance-source-files.ts";
+
+const linuxTest = process.platform === "linux" ? test : test.skip;
+
+linuxTest("CFP2 capture and every live compare prepare while readonly reopens without any sync or output", async () => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ prepare: true });
+  try {
+    const captured = await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+    assert(captured.manifest.rootBindings.every(binding => binding.profile === SOURCE_PREPARE_PROFILE));
+    const initialSyncs = f.state.events.filter(value => value.startsWith("synchronize:")).length;
+    assert(initialSyncs >= 6, "each of the three actual source files is prepared through independent R/V");
+    const firstCount = f.state.events.length;
+    await copy.module.verifyLiveSourceFiles(f.store, f.lock, f.mutex, f.reference, captured.ref);
+    assert.equal(f.state.events.slice(firstCount).filter(value => value.startsWith("synchronize:")).length, initialSyncs);
+    const before = (await readdir(f.store.root, { recursive: true })).sort();
+    for (let repeat = 0; repeat < 2; repeat++) {
+      const start = f.state.events.length;
+      await copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref);
+      const events = f.state.events.slice(start);
+      assert(events.some(value => value.startsWith("read:")), "each readonly invocation performs current bytes again");
+      assert(events.some(value => value === "profile:tail"));
+      assert(!events.some(value => value.startsWith("synchronize:")), "readonly never calls source fsync");
+      assert.deepEqual((await readdir(f.store.root, { recursive: true })).sort(), before);
+      assert.equal(f.state.handles.size, 0);
+    }
+    for (const relative of ["config.json", "sessions/empty", "sessions/nested/binary"]) {
+      const end = f.state.events.indexOf("synchronized:" + relative);
+      assert(end >= 0);
+      const following = f.state.events.slice(end + 1);
+      assert(following.indexOf("closed:" + relative) < following.indexOf("synchronize:" + relative),
+        "the fresh/R close happens before final V sync");
+    }
+  } finally { await f.close(); await copy.close(); }
+});
+
+linuxTest("CFP2 tail close failure blocks Tcut and preserves its actual failure", async () => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ prepare: true });
+  const failure = new Error("real-owner-close-with-synthetic-tail-diagnostic");
+  try {
+    f.state.hook = operation => { if (operation === "closed-carrier") throw failure; };
+    await assert.rejects(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference), (error: any) => {
+      assert.equal(error.tcutReached, false);
+      assert(error.closeErrors.includes(failure)); return true;
+    });
+    assert.equal(f.state.handles.size, 0);
+  } finally { await f.close(); await copy.close(); }
+});
+
+linuxTest("CFP2 a caught read failure remains sticky in the original actual source-lock window", async () => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ prepare: true });
+  try {
+    const captured = await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+    const original = new Error("injected-current-read-io");
+    f.state.hook = operation => { if (operation === "read") throw original; };
+    let failure: unknown;
+    await assert.rejects(copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref), error => {
+      failure = error; return true;
+    });
+    f.state.hook = () => undefined;
+    const at = f.state.events.length;
+    await assert.rejects(copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref), error => error === failure);
+    assert.equal(f.state.events.length, at, "a later new FD/profile cannot clear the same source-lock failure");
+    assert.equal(f.state.handles.size, 0);
+  } finally { await f.close(); await copy.close(); }
+});

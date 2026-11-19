@@ -112,6 +112,28 @@ P3 测试分别记录真实临时文件 owner/getter 与完整 collector 的组�
 
 这些本机普通控制不代替 S 的固定组合检查、独立 REQ/STD、同候选 CI 或真实 qualification。对 statmount/mountinfo/process/config/health 的纯机械正控保留全部未证义务，不能签发成功 profile，也不能把 DM 构建或现场实验转成 P3 资格。
 
+## #152 CFP2：闭文件准备与只读消费者候选
+
+本实现对应已接受的 CLOSED-FILE-PREPARE-2 r2 与尾部载体补充。新判别值为 `linux-native-ext4-fid-fsuuid-source-prepare-v1`，保全策略为 `application-source-preservation-with-prepare-v1`。旧 source-state profile 保持原策略，不被自动升级。新策略允许原已存在逻辑状态的限定物理完成；源字节、身份、权限、时间、xattr/flags、成员及路径仍须逐项保持。它不允许写业务源、全盘同步、修复源或申请额外权限。
+
+| 固定入口 | 真实拥有期与同步 |
+| --- | --- |
+| capture / effectful live compare | 原只读 R 与独立 open 的 V 在首个 fsync 前同时存在；R 同步、同 FD 精确读取、fresh F 检查并关闭、R 后验并关闭、V 同步与后验并关闭。live 比较原 Fs，不重签或补写原清单。 |
+| required readonly compare | 每次重新取得 R/F 和当前完整观察；F 先于 R 关闭。无 V、无源 fsync、无 attempt/payload/目标输出。旧准备结果不能代替当前比较。 |
+| config preview | 原 null 摘要保持；非 null 上限 1 MiB。固定 bootstrap 在普通文件 open 前要求完整新 profile，使用 R/F 与同样的只读尾部，无 prepare 或迁移授权。 |
+
+`synchronize` 与 `closeAsync` 由固定 Node-API worker 执行；原 owner 的强引用保留到实际 syscall 完成，忙碌 owner 不能读、同步重入或提前关闭。没有 `Promise.race`、数值 FD 重试或 GC 代替完成。native/decoder 的实际错误在当前 scope 保留；CFP2 的同一实际 source lock 及当前 controller owner 也保留首错。已明确同步失败与关闭未知分开保存，成功关闭 adapter 不能清掉未知原生资源。
+
+异步 close 的分配、创建或入队失败不等于已经关闭。固定 `closeUnstarted` 只接受原 opaque owner；native 同时证明 close 启动失败且从未执行过 close 时，才同步完成同一 owner 的唯一收尾。该失败路径可能阻塞到真实 syscall 返回，不重置原 120 秒成功期限、不增加同步，也不抹掉启动错误。已尝试、未知或仍忙碌的 close 不会再次执行；TS 仅在真实闭合后移除 ordinary/tail owner。未知结果保留具体 owner、scope 与错误图，阻止重叠源路径的新窗口，并由 controller 的既有 pending 机制保留未决责任；A 失败仍执行 M 的唯一关闭，逐项保留结果。
+
+源目录 D 与同挂载直接父目录 Dp 在最后相关子项及 fresh 目录检查结束后最多同步一次。至多两个根共用同一个 invocation 收束过程，同一 mounted native 目录去重；显式根 mount boundary 保持，子项仍为 `NO_XDEV`。首个准备动作前开始的原 120000 ms 成功预算覆盖解析、读取、资格、原生工作及全部关闭；超时/取消后的真实清理仍须结束，但不能再成功。
+
+文件源普通 owner 关闭前实际取得 O_PATH 元数据 M。尾部 A 通过原 D/Dp 的唯一所有权转交获得，不新开载体、不 dup；其原同步及后验已完成，旧 owner 永久失效。全部其他 R/V/F/D/Dp 及 parent 别名结束后，M/A 执行真实环境、GET_TUNE 与健康观察。ABI 3 明确区分源元数据和 `tail-carrier`，分别核源及载体 metadata/mount。最后按 A→M 实际关闭，任一失败仍保留其他关闭结果。最后 release 后仍可能有新策略允许的既存物理 pending；健康零不等于所有潜伏错误已穷尽。
+
+既有严格 Fs 的 profile、entry digest、qualification digest 只作为收窄比较，在文件 bootstrap promote 前匹配固定 registry。它们不能注册 profile、传入运行模式、注入预算或制造许可。发布清单只有 runtimeEnvironmentDigest 可按原规则变化，其他持久投影仍与原 Fs 严格相等。
+
+普通临时文件的真实 fsync/open/close、控制流合成资格与固定 vendor/device qualification 是三种不同证据。本候选 registry 仍为空，M01/M02/M04/R05/FULL-Q/AC51、六 productionTuple、双库完整恢复与 S4 三个命名产物没有释放。非空配置在当前生产预览中会明确报能力不足；测试正控必须在隔离副本接真实 provider 与合成资格，不能改生产 registry 或跳过原正例。
+
 ## #161 E3：memory object 隔离机械内核
 
 `memory-objects.c` 是独立的 Node-API 8 组件。它实现真实目录与文件 owner、UTF-8/SHA256、不可覆盖发布、同 FD 核验、强同步和收尾；普通 addon **没有 root factory**，也未接入应用启动、source-client、LayoutWindow、数据库保存或 `objects_ready`。本段不表示已取得生产资格。工程范围依据 #161 [E3 接受记录](https://github.com/gbcdby/boardroom/issues/161#issuecomment-6975971607)、[调用预算补充](https://github.com/gbcdby/boardroom/issues/161#issuecomment-6976492513)及[结果解析补充](https://github.com/gbcdby/boardroom/issues/161#issuecomment-6977509921)。

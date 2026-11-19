@@ -17,7 +17,7 @@ import { createPipeBridge } from "../src/server/runtime/isolation/pipe-bridge.ts
 import { migrations } from "../src/server/db/migrations/index.ts";
 import { resolveBoardroomEnvironment } from "../src/server/environment.ts";
 import { createSqliteMaintenanceAdapter } from "../src/server/storage/maintenance/sqlite.ts";
-import { planMigration, persistMigrationPlan } from "../src/server/storage/maintenance/plan.ts";
+import { createPreviewGraph, planMigration, persistMigrationPlan } from "./fixtures/maintenance-preview-graph.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { verifyJournalChain } from "../src/server/storage/maintenance/journal.ts";
 import { buildSourceClientsRoster, sourceClientsDigest } from "../src/server/storage/maintenance/source-clients.ts";
@@ -32,6 +32,9 @@ async function fixture(withClient = false, encoding: "UTF-8" | "UTF-16le" | "UTF
   setup?: (driver: SqliteDriver, directory: string) => Promise<Partial<StorageClientLifecycle>>, initialGeneration = 1) {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), "br-source-facts-")));
   const dataDir = path.join(directory, "data"); await mkdir(dataDir);
+  // Source-facts protocol coverage uses the actual null-config path on Darwin.
+  const configSource = process.platform === "darwin" ? "none" : "file";
+  const preview = await createPreviewGraph(directory, configSource === "none" ? "production" : "qualified-linux");
   const file = path.join(dataDir, "agent-studio.db"), configFile = path.join(directory, "config.json");
   const db = new Database(file);
   try {
@@ -40,9 +43,9 @@ async function fixture(withClient = false, encoding: "UTF-8" | "UTF-16le" | "UTF
     if (initialGeneration > 1) db.prepare("UPDATE storage_maintenance SET owner_generation=?,fence_epoch=?")
       .run(initialGeneration - 1, 2 * (initialGeneration - 1));
   } finally { db.close(); }
-  await writeFile(configFile, JSON.stringify({ dataDir }));
+  if (configSource === "file") await writeFile(configFile, JSON.stringify({ dataDir }));
   const environment = await resolveBoardroomEnvironment({ cwd: directory, homeDir: directory,
-    env: { AGENT_STUDIO_CONFIG: configFile, BOARDROOM_HOME: path.join(directory, "home") } });
+    env: { ...(configSource === "file" ? { AGENT_STUDIO_CONFIG: configFile } : { AGENT_STUDIO_DATA_DIR: dataDir }), BOARDROOM_HOME: path.join(directory, "home") } });
   assert.equal(environment.databaseDescriptor.kind, "sqlite");
   const adapter = await createSqliteMaintenanceAdapter(environment.databaseDescriptor as never);
   let mutex: OperationMutex | undefined;
@@ -96,10 +99,10 @@ async function fixture(withClient = false, encoding: "UTF-8" | "UTF-16le" | "UTF
     await sourceClient?.refresh();
     const receipt = await sourceClient?.waitForDrain();
     return { directory, dataDir, environment, options, file, adapter, store, reference, plan, head, mutex, sourceClient, receipt,
-      async close() { await sourceClient?.close(); await mutex!.release(); await adapter.close(); await rm(directory, { recursive: true }); } };
+      async close() { await sourceClient?.close(); await mutex!.release(); await adapter.close(); await preview.close(); await rm(directory, { recursive: true }); } };
   } catch (error) {
     if (native && native.exitCode === null && native.signalCode === null) { native.kill("SIGKILL"); await nativeDone?.catch(() => {}); }
-    await sourceClient?.close(); await mutex?.release(); await adapter.close(); await rm(directory, { recursive: true }); throw error;
+    await sourceClient?.close(); await mutex?.release(); await adapter.close(); await preview.close(); await rm(directory, { recursive: true }); throw error;
   }
 }
 

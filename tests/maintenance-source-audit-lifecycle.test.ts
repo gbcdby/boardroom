@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { copyFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
-import { sqliteAuditFixture } from "./fixtures/maintenance-source-audit.ts";
+import { protocolSqliteAuditFixture as sqliteAuditFixture } from "./fixtures/maintenance-source-audit.ts";
 import type { OperationMutex } from "../src/server/storage/maintenance/types.ts";
 import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
 

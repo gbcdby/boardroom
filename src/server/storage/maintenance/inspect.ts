@@ -8,7 +8,7 @@ import type { VerifiedJournalChain } from "./journal.ts";
 import { rowsDigest } from "./control-candidate/replay-core.ts";
 import { bindSourceClientManifestRows, supportedEncoding, validateHistoricalControllerProfile } from "./control-candidate/rows.ts";
 import { ArtifactStore } from "./objects.ts";
-import { loadPersistedPlan, observeCapturePlanBindings } from "./plan.ts";
+import { loadPersistedPlan, revalidatePlan } from "./plan.ts";
 import { factsObject, inspectRegisteredSourceProcess } from "./source-facts.ts";
 import type { Blocker, BlockerCode, MaintenanceAdapter, MaintenanceResult, MaintenanceServiceOptions, MigrationPlan, ObservedMaintenanceAnchor, SourceObservation } from "./types.ts";
 
@@ -140,7 +140,7 @@ export async function inspectMaintenance(options: MaintenanceServiceOptions, val
     result = await inspectAnchor(store, initial, plan, owner.adapter);
     // Open terminal is historical. Legitimate later business/config changes
     // cannot resurrect its old frozen state or require a second cancellation.
-    if (result.status !== "cancelled") await observeCapturePlanBindings(plan, options, owner.adapter);
+    if (result.status !== "cancelled") await revalidatePlan(plan, options, owner.adapter);
     await store.assertRoot(); await awaitControllerAdmission(owner);
     requireValue(same(await owner.adapter.observe(), initial), "maintenance_lost");
   } catch (error) { recordControllerFailure(owner, failures, error); }

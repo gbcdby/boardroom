@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { open, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { inspectPreJq } from "../src/server/storage/maintenance/inspect-pre-jq.ts";
+import { assertProtocolNonNullRefusal, inspectPreJq } from "./fixtures/maintenance-preview-graph.ts";
 import { verifyJournalChain } from "../src/server/storage/maintenance/journal.ts";
 import { createSqliteMaintenanceAdapter } from "../src/server/storage/maintenance/sqlite.ts";
-import { appendPlanned, appendStructuralCapture, artifactInventory, changeReceiptGeneration, inspectRequest, postgresInspectFixture, sqliteInspectFixture } from "./fixtures/maintenance-inspect-pre-jq.ts";
+import { appendPlanned, appendStructuralCapture, artifactInventory, changeReceiptGeneration, inspectRequest, protocolPostgresInspectFixture as postgresInspectFixture, protocolSqliteInspectFixture as sqliteInspectFixture } from "./fixtures/maintenance-inspect-pre-jq.ts";
 import type { JournalRecordV2, MaintenanceResult, PersistedPlanRef, SourceClientFactsWindow, SourceLock } from "../src/server/storage/maintenance/types.ts";
 
 function blocked(result: MaintenanceResult, code: string) {
@@ -162,9 +162,12 @@ test("pre-Jq revalidates source selection, config, root identity and strict requ
     const call = (options = f.options, request = inspectRequest(f)) => f.adapter.withSourceLock("control",
       lock => inspectPreJq(options, f.adapter, f.mutex, lock, request));
     blocked(await call({ ...f.options, expectedSourceId: "another-source" }), "source_changed");
-    const config = await readFile(f.configFile);
-    try { await writeFile(f.configFile, Buffer.concat([config, Buffer.from(" \n")])); blocked(await call(), "plan_stale"); }
-    finally { await writeFile(f.configFile, config); }
+    if (process.platform === "darwin") await assertProtocolNonNullRefusal(f.options, f.adapter);
+    else {
+      const config = await readFile(f.configFile);
+      try { await writeFile(f.configFile, Buffer.concat([config, Buffer.from(" \n")])); blocked(await call(), "plan_stale"); }
+      finally { await writeFile(f.configFile, config); }
+    }
     // A root locator substitution is rejected before it can select another plan or directory.
     blocked(await call(f.options, { ...inspectRequest(f), plan: { ...f.reference, controlRoot: f.directory } }), "control_root_mismatch");
     blocked(await call(f.options, { ...inspectRequest(f), callerVerified: true } as never), "request_conflict");
@@ -208,6 +211,11 @@ test("pre-Jq cannot combine a native source lock with a different actual source 
 test("pre-Jq final classification rechecks config and exact journal after the native facts window closes", async t => {
   for (const changed of ["config", "journal"] as const) await t.test(changed, async () => {
     const f = await sqliteInspectFixture();
+    if (changed === "config" && process.platform === "darwin") {
+      try { await assertProtocolNonNullRefusal(f.options, f.adapter); }
+      finally { await f.close(); }
+      return;
+    }
     const file = changed === "config" ? f.configFile : path.join(f.store.root, f.head.ref), bytes = await readFile(file);
     try {
       const before = await f.adapter.observe();

@@ -134,14 +134,16 @@ export interface SourceFileBlockAttributes {
   readonly diskSequence: SourceFileContextFact<SourceFileKernelReadValue>;
 }
 export interface SourceFileRootEnvironment {
-  readonly abiVersion: 2;
+  readonly abiVersion: 2 | 3;
   readonly rootKind: SourceFileMetadata["kind"];
   readonly rootStage: SourceFileRootInfo["stage"];
   readonly source: {
     readonly before: SourceFileExtendedMetadata; readonly after: SourceFileExtendedMetadata;
     readonly metadataCalls: readonly SourceFileNativeCall[];
-    readonly filesystemCarrier: { readonly role: "root" | "bootstrap-parent";
-      readonly before: SourceFileExtendedMetadata; readonly after: SourceFileExtendedMetadata };
+    readonly filesystemCarrier: { readonly role: "root" | "bootstrap-parent" | "tail-carrier";
+      readonly before: SourceFileExtendedMetadata; readonly after: SourceFileExtendedMetadata;
+      readonly mount?: { readonly before: { readonly legacyMountId: bigint; readonly uniqueMountId: bigint };
+        readonly after: { readonly legacyMountId: bigint; readonly uniqueMountId: bigint } } };
     readonly carrierCalls: readonly SourceFileNativeCall[];
   };
   readonly process: {
@@ -193,6 +195,12 @@ interface NativeSourceBinding {
   readAt(owner: object, offset: bigint, length: number): unknown;
   readDirectory(owner: object): unknown;
   close(owner: object): void;
+  reopenFile(owner: object): object;
+  synchronize(owner: object): Promise<void>;
+  closeAsync(owner: object): Promise<void>;
+  closeUnstarted(owner: object): boolean;
+  retainMetadata(owner: object): object;
+  transferCarrier(metadata: object, carrier: object): void;
 }
 export interface SourceFileHandle {
   readonly kind: SourceFileMetadata["kind"];
@@ -204,12 +212,31 @@ export interface SourceFileHandle {
   readAt(offset: bigint, length: number): Buffer;
   readDirectory(): readonly string[];
   close(): void;
+  reopenFile(): SourceFileHandle;
+  synchronize(): Promise<void>;
+  closeAsync(): Promise<void>;
+}
+/** Private native provenance still applies: a copied object cannot acquire M/A. */
+export interface SourceFileMetadataTail {
+  transferCarrier(carrier: SourceFileHandle): void;
+  observe(): SourceFileBootstrapContext;
+  closeAsync(): Promise<void>;
+}
+/** A comparison with an already strictly decoded Fs. It can only reject a
+ * fixed qualified profile; it cannot register, select or authorize one. */
+export interface SourceFileExpectedProfile {
+  readonly profile: string;
+  readonly profileEntryDigest: string;
+  readonly qualificationDigest: string;
 }
 interface SourceScope {
+  readonly root: string;
   readonly binding: NativeSourceBinding;
   readonly opened: Set<OwnedSourceFile>;
   readonly failures: unknown[];
   active: boolean;
+  readonly pending: Set<Promise<void>>;
+  readonly tails: Set<SourceFileMetadataTail>;
 }
 interface SourceOwnerState {
   readonly owner: object;
@@ -218,6 +245,8 @@ interface SourceOwnerState {
   readonly root: boolean;
   bootstrap?: object;
   closed: boolean;
+  pending?: Promise<void>;
+  closing?: Promise<void>;
 }
 const sourceOwners = new WeakMap<object, SourceOwnerState>();
 interface SourceBootstrapState {
@@ -232,7 +261,7 @@ interface SourceBootstrapState {
 const sourceBootstraps = new WeakMap<object, SourceBootstrapState>();
 function activeOwner(handle: unknown, closing = false): SourceOwnerState {
   const state = handle && typeof handle === "object" ? sourceOwners.get(handle) : undefined;
-  if (!state || !state.scope.active || state.closed || !closing && state.scope.failures.length > 0)
+  if (!state || !state.scope.active || state.closed || !closing && (state.scope.failures.length > 0 || state.pending || state.closing))
     throw new MaintenanceFailure("maintenance_lost", "source-file-owner");
   return state;
 }
@@ -272,7 +301,8 @@ function binding(): NativeSourceBinding {
   try { native = createRequire(import.meta.url)(sourceFileNativePath) as NativeSourceBinding; }
   catch { throw unavailable(); }
   for (const method of ["openRoot", "rootInfo", "openRootContent", "observeEnvironment", "openChild", "observe",
-    "observeStatx", "observeStatxUnique", "observeExtended", "readAt", "readDirectory", "close"] as const) {
+    "observeStatx", "observeStatxUnique", "observeExtended", "readAt", "readDirectory", "close",
+    "reopenFile", "synchronize", "closeAsync", "closeUnstarted", "retainMetadata", "transferCarrier"] as const) {
     if (typeof native[method] !== "function") throw unavailable();
   }
   cached = native;
@@ -337,11 +367,11 @@ function checkedExtendedMetadata(value: unknown, kind: SourceFileMetadata["kind"
 function sameMetadata(left: SourceFileExtendedMetadata, right: SourceFileExtendedMetadata): boolean {
   return metadataFields.every(key => left[key] === right[key]);
 }
-function checkedRootInfo(value: unknown): SourceFileRootInfo {
+function checkedRootInfo(value: unknown, tail = false): SourceFileRootInfo {
   const item = exactObject(value, ["abiVersion", "kind", "stage", "metadata"]);
   if (item.abiVersion !== 1 || item.kind !== "file" && item.kind !== "directory"
     || item.stage !== "metadata-only" && item.stage !== "readable"
-    || item.kind === "directory" && item.stage !== "readable") throw invalidContext();
+    || !tail && item.kind === "directory" && item.stage !== "readable") throw invalidContext();
   return Object.freeze({ abiVersion: 1, kind: item.kind, stage: item.stage,
     metadata: checkedExtendedMetadata(item.metadata, item.kind) });
 }
@@ -827,12 +857,12 @@ function checkedGraphFact(value: unknown): SourceFileContextFact<SourceFileDevic
   for (const node of nodes) depth(node.index, new Set());
   return Object.freeze({ status: "observed", reason: null, value: Object.freeze({ nodes: Object.freeze(nodes), edges: Object.freeze(edges) }), calls });
 }
-function checkedEnvironment(value: unknown, info: SourceFileRootInfo): SourceFileRootEnvironment {
+function checkedEnvironment(value: unknown, info: SourceFileRootInfo, tail = false): SourceFileRootEnvironment {
   const item = exactObject(value, ["abiVersion", "rootKind", "rootStage", "source", "process", "kernel", "mount", "configuration", "device", "health", "auxiliaryCalls"]);
-  if (item.abiVersion !== 2 || item.rootKind !== info.kind || item.rootStage !== info.stage) throw invalidContext();
+  if (item.abiVersion !== (tail ? 3 : 2) || item.rootKind !== info.kind || item.rootStage !== info.stage) throw invalidContext();
   const source = exactObject(item.source, ["before", "after", "metadataCalls", "filesystemCarrier", "carrierCalls"]);
-  const carrier = exactObject(source.filesystemCarrier, ["role", "before", "after"]), parent = info.stage === "metadata-only";
-  if (carrier.role !== (parent ? "bootstrap-parent" : "root")) throw invalidContext();
+  const carrier = exactObject(source.filesystemCarrier, tail ? ["role", "before", "after", "mount"] : ["role", "before", "after"]), parent = info.stage === "metadata-only";
+  if (carrier.role !== (tail ? "tail-carrier" : parent ? "bootstrap-parent" : "root") || tail && !parent) throw invalidContext();
   const before = checkedExtendedMetadata(source.before, info.kind), after = checkedExtendedMetadata(source.after, info.kind);
   const carrierBefore = checkedExtendedMetadata(carrier.before, parent ? "directory" : info.kind);
   const carrierAfter = checkedExtendedMetadata(carrier.after, parent ? "directory" : info.kind);
@@ -878,8 +908,25 @@ function checkedEnvironment(value: unknown, info: SourceFileRootInfo): SourceFil
   const binding = checkedDeviceBinding(device.binding), dev = read(device.dev, 4096, 0x62656572n, 2);
   const auxiliaryCalls = checkedAuxiliaryCalls(item.auxiliaryCalls, true, topology.status === "unavailable");
   const blockAttributes = checkedBlockAttributes(device.blockAttributes, before, { binding, dev, topology }, auxiliaryCalls);
-  return Object.freeze({ abiVersion: 2, rootKind: info.kind, rootStage: info.stage,
-    source: Object.freeze({ before, after, metadataCalls, filesystemCarrier: Object.freeze({ role: parent ? "bootstrap-parent" : "root", before: carrierBefore, after: carrierAfter }), carrierCalls }),
+  let carrierMount: SourceFileRootEnvironment["source"]["filesystemCarrier"]["mount"];
+  if (tail) {
+    const pair = exactObject(carrier.mount, ["before", "after"]);
+    const parsePair = (value: unknown) => {
+      const row = exactObject(value, ["legacyMountId", "uniqueMountId"]);
+      return Object.freeze({ legacyMountId: unsigned(row.legacyMountId, 0xffffffffffffffffn, 1n),
+        uniqueMountId: unsigned(row.uniqueMountId, 0xffffffffffffffffn, 1n) });
+    };
+    const first = parsePair(pair.before), last = parsePair(pair.after);
+    const legacy = abi(mount.legacyStatx, "statx-legacy", 256, 2), unique = abi(mount.uniqueStatx, "statx-unique", 256, 2);
+    if (first.legacyMountId !== last.legacyMountId || first.uniqueMountId !== last.uniqueMountId
+      || legacy.status !== "observed" || unique.status !== "observed"
+      || legacy.value.readBigUInt64LE(144) !== first.legacyMountId || unique.value.readBigUInt64LE(144) !== first.uniqueMountId) throw sourceChanged();
+    carrierMount = Object.freeze({ before: first, after: last });
+  }
+  return Object.freeze({ abiVersion: tail ? 3 : 2, rootKind: info.kind, rootStage: info.stage,
+    source: Object.freeze({ before, after, metadataCalls, filesystemCarrier: Object.freeze({
+      role: tail ? "tail-carrier" : parent ? "bootstrap-parent" : "root", before: carrierBefore, after: carrierAfter,
+      ...(carrierMount ? { mount: carrierMount } : {}) }), carrierCalls }),
     process: Object.freeze({ identity: checkedProcessIdentity(process.identity), threadStatus: read(process.threadStatus, 65536, 0x9fa0n),
       processStat: read(process.processStat, 8192, 0x9fa0n), namespaces: checkedNamespaces(process.namespaces) }),
     kernel: Object.freeze({ uname: abi(kernel.uname, "uname", 390), notes: read(kernel.notes, 1048576, 0x62656572n), config }),
@@ -951,15 +998,60 @@ function checkedExtended(value: unknown, kind: SourceFileMetadata["kind"]): Sour
   return item as unknown as SourceFileExtendedObservation;
 }
 
-/** Called only for exceptions from the fixed native binding. Its cleanup has
- * already attempted every known resource; retain the original error/opaque
- * cleanup owner and never retry an unknown numeric descriptor. */
-function recordNativeCleanupFailure(scope: SourceScope, error: unknown): void {
-  if (!error || typeof error !== "object") return;
-  const calls = Object.getOwnPropertyDescriptor(error, "cleanupCalls")?.value as unknown;
-  if (Array.isArray(calls) && calls.some(call => call && typeof call === "object"
-    && typeof call.operation === "string" && (call.operation.startsWith("close-") || call.operation === "closedir-source")
-    && call.rc === -1n && typeof call.errno === "bigint" && call.errno > 0n)) scope.failures.push(error);
+function sourceCall<T>(scope: SourceScope, consume: () => T, handle?: OwnedSourceFile): T {
+  try { return consume(); }
+  catch (error) {
+    // Rejected argument syntax starts no syscall and is not observed source
+    // I/O. All actual native/decoder failures remain sticky for this scope.
+    if ((error as { code?: unknown } | null)?.code !== "ERR_SOURCE_ARGUMENT"
+      && !scope.failures.some(value => Object.is(value, error))) scope.failures.push(error);
+    const state = handle && sourceOwners.get(handle);
+    const native = error as { nativeCleanupOwner?: unknown; cleanupCalls?: unknown } | null;
+    if (state && native?.nativeCleanupOwner === state.owner && Array.isArray(native.cleanupCalls)) {
+      const source = native.cleanupCalls.find(call => call?.operation === "close-source");
+      const parent = native.cleanupCalls.find(call => call?.operation === "close-bootstrap-parent");
+      if (source?.rc === 0n && source.errno === 0n && parent && (parent.rc === null || parent.rc === 0n && parent.errno === 0n)) {
+        // The actual native error path already joined and closed these slots.
+        // Retain the error, but never issue a new close against reused integers.
+        state.closed = true; scope.opened.delete(handle); state.closing = Promise.resolve();
+      }
+    }
+    throw error;
+  }
+}
+
+interface NativeCloseState {
+  readonly owner: object;
+  readonly scope: SourceScope;
+  closed: boolean;
+}
+// Retain the concrete original owner/scope, not just a rejected Promise or a
+// numeric descriptor. No fresh overlapping source window may bypass it.
+const unresolvedNativeCloses = new Set<NativeCloseState>();
+function unresolvedClose(state: NativeCloseState, cause: unknown = state.scope.failures[0]): MaintenanceFailure {
+  const error = new MaintenanceFailure("maintenance_lost", "source-file-close-unresolved");
+  Object.defineProperties(error, { nativeCleanupOwner: { value: state.owner }, cause: { value: cause } });
+  return error;
+}
+async function closeNativeOwner(state: NativeCloseState): Promise<void> {
+  let first: unknown;
+  try {
+    const work = state.scope.binding.closeAsync(state.owner);
+    if (!(work instanceof Promise)) throw invalidContext();
+    await work; state.closed = true; return;
+  } catch (error) { first = error; state.scope.failures.push(error); }
+  // Only native state can establish that no close syscall was started. The
+  // fallback does not allocate/queue another worker and cannot retry an
+  // attempted/unknown close. It may block until its real syscall returns;
+  // this is failed-window cleanup, never a new success budget or a sync.
+  try { state.closed = state.scope.binding.closeUnstarted(state.owner) === true; }
+  catch (error) { state.scope.failures.push(error); }
+  if (!state.closed) {
+    unresolvedNativeCloses.add(state);
+    state.scope.failures.push(unresolvedClose(state, first));
+  }
+  // Even successful actual cleanup cannot erase the original start/I/O error.
+  throw first;
 }
 
 class OwnedSourceFile implements SourceFileHandle {
@@ -975,44 +1067,50 @@ class OwnedSourceFile implements SourceFileHandle {
   }
   observeStatx(): SourceFileStatxObservation {
     const { scope, owner, kind } = activeOwner(this);
-    return checkedStatx(scope.binding.observeStatx(owner), kind);
+    return sourceCall(scope, () => checkedStatx(scope.binding.observeStatx(owner), kind), this);
   }
   observeStatxUnique(): SourceFileUniqueStatxObservation {
     const { scope, owner, kind } = activeOwner(this);
-    if (typeof scope.binding.observeStatxUnique !== "function") throw unavailable();
-    return checkedUniqueStatx(scope.binding.observeStatxUnique(owner), kind);
+    return sourceCall(scope, () => {
+      if (typeof scope.binding.observeStatxUnique !== "function") throw unavailable();
+      return checkedUniqueStatx(scope.binding.observeStatxUnique(owner), kind);
+    }, this);
   }
   observeExtended(): SourceFileExtendedObservation {
     const { scope, owner, kind } = activeOwner(this);
-    return checkedExtended(scope.binding.observeExtended(owner), kind);
+    return sourceCall(scope, () => checkedExtended(scope.binding.observeExtended(owner), kind), this);
   }
   openChild(leaf: string, kind: SourceFileMetadata["kind"]): SourceFileHandle {
     const state = activeOwner(this);
     if (state.kind !== "directory") throw sourceChanged();
-    try { return new OwnedSourceFile(state.scope.binding.openChild(state.owner, leaf, kind), kind, state.scope); }
-    catch (error) { recordNativeCleanupFailure(state.scope, error); throw error; }
+    return sourceCall(state.scope, () => {
+      return new OwnedSourceFile(state.scope.binding.openChild(state.owner, leaf, kind), kind, state.scope);
+    }, this);
   }
   readAt(offset: bigint, length: number): Buffer {
     const { scope, owner, kind } = activeOwner(this);
     if (kind !== "file" || typeof offset !== "bigint" || offset < 0n ||
       !Number.isSafeInteger(length) || length < 1 || length > 65536) throw sourceChanged();
-    const data = scope.binding.readAt(owner, offset, length);
-    if (!Buffer.isBuffer(data) || data.length > length) throw sourceChanged();
-    return data;
+    return sourceCall(scope, () => {
+      const data = scope.binding.readAt(owner, offset, length);
+      if (!Buffer.isBuffer(data) || data.length > length) throw sourceChanged();
+      return data;
+    }, this);
   }
   readDirectory(): readonly string[] {
     const { scope, owner, kind } = activeOwner(this);
     if (kind !== "directory") throw sourceChanged();
-    let names: unknown;
-    try { names = scope.binding.readDirectory(owner); }
-    catch (error) { recordNativeCleanupFailure(scope, error); throw error; }
-    if (!Array.isArray(names) || names.length > 4096 || names.some(value =>
-      typeof value !== "string" || !value || value === "." || value === ".." ||
-      value.includes("/") || value.includes("\0")) || new Set(names).size !== names.length) throw sourceChanged();
-    return [...names].sort();
+    return sourceCall(scope, () => {
+      const names = scope.binding.readDirectory(owner);
+      if (!Array.isArray(names) || names.length > 4096 || names.some(value =>
+        typeof value !== "string" || !value || value === "." || value === ".." ||
+        value.includes("/") || value.includes("\0")) || new Set(names).size !== names.length) throw sourceChanged();
+      return [...names].sort();
+    }, this);
   }
   close(): void {
     const state = activeOwner(this, true);
+    if (state.pending || state.closing) throw new MaintenanceFailure("maintenance_lost", "source-file-native-pending");
     try { state.scope.binding.close(state.owner); }
     catch (error) {
       state.scope.failures.push(error);
@@ -1023,8 +1121,112 @@ class OwnedSourceFile implements SourceFileHandle {
     state.closed = true;
     state.scope.opened.delete(this);
   }
+  reopenFile(): SourceFileHandle {
+    const state = activeOwner(this);
+    if (state.kind !== "file") throw sourceChanged();
+    try { return new OwnedSourceFile(state.scope.binding.reopenFile(state.owner), "file", state.scope, state.root); }
+    catch (error) { state.scope.failures.push(error); throw error; }
+  }
+  synchronize(): Promise<void> {
+    const state = activeOwner(this);
+    if (state.pending || state.closing) throw new MaintenanceFailure("maintenance_lost", "source-file-native-pending");
+    let work: Promise<void>;
+    try { work = state.scope.binding.synchronize(state.owner); }
+    catch (error) { state.scope.failures.push(error); throw error; }
+    const original = work.catch(error => { state.scope.failures.push(error); throw error; }).finally(() => {
+      if (state.pending === original) delete state.pending;
+      state.scope.pending.delete(original);
+    });
+    state.pending = original; state.scope.pending.add(original);
+    void original.catch(() => undefined);
+    return original;
+  }
+  closeAsync(): Promise<void> {
+    const state = sourceOwners.get(this);
+    if (state?.closing) return state.closing;
+    if (!state || !state.scope.active || state.closed)
+      return Promise.reject(new MaintenanceFailure("maintenance_lost", "source-file-owner"));
+    const pending = state.pending;
+    const original = Promise.resolve().then(async () => {
+      // A sync rejection is already sticky. Its actual completion still must
+      // precede this owner's unique close, including failure cleanup.
+      if (pending) await Promise.allSettled([pending]);
+      await closeNativeOwner(state);
+    }).finally(() => {
+      if (state.closed) state.scope.opened.delete(this);
+      state.scope.pending.delete(original);
+    });
+    state.closing = original; state.scope.pending.add(original);
+    void original.catch(() => undefined);
+    return original;
+  }
 }
 Object.freeze(OwnedSourceFile.prototype);
+
+interface MetadataTailState {
+  readonly owner: object; readonly source: SourceFileHandle; readonly scope: SourceScope;
+  attached: boolean; closed: boolean; closing?: Promise<void>;
+}
+const metadataTails = new WeakMap<object, MetadataTailState>();
+function activeTail(tail: object): MetadataTailState {
+  const state = metadataTails.get(tail);
+  if (!state || !state.scope.active || state.closed || state.closing || state.scope.failures.length)
+    throw new MaintenanceFailure("maintenance_lost", "source-file-tail");
+  return state;
+}
+class OwnedMetadataTail implements SourceFileMetadataTail {
+  constructor(owner: object, source: SourceFileHandle, scope: SourceScope) {
+    metadataTails.set(this, { owner, source, scope, attached: false, closed: false });
+    scope.tails.add(this); Object.freeze(this);
+  }
+  transferCarrier(carrier: SourceFileHandle): void {
+    const state = activeTail(this), original = activeOwner(carrier);
+    if (state.attached || original.kind !== "directory" || state.scope.binding !== original.scope.binding)
+      throw sourceChanged();
+    try { state.scope.binding.transferCarrier(state.owner, original.owner); }
+    catch (error) { state.scope.failures.push(error); throw error; }
+    // The native descriptor moved; this is not its release. Only the M/A owner
+    // may now close it, and the old scope must never retry that numeric slot.
+    original.closed = true; original.scope.opened.delete(carrier as OwnedSourceFile);
+    state.attached = true;
+  }
+  observe(): SourceFileBootstrapContext {
+    const state = activeTail(this), source = sourceOwners.get(state.source);
+    if (!state.attached || !source?.closed || state.scope.opened.size || state.scope.pending.size)
+      throw new MaintenanceFailure("maintenance_lost", "source-file-tail-before-source-close");
+    try {
+      const before = checkedRootInfo(state.scope.binding.rootInfo(state.owner), true);
+      if (before.stage !== "metadata-only") throw invalidContext();
+      const environment = checkedEnvironment(nativeEnvironment(state.scope, state.owner), before, true);
+      recordAuxiliaryFailure(state.scope, environment);
+      const after = checkedRootInfo(state.scope.binding.rootInfo(state.owner), true);
+      if (after.kind !== before.kind || after.stage !== before.stage || !sameMetadata(before.metadata, after.metadata)) throw sourceChanged();
+      return Object.freeze({ info: before, environment });
+    } catch (error) { if (!state.scope.failures.some(value => Object.is(value, error))) state.scope.failures.push(error); throw error; }
+  }
+  closeAsync(): Promise<void> {
+    const state = metadataTails.get(this);
+    if (state?.closing) return state.closing;
+    if (!state || !state.scope.active || state.closed)
+      return Promise.reject(new MaintenanceFailure("maintenance_lost", "source-file-tail"));
+    const original = Promise.resolve().then(() => closeNativeOwner(state))
+      .finally(() => {
+        if (state.closed) state.scope.tails.delete(this);
+        state.scope.pending.delete(original);
+      });
+    state.closing = original; state.scope.pending.add(original); void original.catch(() => undefined);
+    return original;
+  }
+}
+Object.freeze(OwnedMetadataTail.prototype);
+export function retainSourceFileMetadata(root: SourceFileHandle): SourceFileMetadataTail {
+  const state = activeRoot(root);
+  try { return new OwnedMetadataTail(state.scope.binding.retainMetadata(state.owner), root, state.scope); }
+  catch (error) { state.scope.failures.push(error); throw error; }
+}
+export function assertSourceFileTailFor(tail: SourceFileMetadataTail, root: SourceFileHandle): void {
+  if (activeTail(tail).source !== root) throw new MaintenanceFailure("maintenance_lost", "source-file-tail-origin");
+}
 
 function closeBootstrap(state: SourceBootstrapState): void {
   if (state.closed) return;
@@ -1083,60 +1285,78 @@ function nativeEnvironment(scope: SourceScope, owner: object): unknown {
 export function assertSourceFileRootActive(root: SourceFileHandle): void { activeRoot(root); }
 export function observeSourceFileRootContext(root: SourceFileHandle): SourceFileRootContext {
   const state = activeRoot(root), native = state.scope.binding;
-  if (typeof native.observeEnvironment !== "function") throw unavailable();
-  const before = checkedRootInfo(native.rootInfo(state.owner));
-  if (before.kind !== state.kind || before.stage !== "readable") throw sourceChanged();
-  const extended = checkedExtended(native.observeExtended(state.owner), state.kind);
-  const legacy = checkedStatx(native.observeStatx(state.owner), state.kind);
-  const unique = checkedUniqueStatx(native.observeStatxUnique(state.owner), state.kind);
-  const environment = checkedEnvironment(nativeEnvironment(state.scope, state.owner), before);
-  recordAuxiliaryFailure(state.scope, environment);
-  const after = checkedRootInfo(native.rootInfo(state.owner));
-  if (after.kind !== before.kind || after.stage !== before.stage || !sameMetadata(before.metadata, after.metadata)
-    || !sameMetadata(before.metadata, extended.before) || !sameMetadata(extended.before, extended.after)) throw sourceChanged();
-  return Object.freeze({ info: before, root: detached(extended), legacyStatx: legacy, uniqueStatx: unique, environment });
+  return sourceCall(state.scope, () => {
+    if (typeof native.observeEnvironment !== "function") throw unavailable();
+    const before = checkedRootInfo(native.rootInfo(state.owner));
+    if (before.kind !== state.kind || before.stage !== "readable") throw sourceChanged();
+    const extended = checkedExtended(native.observeExtended(state.owner), state.kind);
+    const legacy = checkedStatx(native.observeStatx(state.owner), state.kind);
+    const unique = checkedUniqueStatx(native.observeStatxUnique(state.owner), state.kind);
+    const environment = checkedEnvironment(nativeEnvironment(state.scope, state.owner), before);
+    recordAuxiliaryFailure(state.scope, environment);
+    const after = checkedRootInfo(native.rootInfo(state.owner));
+    if (after.kind !== before.kind || after.stage !== before.stage || !sameMetadata(before.metadata, after.metadata)
+      || !sameMetadata(before.metadata, extended.before) || !sameMetadata(extended.before, extended.after)) throw sourceChanged();
+    return Object.freeze({ info: before, root: detached(extended), legacyStatx: legacy, uniqueStatx: unique, environment });
+  }, root as OwnedSourceFile);
 }
 /** This token is never handed to S. Its metadata-only owner cannot call any
  * readable getter, and a caller-created record cannot pass this private map. */
 export function observeSourceFileBootstrap(token: object): SourceFileBootstrapContext {
   const state = activeBootstrap(token), native = state.scope.binding;
-  if (typeof native.observeEnvironment !== "function") throw unavailable();
-  const before = checkedRootInfo(native.rootInfo(state.owner));
-  if (before.kind !== "file" || before.stage !== "metadata-only" || !sameMetadata(before.metadata, state.initial.metadata)) throw sourceChanged();
-  const environment = checkedEnvironment(nativeEnvironment(state.scope, state.owner), before);
-  recordAuxiliaryFailure(state.scope, environment);
-  const after = checkedRootInfo(native.rootInfo(state.owner));
-  if (after.kind !== "file" || after.stage !== "metadata-only" || !sameMetadata(before.metadata, after.metadata)) throw sourceChanged();
-  return Object.freeze({ info: before, environment });
+  return sourceCall(state.scope, () => {
+    if (typeof native.observeEnvironment !== "function") throw unavailable();
+    const before = checkedRootInfo(native.rootInfo(state.owner));
+    if (before.kind !== "file" || before.stage !== "metadata-only" || !sameMetadata(before.metadata, state.initial.metadata)) throw sourceChanged();
+    const environment = checkedEnvironment(nativeEnvironment(state.scope, state.owner), before);
+    recordAuxiliaryFailure(state.scope, environment);
+    const after = checkedRootInfo(native.rootInfo(state.owner));
+    if (after.kind !== "file" || after.stage !== "metadata-only" || !sameMetadata(before.metadata, after.metadata)) throw sourceChanged();
+    return Object.freeze({ info: before, environment });
+  }, undefined);
 }
 
 /** A one-shot native-owned resource scope. All owned child handles must be
  * explicitly closed before callback return; otherwise this operation fails
  * even if the deterministic final cleanup succeeds. */
-export async function withNativeSourceRoot<T>(
+async function sourceRoot<T>(
   root: string, consume: (handle: SourceFileHandle) => Promise<T> | T,
+  expected: SourceFileExpectedProfile | undefined, preview: boolean,
 ): Promise<T> {
+  const selected = path.resolve(root);
+  const contains = (parent: string, child: string) => parent === child || child.startsWith(parent === "/" ? "/" : parent + "/");
+  const unresolved = [...unresolvedNativeCloses].find(state => contains(state.scope.root, selected) || contains(selected, state.scope.root));
+  if (unresolved) throw unresolvedClose(unresolved);
   const native = binding();
-  const scope: SourceScope = { binding: native, opened: new Set(), failures: [], active: true };
+  const scope: SourceScope = { root: selected, binding: native, opened: new Set(), failures: [], pending: new Set(), tails: new Set(), active: true };
   let handle: SourceFileHandle | undefined, raw: object | undefined, bootstrap: SourceBootstrapState | undefined;
   let failed = false, firstError: unknown, result: T | undefined;
   try {
     raw = native.openRoot(root);
     const info = checkedRootInfo(native.rootInfo(raw));
+    if (preview && info.kind !== "file") throw sourceChanged();
     if (info.kind === "directory" && info.stage === "readable") {
       handle = new OwnedSourceFile(raw, info.kind, scope, true); raw = undefined;
+      if (expected) {
+        const profile = await import("./source-file-profile.ts");
+        profile.assertExpectedSourceFileProfile(profile.matchSourceFileProfile(handle), expected);
+      }
     } else {
       if (info.kind !== "file" || info.stage !== "metadata-only") throw sourceChanged();
       const token = Object.freeze({});
       bootstrap = { owner: raw, scope, initial: info, attempted: false, closed: false, closeUnknown: false };
       sourceBootstraps.set(token, bootstrap); raw = undefined;
       const profile = await import("./source-file-profile.ts");
-      handle = profile.initializeSourceFileBootstrap(token);
+      handle = preview ? profile.initializeSourceFilePreviewBootstrap(token) : profile.initializeSourceFileBootstrap(token, expected);
       const state = activeRoot(handle);
       if (state.scope !== scope || state.bootstrap !== token || bootstrap.promoted !== handle) throw sourceChanged();
     }
     result = await consume(handle);
   } catch (error) { failed = true; firstError = error; }
+  if (scope.pending.size) {
+    if (!failed) { failed = true; firstError = new MaintenanceFailure("maintenance_lost", "unsettled-source-native-work"); }
+    await Promise.allSettled([...scope.pending]);
+  }
   if (raw) {
     try { native.close(raw); } catch (error) { scope.failures.push(error); }
   }
@@ -1144,12 +1364,15 @@ export async function withNativeSourceRoot<T>(
     try { closeBootstrap(bootstrap); } catch { /* Already recorded, never close again. */ }
   }
   const pending = [...scope.opened];
-  if (!failed && scope.failures.length === 0 && pending.some(owner => owner !== handle)) {
+  if (!failed && scope.failures.length === 0 && (pending.some(owner => owner !== handle) || scope.tails.size > 0)) {
     failed = true;
     firstError = new MaintenanceFailure("maintenance_lost", "unclosed-source-children");
   }
   for (const owner of pending.reverse()) {
-    try { owner.close(); } catch { /* The real owner's close records its error. */ }
+    try { await owner.closeAsync(); } catch { /* The real owner's close records its error. */ }
+  }
+  for (const tail of [...scope.tails]) {
+    try { await tail.closeAsync(); } catch { /* The actual tail records A and M close errors. */ }
   }
   scope.active = false;
   if (scope.failures.length) {
@@ -1159,7 +1382,15 @@ export async function withNativeSourceRoot<T>(
   if (failed) throw firstError;
   return result as T;
 }
+export function withNativeSourceRoot<T>(root: string, consume: (handle: SourceFileHandle) => Promise<T> | T,
+  expected?: SourceFileExpectedProfile): Promise<T> {
+  return sourceRoot(root, consume, expected, false);
+}
+/** Fixed preview consumer. No caller mode or proof can enable this policy. */
+export function withNativeSourcePreviewFile<T>(root: string, consume: (handle: SourceFileHandle) => Promise<T> | T): Promise<T> {
+  return sourceRoot(root, consume, undefined, true);
+}
 export function observeSourceFile(handle: SourceFileHandle): SourceFileMetadata {
   const { scope, owner, kind } = activeOwner(handle);
-  return checkedObservation(scope.binding.observe(owner), kind);
+  return sourceCall(scope, () => checkedObservation(scope.binding.observe(owner), kind), handle as OwnedSourceFile);
 }

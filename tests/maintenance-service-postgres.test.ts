@@ -2,9 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { inspectMaintenance } from "../src/server/storage/maintenance/inspect.ts";
-import { enterMaintenance } from "../src/server/storage/maintenance/enter.ts";
-import { enterFixture } from "./fixtures/maintenance-enter.ts";
+import { inspectMaintenance } from "./fixtures/maintenance-preview-graph.ts";
+import { enterMaintenance } from "./fixtures/maintenance-preview-graph.ts";
+import { protocolEnterFixture as enterFixture } from "./fixtures/maintenance-enter.ts";
 import { runActualMaintenanceCli, serviceFixture, startServiceChild } from "./fixtures/maintenance-service.ts";
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { verifyJournalChain } from "../src/server/storage/maintenance/journal.ts";
@@ -92,7 +92,7 @@ sourceFilePostgresTest("#152 C3 service PostgreSQL: native LATIN1 and SQL_ASCII 
 });
 
 postgresTest("#152 C3 actual CLI PostgreSQL: fixed production worker enters once and replays the exact planned command", async () => {
-  const f = await enterFixture("postgres", { drainClient: true });
+  const f = await enterFixture("postgres", { drainClient: true, configSource: "none" });
   try {
     const request = { ...f.request, requestId: "actual-pg-cli-public-execute" };
     const executed = runActualMaintenanceCli(f, "execute", request), result = JSON.parse(executed.stdout);

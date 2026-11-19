@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { Client } from "pg";
-import { postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgres.ts";
+import { protocolPostgresAuditFixture as postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgres.ts";
 import { registerExitedAuditClient } from "./fixtures/maintenance-audit-history-child.ts";
 import { checkFactsShape, eventFactsSchema } from "../src/server/storage/maintenance/control-candidate/schema.ts";
 import { storageReceiptDigest } from "../src/server/storage/source-client.ts";

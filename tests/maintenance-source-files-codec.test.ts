@@ -79,6 +79,30 @@ test("#152 Fs codec A01: source-state readEvidence preserves exact canonical fie
   assert.equal(Object.hasOwn(parsed, "authorized"), false);
 });
 
+test("CFP2 distinct prepare profile preserves frozen bytes and rejects cross-policy or caller permits", () => {
+  const previous = sourceStateVector(), value = structuredClone(previous);
+  Object.assign(value.rootBindings[0]!, { profile: "linux-native-ext4-fid-fsuuid-source-prepare-v1" });
+  Object.assign(value.rootBindings[0]!.readEvidence, { policy: "application-source-preservation-with-prepare-v1" });
+  const bytes = canonicalJson(value);
+  assert.deepEqual(parseSourceFiles(value), value);
+  assert.equal(canonicalJson(parseSourceFiles(value)), bytes);
+  for (const key of Object.keys(value.rootBindings[0]!.readEvidence)) {
+    const missing = structuredClone(value) as any;
+    delete missing.rootBindings[0].readEvidence[key];
+    assert.throws(() => parseSourceFiles(missing), invalid, key);
+  }
+  for (const change of [{ mode: "read-only" }, { complete: true }, { preparedForever: true },
+    { policy: "application-source-preservation-v1" }, { blockEffectsObservation: "completed" }]) {
+    const changed = structuredClone(value);
+    Object.assign(changed.rootBindings[0]!.readEvidence, change);
+    assert.throws(() => parseSourceFiles(changed), invalid);
+  }
+  const old = structuredClone(previous);
+  Object.assign(old.rootBindings[0]!.readEvidence, { policy: "application-source-preservation-with-prepare-v1" });
+  assert.throws(() => parseSourceFiles(old), invalid);
+  assert.deepEqual(parseSourceFiles(previous), previous, "old state policy keeps its original codec");
+});
+
 test("#152 Fs codec A02: source-state policy, digests and nested fields are strict", () => {
   const value = sourceStateVector(), binding = value.rootBindings[0]!, evidence = binding.readEvidence;
   const check = (readEvidence: unknown, label: string) => assert.throws(() => parseSourceFiles({ ...value,

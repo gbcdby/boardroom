@@ -15,7 +15,7 @@ import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-sou
 import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
 import { verifyJournalChain, verifySnapshotClosure } from "../src/server/storage/maintenance/journal.ts";
 import { digestJson } from "../src/server/storage/maintenance/canonical.ts";
-import { enterMaintenance } from "../src/server/storage/maintenance/enter.ts";
+import { enterMaintenance } from "./fixtures/maintenance-preview-graph.ts";
 import { captureMaintenance } from "../src/server/storage/maintenance/capture.ts";
 import type { ContinueRequest, OperationMutex } from "../src/server/storage/maintenance/types.ts";
 import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
@@ -24,7 +24,7 @@ import { publishSnapshotBundle } from "../src/server/storage/maintenance/snapsho
 import { verifyRestoreBundle } from "../src/server/storage/maintenance/verify-bundle.ts";
 import { stageSnapshotReady } from "../src/server/storage/maintenance/snapshot-ready.ts";
 import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";
-import { finishControllerOwner } from "../src/server/storage/maintenance/controller-owner.ts";
+import { finishControllerOwner } from "./fixtures/maintenance-capture.ts";
 import type { ControllerOwner } from "../src/server/storage/maintenance/controller-owner.ts";
 
 // The positive S fixture uses the actual Linux ordinary source-FD bridge. It is

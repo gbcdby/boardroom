@@ -10,7 +10,7 @@ import { migrations } from "../../src/server/db/migrations/index.ts";
 import { resolveBoardroomEnvironment } from "../../src/server/environment.ts";
 import { createPostgresMaintenanceAdapter } from "../../src/server/storage/maintenance/postgres.ts";
 import { readPostgresCatalog } from "../../src/server/storage/maintenance/postgres-manifests.ts";
-import { planMigration, persistMigrationPlan } from "../../src/server/storage/maintenance/plan.ts";
+import { createPreviewGraph, planMigration, persistMigrationPlan } from "./maintenance-preview-graph.ts";
 import { ArtifactStore } from "../../src/server/storage/maintenance/objects.ts";
 import { registerStorageSourceClient } from "../../src/server/storage/source-client.ts";
 import type { OperationMutex } from "../../src/server/storage/maintenance/types.ts";
@@ -19,7 +19,8 @@ const quote = (value: string) => `"${value.replaceAll('"', '""')}"`;
 
 /** Real private database and ordinary registration. The fixture alone creates its v2 enter anchor. */
 export async function postgresAuditFixture(encoding: "UTF8" | "LATIN1" | "SQL_ASCII" = "UTF8",
-  options?: { clientCount?: number; beforeRegister?: (descriptor: { kind: "postgres"; connectionString: string }) => Promise<void> }) {
+  options?: { clientCount?: number; beforeRegister?: (descriptor: { kind: "postgres"; connectionString: string }) => Promise<void>;
+    configSource?: "file" | "none" }) {
   if (!testUrl) throw new Error("explicit private PostgreSQL URL required");
   const database = `br_a12b_${randomUUID().replaceAll("-", "")}`;
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), "br-source-audit-pg-")));
@@ -32,6 +33,7 @@ export async function postgresAuditFixture(encoding: "UTF8" | "LATIN1" | "SQL_AS
   let sourceClient: Awaited<ReturnType<typeof registerStorageSourceClient>> | undefined;
   const ordinaryClients: Awaited<ReturnType<typeof registerStorageSourceClient>>[] = [];
   let mutex: OperationMutex | undefined;
+  let preview: Awaited<ReturnType<typeof createPreviewGraph>> | undefined;
   const connect = async (applicationName?: string) => {
     const url = new URL(sourceUrl); if (applicationName) url.searchParams.set("application_name", applicationName);
     const client = new Client({ connectionString: url.toString() }); client.on("error", () => {});
@@ -48,9 +50,10 @@ export async function postgresAuditFixture(encoding: "UTF8" | "LATIN1" | "SQL_AS
         assert.equal(sessions.rows[0].count, "0", "all owned source sessions close before DROP");
         await admin.query(`DROP DATABASE ${quote(database)}`); created = false;
       }
-    } finally { await admin.end(); await rm(directory, { recursive: true }); }
+    } finally { await admin.end(); await preview?.close(); await rm(directory, { recursive: true }); }
   };
   try {
+    preview = await createPreviewGraph(directory, options?.configSource === "none" ? "production" : "qualified-linux");
     await admin.query(`CREATE DATABASE ${quote(database)} TEMPLATE template0 ENCODING '${encoding}' LC_COLLATE 'C' LC_CTYPE 'C'`); created = true;
     const bootstrap = new PostgresDriver({ connectionString: descriptor.connectionString });
     try {
@@ -69,9 +72,12 @@ export async function postgresAuditFixture(encoding: "UTF8" | "LATIN1" | "SQL_AS
       await readPostgresCatalog(proof, "public");
     } finally { await closeClient(proof); }
     const configFile = path.join(directory, "config.json");
-    await writeFile(configFile, JSON.stringify({ dataDir, dbDriver: "postgres", pgConnectionString: descriptor.connectionString }), { mode: 0o600 });
+    if (options?.configSource !== "none")
+      await writeFile(configFile, JSON.stringify({ dataDir, dbDriver: "postgres", pgConnectionString: descriptor.connectionString }), { mode: 0o600 });
     const environment = await resolveBoardroomEnvironment({ cwd: directory, homeDir: directory,
-      env: { AGENT_STUDIO_CONFIG: configFile, BOARDROOM_HOME: path.join(directory, "home") } });
+      env: { ...(options?.configSource === "none" ? { AGENT_STUDIO_DATA_DIR: dataDir, AGENT_STUDIO_DB_DRIVER: "postgres",
+        AGENT_STUDIO_PG_CONNECTION_STRING: descriptor.connectionString } : { AGENT_STUDIO_CONFIG: configFile }),
+        BOARDROOM_HOME: path.join(directory, "home") } });
     await options?.beforeRegister?.(descriptor);
     let clientId = "";
     for (let index = 0; index < (options?.clientCount ?? 1); index++) {
@@ -102,6 +108,11 @@ export async function postgresAuditFixture(encoding: "UTF8" | "LATIN1" | "SQL_AS
     for (const registered of ordinaryClients) { await registered.refresh(); await registered.waitForDrain(); }
     const receipt = await sourceClient!.waitForDrain();
     return { directory, dataDir, database, descriptor, admin, adapter, sourceClient, clientId, receipt,
-      mutex, store, plan, reference, head, connect, closeClient, close };
+      mutex, store, plan, reference, head, connect, closeClient, close, preview, options: planOptions };
   } catch (error) { await close(); throw error; }
+}
+
+export function protocolPostgresAuditFixture(encoding: Parameters<typeof postgresAuditFixture>[0] = "UTF8",
+  options: Parameters<typeof postgresAuditFixture>[1] = {}) {
+  return postgresAuditFixture(encoding, { configSource: process.platform === "darwin" ? "none" : "file", ...options });
 }

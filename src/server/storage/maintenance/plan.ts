@@ -1,5 +1,4 @@
-import { constants } from "node:fs";
-import { lstat, open, readdir } from "node:fs/promises";
+import { lstat, readdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { canonicalizePath } from "../../environment.ts";
@@ -29,19 +28,6 @@ export async function observePlannedPath(file: string): Promise<PlannedPath> {
       absent.push(path.basename(ancestor)); ancestor = path.dirname(ancestor);
     }
   }
-}
-
-async function configDigest(file: string | null): Promise<string> {
-  if (file === null) return digestJson({ configFile: null });
-  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    const before = await handle.stat({ bigint: true });
-    if (!before.isFile() || before.nlink !== 1n || before.size > 1024n * 1024n) throw new MaintenanceFailure("plan_stale");
-    const bytes = await handle.readFile(), after = await handle.stat({ bigint: true }), current = await lstat(file, { bigint: true });
-    for (const item of [after, current]) if (item.dev !== before.dev || item.ino !== before.ino || item.size !== before.size
-      || item.mtimeNs !== before.mtimeNs || item.ctimeNs !== before.ctimeNs) throw new MaintenanceFailure("plan_stale");
-    return sha256(bytes);
-  } finally { await handle.close(); }
 }
 
 function effectiveConfigDigest(options: MaintenanceServiceOptions): string {
@@ -108,18 +94,35 @@ export async function planMigration(options: MaintenanceServiceOptions, adapter:
   if (observation.state.admission !== "open") blockers.push({ code: "maintenance_busy", subjectRef: "source-admission" });
   try { assertMaintenancePlatform(); }
   catch { blockers.push({ code: "unsupported_durability", subjectRef: "host-platform" }); }
+  const { readSourceConfigPreview } = await import("./source-file-preview.ts");
   return parsePlan({ formatVersion: 1, kind: "plan", migrationId: randomUUID(), source: observation.source, sourceIdentity: observation.sourceIdentity,
     originalCwd: path.resolve(options.originalCwd), originalConfigPath: options.environment.configFile,
-    configDigest: await configDigest(options.environment.configFile), effectiveConfigDigest: effectiveConfigDigest(options),
+    configDigest: await readSourceConfigPreview(options.environment.configFile), effectiveConfigDigest: effectiveConfigDigest(options),
     schemaManifestDigest: observation.manifests.schemaManifestDigest, guardManifestDigest: observation.state.guardManifestDigest, ...locations,
     preview: { observedAt: new Date().toISOString(), dataDigest: observation.manifests.fullDataManifestDigest,
       tableCounts: Object.fromEntries(observation.manifests.tables.map(table => [table.name, table.count])), clientInventory: observation.clients },
     requiredCapabilities: ["physical-source-lock", "all-source-writers-quiesced", "source-files-inventory", "known-workspace-root-clearance", "filesystem-durable-publication", "actual-database-restore"], blockers });
 }
 
-async function observePlanBindings(plan: MigrationPlan, options: MaintenanceServiceOptions, adapter: MaintenanceAdapter): Promise<SourceObservation> {
+async function observePlanSelection(plan: MigrationPlan, options: MaintenanceServiceOptions, adapter: MaintenanceAdapter): Promise<SourceObservation> {
   assertSelection(options, adapter);
   const observation = await adapter.observe(); assertObservedDescriptor(options, observation);
+  const paths = [
+    ...(options.environment.configFile === null ? [] : [{ label: "config", path: options.environment.configFile }]),
+    { label: "managed-sessions", path: path.join(options.environment.runtimeRoot, "sessions") },
+  ];
+  if (!same(observation.source, plan.source) || !same(observation.sourceIdentity, plan.sourceIdentity)
+    || observation.manifests.schemaManifestDigest !== plan.schemaManifestDigest || observation.state.guardManifestDigest !== plan.guardManifestDigest
+    || plan.originalCwd !== path.resolve(options.originalCwd) || plan.originalConfigPath !== options.environment.configFile
+    || plan.effectiveConfigDigest !== effectiveConfigDigest(options)
+    || plan.controlRoot.path !== path.resolve(options.originalCwd, options.controlRoot)
+    || plan.targetRoot.path !== path.resolve(options.originalCwd, options.targetRoot)
+    || !same(plan.fileRoots.map(root => ({ label: root.label, path: root.path })), paths)) throw new MaintenanceFailure("plan_stale");
+  return observation;
+}
+
+async function observePlanBindings(plan: MigrationPlan, options: MaintenanceServiceOptions, adapter: MaintenanceAdapter): Promise<SourceObservation> {
+  const observation = await observePlanSelection(plan, options, adapter);
   const locations = await observeLocations(options);
   let controlMatches = same(locations.controlRoot, plan.controlRoot);
   if (!controlMatches && plan.controlRoot.absentSegments.length === 1 && locations.controlRoot.absentSegments.length === 0
@@ -128,16 +131,20 @@ async function observePlanBindings(plan: MigrationPlan, options: MaintenanceServ
     const ancestor = await observePlannedPath(plan.controlRoot.existingAncestor.path);
     controlMatches = same(ancestor.existingAncestor, plan.controlRoot.existingAncestor) && ancestor.absentSegments.length === 0;
   }
-  if (!same(observation.source, plan.source) || !same(observation.sourceIdentity, plan.sourceIdentity)
-    || observation.manifests.schemaManifestDigest !== plan.schemaManifestDigest || observation.state.guardManifestDigest !== plan.guardManifestDigest
-    || plan.originalCwd !== path.resolve(options.originalCwd) || plan.originalConfigPath !== options.environment.configFile
-    || plan.effectiveConfigDigest !== effectiveConfigDigest(options)
-    || !controlMatches || !same(locations.targetRoot, plan.targetRoot) || !same(locations.fileRoots, plan.fileRoots)) throw new MaintenanceFailure("plan_stale");
+  if (!controlMatches || !same(locations.targetRoot, plan.targetRoot) || !same(locations.fileRoots, plan.fileRoots)) throw new MaintenanceFailure("plan_stale");
   return observation;
 }
 
-/** Internal C metadata/selection observation only. Source config bytes must be read and
- * bound by the actual S/P window; this result is never capture or publication authority. */
+/** Before a real source/facts window, inspect only selection, DB observations and
+ * immutable path strings. No source/config pathname is resolved or opened here. */
+export async function observeCapturePlanSelection(planValue: MigrationPlan, options: MaintenanceServiceOptions,
+  adapter: MaintenanceAdapter): Promise<SourceObservation> {
+  return observePlanSelection(parsePlan(planValue), options, adapter);
+}
+
+/** Internal C complete metadata binding, only inside the actual source lock and
+ * source-client facts callback. Config bytes belong to that window's S protocol;
+ * this check never ordinary-opens config, including after S has closed R/V/F. */
 export async function observeCapturePlanBindings(planValue: MigrationPlan, options: MaintenanceServiceOptions,
   adapter: MaintenanceAdapter): Promise<SourceObservation> {
   return observePlanBindings(parsePlan(planValue), options, adapter);
@@ -146,7 +153,8 @@ export async function observeCapturePlanBindings(planValue: MigrationPlan, optio
 /** Immutable binding check only: successful revalidation is never write/seal authorization. */
 export async function revalidatePlan(planValue: MigrationPlan, options: MaintenanceServiceOptions, adapter: MaintenanceAdapter): Promise<SourceObservation> {
   const plan = parsePlan(planValue), observation = await observePlanBindings(plan, options, adapter);
-  if (plan.configDigest !== await configDigest(plan.originalConfigPath)) throw new MaintenanceFailure("plan_stale");
+  const { readSourceConfigPreview } = await import("./source-file-preview.ts");
+  if (plan.configDigest !== await readSourceConfigPreview(plan.originalConfigPath)) throw new MaintenanceFailure("plan_stale");
   return observation;
 }
 

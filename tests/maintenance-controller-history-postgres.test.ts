@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { Client, type QueryResult } from "pg";
-import { postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgres.ts";
+import { protocolPostgresAuditFixture as postgresAuditFixture } from "./fixtures/maintenance-source-audit-postgres.ts";
 import { controllerWriterFixture, historicalControllerProcess, historicalControllerRow } from "./fixtures/maintenance-controller-history.ts";
 import type { ControllerCommandScope } from "../src/server/storage/maintenance/controller-write.ts";
 import type { SourceLock } from "../src/server/storage/maintenance/types.ts";
@@ -37,7 +37,7 @@ pgCaptureTest("C3 PostgreSQL actual factory keeps staged registration invisible 
       await Reflect.apply(end, this, []); if (sessions.has(this)) events.push("source-closed");
     } as typeof end;
     const first = await f.adapter.withSourceLock("control", async lock => {
-      const begun = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request });
+      const begun = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }, f.options);
       scope = begun.scope; return f.writer.commitControllerStep(scope, lock, { kind: "first-capture" });
     });
     firstAnchor = first.node.reference.ref;
@@ -60,7 +60,7 @@ pgCaptureTest("C3 PostgreSQL original callback undefined waits for forgotten res
   const gate = new Promise<void>(resolve => { release = resolve; }), entered = new Promise<void>(resolve => { reached = resolve; });
   try {
     await f.adapter.withSourceLock("control", async lock => {
-      ({ scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }));
+      ({ scope } = await f.writer.beginControllerCommand(f.adapter, f.mutex, lock, { operation: "resume-migration", request: f.request }, f.options));
     });
     const before = await f.adapter.observeSourceClients(); let completed = false;
     outer = f.adapter.withSourceLock("snapshot", async lock => {

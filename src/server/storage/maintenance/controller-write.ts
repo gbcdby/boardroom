@@ -11,7 +11,7 @@ import { assertFrozenSourceUnchanged, captureReference, classifyMaintenanceReque
 import type { SourceClientAudit } from "./native-audit.ts";
 import { ArtifactStore } from "./objects.ts";
 import { maintenanceRequestDigest, parseJournal, parseMaintenanceCommand, parseManifests, readSourceFiles } from "./parse.ts";
-import { loadPersistedPlan } from "./plan.ts";
+import { loadPersistedPlan, observeCapturePlanBindings } from "./plan.ts";
 import { postgresControllerSourceAccess } from "./postgres.ts";
 import { consumeControllerRestoreAuthorization } from "./restore-authorization.ts";
 import { sqliteControllerSourceAccess } from "./sqlite.ts";
@@ -19,7 +19,7 @@ import { captureSourceFiles, verifyLiveSourceFiles } from "./source-files.ts";
 import { buildSourceClientsRoster, sourceClientRawRowSchema, sourceClientsEncodingSchema } from "./source-clients.ts";
 import { assertCapturedSourceClientBinding } from "./source-client-binding.ts";
 import type { ArtifactRef, ControlRootIdentity, JournalFrozenV2, JournalRecord, MaintenanceAdapter, MaintenanceCommand,
-  MigrationPlan, OperationMutex, PersistedPlanRef, SourceClientFactsWindow, SourceClientRawRow, SourceClientsObservation,
+  MaintenanceServiceOptions, MigrationPlan, OperationMutex, PersistedPlanRef, SourceClientFactsWindow, SourceClientRawRow, SourceClientsObservation,
   SourceLock, SourceObservation } from "./types.ts";
 
 const same = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
@@ -59,6 +59,7 @@ interface CommandState {
   readonly adapter: MaintenanceAdapter;
   readonly mutex: OperationMutex;
   readonly command: MaintenanceCommand;
+  readonly options: MaintenanceServiceOptions;
   readonly digest: string;
   readonly plan: MigrationPlan;
   readonly root: ControlRootIdentity;
@@ -115,13 +116,14 @@ function bindPlan(state: CommandState, raw: SourceClientsObservation): void {
 /** Called once in the first actual lock of a complete command, before enter or
  * any controller mutation. Existing request prefixes are read-only scopes. */
 export async function beginControllerCommand(adapter: MaintenanceAdapter, mutex: OperationMutex, lock: SourceLock,
-  value: MaintenanceCommand): Promise<{ readonly scope: ControllerCommandScope; readonly prefix: UntrustedRequestPrefix }> {
+  value: MaintenanceCommand, options: MaintenanceServiceOptions): Promise<{ readonly scope: ControllerCommandScope; readonly prefix: UntrustedRequestPrefix }> {
   const access = await accessFor(adapter, mutex, lock);
   requireValue(access.kind === "control" && !mutexCommands.has(mutex), "maintenance_lost");
+  requireValue(options && options.environment, "plan_stale");
   const command = freeze(parseMaintenanceCommand(value)), plan = await loadPersistedPlan(command.request.plan, command.request.expectedSource);
   const raw = await lock.observeSourceClients(), store = await ArtifactStore.open(command.request.plan.controlRoot, plan.source);
   const scope: ControllerCommandScope = Object.freeze({ kind: "controller-command-scope" });
-  const provisional: CommandState = { adapter, mutex, command, digest: maintenanceRequestDigest(command), plan, root: access.root,
+  const provisional: CommandState = { adapter, mutex, command, options, digest: maintenanceRequestDigest(command), plan, root: access.root,
     prefix: { kind: "untrusted-request-prefix", status: "new", head: null, firstSequence: null }, initialLock: lock,
     previousMigration: null, initialState: freeze({ ...raw.state }),
     locks: new WeakSet([lock]), head: null, running: false, invalid: false };
@@ -174,6 +176,19 @@ export async function assertControllerCommandWindow(scope: ControllerCommandScop
   state.locks.add(lock); scopedLocks.set(lock, scope); await access.assertHeld();
   return Object.freeze({ adapter: state.adapter, mutex: state.mutex, command: state.command, requestDigest: state.digest,
     plan: state.plan, prefix: state.prefix, store, observation: raw, chain, head, kind: access.kind });
+}
+
+/** Fixed consumers call this inside their original source-client facts callback.
+ * Only a genuine admitted command/lock selects the trusted original options;
+ * no callback, mode, copied scope or absent-scope fallback can omit metadata. */
+export async function assertControllerSourcePlanBindings(scope: ControllerCommandScope, lock: SourceLock): Promise<void> {
+  const state = stateFor(scope);
+  requireValue(scopedLocks.get(lock) === scope && state.locks.has(lock), "maintenance_lost");
+  try {
+    await assertControllerCommandWindow(scope, lock);
+    await observeCapturePlanBindings(state.plan, state.options, state.adapter);
+    await lock.assertHeld(); await state.mutex.assertHeld();
+  } catch (error) { state.invalid = true; throw error; }
 }
 
 /** The enter stage cannot borrow a later source lock or an already-used prefix. */
@@ -244,7 +259,9 @@ export async function readAnchoredControllerArchive(adapter: MaintenanceAdapter,
   }
   await lock.withSourceClientFacts(state.command.request.plan, async facts => {
     requireValue(same(facts.observation, raw) && same(facts.origin.chain, chain));
+    await assertControllerSourcePlanBindings(scope, lock);
     await verifyLiveSourceFiles(context.store, lock, mutex, state.command.request.plan, closure.receipt.sourceFilesManifest);
+    await assertControllerSourcePlanBindings(scope, lock);
     await facts.assertCurrent();
   });
   await lock.assertHeld(); await mutex.assertHeld();
@@ -342,6 +359,7 @@ async function performControllerStep(scope: ControllerCommandScope, lock: Source
     let stagedRegistration = false;
     const record = await collect(state.command.request.plan, async (audit, window) => {
       requireValue(same(audit.observation, raw) && same(audit.origin.chain, chain) && same(audit.origin.head, head.reference));
+      await assertControllerSourcePlanBindings(scope, lock);
       if (!writeLegacy) requireValue(supportedEncoding(raw.textEncoding), "source_changed");
       let proof: ControlProof | null = null, frozen: JournalFrozenV2 | null = null;
       let sourceClients: NonNullable<Extract<JournalRecord, { formatVersion: 2 }> ["sourceClients"]> | null = null;
@@ -406,6 +424,7 @@ async function performControllerStep(scope: ControllerCommandScope, lock: Source
         && before.manifests.frozenBusinessManifestDigest === originFrozen.frozenBusinessManifestDigest
         && raw.state.guardManifestDigest === originFrozen.guardManifestDigest);
       await verifyLiveSourceFiles(store, lock, state.mutex, state.command.request.plan, originFrozen.sourceFilesManifest);
+      await assertControllerSourcePlanBindings(scope, lock);
       await assertBefore(); await window.assertCurrent();
       return parseJournal({ formatVersion: writeLegacy ? 2 : 3, kind: "journal", migrationId: state.plan.migrationId,
         sequence: raw.state.journalSequence + 1, previous: head.reference,
