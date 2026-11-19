@@ -15,6 +15,7 @@ import { readPostgresManifests } from "../src/server/storage/maintenance/postgre
 import { canonicalJson, sha256 } from "../src/server/storage/maintenance/canonical.ts";
 import { buildDatabaseManifests } from "../src/server/storage/maintenance/manifests.ts";
 import { buildLayoutMemoryInventory } from "../src/server/storage/maintenance/layout-memory-inventory.ts";
+import { buildLayoutMemoryObjectPayloadValues } from "../src/server/storage/maintenance/layout-memory-payload-values.ts";
 import type { DatabaseManifests, Json } from "../src/server/storage/maintenance/types.ts";
 import { collectLayoutMemoryInventory, MemoryCollectionError } from "../src/server/storage/maintenance/layout-memory-collector.ts";
 
@@ -166,6 +167,11 @@ for (const engine of ["sqlite", "postgres"] as const) {
       const result = await collectLayoutMemoryInventory(snapshot(async (sql, params) => { trace.push(sql); maximum = Math.max(maximum, ++active);
         try { return await view.query(sql, params); } finally { active--; } }), data.request, data.bytes);
       assert.deepEqual(result.inventory, buildLayoutMemoryInventory(result.input)); assert.equal(Object.getPrototypeOf(result), null);
+      const payloads = buildLayoutMemoryObjectPayloadValues(result.input);
+      assert.deepEqual(payloads.inventory, result.inventory);
+      assert.deepEqual(payloads.objects.map(entry => entry.object), result.inventory.objects);
+      assert.deepEqual(new Set(payloads.objects.map(entry => entry.payload.bytesHex)),
+        new Set(seeded.bodies.map(body => Buffer.from(body, "utf8").toString("hex"))));
       assert.ok(Object.isFrozen(result.input.tables[0]!.rows[0]![0])); assert.deepEqual(result.input.tables.map(t => t.rows.length), [3, 9, 6]);
       assert.equal(result.inventory.versions.length, 9); assert.equal(result.inventory.objects.length, 3);
       assert.equal(result.inventory.documents[0]!.legacyKey.agentId, seeded.agent.id);
