@@ -65,7 +65,13 @@ export function rowDigest(f:FState,rows:readonly Json[]):{count:string;digest:st
     for(let out=start;out<end;out++){f.charge(1);const left=r===end||l<middle&&f.compareEncodings(encoded[l]!,encoded[r]!)<=0;target[out]=left?encoded[l++]!:encoded[r++]!;}}
     const previous=encoded;encoded=target;target=previous;}
   const h=createHash('sha256');
-  for(const row of encoded){f.charge(1,32);const prefix=`${row.bytes}:`;f.charge(2,row.bytes+prefix.length);h.update(prefix);f.hashEncoding(h,row);}f.charge(1,32,0,5);return {count:String(rows.length),digest:h.digest('hex')};
+  for(const row of encoded){
+    f.charge(1,32);const length=String(row.bytes); // at most 16 safe-integer digits
+    f.charge(1,length.length*2+length.length+1);const prefix=length+':';
+    f.charge(2,row.bytes+prefix.length); // the complete SHA input, once
+    f.charge(1,prefix.length*3);h.update(prefix); // actual ASCII UTF16 read + UTF8 output
+    f.hashEncoding(h,row);
+  }f.charge(1,32,0,5);return {count:String(rows.length),digest:h.digest('hex')};
 }
 interface MdData { readonly dialect:'sqlite'|'postgres'; readonly schema:Json; readonly controls:DatabaseManifests['controlRows']; readonly result:DatabaseManifests }
 const manifestData=new WeakMap<FState,WeakMap<object,MdData>>();

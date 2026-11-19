@@ -5,14 +5,19 @@ import { MaintenanceFailure, maintenanceFailureCode } from "./error.ts";
 import { counter, hash, id, ref, source, text } from "./parse-primitives.ts";
 import { sourceClientsRosterSchema } from "./source-clients.ts";
 import { checkFactsShape, controlProofSchema, controlProofSchemaFor } from "./control-candidate/schema.ts";
-import { assertP0FSyntaxScope, reserveP0FNativeClone, reserveP0FNativeNodes, reserveP0FNativeShallow,reserveP0FNativeMetadata,reserveP0FNativeSplit, type P0FArtifactSyntaxFrame } from '../../identity/internal/m2-p0-artifacts-frame.ts';
+import { assertP0FSyntaxScope, reserveP0FNativeClone, reserveP0FNativeManifestsClone, reserveP0FNativeNodes, reserveP0FNativeShallow,reserveP0FNativeMetadata,reserveP0FNativeSplit, type P0FArtifactSyntaxFrame } from '../../identity/internal/m2-p0-artifacts-frame.ts';
 import type { ArtifactStore } from "./objects.ts";
 import type { ActualRestoreVerification, ArtifactRef, DatabaseManifests, DurabilityCapability, JournalRecord, JournalRecordV1, JournalRecordV2, MaintenanceCommand, MigrationPlan, PublicationEvidence, RestoreBundleManifest, SnapshotReceipt, SourceFilesManifest, VerificationJournalRecord } from "./types.ts";
 
 const blockerCode = z.enum(["source_changed", "source_missing", "plan_stale", "target_conflict", "control_root_mismatch",
   "source_writer_unknown", "source_writer_active", "drain_incomplete", "maintenance_busy", "maintenance_lost", "schema_guard_incomplete",
   "journal_invalid", "snapshot_invalid", "restore_verification_unavailable", "unsupported_durability", "backup_capability_unavailable", "request_conflict", "phase_conflict"]);
-const json: z.ZodType<unknown> = z.lazy(() => z.union([z.null(), z.boolean(), z.number().finite(), z.string(), z.array(json), z.record(json)]));
+// The recursive grammar is fixed. Only the lazy reference is recursive; parsing
+// a value does not allocate another project-owned list of schema alternatives.
+const json: z.ZodType<unknown> = z.lazy(() => jsonGrammar);
+const jsonGrammar = z.union([z.null(), z.boolean(), z.number().finite(), z.string(), z.array(json), z.record(json)]);
+const proofEvents=Object.freeze(["observation", "takeover", "cancel_intent", "cancelled"]);
+const stableSuccessorEvents=Object.freeze(["capture", "ready", "cancel_intent"]);
 const identity = z.object({ path: text, device: z.string().regex(/^\d+$/), inode: z.string().regex(/^\d+$/) }).strict();
 const capabilityBase = { formatVersion: z.literal(1), kind: z.literal("capability"), node: text,
   rootIdentity: identity.extend({ hostIdentityDigest: hash }).strict(), powerLossTested: z.literal(false), probeDigest: hash };
@@ -113,14 +118,14 @@ export function parseJournal(value: unknown, syntaxFrame?: P0FArtifactSyntaxFram
   }
   requireValue(record.event === "capture" && record.phase === "quiesced"
     || record.event === "ready" && record.phase === "snapshot_ready"
-    || ["observation", "takeover", "cancel_intent", "cancelled"].includes(record.event) && record.phase !== "planned");
+    || proofEvents.includes(record.event) && record.phase !== "planned");
   reserveP0FNativeClone(controlProof);
   const proof = (syntaxFrame === undefined ? controlProofSchema : controlProofSchemaFor(syntaxFrame)).safeParse(controlProof);
   if (!proof.success) throw new MaintenanceFailure("journal_invalid", "verification-journal");
   if (proof.data.kind === "capture-controls") requireValue(record.event === "capture");
   requireValue((record.event === "cancelled") === (proof.data.kind === "cancel-terminal-controls"));
   if (record.event === "cancel_intent") requireValue(proof.data.kind === "control-successor");
-  if (proof.data.kind === "control-successor" && ["capture", "ready", "cancel_intent"].includes(record.event))
+  if (proof.data.kind === "control-successor" && stableSuccessorEvents.includes(record.event))
     requireValue(proof.data.changes.length === 0 && proof.data.beforeRowsDigest === proof.data.afterRowsDigest);
   if (proof.data.kind === "legacy-first-capture-bridge") requireValue(record.phase === "snapshot_ready" && record.event === "observation"
     && proof.data.changes.length === 0 && proof.data.beforeRowsDigest === proof.data.afterRowsDigest);
@@ -218,4 +223,13 @@ export const parseBundle = (value: unknown): RestoreBundleManifest => parse(bund
 export const parsePublication = (value: unknown): PublicationEvidence => parse(publication, value);
 export const parseVerification = (value: unknown): ActualRestoreVerification => parse(verification, value);
 export const parseReceipt = (value: unknown): SnapshotReceipt => parse(receipt, value);
-export const parseManifests = (value: unknown): DatabaseManifests => parse(manifests, value);
+export function parseManifests(value: unknown): DatabaseManifests {
+  const unchanged=reserveP0FNativeManifestsClone(value);
+  const parsed=manifests.safeParse(value);
+  if(!parsed.success)throw new MaintenanceFailure("journal_invalid");
+  // This exact schema has no transforms/defaults. Only generic z.record can
+  // normalize an admitted JSON value (by dropping __proto__); the reservation
+  // seam checks that exception over every generic branch. Always run safeParse.
+  // Without the exact active frame ownership, retain the original Zod clone.
+  return (unchanged?value:parsed.data) as DatabaseManifests;
+}

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { canonicalJson, digestJson } from "./canonical.ts";
 import type { DatabaseManifests, Json } from "./types.ts";
-import { reserveP0FNativeNodes, reserveP0FNativeSort, reserveP0FNativeText,reuseP0FNativeRowDigest,reserveP0FNativeMetadata } from '../../identity/internal/m2-p0-artifacts-frame.ts';
+import { reserveP0FNativeNodes, reserveP0FNativeSort, reserveP0FNativeText,reuseP0FNativeRowDigest,reserveP0FNativeMetadata,reserveP0FNativeRowPrefix } from '../../identity/internal/m2-p0-artifacts-frame.ts';
 
 /** Preserve duplicate rows; each canonical typed row is length-framed before hashing. */
 export function digestRowMultiset(rows: readonly Json[]): { count: string; digest: string } {
@@ -13,6 +13,7 @@ export function digestRowMultiset(rows: readonly Json[]): { count: string; diges
   const hash = createHash("sha256");
   for (const row of encoded) {
     reserveP0FNativeText(row, true);
+    reserveP0FNativeRowPrefix(row);
     hash.update(`${Buffer.byteLength(row)}:`).update(row);
   }
   reserveP0FNativeNodes(5);

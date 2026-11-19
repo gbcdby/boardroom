@@ -1,9 +1,9 @@
 import { canonicalJson, digestJson } from "../canonical.ts";
 import type { ArtifactRef, JournalFrozenV2, MigrationPlan, SourceClientRawRow, SourceClientsRosterV1, SourceRef, VerificationJournalRecord } from "../types.ts";
-import { equal, requireCandidate } from "./common.ts";
+import { equal, requireCandidate, sameJoinedText } from "./common.ts";
 import { applyChanges, validateRowsFacts, type RowContext } from "./rows.ts";
 import type { CancelTerminalProof, ControlProof, MaintenanceInvariant, SuccessorProof } from "./schema.ts";
-import { assertP0FSyntaxScope, reserveP0FNativeNodes,reserveP0FNativeMetadata,encodeP0FNativeShell,reserveP0FNativeComparisons, type P0FArtifactSyntaxFrame } from '../../../identity/internal/m2-p0-artifacts-frame.ts';
+import { assertP0FSyntaxScope, reserveP0FNativeNodes,reserveP0FNativeMetadata,encodeP0FNativeShell,reserveP0FNativeComparisons,reserveP0FNativeText, type P0FArtifactSyntaxFrame } from '../../../identity/internal/m2-p0-artifacts-frame.ts';
 
 const legacyEnterEvents=Object.freeze(["enter", "takeover", "observation"]);
 const samePhaseEvents=Object.freeze(["takeover", "observation", "cancel_intent", "cancelled"]);
@@ -33,14 +33,14 @@ export function validateJournalSequence(nodes: readonly ControlReplayNode[]): Ca
   const requests = new Map<string, string>(), completedRequests = new Set<string>();
   for (const [index, node] of nodes.entries()) {
     const record = node.record, previous = nodes[index - 1];
-    requireCandidate(record.sequence === index + 1 && record.migrationId === first.migrationId
+    requireCandidate(record.sequence === index + 1 && sameJoinedText(record.migrationId,first.migrationId)
       && equal(record.source, first.source) && equal(record.plan, first.plan));
-    const oldDigest = requests.get(record.requestId);
-    requireCandidate(oldDigest === undefined || oldDigest === record.requestDigest);
-    requests.set(record.requestId, record.requestDigest);
-    if (previous && previous.record.requestId !== record.requestId) completedRequests.add(previous.record.requestId);
+    reserveP0FNativeText(record.requestId);const oldDigest = requests.get(record.requestId);
+    requireCandidate(oldDigest === undefined || sameJoinedText(oldDigest,record.requestDigest));
+    reserveP0FNativeText(record.requestId);requests.set(record.requestId, record.requestDigest);
+    if (previous && !sameJoinedText(previous.record.requestId,record.requestId)) {reserveP0FNativeText(previous.record.requestId);completedRequests.add(previous.record.requestId);}
     // Legacy bytes retain their old structural read rules. New v3 commands never reopen a prior request.
-    if (record.formatVersion === 3) requireCandidate(!completedRequests.has(record.requestId));
+    if (record.formatVersion === 3) {reserveP0FNativeText(record.requestId);requireCandidate(!completedRequests.has(record.requestId));}
     if (record.formatVersion === 1) requireCandidate((!previous || previous.record.formatVersion === 1)
       && record.phase === "planned" && legacyEnterEvents.includes(record.event)
       && record.frozen === null && record.snapshot === null);
@@ -65,7 +65,7 @@ export function validateJournalSequence(nodes: readonly ControlReplayNode[]): Ca
     requireCandidate((record.event === "capture") === (record.frozen !== null) && (record.event === "ready") === (record.snapshot !== null));
     reserveP0FNativeNodes(1 + record.evidence.length, record.evidence.length);
     reserveP0FNativeMetadata(2); // label list + uniqueness Set shells; 2E slots/bindings prepaid by sequenceCost and the preceding fee
-    requireCandidate(new Set(record.evidence.map(item => item.ref)).size === record.evidence.length);
+    requireCandidate(new Set(record.evidence.map(item => {reserveP0FNativeText(item.ref);return item.ref;})).size === record.evidence.length);
     if (record.formatVersion === 3) {
       if (record.event === "capture") requireCandidate(record.controlProof?.kind === (origin === null ? "capture-controls" : "control-successor"));
       if (record.controlProof?.kind === "capture-controls") {
@@ -81,7 +81,7 @@ export function validateJournalSequence(nodes: readonly ControlReplayNode[]): Ca
       const original = record.sourceClients;
       requireCandidate(equal(original.source, record.source) && equal(original.plan, record.plan)
         && original.migrationId === record.migrationId && original.fenceEpoch === String(record.fenceEpoch)
-        && original.textEncoding.backend === record.source.kind && digestJson(original) === record.frozen.sourceClientsDigest);
+        && original.textEncoding.backend === record.source.kind && sameJoinedText(digestJson(original),record.frozen.sourceClientsDigest));
       requireCandidate(roster === null ? original.receiptGeneration === String(record.ownerGeneration) : equal(roster, original));
       requireCandidate(frozen === null || equal(frozen, record.frozen));
       if (origin === null) { origin = node; frozen = record.frozen; roster = original; }

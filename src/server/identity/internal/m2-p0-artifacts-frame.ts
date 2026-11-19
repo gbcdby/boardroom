@@ -26,6 +26,7 @@ const passes = new WeakMap<FState, Pass>();
 const frames = new WeakMap<P0FArtifactSyntaxFrame, Frame>();
 const journalContexts = new WeakMap<JournalValueContext,P0FArtifactSyntaxFrame>();
 const knownJournalContexts = new WeakSet<JournalValueContext>();
+const utf8DecoderOptions=Object.freeze({fatal:true,ignoreBOM:true});
 const noRows:readonly SourceClientRawRow[]=Object.freeze([]);
 const unknownFrame = Object.freeze({});
 // Only synchronous fixed consumers enter this stack. It never survives an await
@@ -42,6 +43,9 @@ function nativeState(): FState | undefined { return nativeFrame === undefined ? 
 export function reserveP0FNativeNodes(nodes: number, tuples = 0): void { nativeState()?.charge(nodes, 0, tuples, nodes); }
 /** Explicit project-owned metadata only, separate from semantic JSON nodes. */
 export function reserveP0FNativeMetadata(tuples:number):void { nativeState()?.charge(tuples,0,tuples); }
+/** A dynamic frame-bound schema's explicit configuration is produced even
+ * when called outside the synchronous native-consumer stack. */
+export function reserveP0FSchemaMetadata(frame:P0FArtifactSyntaxFrame,tuples:number):void { state(frame).f.charge(tuples,0,tuples); }
 export function reserveP0FNativeWork(work:number):void { nativeState()?.charge(work); }
 export function reserveP0FNativeKeyList(value:object):void {
   const f=nativeState();if(!f)return;
@@ -81,6 +85,56 @@ export function reserveP0FNativeClone(value: unknown): void {
   const f = nativeState(); if (!f) return;
   const size = f.size(value); f.charge(size.nodes * 8, size.text * 2, 0, size.nodes);
 }
+/** The fixed manifests codec's generic JSON branches use an unchecked Zod
+ * string. It returns each primitive unchanged; there is no character-copy or
+ * validation scan at those leaves. All keys, strict/refined fields, clone nodes
+ * and the original conservative work bound remain prepaid. */
+export function reserveP0FNativeManifestsClone(value:unknown):boolean {
+  if(nativeFrame===undefined)return false;
+  const owner=state(nativeFrame),f:FState=owner.f;
+  if(owner.scope!==value||f.nativeEncoding(value)===undefined){reserveP0FNativeClone(value);return false;}
+  const size=f.size(value);let plainText=0,unchanged=true;
+  const json=(item:unknown):void=>{
+    f.charge(1);
+    if(typeof item==='string'){plainText+=item.length*2;return;}
+    if(item===null||typeof item!=='object')return;
+    for(const key in item)if(Object.hasOwn(item,key)){
+      // Zod's record merger drops this one key even when it parses successfully.
+      // Test every generic record before allowing exact immutable-data reuse.
+      f.charge(1);if(key.length===9){f.charge(1,18);if(key==='__proto__')unchanged=false;}
+      json((item as Record<string,unknown>)[key]);
+    }
+  };
+  if(value!==null&&typeof value==='object'&&!Array.isArray(value)){
+    const v=value as Record<string,unknown>;json(v.schema);
+    if(Array.isArray(v.tables))for(const table of v.tables){f.charge(1);if(table!==null&&typeof table==='object'&&!Array.isArray(table))json(table.columns);}
+    const controls=v.controlRows;
+    if(controls!==null&&typeof controls==='object'&&!Array.isArray(controls)){
+      const rows=controls as Record<string,unknown>;
+      if(Array.isArray(rows.storage_maintenance))for(const row of rows.storage_maintenance){f.charge(1);json(row);}
+      if(Array.isArray(rows.storage_source_clients))for(const row of rows.storage_source_clients){f.charge(1);json(row);}
+    }
+  }
+  f.require(plainText<=size.text);f.charge(size.nodes*8,(size.text-plainText)*2,0,size.nodes);
+  return unchanged;
+}
+/** Fixed caller of the readonly native source-client equality consumer. Its
+ * rows are ordinary enumerable data records from the strict JSON codec or the
+ * fixed decodeRow constructor: no symbol/accessor/nonenumerable user keys exist.
+ * Each dataRow call allocates a prototype list, own-key list and descriptors;
+ * even the same object supplied twice executes both original input checks. */
+export function reserveP0FNativeClientEquality(left:Readonly<Record<string,Json>>,right:Readonly<Record<string,Json>>):void {
+  const f=nativeState();if(!f)return;
+  const count=(row:Readonly<Record<string,Json>>):number=>{
+    f.charge(1);
+    if(row===null||typeof row!=='object'||Array.isArray(row))return 0;
+    const prototype=Object.getPrototypeOf(row);
+    if(prototype!==Object.prototype&&prototype!==null)return 3;
+    let keys=0;for(const key in row)if(Object.hasOwn(row,key)){f.charge(1);keys++;}
+    return 3+1+keys+(keys===16?16:0);
+  };
+  const tuples=count(left)+count(right);f.charge(tuples,0,tuples);
+}
 export function reserveP0FNativeShallow(value: object, copies = 1): void {
   const f = nativeState(); if (!f) return;
   let nodes = 1, edges = 0;
@@ -96,9 +150,8 @@ export function reuseP0FNativeCanonical(value: unknown): string | undefined {
   const f = nativeState(); if (!f) return undefined;
   const encoded = f.nativeEncoding(value); if (!encoded) return undefined;
   const source = f.sourceText(encoded); if (source !== undefined) return source;
-  // Existing text is just a reference. First flatten must pay the original
-  // UTF-16 read+write upper bound before encodedText's actual join.
-  if (encoded.flat === undefined) f.charge(1, encoded.bytes * 3);
+  // encodedText prepays its own actual join reads and canonical output for
+  // every caller, including this native reuse path.
   return f.encodedText(encoded);
 }
 /** Called only at the fixed native literal/array production sites below. It
@@ -136,6 +189,19 @@ export function reserveP0FNativeText(text: string, utf8 = false): void {
   // UTF-8 uses at most three bytes per UTF-16 code unit. Include both encode
   // output and hash/compare input, as well as the original UTF-16 scan.
   f.charge(1, text.length * (utf8 ? 2 + 3 + 3 : 2));
+}
+/** Extra work in the original row-digest expression, separate from its row
+ * UTF8/SHA fee: byteLength scans again, then a decimal prefix is produced,
+ * encoded and hashed. No frame means the original native expression is free
+ * of P0 accounting, as before. */
+export function reserveP0FNativeRowPrefix(text:string):void{
+  const f=nativeState();if(!f)return;
+  f.charge(2,text.length*2);let upper=text.length*3,digits=1;
+  while(upper>=10){f.charge(2);upper=Math.floor(upper/10);digits++;}
+  const prefix=digits+1;
+  // number output <=2D; concatenation reads2D/outputsP; prefix UTF8 reads2P,
+  // outputsP; SHA readsP. All happen after this complete reservation.
+  f.charge(5,digits*2+(digits*2+prefix)+(prefix*2+prefix)+prefix);
 }
 export function reserveP0FNativeSort(values: readonly string[]): void {
   const f = nativeState(); if (!f) return;
@@ -261,7 +327,7 @@ export function preparseP0FRowJson(frame: P0FArtifactSyntaxFrame, row: SourceCli
   const hex = cell[1]; f.charge(2, hex.length * 3);
   const bytes = Buffer.from(hex, 'hex'); preflightP0FRowText(frame, row, s.encoding!, bytes);
   const name = s.encoding!.backend === 'postgres' ? 'utf-8' : s.encoding!.name;
-  const text = new TextDecoder(name, { fatal: true, ignoreBOM: true }).decode(bytes);
+  const text = new TextDecoder(name, utf8DecoderOptions).decode(bytes);
   f.require(f.currentSite);
   const value = parseP0Json(f.request, text, p0NestedSite(f.request, f.currentSite, 8), 'reference');
   f.freeze(value);f.encode(value);

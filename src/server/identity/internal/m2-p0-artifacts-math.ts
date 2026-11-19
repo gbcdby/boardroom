@@ -31,11 +31,23 @@ function rowJsonCost(f:FState,row:SourceClientRawRow,frame:P0FArtifactSyntaxFram
     preparseP0FRowJson(frame,row,key);
   }
 }
+// These fixed sequence fields are only passed to the original, separately
+// metered canonical equality/hash consumers. Keep traversal work; no native
+// operation scans all their characters outside those consumers.
+function sequenceData(f:FState,value:unknown,passes:number):void {
+  const size=f.size(value);f.charge((size.nodes+size.sortWork)*passes);
+}
 function sequenceCost(f:FState,nodes:readonly ControlReplayNode[]):void{
   f.charge(nodes.length*8,0,nodes.length*3);
-  for(const {reference,record} of nodes){f.select(reference,'journal');legacy(f,reference,2,1,'sequence');legacy(f,record.source,2,1,'sequence');legacy(f,record.plan,2,1,'sequence');legacy(f,record.previous,2,1,'sequence');
-    if(record.frozen){legacy(f,record.frozen,3,1,'sequence');legacy(f,record.formatVersion!==1?record.sourceClients:null,3,1,'sequence');}
-    f.charge(record.evidence.length,record.migrationId.length*2+record.requestId.length*2+record.requestDigest.length*2,record.evidence.length);}
+  for(const {reference,record} of nodes){f.select(reference,'journal');sequenceData(f,reference,2);sequenceData(f,record.source,2);sequenceData(f,record.plan,2);sequenceData(f,record.previous,2);
+    if(record.frozen){sequenceData(f,record.frozen,3);const roster=record.formatVersion!==1?record.sourceClients:null;
+      if(roster!==null&&f.request.input.graph.observation.backend==='sqlite'&&f.nativeEncoding(roster)!==undefined&&f.nativeEncoding(roster.rows)!==undefined){
+        // validateJournalSequence only passes rows to the separately metered
+        // digest/equality operations. It reads the top-level binding fields.
+        const whole=f.size(roster),rows=f.size(roster.rows);
+        f.charge(whole.nodes*3,(whole.text-rows.text)*3);
+      }else legacy(f,roster,3,1,'sequence');}
+    f.charge(record.evidence.length,0,record.evidence.length);}
 }
 function controlCost(f:FState,plan:MigrationPlan,node:ControlReplayNode,roster:SourceClientsRosterV1,bindings:ControlReplayBindings,rows:readonly SourceClientRawRow[],frame:P0FArtifactSyntaxFrame):void{
   f.select(node.reference,'journal');const record=node.record;f.require(record.formatVersion===3&&record.controlProof!==null);const proof=record.controlProof;
@@ -48,7 +60,10 @@ function controlCost(f:FState,plan:MigrationPlan,node:ControlReplayNode,roster:S
   // Runtime/client/session joins traverse these arrays. Reserve their actual products,
   // charging only their compared fields/JSON, rather than multiplying the whole journal.
   const facts=proof.facts,n=facts.clients.length+facts.runtime.runners.length+facts.runtime.owners.length+facts.runtime.results.length+1;
-  legacy(f,facts,4,1,'control-facts');const shape=f.size(facts);f.charge(shape.nodes*n,shape.text*n,n*n);
+  legacy(f,facts,4,1,'control-facts');const shape=f.size(facts);// Repeated direct field comparisons are now prepaid at their actual native
+  // join sites. Keep the conservative traversal/metadata bound, not n scans of
+  // unrelated host/process/session payload strings.
+  f.charge(shape.nodes*n,0,n*n);
   legacy(f,plan.sourceIdentity,2,1,'control-identities');legacy(f,plan.fileRoots,2,1,'control-identities');
 }
 export function mathP0(f:FState):JournalValueContext['math']{

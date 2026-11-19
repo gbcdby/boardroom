@@ -9,9 +9,9 @@ import { sourceClientRawRowSchema } from "../source-clients.ts";
 import { counter, hash, id, ref, source } from "../parse-primitives.ts";
 import type { DatabaseManifests, JournalRecord, Json, MigrationPlan, SourceClientRawRow, SourceClientTextCell, SourceClientsRosterV1, SourceRef } from "../types.ts";
 import type { UntrustedJournalCandidate } from "./codec.ts";
-import { compareText, equal, ordered, requireCandidate } from "./common.ts";
+import { compareText, equal, ordered, requireCandidate, sameJoinedText } from "./common.ts";
 import { fence, ownedIdentity, safePos, processDisposition, type ClientFact, type EventFacts, type SuccessorProof } from "./schema.ts";
-import { assertP0FSyntaxScope, assertP0FRow, assertP0FRowJson,bindP0FRowJsonEncoding, preflightP0FRowText, reserveP0FNativeClone, reserveP0FNativeNodes, reserveP0FNativeShallow,encodeP0FNativeShell,reserveP0FNativeMetadata,reserveP0FNativeWork,reserveP0FNativeKeyList,reserveP0FNativeSetBinding,reserveP0FNativeMapBinding, type P0FArtifactSyntaxFrame } from '../../../identity/internal/m2-p0-artifacts-frame.ts';
+import { assertP0FSyntaxScope, assertP0FRow, assertP0FRowJson,bindP0FRowJsonEncoding, preflightP0FRowText, reserveP0FNativeClone,reserveP0FNativeClientEquality, reserveP0FNativeNodes, reserveP0FNativeShallow,encodeP0FNativeShell,reserveP0FNativeMetadata,reserveP0FNativeWork,reserveP0FNativeKeyList,reserveP0FNativeSetBinding,reserveP0FNativeMapBinding, type P0FArtifactSyntaxFrame } from '../../../identity/internal/m2-p0-artifacts-frame.ts';
 
 const sqliteEncodings=Object.freeze(["UTF-8", "UTF-16le", "UTF-16be"]);
 const ordinaryEntrypoints=Object.freeze(["http", "stdio", "owned-background"]);
@@ -20,6 +20,8 @@ const changedObservationColumns=Object.freeze(["last_observed_at", "ended_at"]);
 type Encoding = SourceClientsRosterV1["textEncoding"];
 type Decoded = { -readonly [K in keyof SourceClientRawRow]: string | null };
 type Registration = { readonly creation: z.infer<typeof creation>; readonly actorId: string };
+const utf8DecoderOptions=Object.freeze({fatal:true,ignoreBOM:true});
+
 export interface RowContext {
   readonly plan: MigrationPlan;
   readonly record: JournalRecord | UntrustedJournalCandidate;
@@ -98,7 +100,7 @@ export function decodeRow(row: SourceClientRawRow, encoding: Encoding, frame?: P
       else {
         const bytes = Buffer.from(cell[1], "hex"), name = encoding.backend === "postgres" ? "utf-8" : encoding.name;
         if (frame !== undefined) preflightP0FRowText(frame, row, encoding, bytes);
-        const value = new TextDecoder(name, { fatal: true, ignoreBOM: true }).decode(bytes);
+        const value = new TextDecoder(name, utf8DecoderOptions).decode(bytes);
         requireCandidate(equal(encodeText(value, encoding), cell)); result[key] = value;
       }
     }
@@ -130,14 +132,14 @@ export function bindSourceClientManifestRows(manifests: DatabaseManifests, rows:
       ? column.cid === String(index) && column.type === expected.sqlite && column.notnull === (expected.nullable || index === 0 ? "0" : "1")
       : column.position === String(index + 1) && column.type_oid === expected.postgres && column.not_null === !expected.nullable);
   }
-  const decoded = rows.map(raw => { const value = decodeRow(raw, encoding, syntaxFrame); requireCandidate(value !== null && sameSourceClientRow(value, value)); return value; });
+  const decoded = rows.map(raw => { const value = decodeRow(raw, encoding, syntaxFrame); requireCandidate(value !== null && (reserveP0FNativeClientEquality(value,value),sameSourceClientRow(value,value))); return value; });
   reserveP0FNativeMetadata(1);
   const indexed = new Map<string, Readonly<Record<string, Json>>>();
   for (const row of manifests.controlRows.storage_source_clients) {
-    requireCandidate(sameSourceClientRow(row, row) && typeof row.client_id === "string" && !indexed.has(row.client_id)); indexed.set(row.client_id, row);
+    requireCandidate((reserveP0FNativeClientEquality(row,row),sameSourceClientRow(row,row)) && typeof row.client_id === "string" && !indexed.has(row.client_id)); indexed.set(row.client_id, row);
   }
   requireCandidate(indexed.size === decoded.length && (reserveP0FNativeMetadata(decoded.length+2),new Set(decoded.map(row => row.client_id))).size === decoded.length);
-  for (const row of decoded) { const actual = indexed.get(row.client_id!); requireCandidate(actual && sameSourceClientRow(row, actual)); }
+  for (const row of decoded) { const actual = indexed.get(row.client_id!); requireCandidate(actual && (reserveP0FNativeClientEquality(row,actual),sameSourceClientRow(row,actual))); }
   let typedNodes = 1;
   for (const row of rows) {
     typedNodes++;
@@ -276,12 +278,12 @@ function runtimeRelations(facts: EventFacts): void {
   for (const owner of owners.values()) {
     if (owner.bindingId === null) requireCandidate(owner.leaseOwner === null && owner.leaseExpiresAt === null);
     else requireCandidate(owner.leaseOwner !== null && owner.leaseExpiresAt !== null && Number.isFinite(Date.parse(owner.leaseExpiresAt))
-      && facts.runtime.runners.some(row => row.bindingId === owner.bindingId && row.memberId === owner.memberId && row.generation === owner.generation && row.leaseOwner === owner.leaseOwner));
+      && facts.runtime.runners.some(row => sameJoinedText(row.bindingId,owner.bindingId) && sameJoinedText(row.memberId,owner.memberId) && row.generation === owner.generation && sameJoinedText(row.leaseOwner,owner.leaseOwner)));
   }
   const results = facts.runtime.runners.map(row => {
     const owner = owners.get(row.memberId);
     requireCandidate(owner && owner.generation >= row.generation && (row.leaseOwner === null
-      || owner.bindingId === row.bindingId && owner.generation === row.generation && owner.leaseOwner === row.leaseOwner));
+      || sameJoinedText(owner.bindingId,row.bindingId) && owner.generation === row.generation && sameJoinedText(owner.leaseOwner,row.leaseOwner)));
     if (row.generation === 0) requireCandidate(row.leaseOwner === null && row.processIdentity === null && row.exitConfirmed === 1);
     reserveP0FNativeNodes(2 + facts.clients.length);
     reserveP0FNativeWork(facts.clients.length);
@@ -289,14 +291,14 @@ function runtimeRelations(facts: EventFacts): void {
     for(const client of facts.clients){if(client.kind==='maintenance-controller'||client.receipt===null)emptyLists++;else exitCount+=client.receipt.ownedExits.length;}
     reserveP0FNativeMetadata(2+emptyLists+exitCount*2);
     const exits = facts.clients.flatMap(client => client.kind === "maintenance-controller" ? [] : client.receipt?.ownedExits ?? [])
-      .filter(exit => exit.fence.bindingId === row.bindingId && exit.fence.memberId === row.memberId && exit.fence.generation === row.generation);
+      .filter(exit => sameJoinedText(exit.fence.bindingId,row.bindingId) && sameJoinedText(exit.fence.memberId,row.memberId) && exit.fence.generation === row.generation);
     if (row.processIdentity === null) requireCandidate(row.inspection === null && row.leaseOwner === null && row.exitConfirmed === 1 && (row.generation === 0 || exits.length > 0));
-    else requireCandidate(row.inspection !== null && exits.every(exit => equal(exit.processIdentity, row.processIdentity) && (row.leaseOwner === null || exit.fence.owner === row.leaseOwner)));
+    else requireCandidate(row.inspection !== null && exits.every(exit => equal(exit.processIdentity, row.processIdentity) && (row.leaseOwner === null || sameJoinedText(exit.fence.owner,row.leaseOwner))));
     return { bindingId: row.bindingId, memberId: row.memberId, generation: row.generation, status: row.generation === 0 ? "not-owned" : "exited" };
   });
   requireCandidate(equal(results, facts.runtime.results));
   for (const client of facts.clients) if (client.kind !== "maintenance-controller" && client.classification === "current-client") for (const exit of client.receipt?.ownedExits ?? [])
-    requireCandidate(results.some(row => row.bindingId === exit.fence.bindingId && row.memberId === exit.fence.memberId && row.generation === exit.fence.generation));
+    requireCandidate(results.some(row => sameJoinedText(row.bindingId,exit.fence.bindingId) && sameJoinedText(row.memberId,exit.fence.memberId) && row.generation === exit.fence.generation));
 }
 function sessionSources(facts: EventFacts, context: RowContext, expected: readonly PgRegistered[], allDecoded: boolean): void {
   const sessions = facts.sessions, identity = object(context.plan.sourceIdentity);
@@ -322,8 +324,8 @@ function sessionSources(facts: EventFacts, context: RowContext, expected: readon
       requireCandidate(file.mappedInode === file.inode && file.mappedMajor === String((dev >> 8n & 0xfffn) | (dev >> 32n & 0xfffff000n))
         && file.mappedMinor === String((dev & 0xffn) | (dev >> 12n & 0xffffff00n)));
     }
-    for (const item of sessions.matches) if (item.sourceRole !== "managed-sessions") requireCandidate(sessions.sourceFiles.some(file => file.role === item.sourceRole
-      && file.presence === "present" && file.device === item.device && file.inode === item.inode));
+    for (const item of sessions.matches) if (item.sourceRole !== "managed-sessions") requireCandidate(sessions.sourceFiles.some(file => sameJoinedText(file.role,item.sourceRole)
+      && file.presence === "present" && sameJoinedText(file.device,item.device) && sameJoinedText(file.inode,item.inode)));
   }
 }
 
@@ -372,8 +374,8 @@ export function applyChanges(rows: readonly SourceClientRawRow[], proof: Success
     const key = change.after.client_id[1];
     if (change.kind === "maintenance-registration") {
       requireCandidate(!next.has(key) && proof.facts.actor.clientId === null && change.actorId === proof.facts.actor.actorId
-        && proof.facts.clients.every(client => client.process.instanceId !== change.actorId)
-        && !(reserveP0FNativeMetadata(context.registrations.size+1),[...context.registrations.values()]).some(item => item.actorId === change.actorId));
+        && proof.facts.clients.every(client => !sameJoinedText(client.process.instanceId,change.actorId))
+        && !(reserveP0FNativeMetadata(context.registrations.size+1),[...context.registrations.values()]).some(item => sameJoinedText(item.actorId,change.actorId)));
       reserveP0FNativeNodes(11);
       const creationValue = { migrationId: context.record.migrationId, plan: context.record.plan, fenceEpoch: String(context.fenceEpoch),
         ownerGeneration: String(context.record.ownerGeneration), previousAnchor: proof.previousAnchor, targetSequence: String(context.record.sequence) };

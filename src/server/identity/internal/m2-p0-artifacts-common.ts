@@ -10,7 +10,17 @@ import { chargeP0, createP0TupleIndex, failP0, p0ArtifactSite, parseP0Json } fro
 import type { P0Code, P0Request, P0SelectedArtifact, P0Site, P0TupleIndex } from "./m2-p0.ts";
 import { p0FJournalSyntaxFrame, p0FCodecSyntaxFrame, withP0FNativeConsumer } from './m2-p0-artifacts-frame.ts';
 
+const utf8DecoderOptions=Object.freeze({fatal:true,ignoreBOM:true});
 const referenceKeys=Object.freeze(['ref','sha256','bytes']);
+// Fixed byte grammar is module data, never a request/value/validity cache.
+// These private Buffers are only read by Hash.update and are never exported.
+const hashGrammar=Object.freeze({arrayOpen:Buffer.from('['),arrayClose:Buffer.from(']'),objectOpen:Buffer.from('{'),objectClose:Buffer.from('}'),comma:Buffer.from(','),colon:Buffer.from(':'),payloadOpen:Buffer.from(',"'),quote:Buffer.from('"')});
+const lowerHex="0123456789abcdef";
+const cellGrammar:Readonly<Record<string,{readonly text:string;readonly bytes:Buffer}>>=Object.freeze({
+  null:Object.freeze({text:'"null"',bytes:Buffer.from('"null"')}),integer:Object.freeze({text:'"integer"',bytes:Buffer.from('"integer"')}),
+  text:Object.freeze({text:'"text"',bytes:Buffer.from('"text"')}),blob:Object.freeze({text:'"blob"',bytes:Buffer.from('"blob"')}),
+  real64be:Object.freeze({text:'"real64be"',bytes:Buffer.from('"real64be"')}),
+});
 
 const registered = new Set(["pc-observation","pc-catalog","pc-column-contract","pc-typed-table","pc-typed-row","pc-dependency-domain","pc-pg-sequence-relation","m2-physical-source",
   "plan","journal","source-files","source-file-payload","database-snapshot","database-manifests","capability","restore-bundle","publication","verification","receipt"]);
@@ -27,9 +37,11 @@ interface FKeyTrie { readonly children:Map<string,FKeyTrie>; shape?:FKeyShape }
  * No role, context, reachability or semantic-success result is cached here. */
 interface FSourceSpan { readonly bytes: Buffer; readonly text: string; readonly byteStart: number; readonly unitStart: number; readonly unitEnd: number }
 export interface FEncoding extends Size {
-  readonly kind:'scalar'|'array'|'object'|'cell'; bytes:number;
+  readonly kind:'scalar'|'string'|'array'|'object'|'cell'; bytes:number;
+  readonly raw?:string; readonly escaped?:boolean;
   readonly children?:readonly FEncoding[]; readonly keys?:readonly FEncoding[];
-  readonly cell?:readonly string[]; readonly tagText?:string;
+  readonly cell?:readonly string[]; readonly tagText?:string; readonly tagBytes?:Buffer;
+  utf8?:Buffer; rawUtf8?:Buffer; payloadUtf8?:Buffer;
   flat?:string; digest?:string; source?:FSourceSpan;
 }
 export interface FEntry { readonly selected: P0SelectedArtifact; readonly ordinal: number; readonly site: P0Site; bytes?: Buffer; verified?: boolean; parsed?: unknown; decoded?: unknown }
@@ -86,12 +98,11 @@ export class FState {
       for(const table of request.input.graph.observation.tables)for(const row of table.rows)for(const cell of row.cells){
         this.charge(1);this.require(Object.isFrozen(cell));
         const tag=cell[0]!;this.charge(1,tag.length*2);
-        const tagText=tag==='null'?'"null"':tag==='integer'?'"integer"':tag==='text'?'"text"':tag==='blob'?'"blob"':tag==='real64be'?'"real64be"':undefined;
-        this.require(tagText!==undefined);
+        const grammar=cellGrammar[tag];this.require(grammar!==undefined);const tagText=grammar.text;
         const payload=cell.length===2?cell[1]!:undefined;
         const encoded=tagText.length+2+(payload===undefined?0:payload.length+3);
         this.charge(1,0,3); // record, encodings binding, immutable binding
-        const data:FEncoding={kind:'cell',cell,tagText,bytes:encoded,nodes:payload===undefined?2:3,
+        const data:FEncoding={kind:'cell',cell,tagText,tagBytes:grammar.bytes,bytes:encoded,nodes:payload===undefined?2:3,
           text:(tag.length+(payload?.length??0))*2,encoded,sortWork:0,sortBytes:0};
         this.immutable.add(cell);this.encodings.set(cell,data);
       }
@@ -132,8 +143,9 @@ export class FState {
     this.charge(1,reference.ref.length*2);this.require(pathMatches,'artifact_semantic_mismatch','format-mismatch');
     if(!this.used.has(entry.ordinal)){this.charge(1,0,1);this.used.add(entry.ordinal);}
     if(binary.has(k)){
-      if(!entry.verified){const hex=entry.selected.bytesHex;this.charge(1,hex.length+hex.length/2);
+      if(!entry.verified){const hex=entry.selected.bytesHex,n=hex.length/2;this.charge(1,hex.length+n+n);
         // Consume the immutable hex directly: no separately retained binary Buffer is copied.
+        // The internal hex decoder still produces n bytes before SHA reads n.
         this.require(createHash('sha256').update(hex,'hex').digest('hex')===reference.sha256,'artifact_bytes_mismatch','bytes-mismatch');entry.verified=true;}
     }else this.bytes(entry);
     return entry;
@@ -150,7 +162,7 @@ export class FState {
     if(Object.hasOwn(entry,'parsed'))return entry.parsed;
     const bytes=this.bytes(entry);this.charge(1,bytes.length*2);
     this.require(isUtf8(bytes),'artifact_semantic_mismatch','format-mismatch');
-    const text=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes);
+    const text=new TextDecoder('utf-8',utf8DecoderOptions).decode(bytes);
     // The exact canonical-byte comparison below also rejects a BOM, whitespace and lexical rounding.
     const value=parseP0Json(this.request,text!,entry.site,pc.has(entry.selected.kind)?'reference':'finite');
     this.freeze(value);
@@ -200,6 +212,7 @@ export class FState {
   // structural equality of each cloned subtree; codec-normalized subtrees keep their own bytes.
   copyEncoding(original:unknown,decoded:unknown):boolean{
     this.charge(1);
+    if(original!==null&&typeof original==='object'&&original===decoded&&this.immutable.has(original)&&Object.isFrozen(original))return true;
     if(original===null||typeof original!=='object'){
       if(typeof original==='string'&&typeof decoded==='string')return this.sameText(original,decoded);
       return Object.is(original,decoded);
@@ -356,14 +369,21 @@ export class FState {
   }
   private quote(value:string):FEncoding{
     this.charge(1,value.length*2);const old=this.strings.get(value);if(old!==undefined)return old;
-    this.charge(1,value.length*2);let encoded=2;
-    for(let i=0;i<value.length;i++){const c=value.charCodeAt(i);if(c===34||c===92)encoded+=2;else if(c<32)encoded+=c===8||c===9||c===10||c===12||c===13?2:6;else if(c<128)encoded++;else if(c<2048)encoded+=2;else if(c>=0xd800&&c<=0xdbff&&i+1<value.length&&value.charCodeAt(i+1)>=0xdc00&&value.charCodeAt(i+1)<=0xdfff){encoded+=4;i++;}else encoded+=c>=0xd800&&c<=0xdfff?6:3;}
-    this.charge(1,value.length*2+encoded,2);
-    const flat=JSON.stringify(value),result:FEncoding={kind:'scalar',flat,bytes:encoded,nodes:1,text:value.length*2,encoded,sortWork:0,sortBytes:0};
+    this.charge(1,value.length*2);let encoded=2,direct=true;
+    for(let i=0;i<value.length;i++){const c=value.charCodeAt(i);if(c===34||c===92){encoded+=2;direct=false;}else if(c<32){encoded+=c===8||c===9||c===10||c===12||c===13?2:6;direct=false;}else if(c<128)encoded++;else if(c<2048)encoded+=2;else if(c>=0xd800&&c<=0xdbff&&i+1<value.length&&value.charCodeAt(i+1)>=0xdc00&&value.charCodeAt(i+1)<=0xdfff){encoded+=4;i++;}else if(c>=0xd800&&c<=0xdfff){encoded+=6;direct=false;}else encoded+=3;}
+    // This complete scan proves that JSON.stringify would only add quotes.
+    // Keep the original immutable primitive: no quoted copy is produced here.
+    if(direct){this.charge(1,0,2);const result:FEncoding={kind:'string',raw:value,bytes:encoded,nodes:1,text:value.length*2,encoded,sortWork:0,sortBytes:0};this.strings.set(value,result);return result;}
+    // Escaped text likewise remains immutable source data until a consumer
+    // actually needs its quoted copy. Canonical source admission can compare
+    // every escape without first allocating an equal JSON.stringify result.
+    this.charge(1,0,2);
+    const result:FEncoding={kind:'string',raw:value,escaped:true,bytes:encoded,nodes:1,text:value.length*2,encoded,sortWork:0,sortBytes:0};
     this.strings.set(value,result);return result;
   }
   *encodingParts(value:FEncoding):Generator<string>{
     this.charge(1);if(value.flat!==undefined){yield value.flat;return;}
+    if(value.kind==='string'){if(value.escaped)yield this.quotedText(value);else{yield '"';yield value.raw!;yield '"';}return;}
     if(value.kind==='cell'){
       yield '[';yield value.tagText!;
       if(value.cell!.length===2){this.charge(1);yield ',"';yield value.cell![1]!;yield '"';}
@@ -377,10 +397,16 @@ export class FState {
     }
     yield value.kind==='object'?'}':']';
   }
+  private quotedText(value:FEncoding):string {
+    const source=this.sourceText(value);if(source!==undefined)return source;
+    this.charge(1,value.raw!.length*2+value.bytes);
+    value.flat=JSON.stringify(value.raw!);return value.flat;
+  }
   encodedText(value:FEncoding):string{
     this.charge(1);if(value.flat!==undefined)return value.flat;
     // The UTF-8 count was computed while encoding; no second length scan or nested join.
-    this.charge(1,value.bytes,1);const parts:string[]=[];
+    // UTF16 source reads are at most 2E; the canonical output is E logical bytes.
+    this.charge(1,value.bytes*3,1);const parts:string[]=[];
     for(const part of this.encodingParts(value)){this.charge(1,0,1);parts.push(part);}
     value.flat=parts.join('');return value.flat;
   }
@@ -395,10 +421,40 @@ export class FState {
       this.charge(1,part.length*2);if(!text.startsWith(part,unitAt))return false;
       unitAt+=part.length;byteAt+=byteLength;return true;
     };
+    const quoted=(item:FEncoding):boolean=>{
+      const raw=item.raw!;
+      // One pass reads the decoded UTF16 string and the canonical source.
+      // E UTF8 bytes upper-bounds the number of canonical source code units.
+      this.charge(1,raw.length*2+item.bytes*2);
+      const unit=(code:number,width=1):boolean=>{
+        if(unitAt>=text.length||text.charCodeAt(unitAt)!==code)return false;
+        unitAt++;byteAt+=width;return true;
+      };
+      const escaped=(code:number):boolean=>unit(92)&&unit(117)&&unit(lowerHex.charCodeAt(code>>>12))
+        &&unit(lowerHex.charCodeAt(code>>>8&15))&&unit(lowerHex.charCodeAt(code>>>4&15))&&unit(lowerHex.charCodeAt(code&15));
+      if(!unit(34))return false;
+      for(let i=0;i<raw.length;i++){
+        const code=raw.charCodeAt(i);
+        if(code===34||code===92){if(!unit(92)||!unit(code))return false;}
+        else if(code<32){
+          const short=code===8?98:code===9?116:code===10?110:code===12?102:code===13?114:0;
+          if(short?(!unit(92)||!unit(short)):!escaped(code))return false;
+        }else if(code>=0xd800&&code<=0xdbff){
+          const low=i+1<raw.length?raw.charCodeAt(i+1):0;
+          if(low>=0xdc00&&low<=0xdfff){if(!unit(code,4)||!unit(low,0))return false;i++;}
+          else if(!escaped(code))return false;
+        }else if(code>=0xdc00&&code<=0xdfff){if(!escaped(code))return false;}
+        else if(!unit(code,code<128?1:code<2048?2:3))return false;
+      }
+      return unit(34);
+    };
     const match=(item:FEncoding):boolean=>{
       this.charge(1);const byteStart=byteAt,unitStart=unitAt;
       if(item.kind==='scalar'){
         if(!token(item.flat!,item.bytes))return false;
+      }else if(item.kind==='string'){
+        if(item.escaped){if(!quoted(item))return false;}
+        else if(!token('"')||!token(item.raw!,item.bytes-2)||!token('"'))return false;
       }else if(item.kind==='cell'){
         if(!token('[')||!token(item.tagText!))return false;
         if(item.cell!.length===2&&(!token(',"')||!token(item.cell![1]!)||!token('"')))return false;
@@ -412,10 +468,11 @@ export class FState {
         }
         if(!token(item.kind==='object'?'}':']'))return false;
       }
-      // A scalar already owns its complete canonical flat token. All consumers
-      // can read that same token without a second source-span/index record.
+      // Fixed scalars and unescaped primitives need no source interval. An
+      // escaped string keeps the exact wire interval only after the complete
+      // match, allowing later hashes to reuse bytes without quoting/encoding.
       // Every token still participates in the complete original-wire match.
-      if(!(item.kind==='scalar'&&item.flat!==undefined)&&item.source===undefined&&!staged.has(item)){
+      if((item.kind!=='string'||item.escaped)&&!(item.kind==='scalar'&&item.flat!==undefined)&&item.source===undefined&&!staged.has(item)){
         // One span record contains its target; no extra [encoding, span] array.
         this.charge(1,0,3);pending.push({encoding:item,bytes,text,byteStart,unitStart,unitEnd:unitAt});staged.add(item);
       }
@@ -466,23 +523,32 @@ export class FState {
     this.charge(1);
     if(value.source!==undefined){const s=value.source;this.charge(1,0,1);hash.update(s.bytes.subarray(s.byteStart,s.byteStart+value.bytes));return;}
     if(value.flat!==undefined){
-      // A scalar without a redundant source span now follows this real string
-      // path. Prepay its UTF16 read and UTF8 encoding; the caller separately
-      // reserved the complete SHA input. No Buffer view was produced here.
-      this.charge(1,value.flat.length*2+value.bytes);hash.update(value.flat);return;
+      // Actual byte data belongs to this request's encoding. A later SHA still
+      // reads every byte but does not produce another equal UTF8 buffer.
+      if(value.utf8===undefined){this.charge(1,value.flat.length*2+value.bytes,1);value.utf8=Buffer.from(value.flat,'utf8');}
+      hash.update(value.utf8);return;
+    }
+    if(value.kind==='string'){
+      if(value.escaped){this.quotedText(value);this.hashEncoding(hash,value);return;}
+      if(value.rawUtf8===undefined){this.charge(1,value.raw!.length*2+value.bytes-2,1);value.rawUtf8=Buffer.from(value.raw!,'utf8');}
+      hash.update(hashGrammar.quote);hash.update(value.rawUtf8);hash.update(hashGrammar.quote);return;
     }
     if(value.kind==='cell'){
-      hash.update('[');hash.update(value.tagText!);
-      if(value.cell!.length===2){this.charge(1);hash.update(',"');hash.update(value.cell![1]!);hash.update('"');}
-      hash.update(']');return;
+      hash.update(hashGrammar.arrayOpen);hash.update(value.tagBytes!);
+      if(value.cell!.length===2){
+        this.charge(1);const payload=value.cell![1]!;
+        if(value.payloadUtf8===undefined){this.charge(1,payload.length*3,1);value.payloadUtf8=Buffer.from(payload,'utf8');}
+        hash.update(hashGrammar.payloadOpen);hash.update(value.payloadUtf8);hash.update(hashGrammar.quote);
+      }
+      hash.update(hashGrammar.arrayClose);return;
     }
-    hash.update(value.kind==='object'?'{':'[');
+    hash.update(value.kind==='object'?hashGrammar.objectOpen:hashGrammar.arrayOpen);
     for(let i=0;i<value.children!.length;i++){
-      this.charge(1);if(i)hash.update(',');
-      if(value.kind==='object'){this.hashEncoding(hash,value.keys![i]!);hash.update(':');}
+      this.charge(1);if(i)hash.update(hashGrammar.comma);
+      if(value.kind==='object'){this.hashEncoding(hash,value.keys![i]!);hash.update(hashGrammar.colon);}
       this.hashEncoding(hash,value.children![i]!);
     }
-    hash.update(value.kind==='object'?'}':']');
+    hash.update(value.kind==='object'?hashGrammar.objectClose:hashGrammar.arrayClose);
   }
   digest(value:unknown):string{return this.digestEncoding(this.encode(value));}
   // All PC-owned grammars here have ASCII keys; values still use the R3 Unicode/integer domain.
@@ -499,6 +565,7 @@ export class FState {
     // same bytes. Different layouts still compare the actual canonical stream.
     if(a.kind!==b.kind)return this.compareEncodings(a,b)===0;
     if(a.kind==='scalar')return this.sameText(a.flat!,b.flat!);
+    if(a.kind==='string')return this.sameText(a.raw!,b.raw!);
     if(a.kind==='cell')return this.compareEncodings(a,b)===0;
     // Canonical JSON has one fixed token tree for each value: sorted object keys,
     // ordered arrays and one quoted/number token per scalar. Compare that tree
@@ -513,5 +580,4 @@ export class FState {
     return true;
   }
   equal(a:unknown,b:unknown):boolean{return this.encodingEqual(this.encode(a),this.encode(b));}
-  hash(text:string):string{this.charge(1,this.utf8Bytes(text));return createHash('sha256').update(text).digest('hex');}
 }
