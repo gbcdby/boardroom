@@ -86,3 +86,67 @@ test('F native data: framed multiset and digest agree with the actual unframed n
     const after=p0Usage(a.request);assert.deepEqual(digestRowMultiset([['x'],['x']]),digestRowMultiset([['x'],['x']]));assert.deepEqual(p0Usage(a.request),after);
   }finally{endP0FArtifactPass(a.f);}
 });
+
+test('F encoding metadata: a new eight-key list is refused before Object.keys at zero or one-short capacity',()=>{
+  for(const left of [0,8]){
+    const a=owned(),value={h:0,g:0,f:0,e:0,d:0,c:0,b:0,a:0};let calls=0;
+    const original=Object.keys;
+    try{
+      // The empty key trie first creates eight exact edges (record/Map/binding).
+      // Leave zero or eight units at the actual nine-unit key-list producer.
+      chargeP0(a.request,{tuples:250_000-p0Usage(a.request).tuples-24-left});
+      Object.keys=function(target:object){if(target===value)calls++;return original(target);};
+      const result=withP0Guard(a.request,()=>a.f.encode(value));
+      assert(!result.ok);assert.equal(result.error.code,'resource_limit');assert.equal(calls,0);
+    }finally{Object.keys=original;endP0FArtifactPass(a.f);}
+  }
+});
+
+test('F encoding metadata: every flatten reference is prepaid and insufficient capacity never reaches join',()=>{
+  for(const left of [0,1,12]){
+    const a=owned(),encoded=a.f.encode({a:1,b:2,c:3});let pushes=0,joins=0;
+    const push=Array.prototype.push,join=Array.prototype.join;
+    try{
+      chargeP0(a.request,{tuples:250_000-p0Usage(a.request).tuples-left});
+      Array.prototype.push=function(...values:unknown[]){if(values.length===1&&typeof values[0]==='string')pushes++;return push.apply(this,values);};
+      Array.prototype.join=function(separator?:string){joins++;return join.call(this,separator);};
+      const result=withP0Guard(a.request,()=>a.f.encodedText(encoded));
+      assert(!result.ok);assert.equal(result.error.code,'resource_limit');
+      assert.equal(pushes,Math.max(0,left-1));assert.equal(joins,0);assert.equal(encoded.flat,undefined);
+    }finally{Array.prototype.push=push;Array.prototype.join=join;endP0FArtifactPass(a.f);}
+  }
+});
+
+test('F encoding key data: exact key sequences share data while changed values and new keys are re-encoded',()=>{
+  const a=owned(),first={z:1,a:'before'},second={z:2,a:'after'},extra={z:2,a:'after',b:true};
+  const original=Object.keys;let secondLists=0,extraLists=0;
+  try{
+    assert.equal(a.f.canonical(first),canonicalJson(first));
+    Object.keys=function(target:object){if(target===second)secondLists++;if(target===extra)extraLists++;return original(target);};
+    assert.equal(a.f.canonical(second),'{"a":"after","z":2}');assert.equal(secondLists,0);
+    assert.equal(a.f.canonical(extra),'{"a":"after","b":true,"z":2}');assert.equal(extraLists,1);
+    second.a='changed';assert.equal(a.f.canonical(second),'{"a":"changed","z":2}');
+    const rejected=withP0Guard(a.request,()=>a.f.canonical({z:Infinity,a:'after'}));
+    assert(!rejected.ok);assert.equal(rejected.error.code,'artifact_semantic_mismatch');
+  }finally{Object.keys=original;endP0FArtifactPass(a.f);}
+});
+
+test('F encoding key sort: in-place UTF16 order agrees with the old native algorithm without native sort',()=>{
+  const a=owned(),prefix='shared-'.repeat(300);
+  const value=Object.fromEntries(['2','10','\ue000','\u{10000}','\ud800','\udc00',prefix+'z',prefix+'a','\0\t\n"\\'].map((key,i)=>[key,i]));
+  const expected=canonicalJson(value),sort=Array.prototype.sort;
+  try{
+    Array.prototype.sort=function(){throw new Error('unexpected native sort in private encoding');};
+    assert.equal(a.f.canonical(value),expected);
+  }finally{Array.prototype.sort=sort;endP0FArtifactPass(a.f);}
+});
+
+test('F encoding size data: a cached primitive needs no new tuple but an unseen primitive still reserves a record',()=>{
+  const a=owned();a.f.encode('known scalar');a.f.encode(7);
+  try{
+    chargeP0(a.request,{tuples:250_000-p0Usage(a.request).tuples});
+    assert.equal(a.f.size('known scalar').encoded,14);assert.equal(a.f.size(7).encoded,1);
+    const rejected=withP0Guard(a.request,()=>a.f.size('unseen scalar'));
+    assert(!rejected.ok);assert.equal(rejected.error.code,'resource_limit');
+  }finally{endP0FArtifactPass(a.f);}
+});

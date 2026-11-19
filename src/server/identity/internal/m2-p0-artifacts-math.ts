@@ -62,7 +62,7 @@ export function mathP0(f:FState):JournalValueContext['math']{
       // no longer occurs; keep the schema key and every other MD field here.
       if(v!==null&&typeof v==='object'&&f.decodedKinds.get(v)==='database-manifests'){
         const schema=f.nativeEncoding((v as {schema:unknown}).schema);
-        if(schema!==undefined&&s.nodes>=schema.size.nodes&&s.text>=schema.size.text){f.charge(s.nodes-schema.size.nodes,s.text-schema.size.text);return;}
+        if(schema!==undefined&&s.nodes>=schema.nodes&&s.text>=schema.text){f.charge(s.nodes-schema.nodes,s.text-schema.text);return;}
       }
       f.charge(s.nodes,s.text);
     },

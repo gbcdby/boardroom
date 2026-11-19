@@ -57,7 +57,7 @@ export function reuseP0FNativeCanonical(value: unknown): string | undefined {
   const source = f.sourceText(encoded); if (source !== undefined) return source;
   // Existing text is just a reference. First flatten must pay the original
   // UTF-16 read+write upper bound before encodedText's actual join.
-  if (encoded.text === undefined) f.charge(1, encoded.bytes * 3);
+  if (encoded.flat === undefined) f.charge(1, encoded.bytes * 3);
   return f.encodedText(encoded);
 }
 /** Called only at the fixed native literal/array production sites below. It

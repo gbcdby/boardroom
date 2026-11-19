@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { closeSync, constants, fstatSync, openSync, readSync, readdirSync } from "node:fs";
-import { chmod, copyFile, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir, constants as osConstants } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -588,8 +588,10 @@ async function withFixedP3Package(
     const source = path.join(directory, "src/server/storage/maintenance"), output = path.join(directory, "build/maintenance-platform");
     await mkdir(source, { recursive: true }); await mkdir(output, { recursive: true });
     await writeFile(path.join(directory, "package.json"), '{"type":"module"}\n');
-    for (const name of ["source-file-native.ts", "source-file-profile.ts", "canonical.ts", "error.ts"])
-      await copyFile(path.join(root, "src/server/storage/maintenance", name), path.join(source, name));
+    // Keep the actual canonical/frame dependency graph in this one private package.
+    for (const relative of ["src/server/storage/maintenance", "src/server/identity"])
+      await cp(path.join(root, relative), path.join(directory, relative), { recursive: true });
+    await symlink(path.join(root, "node_modules"), path.join(directory, "node_modules"), "dir");
     const addon = path.join(output, `maintenance-source-files-linux-${process.arch}.node`);
     const variant = fixedP3Variants[macro];
     const blockRoot = path.join(directory, "m04-sysfs"), blockNode = path.join(blockRoot, "devices/m04-test-node");

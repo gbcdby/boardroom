@@ -37,19 +37,28 @@ function sqliteCell(f:FState,cell:ReadonlyDeep<RawCell>):Json{
 /** Stable UTF16 order; compute each sort key once and pay before each comparison.
  * This replaces native name sorting and its quadratic conservative reservation. */
 function sortedByText<T>(f:FState,input:readonly T[],key:(value:T)=>string):T[]{
-  f.charge(input.length*3);let source=input.map(value=>({value,key:key(value)})),target=new Array<(typeof source)[number]>(source.length);
-  for(let width=1;width<source.length;width*=2){for(let start=0;start<source.length;start+=width*2){const middle=Math.min(start+width,source.length),end=Math.min(start+width*2,source.length);let l=start,r=middle;
-    for(let out=start;out<end;out++){f.charge(1);let left=r===end;if(!left&&l<middle)left=f.compareText(source[l]!.key,source[r]!.key)<=0;target[out]=left?source[l++]!:source[r++]!;}}
-    [source,target]=[target,source];}f.charge(source.length);return source.map(item=>item.value);
+  // One array shell, n slots and n key records. Reuse this array for the final
+  // values; neither a merge target nor a result-map array is materialized.
+  f.charge(input.length*2+1,0,input.length*2+1);
+  const source=new Array<{value:T;key:string}>(input.length);
+  for(let i=0;i<input.length;i++){f.charge(1);const value=input[i]!;source[i]={value,key:key(value)};}
+  for(let i=1;i<source.length;i++){
+    f.charge(1);const value=source[i]!;let at=i;
+    while(at>0&&f.compareText(source[at-1]!.key,value.key)>0){f.charge(1);source[at]=source[at-1]!;at--;}
+    f.charge(1);source[at]=value;
+  }
+  const result=source as unknown as T[];
+  for(let i=0;i<source.length;i++){f.charge(1);result[i]=source[i]!.value;}
+  return result;
 }
 export function sortedStrings(f:FState,input:readonly string[]):string[]{return sortedByText(f,input,s=>s);}
 export function rowDigest(f:FState,rows:readonly Json[]):{count:string;digest:string}{
   // Compare the exact canonical token streams. No whole-row string or wrapper
   // projection is materialized merely to sort/hash the immutable typed rows.
-  f.charge(rows.length*2,0,rows.length*2,2);let encoded=rows.map(row=>f.encode(row)),target=new Array<(typeof encoded)[number]>(encoded.length);
+  f.charge(rows.length*2,0,rows.length*2+2,2);let encoded=rows.map(row=>f.encode(row)),target=new Array<(typeof encoded)[number]>(encoded.length);
   for(let width=1;width<encoded.length;width*=2){for(let start=0;start<encoded.length;start+=width*2){const middle=Math.min(start+width,encoded.length),end=Math.min(start+width*2,encoded.length);let l=start,r=middle;
     for(let out=start;out<end;out++){f.charge(1);const left=r===end||l<middle&&f.compareEncodings(encoded[l]!,encoded[r]!)<=0;target[out]=left?encoded[l++]!:encoded[r++]!;}}
-    [encoded,target]=[target,encoded];}
+    const previous=encoded;encoded=target;target=previous;}
   const h=createHash('sha256');
   for(const row of encoded){f.charge(1,32);const prefix=`${row.bytes}:`;f.charge(2,row.bytes+prefix.length);h.update(prefix);f.hashEncoding(h,row);}f.charge(1,32,0,5);return {count:String(rows.length),digest:h.digest('hex')};
 }
@@ -57,7 +66,7 @@ interface MdData { readonly dialect:'sqlite'|'postgres'; readonly schema:Json; r
 const manifestData=new WeakMap<FState,WeakMap<object,MdData>>();
 export function buildMdValue(f:FState,dialect:'sqlite'|'postgres',schema:Json,tables:DatabaseManifests['tables'],controlRows:DatabaseManifests['controlRows']):DatabaseManifests{
   const immutable=f.immutable.has(tables)&&f.immutable.has(controlRows)&&schema!==null&&typeof schema==='object'&&f.immutable.has(schema);
-  let cache=manifestData.get(f);if(!cache){f.charge(1,0,1);cache=new WeakMap();manifestData.set(f,cache);}
+  let cache=manifestData.get(f);if(!cache){f.charge(1,0,2);cache=new WeakMap();manifestData.set(f,cache);}
   f.charge(1);const prior=immutable?cache.get(tables):undefined;
   if(prior&&prior.dialect===dialect&&prior.schema===schema&&prior.controls===controlRows)return prior.result;
   // Shallow JSON wrappers/ordered and filtered arrays are new; their immutable
@@ -70,7 +79,7 @@ export function buildMdValue(f:FState,dialect:'sqlite'|'postgres',schema:Json,ta
     fullDataManifestDigest:f.digest({dialect,schemaManifestDigest,tables:ordered}),
     frozenBusinessManifestDigest:f.digest({dialect,schemaManifestDigest,tables:ordered.filter(t=>!isControl(t))}),
     capturedControlManifestDigest:f.digest({dialect,tables:ordered.filter(isControl),controlRows})};
-  f.freeze(result);if(immutable){f.charge(1,0,1);cache.set(tables,{dialect,schema,controls:controlRows,result});}return result;
+  f.freeze(result);if(immutable){f.charge(1,0,cache.has(tables)?1:2);cache.set(tables,{dialect,schema,controls:controlRows,result});}return result;
 }
 function controlObject(f:FState,row:P0Row):Record<string,Json>{
   const backend=f.request.input.graph.observation.backend,fixed=F_COLUMNS[row.tableOrdinal]![1];f.charge(fixed.length,0,fixed.length);
@@ -94,7 +103,7 @@ const originalManifestData=new WeakMap<FState,OriginalManifestData>();
  * no selected manifest/column input and stores no validity or pass result. Each
  * caller still compares the data with its complete S4 metadata/digest/context. */
 function originalTableData(f:FState,ordinal:number):OriginalTableData{
-  let tables=originalTables.get(f);if(!tables){f.charge(1,0,1);tables=new Map();originalTables.set(f,tables);}
+  let tables=originalTables.get(f);if(!tables){f.charge(1,0,2);tables=new Map();originalTables.set(f,tables);}
   f.charge(1,0,1);const prior=tables.get(ordinal);if(prior)return prior;
   const o=f.request.input.graph.observation,raw=o.tables[ordinal]!,fixed=F_COLUMNS[ordinal]![1],handles=f.request.original.rows(raw.name as P0Table);
   // The outer row lists are newly allocated; reused SQLite cells keep their existing
@@ -157,7 +166,8 @@ export function compareP0Manifests(f:FState,md:DatabaseManifests,columns:readonl
   const allPgColumns=o.backend==='postgres'?f.array(schema.columns):[];let pgOrdinal=0;
   f.require(md.tables.length===o.tables.length+(o.backend==='postgres'?1:0));
   f.charge(md.tables.length);let tableKeyBytes=0;for(const table of md.tables)tableKeyBytes+=table.name.length*2;
-  f.charge(md.tables.length,tableKeyBytes,md.tables.length);const tableMap=new Map(md.tables.map(t=>[t.name,t]));f.require(tableMap.size===md.tables.length);
+  f.charge(md.tables.length,tableKeyBytes,md.tables.length+1);const tableMap=new Map<string,DatabaseManifests['tables'][number]>();
+  for(const table of md.tables)tableMap.set(table.name,table);f.require(tableMap.size===md.tables.length);
   f.charge(3,0,0,6);
   const prior=originalManifestData.get(f);
   const projected:DatabaseManifests['tables'][number][]=[];
@@ -187,6 +197,6 @@ export function compareP0Manifests(f:FState,md:DatabaseManifests,columns:readonl
     &&prior.controls.storage_maintenance===controls.storage_maintenance&&prior.controls.storage_source_clients===controls.storage_source_clients;
   let projection:OriginalManifestData;
   if(same)projection=prior;
-  else {f.freeze(projected);f.freeze(controls);f.charge(1,0,1);projection={tables:projected,controls};originalManifestData.set(f,projection);}
+  else {f.freeze(projected);f.freeze(controls);f.charge(1,0,originalManifestData.has(f)?1:2);projection={tables:projected,controls};originalManifestData.set(f,projection);}
   f.require(f.equal(buildMdValue(f,o.backend,md.schema,projection.tables,projection.controls),md));
 }
