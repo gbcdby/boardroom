@@ -374,10 +374,22 @@ sourceFileTest("#152 C3 guard SQLite: a forgotten whole consumer retains its ori
       await outer;
     };
     let rejected = false, failure: unknown;
-    try { await f.service.runMaintenanceServiceCommand(f.options,
+    let returned: Awaited<ReturnType<typeof f.service.runMaintenanceServiceCommand>> | undefined;
+    try { returned = await f.service.runMaintenanceServiceCommand(f.options,
       { operation: "resume-migration", request: { ...f.request, requestId: "forgotten-whole-guard-consumer" } }); }
     catch (error) { rejected = true; failure = error; }
-    assert.equal(rejected, true); assert.equal(failure, undefined);
+    // A domain blocker can return before the late consumer callback is entered.
+    // Preserve that boundary without emitting source values or changing the failure.
+    assert.equal(rejected, true, "the original consumer must reject; observed service boundary: " + JSON.stringify({
+      status: returned?.status ?? null,
+      phase: returned && "lastVerifiedPhase" in returned ? returned.lastVerifiedPhase
+        : returned && "phase" in returned ? returned.phase : returned && "lastPhase" in returned ? returned.lastPhase : null,
+      blockers: returned && "blockers" in returned ? [...new Set(returned.blockers.map(item => item.code))].slice(0, 16) : [],
+      sourceEntered: source !== undefined, consumerEntered: retained !== undefined,
+      stages: f.state.events.filter(event => event.event === "source-begin" || event.event === "source-end")
+        .slice(-16).map(({ event, stage, kind }) => ({ event, stage, kind })),
+    }));
+    assert.equal(failure, undefined);
     assert(source && retained);
     const outcome = f.sql.controlSqlOutcome(source);
     assert.equal(outcome.commitStarted, false); assert.equal(outcome.commitReturned, false);
