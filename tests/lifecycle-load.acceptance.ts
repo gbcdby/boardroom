@@ -129,10 +129,11 @@ for (const engine of ['sqlite', 'postgres'] as const) {
   const unmentioned = profile === 'unmentioned-history';
   test(`${engine} ${profile} S5-AUDIT-16 固定 V1 与 10000 历史负载，每次补偿及真实 MCP 投递独立验限`,
     { skip: engine === 'postgres' ? pgUnavailable : false, timeout: 120000 }, async t => {
-      // Preserve the first-lock profile while observing the acked-history
-      // COMMIT window with the same single-observer, per-report budget.
+      // The repeated acked-history failure precedes COMMIT. Observe its first
+      // project lock with the same single-observer, per-report budget; the
+      // existing client trace still records COMMIT durations and outcomes.
       const diagnostics = engine === 'postgres'
-        ? new LoadDiagnostics(undefined, unmentioned ? 'first-project-lock' : 'mutation-commit') : undefined;
+        ? new LoadDiagnostics(undefined, 'first-project-lock') : undefined;
       // after runs even if the body/report fails, preserving the original body
       // error when restoration also fails. There is only one hook per test.
       if (diagnostics) {
@@ -145,7 +146,7 @@ for (const engine of ['sqlite', 'postgres'] as const) {
         measurements: { sql: '实际 RepoCtx 查询/写入与 coordinator 锁语句；不含 driver 的 BEGIN/COMMIT/SAVEPOINT 控制语句',
           bytes: '实际返回行 JSON 表示的 UTF-8 字节；不是数据库协议线上的传输字节',
           stages: '等待首个项目锁；capture/verify 直到完整计划通过；apply/readback/audit 直到真实事务返回',
-          failureTiming: '失败 mutation.elapsedMs 保留原 allSettled 后采样；query/branch 失败瞬间另见 pgDiagnostics；allSettledElapsedMs 是各支路整体等待' },
+          failureTiming: '失败 mutation.elapsedMs 保留原 allSettled 后采样；fulfilled 保留各成功支路原完成计时；query/branch 失败瞬间另见 pgDiagnostics；allSettledElapsedMs 是各支路整体等待' },
         scope: '组织/成员补偿与同库真实 MCP 消息、ACK、心跳；不含 HTTP、DOM、macOS 或原生模型',
         pgDiagnostics: null as ReturnType<LoadDiagnostics['snapshot']> | null,
         phases: [] as Array<Record<string, unknown>>, operations: [] as Array<Record<string, unknown>> };
@@ -220,9 +221,15 @@ for (const engine of ['sqlite', 'postgres'] as const) {
                 const allSettledElapsedMs = rounded(performance.now() - stepStarted);
                 const failure = settled.find(result => result.status === 'rejected');
                 if (failure?.status === 'rejected') {
+                  const [changed, beat, chat] = settled;
                   report.operations.push({ historyMessages, step, operation, status: 'FAIL', mutation: budget.measure(),
                     sqlTrace: budget.statements, allSettledElapsedMs,
                     settled: settled.map((result, index) => ({ branch: ['mutation', 'heartbeat', 'traffic'][index], status: result.status })),
+                    fulfilled: {
+                      mutation: changed.status === 'fulfilled' ? changed.value.measurement : null,
+                      heartbeatMs: beat.status === 'fulfilled' ? beat.value.elapsedMs : null,
+                      traffic: chat.status === 'fulfilled' ? chat.value : null,
+                    },
                     error: String(failure.reason) });
                   throw failure.reason;
                 }
