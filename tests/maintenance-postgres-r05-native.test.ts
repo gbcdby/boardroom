@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -27,6 +28,13 @@ const selected = [
 const expectedTests = 24; // Eight original parents + twelve ACL and four native-failure subtests.
 const pattern = selected.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
 const digest = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+const nativeTestEnvironment = () => {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PG")));
+  // This process is itself a node --test child. Its internal context would make
+  // the independent nested runner exit successfully without running any files.
+  delete env["NODE_TEST_CONTEXT"];
+  return env;
+};
 
 // Retain the original maintenance-postgres CI batch limit of 300 s. The
 // enclosing 600 s includes the owned cluster startup, identity checks and actual
@@ -62,7 +70,7 @@ test("R05 owned PG16.15 reuses nonempty native restore, catalog/ACL and actual f
     try {
       cluster = await openCatalogGuardTestCluster(toolsDirectory!, "r05");
       before = await readServer();
-      const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PG")));
+      const env = nativeTestEnvironment();
       env["AGENT_STUDIO_PG_TEST_URL"] = cluster.connectionString();
       // The original pg-native launcher supplies the six exact private 16.15
       // programs in PATH. No driver, Fs or source-preservation profile is replaced.
@@ -129,3 +137,47 @@ test("R05 owned PG16.15 reuses nonempty native restore, catalog/ACL and actual f
     if (errors.length === 1) throw errors[0];
     if (errors.length) throw new AggregateError(errors, "R05 owned native cases or resource retirement failed", { cause: errors[0] });
   });
+
+test("R05 child runner executes actual nested tests without inheriting the parent runner context", { timeout: 10_000 }, async t => {
+  assert.equal(process.env["NODE_TEST_CONTEXT"], "child-v8", "the control must run under an actual parent node --test");
+  const original = { ...process.env };
+  const env = nativeTestEnvironment();
+  for (const [key, value] of Object.entries(original)) {
+    if (key === "NODE_TEST_CONTEXT") continue;
+    assert.ok(env[key] === (key.startsWith("PG") ? undefined : value), "preserve the original environment rule for " + key);
+  }
+  const directory = await mkdtemp(join(tmpdir(), "boardroom-r05-child-"));
+  try {
+    const fixture = join(directory, "child.mjs");
+    await writeFile(fixture, `import test from 'node:test';
+import assert from 'node:assert/strict';
+test('R05 selected parent one', async t => {
+  await t.test('R05 actual nested assertion', () => assert.equal(1 + 1, 2));
+});
+test('R05 selected parent two', () => assert.equal(process.env.NODE_TEST_CONTEXT, 'child-v8'));
+`);
+    const operation = execute(process.execPath, ["--test", "--test-reporter=tap", "--test-concurrency=1", fixture], {
+      env, timeout: 5_000, killSignal: "SIGTERM", maxBuffer: 32_000, signal: t.signal,
+    });
+    let close: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    const closed = new Promise<void>(resolve => operation.child.once("close", (code, signal) => {
+      close = { code, signal }; resolve();
+    }));
+    let stdout: string, stderr: string;
+    try { ({ stdout, stderr } = await operation); } finally { await closed; }
+    assert.ok(Number.isSafeInteger(operation.child.pid) && operation.child.pid! > 1);
+    assert.deepEqual(close, { code: 0, signal: null });
+    t.diagnostic(JSON.stringify({ node: process.version, childClose: close, stdout, stderr }));
+    assert.deepEqual([...stdout.matchAll(/^ok [0-9]+ - (.+)$/gm)].map(match => match[1]),
+      ["R05 selected parent one", "R05 selected parent two"]);
+    for (const [field, value] of Object.entries({ tests: 3, pass: 3, fail: 0, cancelled: 0, skipped: 0, todo: 0 })) {
+      const rows = [...stdout.matchAll(new RegExp("^# " + field + " ([0-9]+)$", "gm"))];
+      assert.equal(rows.length, 1); assert.equal(Number(rows[0]![1]), value);
+    }
+    assert.equal(stderr, "");
+    assert.deepEqual(Object.keys(process.env).sort(), Object.keys(original).sort());
+    for (const [key, value] of Object.entries(original)) {
+      assert.ok(process.env[key] === value, "preparing the child environment must not change parent field " + key);
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
