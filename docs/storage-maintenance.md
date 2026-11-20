@@ -194,3 +194,58 @@ node --input-type=module -e 'const {inspectSelectedSqlitePathBinding} = await im
 成功结果的 scope 为 `sqlite-main-path-observation/v1`，只包含源路径、pin 的 device/inode、组件摘要、路径观察和 schema version。只有数据库及本次持有的文件描述符都已确认关闭，才返回 `retirement: "closed"`。若关闭结果未知，进程保留实际 owner 和仍需要的资源，后续本入口返回 `native_retirement_unknown`；调用者不能以传入确认值、定时等待或重复调用来宣告退休。
 
 `HAS_MOVED = 0` 只表示当前 VFS 路径观察通过。它不返回 SQLite 实际数据库 FD，也不能排除“路径替换后恢复”的 ABA 窗口；单独打开的源 pin 不能消除这个限制。本结果不授予 P1 准入、写权限或生产 native 资格，后续同连接准入、terminal/CF17 和完整 G1 仍须完成各自合同。
+
+## 8. SQLite 原始行与元数据关联观察
+
+SQ-D02 I02 提供有限的五表观察组件。接受来源为 [#153 的 SQ-D02 设计](https://github.com/gbcdby/boardroom/issues/153#issuecomment-7026485094)。它能够观察原始 SQLite 格、控制行、authority 与 receipt 的值关联；成功的固定范围是 `raw-and-metadata-links`，不会授予准入或产生 writer。
+
+| 入口 | 输入与读取来源 | 成功结果的范围 |
+| --- | --- | --- |
+| `inspectSqliteProfileAdmissionValue(input)`，位于 `identity/sqlite-profile-admission-values.ts` | 仅 primitive JSON 字符串；调用方提供的脱离数据库 DTO | 严格原始值与可在 DTO 内核对的元数据关联；没有 native 证明 |
+| `inspectSelectedSqliteProfileObservation()`，位于 `storage/internal/sqlite-path-observation.ts` | 零参数；沿既有环境解析器自行选择并打开实际已存在的 SQLite | 在同一实际只读连接、同一事务取得 DTO，再用同一请求预算计算上述有限观察，实际退休后返回 |
+
+原生入口复用上一节的固定 Linux 组件。构建完成后，在仓库根目录运行：
+
+```bash
+node --input-type=module -e 'const {inspectSelectedSqliteProfileObservation} = await import("./src/server/storage/internal/sqlite-path-observation.ts"); console.log(JSON.stringify(await inspectSelectedSqliteProfileObservation()));'
+```
+
+该入口不收 path、数据库句柄、SQL、callback、预算、验证器或已通过标记。它不创建缺失数据库，不执行 migration，不登记格式或 native tuple。成功结果包含 `pathObservation`、`observation`、`retirement: "closed"` 和 `sourceFileDescriptorQualification: "not_qualified"`。其中 `observation.nativeSource: "not_run"` 保留纯值核自身没有原生证明的含义；外层只增加实际路径和读事务观察，仍受上一节的 VFS/ABA 限制。
+
+### 固定 DTO 与物理布局边界
+
+DTO 的根键精确为 `contract`、`sourceKind`、`textEncoding`、`columns`、`control`、`authority`、`activationReceipts`、`migrations`、`clients`。contract 是 `sqlite-profile-admission-observation/r1`，sourceKind 是 `sqlite`。各表部分精确为 `{rows:[{rowid,cells}]}`。`columns` 必须列出固定五表的完整列全序；不能扩展查询。rowid 是 canonical signed int64 十进制字符串，INTEGER 主键格还必须与其一致。
+
+| 固定表 | DTO 部分 | 列数 |
+| --- | --- | ---: |
+| `storage_maintenance` | `control` | 15 |
+| `storage_source_clients` | `clients` | 17 |
+| `config_authority` | `authority` | 5 |
+| `config_activation_receipts` | `activationReceipts` | 17 |
+| `schema_migrations` | `migrations` | 4 |
+
+`profile: "P0"` 在该固定 DTO 中只表示 protocol 1、精确迁移账本 1–21、没有 authority/receipt/terminal 的元数据分类。三编码原生正例使用的是 **15/17 列的 protocol 1 形状 fixture**，不证明原物理 P0 布局已受支持。旧 control 14 列、client 16 列且没有 authority/receipt 表的数据库，在本有限 reader 中明确返回 `source_contract_mismatch`，保持原数据库不变。既有 P0 driver 和 strict1 parser 继续处理其原路径；它们没有被接到本观察入口或放宽。
+
+P1 元数据观察要求 protocol 2、唯一 authority singleton、local source binding、对应 receipt 的完整 17 格及 canonical payload/digest 冗余、当前 guard digest 与 receipt writer pair、精确受控迁移 22，以及原 control counter/anchor 组合。client17 保留原 storage type、NULL、rowid、日期和编码字节，并检查源 UUID、基础 counter 与格式配对。真实 host/process/session 归属、完整 CF 生命周期和引用的 physical/capture/upgrade 产物内容仍未执行。
+
+当前独立片允许 sealed P1 加 terminal NULL 返回 `phase: "sealed-awaiting-b"`；这仍拒绝业务准入。open P1 加 NULL、错 authority/receipt/source、混合格式会失败；没有 P0/fresh 回退。terminal-present 的分支等待 I03 同请求解码核接入，在此独立片返回 `unsupported_shape`。输出明确保留 `terminalClosure`、`finalSchemaAndGuards`、`clientLifecycle` 为 `not_run`。
+
+### 固定查询与生产前计费
+
+`sqlite-profile-read-source.ts` 保留接受原件的 **32 条 SQL**，原件为 66,179 bytes、SHA-256 `802d88a34b9ac31f22072fb8a95e05e3e009e5558b4a61d12392e6e895d62713`。为落实实际列目录检查，另有 **10 条固定派生读**：每表一条 `Q-COLUMN-METADATA-*` 和一条 `Q-COLUMNS-*`。组件 manifest 因而明确记录总计 **42 条 SQL、29 条只读查询、32 条原件查询、10 条派生目录查询、5 表、58 列**，并包含派生 SQL 的 bytes/SHA。其余固定 C 程序仅为惰性来源，没有开放执行器。
+
+所有表读取和目录读取明确限定 `main`。派生目录先读取 `sqlite_schema.sql` 的类型和 `octet_length`，按长度预付 SQLite 内部目录字段、比较和结果开销，再执行只返回一个布尔值的精确 cid/name/type/notnull/default/pk/hidden 比较。额外列、缺列、错误类型、默认值、主键或隐藏列都不能只靠已知列名通过；这仍不是完整 S1/G1 schema 或 guard manifest 验证。
+
+每张表逐 rowid 执行固定 FIRST/NEXT metadata 查询，每次最多一行，包含最后一次空结果；不会 `.all()` 导出全表。metadata 使用直接 `typeof(column)` 和 `octet_length(column)`。本轮实际 SQLite bytecode 检查确认对应 Column flags 为 128/192，metadata 中没有 CAST/hex payload producer。各格类型、字节数、单格限制、累计范围和预算核对完毕，才能执行同事务、同 rowid 的 Q-VALUE。
+
+| 生产者 | 同一请求中的前置收费 |
+| --- | --- |
+| 组件文件、资源 owner、关闭记录 | 有限路径/owner/收尾记录先预付；文件按 stat 大小预付读取、分配、摘要及 JSON 工作 |
+| metadata | 固定列数决定 native/JS wrapper、字段数、类型字符串和 int64 长度上界；空结果也付费 |
+| text 原值 | 分别预付 CAST 读/拷贝、hex 原字节读与两倍输出、lower 读/写、native 到 JS 读/拷贝，之后才运行值查询 |
+| semantic decode | 沿同一个 `AuditRequest` 继续核 raw hex、fatal UTF-8/UTF-16le/UTF-16be 解码、原字节 roundtrip、JSON、摘要及关联 |
+| 输出和退休 | 成功结果完整 measure 后预付冻结/序列化；ROLLBACK、close、有限失败与退休 owner 已提前保留资源 |
+
+原 limits 保持不变：input 16 MiB、单 raw 4 MiB、rawTotal 8 MiB、field 32 KiB、output 1 MiB、nodes 250,000、depth 64、rows 100,000、characters 64 MiB、work 4,000,000。原失败输出的 characters 2,048/work 128 预留也保留。原生读取和纯值消费不重置请求；相同请求内实际产生的不同拷贝与遍历分别付费。
+
+超大 TEXT 和错误 BLOB storage 的实际反例在第一次 raw value get 之前失败。WAL 并发提交反例确认 metadata/value 读保持同一连接、同一快照。预算失败加 close 未知时，私有 owner 仍保留原 `resource_limit`、关闭失败及实际 DB/文件描述符；后续调用拒绝新开资源。派生私有故障观察与原入口的正常运行证据分开记录，不作为完整原生资格。

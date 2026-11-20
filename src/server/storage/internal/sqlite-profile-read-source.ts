@@ -995,13 +995,33 @@ export const SQLITE_PROFILE_FIXED_QUERIES: readonly SqliteProfileFixedQuery[] = 
     "sha256": "9be868b5fc7744c6a5fa794bedc41fd4f93c13f4ccbc84805546b17682d2505c"
   }
 ]);
-const componentBytes = JSON.stringify({ tables: SQLITE_PROFILE_READ_TABLES, statements: SQLITE_PROFILE_FIXED_QUERIES });
+// AC07 implementation detail: ten additional static reads. Original accepted SQL above is unchanged.
+// All identifiers/values are from the closed source table above, never from an observation or caller.
+const literal = (value: string | number | null): string => value === null ? "NULL" : typeof value === "number" ? String(value) : `'${value.replaceAll("'", "''")}'`;
+export const SQLITE_PROFILE_COLUMN_QUERIES: readonly SqliteProfileFixedQuery[] = freeze(SQLITE_PROFILE_READ_TABLES.flatMap(table => {
+  const fields = ["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"];
+  const expected = table.columns.map(column => `(${[column.cid, column.name, column.type, column.notnull, column.default, column.pk, column.hidden].map(literal).join(",")})`).join(",");
+  const directory = `WITH expected(${fields.map(field => `"${field}"`).join(",")}) AS (VALUES ${expected}), `
+    + `observed AS (SELECT * FROM "main".pragma_table_xinfo(${literal(table.table)},'main') LIMIT ${table.columns.length + 1}) `
+    + `SELECT CASE WHEN (SELECT count(*) FROM observed)=${table.columns.length} AND NOT EXISTS (`
+    + `SELECT 1 FROM observed AS a LEFT JOIN expected AS e ON a.cid=e.cid WHERE e.cid IS NULL OR `
+    + fields.slice(1).map(field => `a."${field}" IS NOT e."${field}"`).join(" OR ") + `) THEN 1 ELSE 0 END AS matches;`;
+  const statements = [
+    { id: `Q-COLUMN-METADATA-${table.table}`, purpose: "Bound schema text before SQLite column-directory materialization",
+      sql: `SELECT typeof(sql) AS storage, octet_length(sql) AS bytes FROM "main".sqlite_schema WHERE type='table' AND name=${literal(table.table)} LIMIT 1;` },
+    { id: `Q-COLUMNS-${table.table}`, purpose: "Fixed exact column metadata only; neither full schema nor guard qualification", sql: directory },
+  ];
+  return statements.map(statement => ({ ...statement, parameters: [], bytes: Buffer.byteLength(statement.sql),
+    sha256: createHash("sha256").update(statement.sql).digest("hex") }));
+}));
+const componentBytes = JSON.stringify({ tables: SQLITE_PROFILE_READ_TABLES, statements: SQLITE_PROFILE_FIXED_QUERIES,
+  columnStatements: SQLITE_PROFILE_COLUMN_QUERIES });
 export const SQLITE_PROFILE_READ_COMPONENT = freeze({
   contract: "sqlite-profile-read-source-component/v1", scope: "fixed-query-source-only",
   acceptedSource: { bytes: 66179, sha256: "802d88a34b9ac31f22072fb8a95e05e3e009e5558b4a61d12392e6e895d62713" },
   acceptedDesign: { issue: 153, comment: 7026485094,
     freezeSha256: "a7fef17604584cdac138aedb1488e1c802378f66a76a7d4eedeb9c81dcb02141" },
   bytes: Buffer.byteLength(componentBytes), sha256: createHash("sha256").update(componentBytes).digest("hex"),
-  queries: 32, readonlyQueries: 19, tables: 5, columns: 58,
+  queries: 42, acceptedQueries: 32, derivedColumnQueries: 10, readonlyQueries: 29, tables: 5, columns: 58,
   finalTargetSchema: null, finalGuardManifest: null, productionAdmission: "not-issued",
 });

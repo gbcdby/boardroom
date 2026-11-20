@@ -54,6 +54,10 @@ function digest(value: unknown, r: AuditRequest): string {
 }
 function nullableId(value: unknown, r: AuditRequest): string | null { return value === null ? null : nonempty(value, r); }
 function nullableDigest(value: unknown, r: AuditRequest): string | null { return value === null ? null : digest(value, r); }
+function equal(left: unknown, right: unknown, r: AuditRequest): void {
+  if (typeof left === "string" && typeof right === "string") r.text((left.length + right.length) * 2);
+  r.units(1); r.require(left === right, "semantic_invariant_failed");
+}
 
 // Every buffer/decode/copy is reserved on the original request. BOMs remain original text data.
 function decodeText(hex: string, encoding: SqliteProfileTextEncoding, r: AuditRequest): string {
@@ -171,7 +175,7 @@ function canonical(value: unknown, r: AuditRequest): string {
   return `{${pieces.join(",")}}`;
 }
 function canonicalEquals(value: unknown, expected: string | null | undefined, r: AuditRequest): void {
-  r.require(canonical(value, r) === expected, "semantic_invariant_failed");
+  equal(canonical(value, r), expected, r);
 }
 function evidence(value: unknown, r: AuditRequest): ObjectValue {
   const ref = record(value, ["artifactId", "digest"], r);
@@ -221,10 +225,10 @@ function receipts(rows: DecodedRow[], r: AuditRequest): Map<string, Receipt> {
     evidence(guard.registeredUpgrade, r);
     r.require(guard.schemaBeforeDigest === body.schemaBeforeDigest && guard.schemaAfterDigest === body.schemaAfterDigest
       && body.committedAuthority === "profile", "semantic_invariant_failed");
-    r.require(row.request_id === body.requestId && row.plan_id === plan.planId && row.plan_digest === plan.digest
-      && row.capture_id === capture.captureId && row.capture_source_digest === capture.sourceDigest
-      && row.capture_artifact_digest === capture.artifactDigest && row.schema_before_digest === body.schemaBeforeDigest
-      && row.schema_after_digest === body.schemaAfterDigest && row.target_rows_digest === body.targetRowsDigest, "semantic_invariant_failed");
+    equal(row.request_id, body.requestId, r); equal(row.plan_id, plan.planId, r); equal(row.plan_digest, plan.digest, r);
+    equal(row.capture_id, capture.captureId, r); equal(row.capture_source_digest, capture.sourceDigest, r);
+    equal(row.capture_artifact_digest, capture.artifactDigest, r); equal(row.schema_before_digest, body.schemaBeforeDigest, r);
+    equal(row.schema_after_digest, body.schemaAfterDigest, r); equal(row.target_rows_digest, body.targetRowsDigest, r);
     canonicalEquals(physical, row.physical_source_ref, r); canonicalEquals(snapshot, row.snapshot_receipt_ref, r);
     canonicalEquals(guard, row.guard_transition_json, r); canonicalEquals(delta, row.allowed_delta_ref, r);
     canonicalEquals(manifest, row.source_to_target_manifest_ref, r); canonicalEquals(body, row.payload_json, r);
@@ -247,10 +251,10 @@ function authority(rows: DecodedRow[], observedReceipts: Map<string, Receipt>, s
   const activation = pair(binding.activation, "activationId", r), physical = evidence(binding.physicalSourceRef, r);
   canonicalEquals(binding, encoded, r);
   const receipt = observedReceipts.get(id);
-  r.require(receipt !== undefined && activation.activationId === id && activation.digest === receipt.row.payload_digest,
-    "semantic_invariant_failed");
-  r.require(physical.artifactId === receipt.physical.artifactId && physical.digest === receipt.physical.digest
-    && state.guardDigest === receipt.guard.guardAfterDigest, "semantic_invariant_failed");
+  r.require(receipt !== undefined, "semantic_invariant_failed");
+  equal(activation.activationId, id, r); equal(activation.digest, receipt.row.payload_digest, r);
+  equal(physical.artifactId, receipt.physical.artifactId, r); equal(physical.digest, receipt.physical.digest, r);
+  equal(state.guardDigest, receipt.guard.guardAfterDigest, r);
   r.require(receipt.guard.writerFormatDigest === M2_PROFILE_WRITER_CONTRACT.profileFormatPair.writerFormatDigest,
     "source_contract_mismatch");
   return receipt;
@@ -304,7 +308,9 @@ function clients(rows: DecodedRow[], state: Control, r: AuditRequest): void {
   const ids = new Set<string>();
   for (const row of rows) {
     const id = nonempty(row.client_id, r);
-    r.require(!ids.has(id) && row.database_instance_id === state.databaseInstanceId, "semantic_invariant_failed"); ids.add(id);
+    r.text(id.length * 2, 2); // Set lookup and insertion each hash/read the whole logical client key.
+    r.require(!ids.has(id), "semantic_invariant_failed"); ids.add(id);
+    equal(row.database_instance_id, state.databaseInstanceId, r);
     r.require(["http", "stdio", "owned-background", "local-management", "maintenance-controller"].includes(nonempty(row.entrypoint, r)),
       "source_contract_mismatch");
     nonempty(row.build_id, r);

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import { SQLITE_PROFILE_FIXED_QUERIES as queries, SQLITE_PROFILE_READ_TABLES as tables,
-  SQLITE_PROFILE_READ_COMPONENT as component } from "../src/server/storage/internal/sqlite-profile-read-source.ts";
+  SQLITE_PROFILE_READ_COMPONENT as component, SQLITE_PROFILE_COLUMN_QUERIES as columnQueries } from "../src/server/storage/internal/sqlite-profile-read-source.ts";
 
 // Original accepted SQ-D02 FIXED-QUERY-SOURCE.json identities, not regenerated from this implementation.
 const expected = [
@@ -233,4 +233,26 @@ test("SQ-D02 I02：实际 SQLite bytecode 的 metadata 读取走 typeof/octet_le
       }
     }
   } finally { db.close(); }
+});
+test("SQ-D02 I02：派生 main 列目录读有界返回，extra/missing/type/default/pk/hidden 不可伪装精确目录", () => {
+  assert.equal(columnQueries.length, 10);
+  assert.equal(component.queries, 42); assert.equal(component.acceptedQueries, 32); assert.equal(component.derivedColumnQueries, 10);
+  for (const table of tables) {
+    const db = new Database(":memory:");
+    try {
+      const declaration = table.columns.map(c => `"${c.name}" ${c.type}${c.notnull ? " NOT NULL" : ""}${c.pk ? " PRIMARY KEY" : ""}${c.default === null ? "" : ` DEFAULT ${c.default}`}`).join(",");
+      db.exec(`CREATE TABLE main."${table.table}"(${declaration}); CREATE TEMP TABLE "${table.table}"(fake TEXT);`);
+      const query = columnQueries.find(q => q.id === `Q-COLUMNS-${table.table}`)!.sql;
+      const check = () => (db.prepare(query).get() as { matches: number }).matches;
+      assert.equal(check(), 1);
+      db.exec(`ALTER TABLE main."${table.table}" ADD COLUMN extra TEXT;`); assert.equal(check(), 0);
+      db.exec(`DROP TABLE main."${table.table}";`);
+      for (const changed of [declaration.split(",").slice(0, -1).join(","), declaration.replace("TEXT", "BLOB"),
+        declaration.replace(" NOT NULL", ""), declaration.replace(" PRIMARY KEY", ""), declaration.replace("TEXT", "TEXT DEFAULT 'unexpected'"),
+        `${declaration},computed TEXT AS ('hidden') VIRTUAL`,
+        declaration.replace(`"${table.columns.at(-1)!.name}" TEXT`, `"${table.columns.at(-1)!.name}" TEXT GENERATED ALWAYS AS ('hidden') VIRTUAL`)]) {
+        db.exec(`CREATE TABLE main."${table.table}"(${changed});`); assert.equal(check(), 0); db.exec(`DROP TABLE main."${table.table}";`);
+      }
+    } finally { db.close(); }
+  }
 });
