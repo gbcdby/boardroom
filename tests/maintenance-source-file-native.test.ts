@@ -20,7 +20,7 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 interface PureNativeDecoders {
   checkedBlockAttributes(value: unknown, source: any, device: any, calls: readonly SourceFileNativeCall[]): any;
   checkedEnvironment(value: unknown, info: any, tail?: boolean): SourceFileRootEnvironment;
-  checkedKernelReadFact(value: unknown, limit: number, samples?: 1 | 2): SourceFileContextFact<SourceFileKernelReadValue>;
+  checkedKernelReadFact(value: unknown, limit: number, samples?: 1 | 2, allowChangedLength?: boolean): SourceFileContextFact<SourceFileKernelReadValue>;
   checkedAuxiliaryCalls(value: unknown, complete?: boolean, unavailableGraph?: boolean): readonly SourceFileNativeCall[];
   checkedEnumeration(value: unknown, index: number): readonly SourceFileNativeCall[];
 }
@@ -43,7 +43,8 @@ interface PureProfileParsers {
   ordinaryProcess(environment: unknown): unknown;
   parseOptions(raw: Buffer): Readonly<Record<string, string | true>>;
   boundHealth(environment: unknown, mount: SourceFileMountBinding): unknown;
-  analyzeEnvironment(context: unknown): { configuration: unknown; unresolved: readonly string[]; contextBinding: string; windowBinding: string };
+  analyzeEnvironment(context: unknown): { configuration: unknown; unresolved: readonly string[]; contextBinding: string; windowBinding: string;
+    mbAllocationObservation: { raw: Buffer; allocation: { mbOptimizeScan: bigint; maxFreeOrderGroups: readonly bigint[]; avgFragmentSizeGroups: readonly bigint[] } } };
   typed(value: unknown): unknown;
 }
 /** Exposes only pure mechanical parsers. FIXED_PROFILES, owner registration,
@@ -259,26 +260,36 @@ test("#152 P3 pure health parser binds all thirteen raw fields and the identical
 
 test("#152 MB1 actual analysis consumes the complete fixed summary and keeps unresolved qualification", async () => {
   await withProfileParsers(parse => {
-    const seen = new Set<string>();
+    const seen = new Set<string>(), observations = new Set<string>();
     for (const bit of [0, 1] as const) for (const explicit of [false, true]) for (const maximum of [false, true]) {
       const fixture = profileParserFixture(), raw = Buffer.from(mbSummaryFixture(bit, maximum));
       fixture.environment.configuration.mbStructsSummary.value.bytes = raw;
       if (explicit) fixture.environment.configuration.options.value.bytes = Buffer.from(`rw\nmb_optimize_scan=${bit}\n`);
       const analysis = parse.analyzeEnvironment(fixture.context);
       const fields = Object.fromEntries((analysis.configuration as any)[1]);
-      assert.deepEqual(fields.mbStructsSummary, parse.typed(raw));
-      assert.deepEqual(fields.mbAllocation, parse.typed({ mbOptimizeScan: BigInt(bit),
+      assert.deepEqual(fields.mbStructsSummary, parse.typed({ grammar: "mb-structs-summary-v1", mbOptimizeScan: BigInt(bit) }));
+      assert.equal(fields.mbAllocation, undefined);
+      assert.deepEqual(parse.typed(analysis.mbAllocationObservation), parse.typed({ raw, allocation: { mbOptimizeScan: BigInt(bit),
         maxFreeOrderGroups: Array.from({ length: 14 }, (_, order) => BigInt(maximum ? 4294967295 : order)),
-        avgFragmentSizeGroups: Array.from({ length: 14 }, (_, order) => BigInt(maximum ? 4294967295 : order)) }));
+        avgFragmentSizeGroups: Array.from({ length: 14 }, (_, order) => BigInt(maximum ? 4294967295 : order)) } }));
       assert.deepEqual(fields.mbGroups, parse.typed(Buffer.from("raw-mb-groups\n")));
       assert.equal(analysis.unresolved.length, 4); assert.ok(analysis.unresolved.every(value => value.endsWith("UNPROVEN")));
-      seen.add(analysis.contextBinding); assert.equal(Object.hasOwn(analysis, "qualified"), false);
+      seen.add(analysis.contextBinding); observations.add(JSON.stringify(parse.typed(analysis.mbAllocationObservation)));
+      assert.equal(Object.hasOwn(analysis, "qualified"), false);
     }
-    const changed = profileParserFixture(); changed.environment.configuration.mbStructsSummary.value.bytes =
-      Buffer.from(mbSummaryFixture().replace("list_order_13_groups: 13", "list_order_13_groups: 14"));
-    assert.notEqual(parse.analyzeEnvironment(changed.context).contextBinding,
-      parse.analyzeEnvironment(profileParserFixture().context).contextBinding, "all counters remain in the material");
-    assert.equal(seen.size, 8, "raw bits, counters and explicit options all remain distinct");
+    const initial = parse.analyzeEnvironment(profileParserFixture().context);
+    for (const count of ["14", "100"]) {
+      const changed = profileParserFixture(); changed.environment.configuration.mbStructsSummary.value.bytes =
+        Buffer.from(mbSummaryFixture().replace("list_order_13_groups: 13", `list_order_13_groups: ${count}`));
+      const analysis = parse.analyzeEnvironment(changed.context);
+      assert.equal(analysis.contextBinding, initial.contextBinding, `counter ${count} does not change context identity`);
+      assert.equal(analysis.windowBinding, initial.windowBinding, `counter ${count} does not change window identity`);
+      assert.deepEqual(analysis.configuration, initial.configuration);
+      assert.notDeepEqual(analysis.mbAllocationObservation, initial.mbAllocationObservation,
+        `counter ${count} remains complete observation evidence`);
+    }
+    assert.equal(seen.size, 4, "only raw bits and explicit options remain distinct");
+    assert.equal(observations.size, 4, "all raw bit and counter observations remain distinct");
   });
 });
 
@@ -401,6 +412,25 @@ test("#152 P3 double samples independently require EOF, close and full bytes wit
     const unavailable = decode(absent, 4096, 2);
     assert.equal(unavailable.status, "unavailable"); assert.equal(unavailable.value, null);
     assert.equal(unavailable.calls[7]!.errno, 2n, "both real absence observations remain explicit, never a success value");
+  });
+});
+test("#152 summary second sample may change length but never exceeds the original per-file limit", async () => {
+  await withNativeDecoders(({ checkedKernelReadFact: decode }) => {
+    const changed = kernelReadFixture(2) as any;
+    changed.calls[11].rc = 3n;
+    assert.equal(decode(changed, 4096, 2, true).status, "observed", "a longer retained observation remains bounded");
+    const oversized = kernelReadFixture(2) as any;
+    oversized.calls[11].rc = 4097n;
+    assert.throws(() => decode(oversized, 4096, 2, true), { code: "backup_capability_unavailable" },
+      "the second sample cannot claim limit+1 bytes in total");
+    assert.throws(() => decode(changed, 4096, 2), { code: "backup_capability_unavailable" },
+      "ordinary two-sample facts still require equal byte lengths");
+    const budget = kernelReadFixture() as any;
+    budget.status = "unavailable"; budget.reason = "budget"; budget.value = null;
+    budget.calls[3].rc = 4097n; budget.calls[4].rc = 0n;
+    const failure = decode(budget, 4096);
+    assert.equal(failure.status, "unavailable"); assert.equal(failure.reason, "budget");
+    assert.equal(failure.calls[3]!.rc, 4097n, "an actual limit+1 attempt stays a structured budget failure");
   });
 });
 
@@ -663,8 +693,11 @@ const fixedP3Variants = {
   P3_TEST_MB_BUDGET: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
   P3_TEST_MB_LIMIT: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
   P3_TEST_MB_OVERSIZED: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_COUNTER_CHANGE: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_COUNTER_WIDTH_CHANGE: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
   P3_TEST_MB_RAW_CHANGE: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
   P3_TEST_MB_BAD_CHANGE: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_GRAMMAR_CHANGE: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
   P3_TEST_MB_IDENTITY_CHANGE: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
   P3_TEST_MB_APPEAR: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
   P3_TEST_MB_DISAPPEAR: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
@@ -813,7 +846,8 @@ for (const variant of ["P3_TEST_MB_ABSENT", "P3_TEST_MB_BUDGET", "P3_TEST_MB_LIM
         const raw = api.observeSourceFileRootContext(handle).environment, fact = raw.configuration.mbStructsSummary;
         const reads = fact.calls.filter(call => /^read-kernel(?:-after)?$/.test(call.operation) && call.rc !== null);
         if (variant === "P3_TEST_MB_LIMIT") {
-          assert.equal(fact.status, "observed"); assert.equal(fact.value?.bytes.length, 16384);
+          assert.equal(fact.status, "unavailable"); assert.equal(fact.value, null);
+          assert.equal(fact.reason, "format");
           assert.deepEqual(reads.map(call => call.rc), [16384n, 0n, 16384n, 0n]);
         } else {
           assert.equal(fact.status, "unavailable"); assert.equal(fact.value, null);
@@ -844,7 +878,27 @@ for (const variant of ["P3_TEST_MB_ABSENT", "P3_TEST_MB_BUDGET", "P3_TEST_MB_LIM
     });
   });
 }
-for (const variant of ["P3_TEST_MB_RAW_CHANGE", "P3_TEST_MB_BAD_CHANGE", "P3_TEST_MB_IDENTITY_CHANGE",
+for (const [variant, count] of [["P3_TEST_MB_COUNTER_CHANGE", "14"], ["P3_TEST_MB_COUNTER_WIDTH_CHANGE", "100"]] as const) {
+  linuxTest(`#152 MB1 fixed ${variant} accepts only allocator observation changes across both real samples`, async () => {
+    await withFixedP3Package(variant, async ({ directory, api }) => {
+      const source = path.join(directory, "source"); await mkdir(source, { mode: 0o700 });
+      const expected = Buffer.from(mbSummaryFixture()), after = Buffer.from(mbSummaryFixture()
+        .replace("list_order_13_groups: 13", `list_order_13_groups: ${count}`));
+      assert.equal(after.length === expected.length, variant === "P3_TEST_MB_COUNTER_CHANGE");
+      await api.withNativeSourceRoot(source, handle => {
+        const raw = api.observeSourceFileRootContext(handle).environment, fact = raw.configuration.mbStructsSummary;
+        assert.equal(fact.status, "observed"); if (fact.status !== "observed") return;
+        assert.deepEqual(fact.value.bytes, expected, "the complete first raw sample remains observation evidence");
+        const reads = fact.calls.filter(call => /^read-kernel(?:-after)?$/.test(call.operation));
+        assert.equal(reads.filter(call => call.rc === 0n).length, 2);
+        assert.equal(reads.reduce((sum, call) => sum + call.rc!, 0n), BigInt(expected.length + after.length));
+        assert.equal(fact.calls.filter(call => call.operation.startsWith("close-") && call.rc === 0n).length, 2);
+        assert.ok(raw.auxiliaryCalls.length <= 32768);
+      });
+    });
+  });
+}
+for (const variant of ["P3_TEST_MB_RAW_CHANGE", "P3_TEST_MB_BAD_CHANGE", "P3_TEST_MB_GRAMMAR_CHANGE", "P3_TEST_MB_IDENTITY_CHANGE",
   "P3_TEST_MB_APPEAR", "P3_TEST_MB_DISAPPEAR", "P3_TEST_MB_PROC_CHANGE"] as const) {
   linuxTest(`#152 MB1 fixed ${variant} keeps the first real change and invalidates its source scope`, async () => {
     await withFixedP3Package(variant, async ({ directory, api, native }) => {

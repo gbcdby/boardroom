@@ -17,6 +17,8 @@
 #include <stdio.h>
 
 long __real_syscall(long number, ...);
+int __real_close(int fd);
+ssize_t __real_read(int fd, void *buffer, size_t size);
 #if defined(P3_TEST_CONTENT_OPEN_FAILURE) || defined(P3_TEST_CONTENT_CLOSE_FAILURE) || \
     defined(P3_TEST_PSEUDO_CLOSE_FAILURE) || defined(P3_TEST_SHORT_READS) || \
     defined(P3_TEST_NO_EOF) || defined(P3_TEST_SOURCE_CHANGE) || defined(P3_TEST_BYTE_BUDGET) || \
@@ -42,6 +44,26 @@ static bool block_fault_applied;
  * modeled. No value here is an actual ext4 qualification observation. */
 static bool mb_fault_applied;
 static unsigned mb_summary_opens;
+#if defined(P3_TEST_MB_COUNTER_CHANGE) || defined(P3_TEST_MB_COUNTER_WIDTH_CHANGE)
+static int mb_change_counter(const char *replacement) {
+  int input = open(P3_TEST_MB_PROC_ROOT "/mb_structs_summary", O_RDONLY | O_CLOEXEC);
+  if (input < 0) return -1;
+  char bytes[16385] = {0}, changed[16385];
+  ssize_t size = __real_read(input, bytes, sizeof(bytes) - 1);
+  if (__real_close(input) || size < 0) { errno = EIO; return -1; }
+  const char *label = "\tlist_order_13_groups: ";
+  char *match = strstr(bytes, label);
+  if (!match || strncmp(match + strlen(label), "13\n", 3)) { errno = EIO; return -1; }
+  const size_t prefix = (size_t)(match - bytes) + strlen(label);
+  const int length = snprintf(changed, sizeof(changed), "%.*s%s%s", (int)prefix, bytes, replacement, match + strlen(label) + 2);
+  if (length < 0 || (size_t)length >= sizeof(changed)) { errno = EIO; return -1; }
+  int output = open(P3_TEST_MB_PROC_ROOT "/mb_structs_summary", O_WRONLY | O_TRUNC | O_CLOEXEC);
+  if (output < 0) return -1;
+  ssize_t wrote = write(output, changed, (size_t)length);
+  if (__real_close(output) || wrote != length) { errno = EIO; return -1; }
+  return 0;
+}
+#endif
 static bool mb_source_fd(int fd) {
   char link[64], target[4096];
   snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
@@ -67,7 +89,6 @@ static void block_forget(int fd) {
     block_owned[i] = block_owned[--block_owned_count]; return;
   }
 }
-int __real_close(int fd);
 #if defined(P3_TEST_BLOCK_RAW_CHANGE) || defined(P3_TEST_BLOCK_IDENTITY_CHANGE) || defined(P3_TEST_BLOCK_APPEAR) || defined(P3_TEST_BLOCK_BAD_CHANGE)
 static int block_write(const char *name, const char *bytes) {
   char target[4096]; snprintf(target, sizeof(target), "%s/devices/m04-test-node/%s", P3_TEST_BLOCK_ROOT, name);
@@ -111,7 +132,6 @@ ssize_t __wrap_readlinkat(int fd, const char *name, char *buffer, size_t size) {
   }
   return __real_readlinkat(fd, name, buffer, size);
 }
-ssize_t __real_read(int fd, void *buffer, size_t size);
 ssize_t __wrap_read(int fd, void *buffer, size_t size) {
 #ifdef P3_TEST_MB_READERS
   if (block_kind(fd) == 9 && size) {
@@ -141,6 +161,20 @@ int __wrap_close(int fd) {
   if (kind == 9 && !mb_fault_applied) {
 #if defined(P3_TEST_MB_CLOSE_FAILURE)
     mb_fault_applied = true; errno = EIO; return -1;
+#elif defined(P3_TEST_MB_COUNTER_CHANGE) || defined(P3_TEST_MB_COUNTER_WIDTH_CHANGE)
+    mb_fault_applied = true;
+#ifdef P3_TEST_MB_COUNTER_WIDTH_CHANGE
+    return mb_change_counter("100");
+#else
+    return mb_change_counter("14");
+#endif
+#elif defined(P3_TEST_MB_GRAMMAR_CHANGE)
+    mb_fault_applied = true;
+    int output = open(P3_TEST_MB_PROC_ROOT "/mb_structs_summary", O_WRONLY | O_CLOEXEC);
+    if (output < 0) return -1;
+    ssize_t wrote = pwrite(output, "x", 1, 17);
+    int closed = __real_close(output);
+    if (wrote != 1 || closed) { errno = EIO; return -1; }
 #elif defined(P3_TEST_MB_RAW_CHANGE) || defined(P3_TEST_MB_BAD_CHANGE)
     mb_fault_applied = true;
     int output = open(P3_TEST_MB_PROC_ROOT "/mb_structs_summary", O_WRONLY | O_CLOEXEC);

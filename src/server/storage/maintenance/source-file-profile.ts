@@ -330,6 +330,7 @@ interface EnvironmentAnalysis {
   readonly mount: SourceFileMountBinding;
   readonly health: Readonly<Record<SourceFileHealthName, SourceFileKernelRead>>;
   readonly configuration: unknown;
+  readonly mbAllocationObservation: { readonly raw: Buffer; readonly allocation: ReturnType<typeof parseMbAllocation>["allocation"] };
   readonly contextBinding: string;
   readonly windowBinding: string;
   readonly unresolved: readonly string[];
@@ -380,7 +381,9 @@ function analyzeEnvironment(context: SourceFileRootContext | SourceFileBootstrap
     anchor = { metadata, uuid: root.uuid.value, fid: root.fid.value, flags: root.inodeFlags.value, xattrs: root.xattrs.value,
       birthtimeNs: unique.birthtimeNs, attributes: unique.attributes, attributesMask: unique.attributesMask };
   }
-  const configuration = { kernel, tune, options, mbGroups, mbStructsSummary, mbAllocation, journalIoprio: journal.rawValue,
+  const mbAllocationObservation = { raw: mbStructsSummary, allocation: mbAllocation };
+  const configuration = { kernel, tune, options, mbGroups,
+    mbStructsSummary: { grammar: "mb-structs-summary-v1", mbOptimizeScan: mbAllocation.mbOptimizeScan }, journalIoprio: journal.rawValue,
     mount: { filesystemType: mount.filesystemType, root: mount.root, attributes: mount.attributes,
       superblockFlags: mount.superblockFlags, propagation: mount.propagation },
     unresolved: UNPROVEN };
@@ -388,7 +391,7 @@ function analyzeEnvironment(context: SourceFileRootContext | SourceFileBootstrap
     device: observed(environment.device.binding), topology: observed(environment.device.topology), blockAttributes: environment.device.blockAttributes,
     health: observed(environment.health.binding), healthValues: health });
   const contextBinding = canonicalJson(typed(contextMaterial)), windowBinding = canonicalJson(typed({ contextMaterial, anchor }));
-  return Object.freeze({ mount, health, configuration: typed(configuration), contextBinding, windowBinding, unresolved: UNPROVEN });
+  return Object.freeze({ mount, health, configuration: typed(configuration), mbAllocationObservation, contextBinding, windowBinding, unresolved: UNPROVEN });
 }
 function selectEntry(context: SourceFileRootContext | SourceFileBootstrapContext): { readonly entry: FixedProfileEntry; readonly analysis: EnvironmentAnalysis } {
   requireValue(FIXED_PROFILES.length > 0, "source-file-profile-unqualified");
