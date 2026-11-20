@@ -827,7 +827,8 @@ for (const variant of ["P3_TEST_MB_ABSENT", "P3_TEST_MB_BUDGET", "P3_TEST_MB_LIM
         const raw = api.observeSourceFileRootContext(handle).environment, fact = raw.configuration.mbStructsSummary;
         const reads = fact.calls.filter(call => /^read-kernel(?:-after)?$/.test(call.operation) && call.rc !== null);
         if (variant === "P3_TEST_MB_LIMIT") {
-          assert.equal(fact.status, "observed"); assert.equal(fact.value?.bytes.length, 16384);
+          assert.equal(fact.status, "unavailable"); assert.equal(fact.value, null);
+          assert.equal(fact.reason, "format");
           assert.deepEqual(reads.map(call => call.rc), [16384n, 0n, 16384n, 0n]);
         } else {
           assert.equal(fact.status, "unavailable"); assert.equal(fact.value, null);

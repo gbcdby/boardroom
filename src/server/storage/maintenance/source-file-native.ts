@@ -414,11 +414,11 @@ function checkedKernelReadValue(value: unknown, limit: number): SourceFileKernel
   return Object.freeze({ bytes: Buffer.from(item.bytes), device: item.device as bigint, inode: item.inode as bigint,
     mode: item.mode as bigint, filesystemType: item.filesystemType as bigint });
 }
-function checkedKernelReadFact(value: unknown, limit: number, samples: 1 | 2 = 1): SourceFileContextFact<SourceFileKernelReadValue> {
+function checkedKernelReadFact(value: unknown, limit: number, samples: 1 | 2 = 1, allowChangedLength = false): SourceFileContextFact<SourceFileKernelReadValue> {
   return checkedReadFact(value, limit, samples, ["open-kernel-read", "fstat-kernel-before", "fstatfs-kernel-before",
-    "read-kernel", "fstatfs-kernel-after", "fstat-kernel-after", "close-kernel-read"]);
+    "read-kernel", "fstatfs-kernel-after", "fstat-kernel-after", "close-kernel-read"], allowChangedLength);
 }
-function checkedReadFact(value: unknown, limit: number, samples: 1 | 2, template: readonly string[]): SourceFileContextFact<SourceFileKernelReadValue> {
+function checkedReadFact(value: unknown, limit: number, samples: 1 | 2, template: readonly string[], allowChangedLength = false): SourceFileContextFact<SourceFileKernelReadValue> {
   const item = exactObject(value, ["status", "reason", "value", "calls"]);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1048576 || samples !== 1 && samples !== 2 || !Array.isArray(item.calls)
     || item.calls.length < 7 * samples || item.calls.length > 256 + 7 * samples) throw invalidContext();
@@ -435,14 +435,14 @@ function checkedReadFact(value: unknown, limit: number, samples: 1 | 2, template
   const fact = checkedContextFact(value, operations, raw => checkedKernelReadValue(raw, limit));
   offset = 0;
   let actualReads = 0;
-  for (const length of lengths) {
+  lengths.forEach((length, phase) => {
     const calls = fact.calls.slice(offset, offset + length); offset += length;
     const open = calls[0]!, close = calls.at(-1)!, readCalls = calls.slice(3, -3);
     actualReads += readCalls.filter(call => call.rc !== null).length;
     if (actualReads > 256) throw invalidContext();
     if (open.rc === null || open.rc === -1n) {
       if (fact.status === "observed" || calls.slice(1).some(call => call.rc !== null)) throw invalidContext();
-      continue;
+      return;
     }
     if (close.rc === null || ![0n, -1n].includes(close.rc)
       || calls.at(-3)!.rc === null || calls.at(-2)!.rc === null) throw invalidContext();
@@ -459,12 +459,14 @@ function checkedReadFact(value: unknown, limit: number, samples: 1 | 2, template
         total += call.rc;
       }
     }
-    // The common value must account for each complete phase independently.
-    // Its length is not the sum of the two observations of the same object.
+    // The first phase's common value is the retained observation bytes. A
+    // specifically permitted second phase may observe a different byte length.
+    const retainedLength = fact.status === "observed" ? BigInt(fact.value.bytes.length) : null;
+    const lengthMatches = phase === 0 || allowChangedLength ? true : total === retainedLength;
     if (fact.status === "observed" && (readCalls.at(-1)!.rc !== 0n
       || readCalls.slice(0, -1).some(call => call.rc === null || call.rc <= 0n)
-      || close.rc !== 0n || total !== BigInt(fact.value.bytes.length))) throw invalidContext();
-  }
+      || close.rc !== 0n || (phase === 0 && total !== retainedLength) || !lengthMatches)) throw invalidContext();
+  });
   return fact;
 }
 function unsigned(value: unknown, maximum = 0xffffffffffffffffn, minimum = 0n): bigint {
@@ -878,8 +880,8 @@ function checkedEnvironment(value: unknown, info: SourceFileRootInfo, tail = fal
   const configuration = exactObject(item.configuration, ["tune", "options", "mbGroups", "mbStructsSummary", "journalTaskBefore", "journalIoprio", "journalTaskAfter"]);
   const device = exactObject(item.device, ["binding", "dev", "uevent", "topology", "blockAttributes"]);
   const health = exactObject(item.health, ["binding", "fields"]);
-  function read(raw: unknown, limit: number, magic: bigint, samples: 1 | 2 = 1): SourceFileContextFact<SourceFileKernelReadValue> {
-    const fact = checkedKernelReadFact(raw, limit, samples);
+  function read(raw: unknown, limit: number, magic: bigint, samples: 1 | 2 = 1, allowChangedLength = false): SourceFileContextFact<SourceFileKernelReadValue> {
+    const fact = checkedKernelReadFact(raw, limit, samples, allowChangedLength);
     if (fact.status === "observed" && fact.value.filesystemType !== magic) throw invalidContext();
     return fact;
   }
@@ -935,7 +937,7 @@ function checkedEnvironment(value: unknown, info: SourceFileRootInfo, tail = fal
       statmount, mountinfo: read(mount.mountinfo, 1048576, 0x9fa0n) }),
     configuration: Object.freeze({ tune: abi(configuration.tune, "ioctl-get-tune", 232, 2), options: read(configuration.options, 16384, 0x9fa0n, 2),
       mbGroups: read(configuration.mbGroups, 16384, 0x9fa0n, 2), journalTaskBefore: read(configuration.journalTaskBefore, 4096, 0x62656572n),
-      mbStructsSummary: read(configuration.mbStructsSummary, 16384, 0x9fa0n, 2),
+      mbStructsSummary: read(configuration.mbStructsSummary, 16384, 0x9fa0n, 2, true),
       journalIoprio: ioprio, journalTaskAfter: read(configuration.journalTaskAfter, 4096, 0x62656572n) }),
     device: Object.freeze({ binding, dev, uevent: read(device.uevent, 4096, 0x62656572n, 2), topology, blockAttributes }),
     health: Object.freeze({ binding: checkedHealthBinding(health.binding), fields: Object.freeze(fields) }),
