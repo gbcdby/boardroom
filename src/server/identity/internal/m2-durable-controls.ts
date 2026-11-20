@@ -101,7 +101,7 @@ export function checkM2TerminalControl(g:M2Graph,before:M2HistoryData,after:M2Hi
     journal:{record:{artifactId:terminal.ref,digest:terminal.sha256},sequence:completion.terminal.sequence},profileTakeoverTerminal:completion});
   for(const table of a.tables){const other=g.tableOf(after,table.name);g.same(table.columnContract,other.columnContract);f.require(table.columnContractValueDigest===other.columnContractValueDigest);
     if(table.name==='storage_maintenance')f.require(table.rows[0]!.rowid===other.rows[0]!.rowid);
-    else g.same(g.sort(table.rows,(x,y)=>g.compareText(f.canonical(x),f.canonical(y))),g.sort(other.rows,(x,y)=>g.compareText(f.canonical(x),f.canonical(y))));}
+    else g.sameTable(a.backend,table,other);}
   g.same(a.sequences,b.sequences);
 }
 

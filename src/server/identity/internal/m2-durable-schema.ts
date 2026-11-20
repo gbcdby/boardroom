@@ -4,7 +4,7 @@ import { wellFormedP0 } from "./m2-p0-lexical.ts";
 import { assertP0FState } from "./m2-p0-artifacts-common.ts";
 import type { FState } from "./m2-p0-artifacts-common.ts";
 import { p0State } from './m2-p0-budget.ts';
-import { m2OwnedCanonicalSource } from './m2-owned-json.ts';
+import { m2OwnedUnicode } from './m2-owned-json.ts';
 import type { M2Definitions } from "./m2-durable-types.ts";
 
 type Schema = { readonly $ref?: string; readonly type?: string; readonly const?: unknown;
@@ -129,7 +129,7 @@ function matches(f: FState, schema: Schema, value: unknown, depth: number, owned
 }
 export function m2Definition<K extends keyof M2Definitions>(f: FState, name: K, value: unknown): M2Definitions[K] {
   assertP0FState(f);
-  const ownedUnicode=m2OwnedCanonicalSource(p0State(f.request),value)!==undefined;
+  const ownedUnicode=m2OwnedUnicode(p0State(f.request),value);
   f.require(Object.hasOwn(fixed, name) && matches(f, fixed[name]!, value, 0,ownedUnicode), "artifact_semantic_mismatch", "format-mismatch");
   // Safe-counter and canonical decimal grammars are followed by exact range refinement.
   if (name === "Int64" || name === "SP_Int64") {

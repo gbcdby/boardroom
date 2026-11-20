@@ -53,7 +53,7 @@ export function runM2OriginHistoryClosure(parent:P0Request):ClosureResult {
       const control=readM2Control(g,g.tableOf(current,'storage_maintenance'),'p1');
       if(control.profileTakeoverTerminal===null){
         g.same(control,origin.controlBeforeB);g.same(o.sequences,origin.preB.observation.sequences);
-        for(const table of o.tables){const old=g.tableOf(origin.preB,table.name);f.require(g.rowDigest(o.backend,table)===g.rowDigest(o.backend,old));}
+        for(const table of o.tables)g.sameTable(o.backend,g.tableOf(origin.preB,table.name),table);
       }else checkM2TerminalControl(g,origin.preB,current,origin.terminal,origin.completion);
       const keys=checkM2LegacyKeys(request,current.view);if(!keys.ok)return keys;
       const identities=checkP0IdentityFamily(request,current.view);if(!identities.ok)return identities;

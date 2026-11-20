@@ -282,6 +282,8 @@ function checkInitialAdvanced(g:M2Graph,old:M2Business,current:M2Business,mappin
     f.require(advanced.state==='selected'&&mapping.advancedRule==='legacy-equivalence'&&mapping.advancedEvidence!==null&&validity==='effective'&&advanced.origin.kind==='legacy_equivalence');
     const evidence=g.payload(mapping.advancedEvidence,'m2-advanced-equivalence'),selected=mapping.selectedKind==='requestedSnapshot'?mapping.requested:mapping.selectedKind==='applied'?mapping.applied:mapping.effective;
     f.require(selected.state==='present'&&selected.workspace.state==='mapped');const snapshot=current.snapshot(selected.snapshotRef),workspace=current.mapping(selected.workspace.mappingRef);
+    f.require(snapshot.advancedBasis.kind==='legacy'&&snapshot.advancedBasis.legacy.mappedValidity==='equivalent'
+      &&snapshot.advancedBasis.legacy.equivalenceEvidenceDigest===f.digestCr3(evidence));
     g.same(evidence.source,old.history.observation.source);g.same(evidence.capture,capture);g.same(evidence.legacyRef,selected.legacyRef);g.same(evidence.profileRef,profileRef);g.same(evidence.bindingRef,bindingRef);
     g.same(evidence.rootObservation,selected.workspace.workspaceObservation);g.same(evidence.compatibilityBasis,{runtimeRevision:original.runtimeRevision,bindingRevision:original.bindingRevision});
     g.same(advanced.origin.captureRef,capture);g.same(advanced.origin.legacyRef,selected.legacyRef);g.same(advanced.basis.profileRef,profileRef);

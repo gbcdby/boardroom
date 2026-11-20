@@ -14,6 +14,14 @@ export interface M2OwnedCanonicalSource {
 }
 const byteOwners=new WeakMap<object,{readonly state:P0State;readonly asciiKeys:boolean;readonly domain:'history'|'r3'|'s4';readonly source?:M2OwnedCanonicalSource}>();
 const selectedBytes=new WeakMap<object,{readonly state:P0State;readonly bytes:Buffer}>();
+const unicodeOwners=new WeakMap<object,P0State>();
+/** A strict scan's decoded Unicode fact for this exact immutable subtree.
+ * No role, string-field policy, schema match or cross-reference is cached. */
+export function m2OwnedUnicode(state:P0State,value:unknown):boolean {
+  assertP0State(state);if(value===null||typeof value!=='object')return false;
+  if(unicodeOwners.get(value)===state)return true;
+  const own=byteOwners.get(value);return own?.state===state&&own.source?.r3===true;
+}
 /** Data provenance for the fixed canonical byte encoder, never a schema or
  * semantic result. Only this actual parser can create a membership. */
 export function m2OwnedAsciiKeys(state:P0State,value:unknown):boolean {
@@ -195,6 +203,7 @@ function owned(state:P0State,text:string,site:P0Site,domain:'history'|'r3'|'s4')
       state.depths.set(result,depth);space();
       let fields=0,maximumKey=0;
       const finish=():unknown=>{chargeState(state,{work:3},site);sortWork+=fields*fields;sortBytes+=fields*fields*maximumKey*2;
+        if(domain==='r3'){chargeState(state,{work:1,tuples:1},site);unicodeOwners.set(result,state);}
         // Native S4 consumers also canonicalize immutable nested values. Record
         // their byte intervals during this scan so those actual encodings need
         // not be reconstructed later. This contains syntax data only.

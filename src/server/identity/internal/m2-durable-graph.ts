@@ -202,6 +202,25 @@ export class M2Graph {
     if(owned){f.charge(1,0,prior?1:3);const values=prior??new Map<string,string>();values.set(backend,digest);if(!prior)this.tableDigests.set(table,values);}
     return digest;
   }
+  /** Compare the full original row-multiset domain, including its metadata,
+   * before lending an already computed digest to the equal owned copy. */
+  sameTable(backend:'sqlite'|'postgres',before:ReadonlyDeep<RawTable>,after:ReadonlyDeep<RawTable>):void {
+    const f:FState=this.f;f.require(before.name===after.name&&before.count===after.count
+      &&before.columnContractValueDigest===after.columnContractValueDigest);
+    this.same(before.columnContract,after.columnContract);this.same(before.columns,after.columns);
+    const frames=(table:ReadonlyDeep<RawTable>):string[]=>{
+      f.charge(table.rows.length,0,table.rows.length+1);
+      return this.sort(table.rows.map(row=>f.canonical([row.rowid,row.cells])),(a,b)=>this.compareText(a,b));
+    };
+    this.same(frames(before),frames(after));this.copyTableDigest(backend,before,after);
+  }
+  private copyTableDigest(backend:'sqlite'|'postgres',before:ReadonlyDeep<RawTable>,after:ReadonlyDeep<RawTable>):void {
+    const f:FState=this.f,digest=this.tableDigests.get(before)?.get(backend);
+    if(digest!==undefined&&f.immutable.has(before)&&f.immutable.has(after)){
+      const prior=this.tableDigests.get(after);f.charge(1,0,prior?1:3);
+      const values=prior??new Map<string,string>();values.set(backend,digest);if(!prior)this.tableDigests.set(after,values);
+    }
+  }
   compareText(a:string,b:string):number {
     // UTF-8 lexical order is scalar order. Compare only the actually inspected
     // prefix; no complete pair of temporary UTF-8 Buffers is constructed.
@@ -237,6 +256,9 @@ export class M2Graph {
   }
   observation(value:unknown):M2HistoryData {
     const f:FState=this.f,view=ownedM2HistoryView(this.request,value),o=value as ReadonlyDeep<HistoryObservationInput>;
+    // The view has just authenticated this scanner-owned immutable tree.
+    // Bind it to the same F byte-data owner before any cache can reuse it.
+    f.freeze(value);
     f.require(o.phase==='p0'||o.phase==='p1');
     const ledger=p0State(this.request);
     for(const table of o.tables)for(const row of view.rows(table.name as P0Table)){
@@ -262,7 +284,13 @@ export class M2Graph {
     const f:FState=this.f;m2Definition(f,'CompleteHistorySelection',selection);f.require(selection.phase==='p0'||selection.phase==='p1');
     const result=this.observation(f.json(this.selected(selection.observation,'pc-observation'))),o=result.observation;
     f.require(o.phase===selection.phase&&o.backend===selection.backend&&f.equal(o.source,selection.source)&&result.completeHistoryDigest===selection.completeHistoryDigest&&selection.tables.length===o.tables.length);
-    for(let i=0;i<selection.tables.length;i++){const selected=selection.tables[i]!,raw=o.tables[i]!;f.require(selected.table===raw.name);this.same(this.table(selected,o.source,o.backend,selection.phase),raw);}
+    for(let i=0;i<selection.tables.length;i++){
+      const selected=selection.tables[i]!,raw=o.tables[i]!;f.require(selected.table===raw.name);
+      const verified=this.table(selected,o.source,o.backend,selection.phase);this.same(verified,raw);
+      // The complete raw-table byte equality above has actually run. Reuse
+      // only its already computed table-domain digest on the equal owned copy.
+      this.copyTableDigest(o.backend,verified,raw);
+    }
     return result;
   }
   /** Complete fixed P1 raw cut used by CF's runtime/control joins. The original
