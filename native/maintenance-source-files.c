@@ -844,6 +844,15 @@ static napi_value observe_extended(napi_env env, napi_callback_info info) {
 
 /* P3 is a fixed ordinary, read-only collector. It never decides qualification,
  * repairs a source, changes credentials, or accepts a caller's observation. */
+#define P3_CHANGE_FIELD_LIMIT 12
+#define P3_CHANGE_RAW_LIMIT 2
+typedef struct { size_t byte_length; char sha256[65]; } p3_raw_digest;
+typedef struct {
+  const char *operation, *fields[P3_CHANGE_FIELD_LIMIT];
+  size_t field_count, before_count, after_count;
+  bool raw_present, before_present, after_present;
+  p3_raw_digest before[P3_CHANGE_RAW_LIMIT], after[P3_CHANGE_RAW_LIMIT];
+} p3_change_evidence;
 typedef struct {
   napi_env env;
   source_owner *owner;
@@ -853,6 +862,7 @@ typedef struct {
   bool failed, budget_failed, graph_active, changed;
   int proc_fd, sys_fd, proc_owned, sys_owned;
   napi_value proc_calls, sys_calls;
+  p3_change_evidence change;
 } p3_context;
 typedef struct {
   napi_value result, calls, value;
@@ -870,8 +880,131 @@ typedef struct {
   const void *bytes[2]; size_t length[2];
   int64_t numbers[3];
 } p3_sample;
-static void p3_changed(p3_context *c) {
-  if (!c->changed) { c->changed = true; c->changed_at = c->calls; }
+typedef struct {
+  uint32_t h[8];
+  uint64_t bytes;
+  size_t used;
+  unsigned char block[64];
+} p3_sha;
+static uint32_t p3_rotr(uint32_t value, unsigned count) { return (value >> count) | (value << (32 - count)); }
+static void p3_sha_block(p3_sha *state, const unsigned char *bytes) {
+  static const uint32_t constants[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  };
+  uint32_t words[64];
+  for (unsigned i = 0; i < 16; i++) words[i] = (uint32_t)bytes[4 * i] << 24 |
+    (uint32_t)bytes[4 * i + 1] << 16 | (uint32_t)bytes[4 * i + 2] << 8 | bytes[4 * i + 3];
+  for (unsigned i = 16; i < 64; i++) {
+    const uint32_t a = words[i - 15], b = words[i - 2];
+    words[i] = words[i - 16] + (p3_rotr(a, 7) ^ p3_rotr(a, 18) ^ (a >> 3)) + words[i - 7] +
+      (p3_rotr(b, 17) ^ p3_rotr(b, 19) ^ (b >> 10));
+  }
+  uint32_t a = state->h[0], b = state->h[1], c = state->h[2], d = state->h[3];
+  uint32_t e = state->h[4], f = state->h[5], g = state->h[6], h = state->h[7];
+  for (unsigned i = 0; i < 64; i++) {
+    const uint32_t first = h + (p3_rotr(e, 6) ^ p3_rotr(e, 11) ^ p3_rotr(e, 25)) + ((e & f) ^ (~e & g)) + constants[i] + words[i];
+    const uint32_t second = (p3_rotr(a, 2) ^ p3_rotr(a, 13) ^ p3_rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+    h = g; g = f; f = e; e = d + first; d = c; c = b; b = a; a = first + second;
+  }
+  state->h[0] += a; state->h[1] += b; state->h[2] += c; state->h[3] += d;
+  state->h[4] += e; state->h[5] += f; state->h[6] += g; state->h[7] += h;
+}
+static void p3_sha_digest(const void *data, size_t length, p3_raw_digest *out) {
+  static const uint32_t initial[8] = {
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+  };
+  static const char hex[] = "0123456789abcdef";
+  p3_sha state = { .bytes = length }; memcpy(state.h, initial, sizeof(initial));
+  const unsigned char *bytes = data;
+  while (length >= 64) { p3_sha_block(&state, bytes); bytes += 64; length -= 64; }
+  if (length) memcpy(state.block, bytes, length);
+  state.used = length; state.block[state.used++] = 0x80;
+  if (state.used > 56) {
+    memset(state.block + state.used, 0, 64 - state.used); p3_sha_block(&state, state.block); state.used = 0;
+  }
+  memset(state.block + state.used, 0, 56 - state.used);
+  const uint64_t bits = state.bytes * 8;
+  for (unsigned i = 0; i < 8; i++) state.block[63 - i] = (unsigned char)(bits >> (8 * i));
+  p3_sha_block(&state, state.block);
+  for (unsigned i = 0; i < 32; i++) {
+    const unsigned char value = (unsigned char)(state.h[i / 4] >> (24 - 8 * (i % 4)));
+    out->sha256[i * 2] = hex[value >> 4]; out->sha256[i * 2 + 1] = hex[value & 15];
+  }
+  out->sha256[64] = 0;
+}
+static void p3_changed(p3_context *c, const char *operation) {
+  if (!c->changed) { c->changed = true; c->changed_at = c->calls; c->change.operation = operation; }
+}
+static bool p3_change_start(p3_context *c, const char *operation) {
+  if (c->changed) return false;
+  p3_changed(c, operation); return true;
+}
+static void p3_change_field(p3_context *c, const char *field) {
+  for (size_t i = 0; i < c->change.field_count; i++) if (!strcmp(c->change.fields[i], field)) return;
+  if (c->change.field_count < P3_CHANGE_FIELD_LIMIT) c->change.fields[c->change.field_count++] = field;
+}
+static void p3_change_raw(p3_context *c, bool after, const void *bytes, size_t length) {
+  p3_change_evidence *change = &c->change;
+  size_t *count = after ? &change->after_count : &change->before_count;
+  if (*count >= P3_CHANGE_RAW_LIMIT) return;
+  p3_raw_digest *digest = after ? &change->after[*count] : &change->before[*count];
+  digest->byte_length = length; p3_sha_digest(bytes, length, digest); (*count)++;
+  change->raw_present = true;
+  if (after) change->after_present = true; else change->before_present = true;
+}
+static void p3_metadata_fields(p3_context *c, const struct stat *before, const struct stat *after,
+                               const struct statfs *before_fs, const struct statfs *after_fs) {
+  if (before->st_dev != after->st_dev) p3_change_field(c, "dev");
+  if (before->st_ino != after->st_ino) p3_change_field(c, "inode");
+  if (before->st_mode != after->st_mode) p3_change_field(c, "mode");
+  if (before->st_uid != after->st_uid) p3_change_field(c, "uid");
+  if (before->st_gid != after->st_gid) p3_change_field(c, "gid");
+  if (before->st_nlink != after->st_nlink) p3_change_field(c, "nlink");
+  if (before->st_size != after->st_size) p3_change_field(c, "size");
+  if (before->st_atim.tv_sec != after->st_atim.tv_sec || before->st_atim.tv_nsec != after->st_atim.tv_nsec)
+    p3_change_field(c, "atimeNs");
+  if (before->st_mtim.tv_sec != after->st_mtim.tv_sec || before->st_mtim.tv_nsec != after->st_mtim.tv_nsec)
+    p3_change_field(c, "mtimeNs");
+  if (before->st_ctim.tv_sec != after->st_ctim.tv_sec || before->st_ctim.tv_nsec != after->st_ctim.tv_nsec)
+    p3_change_field(c, "ctimeNs");
+  if (before_fs && after_fs && before_fs->f_type != after_fs->f_type) p3_change_field(c, "filesystemType");
+}
+static void p3_note_metadata(p3_context *c, const char *operation, const struct stat *before, const struct stat *after,
+                             const struct statfs *before_fs, const struct statfs *after_fs) {
+  if (p3_change_start(c, operation)) p3_metadata_fields(c, before, after, before_fs, after_fs);
+}
+static void p3_note_read(p3_context *c, const char *operation, const p3_read *before, const p3_read *after) {
+  if (!p3_change_start(c, operation)) return;
+  if (before->ok && after->ok) {
+    p3_metadata_fields(c, &before->st, &after->st, &before->fs, &after->fs);
+    if (before->length != after->length || (before->length && memcmp(before->bytes, after->bytes, before->length)))
+      p3_change_field(c, "raw");
+  } else p3_change_field(c, "presence");
+  if (before->ok) p3_change_raw(c, false, before->bytes, before->length);
+  if (after->ok) p3_change_raw(c, true, after->bytes, after->length);
+}
+static void p3_note_sample(p3_context *c, const char *operation, const p3_sample *before, const p3_sample *after) {
+  if (!p3_change_start(c, operation)) return;
+  if (memcmp(before->numbers, after->numbers, sizeof(before->numbers))) p3_change_field(c, "numbers");
+  for (unsigned i = 0; i < 2; i++) {
+    if (before->length[i] != after->length[i] ||
+        (before->length[i] && memcmp(before->bytes[i], after->bytes[i], before->length[i])))
+      p3_change_field(c, i == 1 ? "result" : !strcmp(operation, "mount.statmount") ? "request" : "raw");
+    if (before->bytes[i]) p3_change_raw(c, false, before->bytes[i], before->length[i]);
+    if (after->bytes[i]) p3_change_raw(c, true, after->bytes[i], after->length[i]);
+  }
+}
+static void p3_note_raw(p3_context *c, const char *operation, const void *before, size_t before_length,
+                        const void *after, size_t after_length) {
+  if (!p3_change_start(c, operation)) return;
+  p3_change_field(c, "raw"); p3_change_raw(c, false, before, before_length); p3_change_raw(c, true, after, after_length);
 }
 static napi_value p3_array(p3_context *c) {
   napi_value result = NULL;
@@ -1059,7 +1192,7 @@ static p3_read p3_kernel_read_phase(p3_context *c, int base, const char *path, s
   p3_phase_call(c, out.calls, operations[5], second, fd >= 0, rc, error, true);
   if (fd >= 0 && rc && !reason) reason = "syscall";
   if (!reason && (!p3_same_identity(&out.st, &after) || out.fs.f_type != fs_after.f_type)) {
-    p3_changed(c); reason = "binding";
+    p3_note_metadata(c, "environment.changed", &out.st, &after, &out.fs, &fs_after); reason = "binding";
   }
   char close_name[128]; snprintf(close_name, sizeof(close_name), "%s%s", operations[6], second ? "-after" : "");
   const int ce = p3_close(c, &fd, out.calls, close_name);
@@ -1078,22 +1211,24 @@ static p3_read p3_kernel_read_phase(p3_context *c, int base, const char *path, s
 static p3_read p3_kernel_read(p3_context *c, int base, const char *path, size_t limit, long magic) {
   return p3_kernel_read_phase(c, base, path, limit, magic, false, 0, P3_KERNEL_GENERIC);
 }
-static void p3_kernel_after_reader(p3_context *c, p3_read *first, int base, const char *path, size_t limit, long magic, p3_reader reader) {
+static void p3_kernel_after_reader(p3_context *c, p3_read *first, int base, const char *path, size_t limit, long magic,
+                                   p3_reader reader, const char *operation) {
   p3_read second = p3_kernel_read_phase(c, base, path, limit, magic, true, first->read_count, reader);
   p3_extend_calls(c, first->calls, second.calls);
   if ((first->ok && second.ok && (!p3_same_identity(&first->st, &second.st) ||
         first->fs.f_type != second.fs.f_type || first->length != second.length ||
         (first->length && memcmp(first->bytes, second.bytes, first->length)))) ||
       (first->ok && second.open_error == ENOENT) || (first->open_error == ENOENT && second.ok)) {
-    p3_changed(c); first->reason = "binding";
+    p3_note_read(c, operation, first, &second); first->reason = "binding";
   }
   if (!first->reason) first->reason = second.reason;
   first->ok = !first->reason; first->read_count = second.read_count;
   if (first->open_error != ENOENT || second.open_error != ENOENT) first->open_error = 0;
   first->result = p3_fact(c, first->calls, first->ok ? first->value : NULL, first->reason);
 }
-static void p3_kernel_after(p3_context *c, p3_read *first, int base, const char *path, size_t limit, long magic) {
-  p3_kernel_after_reader(c, first, base, path, limit, magic, P3_KERNEL_GENERIC);
+static void p3_kernel_after(p3_context *c, p3_read *first, int base, const char *path, size_t limit, long magic,
+                            const char *operation) {
+  p3_kernel_after_reader(c, first, base, path, limit, magic, P3_KERNEL_GENERIC, operation);
 }
 /* No caller-selected path, descriptor, node, read limit or magic enters these
  * readers. The supplied base is the original source-derived node zero FD. */
@@ -1109,7 +1244,9 @@ static p3_read p3_block_before(p3_context *c, int base, p3_reader reader) {
   return p3_kernel_read_phase(c, base, p3_block_leaf(reader), 4096, SYSFS_MAGIC, false, 0, reader);
 }
 static void p3_block_after(p3_context *c, p3_read *first, int base, p3_reader reader) {
-  p3_kernel_after_reader(c, first, base, p3_block_leaf(reader), 4096, SYSFS_MAGIC, reader);
+  const char *operation = reader == P3_M04_SIZE ? "device.blockAttributes.size" :
+    reader == P3_M04_RO ? "device.blockAttributes.readOnly" : "device.blockAttributes.diskSequence";
+  p3_kernel_after_reader(c, first, base, p3_block_leaf(reader), 4096, SYSFS_MAGIC, reader, operation);
 }
 static napi_value p3_sample_result(p3_context *c, p3_sample *sample) {
   sample->result = p3_fact(c, sample->calls, sample->reason ? NULL : sample->value, sample->reason);
@@ -1122,13 +1259,13 @@ static bool p3_sample_bytes(p3_context *c, p3_sample *sample, unsigned index,
   if (napi_create_buffer_copy(c->env, size, data, &copy, buffer) != napi_ok) { c->failed = true; return false; }
   sample->bytes[index] = copy; sample->length[index] = size; return true;
 }
-static napi_value p3_sample_join(p3_context *c, p3_sample *first, const p3_sample *second) {
+static napi_value p3_sample_join(p3_context *c, p3_sample *first, const p3_sample *second, const char *operation) {
   p3_extend_calls(c, first->calls, second->calls);
   if (!first->reason && !second->reason) {
     bool same = !memcmp(first->numbers, second->numbers, sizeof(first->numbers));
     for (unsigned i = 0; i < 2; i++) same = same && first->length[i] == second->length[i] &&
       (!first->length[i] || !memcmp(first->bytes[i], second->bytes[i], first->length[i]));
-    if (!same) { p3_changed(c); first->reason = "binding"; }
+    if (!same) { p3_note_sample(c, operation, first, second); first->reason = "binding"; }
   }
   if (!first->reason) first->reason = second->reason;
   return p3_sample_result(c, first);
@@ -1278,7 +1415,14 @@ static napi_value p3_identity_after(p3_context *c, p3_credentials *id) {
   if (after_nnp < 0 && !reason) reason = "syscall";
   if (!reason && (memcmp(id->uid, ua, sizeof(ua)) || memcmp(id->gid, ga, sizeof(ga)) || after_got != after_count ||
       id->count != after_count || id->nnp != after_nnp || memcmp(id->groups, after_groups, (size_t)id->count * sizeof(gid_t)))) {
-    p3_changed(c); reason = "binding";
+    if (p3_change_start(c, "process.identity")) {
+      if (memcmp(id->uid, ua, sizeof(ua))) p3_change_field(c, "uid");
+      if (memcmp(id->gid, ga, sizeof(ga))) p3_change_field(c, "gid");
+      if (after_got != after_count || id->count != after_count ||
+          memcmp(id->groups, after_groups, (size_t)id->count * sizeof(gid_t))) p3_change_field(c, "groups");
+      if (id->nnp != after_nnp) p3_change_field(c, "noNewPrivileges");
+    }
+    reason = "binding";
   }
   napi_value value = NULL;
   if (!reason) {
@@ -1492,7 +1636,8 @@ static bool p3_device_link(p3_context *c, p3_node *n, unsigned index, bool after
   p3_call(c, n->binding_calls, operation, ran, got, error, true);
   if (got > 0 && !p3_account(c, (size_t)got)) return false;
   if (after && got >= 0 && n->resolved_size &&
-      ((size_t)got != n->resolved_size || memcmp(n->resolved, raw, n->resolved_size))) p3_changed(c);
+      ((size_t)got != n->resolved_size || memcmp(n->resolved, raw, n->resolved_size)))
+    p3_note_raw(c, "device.resolved", n->resolved, n->resolved_size, raw, (size_t)got);
   if (got <= 13 || (size_t)got >= capacity || memchr(raw, 0, (size_t)got) || memcmp(raw, "/sys/devices/", 13)) return false;
   raw[got] = 0;
   const char *leaf = strrchr(raw, '/');
@@ -1606,12 +1751,12 @@ static void p3_graph_after(p3_context *c, p3_graph *g) {
   c->graph_active = true;
   for (size_t i = 0; i < g->count; i++) {
     p3_node *n = &g->nodes[i]; const int base = n->valid ? n->fd : -1;
-    p3_kernel_after(c, &n->dev, base, "dev", 4096, SYSFS_MAGIC);
-    p3_kernel_after(c, &n->uevent, base, "uevent", 4096, SYSFS_MAGIC);
-    p3_kernel_after(c, &n->partition, base, "partition", 4096, SYSFS_MAGIC);
-    p3_kernel_after(c, &n->loop, base, "loop/backing_file", 4096, SYSFS_MAGIC);
-    p3_kernel_after(c, &n->dm_name, base, "dm/name", 4096, SYSFS_MAGIC);
-    p3_kernel_after(c, &n->dm_uuid, base, "dm/uuid", 4096, SYSFS_MAGIC);
+    p3_kernel_after(c, &n->dev, base, "dev", 4096, SYSFS_MAGIC, "device.dev");
+    p3_kernel_after(c, &n->uevent, base, "uevent", 4096, SYSFS_MAGIC, "device.uevent");
+    p3_kernel_after(c, &n->partition, base, "partition", 4096, SYSFS_MAGIC, "device.partition");
+    p3_kernel_after(c, &n->loop, base, "loop/backing_file", 4096, SYSFS_MAGIC, "device.loopBackingFile");
+    p3_kernel_after(c, &n->dm_name, base, "dm/name", 4096, SYSFS_MAGIC, "device.dmName");
+    p3_kernel_after(c, &n->dm_uuid, base, "dm/uuid", 4096, SYSFS_MAGIC, "device.dmUuid");
     if ((!n->dev.ok || !n->uevent.ok || !p3_absent_or_read(&n->partition) || !p3_absent_or_read(&n->loop) ||
         !p3_absent_or_read(&n->dm_name) || !p3_absent_or_read(&n->dm_uuid)) && !g->reason) g->reason = "binding";
     p3_names *before[] = {n->holders, n->slaves, n->partitions};
@@ -1620,7 +1765,9 @@ static void p3_graph_after(p3_context *c, p3_graph *g) {
       char resource[64]; snprintf(resource, sizeof(resource), "%s-%zu", labels[set], i);
       p3_names *after = p3_enumerate(c, base, paths[set], resource, n->enumeration_calls, true, before[set]->read_count);
       if (!p3_names_equal(before[set], after)) {
-        if (before[set]->ok && after && after->ok) p3_changed(c);
+        if (before[set]->ok && after && after->ok) {
+          if (p3_change_start(c, "device.topology")) p3_change_field(c, labels[set]);
+        }
         if (!g->reason) g->reason = c->budget_failed ? "budget" : "enumeration";
       }
       free(after);
@@ -1637,7 +1784,12 @@ static void p3_graph_after(p3_context *c, p3_graph *g) {
       const bool same = n->partitions->partition_presence[j] == 1 ? absent :
         ran && rc == 0 && p3_same_identity(&n->partitions->partition_identity[j], &actual);
       if (!same) {
-        if (ran && (rc == 0 || absent)) p3_changed(c);
+        if (ran && (rc == 0 || absent)) {
+          if (p3_change_start(c, "device.topology.partitions")) {
+            if (rc == 0) p3_metadata_fields(c, &n->partitions->partition_identity[j], &actual, NULL, NULL);
+            else p3_change_field(c, "presence");
+          }
+        }
         if (!g->reason) g->reason = "binding";
       }
     }
@@ -1653,7 +1805,7 @@ static void p3_graph_after(p3_context *c, p3_graph *g) {
       if (ran) { errno = 0; rc = fstatat(c->sys_fd, path, &actual, 0); error = rc ? errno : 0; }
       snprintf(op, sizeof(op), "stat-device-link-%zu-after", i); p3_call(c, n->enumeration_calls, op, ran, rc, error, true);
       if (!ran || rc || !p3_same_identity(&target->st, &actual)) {
-        if (ran && !rc) p3_changed(c);
+        if (ran && !rc) p3_note_metadata(c, "device.topology.edges", &target->st, &actual, NULL, NULL);
         if (!g->reason) g->reason = "binding";
       }
     }
@@ -1669,7 +1821,8 @@ static void p3_finish_nodes(p3_context *c, p3_graph *g) {
     bool linked = p3_device_link(c, n, (unsigned)i, true);
     snprintf(operation, sizeof(operation), "close-device-node-%zu", i); int ce = p3_close(c, &n->fd, n->binding_calls, operation);
     n->post_valid = valid && linked && p3_same_identity(&n->st, &after) && n->fs.f_type == fs.f_type && !ce;
-    if (n->valid && valid && (!p3_same_identity(&n->st, &after) || n->fs.f_type != fs.f_type)) p3_changed(c);
+    if (n->valid && valid && (!p3_same_identity(&n->st, &after) || n->fs.f_type != fs.f_type))
+      p3_note_metadata(c, "device.metadata", &n->st, &after, &n->fs, &fs);
     if (!n->post_valid && !g->reason) g->reason = "binding";
   }
   c->graph_active = false;
@@ -1748,7 +1901,13 @@ static void p3_directory_after(p3_context *c, p3_directory *d) {
   const bool same = valid && p3_same_identity(&d->st, &after) && d->fs.f_type == fs.f_type &&
     ran && !rc && p3_same_identity(&d->st, &link);
   if (d->valid && ((valid && (!p3_same_identity(&d->st, &after) || d->fs.f_type != fs.f_type)) ||
-      (ran && !rc && !p3_same_identity(&d->st, &link)))) p3_changed(c);
+      (ran && !rc && !p3_same_identity(&d->st, &link)))) {
+    const char *operation = !strcmp(d->label, "health-directory") ? "health.directory" : "configuration.procDirectory";
+    if (p3_change_start(c, operation)) {
+      if (valid) p3_metadata_fields(c, &d->st, &after, &d->fs, &fs);
+      if (ran && !rc) p3_metadata_fields(c, &d->st, &link, NULL, NULL);
+    }
+  }
   snprintf(op, sizeof(op), "close-%s", d->label); const int ce = p3_close(c, &d->fd, d->calls, op);
   d->post_valid = d->valid && same && !ce;
 }
@@ -1769,7 +1928,15 @@ static bool p3_source_metadata(p3_context *c, int fd, bool directory, bool after
     if (!*first_error) *first_error = se ? se : fe;
   }
   if (sr || fr) return false;
-  if (!valid_metadata(st, directory)) { p3_changed(c); return false; }
+  if (!valid_metadata(st, directory)) {
+    if (p3_change_start(c, carrier ? "carrier.metadata" : "source.metadata")) {
+      if (st->st_uid != getuid()) p3_change_field(c, "uid");
+      if ((st->st_mode & 0022) || (directory ? !S_ISDIR(st->st_mode) : !S_ISREG(st->st_mode))) p3_change_field(c, "mode");
+      if (!directory && st->st_nlink != 1) p3_change_field(c, "nlink");
+      if (!directory && st->st_size < 0) p3_change_field(c, "size");
+    }
+    return false;
+  }
   return true;
 }
 static void p3_read_reject(p3_context *c, p3_read *read, const char *reason) {
@@ -1792,6 +1959,41 @@ static void p3_mountinfo_limit(p3_context *c, p3_read *read) {
   }
   if (length) p3_read_reject(c, read, "format");
 }
+static napi_value p3_change_raw_side(p3_context *c, bool after) {
+  const p3_change_evidence *change = &c->change;
+  napi_value result = NULL;
+  if (!(after ? change->after_present : change->before_present)) {
+    if (napi_get_null(c->env, &result) != napi_ok) c->failed = true;
+    return result;
+  }
+  result = p3_array(c);
+  const size_t count = after ? change->after_count : change->before_count;
+  const p3_raw_digest *digests = after ? change->after : change->before;
+  for (size_t i = 0; i < count; i++) {
+    napi_value item = NULL;
+    if (napi_create_object(c->env, &item) != napi_ok || !set_big(c->env, item, "byteLength", digests[i].byte_length) ||
+        !set_text(c->env, item, "sha256", digests[i].sha256) || !p3_append(c->env, result, item)) c->failed = true;
+  }
+  return result;
+}
+static bool p3_change_error_fields(p3_context *c, napi_value error, const char *code) {
+  if (strcmp(code, "ERR_SOURCE_IDENTITY")) return true;
+  napi_value fields = p3_array(c), raw = NULL, operation = NULL;
+  if (napi_create_string_utf8(c->env, c->change.operation ? c->change.operation : "environment.changed",
+      NAPI_AUTO_LENGTH, &operation) != napi_ok) c->failed = true;
+  for (size_t i = 0; i < c->change.field_count; i++) {
+    napi_value field = NULL;
+    if (napi_create_string_utf8(c->env, c->change.fields[i], NAPI_AUTO_LENGTH, &field) != napi_ok ||
+        !p3_append(c->env, fields, field)) c->failed = true;
+  }
+  if (c->change.raw_present) {
+    if (napi_create_object(c->env, &raw) != napi_ok) c->failed = true;
+    (void)p3_property(c, raw, "before", p3_change_raw_side(c, false));
+    (void)p3_property(c, raw, "after", p3_change_raw_side(c, true));
+  } else if (napi_get_null(c->env, &raw) != napi_ok) c->failed = true;
+  return p3_property(c, error, "changeOperation", operation) &&
+    p3_property(c, error, "changeFields", fields) && p3_property(c, error, "changeRaw", raw);
+}
 static napi_value p3_environment_failure(p3_context *c, napi_value owner, const char *code,
                                          const char *stage, int error_number) {
   c->owner->invalid = true;
@@ -1802,7 +2004,8 @@ static napi_value p3_environment_failure(p3_context *c, napi_value owner, const 
       napi_create_int32(c->env, error_number, &field) != napi_ok || napi_set_named_property(c->env, error, "errno", field) != napi_ok ||
       napi_create_int32(c->env, -1, &field) != napi_ok || napi_set_named_property(c->env, error, "rc", field) != napi_ok ||
       napi_set_named_property(c->env, error, "cleanupCalls", c->auxiliary) != napi_ok ||
-      napi_set_named_property(c->env, error, "nativeCleanupOwner", owner) != napi_ok)
+      napi_set_named_property(c->env, error, "nativeCleanupOwner", owner) != napi_ok ||
+      !p3_change_error_fields(c, error, code))
     return throw_code(c->env, code, "Could not encode environment failure");
   /* The already-delivered root remains its caller's responsibility. New aux
    * owners have all been attempted; unknown integers are never closed again. */
@@ -1831,13 +2034,30 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
     carrier_calls, &carrier_before, &carrier_fs, &metadata_error);
   if (!source_ok || !carrier_ok || !same_metadata(&owner->initial, &before) || before.st_dev != carrier_before.st_dev ||
       fs_before.f_type != carrier_fs.f_type ||
-      (owner->metadata_only && !same_metadata(&owner->parent_initial, &carrier_before)))
+      (owner->metadata_only && !same_metadata(&owner->parent_initial, &carrier_before))) {
+    if (source_ok && carrier_ok) {
+      if (!same_metadata(&owner->initial, &before))
+        p3_note_metadata(&c, "source.metadata", &owner->initial, &before, NULL, NULL);
+      else if (before.st_dev != carrier_before.st_dev || fs_before.f_type != carrier_fs.f_type) {
+        if (p3_change_start(&c, "source.carrier.binding")) {
+          if (before.st_dev != carrier_before.st_dev) p3_change_field(&c, "dev");
+          if (fs_before.f_type != carrier_fs.f_type) p3_change_field(&c, "filesystemType");
+        }
+      } else if (owner->metadata_only)
+        p3_note_metadata(&c, "carrier.metadata", &owner->parent_initial, &carrier_before, NULL, NULL);
+    }
     return p3_environment_failure(&c, args[0], metadata_error ? "ERR_SOURCE_NATIVE_IO" : "ERR_SOURCE_IDENTITY",
       "environment-source-before", metadata_error ? metadata_error : ESTALE);
+  }
   uint64_t carrier_legacy_before = 0, carrier_unique_before = 0, carrier_legacy_after = 0, carrier_unique_after = 0;
   if (owner->tail && (!mount_pair(carrier, &carrier_before, &carrier_legacy_before, &carrier_unique_before) ||
-      carrier_legacy_before != owner->legacy_mount_id || carrier_unique_before != owner->unique_mount_id))
+      carrier_legacy_before != owner->legacy_mount_id || carrier_unique_before != owner->unique_mount_id)) {
+    if (p3_change_start(&c, "tail.carrier.mount")) {
+      if (carrier_legacy_before != owner->legacy_mount_id) p3_change_field(&c, "legacyMountId");
+      if (carrier_unique_before != owner->unique_mount_id) p3_change_field(&c, "uniqueMountId");
+    }
     return p3_environment_failure(&c, args[0], "ERR_SOURCE_IDENTITY", "tail-carrier-mount-before", ESTALE);
+  }
 
   c.proc_fd = p3_anchor(&c, "/proc", "proc-root", PROC_SUPER_MAGIC, c.proc_calls, &c.proc_owned);
   c.sys_fd = p3_anchor(&c, "/sys", "sysfs-root", SYSFS_MAGIC, c.sys_calls, &c.sys_owned);
@@ -1902,20 +2122,21 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
    * sample. Each repeated item retains the original finite read allowance. */
   p3_read journal_after = p3_kernel_read(&c, health_fd, "journal_task", 4096, SYSFS_MAGIC);
   p3_sample ioprio_after = p3_ioprio_fact(&c, &journal_after, true);
-  napi_value ioprio_value = p3_sample_join(&c, &ioprio, &ioprio_after);
+  napi_value ioprio_value = p3_sample_join(&c, &ioprio, &ioprio_after, "configuration.journalIoprio");
   if (journal_before.ok && journal_after.ok && (journal_before.length != journal_after.length ||
-      (journal_before.length && memcmp(journal_before.bytes, journal_after.bytes, journal_before.length)))) p3_changed(&c);
+      (journal_before.length && memcmp(journal_before.bytes, journal_after.bytes, journal_before.length))))
+    p3_note_raw(&c, "configuration.journalTask", journal_before.bytes, journal_before.length, journal_after.bytes, journal_after.length);
   p3_sample tune_after = p3_tune_fact(&c, ext4 ? carrier : -1, true);
-  napi_value tune_value = p3_sample_join(&c, &tune, &tune_after);
-  p3_kernel_after(&c, &options, proc_fd, "options", 16384, PROC_SUPER_MAGIC);
-  p3_kernel_after(&c, &mb_groups, proc_fd, "mb_groups", 16384, PROC_SUPER_MAGIC);
-  p3_kernel_after(&c, &mb_structs_summary, proc_fd, "mb_structs_summary", 16384, PROC_SUPER_MAGIC);
+  napi_value tune_value = p3_sample_join(&c, &tune, &tune_after, "configuration.tune");
+  p3_kernel_after(&c, &options, proc_fd, "options", 16384, PROC_SUPER_MAGIC, "configuration.options");
+  p3_kernel_after(&c, &mb_groups, proc_fd, "mb_groups", 16384, PROC_SUPER_MAGIC, "configuration.mbGroups");
+  p3_kernel_after(&c, &mb_structs_summary, proc_fd, "mb_structs_summary", 16384, PROC_SUPER_MAGIC, "configuration.mbStructsSummary");
   p3_sample legacy_after = p3_statx_fact(&c, owner->fd, &before, false, &legacy_after_raw, &legacy_after_available, true);
   p3_sample unique_after = p3_statx_fact(&c, owner->fd, &before, true, &unique_after_raw, &unique_after_available, true);
   p3_sample mount_after = p3_statmount_fact(&c, &unique_after_raw, unique_after_available, true);
-  napi_value legacy_value = p3_sample_join(&c, &legacy, &legacy_after);
-  napi_value unique_value = p3_sample_join(&c, &unique, &unique_after);
-  napi_value mount_value = p3_sample_join(&c, &mount, &mount_after);
+  napi_value legacy_value = p3_sample_join(&c, &legacy, &legacy_after, "mount.legacyStatx");
+  napi_value unique_value = p3_sample_join(&c, &unique, &unique_after, "mount.uniqueStatx");
+  napi_value mount_value = p3_sample_join(&c, &mount, &mount_after, "mount.statmount");
   p3_block_after(&c, &block_size, block_base, P3_M04_SIZE);
   p3_block_after(&c, &block_ro, block_base, P3_M04_RO);
   p3_block_after(&c, &block_diskseq, block_base, P3_M04_DISKSEQ);
@@ -1940,7 +2161,13 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
   for (unsigned i = 0; namespaces_stable && i < 3; i++)
     if (!p3_same_identity(&namespace_before.st[i], &namespace_after.st[i]) || namespace_before.fs[i].f_type != namespace_after.fs[i].f_type ||
         namespace_before.size[i] != namespace_after.size[i] || memcmp(namespace_before.raw[i], namespace_after.raw[i], namespace_before.size[i])) {
-      namespaces_stable = false; p3_changed(&c);
+      namespaces_stable = false;
+      if (p3_change_start(&c, "process.namespaces")) {
+        p3_change_field(&c, i == 0 ? "pid" : i == 1 ? "mount" : "user");
+        p3_metadata_fields(&c, &namespace_before.st[i], &namespace_after.st[i], &namespace_before.fs[i], &namespace_after.fs[i]);
+        p3_change_raw(&c, false, namespace_before.raw[i], namespace_before.size[i]);
+        p3_change_raw(&c, true, namespace_after.raw[i], namespace_after.size[i]);
+      }
     }
   napi_value namespaces_value = p3_fact(&c, namespace_calls, namespaces_stable ? namespace_value : NULL, namespaces_stable ? NULL : "binding");
   napi_value identity_value = p3_identity_after(&c, &credentials);
@@ -1951,9 +2178,18 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
   const bool carrier_after_ok = p3_source_metadata(&c, carrier, carrier_directory, true, true,
     carrier_calls, &carrier_after, &carrier_fs_after, &metadata_error);
   if (owner->tail && (!carrier_after_ok || !mount_pair(carrier, &carrier_after, &carrier_legacy_after, &carrier_unique_after) ||
-      carrier_legacy_before != carrier_legacy_after || carrier_unique_before != carrier_unique_after)) p3_changed(&c);
+      carrier_legacy_before != carrier_legacy_after || carrier_unique_before != carrier_unique_after)) {
+    if (p3_change_start(&c, "tail.carrier.mount")) {
+      if (carrier_legacy_before != carrier_legacy_after) p3_change_field(&c, "legacyMountId");
+      if (carrier_unique_before != carrier_unique_after) p3_change_field(&c, "uniqueMountId");
+    }
+  }
   if (source_after_ok && carrier_after_ok && (!same_metadata(&before, &after) || fs_before.f_type != fs_after.f_type ||
-      !same_metadata(&carrier_before, &carrier_after) || carrier_fs.f_type != carrier_fs_after.f_type)) p3_changed(&c);
+      !same_metadata(&carrier_before, &carrier_after) || carrier_fs.f_type != carrier_fs_after.f_type)) {
+    if (!same_metadata(&before, &after) || fs_before.f_type != fs_after.f_type)
+      p3_note_metadata(&c, "source.metadata", &before, &after, &fs_before, &fs_after);
+    else p3_note_metadata(&c, "carrier.metadata", &carrier_before, &carrier_after, &carrier_fs, &carrier_fs_after);
+  }
   if (c.changed || c.close_failed_at || !source_after_ok || !carrier_after_ok || c.failed) {
     p3_free_graph(graph);
     const bool first_change = c.changed && (!c.close_failed_at || c.changed_at < c.close_failed_at);

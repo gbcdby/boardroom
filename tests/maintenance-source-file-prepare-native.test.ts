@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir, constants as osConstants } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -24,7 +24,7 @@ interface Binding {
   rootInfo(owner: object): any;
 }
 
-linuxTest("CFP2 actual ordinary R/V sync and close settle while the event loop remains available", async () => {
+linuxTest("CFP2 actual ordinary R/V sync and close settle while the event loop remains available", async t => {
   const built = spawnSync(process.execPath, ["scripts/build-maintenance-platform.mjs", "--source-files"],
     { cwd: root, encoding: "utf8", timeout: 65_000 });
   assert.equal(built.status, 0, built.stderr);
@@ -65,7 +65,39 @@ linuxTest("CFP2 actual ordinary R/V sync and close settle while the event loop r
     native.transferCarrier(metadata, parent); owners.delete(parent);
     assert.throws(() => native.rootInfo(parent), { code: "ERR_SOURCE_HANDLE" });
     assert.throws(() => native.close(parent), { code: "ERR_SOURCE_HANDLE" });
-    const tail = native.observeEnvironment(metadata);
+    let tail: any;
+    try { tail = native.observeEnvironment(metadata); }
+    catch (error: any) {
+      const calls = Array.isArray(error?.cleanupCalls) ? error.cleanupCalls.map((call: any) => ({
+        operation: call.operation,
+        ...(typeof call.operation === "string" && call.operation.startsWith("open-") ? {
+          outcome: call.rc === null ? "not-run" : call.rc < 0n ? "error" : "success",
+        } : { rc: call.rc }),
+        errno: call.errno,
+      })) : [];
+      t.diagnostic("CFP2_SOURCE_ENVIRONMENT_REJECT " + JSON.stringify({
+        code: error?.code, syscall: error?.syscall, errno: error?.errno, rc: error?.rc,
+        changeOperation: error?.changeOperation, changeFields: error?.changeFields, changeRaw: error?.changeRaw,
+        cleanupCalls: calls,
+      }, (_key, value) => typeof value === "bigint" ? String(value) : value));
+      assert.equal(error?.code, "ERR_SOURCE_IDENTITY");
+      assert.ok(["environment-source-before", "tail-carrier-mount-before", "environment-changed"].includes(error.syscall));
+      assert.equal(error.errno, osConstants.errno.ESTALE);
+      assert.equal(error.rc, -1);
+      assert.match(error.changeOperation, /^[a-z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+)*$/);
+      assert.ok(Array.isArray(error.changeFields) && error.changeFields.every((field: any) => typeof field === "string"));
+      if (error.changeRaw !== null) {
+        for (const side of ["before", "after"] as const) {
+          const digests = error.changeRaw[side];
+          assert.ok(digests === null || Array.isArray(digests));
+          for (const digest of digests ?? []) {
+            assert.equal(typeof digest.byteLength, "bigint");
+            assert.match(digest.sha256, /^[a-f0-9]{64}$/);
+          }
+        }
+      }
+      throw error;
+    }
     assert.equal(tail.abiVersion, 3);
     assert.equal(tail.source.filesystemCarrier.role, "tail-carrier");
     assert.deepEqual(tail.source.filesystemCarrier.mount.before, tail.source.filesystemCarrier.mount.after);

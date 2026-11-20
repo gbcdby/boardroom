@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { closeSync, constants, fstatSync, openSync, readSync, readdirSync } from "node:fs";
 import { chmod, cp, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
@@ -810,7 +811,19 @@ for (const variant of ["P3_TEST_MB_RAW_CHANGE", "P3_TEST_MB_BAD_CHANGE", "P3_TES
         try { api.observeSourceFileRootContext(handle); assert.fail("the actual fixed leaf or directory changed"); }
         catch (error: any) {
           first = error; assert.equal(error.code, "ERR_SOURCE_IDENTITY"); assert.equal(error.syscall, "environment-changed");
-          assert.equal(error.errno, osConstants.errno.ESTALE);
+          assert.equal(error.errno, osConstants.errno.ESTALE); assert.equal(error.rc, -1);
+          assert.equal(error.changeOperation, variant === "P3_TEST_MB_PROC_CHANGE" ? "configuration.procDirectory" : "configuration.mbStructsSummary");
+          if (variant !== "P3_TEST_MB_PROC_CHANGE") {
+            const expectedField = variant === "P3_TEST_MB_IDENTITY_CHANGE" ? "inode"
+              : variant === "P3_TEST_MB_APPEAR" || variant === "P3_TEST_MB_DISAPPEAR" ? "presence" : "raw";
+            assert.ok(error.changeFields.includes(expectedField));
+            const before = Buffer.from(mbSummaryFixture());
+            const after = Buffer.from(before);
+            if (variant !== "P3_TEST_MB_IDENTITY_CHANGE") after[15] = variant === "P3_TEST_MB_BAD_CHANGE" ? 50 : 49;
+            const expected = (value: Buffer) => ({ byteLength: BigInt(value.length), sha256: createHash("sha256").update(value).digest("hex") });
+            assert.deepEqual(error.changeRaw.before, variant === "P3_TEST_MB_APPEAR" ? null : [expected(before)]);
+            assert.deepEqual(error.changeRaw.after, variant === "P3_TEST_MB_DISAPPEAR" ? null : [expected(after)]);
+          }
           assert.ok(error.cleanupCalls.some((call: SourceFileNativeCall) => call.operation === "close-ext4-proc-directory" && call.rc === 0n));
         }
         assert.throws(() => handle.observe(), { code: "maintenance_lost" });
@@ -1048,7 +1061,11 @@ linuxTest(`#152 P3 fixed source change remains sticky even when the caller catch
     await assert.rejects(api.withNativeSourceRoot(source, handle => {
       const initial = readdirSync("/proc/self/fd").length;
       try { api.observeSourceFileRootContext(handle); assert.fail("fixed source observation must change"); }
-      catch (error) { first = error; assert.equal(first.code, "ERR_SOURCE_IDENTITY"); assert.equal(first.syscall, "environment-changed"); }
+      catch (error) {
+        first = error; assert.equal(first.code, "ERR_SOURCE_IDENTITY"); assert.equal(first.syscall, "environment-changed");
+        assert.equal(first.rc, -1); assert.equal(first.changeOperation, "source.metadata"); assert.deepEqual(first.changeFields, ["size"]);
+        assert.equal(first.changeRaw, null);
+      }
       assert.equal(readdirSync("/proc/self/fd").length, initial, "every new known auxiliary owner is closed before failure escapes");
       assert.throws(() => native.rootInfo(first.nativeCleanupOwner));
       assert.throws(() => handle.observe(), { code: "maintenance_lost" });
