@@ -1,5 +1,5 @@
 /**
- * 已接受 SQ-D01 的内部固定数据。资格见 SQLITE_PROFILE_RULE_SOURCE。
+ * 已接受 SQ-D01 与 SRC-D01 R2 增补的内部固定数据。资格见 SQLITE_PROFILE_RULE_SOURCE。
  * 70 张通用 guard 表包含迁移账本，不是 70 张可复制/清除的业务表。
  * 目录和 operationEligibility 不授予权限，也不是可注册/执行的程序表。
  * 仅在 module 初始化时构造固定大小数据；不读取请求、文件或数据库。
@@ -60,14 +60,36 @@ export const SQLITE_PROFILE_RULE_SOURCE = freezeSource({
   "contract": "m2-g1-sqlite-rules-component/v1",
   "qualification": "inert-fixed-source; not-admission",
   "acceptedDesign": "https://github.com/gbcdby/boardroom/issues/153#issuecomment-7024732935",
+  "acceptedAmendments": [
+    {
+      "contract": "BR-COLLAB-S2-T2-M2-SRC-D01-20261120-R2",
+      "acceptedDesign": "https://github.com/gbcdby/boardroom/issues/153#issuecomment-7026021337",
+      "parentMatrix": {
+        "bytes": 208994,
+        "sha256": "f2816e3ea8cc23420c7064cb5025aefd8e52ffca46ef4da49f246a558fddabb6"
+      },
+      "baseDesignFreeze": {
+        "bytes": 4838,
+        "sha256": "7d12c4b94ae5ec644ad9e2cbee52ef4f5c4f9a2e553eed595d2beeddd46882a4"
+      },
+      "amendmentFreeze": {
+        "bytes": 2006,
+        "sha256": "bc2af842332a54553d636d5948b97b8eef6ad8fa4a2fe17b8f50bfe12e2c11b3"
+      },
+      "reviewFreeze": {
+        "bytes": 1747,
+        "sha256": "04c0607e01bde2c9545d65be11b3e022d1d17955d3049f5a6238646bc754841c"
+      }
+    }
+  ],
   "basis": {
     "policy": {
       "bytes": 2230,
       "sha256": "68af0e285c1030b8d456b733e4b99c5889a028edff199bec2c35a8dcbb07e201"
     },
     "matrix": {
-      "bytes": 208994,
-      "sha256": "f2816e3ea8cc23420c7064cb5025aefd8e52ffca46ef4da49f246a558fddabb6"
+      "bytes": 209374,
+      "sha256": "7485efee85b7c56093f3685c0465e1104a3b972ce8d581774a7a193441b85c38"
     },
     "structureCatalog": {
       "bytes": 253222,
@@ -183,7 +205,8 @@ const OPERATIONS = freezeSource([
   {
     "insert": [
       "CFG-01",
-      "A"
+      "A",
+      "SRC-01 exact full-source replacement with own target authority"
     ],
     "update": [],
     "delete": [
@@ -290,7 +313,8 @@ const OPERATIONS = freezeSource([
   {
     "insert": [
       "LIFE-01",
-      "A"
+      "A",
+      "SRC-01 exact full-source replacement with own target authority"
     ],
     "update": [],
     "delete": [
@@ -301,7 +325,8 @@ const OPERATIONS = freezeSource([
   {
     "insert": [
       "CFG-01/LIFE-01/LIFE-02 (only where original keyed contract applies)",
-      "A"
+      "A",
+      "SRC-01 exact full-source replacement with own target authority"
     ],
     "update": [],
     "delete": [
@@ -323,7 +348,8 @@ const OPERATIONS = freezeSource([
   {
     "insert": [
       "MAP-01",
-      "A"
+      "A",
+      "SRC-01 exact full-source replacement with own target authority"
     ],
     "update": [],
     "delete": [
@@ -334,7 +360,8 @@ const OPERATIONS = freezeSource([
   {
     "insert": [
       "CFG-01/LIFE-01/LIFE-02",
-      "A"
+      "A",
+      "SRC-01 exact full-source replacement with own target authority"
     ],
     "update": [],
     "delete": [

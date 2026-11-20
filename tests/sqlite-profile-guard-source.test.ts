@@ -105,14 +105,24 @@ function mechanism(seeds: readonly Seed[] = [], controlOverrides: Image | null =
 }
 
 test("SQ source: complete accepted matrix, column catalog and non-G0 sources retain their independent digests", () => {
-  // 期望来自实施前固定的已接受原件投影，不由产品实现或 SQL 返回值生成。
+  // 期望来自已接受 SQ-D01 + SRC-D01 R2 原件，不由产品实现或 SQL 返回值生成。
   const matrix = SQLITE_PROFILE_TABLE_RULES.map(rule => ({
     table: rule.table, columnCount: rule.columns.length, primaryKey: rule.primaryKey,
     guardOwner: rule.guardOwner, owner: rule.owner, operationEligibility: rule.operationEligibility,
     columns: rule.columns.map(column => ({ column: column.name, rule: column.rule })),
     originalRule: rule.originalRule, qualification: rule.qualification,
   }));
-  assert.equal(hash(canonical(matrix)), "97d6b19b6aba0f3813879ee83f0cb1e8ea8816b63a0c41a3f6bcff7eddd55ddc");
+  assert.equal(hash(canonical(matrix)), "b019a09f05a649bf7a38618829160360c1e200b2509d34f5e97b35ac4ebca89f");
+  const sourceReplacement = "SRC-01 exact full-source replacement with own target authority";
+  assert.deepEqual(matrix.filter(row => row.operationEligibility.insert.includes(sourceReplacement)).map(row => row.table),
+    ["agent_profile_versions", "config_detach_snapshots", "config_mutation_receipts", "config_workspace_mappings", "group_binding_config_versions"]);
+  // 移除仅这五项增补后，整个旧矩阵（含 UPDATE/DELETE/列策略）仍逐值相等。
+  const originalMatrix = matrix.map(row => ({ ...row, operationEligibility: {
+    ...row.operationEligibility, insert: row.operationEligibility.insert.filter(item => item !== sourceReplacement),
+  } }));
+  assert.equal(hash(canonical(originalMatrix)), "97d6b19b6aba0f3813879ee83f0cb1e8ea8816b63a0c41a3f6bcff7eddd55ddc");
+  assert.equal(SQLITE_PROFILE_RULE_SOURCE.basis.matrix.bytes, 209374);
+  assert.equal(SQLITE_PROFILE_RULE_SOURCE.basis.matrix.sha256, "7485efee85b7c56093f3685c0465e1104a3b972ce8d581774a7a193441b85c38");
   const catalog = SQLITE_PROFILE_TABLE_RULES.map(rule => ({
     name: rule.table,
     columns: rule.columns.map(({ rule: _rule, ...column }) => column),
