@@ -223,6 +223,19 @@ export function observeDisplaySyntax(text: string, r: AuditRequest): JsonKind | 
   // root object -> raw-cell array -> hex TEXT -> expanded JSON root.
   return scan(text, false, 3, r);
 }
+/** Strict nested JSON on the enclosing request. This does not start a second boundary. */
+export function parseAuditJsonText(text: string, r: AuditRequest): unknown {
+  r.require(typeof text === "string", "unsupported_shape");
+  if (text.length > AUDIT_LIMITS.input) r.fail("resource_limit");
+  const bytes = r.utf8Bytes(text);
+  if (bytes > AUDIT_LIMITS.input) r.fail("resource_limit");
+  // Token slices, decoded strings, scanner reads and the final parsed copy.
+  r.text(bytes, 7);
+  // Each document has its own syntactic root. Reference-graph depth is a separate
+  // upper-layer invariant; all node/text/work charges still belong to this r.
+  if (scan(text, true, 0, r) === null) r.fail();
+  return JSON.parse(text);
+}
 export function record(value: unknown, keys: readonly string[], r: AuditRequest): Record<string, unknown> {
   r.units(1);
   r.require(value !== null && typeof value === "object" && !Array.isArray(value), "unsupported_shape");

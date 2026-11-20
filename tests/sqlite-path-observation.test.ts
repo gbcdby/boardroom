@@ -33,7 +33,8 @@ function sample(source: string): void {
 function derive(directory: string, t: TestContext, name: string, transform: (source: string) => string): string {
   const original = readFileSync(path.join(root, "src/server/storage/internal/sqlite-path-observation.ts"), "utf8");
   let source = original.replace('const root = realpathSync(fileURLToPath(new URL("../../../../", import.meta.url)));', "const root = " + JSON.stringify(root) + ";")
-    .replace('from "../../environment.ts";', "from " + JSON.stringify(pathToFileURL(path.join(root, "src/server/environment.ts")).href) + ";");
+    .replace(/from "(\.{1,2}\/[^\"]+)";/g, (_match, relative: string) => "from "
+      + JSON.stringify(pathToFileURL(path.resolve(root, "src/server/storage/internal", relative)).href) + ";");
   assert.notEqual(source, original);
   source = transform(source);
   source += "\nexport function __privateObservation() { return [...pendingOwners].map(s => ({ dbPhase:s.dbPhase, dbOpen:s.db?.open, files:s.files.map(f=>f.phase), fileOpen:s.files.map(f=>{try{fstatSync(f.fd);return true}catch{return false}}), failures:s.failures.map(f=>f.phase) })); }\n";
