@@ -595,6 +595,56 @@ class PgNativeEntryContracts(unittest.TestCase):
                 ci.verify_pg_tools(copied, receipt)
             self.assertEqual((root / 'usr/share/postgresql/16/postgres.bki').read_bytes(), b'owned fixture schema\n')
 
+    def test_private_package_dangling_internal_links_are_preserved_without_materializing_targets(self):
+        # The actual PG16.15 pair contains documentation links into a common
+        # package that is deliberately not installed in this private tree.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); temporary = base / 'runner'; temporary.mkdir()
+            root = temporary / 'boardroom-pg16-restart-tools.fixture'
+            binary = self.fixture(root)
+            docs = root / 'usr/share/doc'; docs.mkdir()
+            (docs / 'postgresql-client-16').symlink_to('postgresql-common')
+            (docs / 'postgresql-16').mkdir()
+            (docs / 'postgresql-16/README.Debian.gz').symlink_to('../postgresql-common/README.Debian.gz')
+            before = ci.pg_tools_snapshot(root)
+            archive = base / 'pg-tools.tar'
+            receipt = ci.archive_pg_tools(binary, temporary, archive)
+            destination = base / 'workspace'; destination.mkdir()
+            ci.extract_pg_tools(archive, destination, receipt)
+            copied = destination / 'ci-pg16-tools'
+            self.assertEqual(before, ci.pg_tools_snapshot(copied))
+            self.assertEqual(os.readlink(copied / 'usr/share/doc/postgresql-client-16'), 'postgresql-common')
+            self.assertEqual(os.readlink(copied / 'usr/share/doc/postgresql-16/README.Debian.gz'),
+                             '../postgresql-common/README.Debian.gz')
+            self.assertFalse((copied / 'usr/share/doc/postgresql-common').exists())
+            self.assertEqual(ci.verify_pg_tools(copied, receipt), receipt)
+            (copied / 'usr/share/doc/postgresql-common').mkdir()
+            with self.assertRaises(ci.IsolationError):
+                ci.verify_pg_tools(copied, receipt)
+
+    def test_dangling_internal_resolution_does_not_allow_escape_cycles_or_missing_programs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); root = base / 'boardroom-pg16-restart-tools.fixture'
+            binary = self.fixture(root)
+            candidate = root / 'dangling'
+            for target in ('../outside-missing', str(base / 'absolute-missing')):
+                candidate.symlink_to(target)
+                with self.assertRaises(ci.IsolationError):
+                    ci.pg_tools_snapshot(root)
+                candidate.unlink()
+            candidate.symlink_to('second')
+            (root / 'second').symlink_to('../outside-missing')
+            with self.assertRaises(ci.IsolationError):
+                ci.pg_tools_snapshot(root)
+            (root / 'second').unlink(); candidate.unlink()
+            candidate.symlink_to('second'); (root / 'second').symlink_to('dangling')
+            with self.assertRaises((RuntimeError, OSError, ci.IsolationError)):
+                ci.pg_tools_snapshot(root)
+            (root / 'second').unlink(); candidate.unlink()
+            (binary / 'postgres').unlink(); (binary / 'postgres').symlink_to('missing-postgres')
+            with self.assertRaises((OSError, ci.IsolationError)):
+                ci.pg_tools_receipt(root)
+
     def test_transport_rejects_unowned_location_external_link_special_file_and_version_substitution(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

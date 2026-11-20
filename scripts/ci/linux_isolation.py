@@ -170,8 +170,18 @@ def pg_tools_snapshot(root, owner=None, deadline=None):
             row.update(kind='file', bytes=info.st_size, sha256=digest(path))
         elif stat.S_ISLNK(info.st_mode):
             target = os.readlink(path)
-            if Path(target).is_absolute() or not path.resolve(strict=True).is_relative_to(root):
+            # Preserve the package's exact internal link even when its optional
+            # target is absent (for example a separate documentation package).
+            # Resolve existing link chains to enforce containment; do not copy
+            # a host target, invent missing bytes or omit any package member.
+            # The six executables and required share/library paths remain strict
+            # in pg_tools_receipt and in the actual child bootstrap below.
+            if Path(target).is_absolute() or not path.resolve(strict=False).is_relative_to(root):
                 raise IsolationError('Private PG tree has an external symbolic link')
+            try:
+                path.stat()  # ELOOP/access errors still fail; only absence is permitted.
+            except FileNotFoundError:
+                pass
             row.update(kind='symlink', target=target)
         else:
             raise IsolationError('Private PG tree contains a special or shared file')
