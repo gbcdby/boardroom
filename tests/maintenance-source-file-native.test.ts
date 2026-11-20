@@ -425,6 +425,12 @@ test("#152 summary second sample may change length but never exceeds the origina
       "the second sample cannot claim limit+1 bytes in total");
     assert.throws(() => decode(changed, 4096, 2), { code: "backup_capability_unavailable" },
       "ordinary two-sample facts still require equal byte lengths");
+    const budget = kernelReadFixture() as any;
+    budget.status = "unavailable"; budget.reason = "budget"; budget.value = null;
+    budget.calls[3].rc = 4097n; budget.calls[4].rc = 0n;
+    const failure = decode(budget, 4096);
+    assert.equal(failure.status, "unavailable"); assert.equal(failure.reason, "budget");
+    assert.equal(failure.calls[3]!.rc, 4097n, "an actual limit+1 attempt stays a structured budget failure");
   });
 });
 

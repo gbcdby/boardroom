@@ -462,10 +462,9 @@ function checkedReadFact(value: unknown, limit: number, samples: 1 | 2, template
     // The first phase's common value is the retained observation bytes. A
     // specifically permitted second phase may observe a different byte length,
     // but every phase remains independently bounded by the original limit.
-    if (total > BigInt(limit)) throw invalidContext();
     const retainedLength = fact.status === "observed" ? BigInt(fact.value.bytes.length) : null;
     const lengthMatches = phase === 0 || allowChangedLength ? true : total === retainedLength;
-    if (fact.status === "observed" && (readCalls.at(-1)!.rc !== 0n
+    if (fact.status === "observed" && (total > BigInt(limit) || readCalls.at(-1)!.rc !== 0n
       || readCalls.slice(0, -1).some(call => call.rc === null || call.rc <= 0n)
       || close.rc !== 0n || (phase === 0 && total !== retainedLength) || !lengthMatches)) throw invalidContext();
   });
