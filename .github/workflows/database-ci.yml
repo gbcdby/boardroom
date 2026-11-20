@@ -251,6 +251,7 @@ jobs:
         run: |
           python3 -B tests/whole-brd-f3.test.py
           python3 -B tests/whole-brd-f3-dm.test.py
+          python3 -B tests/whole-brd-f4-cfp2.test.py
 
       - name: 准备 Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
