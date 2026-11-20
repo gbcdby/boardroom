@@ -1,0 +1,3249 @@
+{
+  "columns": {
+    "agent_profile_versions": [
+      {
+        "ordinal": 1,
+        "name": "agent_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 1,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 2,
+        "name": "revision",
+        "declaredType": "BIGINT",
+        "nullable": false,
+        "primaryKeyOrdinal": 2,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 3,
+        "name": "content_json",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 4,
+        "name": "content_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 5,
+        "name": "default_role_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 6,
+        "name": "default_role_revision",
+        "declaredType": "INTEGER",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int4",
+        "pgOid": "23",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 7,
+        "name": "compat_runtime_revision",
+        "declaredType": "BIGINT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      }
+    ],
+    "agent_profiles": [
+      {
+        "ordinal": 1,
+        "name": "agent_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 1,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 2,
+        "name": "current_revision",
+        "declaredType": "BIGINT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 3,
+        "name": "legacy_runtime_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 4,
+        "name": "compat_runtime_revision",
+        "declaredType": "BIGINT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      }
+    ],
+    "agent_runner_states": [
+      {
+        "ordinal": 23,
+        "name": "applied_config_snapshot_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": null,
+        "pgOid": "25",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 24,
+        "name": "applied_workspace_mapping_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": null,
+        "pgOid": "25",
+        "pgCollation": null
+      }
+    ],
+    "agent_runtime_bindings": [
+      {
+        "ordinal": 15,
+        "name": "group_binding_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": null,
+        "pgOid": "25",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 16,
+        "name": "attachment_state",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": null,
+        "pgOid": "25",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 17,
+        "name": "detach_config_snapshot_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": null,
+        "pgOid": "25",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 18,
+        "name": "detached_at",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": null,
+        "pgOid": "25",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 19,
+        "name": "requested_config_snapshot_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": null,
+        "pgOid": "25",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 20,
+        "name": "requested_workspace_mapping_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": null,
+        "pgOid": "25",
+        "pgCollation": null
+      }
+    ],
+    "config_activation_receipts": [
+      {
+        "ordinal": 1,
+        "name": "id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 1,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 2,
+        "name": "request_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 3,
+        "name": "plan_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 4,
+        "name": "plan_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 5,
+        "name": "physical_source_ref",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 6,
+        "name": "snapshot_receipt_ref",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 7,
+        "name": "capture_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 8,
+        "name": "capture_source_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 9,
+        "name": "capture_artifact_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 10,
+        "name": "schema_before_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 11,
+        "name": "schema_after_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 12,
+        "name": "guard_transition_json",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 13,
+        "name": "allowed_delta_ref",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 14,
+        "name": "target_rows_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 15,
+        "name": "source_to_target_manifest_ref",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 16,
+        "name": "payload_json",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 17,
+        "name": "payload_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      }
+    ],
+    "config_authority": [
+      {
+        "ordinal": 1,
+        "name": "singleton",
+        "declaredType": "INTEGER",
+        "nullable": false,
+        "primaryKeyOrdinal": 1,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int4",
+        "pgOid": "23",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 2,
+        "name": "format_version",
+        "declaredType": "INTEGER",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int4",
+        "pgOid": "23",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 3,
+        "name": "owner",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 4,
+        "name": "activation_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 5,
+        "name": "source_binding_ref",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      }
+    ],
+    "config_detach_snapshots": [
+      {
+        "ordinal": 1,
+        "name": "id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 1,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 2,
+        "name": "execution_binding_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 3,
+        "name": "group_binding_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 4,
+        "name": "runtime_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 5,
+        "name": "profile_agent_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 6,
+        "name": "profile_revision",
+        "declaredType": "BIGINT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 7,
+        "name": "profile_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 8,
+        "name": "binding_revision",
+        "declaredType": "BIGINT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 9,
+        "name": "binding_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 10,
+        "name": "resolution_json",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 11,
+        "name": "root_source_json",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 12,
+        "name": "current_advanced_view_json",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 13,
+        "name": "requested_source_json",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 14,
+        "name": "applied_source_json",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 15,
+        "name": "observed_at",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 16,
+        "name": "content_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 17,
+        "name": "requested_snapshot_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 18,
+        "name": "requested_snapshot_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 19,
+        "name": "requested_mapping_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 20,
+        "name": "requested_mapping_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 21,
+        "name": "applied_snapshot_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 22,
+        "name": "applied_snapshot_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 23,
+        "name": "applied_mapping_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 24,
+        "name": "applied_mapping_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 25,
+        "name": "root_workspace_project_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 26,
+        "name": "root_workspace_revision",
+        "declaredType": "INTEGER",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int4",
+        "pgOid": "23",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 27,
+        "name": "root_mapping_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 28,
+        "name": "root_mapping_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      }
+    ],
+    "config_mutation_receipts": [
+      {
+        "ordinal": 1,
+        "name": "actor_scope",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 1,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 2,
+        "name": "operation",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 2,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 3,
+        "name": "target_scope",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 3,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 4,
+        "name": "mutation_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 4,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 5,
+        "name": "command_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 6,
+        "name": "result_json",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 7,
+        "name": "result_profile_agent_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 8,
+        "name": "result_profile_revision",
+        "declaredType": "BIGINT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 9,
+        "name": "result_profile_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 10,
+        "name": "result_binding_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 11,
+        "name": "result_binding_revision",
+        "declaredType": "BIGINT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 12,
+        "name": "result_binding_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 13,
+        "name": "audit_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      }
+    ],
+    "config_snapshots": [
+      {
+        "ordinal": 1,
+        "name": "id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 1,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 2,
+        "name": "agent_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 3,
+        "name": "group_binding_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 4,
+        "name": "execution_binding_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 5,
+        "name": "project_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 6,
+        "name": "member_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 7,
+        "name": "group_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 8,
+        "name": "origin_kind",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 9,
+        "name": "content_json",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 10,
+        "name": "content_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 11,
+        "name": "semantic_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 12,
+        "name": "capture_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 13,
+        "name": "capture_source_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 14,
+        "name": "capture_artifact_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 15,
+        "name": "profile_revision",
+        "declaredType": "BIGINT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 16,
+        "name": "profile_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 17,
+        "name": "binding_revision",
+        "declaredType": "BIGINT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 18,
+        "name": "binding_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      }
+    ],
+    "config_workspace_mappings": [
+      {
+        "ordinal": 1,
+        "name": "id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 1,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 2,
+        "name": "snapshot_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 3,
+        "name": "snapshot_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 4,
+        "name": "project_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 5,
+        "name": "workspace_revision",
+        "declaredType": "INTEGER",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int4",
+        "pgOid": "23",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 6,
+        "name": "original_workdir",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 7,
+        "name": "canonical_root",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 8,
+        "name": "root_identity_json",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 9,
+        "name": "physical_resource_key",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 10,
+        "name": "observed_at",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 11,
+        "name": "content_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      }
+    ],
+    "group_binding_config_versions": [
+      {
+        "ordinal": 1,
+        "name": "binding_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 1,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 2,
+        "name": "revision",
+        "declaredType": "BIGINT",
+        "nullable": false,
+        "primaryKeyOrdinal": 2,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 3,
+        "name": "content_json",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 4,
+        "name": "content_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 5,
+        "name": "role_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 6,
+        "name": "role_revision",
+        "declaredType": "INTEGER",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int4",
+        "pgOid": "23",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 7,
+        "name": "compat_execution_binding_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 8,
+        "name": "compat_binding_revision",
+        "declaredType": "BIGINT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 9,
+        "name": "advanced_state",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 10,
+        "name": "advanced_profile_agent_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 11,
+        "name": "advanced_profile_revision",
+        "declaredType": "BIGINT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 12,
+        "name": "advanced_profile_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 13,
+        "name": "advanced_capture_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 14,
+        "name": "advanced_capture_source_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 15,
+        "name": "advanced_capture_artifact_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 16,
+        "name": "advanced_workspace_project_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 17,
+        "name": "advanced_workspace_revision",
+        "declaredType": "INTEGER",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int4",
+        "pgOid": "23",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 18,
+        "name": "advanced_execution_binding_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      }
+    ],
+    "group_bindings": [
+      {
+        "ordinal": 1,
+        "name": "id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 1,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 2,
+        "name": "project_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 3,
+        "name": "group_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 4,
+        "name": "member_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 5,
+        "name": "agent_id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 6,
+        "name": "current_revision",
+        "declaredType": "BIGINT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 7,
+        "name": "original_legacy_binding_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 8,
+        "name": "current_attachment_id",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 9,
+        "name": "current_attachment_state",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 10,
+        "name": "current_compat_binding_revision",
+        "declaredType": "BIGINT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": "pg_catalog.int8",
+        "pgOid": "20",
+        "pgCollation": null
+      },
+      {
+        "ordinal": 11,
+        "name": "retired_at",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      }
+    ],
+    "legacy_config_captures": [
+      {
+        "ordinal": 1,
+        "name": "id",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 1,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 2,
+        "name": "physical_source_ref",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 3,
+        "name": "source_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 4,
+        "name": "artifact_digest",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 5,
+        "name": "capture_json",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      },
+      {
+        "ordinal": 6,
+        "name": "snapshot_receipt_ref",
+        "declaredType": "TEXT",
+        "nullable": false,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": "BINARY",
+        "pgType": "pg_catalog.text",
+        "pgOid": "25",
+        "pgCollation": "C"
+      }
+    ],
+    "storage_maintenance": [
+      {
+        "ordinal": 15,
+        "name": "profile_takeover_terminal_json",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": null,
+        "pgOid": "25",
+        "pgCollation": null
+      }
+    ],
+    "storage_source_clients": [
+      {
+        "ordinal": 17,
+        "name": "writer_format_digest",
+        "declaredType": "TEXT",
+        "nullable": true,
+        "primaryKeyOrdinal": 0,
+        "hidden": 0,
+        "generated": null,
+        "identity": null,
+        "defaultExpression": null,
+        "collation": null,
+        "pgType": null,
+        "pgOid": "25",
+        "pgCollation": null
+      }
+    ]
+  },
+  "keys": [
+    {
+      "table": "agent_profiles",
+      "primaryKey": [
+        "agent_id"
+      ],
+      "uniqueKeys": [
+        {
+          "name": "m2_r01_uq_legacy_runtime",
+          "columns": [
+            "legacy_runtime_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        }
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "agent_id"
+          ],
+          "targetTable": "agents",
+          "targetColumns": [
+            "id"
+          ]
+        },
+        {
+          "columns": [
+            "agent_id",
+            "current_revision"
+          ],
+          "targetTable": "agent_profile_versions",
+          "targetColumns": [
+            "agent_id",
+            "revision"
+          ]
+        },
+        {
+          "columns": [
+            "legacy_runtime_id"
+          ],
+          "targetTable": "agent_runtimes",
+          "targetColumns": [
+            "id"
+          ]
+        }
+      ],
+      "indexes": []
+    },
+    {
+      "table": "agent_profile_versions",
+      "primaryKey": [
+        "agent_id",
+        "revision"
+      ],
+      "uniqueKeys": [
+        {
+          "name": "m2_r02_uq_ref",
+          "columns": [
+            "agent_id",
+            "revision",
+            "content_digest"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r02_uq_compat",
+          "columns": [
+            "agent_id",
+            "compat_runtime_revision"
+          ],
+          "partial": false,
+          "deferrable": false
+        }
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "agent_id"
+          ],
+          "targetTable": "agent_profiles",
+          "targetColumns": [
+            "agent_id"
+          ]
+        },
+        {
+          "columns": [
+            "default_role_id",
+            "default_role_revision"
+          ],
+          "targetTable": "role_template_versions",
+          "targetColumns": [
+            "role_template_id",
+            "revision"
+          ]
+        }
+      ],
+      "indexes": []
+    },
+    {
+      "table": "group_bindings",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        {
+          "name": "m2_r03_uq_member_group",
+          "columns": [
+            "member_id",
+            "group_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r03_uq_original",
+          "columns": [
+            "original_legacy_binding_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r03_uq_attachment",
+          "columns": [
+            "current_attachment_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r03_uq_execution_scope",
+          "columns": [
+            "id",
+            "project_id",
+            "group_id",
+            "member_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r03_uq_full_scope",
+          "columns": [
+            "id",
+            "agent_id",
+            "project_id",
+            "group_id",
+            "member_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        }
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "agent_id"
+          ],
+          "targetTable": "agent_profiles",
+          "targetColumns": [
+            "agent_id"
+          ]
+        },
+        {
+          "columns": [
+            "project_id"
+          ],
+          "targetTable": "projects",
+          "targetColumns": [
+            "id"
+          ]
+        },
+        {
+          "columns": [
+            "group_id"
+          ],
+          "targetTable": "groups",
+          "targetColumns": [
+            "id"
+          ]
+        },
+        {
+          "columns": [
+            "member_id"
+          ],
+          "targetTable": "members",
+          "targetColumns": [
+            "id"
+          ]
+        },
+        {
+          "columns": [
+            "id",
+            "current_revision"
+          ],
+          "targetTable": "group_binding_config_versions",
+          "targetColumns": [
+            "binding_id",
+            "revision"
+          ]
+        },
+        {
+          "columns": [
+            "original_legacy_binding_id"
+          ],
+          "targetTable": "agent_runtime_bindings",
+          "targetColumns": [
+            "id"
+          ]
+        },
+        {
+          "columns": [
+            "current_attachment_id",
+            "id",
+            "current_attachment_state"
+          ],
+          "targetTable": "agent_runtime_bindings",
+          "targetColumns": [
+            "id",
+            "group_binding_id",
+            "attachment_state"
+          ]
+        }
+      ],
+      "indexes": []
+    },
+    {
+      "table": "group_binding_config_versions",
+      "primaryKey": [
+        "binding_id",
+        "revision"
+      ],
+      "uniqueKeys": [
+        {
+          "name": "m2_r04_uq_ref",
+          "columns": [
+            "binding_id",
+            "revision",
+            "content_digest"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r04_uq_compat",
+          "columns": [
+            "compat_execution_binding_id",
+            "compat_binding_revision"
+          ],
+          "partial": false,
+          "deferrable": false
+        }
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "binding_id"
+          ],
+          "targetTable": "group_bindings",
+          "targetColumns": [
+            "id"
+          ]
+        },
+        {
+          "columns": [
+            "role_id",
+            "role_revision"
+          ],
+          "targetTable": "role_template_versions",
+          "targetColumns": [
+            "role_template_id",
+            "revision"
+          ]
+        },
+        {
+          "columns": [
+            "compat_execution_binding_id",
+            "binding_id"
+          ],
+          "targetTable": "agent_runtime_bindings",
+          "targetColumns": [
+            "id",
+            "group_binding_id"
+          ]
+        },
+        {
+          "columns": [
+            "advanced_profile_agent_id",
+            "advanced_profile_revision",
+            "advanced_profile_digest"
+          ],
+          "targetTable": "agent_profile_versions",
+          "targetColumns": [
+            "agent_id",
+            "revision",
+            "content_digest"
+          ]
+        },
+        {
+          "columns": [
+            "advanced_capture_id",
+            "advanced_capture_source_digest",
+            "advanced_capture_artifact_digest"
+          ],
+          "targetTable": "legacy_config_captures",
+          "targetColumns": [
+            "id",
+            "source_digest",
+            "artifact_digest"
+          ]
+        },
+        {
+          "columns": [
+            "advanced_workspace_project_id",
+            "advanced_workspace_revision"
+          ],
+          "targetTable": "project_workspace_versions",
+          "targetColumns": [
+            "project_id",
+            "workspace_revision"
+          ]
+        },
+        {
+          "columns": [
+            "advanced_execution_binding_id",
+            "binding_id"
+          ],
+          "targetTable": "agent_runtime_bindings",
+          "targetColumns": [
+            "id",
+            "group_binding_id"
+          ]
+        }
+      ],
+      "indexes": []
+    },
+    {
+      "table": "legacy_config_captures",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        {
+          "name": "m2_r05_uq_ref",
+          "columns": [
+            "id",
+            "source_digest",
+            "artifact_digest"
+          ],
+          "partial": false,
+          "deferrable": false
+        }
+      ],
+      "foreignKeys": [],
+      "indexes": []
+    },
+    {
+      "table": "config_snapshots",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        {
+          "name": "m2_r06_uq_ref",
+          "columns": [
+            "id",
+            "content_digest"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r06_uq_execution",
+          "columns": [
+            "id",
+            "execution_binding_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r06_uq_scope",
+          "columns": [
+            "id",
+            "execution_binding_id",
+            "group_binding_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r06_uq_project",
+          "columns": [
+            "id",
+            "project_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        }
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "group_binding_id",
+            "agent_id",
+            "project_id",
+            "group_id",
+            "member_id"
+          ],
+          "targetTable": "group_bindings",
+          "targetColumns": [
+            "id",
+            "agent_id",
+            "project_id",
+            "group_id",
+            "member_id"
+          ]
+        },
+        {
+          "columns": [
+            "execution_binding_id",
+            "group_binding_id"
+          ],
+          "targetTable": "agent_runtime_bindings",
+          "targetColumns": [
+            "id",
+            "group_binding_id"
+          ]
+        },
+        {
+          "columns": [
+            "capture_id",
+            "capture_source_digest",
+            "capture_artifact_digest"
+          ],
+          "targetTable": "legacy_config_captures",
+          "targetColumns": [
+            "id",
+            "source_digest",
+            "artifact_digest"
+          ]
+        },
+        {
+          "columns": [
+            "agent_id",
+            "profile_revision",
+            "profile_digest"
+          ],
+          "targetTable": "agent_profile_versions",
+          "targetColumns": [
+            "agent_id",
+            "revision",
+            "content_digest"
+          ]
+        },
+        {
+          "columns": [
+            "group_binding_id",
+            "binding_revision",
+            "binding_digest"
+          ],
+          "targetTable": "group_binding_config_versions",
+          "targetColumns": [
+            "binding_id",
+            "revision",
+            "content_digest"
+          ]
+        }
+      ],
+      "indexes": []
+    },
+    {
+      "table": "config_detach_snapshots",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        {
+          "name": "m2_r07_uq_execution",
+          "columns": [
+            "execution_binding_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r07_uq_ref",
+          "columns": [
+            "id",
+            "content_digest"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r07_uq_scope",
+          "columns": [
+            "id",
+            "execution_binding_id",
+            "group_binding_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        }
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "execution_binding_id",
+            "group_binding_id",
+            "runtime_id"
+          ],
+          "targetTable": "agent_runtime_bindings",
+          "targetColumns": [
+            "id",
+            "group_binding_id",
+            "runtime_id"
+          ]
+        },
+        {
+          "columns": [
+            "profile_agent_id",
+            "profile_revision",
+            "profile_digest"
+          ],
+          "targetTable": "agent_profile_versions",
+          "targetColumns": [
+            "agent_id",
+            "revision",
+            "content_digest"
+          ]
+        },
+        {
+          "columns": [
+            "group_binding_id",
+            "binding_revision",
+            "binding_digest"
+          ],
+          "targetTable": "group_binding_config_versions",
+          "targetColumns": [
+            "binding_id",
+            "revision",
+            "content_digest"
+          ]
+        },
+        {
+          "columns": [
+            "requested_snapshot_id",
+            "requested_snapshot_digest"
+          ],
+          "targetTable": "config_snapshots",
+          "targetColumns": [
+            "id",
+            "content_digest"
+          ]
+        },
+        {
+          "columns": [
+            "requested_snapshot_id",
+            "execution_binding_id"
+          ],
+          "targetTable": "config_snapshots",
+          "targetColumns": [
+            "id",
+            "execution_binding_id"
+          ]
+        },
+        {
+          "columns": [
+            "requested_mapping_id",
+            "requested_mapping_digest"
+          ],
+          "targetTable": "config_workspace_mappings",
+          "targetColumns": [
+            "id",
+            "content_digest"
+          ]
+        },
+        {
+          "columns": [
+            "requested_mapping_id",
+            "requested_snapshot_id"
+          ],
+          "targetTable": "config_workspace_mappings",
+          "targetColumns": [
+            "id",
+            "snapshot_id"
+          ]
+        },
+        {
+          "columns": [
+            "applied_snapshot_id",
+            "applied_snapshot_digest"
+          ],
+          "targetTable": "config_snapshots",
+          "targetColumns": [
+            "id",
+            "content_digest"
+          ]
+        },
+        {
+          "columns": [
+            "applied_snapshot_id",
+            "execution_binding_id"
+          ],
+          "targetTable": "config_snapshots",
+          "targetColumns": [
+            "id",
+            "execution_binding_id"
+          ]
+        },
+        {
+          "columns": [
+            "applied_mapping_id",
+            "applied_mapping_digest"
+          ],
+          "targetTable": "config_workspace_mappings",
+          "targetColumns": [
+            "id",
+            "content_digest"
+          ]
+        },
+        {
+          "columns": [
+            "applied_mapping_id",
+            "applied_snapshot_id"
+          ],
+          "targetTable": "config_workspace_mappings",
+          "targetColumns": [
+            "id",
+            "snapshot_id"
+          ]
+        },
+        {
+          "columns": [
+            "root_workspace_project_id",
+            "root_workspace_revision"
+          ],
+          "targetTable": "project_workspace_versions",
+          "targetColumns": [
+            "project_id",
+            "workspace_revision"
+          ]
+        },
+        {
+          "columns": [
+            "root_mapping_id",
+            "root_mapping_digest"
+          ],
+          "targetTable": "config_workspace_mappings",
+          "targetColumns": [
+            "id",
+            "content_digest"
+          ]
+        }
+      ],
+      "indexes": []
+    },
+    {
+      "table": "config_workspace_mappings",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        {
+          "name": "m2_r08_uq_ref",
+          "columns": [
+            "id",
+            "content_digest"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r08_uq_snapshot",
+          "columns": [
+            "id",
+            "snapshot_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        }
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "snapshot_id",
+            "snapshot_digest"
+          ],
+          "targetTable": "config_snapshots",
+          "targetColumns": [
+            "id",
+            "content_digest"
+          ]
+        },
+        {
+          "columns": [
+            "snapshot_id",
+            "project_id"
+          ],
+          "targetTable": "config_snapshots",
+          "targetColumns": [
+            "id",
+            "project_id"
+          ]
+        },
+        {
+          "columns": [
+            "project_id",
+            "workspace_revision"
+          ],
+          "targetTable": "project_workspace_versions",
+          "targetColumns": [
+            "project_id",
+            "workspace_revision"
+          ]
+        }
+      ],
+      "indexes": []
+    },
+    {
+      "table": "config_authority",
+      "primaryKey": [
+        "singleton"
+      ],
+      "uniqueKeys": [],
+      "foreignKeys": [
+        {
+          "columns": [
+            "activation_id"
+          ],
+          "targetTable": "config_activation_receipts",
+          "targetColumns": [
+            "id"
+          ]
+        }
+      ],
+      "indexes": []
+    },
+    {
+      "table": "config_activation_receipts",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        {
+          "name": "m2_r10_uq_request",
+          "columns": [
+            "request_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_r10_uq_ref",
+          "columns": [
+            "id",
+            "payload_digest"
+          ],
+          "partial": false,
+          "deferrable": false
+        }
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "capture_id",
+            "capture_source_digest",
+            "capture_artifact_digest"
+          ],
+          "targetTable": "legacy_config_captures",
+          "targetColumns": [
+            "id",
+            "source_digest",
+            "artifact_digest"
+          ]
+        }
+      ],
+      "indexes": []
+    },
+    {
+      "table": "config_mutation_receipts",
+      "primaryKey": [
+        "actor_scope",
+        "operation",
+        "target_scope",
+        "mutation_id"
+      ],
+      "uniqueKeys": [],
+      "foreignKeys": [
+        {
+          "columns": [
+            "result_profile_agent_id",
+            "result_profile_revision",
+            "result_profile_digest"
+          ],
+          "targetTable": "agent_profile_versions",
+          "targetColumns": [
+            "agent_id",
+            "revision",
+            "content_digest"
+          ]
+        },
+        {
+          "columns": [
+            "result_binding_id",
+            "result_binding_revision",
+            "result_binding_digest"
+          ],
+          "targetTable": "group_binding_config_versions",
+          "targetColumns": [
+            "binding_id",
+            "revision",
+            "content_digest"
+          ]
+        },
+        {
+          "columns": [
+            "audit_id"
+          ],
+          "targetTable": "audit_log",
+          "targetColumns": [
+            "id"
+          ]
+        }
+      ],
+      "indexes": []
+    },
+    {
+      "table": "agent_runtime_bindings",
+      "primaryKey": [],
+      "uniqueKeys": [
+        {
+          "name": "m2_e01_uq_stable",
+          "columns": [
+            "id",
+            "group_binding_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_e01_uq_runtime",
+          "columns": [
+            "id",
+            "group_binding_id",
+            "runtime_id"
+          ],
+          "partial": false,
+          "deferrable": false
+        },
+        {
+          "name": "m2_e01_uq_attachment",
+          "columns": [
+            "id",
+            "group_binding_id",
+            "attachment_state"
+          ],
+          "partial": false,
+          "deferrable": false
+        }
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "group_binding_id",
+            "project_id",
+            "group_id",
+            "member_id"
+          ],
+          "targetTable": "group_bindings",
+          "targetColumns": [
+            "id",
+            "project_id",
+            "group_id",
+            "member_id"
+          ]
+        },
+        {
+          "columns": [
+            "detach_config_snapshot_id",
+            "id",
+            "group_binding_id"
+          ],
+          "targetTable": "config_detach_snapshots",
+          "targetColumns": [
+            "id",
+            "execution_binding_id",
+            "group_binding_id"
+          ]
+        },
+        {
+          "columns": [
+            "requested_config_snapshot_id",
+            "id",
+            "group_binding_id"
+          ],
+          "targetTable": "config_snapshots",
+          "targetColumns": [
+            "id",
+            "execution_binding_id",
+            "group_binding_id"
+          ]
+        },
+        {
+          "columns": [
+            "requested_workspace_mapping_id",
+            "requested_config_snapshot_id"
+          ],
+          "targetTable": "config_workspace_mappings",
+          "targetColumns": [
+            "id",
+            "snapshot_id"
+          ]
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ux_m2_attached_runtime_scope",
+          "unique": true,
+          "columns": [
+            "runtime_id",
+            "project_id",
+            "group_id"
+          ],
+          "predicate": {
+            "column": "attachment_state",
+            "equals": "attached"
+          }
+        },
+        {
+          "name": "ux_m2_attached_member_group",
+          "unique": true,
+          "columns": [
+            "member_id",
+            "group_id"
+          ],
+          "predicate": {
+            "column": "attachment_state",
+            "equals": "attached"
+          }
+        },
+        {
+          "name": "ux_m2_attached_binding",
+          "unique": true,
+          "columns": [
+            "group_binding_id"
+          ],
+          "predicate": {
+            "column": "attachment_state",
+            "equals": "attached"
+          }
+        }
+      ]
+    },
+    {
+      "table": "agent_runner_states",
+      "primaryKey": [],
+      "uniqueKeys": [],
+      "foreignKeys": [
+        {
+          "columns": [
+            "applied_config_snapshot_id",
+            "binding_id"
+          ],
+          "targetTable": "config_snapshots",
+          "targetColumns": [
+            "id",
+            "execution_binding_id"
+          ]
+        },
+        {
+          "columns": [
+            "applied_workspace_mapping_id",
+            "applied_config_snapshot_id"
+          ],
+          "targetTable": "config_workspace_mappings",
+          "targetColumns": [
+            "id",
+            "snapshot_id"
+          ]
+        }
+      ],
+      "indexes": []
+    },
+    {
+      "table": "agent_runtime_members",
+      "primaryKey": [],
+      "uniqueKeys": [],
+      "foreignKeys": [],
+      "indexes": []
+    }
+  ]
+}

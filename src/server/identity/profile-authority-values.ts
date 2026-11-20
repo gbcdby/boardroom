@@ -1,3 +1,5 @@
+import { reserveP0FIsolatedCopy, reserveP0FNativeClone, reserveP0FNativeWork,
+  reserveP0FNativeKeyList } from "./internal/m2-p0-artifacts-frame.ts";
 import { z } from "zod";
 import { canonicalJson, digestJson } from "../storage/maintenance/canonical.ts";
 import { hash, ref, source } from "../storage/maintenance/parse-primitives.ts";
@@ -27,6 +29,7 @@ const MAX_NODES = 250_000;
 
 // Private, fixed-budget copy. The whole public call is bounded before schema traversal or hashing.
 function copyData(value: unknown): unknown {
+  reserveP0FIsolatedCopy(value);
   let nodes = 0;
   let bytes = 0;
   const ancestors = new Set<object>();
@@ -106,6 +109,8 @@ function withCopy<T>(value: unknown, consume: (safe: unknown) => T): T {
   }
 }
 function immutable<T>(value: T): ReadonlyDeep<T> {
+  reserveP0FNativeWork(1);
+  if (value !== null && typeof value === "object") reserveP0FNativeKeyList(value);
   if (value !== null && typeof value === "object") {
     for (const item of Object.values(value)) immutable(item);
     Object.freeze(value);
@@ -120,6 +125,7 @@ function contract(value: unknown, expected: string) {
   if (typeof tag === "string" && tag !== expected) throw new ProfileAuthorityValueError("unsupported_shape");
 }
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
+  reserveP0FNativeClone(value);
   const result = schema.safeParse(value);
   if (!result.success) throw new ProfileAuthorityValueError("invalid_value");
   return result.data;

@@ -12,7 +12,7 @@ import { checkP0TaskDecisionWorkEvents, P0_C_RULES } from "./m2-p0-task-decision
 import { checkP0AuditMemory, P0_D_RULES } from "./m2-p0-audit-memory.ts";
 import { checkP0ConfigurationFamily } from "./m2-p0-config-family.ts";
 import { E_RULES } from "./m2-p0-e-context.ts";
-import { checkP0Artifacts } from "./m2-p0-artifacts.ts";
+import { checkP0Artifacts, checkM2OriginalP0Artifacts } from "./m2-p0-artifacts.ts";
 import { getP0OriginalClientClassifications } from "./m2-p0-artifacts-clients.ts";
 import type { P0OriginalClientClassification } from "./m2-p0-artifacts-clients.ts";
 import { ClosureEncoder, freezeClosureOutput, sortedClosureFrames } from "./m2-p0-closure-output.ts";
@@ -54,7 +54,7 @@ function phase(request: P0Request, view: P0View, actual: P0View["phase"]): void 
 
 /** The compiled ownership sequence is the only route to a pass. Every receipt
  * follows the real synchronous consumer for this exact request and view. */
-function completePass(request: P0Request, view: P0View): P0Result<CompletedPass> {
+function completePass(request: P0Request, view: P0View, withinM2 = false): P0Result<CompletedPass> {
   chargeP0(request, { work: 8, tuples: 2 });
   const checked = new Set<P0Rule>();
   const a = checkP0Keys(request, view); if (!a.ok) return a;
@@ -76,10 +76,10 @@ function completePass(request: P0Request, view: P0View): P0Result<CompletedPass>
   const e = checkP0ConfigurationFamily(request, view); if (!e.ok) return e;
   if (e.value.classification !== "configuration-observation") failP0(request, { code: "invalid_value", rule: null });
   phase(request, view, e.value.phase); obligation(request, checked, E_RULES, e.value.checkedRules);
-  const f = checkP0Artifacts(request, view); if (!f.ok) return f;
+  const f = withinM2 ? checkM2OriginalP0Artifacts(request, view) : checkP0Artifacts(request, view); if (!f.ok) return f;
   if (f.value.classification !== "artifact-value-observation") failP0(request, { code: "invalid_value", rule: null });
   phase(request, view, f.value.phase); obligation(request, checked, ["PC1B-ART01"], [f.value.rule]);
-  if (f.value.artifacts !== request.input.artifacts.length || f.value.evidence !== request.input.evidence.length)
+  if (!withinM2 && (f.value.artifacts !== request.input.artifacts.length || f.value.evidence !== request.input.evidence.length))
     failP0(request, { code: "artifact_semantic_mismatch", rule: "PC1B-ART01", condition: "count-mismatch" });
   chargeP0(request, { work: ALL_REQUIRED.length + 3 });
   if (checked.size !== 43 || ALL_REQUIRED.some(rule => !checked.has(rule)))
@@ -164,7 +164,7 @@ function exactRetained(request: P0Request, original: CompletedPass): P0Result<Re
   const frames: string[] = [], selectors = createP0TupleIndex<Selection>(request);
   for (const selector of deletion.rows) {
     chargeP0(request, { work: 61 });
-    const ordinal = P0_TABLE_NAMES.indexOf(selector.table), site = deletionSite(request, ordinal);
+    const ordinal = (P0_TABLE_NAMES as readonly string[]).indexOf(selector.table), site = deletionSite(request, ordinal);
     const row = index.get(exactKey(request, ordinal, selector.key, selector.rowid));
     if (!row) failP0(request, { code: "invalid_value", rule: "PC1B-DEL01", condition: "missing-target", site });
     if (deleted.has(row)) failP0(request, { code: "invalid_value", rule: "PC1B-DEL01", condition: "duplicate-key", site });
@@ -267,4 +267,16 @@ export function runP0Closure(request: P0Request): ClosureResult {
     return Object.freeze({ ok: true, value: finish(request, original.value, retained, selected) });
   });
   return guarded.ok ? guarded.value : guarded;
+}
+
+/** Fixed internal M2 consumer of the actual captured P0 history. No partial
+ * result escapes as a public complete-history result or a native permit. */
+export function runP0M2Predecessor(request: P0Request): P0Result<{ readonly completeHistoryDigest: string }> {
+  const guarded = withP0Guard(request, () => {
+    if(request.input.graph.observation.phase!=="p0" || request.input.proposedDeletion!==null)
+      failP0(request,{code:"unsupported_shape",rule:"PC1B-RAW01"});
+    const result=completePass(request,request.original,true);
+    return result.ok ? Object.freeze({ok:true as const,value:Object.freeze({completeHistoryDigest:result.value.completeHistoryDigest})}) : result;
+  });
+  return guarded.ok?guarded.value:guarded;
 }

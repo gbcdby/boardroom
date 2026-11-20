@@ -1,3 +1,4 @@
+import { m2RequestData } from "./m2-p0-request.ts";
 import {withP0Guard,assertP0View} from './m2-p0.ts';
 import type {P0Request,P0View,P0Result} from './m2-p0.ts';
 import {fState} from './m2-p0-artifacts-common.ts';
@@ -33,11 +34,12 @@ export interface P0ArtifactObservation {
   readonly receiptAnchor:'capture-prefix';readonly fullSemanticClosure:'not-performed';
 }
 /** Only the authenticated private P0 request/view enter here. No caller-supplied roots or contexts. */
-export function checkP0Artifacts(request:P0Request,view:P0View):P0Result<P0ArtifactObservation>{
+function artifacts(request:P0Request,view:P0View,withinM2:boolean):P0Result<P0ArtifactObservation>{
   return withP0Guard(request,()=>{
     assertP0View(request,view);const f:FState=fState(request);beginP0FArtifactPass(f,view);
     try {
-    f.used.clear();f.usedEvidence.clear();
+    if(withinM2)f.require(m2RequestData(request)!==undefined);
+    else {f.used.clear();f.usedEvidence.clear();}
     const columns=catalogP0(f),physical=physicalP0(f),o=request.input.graph.observation;
     const receipt=f.bridge(o.snapshotReceiptRef,'receipt');
     const closure=runP0Journal(f,physical.plan,physical.root,receipt.selected.artifact);
@@ -51,7 +53,7 @@ export function checkP0Artifacts(request:P0Request,view:P0View):P0Result<P0Artif
     }
     // Retained views preserve S/original G and rerun these equations; they do not re-sign its old snapshot.
     compareP0Manifests(f,closure.manifests,columns);
-    f.finish();
+    if(!withinM2)f.finish();
     // A's outer scanner admitted every string/integer in this exact frozen
     // observation, and its closed table/source/row grammar has only ASCII
     // object keys. The fixed two-element wrapper therefore is already R3.
@@ -61,4 +63,13 @@ export function checkP0Artifacts(request:P0Request,view:P0View):P0Result<P0Artif
     return Object.freeze({classification:'artifact-value-observation',phase:view.phase,rule:'PC1B-ART01',artifacts:f.used.size,evidence:f.usedEvidence.size,originalHistoryDigest:f.historyDigest,receiptAnchor:'capture-prefix',fullSemanticClosure:'not-performed'});
     } finally { endP0FArtifactPass(f); }
   });
+}
+
+export function checkP0Artifacts(request:P0Request,view:P0View):P0Result<P0ArtifactObservation>{
+  return artifacts(request,view,false);
+}
+/** Complete original P0 consumers inside one larger fixed M2 graph. The caller
+ * must still run the enclosing root's exact reachability/unused check. */
+export function checkM2OriginalP0Artifacts(request:P0Request,view:P0View):P0Result<P0ArtifactObservation>{
+  return artifacts(request,view,true);
 }

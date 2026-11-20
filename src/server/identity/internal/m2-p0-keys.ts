@@ -5,6 +5,7 @@ import { P0_POSTGRES_SQL, P0_SQLITE_SQL, P0_SQL_PREDICATES } from "./m2-p0-catal
 import type { P0SqlOps, P0SqlTable, P0SqlTruth, P0SqlValue } from "./m2-p0-catalog.ts";
 import { p0RowSite, readP0Int64, readP0Json, readP0Text } from "./m2-p0-raw.ts";
 import { parseP0Json } from "./m2-p0-lexical.ts";
+import { m2RequestData } from "./m2-p0-request.ts";
 
 type Atom = string | bigint | number | null;
 type Node<T> = { children: Map<string, Map<Atom, Node<T>>>; present: boolean; value: T | undefined };
@@ -170,10 +171,17 @@ function sqlRow(request: P0Request, view: P0View, row: P0Row, table: P0SqlTable)
 }
 
 type TableContext = { table: P0SqlTable; rows: readonly P0Row[]; ops: Map<P0Row, P0SqlOps>; indexes: Map<string, P0TupleIndex<P0Row>> };
-export function checkP0Keys(request: P0Request, inputView?: P0View): P0Result<P0KeyObservation> {
+function keys(request: P0Request, inputView: P0View | undefined, m2: boolean): P0Result<P0KeyObservation> {
   return withP0Guard(request, () => {
     const view = inputView === undefined ? request.original : inputView;
     const state = p0State(request); assertView(state, view);
+    if(m2){
+      if(m2RequestData(request)===undefined||view.rows('storage_maintenance').length!==1||view.rows('storage_maintenance')[0]!.stage!=='p1')
+        throwP0(state,{code:'unsupported_shape',rule:'PC1B-KEY01'});
+      for(const table of request.input.graph.observation.tables)for(const row of view.rows(table.name as P0Table)){
+        chargeState(state,{work:1});if(row.stage!=='p1')throwP0(state,{code:'unsupported_shape',rule:'PC1B-KEY01'});
+      }
+    }
     const catalog = request.input.graph.observation.backend === "sqlite" ? P0_SQLITE_SQL : P0_POSTGRES_SQL;
     chargeState(state, { work: catalog.length * 3, tuples: catalog.length });
     const tables = new Map<P0Table, TableContext>();
@@ -207,6 +215,10 @@ export function checkP0Keys(request: P0Request, inputView?: P0View): P0Result<P0
         for (const [index, column] of table.columns.entries()) if (column.notNull && row.raw.cells[index]![0] === "null") fail(row, index, "state-mismatch");
         for (const check of table.checks) {
           chargeState(state, { work: 1 });
+          // The exact schema22 predicates replace only these two original
+          // protocol literals. No original P0 predicate is relaxed.
+          if(m2&&table.name==='storage_maintenance'&&check===143){if(ops.c(12)!==2n)fail(row,12,'state-mismatch');continue;}
+          if(m2&&table.name==='storage_source_clients'&&check===149){if(ops.c(4)!==1n&&ops.c(4)!==2n)fail(row,4,'state-mismatch');continue;}
           // SQL CHECK rejects FALSE; UNKNOWN is admitted. NOT NULL is independent.
           if (P0_SQL_PREDICATES[check]!(ops) === false) fail(row, undefined, "state-mismatch");
         }
@@ -219,6 +231,8 @@ export function checkP0Keys(request: P0Request, inputView?: P0View): P0Result<P0
       if (constraint.predicate === null) context.indexes.set(constraint.columns.join(","), index);
       for (const row of context.rows) {
         chargeState(state, { work: 1 });
+        if(m2&&context.table.name==='agent_runtime_bindings'&&constraint.columns.length>1
+          &&readP0Text(request,row,'attachment_state',p0RowSite(request,view,row,'attachment_state','PC1B-KEY01.P01'))!=='attached')continue;
         if (constraint.predicate !== null && P0_SQL_PREDICATES[constraint.predicate]!(context.ops.get(row)!) !== true) continue;
         if (hasNull(row, constraint.columns)) continue;
         const previous = index.insert(tuple(context, row, constraint.columns), row);
@@ -243,3 +257,7 @@ export function checkP0Keys(request: P0Request, inputView?: P0View): P0Result<P0
       tables: catalog.length, rows: view.rowCount, fullSemanticClosure: "not-performed" });
   });
 }
+export function checkP0Keys(request:P0Request,inputView?:P0View):P0Result<P0KeyObservation>{return keys(request,inputView,false);}
+/** Fixed schema22 continuation on an authentic M2 request; new keys and row
+ * grammar are also checked by the complete M201/M202 consumer. */
+export function checkM2LegacyKeys(request:P0Request,inputView?:P0View):P0Result<P0KeyObservation>{return keys(request,inputView,true);}

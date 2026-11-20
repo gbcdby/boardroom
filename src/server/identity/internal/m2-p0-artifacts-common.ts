@@ -1,7 +1,13 @@
+import { M2_DURABLE_KINDS, M2_DURABLE_PATHS } from "./m2-durable-kinds.ts";
+import { M2_CONTRACT_SOURCES } from "./m2-durable-fixed-sources.ts";
+import { m2RequestData } from "./m2-p0-request.ts";
 // Request-private ART01 machinery. No ArtifactStore, IO, caller roots or public success token.
 import { createHash } from "node:crypto";
 import { isUtf8 } from "node:buffer";
 import { wellFormedP0 } from "./m2-p0-lexical.ts";
+import { scanM2OwnedCanonical,scanM2OwnedS4Canonical,m2OwnedCanonicalSource,m2OwnedS4Source } from './m2-owned-json.ts';
+import type { M2OwnedCanonicalSource } from './m2-owned-json.ts';
+import { p0State } from './m2-p0-budget.ts';
 import { maintenanceFailureCode } from "../../storage/maintenance/error.ts";
 import { decodeJournalParsed } from "../../storage/maintenance/journal-codecs.ts";
 import type { JournalDecodedKind } from "../../storage/maintenance/journal-codecs.ts";
@@ -24,12 +30,13 @@ const cellGrammar:Readonly<Record<string,{readonly text:string;readonly bytes:Bu
 
 const registered = new Set(["pc-observation","pc-catalog","pc-column-contract","pc-typed-table","pc-typed-row","pc-dependency-domain","pc-pg-sequence-relation","m2-physical-source",
   "plan","journal","source-files","source-file-payload","database-snapshot","database-manifests","capability","restore-bundle","publication","verification","receipt"]);
+const allRegistered = new Set<string>(M2_DURABLE_KINDS);
 const pc = new Set(["pc-observation","pc-catalog","pc-column-contract","pc-typed-table","pc-typed-row","pc-dependency-domain","pc-pg-sequence-relation","m2-physical-source"]);
 const binary = new Set(["database-snapshot","source-file-payload"]);
 export type FObject = Record<string, unknown>;
 interface Size { nodes: number; text: number; encoded: number; sortWork: number; sortBytes: number }
 interface NativeCanonicalCost { work: number; bytes: number; tuples: number }
-interface FKeyShape { readonly keys:readonly string[]; readonly quoted:readonly FEncoding[]; readonly sortWork:number; readonly sortBytes:number }
+interface FKeyShape { readonly keys:readonly string[]; readonly quoted:readonly FEncoding[]; readonly sortWork:number; readonly sortBytes:number;readonly ascii:boolean }
 interface FKeyTrie { readonly children:Map<string,FKeyTrie>; shape?:FKeyShape }
 /** Immutable canonical byte data. Size fields live in this one record. Arrays
  * retain only child references; object key slots are reused after in-place sort.
@@ -37,15 +44,26 @@ interface FKeyTrie { readonly children:Map<string,FKeyTrie>; shape?:FKeyShape }
  * No role, context, reachability or semantic-success result is cached here. */
 interface FSourceSpan { readonly bytes: Buffer; readonly text: string; readonly byteStart: number; readonly unitStart: number; readonly unitEnd: number }
 export interface FEncoding extends Size {
-  readonly kind:'scalar'|'string'|'array'|'object'|'cell'; bytes:number;
+  readonly kind:'scalar'|'string'|'array'|'object'|'cell'|'source'; bytes:number;
   readonly raw?:string; readonly escaped?:boolean;
   readonly children?:readonly FEncoding[]; readonly keys?:readonly FEncoding[];
   readonly cell?:readonly string[]; readonly tagText?:string; readonly tagBytes?:Buffer;
   utf8?:Buffer; rawUtf8?:Buffer; payloadUtf8?:Buffer;
   flat?:string; digest?:string; source?:FSourceSpan;
+  /** Exact syntax property of these immutable bytes, never a role/context verdict. */
+  r3?:boolean;
 }
 export interface FEntry { readonly selected: P0SelectedArtifact; readonly ordinal: number; readonly site: P0Site; bytes?: Buffer; verified?: boolean; parsed?: unknown; decoded?: unknown }
 const caches = new WeakMap<P0Request, FState>();
+interface ByteData {
+  readonly immutable:WeakSet<object>;readonly sizes:WeakMap<object,Size>;readonly encodings:WeakMap<object,FEncoding>;
+  readonly nativeCanonicalCosts:WeakMap<object,NativeCanonicalCost>;readonly strings:Map<string,FEncoding>;
+  readonly atoms:Map<null|boolean|number,FEncoding>;readonly keyData:FKeyTrie;
+}
+// A preliminary M2 locator and its captured view own the same original ledger
+// and immutable input data. Share only those byte representations; every F
+// entry, source role, reachability set and decoded owner decision stays local.
+const m2ByteData=new WeakMap<object,ByteData>();
 const authenticatedStates = new WeakSet<FState>();
 const unknownState = Object.freeze({});
 export function fState(request: P0Request): FState {
@@ -56,6 +74,7 @@ export function fState(request: P0Request): FState {
 export function assertP0FState(value: FState): void { if(!authenticatedStates.has(value))throw unknownState; }
 export class FState {
   readonly request: P0Request;
+  readonly durable: boolean;
   readonly entries: P0TupleIndex<FEntry>;
   readonly evidence: P0TupleIndex<number>;
   readonly used:Set<number>;
@@ -71,22 +90,26 @@ export class FState {
   currentSite: P0Site | undefined;
   historyDigest: string | undefined;
   constructor(request:P0Request){
-    this.request=request;this.charge(11,0,11);
-    this.used=new Set();this.usedEvidence=new Set();this.immutable=new WeakSet();
-    this.sizes=new WeakMap();this.encodings=new WeakMap();this.nativeCanonicalCosts=new WeakMap();
-    this.strings=new Map();this.atoms=new Map();this.decodedKinds=new WeakMap();
-    this.keyData={children:new Map()};
+    this.request=request;const m2=m2RequestData(request);this.durable=m2!==undefined;this.charge(11,0,11);
+    this.used=new Set();this.usedEvidence=new Set();this.decodedKinds=new WeakMap();
+    const existing=m2===undefined?undefined:m2ByteData.get(m2);
+    if(existing){this.immutable=existing.immutable;this.sizes=existing.sizes;this.encodings=existing.encodings;
+      this.nativeCanonicalCosts=existing.nativeCanonicalCosts;this.strings=existing.strings;this.atoms=existing.atoms;this.keyData=existing.keyData;}
+    else {this.immutable=new WeakSet();this.sizes=new WeakMap();this.encodings=new WeakMap();this.nativeCanonicalCosts=new WeakMap();
+      this.strings=new Map();this.atoms=new Map();this.keyData={children:new Map()};
+      if(m2!==undefined){this.charge(1,0,2);m2ByteData.set(m2,{immutable:this.immutable,sizes:this.sizes,encodings:this.encodings,
+        nativeCanonicalCosts:this.nativeCanonicalCosts,strings:this.strings,atoms:this.atoms,keyData:this.keyData});}}
     this.entries=createP0TupleIndex(request);this.evidence=createP0TupleIndex(request);
     for(const [ordinal,selected] of request.input.artifacts.entries()){
       const site=p0ArtifactSite(request,ordinal);this.currentSite=site;
       this.charge(1,selected.kind.length*2);
-      this.require(registered.has(selected.kind),'artifact_kind_unsupported','undefined-grammar');
+      this.require((this.durable?allRegistered:registered).has(selected.kind),'artifact_kind_unsupported','undefined-grammar');
       this.charge(1,0,3); // one key-list shell/slot and one entry record
       this.require(this.entries.insert([selected.artifact.ref],{selected,ordinal,site})===undefined,'artifact_semantic_mismatch','duplicate-key');
     }
     for(const [ordinal,selected] of request.input.evidence.entries()){
       this.charge(1,selected.kind.length*2);
-      this.require(registered.has(selected.kind),'artifact_kind_unsupported','undefined-grammar');
+      this.require((this.durable?allRegistered:registered).has(selected.kind),'artifact_kind_unsupported','undefined-grammar');
       this.charge(1,0,2);
       this.require(this.evidence.insert([selected.evidence.artifactId],ordinal)===undefined,'artifact_semantic_mismatch','duplicate-key');
     }
@@ -104,6 +127,7 @@ export class FState {
         this.charge(1,0,3); // record, encodings binding, immutable binding
         const data:FEncoding={kind:'cell',cell,tagText,tagBytes:grammar.bytes,bytes:encoded,nodes:payload===undefined?2:3,
           text:(tag.length+(payload?.length??0))*2,encoded,sortWork:0,sortBytes:0};
+        if(this.durable)data.r3=true;
         this.immutable.add(cell);this.encodings.set(cell,data);
       }
     }
@@ -136,13 +160,18 @@ export class FState {
     this.require(this.refEqual(reference,entry.selected.artifact),'artifact_bytes_mismatch','bytes-mismatch');
     if(kind!==undefined)this.require(this.sameText(entry.selected.kind,kind),'artifact_kind_unsupported','format-mismatch');
     const k=entry.selected.kind;let pathMatches=false;
-    if(pc.has(k))pathMatches=reference.ref===`m2/sha256/${reference.sha256}/${k}.json`;
+    if(this.durable && k==='fixed-contract-source') pathMatches=M2_CONTRACT_SOURCES.some(source=>this.refEqual(source.artifact,reference));
+    else if(this.durable && M2_DURABLE_PATHS[k]!==undefined)pathMatches=reference.ref===M2_DURABLE_PATHS[k]!.replace('{byteSha256}',reference.sha256);
+    else if(pc.has(k))pathMatches=reference.ref===`m2/sha256/${reference.sha256}/${k}.json`;
     else if(k==='plan')pathMatches=reference.ref===`plans/${reference.sha256}.json`;
     else if(k==='journal')pathMatches=new RegExp(`^journals/[A-Za-z0-9_-]{1,100}/[1-9][0-9]*-${reference.sha256}\\.json$`).test(reference.ref);
     else pathMatches=reference.ref===`snapshots/${reference.sha256}/${k}.${binary.has(k)?'bin':'json'}`;
     this.charge(1,reference.ref.length*2);this.require(pathMatches,'artifact_semantic_mismatch','format-mismatch');
     if(!this.used.has(entry.ordinal)){this.charge(1,0,1);this.used.add(entry.ordinal);}
-    if(binary.has(k)){
+    if(binary.has(k)||k==='fixed-contract-source'){
+      // EG admission already verified every selected byte buffer. This cache is
+      // immutable byte data owned by that same request, never a semantic pass.
+      if(m2RequestData(this.request)?.bytes.has(entry.selected))entry.verified=true;
       if(!entry.verified){const hex=entry.selected.bytesHex,n=hex.length/2;this.charge(1,hex.length+n+n);
         // Consume the immutable hex directly: no separately retained binary Buffer is copied.
         // The internal hex decoder still produces n bytes before SHA reads n.
@@ -152,6 +181,7 @@ export class FState {
   }
   bytes(entry:FEntry):Buffer{
     if(entry.bytes)return entry.bytes;
+    const admitted=m2RequestData(this.request)?.bytes.get(entry.selected);if(admitted){entry.bytes=admitted;return admitted;}
     const hex=entry.selected.bytesHex,n=hex.length/2;
     this.charge(2,hex.length+n*2); // hex decode input/output, then SHA input
     const bytes=Buffer.from(hex,'hex');
@@ -160,17 +190,59 @@ export class FState {
   }
   json(entry:FEntry):unknown{
     if(Object.hasOwn(entry,'parsed'))return entry.parsed;
+    const admitted=m2RequestData(this.request)?.parsed;
+    if(admitted?.has(entry.selected)){const value=admitted.get(entry.selected);this.freeze(value);entry.parsed=value;return value;}
     const bytes=this.bytes(entry);this.charge(1,bytes.length*2);
     this.require(isUtf8(bytes),'artifact_semantic_mismatch','format-mismatch');
     const text=new TextDecoder('utf-8',utf8DecoderOptions).decode(bytes);
     // The exact canonical-byte comparison below also rejects a BOM, whitespace and lexical rounding.
-    const value=parseP0Json(this.request,text!,entry.site,pc.has(entry.selected.kind)?'reference':'finite');
+    const owned=this.durable&&(pc.has(entry.selected.kind)||!registered.has(entry.selected.kind));
+    const ownedS4=this.durable&&!owned;
+    const value=owned?scanM2OwnedCanonical(p0State(this.request),text,entry.site):ownedS4?scanM2OwnedS4Canonical(p0State(this.request),text,entry.site)
+      :parseP0Json(this.request,text!,entry.site,pc.has(entry.selected.kind)?'reference':'finite');
     this.freeze(value);
-    if(pc.has(entry.selected.kind))this.scanCr3(value);
-    const encoded=this.encode(value);
-    this.require(this.matchSource(encoded,bytes,text!),'artifact_semantic_mismatch','format-mismatch');
+    const exactOwned=owned?m2OwnedCanonicalSource(p0State(this.request),value):ownedS4?m2OwnedS4Source(p0State(this.request),value):undefined;
+    let encoded:FEncoding;
+    if(exactOwned!==undefined){
+      // The same strict scan has already computed the exact root/payload sizes
+      // and UTF-8 offsets while constructing their owned tree. Keep those source
+      // bytes directly; do not allocate an eager encoding of every child merely
+      // to recover the already known root bytes. A child is encoded on demand.
+      const bind=(node:object,span:M2OwnedCanonicalSource):FEncoding=>{
+        this.charge(1,0,3);
+        const data:FEncoding={kind:'source',bytes:span.encoded,nodes:span.nodes,text:span.text,encoded:span.encoded,
+          sortWork:span.sortWork,sortBytes:span.sortBytes,r3:span.r3,
+          source:{bytes,text,byteStart:span.byteStart,unitStart:span.unitStart,unitEnd:span.unitEnd}};
+        if(span.unitStart===0&&span.unitEnd===text.length)data.flat=text;
+        this.encodings.set(node,data);return data;
+      };
+      this.require(exactOwned.encoded===bytes.length);
+      encoded=bind(value as object,exactOwned);
+      if(ownedS4){
+        const children=(node:object):void=>{
+          for(const key in node)if(Object.hasOwn(node,key)){
+            this.charge(1);const child=(node as FObject)[key];
+            if(child!==null&&typeof child==='object'){
+              const span=m2OwnedS4Source(p0State(this.request),child);this.require(span!==undefined);
+              bind(child,span);children(child);
+            }
+          }
+        };children(value as object);
+      }
+      const v=value as FObject;let keys=0;for(const key in v)if(Object.hasOwn(v,key)){this.charge(1);keys++;}
+      if(keys===3&&v.formatVersion===1&&v.kind===entry.selected.kind&&v.payload!==null&&typeof v.payload==='object'){
+        const prefix=`{"formatVersion":1,"kind":"${entry.selected.kind}","payload":`;
+        this.charge(2,prefix.length*2);const span=ownedS4?m2OwnedS4Source(p0State(this.request),v.payload):m2OwnedCanonicalSource(p0State(this.request),v.payload);
+        this.require(span!==undefined&&span.byteStart===prefix.length&&span.unitStart===prefix.length
+          &&span.unitEnd===text.length-1&&span.encoded===bytes.length-prefix.length-1);
+        bind(v.payload,span);
+      }
+    }else {
+      if(pc.has(entry.selected.kind))this.scanCr3(value);
+      encoded=this.encode(value);this.require(this.matchSource(encoded,bytes,text!),'artifact_semantic_mismatch','format-mismatch');
+    }
     encoded.flat=text!;encoded.digest=entry.selected.artifact.sha256;
-    this.freeze(value);entry.parsed=value;return value;
+    this.freeze(value);entry.parsed=value;admitted?.set(entry.selected,value);return value;
   }
   decode<K extends JournalDecodedKind>(reference:ArtifactRef,kind:K):ReturnType<typeof decodeJournalParsed<K>>{
     const entry=this.select(reference,kind);if(Object.hasOwn(entry,'decoded'))return entry.decoded as ReturnType<typeof decodeJournalParsed<K>>;
@@ -318,6 +390,7 @@ export class FState {
       this.charge(1,0,2); // scalar record and one primitive-data cache binding
       const flat=value===null?'null':typeof value==='boolean'?(value?'true':'false'):JSON.stringify(value);
       const result:FEncoding={kind:'scalar',flat,bytes:flat.length,nodes:1,text:0,encoded:flat.length,sortWork:0,sortBytes:0};
+      if(this.durable)result.r3=typeof value!=='number'||Number.isSafeInteger(value);
       this.atoms.set(value,result);return result;
     }
     let result:FEncoding;
@@ -325,14 +398,16 @@ export class FState {
       this.charge(value.length+2,0,value.length+2);
       const children=new Array<FEncoding>(value.length);
       result={kind:'array',children,bytes:0,nodes:1,text:0,encoded:2+Math.max(0,value.length-1),sortWork:0,sortBytes:0};
-      for(let i=0;i<value.length;i++){this.charge(1);const child=this.encode(value[i]);children[i]=child;this.addSize(result,child);}
+      if(this.durable)result.r3=true;
+      for(let i=0;i<value.length;i++){this.charge(1);const child=this.encode(value[i]);children[i]=child;this.addSize(result,child);if(this.durable&&child.r3!==true)result.r3=false;}
     }else{
       const object=this.object(value),shape=this.objectKeyData(object),count=shape.keys.length;
       this.charge(count+2,0,count+2);const children=new Array<FEncoding>(count);
       result={kind:'object',children,keys:shape.quoted,bytes:0,nodes:1,text:0,encoded:2+Math.max(0,count-1)+count,sortWork:0,sortBytes:0};
+      if(this.durable)result.r3=shape.ascii;
       for(let i=0;i<count;i++){
         this.charge(1);const quoted=shape.quoted[i]!,child=this.encode(object[shape.keys[i]!]);children[i]=child;
-        this.addSize(result,quoted);this.addSize(result,child);
+        this.addSize(result,quoted);this.addSize(result,child);if(this.durable&&child.r3!==true)result.r3=false;
       }
       // Native fallback consumers retain the original conservative sort bound.
       result.sortWork+=shape.sortWork;result.sortBytes+=shape.sortBytes;
@@ -361,28 +436,31 @@ export class FState {
       while(at>0&&this.compareText(keys[at-1]!,key)>0){this.charge(1);keys[at]=keys[at-1]!;at--;}
       this.charge(1);keys[at]=key;
     }
-    this.charge(count+2,0,count+2);const quoted=new Array<FEncoding>(count);let maximum=0;
-    for(let i=0;i<count;i++){this.charge(1);const key=keys[i]!;maximum=Math.max(maximum,key.length);quoted[i]=this.quote(key);}
-    const result:FKeyShape={keys,quoted,sortWork:count*count,sortBytes:count*count*maximum*2};
+    this.charge(count+2,0,count+2);const quoted=new Array<FEncoding>(count);let maximum=0,ascii=true;
+    for(let i=0;i<count;i++){this.charge(1);const key=keys[i]!;maximum=Math.max(maximum,key.length);quoted[i]=this.quote(key);
+      if(this.durable){this.charge(1,key.length*2);if(!/^[\x00-\x7f]*$/.test(key))ascii=false;}}
+    const result:FKeyShape={keys,quoted,sortWork:count*count,sortBytes:count*count*maximum*2,ascii};
     this.charge(count*2+3);Object.freeze(keys);Object.freeze(quoted);Object.freeze(result);
     node.shape=result;return result;
   }
   private quote(value:string):FEncoding{
     this.charge(1,value.length*2);const old=this.strings.get(value);if(old!==undefined)return old;
-    this.charge(1,value.length*2);let encoded=2,direct=true;
-    for(let i=0;i<value.length;i++){const c=value.charCodeAt(i);if(c===34||c===92){encoded+=2;direct=false;}else if(c<32){encoded+=c===8||c===9||c===10||c===12||c===13?2:6;direct=false;}else if(c<128)encoded++;else if(c<2048)encoded+=2;else if(c>=0xd800&&c<=0xdbff&&i+1<value.length&&value.charCodeAt(i+1)>=0xdc00&&value.charCodeAt(i+1)<=0xdfff){encoded+=4;i++;}else if(c>=0xd800&&c<=0xdfff){encoded+=6;direct=false;}else encoded+=3;}
+    this.charge(1,value.length*2);let encoded=2,direct=true,r3=true;
+    for(let i=0;i<value.length;i++){const c=value.charCodeAt(i);if(c===34||c===92){encoded+=2;direct=false;}else if(c<32){encoded+=c===8||c===9||c===10||c===12||c===13?2:6;direct=false;}else if(c<128)encoded++;else if(c<2048)encoded+=2;else if(c>=0xd800&&c<=0xdbff&&i+1<value.length&&value.charCodeAt(i+1)>=0xdc00&&value.charCodeAt(i+1)<=0xdfff){encoded+=4;i++;}else if(c>=0xd800&&c<=0xdfff){encoded+=6;direct=false;r3=false;}else encoded+=3;}
     // This complete scan proves that JSON.stringify would only add quotes.
     // Keep the original immutable primitive: no quoted copy is produced here.
-    if(direct){this.charge(1,0,2);const result:FEncoding={kind:'string',raw:value,bytes:encoded,nodes:1,text:value.length*2,encoded,sortWork:0,sortBytes:0};this.strings.set(value,result);return result;}
+    if(direct){this.charge(1,0,2);const result:FEncoding={kind:'string',raw:value,bytes:encoded,nodes:1,text:value.length*2,encoded,sortWork:0,sortBytes:0};if(this.durable)result.r3=r3;this.strings.set(value,result);return result;}
     // Escaped text likewise remains immutable source data until a consumer
     // actually needs its quoted copy. Canonical source admission can compare
     // every escape without first allocating an equal JSON.stringify result.
     this.charge(1,0,2);
     const result:FEncoding={kind:'string',raw:value,escaped:true,bytes:encoded,nodes:1,text:value.length*2,encoded,sortWork:0,sortBytes:0};
+    if(this.durable)result.r3=r3;
     this.strings.set(value,result);return result;
   }
   *encodingParts(value:FEncoding):Generator<string>{
     this.charge(1);if(value.flat!==undefined){yield value.flat;return;}
+    if(value.kind==='source'){yield this.sourceText(value)!;return;}
     if(value.kind==='string'){if(value.escaped)yield this.quotedText(value);else{yield '"';yield value.raw!;yield '"';}return;}
     if(value.kind==='cell'){
       yield '[';yield value.tagText!;
@@ -553,7 +631,9 @@ export class FState {
   digest(value:unknown):string{return this.digestEncoding(this.encode(value));}
   // All PC-owned grammars here have ASCII keys; values still use the R3 Unicode/integer domain.
   scanCr3(value:unknown):void{
-    const scan=(v:unknown):void=>{this.charge(1);if(typeof v==='string'){this.charge(1,v.length*2);this.require(wellFormedP0(v));}else if(typeof v==='number')this.require(Number.isSafeInteger(v)&&!Object.is(v,-0));else if(v!==null&&typeof v==='object')for(const key in v)if(Object.hasOwn(v,key)){this.charge(1,key.length*2);this.require(/^[\x00-\x7f]*$/.test(key));scan((v as FObject)[key]);}};
+    const scan=(v:unknown):void=>{this.charge(1);
+      if(this.durable&&v!==null&&typeof v==='object'&&this.immutable.has(v)&&this.encodings.get(v)?.r3===true)return;
+      if(typeof v==='string'){this.charge(1,v.length*2);this.require(wellFormedP0(v));}else if(typeof v==='number')this.require(Number.isSafeInteger(v)&&!Object.is(v,-0));else if(v!==null&&typeof v==='object')for(const key in v)if(Object.hasOwn(v,key)){this.charge(1,key.length*2);this.require(/^[\x00-\x7f]*$/.test(key));scan((v as FObject)[key]);}};
     scan(value);
   }
   cr3(value:unknown):string{this.scanCr3(value);return this.canonical(value);}
@@ -566,7 +646,7 @@ export class FState {
     if(a.kind!==b.kind)return this.compareEncodings(a,b)===0;
     if(a.kind==='scalar')return this.sameText(a.flat!,b.flat!);
     if(a.kind==='string')return this.sameText(a.raw!,b.raw!);
-    if(a.kind==='cell')return this.compareEncodings(a,b)===0;
+    if(a.kind==='cell'||a.kind==='source')return this.compareEncodings(a,b)===0;
     // Canonical JSON has one fixed token tree for each value: sorted object keys,
     // ordered arrays and one quoted/number token per scalar. Compare that tree
     // directly; equal immutable children require only their identity comparison.
@@ -579,5 +659,48 @@ export class FState {
     }
     return true;
   }
-  equal(a:unknown,b:unknown):boolean{return this.encodingEqual(this.encode(a),this.encode(b));}
+  equal(a:unknown,b:unknown):boolean{
+    const owned=this.durable?this.ownedM2Equal(a,b):undefined;
+    return owned??this.encodingEqual(this.encode(a),this.encode(b));
+  }
+  /** Exact canonical-JSON equality for two trees this authentic M2 request
+   * already owns. Compare their data directly instead of allocating two token
+   * trees. Every occurrence still reads its scalar/keys and validates numbers;
+   * identity alone is deliberately not a successful comparison. */
+  ownedM2Equal(a:unknown,b:unknown):boolean|undefined {
+    assertP0FState(this);
+    if(!this.durable||a===null||b===null||typeof a!=='object'||typeof b!=='object'
+      ||!this.immutable.has(a)||!this.immutable.has(b))return undefined;
+    const equal=(left:unknown,right:unknown):boolean=>{
+      this.charge(1);
+      // Restore the original encoder's exact immutable-byte identity shortcut.
+      // A shared encoding is installed only by strict source admission or the
+      // completed recursive copyEncoding comparison. A frozen object, matching
+      // appearance or object identity alone is insufficient.
+      if(left!==null&&right!==null&&typeof left==='object'&&typeof right==='object'
+        &&this.immutable.has(left)&&this.immutable.has(right)){
+        const bytes=this.encodings.get(left);if(bytes!==undefined&&bytes===this.encodings.get(right))return true;
+      }
+      if(typeof left==='number'){this.charge(4);this.require(Number.isFinite(left)&&!Object.is(left,-0)&&(!Number.isInteger(left)||Number.isSafeInteger(left)));}
+      if(typeof right==='number'){this.charge(4);this.require(Number.isFinite(right)&&!Object.is(right,-0)&&(!Number.isInteger(right)||Number.isSafeInteger(right)));}
+      if(typeof left!==typeof right)return false;
+      if(typeof left==='string')return this.sameText(left,right as string);
+      if(left===null||right===null||typeof left==='number'||typeof left==='boolean')return left===right;
+      this.require(typeof left==='object'&&typeof right==='object'&&this.immutable.has(left)&&this.immutable.has(right));
+      if(Array.isArray(left)){
+        if(!Array.isArray(right)||left.length!==right.length)return false;
+        for(let i=0;i<left.length;i++)if(!equal(left[i],right[i]))return false;
+        return true;
+      }
+      if(Array.isArray(right))return false;
+      const x=left as FObject,y=right as FObject;let count=0,other=0;
+      for(const key in y)if(Object.hasOwn(y,key)){this.charge(1);other++;}
+      for(const key in x)if(Object.hasOwn(x,key)){
+        this.charge(2,key.length*2);count++;
+        if(!Object.hasOwn(y,key)||!equal(x[key],y[key]))return false;
+      }
+      return count===other;
+    };
+    return equal(a,b);
+  }
 }

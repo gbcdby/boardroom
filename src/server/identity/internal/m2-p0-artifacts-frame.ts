@@ -9,6 +9,7 @@ import type { SourceClientRawRow, SourceClientsRosterV1 } from '../../storage/ma
 import type { Json } from '../../storage/maintenance/types.ts';
 import type { JournalValueContext } from '../../storage/maintenance/journal-values.ts';
 import { rowDigest } from './m2-p0-artifacts-md.ts';
+import { p0State } from './m2-p0-budget.ts';
 
 declare const frameBrand: unique symbol;
 export interface P0FArtifactSyntaxFrame { readonly [frameBrand]: true; }
@@ -21,6 +22,7 @@ interface Frame {
   readonly firstText: unknown; readonly secondText: unknown;
   readonly rows: WeakSet<object>; readonly encoding: Encoding | null;
   readonly rowJson: WeakMap<object, Map<JsonColumn, { readonly text: string; readonly nodes: number;readonly value:unknown }>>;
+  embeddedNodes:number;
 }
 const passes = new WeakMap<FState, Pass>();
 const frames = new WeakMap<P0FArtifactSyntaxFrame, Frame>();
@@ -39,8 +41,67 @@ export function withP0FNativeConsumer<T>(frame: P0FArtifactSyntaxFrame, consume:
   try { return consume(); } finally { nativeFrame = previous; }
 }
 function nativeState(): FState | undefined { return nativeFrame === undefined ? undefined : state(nativeFrame).f; }
+/** Only fixed M2 codec production sites call this after their original input
+ * isolation/schema has produced data. It records those actual immutable values
+ * for this synchronous request; a standalone call has no such frame. */
+export function encodeP0FM2CodecProduced<T>(value:T):T {
+  if(nativeFrame===undefined)return value;
+  const owner=state(nativeFrame),f:FState=owner.f;
+  if(owner.role!=='codec'||!f.durable||!f.immutable.has(owner.scope))return value;
+  f.freeze(value);f.encode(value);return value;
+}
+/** The fixed DTOs normally have ASCII keys, where UTF-16 and C-R3 key order
+ * coincide. Non-ASCII keys keep the original full codepoint encoder. No decoded
+ * value or semantic decision is cached here; only exact owned byte data is used. */
+export function reuseP0FM2CodecR3(value:unknown):string|undefined {
+  if(nativeFrame===undefined)return undefined;
+  const owner=state(nativeFrame),f:FState=owner.f;
+  if(owner.role!=='codec'||!f.durable||!f.immutable.has(owner.scope))return undefined;
+  const ascii=(item:unknown):boolean=>{
+    f.charge(1);if(item===null||typeof item!=='object')return true;
+    if(!f.immutable.has(item))return false;
+    for(const key in item)if(Object.hasOwn(item,key)){
+      f.charge(1,key.length*2);if(!/^[\x00-\x7f]*$/.test(key)||!ascii((item as Record<string,unknown>)[key]))return false;
+    }
+    return true;
+  };
+  return ascii(value)?f.cr3(value):undefined;
+}
+/** Membership is established only by this request's actual scanner or fixed
+ * data production. Object.isFrozen alone, foreign request data and caller
+ * flags cannot enter this branch. The local codec still traverses the value
+ * and applies its original byte/node/depth limits. */
+export function isP0FM2CodecOwned(value:unknown):boolean {
+  if(nativeFrame===undefined||value===null||typeof value!=='object')return false;
+  const owner=state(nativeFrame),f:FState=owner.f;
+  return owner.role==='codec'&&f.durable&&f.immutable.has(owner.scope)&&f.immutable.has(value)&&Object.isFrozen(value);
+}
+export function reserveP0FM2CodecRead(value:unknown):void {
+  if(!isP0FM2CodecOwned(value))throw unknownFrame;
+  const f=nativeState()!,size=f.size(value);
+  // The private path performs a readonly local-budget traversal. It allocates
+  // no reflection map, property descriptors or clone nodes.
+  f.charge(size.nodes*2,size.text);
+}
 /** Cost seams only: the original consumer still makes every semantic decision. */
 export function reserveP0FNativeNodes(nodes: number, tuples = 0): void { nativeState()?.charge(nodes, 0, tuples, nodes); }
+/** Fixed isolated-copy consumers use the authenticated request's accounting.
+ * A standalone public call has no frame and keeps its existing local boundary. */
+export function reserveP0FIsolatedCopy(value: unknown): void {
+  const f = nativeState(); if (!f) return;
+  const size = f.size(value);
+  f.charge(size.nodes * 16, size.text * 4, size.nodes * 3, size.nodes);
+}
+/** Strict embedded JSON in a P-A consumer is part of this same logical graph. */
+export function parseP0FNativeJson(text: string, depth: number): { readonly value: unknown } | undefined {
+  const owner = nativeState(); if (!owner) return undefined;
+  const f: FState = owner;
+  f.require(f.currentSite);
+  const ownerFrame=nativeFrame===undefined?undefined:state(nativeFrame),ledger=p0State(f.request),nodes=ledger.usage.nodes;
+  const value = parseP0Json(f.request, text, p0NestedSite(f.request, f.currentSite, depth), 'reference');
+  if(ownerFrame?.role==='codec'&&f.durable)ownerFrame.embeddedNodes+=ledger.usage.nodes-nodes;
+  f.freeze(value); f.charge(1, 0, 1); return { value };
+}
 /** Explicit project-owned metadata only, separate from semantic JSON nodes. */
 export function reserveP0FNativeMetadata(tuples:number):void { nativeState()?.charge(tuples,0,tuples); }
 /** A dynamic frame-bound schema's explicit configuration is produced even
@@ -147,7 +208,8 @@ export function reserveP0FNativeShallow(value: object, copies = 1): void {
 }
 export function reserveP0FNativeCanonical(value: unknown): void { nativeState()?.reserveCanonical(value); }
 export function reuseP0FNativeCanonical(value: unknown): string | undefined {
-  const f = nativeState(); if (!f) return undefined;
+  const owner = nativeState(); if (!owner) return undefined;
+  const f: FState = owner;
   const encoded = f.nativeEncoding(value); if (!encoded) return undefined;
   const source = f.sourceText(encoded); if (source !== undefined) return source;
   // encodedText prepays its own actual join reads and canonical output for
@@ -242,7 +304,7 @@ function create(f: FState, scope: object, role: Frame['role'], firstText:unknown
   f.charge(rows.length + 5, 0, rows.length + 5);
   for (const row of rows) if (!f.immutable.has(row)) throw unknownFrame;
   const frame = Object.freeze({}) as P0FArtifactSyntaxFrame;
-  frames.set(frame, { f, pass, scope, role, firstText,secondText, rows: new WeakSet(rows), encoding, rowJson: new WeakMap() });
+  frames.set(frame, { f, pass, scope, role, firstText,secondText, rows: new WeakSet(rows), encoding, rowJson: new WeakMap(),embeddedNodes:0 });
   return frame;
 }
 export function p0FJournalSyntaxFrame(f: FState, value: object): P0FArtifactSyntaxFrame {
@@ -252,6 +314,9 @@ export function p0FJournalSyntaxFrame(f: FState, value: object): P0FArtifactSynt
   return create(f, value, 'journal', invariant?.controlRootJson, invariant?.mutexIdentityJson);
 }
 export function p0FCodecSyntaxFrame(f: FState, value: object): P0FArtifactSyntaxFrame { return create(f, value, 'codec'); }
+export function p0FM2CodecEmbeddedNodes(frame:P0FArtifactSyntaxFrame):number {
+  const owner=state(frame);if(owner.role!=='codec'||!owner.f.durable)throw unknownFrame;return owner.embeddedNodes;
+}
 export function p0FManifestSyntaxFrame(f: FState, value: object): P0FArtifactSyntaxFrame {
   ownedScope(f, value);
   const md = value as { controlRows: { storage_maintenance: readonly Record<string, unknown>[] } };
