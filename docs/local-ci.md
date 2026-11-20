@@ -14,7 +14,10 @@ npm run ci:local -- --focus=tests/foo.test.ts,tests/bar.test.ts
 npm run ci:local -- --shard=3/8
 npm run ci:local:full -- --jobs=4
 npm run ci:local -- --no-web --no-native
+npm run ci:local:linux -- tests/maintenance-source-file-native.test.ts --test-name-pattern=P3_TEST_MB_LIMIT
 ```
+
+`ci:local:linux` 在只读挂载当前仓库的 `node:24.22.3-bookworm` 容器内复制源码、按锁文件安装依赖、构建 Linux `--source-files` 桥接后运行指定 Node 测试参数；不会改动宿主机 `node_modules` 或 `build/`。
 
 - `preflight`：typecheck、Web 构建、原生维护工具构建、Python 纯控制、分区合同，以及 macOS 上的原生维护定向回归。
 - `--focus`：只跑指定测试文件。
