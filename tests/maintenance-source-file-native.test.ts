@@ -19,7 +19,7 @@ const root = fileURLToPath(new URL("../", import.meta.url));
  * the production binding/registry nor registers any synthetic root/profile. */
 interface PureNativeDecoders {
   checkedBlockAttributes(value: unknown, source: any, device: any, calls: readonly SourceFileNativeCall[]): any;
-  checkedEnvironment(value: unknown, info: any): SourceFileRootEnvironment;
+  checkedEnvironment(value: unknown, info: any, tail?: boolean): SourceFileRootEnvironment;
   checkedKernelReadFact(value: unknown, limit: number, samples?: 1 | 2): SourceFileContextFact<SourceFileKernelReadValue>;
   checkedAuxiliaryCalls(value: unknown, complete?: boolean, unavailableGraph?: boolean): readonly SourceFileNativeCall[];
   checkedEnumeration(value: unknown, index: number): readonly SourceFileNativeCall[];
@@ -43,7 +43,7 @@ interface PureProfileParsers {
   ordinaryProcess(environment: unknown): unknown;
   parseOptions(raw: Buffer): Readonly<Record<string, string | true>>;
   boundHealth(environment: unknown, mount: SourceFileMountBinding): unknown;
-  analyzeEnvironment(context: unknown): { unresolved: readonly string[]; contextBinding: string; windowBinding: string };
+  analyzeEnvironment(context: unknown): { configuration: unknown; unresolved: readonly string[]; contextBinding: string; windowBinding: string };
   typed(value: unknown): unknown;
 }
 /** Exposes only pure mechanical parsers. FIXED_PROFILES, owner registration,
@@ -63,6 +63,10 @@ async function withProfileParsers(consume: (parsers: PureProfileParsers) => void
 
 /** Inert ABI/parser values from the accepted x86_64 statx/statmount layouts.
  * They are never submitted to native acquisition, the registry, or S. */
+function mbSummaryFixture(bit: 0 | 1 = 0, maximum = false): string {
+  const groups = Array.from({ length: 14 }, (_, order) => `\tlist_order_${order}_groups: ${maximum ? 4294967295 : order}\n`).join("");
+  return `optimize_scan: ${bit}\nmax_free_order_lists:\n${groups}avg_fragment_size_lists:\n${groups}`;
+}
 function profileParserFixture(): any {
   const metadata = { kind: "file", dev: 2049n, ino: 9007199254741001n, mode: 0o100600n, uid: 1001n, gid: 1001n,
     nlink: 1n, size: 7n, fsType: 0xef53n, atimeNs: 1000000002n, mtimeNs: 2000000003n, ctimeNs: 3000000004n };
@@ -110,7 +114,8 @@ function profileParserFixture(): any {
       namespaces: observed({ pid: { inode: 1n }, mount: { inode: 2n }, user: { inode: 3n } }) },
     kernel: { uname: observed(uname), notes: read("fixture-not-a-qualified-build"), config: { status: "unavailable", reason: "unsupported", value: null, calls: [] } },
     mount: { legacyStatx: observed(legacyBytes), uniqueStatx: observed(uniqueBytes), statmount: observed({ request, result }), mountinfo: read(mountinfo.toString()) },
-    configuration: { tune: observed(Buffer.alloc(232)), options: read("rw,data=ordered,errors=remount-ro\n", 42n, 2), mbGroups: read("raw-mb-groups\n", 43n, 2),
+    configuration: { tune: observed(Buffer.alloc(232)), options: read("rw\ndata=ordered\nerrors=remount-ro\n", 42n, 2), mbGroups: read("raw-mb-groups\n", 43n, 2),
+      mbStructsSummary: read(mbSummaryFixture(), 44n, 2),
       journalTaskBefore: read("333\n"), journalTaskAfter: read("333\n"), journalIoprio: observed({ which: 1n, who: 333n, rawValue: 16388n }) },
     device: { binding: observed(binding), dev, uevent, topology: observed({ nodes: [{ index: 0, major: 8n, minor: 1n, identity: deviceIdentity,
       kernelName: binding.kernelName, resolved: binding.resolved, dev, uevent, holders: [], slaves: [] }], edges: [] }),
@@ -206,6 +211,57 @@ test("#152 P3 pure health parser binds all thirteen raw fields and the identical
     const wrongBinding = profileParserFixture().environment;
     wrongBinding.health.binding.value.sourceDevMinor = 2n;
     assert.throws(() => parse.boundHealth(wrongBinding, mount), { code: "source_changed" });
+  });
+});
+
+test("#152 MB1 actual analysis consumes the complete fixed summary and keeps unresolved qualification", async () => {
+  await withProfileParsers(parse => {
+    const seen = new Set<string>();
+    for (const bit of [0, 1] as const) for (const explicit of [false, true]) for (const maximum of [false, true]) {
+      const fixture = profileParserFixture(), raw = Buffer.from(mbSummaryFixture(bit, maximum));
+      fixture.environment.configuration.mbStructsSummary.value.bytes = raw;
+      if (explicit) fixture.environment.configuration.options.value.bytes = Buffer.from(`rw\nmb_optimize_scan=${bit}\n`);
+      const analysis = parse.analyzeEnvironment(fixture.context);
+      const fields = Object.fromEntries((analysis.configuration as any)[1]);
+      assert.deepEqual(fields.mbStructsSummary, parse.typed(raw));
+      assert.deepEqual(fields.mbAllocation, parse.typed({ mbOptimizeScan: BigInt(bit),
+        maxFreeOrderGroups: Array.from({ length: 14 }, (_, order) => BigInt(maximum ? 4294967295 : order)),
+        avgFragmentSizeGroups: Array.from({ length: 14 }, (_, order) => BigInt(maximum ? 4294967295 : order)) }));
+      assert.deepEqual(fields.mbGroups, parse.typed(Buffer.from("raw-mb-groups\n")));
+      assert.equal(analysis.unresolved.length, 4); assert.ok(analysis.unresolved.every(value => value.endsWith("UNPROVEN")));
+      seen.add(analysis.contextBinding); assert.equal(Object.hasOwn(analysis, "qualified"), false);
+    }
+    const changed = profileParserFixture(); changed.environment.configuration.mbStructsSummary.value.bytes =
+      Buffer.from(mbSummaryFixture().replace("list_order_13_groups: 13", "list_order_13_groups: 14"));
+    assert.notEqual(parse.analyzeEnvironment(changed.context).contextBinding,
+      parse.analyzeEnvironment(profileParserFixture().context).contextBinding, "all counters remain in the material");
+    assert.equal(seen.size, 8, "raw bits, counters and explicit options all remain distinct");
+  });
+});
+
+test("#152 MB1 actual analysis rejects every malformed summary and contradictory proc option", async () => {
+  await withProfileParsers(parse => {
+    const raw = mbSummaryFixture();
+    const invalid = [raw.replace("optimize_scan: 0", "optimize_scan: 2"), raw.replace("0\n", "00\n"),
+      raw.replace("max_free_order_lists:", "max_free_order_list:"), raw.replace("avg_fragment_size_lists:", "avg_fragment_size_lists: "),
+      raw.replace("\tlist_order_0_groups: 0\n", ""), raw.replace("list_order_0_groups", "list_order_1_groups"),
+      raw.replace("\tlist_order_0_groups: 0\n\tlist_order_1_groups: 1\n", "\tlist_order_1_groups: 1\n\tlist_order_0_groups: 0\n"),
+      raw.replace("groups: 0", "groups: -1"), raw.replace("groups: 0", "groups: +1"), raw.replace("groups: 0", "groups: 01"),
+      raw.replace("groups: 0", "groups: 4294967296"), raw.replace("groups: 0", "groups: 1.0"), raw.replace("groups: 0", "groups: 0,1"),
+      raw.slice(0, -1), raw + "\n", raw + "extra\n", raw.replace("\n", "\r\n"), raw.replace("\n", "\0\n"),
+      raw.replace("groups: 0", "groups: é"), "x".repeat(16385)];
+    for (const value of invalid) {
+      const fixture = profileParserFixture(); fixture.environment.configuration.mbStructsSummary.value.bytes = Buffer.from(value);
+      assert.throws(() => parse.analyzeEnvironment(fixture.context), { code: "backup_capability_unavailable" });
+    }
+    for (const value of ["rw,data=ordered\n", "rw\r\n", "rw\0\n", "rw", "rw\n\n", "rw\nrw\n",
+      "rw\nmb_optimize_scan=1\n", "rw\nmb_optimize_scan=2\n", "rw\nmb_optimize_scan=00\n", "rw\nmb_optimize_scan\n"]) {
+      const fixture = profileParserFixture(); fixture.environment.configuration.options.value.bytes = Buffer.from(value);
+      assert.throws(() => parse.analyzeEnvironment(fixture.context), { code: "backup_capability_unavailable" });
+    }
+    const fixture = profileParserFixture();
+    fixture.environment.configuration.mbStructsSummary = { status: "unavailable", reason: "syscall", value: null, calls: [] };
+    assert.throws(() => parse.analyzeEnvironment(fixture.context), { code: "backup_capability_unavailable" });
   });
 });
 
@@ -547,6 +603,9 @@ type NativeBinding = {
   observeExtended(owner: object): unknown;
   readAt(owner: object, offset: bigint, length: number): Buffer;
   readDirectory(owner: object): string[];
+  retainMetadata(owner: object): object;
+  transferCarrier(metadata: object, carrier: object): void;
+  closeAsync(owner: object): Promise<void>;
   close(owner: object): void;
 };
 
@@ -554,7 +613,21 @@ type NativeBinding = {
  * and the normal fixed addon pathname. There is no production loader override,
  * registry replacement, caller proof or synthetic native owner. */
 const blockWrappers = ["fstatfs", "readlinkat", "read", "__read_chk", "close"];
+const mbWrappers = [...blockWrappers, "fstatat"];
 const fixedP3Variants = {
+  P3_TEST_MB_READERS: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_ABSENT: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_BUDGET: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_LIMIT: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_OVERSIZED: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_RAW_CHANGE: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_BAD_CHANGE: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_IDENTITY_CHANGE: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_APPEAR: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_DISAPPEAR: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_PROC_CHANGE: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_PROC_UNAVAILABLE: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
+  P3_TEST_MB_CLOSE_FAILURE: { extra: ["P3_TEST_BLOCK_READERS", "P3_TEST_MB_READERS"], wrappers: mbWrappers },
   P3_TEST_BLOCK_READERS: { extra: [], wrappers: blockWrappers },
   P3_TEST_BLOCK_INVALID_FORMAT: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: blockWrappers },
   P3_TEST_BLOCK_BAD_CHANGE: { extra: ["P3_TEST_BLOCK_READERS"], wrappers: blockWrappers },
@@ -595,7 +668,8 @@ async function withFixedP3Package(
     const addon = path.join(output, `maintenance-source-files-linux-${process.arch}.node`);
     const variant = fixedP3Variants[macro];
     const blockRoot = path.join(directory, "m04-sysfs"), blockNode = path.join(blockRoot, "devices/m04-test-node");
-    const blockFixture = macro.startsWith("P3_TEST_BLOCK_");
+    const mbFixture = macro.startsWith("P3_TEST_MB_"), mbRoot = path.join(directory, "mb1-proc");
+    const blockFixture = macro.startsWith("P3_TEST_BLOCK_") || mbFixture;
     if (blockFixture) {
       await mkdir(path.join(blockNode, "holders"), { recursive: true }); await mkdir(path.join(blockNode, "slaves"));
       await mkdir(path.join(blockRoot, "dev/block"), { recursive: true });
@@ -610,10 +684,19 @@ async function withFixedP3Package(
       if (!["P3_TEST_BLOCK_ABSENT", "P3_TEST_BLOCK_APPEAR"].includes(macro))
         await writeFile(path.join(blockNode, "diskseq"), macro === "P3_TEST_BLOCK_OVERSIZED" ? "1".repeat(4097) : "0\n");
     }
+    if (mbFixture) {
+      await mkdir(mbRoot, { mode: 0o700 });
+      await writeFile(path.join(mbRoot, "options"), "rw\ndata=ordered\n");
+      await writeFile(path.join(mbRoot, "mb_groups"), "original-mb-groups\n");
+      if (macro !== "P3_TEST_MB_ABSENT") await writeFile(path.join(mbRoot,
+        macro === "P3_TEST_MB_APPEAR" ? "available-summary" : "mb_structs_summary"),
+        macro === "P3_TEST_MB_LIMIT" ? "x".repeat(16384) : macro === "P3_TEST_MB_OVERSIZED" ? "x".repeat(16385) : mbSummaryFixture());
+    }
     const build = spawnSync("/usr/bin/cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-DNAPI_VERSION=8",
       ...(compiler === "fortified" ? ["-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=3"] : []),
       "-DNODE_GYP_MODULE_NAME=boardroom_source_file_fixed_p3", `-D${macro}`,
       ...(blockFixture ? [`-DP3_TEST_BLOCK_ROOT=${JSON.stringify(blockRoot)}`] : []), ...variant.extra.map(name => `-D${name}`), "-shared", "-fPIC",
+      ...(mbFixture ? [`-DP3_TEST_MB_PROC_ROOT=${JSON.stringify(mbRoot)}`, `-DP3_TEST_MB_SOURCE_ROOT=${JSON.stringify(path.join(directory, "source"))}`] : []),
       "-I", path.join(root, "native/node-api/v24.22.1"), path.join(root, "native/maintenance-source-files.c"),
       path.join(root, "tests/fixtures/maintenance-source-file-getter-errors.c"), "-Wl,--wrap=ioctl", "-Wl,--wrap=syscall",
       ...variant.wrappers.map(name => `-Wl,--wrap=${name}`), "-o", addon], { encoding: "utf8", timeout: 30_000 });
@@ -623,6 +706,152 @@ async function withFixedP3Package(
     const native = createRequire(import.meta.url)(addon) as NativeBinding;
     await consume({ directory, api, native });
   } finally { await rm(directory, { recursive: true, force: true }); }
+}
+
+// These fixed-link controls model only the source filesystem/proc/sysfs
+// binding. Leaf opens, short reads, EOF, inode replacement and closes are real
+// operations on this package's owned ordinary files, never ext4 qualification.
+for (const compiler of ["default", "fortified"] as const) {
+  linuxTest(`#152 MB1 fixed summary reads both actual bits with one original owner (${compiler})`, async () => {
+    await withFixedP3Package("P3_TEST_MB_READERS", async ({ directory, api, native }) => {
+      const source = path.join(directory, "source"); await mkdir(source, { mode: 0o700 });
+      await writeFile(path.join(source, "file"), "owned payload", { mode: 0o600 });
+      const profile = await import(pathToFileURL(path.join(directory, "src/server/storage/maintenance/source-file-profile.ts")).href);
+      for (const bit of [0, 1] as const) {
+        const expected = Buffer.from(mbSummaryFixture(bit));
+        await writeFile(path.join(directory, "mb1-proc/mb_structs_summary"), expected);
+        await api.withNativeSourceRoot(source, handle => {
+          const raw = api.observeSourceFileRootContext(handle).environment, fact = raw.configuration.mbStructsSummary;
+          assert.equal(fact.status, "observed"); if (fact.status !== "observed") return;
+          assert.deepEqual(fact.value.bytes, expected); assert.equal(fact.value.filesystemType, 0x9fa0n);
+          const reads = fact.calls.filter(call => /^read-kernel(?:-after)?$/.test(call.operation));
+          assert.equal(reads.filter(call => call.rc === 0n).length, 2);
+          assert.ok(reads.every(call => call.rc !== null && call.rc >= 0n && call.rc <= 17n));
+          assert.equal(reads.reduce((sum, call) => sum + call.rc!, 0n), BigInt(expected.length * 2));
+          assert.equal(fact.calls.filter(call => !/^read-kernel(?:-after)?$/.test(call.operation)).length, 12);
+          assert.equal(fact.calls.filter(call => call.operation.startsWith("close-") && call.rc === 0n).length, 2);
+          assert.deepEqual(raw.configuration.mbGroups.value?.bytes, Buffer.from("original-mb-groups\n"));
+          assert.ok(raw.auxiliaryCalls.length <= 32768);
+          assert.throws(() => profile.matchSourceFileProfile(handle), (error: any) => error.code === "backup_capability_unavailable"
+            && error.message.includes("source-file-profile-unqualified"));
+        });
+      }
+      const bootstrap = native.openRoot(path.join(source, "file"));
+      try {
+        const raw = native.observeEnvironment(bootstrap) as SourceFileRootEnvironment;
+        assert.equal(raw.rootStage, "metadata-only"); assert.equal(raw.source.filesystemCarrier.role, "bootstrap-parent");
+        assert.equal(raw.configuration.mbStructsSummary.status, "observed");
+        await withNativeDecoders(decode => assert.equal(decode.checkedEnvironment(raw, native.rootInfo(bootstrap))
+          .configuration.mbStructsSummary.status, "observed"));
+      } finally { native.close(bootstrap); }
+      const owned = new Set<object>();
+      try {
+        const parent = native.openRoot(source); owned.add(parent);
+        const file = native.openChild(parent, "file", "file"); owned.add(file);
+        const tail = native.retainMetadata(file); owned.add(tail);
+        await native.closeAsync(file); owned.delete(file);
+        native.transferCarrier(tail, parent); owned.delete(parent);
+        const raw = native.observeEnvironment(tail) as SourceFileRootEnvironment;
+        assert.equal(raw.abiVersion, 3); assert.equal(raw.source.filesystemCarrier.role, "tail-carrier");
+        assert.equal(raw.configuration.mbStructsSummary.status, "observed");
+        await withNativeDecoders(decode => assert.equal(decode.checkedEnvironment(raw, native.rootInfo(tail), true)
+          .configuration.mbStructsSummary.status, "observed"));
+        await native.closeAsync(tail); owned.delete(tail);
+      } finally { for (const owner of [...owned].reverse()) await native.closeAsync(owner); }
+    }, compiler);
+  });
+}
+for (const variant of ["P3_TEST_MB_ABSENT", "P3_TEST_MB_BUDGET", "P3_TEST_MB_LIMIT", "P3_TEST_MB_OVERSIZED",
+  "P3_TEST_MB_PROC_UNAVAILABLE"] as const) {
+  linuxTest(`#152 MB1 fixed ${variant} preserves limits, actual attempts and post-binding refusal`, async () => {
+    await withFixedP3Package(variant, async ({ directory, api }) => {
+      const source = path.join(directory, "source"); await mkdir(source, { mode: 0o700 });
+      await api.withNativeSourceRoot(source, handle => {
+        const raw = api.observeSourceFileRootContext(handle).environment, fact = raw.configuration.mbStructsSummary;
+        const reads = fact.calls.filter(call => /^read-kernel(?:-after)?$/.test(call.operation) && call.rc !== null);
+        if (variant === "P3_TEST_MB_LIMIT") {
+          assert.equal(fact.status, "observed"); assert.equal(fact.value?.bytes.length, 16384);
+          assert.deepEqual(reads.map(call => call.rc), [16384n, 0n, 16384n, 0n]);
+        } else {
+          assert.equal(fact.status, "unavailable"); assert.equal(fact.value, null);
+          assert.equal(fact.reason, variant === "P3_TEST_MB_ABSENT" ? "syscall" : variant === "P3_TEST_MB_PROC_UNAVAILABLE" ? "binding" : "budget");
+          if (variant === "P3_TEST_MB_ABSENT") {
+            assert.equal(reads.length, 0);
+            assert.deepEqual(fact.calls.filter(call => call.operation.startsWith("open-")).map(call => [call.rc, call.errno]),
+              [[-1n, BigInt(osConstants.errno.ENOENT)], [-1n, BigInt(osConstants.errno.ENOENT)]]);
+          } else if (variant === "P3_TEST_MB_BUDGET") {
+            assert.equal(reads.length, 256, "the two phases share one read-call allowance");
+            assert.ok(reads.every(call => call.rc === 1n));
+            assert.ok(fact.calls.some(call => call.operation === "read-kernel-after" && call.rc === null));
+          } else if (variant === "P3_TEST_MB_OVERSIZED") {
+            assert.deepEqual(reads.map(call => call.rc), [16384n, 1n, 16384n, 1n]);
+          } else {
+            assert.equal(reads.filter(call => call.rc === 0n).length, 2);
+            assert.ok(raw.auxiliaryCalls.some(call => call.operation === "stat-ext4-proc-directory-link-after"
+              && call.rc === -1n && call.errno === BigInt(osConstants.errno.EACCES)));
+          }
+        }
+        if (variant !== "P3_TEST_MB_ABSENT")
+          assert.equal(fact.calls.filter(call => call.operation.startsWith("close-") && call.rc === 0n).length, 2);
+        assert.ok(raw.auxiliaryCalls.length <= 32768);
+        const bytes = raw.auxiliaryCalls.filter(call => call.operation.startsWith("read-") && call.rc !== null && call.rc > 0n)
+          .reduce((sum, call) => sum + call.rc!, 0n);
+        assert.ok(bytes <= 2097152n);
+      });
+    });
+  });
+}
+for (const variant of ["P3_TEST_MB_RAW_CHANGE", "P3_TEST_MB_BAD_CHANGE", "P3_TEST_MB_IDENTITY_CHANGE",
+  "P3_TEST_MB_APPEAR", "P3_TEST_MB_DISAPPEAR", "P3_TEST_MB_PROC_CHANGE"] as const) {
+  linuxTest(`#152 MB1 fixed ${variant} keeps the first real change and invalidates its source scope`, async () => {
+    await withFixedP3Package(variant, async ({ directory, api, native }) => {
+      const source = path.join(directory, "source"); await mkdir(source, { mode: 0o700 }); let first: any;
+      await assert.rejects(api.withNativeSourceRoot(source, handle => {
+        try { api.observeSourceFileRootContext(handle); assert.fail("the actual fixed leaf or directory changed"); }
+        catch (error: any) {
+          first = error; assert.equal(error.code, "ERR_SOURCE_IDENTITY"); assert.equal(error.syscall, "environment-changed");
+          assert.equal(error.errno, osConstants.errno.ESTALE);
+          assert.ok(error.cleanupCalls.some((call: SourceFileNativeCall) => call.operation === "close-ext4-proc-directory" && call.rc === 0n));
+        }
+        assert.throws(() => handle.observe(), { code: "maintenance_lost" });
+        assert.throws(() => native.rootInfo(first.nativeCleanupOwner), { code: "ERR_SOURCE_HANDLE" });
+      }), error => error instanceof AggregateError && error.errors[0] === first && error.cause === first);
+    });
+  });
+}
+for (const primary of ["undefined", "cancelled"] as const) {
+  linuxTest(`#152 MB1 fixed leaf close unknown preserves ${primary} and cannot reclose a replacement FD`, async () => {
+    await withFixedP3Package("P3_TEST_MB_CLOSE_FAILURE", async ({ directory, api, native }) => {
+      const source = path.join(directory, "source"), sentinel = path.join(source, "sentinel");
+      await mkdir(source, { mode: 0o700 }); await writeFile(sentinel, "still owned", { mode: 0o600 });
+      const controller = new AbortController(); if (primary === "cancelled") controller.abort();
+      const first = primary === "cancelled" ? controller.signal.reason : undefined;
+      let failure: any; const descriptors: number[] = [];
+      try {
+        await assert.rejects(api.withNativeSourceRoot(source, handle => {
+          try { api.observeSourceFileRootContext(handle); assert.fail("the actual fixed summary close failed"); }
+          catch (error: any) {
+            failure = error; assert.equal(error.code, "ERR_SOURCE_NATIVE_IO"); assert.equal(error.syscall, "environment-close");
+            assert.equal(error.errno, osConstants.errno.EIO);
+          }
+          const calls: SourceFileNativeCall[] = failure.cleanupCalls;
+          const index = calls.findIndex(call => call.operation === "close-kernel-read" && call.rc === -1n
+            && call.errno === BigInt(osConstants.errno.EIO));
+          assert.ok(index > 0); let opening = index - 1;
+          while (opening >= 0 && calls[opening]!.operation !== "open-kernel-read") opening--;
+          assert.ok(opening >= 0); const unknown = calls[opening]!.rc;
+          assert.ok(calls.some(call => call.operation === "close-ext4-proc-directory" && call.rc === 0n));
+          for (let i = 0; i < 32; i++) { const fd = openSync(sentinel, constants.O_RDONLY); descriptors.push(fd); if (BigInt(fd) === unknown) break; }
+          assert.ok(descriptors.some(fd => BigInt(fd) === unknown));
+          assert.throws(() => native.rootInfo(failure.nativeCleanupOwner), { code: "ERR_SOURCE_HANDLE" });
+          assert.throws(() => handle.observe(), { code: "maintenance_lost" });
+          if (primary === "cancelled") controller.signal.throwIfAborted();
+          throw undefined;
+        }), error => error instanceof AggregateError && error.cause === first && error.errors[0] === first && error.errors.includes(failure));
+        for (const fd of descriptors) assert.equal(fstatSync(fd).size, 11);
+      } finally { for (const fd of descriptors) closeSync(fd); }
+    });
+  });
 }
 
 // All of these are explicitly synthetic sysfs observations over real owned
@@ -946,6 +1175,47 @@ linuxTest("#152 P3 strict context consumes the real collector with complete type
       }
     });
   } finally { await rm(tmp, { recursive: true, force: true }); }
+});
+
+linuxTest("#152 MB1 real collector supplies a mandatory two-pass fact and rejects stale native output", async t => {
+  const build = spawnSync(process.execPath, ["scripts/build-maintenance-platform.mjs", "--source-files"],
+    { cwd: root, encoding: "utf8", timeout: 65_000 });
+  assert.equal(build.error, undefined); assert.equal(build.status, 0, build.stderr);
+  const directory = await mkdtemp(path.join(tmpdir(), "br-mb1-real-source-"));
+  const native = createRequire(import.meta.url)(sourceFileNativePath) as NativeBinding, owner = native.openRoot(directory);
+  try {
+    const info = native.rootInfo(owner), raw = native.observeEnvironment(owner) as SourceFileRootEnvironment;
+    assert.equal(Object.hasOwn(raw.configuration, "mbStructsSummary"), true, "the production collector must emit the new fixed leaf fact");
+    const fact = (raw.configuration as any).mbStructsSummary as SourceFileContextFact<SourceFileKernelReadValue>;
+    assert.equal(fact.calls[0]!.operation, "open-kernel-read");
+    assert.ok(fact.calls.some(call => call.operation === "open-kernel-read-after"));
+    assert.equal(fact.calls.at(-1)!.operation, "close-kernel-read-after");
+    await withNativeDecoders(decode => {
+      assert.ok(Object.hasOwn(decode.checkedEnvironment(raw, info).configuration, "mbStructsSummary"));
+      const stale = native.observeEnvironment(owner) as any; delete stale.configuration.mbStructsSummary;
+      assert.throws(() => decode.checkedEnvironment(stale, info), { code: "backup_capability_unavailable" });
+      for (const mutate of [(value: any) => { value.configuration.mbFallback = 0; },
+        (value: any) => { value.configuration.mbStructsSummary = kernelReadFixture(1); },
+        (value: any) => { value.configuration.mbStructsSummary = kernelReadFixture(2);
+          value.configuration.mbStructsSummary.value.filesystemType = 0x62656572n; }]) {
+        const value = native.observeEnvironment(owner); mutate(value);
+        assert.throws(() => decode.checkedEnvironment(value, info), { code: "backup_capability_unavailable" });
+      }
+      let accessed = false;
+      const value = native.observeEnvironment(owner) as any;
+      Object.defineProperty(value.configuration, "mbStructsSummary", { enumerable: true,
+        get() { accessed = true; throw new Error("the source getter must never execute"); } });
+      assert.throws(() => decode.checkedEnvironment(value, info), { code: "backup_capability_unavailable" });
+      assert.equal(accessed, false);
+    });
+    let touched = false;
+    const forged = new Proxy({}, { get() { touched = true; throw new Error("caller source material must not execute"); } });
+    assert.throws(() => observeSourceFileRootContext(forged as any), { code: "maintenance_lost" });
+    assert.throws(() => matchSourceFileProfile(raw as any), { code: "maintenance_lost" });
+    assert.equal(touched, false);
+    t.diagnostic(fact.status === "observed" ? "actual fixed leaf OBSERVED; fixed ext4 qualification still NOT_RUN"
+      : `actual collector ${fact.reason} fact OBSERVED; successful fixed ext4 leaf acquisition NOT_RUN`);
+  } finally { native.close(owner); await rm(directory, { recursive: true, force: true }); }
 });
 
 linuxTest("#152 P3 complete real root and file preflight reach the fixed empty registry", async () => {
