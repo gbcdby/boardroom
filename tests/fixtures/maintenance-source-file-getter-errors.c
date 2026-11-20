@@ -42,8 +42,6 @@ static bool block_fault_applied;
  * modeled. No value here is an actual ext4 qualification observation. */
 static bool mb_fault_applied;
 static unsigned mb_summary_opens;
-int __real_close(int fd);
-ssize_t __real_read(int fd, void *buffer, size_t size);
 #if defined(P3_TEST_MB_COUNTER_CHANGE) || defined(P3_TEST_MB_COUNTER_WIDTH_CHANGE)
 static int mb_change_counter(const char *replacement) {
   int input = open(P3_TEST_MB_PROC_ROOT "/mb_structs_summary", O_RDONLY | O_CLOEXEC);
@@ -89,6 +87,7 @@ static void block_forget(int fd) {
     block_owned[i] = block_owned[--block_owned_count]; return;
   }
 }
+int __real_close(int fd);
 #if defined(P3_TEST_BLOCK_RAW_CHANGE) || defined(P3_TEST_BLOCK_IDENTITY_CHANGE) || defined(P3_TEST_BLOCK_APPEAR) || defined(P3_TEST_BLOCK_BAD_CHANGE)
 static int block_write(const char *name, const char *bytes) {
   char target[4096]; snprintf(target, sizeof(target), "%s/devices/m04-test-node/%s", P3_TEST_BLOCK_ROOT, name);
@@ -132,6 +131,7 @@ ssize_t __wrap_readlinkat(int fd, const char *name, char *buffer, size_t size) {
   }
   return __real_readlinkat(fd, name, buffer, size);
 }
+ssize_t __real_read(int fd, void *buffer, size_t size);
 ssize_t __wrap_read(int fd, void *buffer, size_t size) {
 #ifdef P3_TEST_MB_READERS
   if (block_kind(fd) == 9 && size) {
