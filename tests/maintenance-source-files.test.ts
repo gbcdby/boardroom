@@ -21,6 +21,29 @@ async function rejected(work: Promise<unknown>) {
   assert.fail("operation unexpectedly succeeded");
 }
 
+linuxTest("#152 S shared fixture prepares the current native bridge once before actual owner use", async t => {
+  const original = childProcess.spawnSync;
+  const script = fileURLToPath(new URL("../scripts/build-maintenance-platform.mjs", import.meta.url));
+  const fixtures: Awaited<ReturnType<typeof sourceFilesFixture>>[] = [];
+  let builds = 0;
+  t.mock.method(childProcess, "spawnSync", function(...args: Parameters<typeof original>) {
+    if (args[0] === process.execPath && Array.isArray(args[1]) && args[1][0] === script) builds++;
+    return Reflect.apply(original, childProcess, args);
+  });
+  syncBuiltinESMExports();
+  try {
+    for (let index = 0; index < 2; index++) {
+      const f = await sourceFilesFixture(); fixtures.push(f);
+      await withNativeSourceRoot(f.sessions, handle => assert.equal(handle.kind, "directory"));
+      assert.equal(f.state.handles.size, 0);
+    }
+    assert.equal(builds, 1, "an existing addon is rebuilt, then the second fixture shares that completed preparation");
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    for (const f of fixtures) await f.close();
+  }
+});
+
 linuxTest("#152 IG1 capture rejects a non-narrow child before its payload", async () => {
   const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: false, prepare: true });
   try {
@@ -185,28 +208,6 @@ linuxTest("#152 S fixture loads the real native owner bridge (no profile qualifi
   const result = spawnSync(process.execPath, ["scripts/build-maintenance-platform.mjs", "--source-files"],
     { cwd: process.cwd(), encoding: "utf8", timeout: 65_000 });
   assert.equal(result.error, undefined); assert.equal(result.status, 0, result.stderr);
-});
-linuxTest("#152 S shared fixture prepares the current native bridge once before actual owner use", async t => {
-  const original = childProcess.spawnSync;
-  const script = fileURLToPath(new URL("../scripts/build-maintenance-platform.mjs", import.meta.url));
-  const fixtures: Awaited<ReturnType<typeof sourceFilesFixture>>[] = [];
-  let builds = 0;
-  t.mock.method(childProcess, "spawnSync", function(...args: Parameters<typeof original>) {
-    if (args[0] === process.execPath && Array.isArray(args[1]) && args[1][0] === script) builds++;
-    return Reflect.apply(original, childProcess, args);
-  });
-  syncBuiltinESMExports();
-  try {
-    for (let index = 0; index < 2; index++) {
-      const f = await sourceFilesFixture(); fixtures.push(f);
-      await withNativeSourceRoot(f.sessions, handle => assert.equal(handle.kind, "directory"));
-      assert.equal(f.state.handles.size, 0);
-    }
-    assert.equal(builds, 1, "an existing addon is rebuilt, then the second fixture shares that completed preparation");
-  } finally {
-    t.mock.restoreAll(); syncBuiltinESMExports();
-    for (const f of fixtures) await f.close();
-  }
 });
 linuxTest("#152 S shared fixture preserves an actual compiler failure without retry or fixture creation", async t => {
   const directory = await promises.mkdtemp(path.join(process.cwd(), ".agent-output-s-build-failure-"));
