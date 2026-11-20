@@ -11,6 +11,15 @@ test("CFP2 config-null preview retains the exact original null binding without n
 });
 
 const linuxTest = process.platform === "linux" ? test : test.skip;
+linuxTest("#152 IG1 RED preview rejects its non-narrow parent before reading config", async () => {
+  const copy = await isolatedSourcePreview(), f = await sourceFilesFixture({ prepare: true });
+  try {
+    f.state.flags.set(f.directory, 0x40n);
+    await assert.rejects(copy.module.readSourceConfigPreview(f.config), { code: "backup_capability_unavailable" });
+    assert(!f.state.events.some(event => /^(read|synchronize):/.test(event)));
+    assert.equal(f.state.handles.size, 0);
+  } finally { await f.close(); await copy.close(); }
+});
 linuxTest("CFP2 actual config read uses R/F and closes its tail with no sync or output under synthetic qualification", async () => {
   const copy = await isolatedSourcePreview(), f = await sourceFilesFixture({ prepare: true });
   try {

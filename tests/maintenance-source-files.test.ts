@@ -20,6 +20,28 @@ async function rejected(work: Promise<unknown>) {
   try { await work; } catch (error) { return { rejected: true, error: error as { code: string; cause: unknown; closeErrors: unknown[]; tcutReached: boolean } }; }
   assert.fail("operation unexpectedly succeeded");
 }
+
+linuxTest("#152 IG1 RED capture rejects a non-narrow child before its payload", async () => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: false, prepare: true });
+  try {
+    f.state.flags.set(path.join(f.sessions, "nested", "binary"), 0x40n);
+    const result = await rejected(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference));
+    assert.equal(result.error.code, "backup_capability_unavailable");
+    assert(!f.state.events.includes("read:sessions/nested/binary"));
+    assert.equal(result.error.tcutReached, false); assert.equal(f.state.handles.size, 0);
+  } finally { await f.close(); await copy.close(); }
+});
+
+linuxTest("#152 IG1 RED same-source parent is admitted before child enumeration or payload", async () => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: false, prepare: true });
+  try {
+    f.state.flags.set(f.directory, 0x40n);
+    const result = await rejected(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference));
+    assert.equal(result.error.code, "backup_capability_unavailable");
+    assert(!f.state.events.some(event => /^(read|enumerate|synchronize):/.test(event)));
+    assert.equal(result.error.tcutReached, false); assert.equal(f.state.handles.size, 0);
+  } finally { await f.close(); await copy.close(); }
+});
 async function manifests(store: ArtifactStore): Promise<string[]> {
   const names: string[] = [];
   try {

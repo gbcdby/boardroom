@@ -69,7 +69,13 @@ function wrap(raw: SourceFileHandle, file: string, state: State, active: () => b
     state.events.push(operation + ":" + path.relative(state.directory, file)); state.hook(operation, file, value);
   };
   const metadata = (value: SourceFileExtendedObservation["before"]) => ({ ...value, fsType: 0xef53n });
-  const statx = (): SourceFileStatxObservation => ({ ...raw.observeStatx(), mountId: 71n + state.mountDelta });
+  const statx = (): SourceFileStatxObservation => {
+    const observed = raw.observeStatx();
+    // Explicitly inert ext4 shape, like the UUID/FID/profile below. The host's
+    // real statx mask does not qualify its filesystem for this S control test.
+    return { ...observed, attributes: observed.attributes & ~0x200800n,
+      attributesMask: observed.attributesMask | 0x200800n, mountId: 71n + state.mountDelta };
+  };
   const handle: FixtureHandle = {
     kind: raw.kind,
     observe() { call("observe"); return { ...raw.observe(), fsType: 0xef53n }; },
@@ -88,7 +94,7 @@ function wrap(raw: SourceFileHandle, file: string, state: State, active: () => b
       const result: SourceFileExtendedObservation = { ...value, before: metadata(value.before), after: metadata(value.after),
         uuid: fact({ length: 16n, bytes: Buffer.from("41".repeat(16), "hex") }, "ioctl-getfsuuid"),
         fid: fact({ handleType: 1n, handleBytes: 8n, mountId: 9001n + state.mountDelta, bytes: Buffer.from(incarnation, "hex") }, "name-to-handle-at"),
-        inodeFlags: fact(state.flags.get(file) ?? 0n, "ioctl-getflags"),
+        inodeFlags: fact(state.flags.get(file) ?? 0x80000n, "ioctl-getflags"),
         xattrs: fact(state.attributes.get(file) ?? [], "flistxattr-fixture") };
       state.hook("extended-result", file, result); return result;
     },

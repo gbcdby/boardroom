@@ -73,7 +73,7 @@ function profileParserFixture(): any {
   function statx(unique: boolean): Buffer {
     const raw = Buffer.alloc(256);
     raw.writeUInt32LE(0xfff | (unique ? 0x4000 : 0x1000), 0);
-    raw.writeBigUInt64LE(0x200000n, 56); raw.writeUInt32LE(1, 16);
+    raw.writeBigUInt64LE(0x200800n, 56); raw.writeUInt32LE(1, 16);
     raw.writeUInt32LE(1001, 20); raw.writeUInt32LE(1001, 24); raw.writeUInt16LE(Number(metadata.mode), 28);
     raw.writeBigUInt64LE(metadata.ino, 32); raw.writeBigUInt64LE(metadata.size, 40);
     for (const [offset, value] of [[64, metadata.atimeNs], [80, 1n], [96, metadata.ctimeNs], [112, metadata.mtimeNs]] as const) {
@@ -133,6 +133,15 @@ function profileParserFixture(): any {
     uniqueStatx: { uniqueMountId: 9007199254740995n, ino: metadata.ino }, legacyStatx: { mountId: 17n, ino: metadata.ino } };
   return { metadata, legacyBytes, uniqueBytes, request, result, mountinfo, environment, context };
 }
+
+test("#152 IG1 RED metadata-only bootstrap rejects DAX before readable promotion", async () => {
+  await withProfileParsers(parse => {
+    const fixture = profileParserFixture();
+    for (const raw of [fixture.legacyBytes, fixture.uniqueBytes]) raw.writeBigUInt64LE(0x200000n, 8);
+    const context = { info: { ...fixture.context.info, stage: "metadata-only" }, environment: fixture.environment };
+    assert.throws(() => parse.analyzeEnvironment(context), { code: "backup_capability_unavailable" });
+  });
+});
 
 test("#152 P3 pure statx and mount parsers bind separate IDs, exact ABI and complete mountinfo", async () => {
   await withProfileParsers(parse => {
