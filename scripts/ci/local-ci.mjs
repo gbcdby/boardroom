@@ -60,7 +60,9 @@ function preflight() {
   }, null, 2));
   run("typecheck", "npm", ["run", "typecheck"]);
   if (!skipWeb) run("build:web", "npm", ["run", "build"]);
+  else skip("build:web", "--no-web was set");
   if (!skipNative) run("native build", process.execPath, ["scripts/build-maintenance-platform.mjs", "--required"]);
+  else skip("native build", "--no-native was set");
   run("whole-suite budget/ launcher controls", "python3", ["-B", "scripts/ci/test_linux_isolation.py",
     "WholeSuiteBudgetContracts", "LauncherContracts.test_original_commands_and_explicit_pg_scope", "-v"]);
   run("fs effective options", "python3", ["tests/fs-effective-options.test.py"]);
@@ -71,15 +73,24 @@ function preflight() {
   if (process.platform === "linux") run("partition contracts", "python3", ["-B", "scripts/ci/test_linux_isolation.py", "WholeSuitePartitionContracts", "-v"]);
   else skip("partition contracts", "Linux-only partition execution contracts");
   run("macOS partition contracts", "python3", ["-B", "scripts/ci/test_macos_partitions.py", "-v"]);
-  if (process.platform === "darwin" && !skipNative) {
+  if (process.platform !== "darwin") skip("darwin native gates", "not a macOS host");
+  else if (skipNative) {
+    skip("darwin maintenance acceptance", "--no-native was set");
+    skip("darwin maintenance regression", "--no-native was set");
+  } else {
     run("darwin maintenance acceptance", process.execPath,
       ["--test", "--test-reporter=tap", "--test-timeout=60000", "--test-concurrency=1", "tests/maintenance-darwin.acceptance.ts"]);
     const regression = ["tests/db-host-migration.test.ts", "tests/native-management-admission.test.ts", "tests/storage-source-client.test.ts",
       "tests/maintenance-platform.test.ts", "tests/maintenance-objects.test.ts", "tests/maintenance-plan.test.ts"];
-    if (skipLocalLimited) skip("maintenance-sqlite regression", "本机 libproc 进程审计受限；CI macos-26 分片仍执行该文件");
-    else regression.splice(4, 0, "tests/maintenance-sqlite.test.ts");
     run("darwin maintenance regression", process.execPath,
       ["--test", "--test-reporter=tap", "--test-timeout=60000", "--test-concurrency=1", ...regression]);
+    const sqliteSafe = "source-bound SQLite operation mutex|native lock serializes all control CAS|SQLite verification keeps its original pending|SQLite handled verification cleanup failure";
+    if (skipLocalLimited) {
+      skip("maintenance-sqlite libproc-limited tests", "本机 libproc 进程审计受限；CI macos-26 分片仍执行这两项");
+      run("maintenance-sqlite local regression", process.execPath,
+        ["--test", "--test-reporter=tap", "--test-timeout=60000", "--test-concurrency=1", "--test-name-pattern", sqliteSafe, "tests/maintenance-sqlite.test.ts"]);
+    } else run("maintenance-sqlite full regression", process.execPath,
+      ["--test", "--test-reporter=tap", "--test-timeout=60000", "--test-concurrency=1", "tests/maintenance-sqlite.test.ts"]);
   }
   return ok;
 }
@@ -114,6 +125,7 @@ const failed = results.filter(result => !result.skipped && result.status !== 0);
 writeFileSync(path.join(outDir, "summary.json"), JSON.stringify({
   started, finished: stamp(), durationMs: Date.now() - started, mode, platform: process.platform,
   node: process.version, results, failed: failed.length,
+  options: { jobs, skipWeb, skipNative, skipLocalLimited },
 }, null, 2));
 console.log(`\n本地 CI：${results.filter(result => result.status === 0).length}/${results.length - results.filter(result => result.skipped).length} 个可执行步骤通过，${results.filter(result => result.skipped).length} 个平台专属步骤跳过；日志 ${outDir}`);
 if (failed.length) process.exitCode = 1;

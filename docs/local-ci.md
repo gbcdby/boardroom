@@ -4,7 +4,7 @@
 
 ## 目的
 
-`scripts/ci/local-ci.mjs` 把云端 workflow 中可以本地执行的步骤集中为快速入口，用于在等待 GitHub Actions 前发现类型、构建、纯控制和目标测试失败。它不修改测试门槛，不跳过用例，只改变执行位置与并发方式。
+`scripts/ci/local-ci.mjs` 把云端 workflow 中可以本地执行的步骤集中为快速入口，用于在等待 GitHub Actions 前发现类型、构建、纯控制和目标测试失败。它不修改测试门槛；所有省略均在摘要中记为 SKIP 并说明原因，只改变执行位置与并发方式。
 
 ## 用法
 
@@ -21,10 +21,10 @@ npm run ci:local -- --no-web --no-native
 - `--shard=i/8`：跑一个 macOS 全量分片。
 - `--full`：本地并行跑 8 个 macOS 分片，日志写入 `.agent-output/local-ci/`。
 - `--jobs=N`：本地并行度，默认 4。
-- `--no-web` / `--no-native`：跳过 Web 构建或原生维护工具构建，仅用于定位环境问题，不能作为完整结果。
-- `--skip-local-limited`：显式跳过本机已知受限的 `tests/maintenance-sqlite.test.ts` 进程审计用例（macOS 本机 libproc 观察其他进程失败，CI macos-26 仍执行）；摘要中记为 SKIP，绝不写成 PASS。
+- `--no-web` / `--no-native`：跳过 Web 构建或原生维护工具构建，仅用于定位环境问题；被省略的步骤及其 macOS 原生回归会逐项记为 SKIP，摘要顶层同时记录选项，不能作为完整结果。
+- `--skip-local-limited`：显式跳过 `tests/maintenance-sqlite.test.ts` 中仅两项已知本机 libproc 受限用例；同文件其余四项仍执行，跳过项记为 SKIP，CI macos-26 仍执行完整文件。
 
-结果摘要写入 `.agent-output/local-ci/summary.json`，包含每步命令、退出码、耗时、平台与 Node 版本。
+结果摘要写入 `.agent-output/local-ci/summary.json`，包含每步命令、退出码、耗时、平台、Node 版本、影响覆盖范围的选项与各 SKIP 原因。
 
 ## 边界
 

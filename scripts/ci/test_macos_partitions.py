@@ -10,6 +10,11 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+FULL_MATRIX = "github.event_name == 'workflow_dispatch' && inputs.full_matrix"
+FULL_MATRIX_LABEL = "github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full')"
+FULL_MATRIX_IF = f"${{{{ ({FULL_MATRIX}) || ({FULL_MATRIX_LABEL}) }}}}"
+FULL_MATRIX_AGGREGATE_IF = f"${{{{ always() && (({FULL_MATRIX}) || ({FULL_MATRIX_LABEL})) }}}}"
+FULL_MATRIX_BROWSER_IF = f"${{{{ !cancelled() && (({FULL_MATRIX}) || ({FULL_MATRIX_LABEL})) }}}}"
 
 
 class MacosPartitionContracts(unittest.TestCase):
@@ -24,6 +29,9 @@ class MacosPartitionContracts(unittest.TestCase):
 
     def test_fixed_jobs_keep_native_gates_default_concurrency_and_observation(self):
         self.assertEqual(self.job['runs-on'], 'macos-26')
+        self.assertEqual(self.job['if'], FULL_MATRIX_IF)
+        self.assertEqual(self.workflow['jobs']['browser-dependencies']['if'], FULL_MATRIX_IF)
+        self.assertEqual(self.workflow['jobs']['managed-web-browser']['if'], FULL_MATRIX_BROWSER_IF)
         self.assertEqual(self.job['timeout-minutes'], 15)
         self.assertEqual(self.job['strategy'], {'fail-fast': False, 'matrix': {'include': [
             {'partition': f'{index}/8', 'script': f'test:ci:macos:{index}of8'}
@@ -60,9 +68,7 @@ class MacosPartitionContracts(unittest.TestCase):
         aggregate = self.workflow['jobs']['macos-tests']
         self.assertEqual(aggregate['name'], 'Node 24 · macOS arm64 / SQLite')
         self.assertEqual(aggregate['needs'], 'macos-partitions')
-        self.assertIn('always()', aggregate['if'])
-        self.assertIn('inputs.full_matrix', aggregate['if'])
-        self.assertIn("contains(github.event.pull_request.labels.*.name, 'ci-full')", aggregate['if'])
+        self.assertEqual(aggregate['if'], FULL_MATRIX_AGGREGATE_IF)
         gate, = aggregate['steps']
         self.assertEqual(gate['env']['PARTITIONS_RESULT'], '${{ needs.macos-partitions.result }}')
         for result in ('success', 'failure', 'cancelled', 'skipped', '', 'unknown'):
