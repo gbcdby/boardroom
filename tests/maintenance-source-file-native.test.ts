@@ -20,7 +20,7 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 interface PureNativeDecoders {
   checkedBlockAttributes(value: unknown, source: any, device: any, calls: readonly SourceFileNativeCall[]): any;
   checkedEnvironment(value: unknown, info: any, tail?: boolean): SourceFileRootEnvironment;
-  checkedKernelReadFact(value: unknown, limit: number, samples?: 1 | 2): SourceFileContextFact<SourceFileKernelReadValue>;
+  checkedKernelReadFact(value: unknown, limit: number, samples?: 1 | 2, allowChangedLength?: boolean): SourceFileContextFact<SourceFileKernelReadValue>;
   checkedAuxiliaryCalls(value: unknown, complete?: boolean, unavailableGraph?: boolean): readonly SourceFileNativeCall[];
   checkedEnumeration(value: unknown, index: number): readonly SourceFileNativeCall[];
 }
@@ -412,6 +412,19 @@ test("#152 P3 double samples independently require EOF, close and full bytes wit
     const unavailable = decode(absent, 4096, 2);
     assert.equal(unavailable.status, "unavailable"); assert.equal(unavailable.value, null);
     assert.equal(unavailable.calls[7]!.errno, 2n, "both real absence observations remain explicit, never a success value");
+  });
+});
+test("#152 summary second sample may change length but never exceeds the original per-file limit", async () => {
+  await withNativeDecoders(({ checkedKernelReadFact: decode }) => {
+    const changed = kernelReadFixture(2) as any;
+    changed.calls[11].rc = 3n;
+    assert.equal(decode(changed, 4096, 2, true).status, "observed", "a longer retained observation remains bounded");
+    const oversized = kernelReadFixture(2) as any;
+    oversized.calls[11].rc = 4097n;
+    assert.throws(() => decode(oversized, 4096, 2, true), { code: "backup_capability_unavailable" },
+      "the second sample cannot claim limit+1 bytes in total");
+    assert.throws(() => decode(changed, 4096, 2), { code: "backup_capability_unavailable" },
+      "ordinary two-sample facts still require equal byte lengths");
   });
 });
 
