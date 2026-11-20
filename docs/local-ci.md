@@ -22,6 +22,7 @@ npm run ci:local -- --no-web --no-native
 - `--full`：本地并行跑 8 个 macOS 分片，日志写入 `.agent-output/local-ci/`。
 - `--jobs=N`：本地并行度，默认 4。
 - `--no-web` / `--no-native`：跳过 Web 构建或原生维护工具构建，仅用于定位环境问题，不能作为完整结果。
+- `--skip-local-limited`：显式跳过本机已知受限的 `tests/maintenance-sqlite.test.ts` 进程审计用例（macOS 本机 libproc 观察其他进程失败，CI macos-26 仍执行）；摘要中记为 SKIP，绝不写成 PASS。
 
 结果摘要写入 `.agent-output/local-ci/summary.json`，包含每步命令、退出码、耗时、平台与 Node 版本。
 

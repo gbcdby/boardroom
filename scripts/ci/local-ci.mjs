@@ -19,6 +19,7 @@ const mode = option("full", false) ? "full" : option("shard") ? "shard" : option
 const jobs = Math.max(1, Number(option("jobs", 4)) || 4);
 const skipWeb = Boolean(option("no-web", false));
 const skipNative = Boolean(option("no-native", false));
+const skipLocalLimited = Boolean(option("skip-local-limited", false));
 
 const results = [];
 const started = Date.now();
@@ -73,11 +74,12 @@ function preflight() {
   if (process.platform === "darwin" && !skipNative) {
     run("darwin maintenance acceptance", process.execPath,
       ["--test", "--test-reporter=tap", "--test-timeout=60000", "--test-concurrency=1", "tests/maintenance-darwin.acceptance.ts"]);
+    const regression = ["tests/db-host-migration.test.ts", "tests/native-management-admission.test.ts", "tests/storage-source-client.test.ts",
+      "tests/maintenance-platform.test.ts", "tests/maintenance-objects.test.ts", "tests/maintenance-plan.test.ts"];
+    if (skipLocalLimited) skip("maintenance-sqlite regression", "本机 libproc 进程审计受限；CI macos-26 分片仍执行该文件");
+    else regression.splice(4, 0, "tests/maintenance-sqlite.test.ts");
     run("darwin maintenance regression", process.execPath,
-      ["--test", "--test-reporter=tap", "--test-timeout=60000", "--test-concurrency=1",
-        "tests/db-host-migration.test.ts", "tests/native-management-admission.test.ts", "tests/storage-source-client.test.ts",
-        "tests/maintenance-platform.test.ts", "tests/maintenance-sqlite.test.ts", "tests/maintenance-objects.test.ts",
-        "tests/maintenance-plan.test.ts"]);
+      ["--test", "--test-reporter=tap", "--test-timeout=60000", "--test-concurrency=1", ...regression]);
   }
   return ok;
 }
