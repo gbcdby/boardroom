@@ -11,6 +11,7 @@ import { parsePlan, parseSourceFiles, readSourceFiles } from "./parse.ts";
 import { observePlannedPath } from "./plan.ts";
 import { syncMaintenanceHandle } from "./platform.ts";
 import { withNativeSourceRoot } from "./source-file-native.ts";
+import { sourceFileObservationStart, chargeSourceFileObservation } from "./source-file-writers.ts";
 import type { SourceFileHandle, SourceFileExtendedMetadata, SourceFileExtendedObservation,
   SourceFileStatxObservation, SourceFileUniqueStatxObservation, SourceFileExpectedProfile } from "./source-file-native.ts";
 import { matchSourceFileProfile, SOURCE_PREPARE_PROFILE } from "./source-file-profile.ts";
@@ -195,6 +196,7 @@ interface Scan {
   readonly closeErrors: unknown[]; readonly stages: { stage: Stage; at: string }[];
   readonly rootsEvidence: WindowEvidence[]; readonly entriesEvidence: EntryWindowEvidence[];
   count: number; keptBytes: number; contentBytes: bigint; stage: Stage; tcut: boolean;
+  chargedCount: number; chargedBytes: number; chargedContentBytes: bigint;
   preparePolicy: boolean;
   attempt: string | undefined;
 }
@@ -202,6 +204,9 @@ function stage(scan: Scan, value: Stage): void {
   scan.stage = value; scan.stages.push({ stage: value, at: new Date().toISOString() });
 }
 function budget(scan: Scan): void {
+  chargeSourceFileObservation(scan.count - scan.chargedCount, scan.keptBytes - scan.chargedBytes,
+    scan.contentBytes - scan.chargedContentBytes);
+  scan.chargedCount = scan.count; scan.chargedBytes = scan.keptBytes; scan.chargedContentBytes = scan.contentBytes;
   requireValue(performance.now() - scan.start <= MAX_WORK_MS && scan.count <= MAX_ENTRIES
     && scan.keptBytes <= MAX_MANIFEST_BYTES && scan.contentBytes <= MAX_CONTENT_BYTES,
   "backup_capability_unavailable", "source-files-budget");
@@ -341,7 +346,8 @@ async function initialScan(store: ArtifactStore, lock: SourceLock, mutex: Operat
   const scan: Scan = { store: guarded, lock, mutex, reference, plan, initial, raw, start, mode, forbidden: new Set(), seen: new Set(),
     syncedDirectories: new Set(), expectedBindings: new Map(), windows: [],
     entries: [], bindings: [], closeErrors: [], stages: [], rootsEvidence: [], entriesEvidence: [],
-    count: 0, keptBytes: 0, contentBytes: 0n, stage: "input", tcut: false, preparePolicy: false, attempt: undefined };
+    count: 0, keptBytes: 0, contentBytes: 0n, chargedCount: 0, chargedBytes: 0, chargedContentBytes: 0n,
+    stage: "input", tcut: false, preparePolicy: false, attempt: undefined };
   try {
     retain(scan, plan.fileRoots); await current(scan); stage(scan, "boundary"); await protectedIdentities(scan);
     if (mode === "record-attempt") scan.attempt = await guarded.createAttempt(state.ownerGeneration);
@@ -669,7 +675,7 @@ async function writeAttempt(scan: Scan, successful: boolean): Promise<void> {
 }
 async function run(store: ArtifactStore, lock: SourceLock, mutex: OperationMutex, reference: PersistedPlanRef,
   existing?: ArtifactRef, mode: "record-attempt" | "read-only" = "record-attempt"): Promise<{ ref: ArtifactRef; manifest: SourceFilesManifest }> {
-  const start = performance.now();
+  const start = sourceFileObservationStart() ?? performance.now();
   const previous = failedSourceWindows.get(lock);
   if (previous) throw previous;
   let scan: Scan | undefined, result: { ref: ArtifactRef; manifest: SourceFilesManifest } | undefined;

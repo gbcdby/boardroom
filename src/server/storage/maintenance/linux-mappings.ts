@@ -15,20 +15,33 @@ function unavailable(): never { throw new Error("linux_mapping_inventory_unavail
 function absent(error: unknown): boolean { return ["ENOENT", "ESRCH"].includes(String((error as NodeJS.ErrnoException).code)); }
 
 // Bound both allocation and the number of reads. Reaching a limit is unknown, never EOF.
-function procText(file: string, limit: number): string {
+export function readLinuxProcText(file: string, limit: number, check = () => {},
+  uncertainClose?: (owner: object, error: unknown) => void): string {
+  check();
   const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let failed = false, first: unknown, result: string | undefined;
   try {
     const parts: Buffer[] = [], chunk = Buffer.allocUnsafe(64 * 1024); let bytes = 0;
     for (let reads = 0; reads < READ_LIMIT; reads++) {
+      check();
       const size = readSync(fd, chunk, 0, Math.min(chunk.length, limit + 1 - bytes), null);
-      if (size === 0) return Buffer.concat(parts, bytes).toString("latin1");
+      if (size === 0) { result = Buffer.concat(parts, bytes).toString("latin1"); break; }
       bytes += size;
       if (bytes > limit) unavailable();
       parts.push(Buffer.from(chunk.subarray(0, size)));
     }
-    return unavailable();
-  } finally { closeSync(fd); }
+    if (result === undefined) unavailable();
+  } catch (error) { failed = true; first = error; }
+  try { closeSync(fd); }
+  catch (error) {
+    uncertainClose?.({ fd, file, attempted: true }, error);
+    if (failed) throw new AggregateError([first, error], "linux-process-observation", { cause: first });
+    throw error;
+  }
+  if (failed) throw first;
+  return result!;
 }
+const procText = readLinuxProcText;
 
 export interface LinuxSourceMappingIdentity {
   readonly file: string;
@@ -116,15 +129,15 @@ export function linuxMappedSourceHandles(directory: string, sources: readonly Li
   return { handles, empty: text.length === 0 };
 }
 
-function processIdentity(directory: string) {
-  const text = procText(`${directory}/stat`, 8192), end = text.lastIndexOf(") ");
+function processIdentity(directory: string, check?: () => void, uncertainClose?: (owner: object, error: unknown) => void) {
+  const text = procText(`${directory}/stat`, 8192, check, uncertainClose), end = text.lastIndexOf(") ");
   const pid = /^([1-9][0-9]*) \(/.exec(text), fields = text.slice(end + 2).trim().split(/\s+/);
   if (!pid || end < 0 || !/^[A-Za-z]$/.test(fields[0] ?? "") || !/^[1-9][0-9]*$/.test(fields[17] ?? "")
     || !/^[0-9]{1,20}$/.test(fields[19] ?? "")) unavailable();
   return { pid: pid[1]!, startTicks: fields[19]!, state: fields[0]!, threads: fields[17]! };
 }
-function processGone(directory: string): boolean {
-  try { processIdentity(directory); return false; }
+function processGone(directory: string, check?: () => void, uncertainClose?: (owner: object, error: unknown) => void): boolean {
+  try { processIdentity(directory, check, uncertainClose); return false; }
   catch (error) { return absent(error); }
 }
 
@@ -165,6 +178,120 @@ export function confirmedLinuxZombieFdDenial(
 export function linuxMappingIdentityAvailable(kernelRelease: string): boolean {
   const match = /^([0-9]+)\.([0-9]+)(?:\.|-)/.exec(kernelRelease);
   return !!match && (Number(match[1]) > 6 || (Number(match[1]) === 6 && Number(match[2]) >= 8));
+}
+
+export interface LinuxFileProcessSelection {
+  readonly files: readonly string[];
+  readonly trees: readonly string[];
+  readonly identities: ReadonlySet<string>;
+  readonly mappedIdentities: ReadonlySet<string>;
+}
+/** Internal observer hooks come only from the live local inventory owner. No
+ * request, stored audit, PID allowlist or caller-provided FD map reaches here. */
+export interface LinuxFileProcessOwner {
+  check(): Promise<void>;
+  checkSync(): void;
+  observedEntry(): void;
+  ownsDescriptor(fd: number, identity: string): boolean;
+  uncertainClose(owner: object, error: unknown): void;
+}
+
+/** The G2 selection needs only plan strings/identities. G3 supplies real pinned
+ * metadata identities. Neither call looks up a source pathname. All current-UID
+ * FDs are statted, so a renamed or aliased FD also matches by object identity. */
+export async function inspectLinuxFileProcesses(selection: LinuxFileProcessSelection,
+  owner: LinuxFileProcessOwner): Promise<Blocker[]> {
+  const blockers: Blocker[] = [], uid = process.getuid!();
+  const unknown = (pid: string) => blockers.push({ code: "source_writer_unknown", subjectRef: `unreadable-process:${pid}` });
+  await owner.check();
+  if (!linuxMappingIdentityAvailable(release())) return [{ code: "source_writer_unknown", subjectRef: "os-inventory-unavailable" }];
+  let pids: string[];
+  try { pids = (await readdir("/proc")).filter(entry => /^[1-9][0-9]*$/.test(entry)); }
+  catch { return [{ code: "source_writer_unknown", subjectRef: "os-inventory-unavailable" }]; }
+  await owner.check();
+  const named = (target: string) => selection.files.includes(target)
+    || selection.trees.some(tree => target === tree || target.startsWith(tree === "/" ? "/" : `${tree}/`));
+  const descriptorIdentity = (fd: number) => {
+    const info = fstatSync(fd, { bigint: true });
+    if (!info.isDirectory()) unavailable();
+    const rows = procText(`/proc/self/fdinfo/${fd}`, 65_536, undefined, owner.uncertainClose)
+      .split("\n").filter(line => line.startsWith("flags:"));
+    const flags = rows.length === 1 ? /^flags:\s*([0-7]{1,12})\s*$/.exec(rows[0]!) : null;
+    if (!flags) unavailable();
+    return `${info.dev}:${info.ino}:${BigInt(`0o${flags[1]}`)}`;
+  };
+  for (const pid of pids) {
+    await owner.check(); owner.observedEntry();
+    let processFd: number | undefined, directory: string | undefined, processBinding: string | undefined;
+    let observedBefore: ReturnType<typeof processIdentity> | undefined, observedUid: number | undefined;
+    try {
+      processFd = openSync(`/proc/${pid}`, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      processBinding = descriptorIdentity(processFd);
+      observedUid = fstatSync(processFd).uid;
+      if (observedUid !== uid) continue;
+      directory = `/proc/self/fd/${processFd}`;
+      const before = processIdentity(directory, owner.checkSync, owner.uncertainClose); observedBefore = before;
+      if (before.pid !== pid) unavailable();
+      const fds = await readdir(`${directory}/fd`); await owner.check();
+      for (const fd of fds) {
+        await owner.check(); owner.observedEntry();
+        try {
+          if (!/^(0|[1-9][0-9]*)$/.test(fd) || !Number.isSafeInteger(Number(fd))) unavailable();
+          const file = `${directory}/fd/${fd}`, target = (await readlink(file)).replace(/ \(deleted\)$/, "");
+          await owner.check();
+          const info = await stat(file, { bigint: true }), identity = `${info.dev}:${info.ino}`;
+          await owner.check();
+          if (!named(target) && !selection.identities.has(identity)) continue;
+          if (Number(pid) === process.pid && owner.ownsDescriptor(Number(fd), identity)) continue;
+          blockers.push({ code: "source_writer_unknown", subjectRef: `os-process:${pid}` });
+        } catch (error) {
+          // Only a disappearing individual FD is the existing descriptor race
+          // exception; an inaccessible live FD or malformed observation is unknown.
+          owner.checkSync();
+          if (!["ENOENT", "ESRCH", "EBADF"].includes(String((error as NodeJS.ErrnoException)?.code))) unknown(pid);
+        }
+      }
+      await owner.check();
+      const text = procText(`${directory}/maps`, MAP_LIMIT, owner.checkSync, owner.uncertainClose), mappings = parseLinuxMappings(text);
+      for (const mapping of mappings) {
+        owner.observedEntry();
+        if (selection.mappedIdentities.has(mapping.mappedIdentity))
+          blockers.push({ code: "source_writer_unknown", subjectRef: `os-process:${pid}` });
+      }
+      const after = processIdentity(directory, owner.checkSync, owner.uncertainClose);
+      if (after.pid !== before.pid || after.startTicks !== before.startTicks || fstatSync(processFd).uid !== uid) unavailable();
+      if (text.length === 0 && !(before.state === "Z" && after.state === "Z" && before.threads === "1" && after.threads === "1")) unavailable();
+    } catch (error) {
+      owner.checkSync();
+      const missing = absent(error), fault = error as NodeJS.ErrnoException | null;
+      const pinnedFdDenied = directory !== undefined && fault?.code === "EACCES"
+        && fault.syscall === "scandir" && fault.path === `${directory}/fd`;
+      let retired = false;
+      if (missing || pinnedFdDenied) {
+        if (missing && (directory === undefined || processGone(directory, owner.checkSync, owner.uncertainClose))) retired = true;
+        else if (directory && observedBefore && observedUid !== undefined && processFd !== undefined) {
+          try {
+            const after = processIdentity(directory, owner.checkSync, owner.uncertainClose), afterUid = fstatSync(processFd).uid;
+            retired = missing && confirmedLinuxZombieExit(observedBefore, after, observedUid, afterUid, uid)
+              || pinnedFdDenied && confirmedLinuxZombieFdDenial(fault, directory, observedBefore, after, observedUid, afterUid, uid);
+          } catch { /* Unreadable corroboration is unknown. */ }
+        }
+      }
+      if (!retired) unknown(pid);
+    } finally {
+      if (processFd !== undefined) {
+        // Never retry a numeric descriptor after an uncertain native close.
+        const retained = { fd: processFd, pid, directory, processBinding };
+        try {
+          if (processBinding === undefined || descriptorIdentity(processFd) !== processBinding) unavailable();
+          closeSync(processFd);
+        }
+        catch (error) { owner.uncertainClose(retained, error); unknown(pid); }
+      }
+    }
+    await owner.check();
+  }
+  return [...new Map(blockers.map(blocker => [blocker.subjectRef, blocker])).values()];
 }
 
 export async function inspectLinuxSourceProcesses(files: readonly string[], sessions: string, ownHandles: ReadonlyMap<string, string>,

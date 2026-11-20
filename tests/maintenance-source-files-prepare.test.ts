@@ -2,8 +2,43 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readdir } from "node:fs/promises";
 import { isolatedSourceFiles, sourceFilesFixture, SOURCE_PREPARE_PROFILE } from "./fixtures/maintenance-source-files.ts";
+import { inspectSourceFileWriters, withSourceFileObservationWindow } from "../src/server/storage/maintenance/source-file-writers.ts";
 
 const linuxTest = process.platform === "linux" ? test : test.skip;
+
+linuxTest("WR1 actual local inventory composes with existing CFP2 readers, prepare and readonly close order", async () => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ prepare: true });
+  try {
+    await withSourceFileObservationWindow(() => f.lock.assertHeld(), async () => {
+      await inspectSourceFileWriters(f.plan.fileRoots);
+      const captured = await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+      assert.equal(f.state.handles.size, 0, "actual CFP2 owners close before the facts inventory refresh");
+      await inspectSourceFileWriters(f.plan.fileRoots);
+      const at = f.state.events.length;
+      await copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref);
+      assert.equal(f.state.handles.size, 0);
+      assert(!f.state.events.slice(at).some(event => event.startsWith("synchronize:")));
+      await inspectSourceFileWriters(f.plan.fileRoots);
+    });
+  } finally { await f.close(); await copy.close(); }
+});
+
+linuxTest("WR1 source S cannot restart D0 after the real local inventory has consumed the window", async t => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ prepare: true });
+  let now = 0, produced = false, advanced = false;
+  try {
+    t.mock.method(performance, "now", () => now);
+    await assert.rejects(withSourceFileObservationWindow(() => f.lock.assertHeld(), async () => {
+      await inspectSourceFileWriters(f.plan.fileRoots);
+      now = 119_999;
+      f.state.hook = operation => { if (!advanced && operation.startsWith("profile:")) { now = 120_001; advanced = true; } };
+      await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference); produced = true;
+    }), { code: "backup_capability_unavailable" });
+    assert.equal(advanced, true); assert.equal(produced, false);
+    assert(!f.state.events.some(event => event.startsWith("read:")), "ordinary source content must not start after D0 expires");
+    assert.equal(f.state.handles.size, 0);
+  } finally { t.mock.restoreAll(); await f.close(); await copy.close(); }
+});
 
 linuxTest("CFP2 capture and every live compare prepare while readonly reopens without any sync or output", async () => {
   const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ prepare: true });
