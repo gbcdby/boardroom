@@ -2,7 +2,7 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { readFileSync, statSync, mkdtempSync, mkdirSync, rmSync, existsSync, copyFileSync, writeFileSync, renameSync,
-  chmodSync, linkSync, unlinkSync, symlinkSync } from "node:fs";
+  chmodSync, linkSync, unlinkSync, symlinkSync, openSync, constants } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -18,11 +18,11 @@ function fixture(body: (directory: string, source: string) => void): void {
   const source = path.join(directory, "selected", "agent-studio.db");
   try { body(directory, source); } finally { rmSync(directory, { recursive: true, force: true }); }
 }
-function observe(directory: string, url = moduleUrl) {
+function observe(directory: string, url = moduleUrl, cwd = directory) {
   const code = "import {inspectSelectedSqlitePathBinding as inspect} from " + JSON.stringify(url) + ";" +
     "try { console.log(JSON.stringify({ok:true,arity:inspect.length,value:await inspect()})); }" +
     "catch(error) { console.log(JSON.stringify({ok:false,code:error.code})); process.exitCode=1; }";
-  return spawnSync(process.execPath, ["--input-type=module", "-e", code], { cwd: directory,
+  return spawnSync(process.execPath, ["--input-type=module", "-e", code], { cwd,
     env: { BOARDROOM_HOME: path.join(directory, "home"), AGENT_STUDIO_DB_DRIVER: "sqlite", AGENT_STUDIO_DATA_DIR: path.join(directory, "selected") },
     encoding: "utf8", timeout: 15_000 });
 }
@@ -108,6 +108,36 @@ test("SQ-D02 I01：原入口缺失源明确拒绝且不创建目录或数据库"
   assert.equal(result.status, 1);
   assert.equal(JSON.parse(result.stdout).code, "source_unavailable");
   assert.equal(existsSync(path.dirname(source)), false);
+}));
+
+test("SQ-D02 I01：可遍历但不可读取的外部祖先不阻断真实只读观察", { skip: !linux }, () => fixture((directory, source) => {
+  sample(source);
+  const before = readFileSync(source);
+  chmodSync(directory, 0o111);
+  try {
+    assert.throws(() => openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY), { code: "EACCES" });
+    const result = observe(directory);
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.value.retirement, "closed");
+    assert.equal(output.value.observations.vfsMainPathUnmoved, true);
+    assert.deepEqual(readFileSync(source), before);
+    assert.equal(statSync(directory).mode & 0o777, 0o111, "不得扩大外部目录权限");
+  } finally { chmodSync(directory, 0o700); }
+}));
+
+test("SQ-D02 I01：元数据祖先pin不绕过真实遍历权限", { skip: !linux }, () => fixture((directory, source) => {
+  sample(source);
+  const before = readFileSync(source);
+  chmodSync(directory, 0o000);
+  try {
+    const result = observe(directory, moduleUrl, tmpdir());
+    assert.equal(result.error, undefined, "子进程应执行原入口，而非在cwd准备时失败");
+    assert.equal(result.status, 1, result.stderr + result.stdout);
+    assert.equal(JSON.parse(result.stdout).ok, false);
+    assert.equal(statSync(directory).mode & 0o777, 0o000);
+  } finally { chmodSync(directory, 0o700); }
+  assert.deepEqual(readFileSync(source), before);
 }));
 
 test("SQ-D02 I01：原入口二义source拒绝，不选择替代库或改变两个已有库", { skip: !linux }, () => fixture((directory, source) => {
