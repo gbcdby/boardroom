@@ -28,11 +28,22 @@ const selected = [
 const expectedTests = 24; // Eight original parents + twelve ACL and four native-failure subtests.
 const pattern = selected.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
 const digest = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+const withoutInheritedReporters = (options: string) => {
+  const args = options.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
+  const retained: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === "--test-reporter" || arg === "--test-reporter-destination") index++;
+    else if (!/^--test-reporter(?:-destination)?=/.test(arg)) retained.push(arg);
+  }
+  return retained.join(" ");
+};
 const nativeTestEnvironment = () => {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PG")));
-  // This process is itself a node --test child. Its internal context would make
-  // the independent nested runner exit successfully without running any files.
+  // The independent runner needs its own context and the single CLI reporter.
+  // Inherited reporter/destination pairs otherwise conflict with that reporter.
   delete env["NODE_TEST_CONTEXT"];
+  if (env["NODE_OPTIONS"] !== undefined) env["NODE_OPTIONS"] = withoutInheritedReporters(env["NODE_OPTIONS"]);
   return env;
 };
 
@@ -143,9 +154,13 @@ test("R05 child runner executes actual nested tests without inheriting the paren
   const original = { ...process.env };
   const env = nativeTestEnvironment();
   for (const [key, value] of Object.entries(original)) {
-    if (key === "NODE_TEST_CONTEXT") continue;
+    if (key === "NODE_TEST_CONTEXT" || key === "NODE_OPTIONS") continue;
     assert.ok(env[key] === (key.startsWith("PG") ? undefined : value), "preserve the original environment rule for " + key);
   }
+  const expectedNodeOptions = original["NODE_OPTIONS"]?.split(/\s+/)
+    .filter(arg => !arg.startsWith("--test-reporter=") && !arg.startsWith("--test-reporter-destination="))
+    .join(" ");
+  assert.equal(env["NODE_OPTIONS"], expectedNodeOptions, "retain every non-reporter Node option");
   const directory = await mkdtemp(join(tmpdir(), "boardroom-r05-child-"));
   try {
     const fixture = join(directory, "child.mjs");
