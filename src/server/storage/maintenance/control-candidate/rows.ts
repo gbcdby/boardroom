@@ -24,7 +24,7 @@ const utf8DecoderOptions=Object.freeze({fatal:true,ignoreBOM:true});
 
 export interface RowContext {
   readonly plan: MigrationPlan;
-  readonly record: JournalRecord | UntrustedJournalCandidate;
+  readonly record: Pick<JournalRecord | UntrustedJournalCandidate, 'source' | 'migrationId' | 'plan' | 'ownerGeneration' | 'sequence'>;
   /** Row/receipt history stays at the origin epoch, including the terminal E+1 record. */
   readonly fenceEpoch: number;
   readonly encoding: Encoding;
@@ -61,11 +61,13 @@ const pgSession = z.discriminatedUnion("owner", [
 const nativeSession = z.object({ kind: z.literal("sqlite"), owner: z.literal("native-management"), connectionId: text, state: z.literal("closed"), nativeTransactions: transactions }).strict();
 const envelope = z.object({ formatVersion: z.literal(1), sourceIdentity: z.unknown(), sessions: z.array(z.unknown()), drainReceipt: receiptSchema.nullable() }).strict();
 function parse<T>(schema: z.ZodType<T>, value: unknown): T { reserveP0FNativeClone(value); const result = schema.safeParse(value); requireCandidate(result.success); return result.data; }
-function json(value: string | null, frame?: P0FArtifactSyntaxFrame, row?: SourceClientRawRow,
+function json(value: string | null, frame?: P0FArtifactSyntaxFrame, row?: Omit<SourceClientRawRow, 'protocol_version'>,
   column?: 'host_identity_json' | 'process_identity_json' | 'db_sessions_json'): unknown {
   requireCandidate(value !== null);
-  const decode = () => { const decoded: unknown = JSON.parse(value);if(frame!==undefined)bindP0FRowJsonEncoding(frame,row!,column!,decoded); canonicalJson(decoded); return decoded; };
-  if (frame !== undefined) { assertP0FRowJson(frame, row!, column!, value); return decode(); }
+  const decode = () => { const decoded: unknown = JSON.parse(value);if(frame!==undefined)bindP0FRowJsonEncoding(frame,row as SourceClientRawRow,column!,decoded); canonicalJson(decoded); return decoded; };
+  // A supplied old frame still requires its exact authenticated original row.
+  // The new metadata-only consumer supplies no old row syntax frame.
+  if (frame !== undefined) { assertP0FRowJson(frame, row as SourceClientRawRow, column!, value); return decode(); }
   try { return decode(); }
   catch { requireCandidate(false); }
 }
@@ -168,7 +170,7 @@ export function sourceClientEpochClassification(row: Pick<SourceClientRawRow,'dr
   return currentClient(row,epoch)?'current-client':'historical-client';
 }
 type PgRegistered = Omit<Extract<EventFacts["sessions"], { kind: "postgres-session-audit-v1" }>["registeredSessions"][number], "normalizedBackendStart" | "subject"> & { readonly subject: SourceClientTextCell };
-function ordinaryProfile(row: SourceClientRawRow, decoded: Decoded, fact: Exclude<ClientFact, { kind: "maintenance-controller" }>, context: RowContext): PgRegistered[] {
+export function ordinaryProfile(row: Omit<SourceClientRawRow, 'protocol_version'>, decoded: Decoded, fact: Exclude<ClientFact, { kind: "maintenance-controller" }>, context: RowContext): PgRegistered[] {
   reserveP0FNativeNodes(1);
   const native = fact.kind === "native-management-client", registered: PgRegistered[] = [];
   requireCandidate(decoded.client_id !== null && decoded.client_id !== "" && decoded.database_instance_id === context.record.source.databaseInstanceId
@@ -229,7 +231,7 @@ function ordinaryProfile(row: SourceClientRawRow, decoded: Decoded, fact: Exclud
 }
 type ControllerDecoded = Pick<Decoded, "client_id" | "database_instance_id" | "entrypoint" | "build_id" | "drain_state"
   | "db_sessions_json" | "host_identity_json" | "process_identity_json">;
-function controllerRegistration(row: SourceClientRawRow, decoded: ControllerDecoded,
+export function controllerRegistration(row: Omit<SourceClientRawRow, 'protocol_version'>, decoded: ControllerDecoded,
   identity: { readonly host: unknown; readonly process: unknown }, source: SourceRef, syntaxFrame?: P0FArtifactSyntaxFrame) {
   const body = parse(registrationSchema, json(decoded.db_sessions_json, syntaxFrame, row, 'db_sessions_json'));
   requireCandidate(decoded.client_id !== null && decoded.client_id !== "" && decoded.database_instance_id === source.databaseInstanceId
@@ -270,7 +272,7 @@ function controllerProfile(row: SourceClientRawRow, decoded: Decoded, fact: Extr
     && fact.classification === "exited-actor");
   if (fact.classification === "active-actor") requireCandidate(row.ended_at[0] === "null");
 }
-function runtimeRelations(facts: EventFacts): void {
+export function runtimeRelations(facts: EventFacts): void {
   // owner [key, reused object] tuples, results array and four-scalar projections.
   reserveP0FNativeNodes(2 + facts.runtime.owners.length * 2 + facts.runtime.runners.length * 9, facts.runtime.owners.length);
   reserveP0FNativeMetadata(2+facts.runtime.owners.length*4); // map/list shells + list/pair metadata; bindings prepaid above
@@ -300,7 +302,7 @@ function runtimeRelations(facts: EventFacts): void {
   for (const client of facts.clients) if (client.kind !== "maintenance-controller" && client.classification === "current-client") for (const exit of client.receipt?.ownedExits ?? [])
     requireCandidate(results.some(row => sameJoinedText(row.bindingId,exit.fence.bindingId) && sameJoinedText(row.memberId,exit.fence.memberId) && row.generation === exit.fence.generation));
 }
-function sessionSources(facts: EventFacts, context: RowContext, expected: readonly PgRegistered[], allDecoded: boolean): void {
+export function sessionSources(facts: EventFacts, context: RowContext, expected: readonly PgRegistered[], allDecoded: boolean): void {
   const sessions = facts.sessions, identity = object(context.plan.sourceIdentity);
   if (sessions.kind === "postgres-session-audit-v1") {
     requireCandidate(identity.kind === "postgres" && sessions.databaseOid === identity.databaseOid && sessions.schemaOid === identity.schemaOid && sessions.descriptorDigest === identity.descriptorDigest);

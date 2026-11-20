@@ -1,3 +1,7 @@
+import { reserveP0FIsolatedCopy, reserveP0FNativeClone, reserveP0FNativeWork,
+  reserveP0FNativeMetadata, reserveP0FNativeKeyList, reserveP0FNativeCanonical,
+  reserveP0FNativeText, parseP0FNativeJson, encodeP0FM2CodecProduced, reuseP0FM2CodecR3,
+  reuseP0FNativeEquality,isP0FM2CodecOwned,reserveP0FM2CodecRead } from "./internal/m2-p0-artifacts-frame.ts";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { parseProfileContent, parseBindingOrdinaryContent, parseLegacyConfigSnapshotRef,
@@ -19,6 +23,9 @@ const failures = new WeakMap<object, M2ValueErrorCode>();
 function fail(code: M2ValueErrorCode): never { const error = Object.create(null) as object; failures.set(error, code); throw error; }
 function conflict(condition: boolean): asserts condition { if (!condition) fail("value_conflict"); }
 function frozen<T>(value: T): ReadonlyDeep<T> {
+  reserveP0FNativeWork(1);
+  if(isP0FM2CodecOwned(value))return value as ReadonlyDeep<T>;
+  if (value !== null && typeof value === "object") reserveP0FNativeKeyList(value);
   if (value !== null && typeof value === "object") { for (const v of Object.values(value)) frozen(v); Object.freeze(value); }
   return value as ReadonlyDeep<T>;
 }
@@ -33,6 +40,7 @@ function ownData(descriptor: PropertyDescriptor | undefined): descriptor is Prop
     && !Object.hasOwn(descriptor, "get") && !Object.hasOwn(descriptor, "set");
 }
 function prototypeState(previous?: PrototypeState): PrototypeState {
+  reserveP0FNativeMetadata(600); reserveP0FNativeWork(1200);
   const state: PrototypeState = new Map();
   const require = (condition: unknown): void => { if (!condition) fail("invalid_value"); };
   require(Object.getPrototypeOf(Object.prototype) === null && Object.getPrototypeOf(Array.prototype) === Object.prototype);
@@ -104,7 +112,22 @@ class Budget {
     }
     this.charge(n);
   }
+  private owned(input:unknown,countBytes:boolean,depth:number):unknown {
+    if(++this.nodes>MAX_NODES||depth>MAX_DEPTH)fail('budget_exceeded');
+    const charge=(bytes:number)=>{if(countBytes)this.charge(bytes);};
+    if(input===null){charge(4);return input;}
+    if(typeof input==='string'){if(countBytes)this.stringSize(input);return input;}
+    if(typeof input==='boolean'){charge(input?4:5);return input;}
+    if(typeof input==='number'){if(!Number.isSafeInteger(input)||Object.is(input,-0))fail('invalid_value');charge(String(input).length);return input;}
+    if(input===null||typeof input!=='object')fail('invalid_value');
+    if(Array.isArray(input)){charge(2+Math.max(0,input.length-1));for(const item of input)this.owned(item,countBytes,depth+1);}
+    else{let fields=0;for(const key in input)if(Object.hasOwn(input,key)){fields++;if(countBytes)this.stringSize(key);charge(1);this.owned((input as Record<string,unknown>)[key],countBytes,depth+1);}
+      charge(2+Math.max(0,fields-1));}
+    return input;
+  }
   copy(input: unknown, countBytes = true, offset = 0): unknown {
+    if(isP0FM2CodecOwned(input)){reserveP0FM2CodecRead(input);return this.owned(input,countBytes,offset);}
+    reserveP0FIsolatedCopy(input);
     const ancestors = new Set<object>();
     const charge = (n: number) => { if (countBytes) this.charge(n); };
     const stringSize = (s: string) => { if (countBytes) this.stringSize(s); };
@@ -145,6 +168,8 @@ class Budget {
     return visit(input, offset);
   }
   json(text: string, offset: number): unknown {
+    const shared = parseP0FNativeJson(text, offset);
+    if (shared) return this.copy(shared.value, false, offset);
     // Preflight before JSON.parse allocates any deep/wide structure. The original string bytes
     // were already charged by the outer copy; the parsed nodes share this same call budget.
     const stack: string[] = []; let wantValue = true, nodes = 0;
@@ -164,8 +189,8 @@ class Budget {
 }
 function total<T>(input: unknown, body: (value: unknown, budget: Budget) => T): M2ValueResult<T> {
   try {
-    const environment = prototypeState(), budget = new Budget(), copy = budget.copy(input);
-    prototypeState(environment); // All caller reflection has returned; E1/P1 receive only isolated data.
+    const owned=isP0FM2CodecOwned(input),environment = prototypeState(), budget = new Budget(), copy = budget.copy(input);
+    if(!owned)prototypeState(environment); // Borrowed data performs no caller reflection window.
     const value = body(copy, budget); prototypeState(environment);
     return frozen({ ok: true as const, classification: "value-consistent" as const, value });
   }
@@ -173,6 +198,7 @@ function total<T>(input: unknown, body: (value: unknown, budget: Budget) => T): 
     return frozen({ ok: false as const, error: { code: code ?? "invalid_value" } }); }
 }
 function parse<T, Input>(schema: z.ZodType<T, z.ZodTypeDef, Input>, value: unknown): T {
+  reserveP0FNativeClone(value);
   const result = schema.safeParse(value);
   if (result.success) return result.data;
   const atPath = (path: (string | number)[]) => path.reduce<unknown>((item, key) =>
@@ -184,15 +210,24 @@ function parse<T, Input>(schema: z.ZodType<T, z.ZodTypeDef, Input>, value: unkno
       && ["configVersion", "protocolBefore", "protocolAfter"].includes(String(i.path.at(-1))));
   fail(future ? "unsupported_shape" : "invalid_value");
 }
-const hash = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
-const same = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
+const hash = (text: string) => { reserveP0FNativeText(text, true); return createHash("sha256").update(text, "utf8").digest("hex"); };
+const same = (a: unknown, b: unknown) => {
+  encodeP0FM2CodecProduced(a);encodeP0FM2CodecProduced(b);
+  return reuseP0FNativeEquality(a,b)??canonicalJson(a) === canonicalJson(b);
+};
 // Known DTO keys are ASCII. Codepoint comparison is still explicit for the frozen C-R3 domain.
 function r3(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(r3).join(",")}]`;
+  encodeP0FM2CodecProduced(value);
+  const shared=reuseP0FM2CodecR3(value);if(shared!==undefined)return shared;
+  reserveP0FNativeCanonical(value); reserveP0FNativeCanonical(value);
+  return r3Core(value);
+}
+function r3Core(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(r3Core).join(",")}]`;
   if (value !== null && typeof value === "object") {
     const cp = (a: string, b: string) => { const aa = Array.from(a), bb = Array.from(b); for (let i = 0; i < Math.min(aa.length, bb.length); i++) {
       const delta = aa[i]!.codePointAt(0)! - bb[i]!.codePointAt(0)!; if (delta) return delta; } return aa.length - bb.length; };
-    return `{${Object.keys(value).sort(cp).map(k => `${JSON.stringify(k)}:${r3((value as Record<string, unknown>)[k])}`).join(",")}}`;
+    return `{${Object.keys(value).sort(cp).map(k => `${JSON.stringify(k)}:${r3Core((value as Record<string, unknown>)[k])}`).join(",")}}`;
   }
   return JSON.stringify(value);
 }
@@ -217,7 +252,7 @@ const config = z.object({ model: z.string().nullable(), workdir: id, tools, syst
 const originalSelection = versions.extend({ strategy }).strict();
 const envelope = z.object({ kind: z.string(), value: requiredValue }).strict();
 const hashEnvelope = z.object({ kind: z.string(), body: requiredValue }).strict();
-function profile(value: unknown) { try { return parseProfileContent(value); } catch { return fail("invalid_value"); } }
+function profile(value: unknown) { reserveP0FNativeClone(value); try { return parseProfileContent(value); } catch { return fail("invalid_value"); } }
 
 const legacyRefSchema = z.object({ authority: z.literal("legacy"), kind: z.enum(["effective", "requestedSnapshot", "applied"]),
   sourceId: id, runtimeId: id, bindingId: id, agentId: id, digest, versions, configVersion: z.literal(1) }).strict();
@@ -247,6 +282,7 @@ const receiptBodySchema = z.object({ requestId: id, planRef, physicalSourceRef: 
 const receiptSchema = receiptBodySchema.extend({ ref: activationRef }).strict();
 function legacyReference(value: unknown) {
   const v = parse(legacyRefSchema, value); conflict(v.sourceId === v.bindingId);
+  reserveP0FNativeClone(v);
   try { return parseLegacyConfigSnapshotRef(v); } catch { return fail("invalid_value"); }
 }
 function advanced(value: unknown): CurrentAdvancedSelection {
@@ -271,6 +307,7 @@ function view(value: unknown): CurrentAdvancedView {
 }
 function bindingContent(value: unknown): BindingContent {
   const v = parse(z.object({ roleRef: requiredValue, profileOverrides: requiredValue, currentAdvanced: requiredValue }).strict(), value);
+  reserveP0FNativeClone(v);
   let ordinary; try { ordinary = parseBindingOrdinaryContent({ roleRef: v.roleRef, profileOverrides: v.profileOverrides }); }
   catch { return fail("invalid_value"); }
   return { ...ordinary, currentAdvanced: advanced(v.currentAdvanced) };
@@ -354,6 +391,7 @@ function snapshotBody(value: unknown, budget: Budget, jsonDepth = 5): Omit<Confi
     if (a.originalSelection === null) conflict(a.mappedValidity === "not_selected" && a.equivalenceEvidenceDigest === null);
     else conflict(a.mappedValidity !== "not_selected");
     if (a.mappedValidity === "equivalent") conflict(a.originalValidity === "effective" && a.equivalenceEvidenceDigest !== null);
+    reserveP0FNativeClone(v);
     try { parseLegacySourceValue({ ref: l, snapshot: { backend: v.backend, config: v.config, versions: l.versions,
       advancedStrategy: v.advancedStrategy, digest: v.semanticDigest }, rawJson: raw.rawJson, rawDigest: raw.rawDigest,
       rawAdvancedJson: raw.rawAdvancedJson, rawAdvancedDigest: raw.rawAdvancedDigest }); }

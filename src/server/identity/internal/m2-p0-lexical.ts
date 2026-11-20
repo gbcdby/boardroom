@@ -13,7 +13,7 @@ export function wellFormedP0(value: string): boolean {
   return true;
 }
 // Exact mathematical integer test before Number conversion. Long exponents never reach BigInt.
-function exactInteger(token: string, negativeZero: boolean): boolean {
+export function exactInteger(token: string, negativeZero: boolean): boolean {
   const match = /^(-?)(0|[1-9][0-9]*)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$/.exec(token);
   if (!match) return false;
   const digits = `${match[2]}${match[3] ?? ""}`.replace(/^0+/, "");
@@ -31,7 +31,7 @@ function exactInteger(token: string, negativeZero: boolean): boolean {
   const integer = digits.slice(0, significantLength) + "0".repeat(shift);
   return integer.length < 16 || integer <= "9007199254740991";
 }
-export interface JsonScanOptions { readonly policy: P0JsonPolicy; readonly outer: boolean }
+export interface JsonScanOptions { readonly policy: P0JsonPolicy; readonly outer: boolean; readonly canonical?: true }
 export function scanP0Json(state: P0State, text: string, site: P0Site, options: JsonScanOptions): unknown {
   const { depth: baseDepth } = siteData(state, site);
   const invalidLegacySyntax = Object.freeze({});
@@ -58,7 +58,7 @@ export function scanP0Json(state: P0State, text: string, site: P0Site, options: 
     maximumDepth = Math.max(maximumDepth, depth);
     chargeState(state, { nodes: 1, work: 1 }, site);
   };
-  const space = (): void => { while (at < text.length && (text[at] === " " || text[at] === "\t" || text[at] === "\r" || text[at] === "\n")) at++; };
+  const space = (): void => { while (at < text.length && (text[at] === " " || text[at] === "\t" || text[at] === "\r" || text[at] === "\n")) {if(options.canonical)fail();at++;} };
   const string = (decodeKey: boolean): string | undefined => {
     if (text[at++] !== '"') return fail();
     const start = at - 1;
@@ -78,12 +78,14 @@ export function scanP0Json(state: P0State, text: string, site: P0Site, options: 
             const hex = text.charCodeAt(at++);
             let nibble: number;
             if (hex >= 0x30 && hex <= 0x39) nibble = hex - 0x30;
-            else if (hex >= 0x41 && hex <= 0x46) nibble = hex - 0x41 + 10;
+            else if (hex >= 0x41 && hex <= 0x46) { if(options.canonical)fail();nibble = hex - 0x41 + 10; }
             else if (hex >= 0x61 && hex <= 0x66) nibble = hex - 0x61 + 10;
             else return fail();
             code = code * 16 + nibble;
           }
+          if(options.canonical&&(code>=32||[8,9,10,12,13].includes(code)))fail();
         } else {
+          if(options.canonical&&escape==='/')fail();
           if (escape === undefined || !'"\\/bfnrt'.includes(escape)) return fail();
           code = 0; // Every permitted non-u escape decodes to a non-surrogate.
         }
@@ -111,10 +113,19 @@ export function scanP0Json(state: P0State, text: string, site: P0Site, options: 
     if (text[at] === "{") {
       at++; space();
       const keys = options.policy === "legacy-display" ? null : new Set<string>();
+      let previousKey:string|undefined;
       if (text[at] === "}") { at++; return; }
       for (;;) {
         // Both the decoded key and its value are JSON nodes, including repeated legacy keys.
         node(depth + 1); const key = string(keys !== null);
+        if(options.canonical&&key!==undefined){
+          if(previousKey!==undefined){
+            chargeState(state,{bytes:(previousKey.length+key.length)*2,work:1},site);
+            let a=0,b=0,order=0;
+            while(a<previousKey.length&&b<key.length){const x=previousKey.codePointAt(a)!,y=key.codePointAt(b)!;if(x!==y){order=x-y;break;}a+=x>65535?2:1;b+=y>65535?2:1;}
+            if(order===0)order=previousKey.length-key.length;if(order>=0)fail();
+          }previousKey=key;
+        }
         if (keys?.has(key!)) return fail(); keys?.add(key!);
         space(); if (text[at++] !== ":") return fail();
         value(depth + 1); space();
@@ -140,6 +151,7 @@ export function scanP0Json(state: P0State, text: string, site: P0Site, options: 
     if (!/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$/.test(token)) return fail();
     if (options.policy === "reference" && !exactInteger(token, !options.outer)) return fail();
     if (options.policy === "finite" && !Number.isFinite(Number(token))) return fail();
+    if(options.canonical&&String(Number(token))!==token)fail();
   };
   try {
     value(baseDepth); space(); if (at !== text.length) return fail();
@@ -163,4 +175,10 @@ export function scanP0Json(state: P0State, text: string, site: P0Site, options: 
 }
 export function parseP0Json(request: P0Request, text: string, site: P0Site, policy: P0JsonPolicy = "reference"): unknown {
   return scanP0Json(p0State(request), text, site, { policy, outer: false });
+}
+
+/** EG has a primitive canonical C-R3 envelope. Canonical spelling is checked
+ * during the original scan; selected hex is never copied into a second carrier. */
+export function scanM2CanonicalJson(state:P0State,text:string,site:P0Site):unknown {
+  return scanP0Json(state,text,site,{policy:'reference',outer:true,canonical:true});
 }

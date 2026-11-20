@@ -1,4 +1,4 @@
-import {JOURNAL_VALUE_MATH,readReceiptValues} from '../../storage/maintenance/journal-values.ts';
+import {JOURNAL_VALUE_MATH,readReceiptValues,readJournalValues,readSnapshotValues} from '../../storage/maintenance/journal-values.ts';
 import type {JournalValueContext, SnapshotValueClosure} from '../../storage/maintenance/journal-values.ts';
 import {maintenanceFailureCode} from '../../storage/maintenance/error.ts';
 import {parseP0Json} from './m2-p0.ts';
@@ -141,6 +141,29 @@ export function runP0Journal(f:FState,plan:MigrationPlan,root:ControlRootIdentit
   const context=createP0FJournalContext(f,frame,root);
   try{
     const program=readReceiptValues(context,receipt);
+    assertP0FJournalContext(frame,context);let step=program.next();
+    while(!step.done){f.charge(1);const op=step.value;let value:unknown;
+      if(op.operation==='decode')value=f.decode(op.reference,op.as);
+      else{const e=f.select(op.reference);value=op.operation==='kind'?e.selected.kind:undefined;}
+      assertP0FJournalContext(frame,context);step=program.next(value);
+    }
+    return step.value;
+  }catch(error){if(maintenanceFailureCode(error)!==undefined)f.require(false);throw error;}
+  finally{releaseP0FJournalContext(context);}
+}
+
+/** M2's actual A predecessor must include the complete original ready tail.
+ * This fixed runner retains the old version/event/receipt/control consumers and
+ * the exact authenticated F frame. It has no IO, callback or replacement meter. */
+export function runP0ReadyJournal(f:FState,plan:MigrationPlan,root:ControlRootIdentity,anchor:ArtifactRef):SnapshotValueClosure{
+  const frame=p0FCodecSyntaxFrame(f,plan);
+  const context=createP0FJournalContext(f,frame,root);
+  try{
+    const program=(function*(){
+      const chain=yield* readJournalValues(context,anchor);
+      f.require(f.equal(chain.plan,plan));
+      return yield* readSnapshotValues(context,chain);
+    })();
     assertP0FJournalContext(frame,context);let step=program.next();
     while(!step.done){f.charge(1);const op=step.value;let value:unknown;
       if(op.operation==='decode')value=f.decode(op.reference,op.as);

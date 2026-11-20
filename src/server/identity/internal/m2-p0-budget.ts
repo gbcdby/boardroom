@@ -1,4 +1,4 @@
-import { P0_RULES, P0_TABLE_NAMES } from "./m2-p0-types.ts";
+import { P0_RULES, M2_ALL_TABLE_NAMES } from "./m2-p0-types.ts";
 import type { P0Code, P0Condition, P0Cost, P0Error, P0Failure, P0Location, P0Path, P0Request,
   P0Result, P0Row, P0Site, P0Usage, P0View } from "./m2-p0-types.ts";
 
@@ -14,7 +14,7 @@ const CONDITIONS = new Set<P0Condition>(["missing-target", "scope-mismatch", "st
   "identity-mismatch", "source-mismatch", "format-mismatch", "bytes-mismatch", "immutable-history-mismatch", "phase-mismatch",
   "duplicate-key", "conditional-target-required", "negative-invariant", "unsupported-value", "undefined-grammar", "budget-exceeded"]);
 const PATHS = new Set<P0Path>(["input.root", "observation.root", "artifact.root", "row.cell", ...P0_RULES.map(r => `${r}.P01` as const)]);
-const rules = new Set<string>(P0_RULES), tables = new Set<string>(P0_TABLE_NAMES);
+const rules = new Set<string>(P0_RULES), tables = new Set<string>(M2_ALL_TABLE_NAMES);
 export interface P0SiteData { readonly depth: number; readonly location: P0Location; readonly phase: P0Site["phase"] }
 type Usage = { -readonly [K in keyof P0Usage]: P0Usage[K] };
 export interface P0State {
@@ -33,6 +33,7 @@ export interface P0State {
   request: P0Request | null;
 }
 const states = new WeakMap<object, P0State>();
+const actualStates = new WeakSet<object>();
 const isObject = (v: unknown): v is object => (typeof v === "object" && v !== null) || typeof v === "function";
 export function fixedError(code: P0Code = "invalid_value", location: P0Location | null = null): P0Error {
   const conflict = location ? Object.freeze({ rule: "PC1B-RAW01" as const, source: location, target: null,
@@ -47,7 +48,11 @@ export function newP0State(): P0State {
     // Reserve finite unknown/failure serialization even after exhaustion; never expose raw selectors.
     usage: { work: 128, bytes: 4096, tuples: 0, nodes: 0, rows: 0, selectedBytes: 0 }, rootSite, poisoned: null, request: null };
   state.sites.set(rootSite, { depth: 0, location: inputLocation, phase: "input" });
+  actualStates.add(state);
   return state;
+}
+export function assertP0State(state: P0State): void {
+  if (!isObject(state) || !actualStates.has(state)) throw UNKNOWN_REQUEST;
 }
 export function bindP0State(request: P0Request, state: P0State): void { states.set(request, state); state.request = request; }
 export function p0State(request: P0Request): P0State {
