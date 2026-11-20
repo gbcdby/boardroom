@@ -170,3 +170,27 @@ schema 必须与源一致；省略不会从源推导。只设置 schema、空连
 `failure` 非空，或结果为 `blocked`、`recovery_required`、`cancel_pending` 时，CLI 以非零退出码结束。其他状态仍须结合其含义判断，不能仅以退出码 0 推断迁移完成。安全输出保留稳定错误码与必要引用，不公开 DSN、配置正文、原生工具 stderr 或内部凭据。
 
 新进程复用历史 ready 时仍需重新核对实际来源、控制历史和隔离恢复，历史 snapshot/receipt 不是可转交的运行许可。保留计划、journal 与维护产物，后续消费只通过项目提供的受信入口完成；本页不提供任意 callback、插件加载、HTTP 或 MCP 执行维护的通道。
+
+## 7. Linux SQLite 路径观察组件
+
+开发和维护诊断可单独构建一个 Linux SQLite 扩展，用于在实际只读连接上观察 `main` 的当前 VFS 路径是否移动。使用项目锁定的依赖，在仓库根目录运行：
+
+```bash
+node scripts/build-sqlite-path-check.mjs
+```
+
+该命令仅支持 Linux x64/arm64，固定使用 `/usr/bin/cc` 和已安装的 `better-sqlite3` 所带头文件；它不下载依赖，也不接受编译器、扩展或目标路径参数。编译进程使用固定环境，不继承 `CC`、`CFLAGS`、`CPATH` 等搜索或注入变量。原 postinstall 与其他平台构建流程保持原有职责。
+
+组件写入本仓库的 `build/maintenance-platform/sqlite-path-check-linux-<arch>/`。二进制和 manifest 分别按完整 SHA-256 保存在不可变位置，最后原子发布 `current.json`。并发构建遇到已有构建锁会失败；失败不会删除其他 attempt 的锁、原有代际或已发布 manifest。源码、依赖或构建脚本变化后应重新运行该固定命令，不能手工改 manifest 让旧产物匹配。
+
+内部零参数入口 `inspectSelectedSqlitePathBinding()` 使用既有环境解析器重新选择来源，自行打开已存在的只读 SQLite 连接。需要从仓库根目录直接做一次观察时，可以运行：
+
+```bash
+node --input-type=module -e 'const {inspectSelectedSqlitePathBinding} = await import("./src/server/storage/internal/sqlite-path-observation.ts"); console.log(JSON.stringify(await inspectSelectedSqlitePathBinding()));'
+```
+
+来源由原配置、环境变量和当前启动目录选择，规则仍见[环境解析与旧数据来源预检](environment-resolution.md)。缺失来源或选择冲突会拒绝；入口不会新建数据库、执行 migration 或自动安装组件。它核对所加载组件、源文件 pin 和目录身份，并在同一只读事务内对读取前后进行路径观察。SQLite 自身仍可能涉及 WAL/SHM 的读取或锁行为，因此“只读”描述的是数据库逻辑操作。
+
+成功结果的 scope 为 `sqlite-main-path-observation/v1`，只包含源路径、pin 的 device/inode、组件摘要、路径观察和 schema version。只有数据库及本次持有的文件描述符都已确认关闭，才返回 `retirement: "closed"`。若关闭结果未知，进程保留实际 owner 和仍需要的资源，后续本入口返回 `native_retirement_unknown`；调用者不能以传入确认值、定时等待或重复调用来宣告退休。
+
+`HAS_MOVED = 0` 只表示当前 VFS 路径观察通过。它不返回 SQLite 实际数据库 FD，也不能排除“路径替换后恢复”的 ABA 窗口；单独打开的源 pin 不能消除这个限制。本结果不授予 P1 准入、写权限或生产 native 资格，后续同连接准入、terminal/CF17 和完整 G1 仍须完成各自合同。
