@@ -10,7 +10,8 @@ import { loadPersistedPlan } from "./plan.ts";
 import { parseManifests } from "./parse.ts";
 import { verifyJournalChain } from "./journal.ts";
 import { sourceClientFacts, sourceRuntimeFacts, type SourceRuntimeRows } from "./source-facts.ts";
-import type { Blocker, ControlRootIdentity, Json, PersistedPlanRef, SourceClientFactsWindow, SourceClientsObservation } from "./types.ts";
+import { withSourceFileObservationWindow } from "./source-file-writers.ts";
+import type { Blocker, ControlRootIdentity, FileRoot, Json, PersistedPlanRef, SourceClientFactsWindow, SourceClientsObservation } from "./types.ts";
 
 const same = (left: unknown, right: unknown) => canonicalJson(left) === canonicalJson(right);
 function freeze<T>(value: T): T {
@@ -28,12 +29,20 @@ export interface SourceFactsAccess {
   observe(): Promise<SourceClientsObservation>;
   decodedRows(observation: SourceClientsObservation): Promise<readonly Record<string, unknown>[]>;
   validateSource(value: unknown, observation: SourceClientsObservation): void;
-  inspectWriters(observation: SourceClientsObservation, rows: readonly Record<string, unknown>[], audit?: SessionAuditCollection): Promise<readonly Blocker[]>;
+  inspectWriters(observation: SourceClientsObservation, rows: readonly Record<string, unknown>[], roots: readonly FileRoot[],
+    audit?: SessionAuditCollection): Promise<readonly Blocker[]>;
   runtimeRows(): Promise<SourceRuntimeRows>;
 }
 
 interface NativeFactsScope { readonly lease: BootstrapAuditLease; readonly lock: object }
 async function withFacts<T>(access: SourceFactsAccess, input: PersistedPlanRef,
+  consume: (window: SourceClientFactsWindow, audit: SourceClientAudit | undefined) => Promise<T>,
+  native: NativeFactsScope | undefined, purpose: "consumer" | "producer" | "cancellation"): Promise<T> {
+  if (native) assertOriginalControllerLease(native.lease, native.lock);
+  return withSourceFileObservationWindow(() => access.assertUnchangedLock(),
+    () => collectFacts(access, input, consume, native, purpose), { lock: native?.lock ?? access, root: access.root });
+}
+async function collectFacts<T>(access: SourceFactsAccess, input: PersistedPlanRef,
   consume: (window: SourceClientFactsWindow, audit: SourceClientAudit | undefined) => Promise<T>,
   native: NativeFactsScope | undefined, purpose: "consumer" | "producer" | "cancellation"): Promise<T> {
   if (native) assertOriginalControllerLease(native.lease, native.lock);
@@ -59,6 +68,9 @@ async function withFacts<T>(access: SourceFactsAccess, input: PersistedPlanRef,
     if (!same(plan.sourceIdentity, observation.sourceIdentity) || plan.schemaManifestDigest !== observation.schemaManifestDigest
       || plan.guardManifestDigest !== state.guardManifestDigest || state.activeMigrationId !== plan.migrationId
       || state.planDigest !== reference.planDigest) throw new MaintenanceFailure("plan_stale");
+    const configs = plan.fileRoots.filter(root => root.label === "config");
+    if (configs.length !== (plan.originalConfigPath === null ? 0 : 1)
+      || configs.some(root => root.path !== plan.originalConfigPath)) throw new MaintenanceFailure("plan_stale");
     if (!state.journalRecordRef || !state.journalDigest || state.journalSequence < 1) throw new MaintenanceFailure("journal_invalid");
     const store = await ArtifactStore.open(reference.controlRoot, observation.source);
     let head, chain;
@@ -134,7 +146,7 @@ async function withFacts<T>(access: SourceFactsAccess, input: PersistedPlanRef,
         registrations: replay?.registrations ?? new Map(), purpose: purpose === "consumer" ? "consumer" : "producer" } : undefined);
     const runtimeRows = await access.runtimeRows();
     const runtime = await sourceRuntimeFacts(runtimeRows, clients, runtimeAudit);
-    const blockers = await access.inspectWriters(observation, rows, sessionAudit);
+    const blockers = await access.inspectWriters(observation, rows, plan.fileRoots, sessionAudit);
     if (blockers.length) throw new MaintenanceFailure(blockers[0]!.code, blockers[0]!.subjectRef);
     await assertActive();
     const after = await access.observe();

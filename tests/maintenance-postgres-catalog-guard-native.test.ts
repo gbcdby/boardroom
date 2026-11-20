@@ -1,10 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, open, realpath, rm, writeFile, type FileHandle } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { Client, QueryResult } from "pg";
+import { PostgresDriver } from "../src/server/db/drivers/postgres.ts";
+import { migrations } from "../src/server/db/migrations/index.ts";
+import { resolveBoardroomEnvironment } from "../src/server/environment.ts";
+import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintenance/postgres.ts";
+import { ArtifactStore } from "../src/server/storage/maintenance/objects.ts";
+import type { OperationMutex } from "../src/server/storage/maintenance/types.ts";
+import { createPreviewGraph, planMigration, persistMigrationPlan } from "./fixtures/maintenance-preview-graph.ts";
 import { PG_CATALOG_GUARD_MODULE, PG_CATALOG_GUARD_SQL } from "../src/server/storage/maintenance/postgres-catalog-guard/fixed-module.ts";
 import { parsePgCatalogGuardModuleObservation } from "../src/server/storage/maintenance/postgres-catalog-guard/observation-values.ts";
 import { h04Roles, openCatalogGuardTestCluster } from "./fixtures/postgres-catalog-guard-cluster.ts";
 import { readFixtureCatalogGuardModule } from "./fixtures/postgres-catalog-guard-observation.ts";
+import { sourceWriterFailureSubjects, withSourceFactsInventoryDiagnostics,
+  type SourceFactsInventoryEvidence } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
 
 const toolsDirectory = process.env["AGENT_STUDIO_PG_RESTART_BIN"];
 const share = 'SELECT "boardroom_catalog_guard_v1"."acquire_share"() AS guard';
@@ -137,4 +150,121 @@ test("H04 fixed helpers: exact owned PG 16.15 parse, real roles, catalog locks, 
       for (const client of clients.reverse()) await client.end();
       await cluster.close();
     }
+  });
+
+test("WR1 native PG16.15 actual facts combine local fileRoots with unchanged database writer inventory",
+  { skip: toolsDirectory === undefined, timeout: 150_000 }, async t => {
+    const cluster = await openCatalogGuardTestCluster(toolsDirectory!, "wr1");
+    let directory: string | undefined, preview: Awaited<ReturnType<typeof createPreviewGraph>> | undefined;
+    let adapter: Awaited<ReturnType<typeof createPostgresMaintenanceAdapter>> | undefined, mutex: OperationMutex | undefined;
+    let fileOwner: FileHandle | undefined, external: Client | undefined;
+    let failed = false, first: unknown;
+    try {
+      directory = await realpath(await mkdtemp(path.join(tmpdir(), "br-wr1-pg-facts-")));
+      preview = await createPreviewGraph(directory, "qualified-linux");
+      const admin = await cluster.connect();
+      try { await admin.query('CREATE DATABASE "h04_source" TEMPLATE template0'); } finally { await admin.end(); }
+      const connectionString = cluster.connectionString("h04_source"), bootstrap = new PostgresDriver({ connectionString });
+      try { await bootstrap.connect(); await bootstrap.migrate(migrations); } finally { await bootstrap.close(); }
+      const dataDir = path.join(directory, "data"), configFile = path.join(directory, "config.json");
+      await mkdir(dataDir, { mode: 0o700 });
+      await writeFile(configFile, JSON.stringify({ dataDir, dbDriver: "postgres", pgConnectionString: connectionString }), { mode: 0o600 });
+      const environment = await resolveBoardroomEnvironment({ cwd: directory, homeDir: directory,
+        env: { AGENT_STUDIO_CONFIG: configFile, BOARDROOM_HOME: path.join(directory, "home") } });
+      assert.equal(environment.databaseDescriptor.kind, "postgres");
+      const sessionRoot = path.join(environment.runtimeRoot, "sessions"), sessionFile = path.join(sessionRoot, "nested", "session.json");
+      await mkdir(path.dirname(sessionFile), { recursive: true, mode: 0o700 });
+      await writeFile(sessionFile, '{"closed":true}\n', { mode: 0o600 });
+      adapter = await createPostgresMaintenanceAdapter(environment.databaseDescriptor as never, undefined);
+      const options = { environment, originalCwd: directory, expectedSourceId: environment.inventory.selectedSourceId!,
+        controlRoot: path.join(dataDir, "control"), targetRoot: path.join(directory, "target") };
+      const plan = await planMigration(options, adapter), reference = await persistMigrationPlan(plan, options, adapter);
+      assert.equal(plan.fileRoots.find(root => root.label === "managed-sessions")!.path, sessionRoot);
+      const store = await ArtifactStore.open(reference.controlRoot, plan.source);
+      mutex = await adapter.acquireMutex(store.identity, (await adapter.observe()).state);
+      await adapter.withSourceLock("control", async lock => {
+        const raw = await lock.observeSourceClients();
+        const journal = await store.putJson("journal", { formatVersion: 2, kind: "journal", migrationId: plan.migrationId, sequence: 1,
+          previous: null, phase: "planned", event: "enter", requestId: "wr1-owned-pg-enter", requestDigest: "a".repeat(64), source: plan.source,
+          plan: reference.immutablePlan, fenceEpoch: 1, ownerGeneration: 1, evidence: [], snapshot: null, sourceClients: null, frozen: null });
+        await lock.anchor({ expected: raw.state, admission: "draining", fenceEpoch: 1, ownerGeneration: 1,
+          activeMigrationId: plan.migrationId, planDigest: reference.planDigest, controlRootIdentity: store.identity as never,
+          mutexIdentity: mutex!.identity, journal, journalSequence: 1 });
+      });
+      const read = (consume: () => Promise<void>, evidence?: SourceFactsInventoryEvidence) => withSourceFactsInventoryDiagnostics(
+        () => adapter!.withSourceLock("control",
+          lock => lock.withSourceClientFacts(reference, async facts => { await facts.assertCurrent(); await consume(); })),
+        { outputRoot: path.resolve(".agent-output/maintenance-native-diagnostics/source-inventory/wr1-pg"),
+          ...(evidence ? { evidence } : {}) });
+      const rejectsSubject = (subject: string) => (error: unknown) => {
+        assert.equal((error as { code?: unknown })?.code, "source_writer_unknown");
+        assert.deepEqual(sourceWriterFailureSubjects(error), [subject],
+          "the actual selected resource must reject; an earlier unreadable process is not this negative control");
+        return true;
+      };
+      const selectDescriptor = async (label: NonNullable<SourceFactsInventoryEvidence["selected"]>["label"], file: string,
+        owner: FileHandle, evidence: SourceFactsInventoryEvidence) => {
+        const identity = await owner.stat({ bigint: true });
+        evidence.selected = { label, file, fd: owner.fd, dev: String(identity.dev), ino: String(identity.ino) };
+      };
+      const assertDescriptorObserved = (evidence: SourceFactsInventoryEvidence) => {
+        const expected = evidence.selected!;
+        assert.ok(evidence.matches.some(row => row.pid === process.pid && row.fd === expected.fd
+          && row.dev === expected.dev && row.ino === expected.ino && row.label === expected.label),
+        "the original inventory must actually readlink and stat this exact owned-fixture descriptor");
+        t.diagnostic(JSON.stringify({ scope: "WR1 selected native source descriptor rejection", ...expected, file: undefined,
+          process: process.pid, originalInventoryMatches: evidence.matches.length }));
+      };
+      await t.test("WR1-PG closed config and nested session reach the actual callback", async () => {
+        let entered = false; await read(async () => { entered = true; }); assert.equal(entered, true);
+      });
+      for (const [label, file] of [["config", configFile], ["nested-session", sessionFile]] as const)
+        await t.test(`WR1-PG ${label} unowned FD rejects before callback with no external database backend`, async () => {
+          let entered = false; const evidence: SourceFactsInventoryEvidence = { matches: [] }; fileOwner = await open(file, "r+");
+          try {
+            await selectDescriptor(label, file, fileOwner, evidence);
+            await assert.rejects(read(async () => { entered = true; }, evidence), rejectsSubject(`os-process:${process.pid}`));
+            assert.equal(entered, false); assertDescriptorObserved(evidence);
+          }
+          finally { await fileOwner.close(); fileOwner = undefined; }
+        });
+      await t.test("WR1-PG database-only external backend still rejects independently of fileRoots", async () => {
+        external = await cluster.connect("h04_source"); let entered = false;
+        try {
+          await external.query("SET TimeZone='UTC'");
+          const backend = (await external.query("SELECT pid,backend_start::text FROM pg_catalog.pg_stat_activity WHERE pid=pg_backend_pid()")).rows[0];
+          const subject = `postgres-backend:${createHash("sha256").update(`${backend.pid}:${backend.backend_start}`).digest("hex").slice(0, 24)}`;
+          await assert.rejects(read(async () => { entered = true; }), rejectsSubject(subject)); assert.equal(entered, false);
+          t.diagnostic(JSON.stringify({ scope: "WR1 independent actual PostgreSQL backend rejection", subject }));
+        }
+        finally { await external.end(); external = undefined; }
+      });
+      await t.test("WR1-PG a session FD created by the actual callback is rejected at fresh exit", async () => {
+        let entered = false; const evidence: SourceFactsInventoryEvidence = { matches: [] };
+        try {
+          await assert.rejects(read(async () => {
+            entered = true; fileOwner = await open(sessionFile, "r");
+            await selectDescriptor("callback-session", sessionFile, fileOwner, evidence);
+          }, evidence), rejectsSubject(`os-process:${process.pid}`));
+          assert.equal(entered, true); assertDescriptorObserved(evidence);
+        } finally { await fileOwner?.close(); fileOwner = undefined; }
+      });
+      await t.test("WR1-PG closed descriptors permit a fresh actual facts window", async () => {
+        let entered = false; await read(async () => { entered = true; }); assert.equal(entered, true);
+      });
+      t.diagnostic(JSON.stringify({ scope: "WR1 actual PG16.15 facts and local Linux config/session inventory",
+        systemIdentifier: cluster.systemIdentifier, profile: "preview qualification is synthetic; native process/FD and database are real",
+        fixedSourceQualification: "NOT_RUN", restoreQualification: "NOT_RUN", productionRegistry: "UNCHANGED_EMPTY" }));
+    } catch (error) { failed = true; first = error; }
+    finally {
+      const results = await Promise.allSettled([fileOwner?.close(), external?.end()]);
+      const errors = results.flatMap(value => value.status === "rejected" ? [value.reason] : []);
+      for (const close of [() => mutex?.release(), () => adapter?.close(), () => preview?.close(), () => cluster.close(),
+        () => directory ? rm(directory, { recursive: true }) : undefined]) {
+        try { await close(); } catch (error) { errors.push(error); }
+      }
+      if (errors.length) throw new AggregateError(failed ? [first, ...errors] : errors, "WR1 owned PG fixture cleanup failed",
+        { cause: failed ? first : errors[0] });
+    }
+    if (failed) throw first;
   });

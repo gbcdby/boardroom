@@ -5,6 +5,7 @@ import promises, { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { types } from "node:util";
 
 type Call = (...args: unknown[]) => unknown;
 type Identity = { pid: string | null; comm: string | null; ppid: string | null; state: string | null; threads: string | null; startTicks: string | null };
@@ -12,11 +13,13 @@ type DirectoryIdentity = { event: number; dev: string | null; ino: string | null
 type ReadSummary = { event: number; bytes: number; reads: number; eof: boolean; closed: boolean; sha256: string;
   endsWithNewline: boolean; shortPositiveReads: number; identity?: Identity; identitySummaryTruncated?: boolean };
 type Proc = { pid: number; errors: object[]; droppedErrors: number; observationErrors: number;
-  stats: ReadSummary[]; maps: ReadSummary[]; uids: string[]; directoryIdentities: DirectoryIdentity[]; fdDirectoryCounts: number[]; droppedSummaries: number };
+  stats: ReadSummary[]; maps: ReadSummary[]; uids: string[]; directoryIdentities: DirectoryIdentity[]; fdDirectoryCounts: number[]; droppedSummaries: number;
+  supplementalStatus?: Record<string, unknown> };
 type Capture = { proc: Proc; subject: "stat" | "maps"; hash: Hash; bytes: number; reads: number; eof: boolean;
   event: number; lastByte: number | null; shortPositiveReads: number; statBytes: Buffer[]; statCaptured: number };
 type Frame = { index: number; phase: string; processes: Map<number, Proc>; pins: Map<number, Proc>;
-  descriptors: Map<number, Capture>; event: number; droppedProcesses: number; observationErrors: number; finished: boolean };
+  descriptors: Map<number, Capture>; event: number; droppedProcesses: number; observationErrors: number; finished: boolean;
+  errorDiagnostic?: (proc: Proc, event: number) => void; selectedLinks?: Map<string, string> };
 const limits = { inspections: 2, failedPidsPerInspection: 16, processesPerInspection: 512, errorsPerProcess: 32,
   summariesPerProcess: 4, statIdentityBytes: 8192 } as const;
 const root = fileURLToPath(new URL("../../", import.meta.url));
@@ -25,9 +28,10 @@ const syncNames = ["openSync", "readSync", "closeSync", "fstatSync"] as const;
 const asyncNames = ["readdir", "readlink", "stat"] as const;
 const context = new AsyncLocalStorage<Frame>();
 function safeError(error: unknown) {
-  const value = error as { name?: unknown; code?: unknown; syscall?: unknown } | null;
+  const value = error as { name?: unknown; code?: unknown; syscall?: unknown; errno?: unknown } | null;
   return { name: ["Error", "TypeError", "RangeError", "MaintenanceFailure"].includes(String(value?.name)) ? String(value!.name) : "other",
     code: typeof value?.code === "string" && /^E[A-Z0-9_]{1,30}$/.test(value.code) ? value.code : null,
+    ...(typeof value?.errno === "number" && Number.isSafeInteger(value.errno) ? { errno: value.errno } : {}),
     syscall: typeof value?.syscall === "string" && ["open", "read", "close", "fstat", "stat", "readlink", "scandir"].includes(value.syscall) ? value.syscall : null };
 }
 function observe(frame: Frame, proc: Proc | undefined, work: () => void) {
@@ -42,13 +46,14 @@ function getProcess(frame: Frame, pid: number): Proc | undefined {
   }
   return result;
 }
-function subject(frame: Frame, value: unknown): { proc: Proc; subject: string } | undefined {
+function subject(frame: Frame, value: unknown): { proc: Proc; subject: string; fd?: number } | undefined {
   if (typeof value !== "string") return;
   const pin = /^\/proc\/([1-9][0-9]*)$/.exec(value);
   if (pin) { const proc = getProcess(frame, Number(pin[1])); return proc ? { proc, subject: "proc-directory" } : undefined; }
-  const item = /^\/proc\/self\/fd\/([0-9]+)\/(stat|maps|fd)(?:\/[0-9]+)?$/.exec(value);
+  const item = /^\/proc\/self\/fd\/([0-9]+)\/(stat|maps|fd)(?:\/([0-9]+))?$/.exec(value);
   const proc = item && frame.pins.get(Number(item[1]));
-  if (proc && item) return { proc, subject: item[2] === "fd" && value.endsWith("/fd") ? "fd-directory" : item[2] === "fd" ? "process-fd" : item[2]! };
+  if (proc && item) return { proc, subject: item[2] === "fd" && value.endsWith("/fd") ? "fd-directory" : item[2] === "fd" ? "process-fd" : item[2]!,
+    ...(item[3] === undefined ? {} : { fd: Number(item[3]) }) };
 }
 function recordError(frame: Frame, proc: Proc | undefined, operation: string, category: string, error: unknown, event: number) {
   if (!proc) return;
@@ -58,7 +63,39 @@ function recordError(frame: Frame, proc: Proc | undefined, operation: string, ca
       originalHandling: category === "process-fd" && ["ENOENT", "ESRCH", "EBADF"].includes(safe.code ?? "")
         ? "ignored-fd-race" : "requires-original-path-context" });
     else proc.droppedErrors++;
+    if (!(category === "process-fd" && ["ENOENT", "ESRCH", "EBADF"].includes(safe.code ?? ""))) frame.errorDiagnostic?.(proc, event);
   });
+}
+
+/** Only finite own data; extract the fixed public error subject, never arbitrary error text. */
+export function sourceWriterFailureSubjects(error: unknown): string[] {
+  const result: string[] = [], seen = new Set<object>();
+  for (let index = 0; index < 8 && error !== null && typeof error === "object" && !types.isProxy(error) && !seen.has(error); index++) {
+    seen.add(error);
+    const data = (name: string) => { const property = Object.getOwnPropertyDescriptor(error, name); return property && "value" in property ? property.value : undefined; };
+    const code = data("code"), direct = data("subjectRef"), message = data("message");
+    // MaintenanceFailure intentionally has no subjectRef property: the public
+    // subject is part of its fixed, redacted constructor message.
+    const subject = typeof direct === "string" ? direct : typeof message === "string" && message.length <= 192
+      ? /^storage_maintenance: source_writer_unknown \(([^()]+)\)$/.exec(message)?.[1] : undefined;
+    if (code === "source_writer_unknown" && typeof subject === "string" && subject.length <= 128
+      && /^(?:unreadable-process:[1-9][0-9]*|os-process:[1-9][0-9]*|postgres-backend:[0-9a-f]{24})$/.test(subject)) result.push(subject);
+    error = data("cause");
+  }
+  return [...new Set(result)];
+}
+
+export type SourceFactsInventoryEvidence = {
+  selected?: { label: "config" | "nested-session" | "callback-session"; file: string; fd: number; dev: string; ino: string };
+  matches: { label: string; pid: number; fd: number; dev: string; ino: string; event: number }[];
+};
+type FactsOptions = { outputRoot?: string; evidence?: SourceFactsInventoryEvidence };
+
+/** Covers withSourceClientFacts itself, which never calls adapter.inspectCurrentWriters. */
+export function withSourceFactsInventoryDiagnostics<T>(operation: () => Promise<T>, options: FactsOptions = {}): Promise<T> {
+  const boundary = { inspectCurrentWriters: operation };
+  return inventoryDiagnostics(boundary, () => boundary.inspectCurrentWriters(), options.outputRoot ?? defaultOutput, process.pid,
+    { facts: true, ...(options.evidence ? { evidence: options.evidence } : {}) });
 }
 function finishRead(capture: Capture, closed: boolean): ReadSummary {
   const result: ReadSummary = { event: capture.event, bytes: capture.bytes, reads: capture.reads, eof: capture.eof, closed,
@@ -108,6 +145,12 @@ function stageHint(proc: Proc): string {
 /** Test-only passive observer. Original native calls, promises, return values and exceptions are forwarded once. */
 export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
   operation: (phase: (value: string) => void) => Promise<T>, outputRoot = defaultOutput, ownedPid?: number): Promise<T> {
+  return inventoryDiagnostics(adapter, operation, outputRoot, ownedPid);
+}
+
+async function inventoryDiagnostics<T>(adapter: object,
+  operation: (phase: (value: string) => void) => Promise<T>, outputRoot: string, ownedPid?: number,
+  options: { facts?: boolean; evidence?: SourceFactsInventoryEvidence } = {}): Promise<T> {
   if (process.platform !== "linux") return operation(() => {});
   const target = adapter as { inspectCurrentWriters: Call }, prior = Object.getOwnPropertyDescriptor(target, "inspectCurrentWriters");
   const originalInspect = target.inspectCurrentWriters;
@@ -120,13 +163,62 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
   const failures: object[] = [];
   const observedPid = Number.isSafeInteger(ownedPid) && ownedPid! > 0 ? ownedPid : undefined;
   const observations: ({ evidenceState: "OBSERVED" | "UNOBSERVED" } & Record<string, unknown>)[] = []; let droppedObservations = 0;
+  let statusSnapshots = 0;
+  const supplementalStatus = (frame: Frame, proc: Proc, event: number) => {
+    if (!options.facts || proc.supplementalStatus || statusSnapshots >= limits.failedPidsPerInspection) return;
+    statusSnapshots++;
+    let pin = [...frame.pins].find(([, value]) => value === proc)?.[0];
+    // A failed/unknown close can leave a reused numeric FD. Never read a
+    // source-directory "status" payload through an unverified old proc pin.
+    if (pin !== undefined) try {
+      const original = proc.directoryIdentities[0], current = syncOriginal.fstatSync(pin, { bigint: true }) as fs.BigIntStats;
+      if (!original || !current.isDirectory() || decimal(current.dev) !== original.dev || decimal(current.ino) !== original.ino) pin = undefined;
+    } catch { pin = undefined; }
+    const report: Record<string, unknown> = { originalErrorEvent: event,
+      binding: pin === undefined ? "numeric-pid-after-original-error" : "original-pinned-process-directory",
+      scope: "Additional bounded status read at the original syscall error; never returned to inventory or used as an exemption.",
+      fields: {}, eof: false, closed: false };
+    proc.supplementalStatus = report;
+    let fd: number | undefined;
+    try {
+      const name = pin === undefined ? `/proc/${proc.pid}/status` : `/proc/self/fd/${pin}/status`;
+      fd = syncOriginal.openSync(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK) as number;
+      const chunks: Buffer[] = []; let bytes = 0;
+      for (let index = 0; index < 17; index++) {
+        const chunk = Buffer.alloc(Math.min(4096, 16_384 - bytes + 1));
+        const count = syncOriginal.readSync(fd, chunk, 0, chunk.length, null) as number;
+        if (count === 0) { report.eof = true; break; }
+        bytes += count;
+        if (bytes > 16_384) break;
+        chunks.push(chunk.subarray(0, count));
+      }
+      report.bytes = bytes;
+      if (report.eof) {
+        const fields: Record<string, string | string[]> = {};
+        for (const line of Buffer.concat(chunks).toString("latin1").split("\n")) {
+          const match = /^(Pid|PPid|Tgid|TracerPid|Threads|Uid|Gid|Groups|CapInh|CapPrm|CapEff|CapBnd|CapAmb|NoNewPrivs|Seccomp):\s*(.*?)\s*$/.exec(line);
+          if (!match) continue;
+          const [, key, value] = match;
+          if (["Uid", "Gid", "Groups"].includes(key!)) {
+            const parts = value!.trim() ? value!.trim().split(/\s+/) : [];
+            if (parts.length <= 128 && parts.every(item => /^[0-9]{1,24}$/.test(item))) fields[key!] = parts;
+          } else if (key!.startsWith("Cap") ? /^[0-9a-f]{1,16}$/.test(value!) : /^[0-9]{1,24}$/.test(value!)) fields[key!] = value!;
+        }
+        report.fields = fields;
+      }
+    } catch (error) { report.error = safeError(error); }
+    finally {
+      if (fd !== undefined) try { syncOriginal.closeSync(fd); report.closed = true; }
+      catch (error) { report.closeError = safeError(error); }
+    }
+  };
   const recordObservation = (frame: Frame, value: unknown, originalThrew = false) => {
     if (observedPid === undefined) return;
     if (observations.length === limits.inspections) { droppedObservations++; return; }
     const identity = { inspection: frame.index, phase: frame.phase, pid: observedPid };
     try {
       const proc = frame.processes.get(observedPid), reasons: string[] = [];
-      const result = originalThrew ? "THREW" : Array.isArray(value) ? value.length ? "BLOCKERS" : "CLEAR" : "OTHER";
+      const result = originalThrew ? "THREW" : options.facts ? "RETURNED" : Array.isArray(value) ? value.length ? "BLOCKERS" : "CLEAR" : "OTHER";
       const unfinished = [...frame.descriptors.values()].filter(capture => capture.proc === proc)
         .map(capture => ({ subject: capture.subject, ...finishRead({ ...capture, statBytes: [...capture.statBytes] }, false) }));
       if (!proc) reasons.push("target-not-observed");
@@ -151,10 +243,12 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
     try { if (prior) Object.defineProperty(target, "inspectCurrentWriters", prior); else delete (target as Partial<typeof target>).inspectCurrentWriters; }
     catch { restorationErrors++; }
   };
-  const finish = (frame: Frame, value: unknown) => observe(frame, undefined, () => {
+  const finish = (frame: Frame, value: unknown, originalThrew = false) => observe(frame, undefined, () => {
     frame.finished = true;
-    recordObservation(frame, value);
-    const pids = Array.isArray(value) ? [...new Set(value.flatMap(item => {
+    recordObservation(frame, value, originalThrew);
+    const pids = originalThrew ? options.facts ? sourceWriterFailureSubjects(value).flatMap(subject => {
+      const match = /^unreadable-process:([1-9][0-9]*)$/.exec(subject); return match ? [Number(match[1])] : [];
+    }) : [] : Array.isArray(value) ? [...new Set(value.flatMap(item => {
       if (item?.code !== "source_writer_unknown" || typeof item.subjectRef !== "string") return [];
       const match = /^unreadable-process:([1-9][0-9]*)$/.exec(item.subjectRef); return match ? [Number(match[1])] : [];
     }))] : [];
@@ -228,6 +322,16 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
           if (name === "readdir" && observed.subject === "fd-directory" && Array.isArray(value)) {
             if (observed.proc.fdDirectoryCounts.length < limits.summariesPerProcess) observed.proc.fdDirectoryCounts.push(value.length); else observed.proc.droppedSummaries++;
           }
+          const evidence = options.evidence, selected = evidence?.selected;
+          if (selected && observed.subject === "process-fd" && observed.proc.pid === process.pid && observed.fd === selected.fd) {
+            const key = `${observed.proc.pid}:${observed.fd}`;
+            if (name === "readlink" && typeof value === "string") frame.selectedLinks!.set(key, value.replace(/ \(deleted\)$/, ""));
+            if (name === "stat" && frame.selectedLinks!.get(key) === selected.file) {
+              const info = value as fs.BigIntStats;
+              if (decimal(info.dev) === selected.dev && decimal(info.ino) === selected.ino && evidence!.matches.length < 32)
+                evidence!.matches.push({ label: selected.label, pid: observed.proc.pid, fd: selected.fd, dev: selected.dev, ino: selected.ino, event });
+            }
+          }
         }), error => recordError(frame, observed.proc, name, observed.subject, error, event)); });
       }
       return pending; // Keep the original promise, including its original rejection object and native call order.
@@ -235,13 +339,14 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
     syncBuiltinESMExports();
     Object.defineProperty(target, "inspectCurrentWriters", { configurable: true, writable: true, value: function(this: unknown, ...args: unknown[]) {
       const frame: Frame = { index: ++inspectionCalls, phase, processes: new Map(), pins: new Map(), descriptors: new Map(),
-        event: 0, droppedProcesses: 0, observationErrors: 0, finished: false };
+        event: 0, droppedProcesses: 0, observationErrors: 0, finished: false, selectedLinks: new Map() };
+      if (options.facts) frame.errorDiagnostic = (proc, event) => supplementalStatus(frame, proc, event);
       let value: unknown;
       try { value = context.run(frame, () => Reflect.apply(originalInspect, this, args)); }
-      catch (error) { frame.finished = true; recordObservation(frame, undefined, true); throw error; }
+      catch (error) { finish(frame, error, true); throw error; }
       observe(frame, undefined, () => {
         if (value && typeof (value as Promise<unknown>).then === "function")
-          (value as Promise<unknown>).then(result => finish(frame, result), () => { frame.finished = true; recordObservation(frame, undefined, true); });
+          (value as Promise<unknown>).then(result => finish(frame, result), error => finish(frame, error, true));
         else finish(frame, value);
       });
       return value;
@@ -256,12 +361,17 @@ export async function withSqliteSourceInventoryDiagnostics<T>(adapter: object,
     const directory = await mkdtemp(path.join(outputRoot, "inspection-"));
     await writeFile(path.join(directory, "report.json"), JSON.stringify({ setupComplete, restorationErrors, inspectionCalls,
       originalOperationThrew: threw, droppedFailures, limits, pid: process.pid, uid: process.getuid?.() ?? null,
+      ...(options.facts ? { boundary: "source-facts-operation", supplementalStatusLimit: limits.failedPidsPerInspection,
+        supplementalStatusBytes: 16_384, sourceDescriptorMatches: options.evidence?.matches ?? [],
+        supplementalStatusScope: "Additional status read only at an original non-race syscall error; pinned when available, numeric PID otherwise. No qualification or permission inference." } : {}),
       ...(observedPid === undefined ? {} : { ownedPid: observedPid, observations, droppedObservations,
         requestEvidenceState: setupComplete && observations.length > 0 && !droppedObservations
           && observations.every(item => item.evidenceState === "OBSERVED") ? "OBSERVED" : "UNOBSERVED",
         observationScope: "Original selected-PID summaries, including clear results; OBSERVED describes collection, never source-view qualification." }),
       node: process.version, candidate: /^[a-f0-9]{40}$/.test(process.env.GITHUB_SHA ?? "") ? process.env.GITHUB_SHA : null,
-      provenance: observedPid === undefined
+      provenance: options.facts
+        ? "Original facts operation and original syscall results; additional bounded status only at the original syscall error, separately labelled. No inventory retry, source payload read or qualification change."
+        : observedPid === undefined
         ? "Original calls and returned bytes only. Failed PID summaries only; no proc/source reread, dump, retry or qualification change."
         : "Original calls and returned bytes only. Failed PID and opt-in owned PID summaries; no proc/source reread, dump, retry or qualification change.",
       identityEvidenceScope: "Bounded original stat/fstat fields only; OBSERVED does not prove complete credentials, program path, exit, source qualification or cause.",

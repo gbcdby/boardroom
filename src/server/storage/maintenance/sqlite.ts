@@ -13,6 +13,7 @@ import { maintenanceHostIdentityDigest } from "./host.ts";
 import { ArtifactStore } from "./objects.ts";
 import { assertDarwinSqliteSource, bindDarwinSqliteSource, darwinSourceHandles, darwinSourceInventory } from "./darwin.ts";
 import { inspectLinuxSourceProcesses, linuxMappedSourceHandles, linuxSourceMappingIdentities } from "./linux-mappings.ts";
+import { inspectSourceFileWriters } from "./source-file-writers.ts";
 import { fullSyncDarwinDatabaseHandle, syncMaintenanceHandle } from "./platform.ts";
 import { readSqliteManifests } from "./sqlite-manifests.ts";
 import { readSqliteSourceClients } from "./sqlite-source-clients.ts";
@@ -507,7 +508,11 @@ class SqliteMaintenanceAdapter implements MaintenanceAdapter {
           observe: () => lock.observeSourceClients(),
           decodedRows: async observation => decodeSqliteSourceRows(observation),
           validateSource: (value, observation) => { if (!same(value, observation.sourceIdentity)) throw new MaintenanceFailure("source_changed"); },
-          inspectWriters: async (_observation, _rows, audit) => this.inspectCurrentWriters(true, audit),
+          inspectWriters: async (_observation, _rows, roots, audit) => {
+            const blockers = await this.inspectCurrentWriters(true, audit);
+            if (blockers.length === 0) await inspectSourceFileWriters(roots);
+            return blockers;
+          },
           runtimeRows: async () => ({
             runners: db.prepare(`SELECT b.id AS binding_id,b.member_id,r.generation,r.lease_owner,r.exit_confirmed,
               r.process_identity_json,r.state FROM agent_runtime_bindings b LEFT JOIN agent_runner_states r ON r.binding_id=b.id`).all() as Record<string, unknown>[],

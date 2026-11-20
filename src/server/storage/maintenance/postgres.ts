@@ -19,6 +19,7 @@ import { postgresFileDigest, restorePostgresPublic } from "./postgres-public-res
 import { readPublicRestoreCatalogBinding, type PublicRestoreCatalogBinding } from "./postgres-public-toc.ts";
 import { decodePostgresSourceRows, readPostgresSourceClients } from "./postgres-source-clients.ts";
 import { readSourceClientAudit, withCancellationSourceClientFacts, withControllerSourceClientFacts, withSourceClientFacts, type SourceFactsAccess } from "./source-writers.ts";
+import { inspectSourceFileWriters } from "./source-file-writers.ts";
 import { readAnchoredControllerArchive, type ControllerSourceAccess } from "./controller-write.ts";
 import { finishControllerRestoreCallback, retainPendingControllerRestoreFailures } from "./restore-authorization.ts";
 import { BootstrapAuditFactory, type SessionAuditCollection } from "./native-audit.ts";
@@ -739,7 +740,11 @@ export async function createPostgresMaintenanceAdapter(source: PostgresDescripto
               database_name: actual.databaseName, schema_name: actual.schemaName, configurationDigest: sha256(source.connectionString) };
             if (!same(value, expected)) throw new MaintenanceFailure("source_changed");
           },
-          inspectWriters: async (observation, rows, audit) => inspectWriters({ ...observation, clients: rows as readonly Readonly<Record<string, Json>>[] }, "external", true, audit),
+          inspectWriters: async (observation, rows, roots, audit) => {
+            const blockers = await inspectWriters({ ...observation, clients: rows as readonly Readonly<Record<string, Json>>[] }, "external", true, audit);
+            if (blockers.length === 0) await inspectSourceFileWriters(roots);
+            return blockers;
+          },
           runtimeRows: async () => {
             try {
               return {

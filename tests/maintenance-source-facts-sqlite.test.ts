@@ -992,3 +992,40 @@ test("A11A refuses an uncertain registered-process handle close without exposing
     assert.equal(attempted, true); assert.equal(consumed, false);
   } finally { t.mock.restoreAll(); await f.close(); }
 });
+
+test("WR1 SQLite actual facts refuse an unowned selected-config descriptor before the consumer", async t => {
+  if (process.platform !== "linux") { t.skip("Linux fileRoots inventory"); return; }
+  const f = await fixture(), reader = await open(f.environment.configFile!, "r+");
+  let consumed = false;
+  try {
+    await assert.rejects(f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference,
+      async () => { consumed = true; })), { code: "source_writer_unknown" });
+    assert.equal(consumed, false);
+  } finally { await reader.close(); await f.close(); }
+});
+
+test("WR1 SQLite actual facts admit closed config and recheck a new descriptor at callback exit", async t => {
+  if (process.platform !== "linux") { t.skip("Linux fileRoots inventory"); return; }
+  const f = await fixture(); let reader: FileHandle | undefined, consumed = false;
+  try {
+    await f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference,
+      async facts => { await facts.assertCurrent(); consumed = true; }));
+    assert.equal(consumed, true);
+    await assert.rejects(f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference,
+      async () => { reader = await open(f.environment.configFile!, "r"); })), { code: "source_writer_unknown" });
+  } finally { await reader?.close(); await f.close(); }
+});
+
+test("WR1 a caught inventory failure stays latched to its actual source lock", async t => {
+  if (process.platform !== "linux") { t.skip("Linux fileRoots inventory"); return; }
+  const f = await fixture(); let reader: FileHandle | undefined, first: unknown;
+  try {
+    await f.adapter.withSourceLock("control", async lock => {
+      reader = await open(f.environment.configFile!, "r");
+      await assert.rejects(lock.withSourceClientFacts(f.reference, async () => {}), error => { first = error; return true; });
+      await reader.close(); reader = undefined;
+      await assert.rejects(lock.withSourceClientFacts(f.reference, async () => {}), error => error === first);
+    });
+    await f.adapter.withSourceLock("control", lock => lock.withSourceClientFacts(f.reference, async () => {}));
+  } finally { await reader?.close(); await f.close(); }
+});

@@ -16,7 +16,7 @@ type FixtureDatabase = "postgres" | "h04_source" | "h04_verification";
 
 /** Test-only adaptation of the existing restart fixture. This owns a fresh child/datadir, never a supplied database URL.
  * Trust authentication is deliberate fixture behavior, not evidence of the H04 production server epoch or HBA profile. */
-export async function openCatalogGuardTestCluster(binaryDirectory: string) {
+export async function openCatalogGuardTestCluster(binaryDirectory: string, diagnostic: "h04" | "wr1" = "h04") {
   assert.ok(isAbsolute(binaryDirectory), "private PostgreSQL tools require an explicit absolute directory");
   assert.equal(process.platform, "linux"); assert.notEqual(process.getuid?.(), 0);
   const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PG")));
@@ -35,7 +35,7 @@ export async function openCatalogGuardTestCluster(binaryDirectory: string) {
   const diagnostics = async () => {
     const evidence = resolve(".agent-output/maintenance-pg-restart");
     await mkdir(evidence, { recursive: true, mode: 0o700 });
-    await copyFile(log, join(evidence, "h04-postgres.log")).catch(error => {
+    await copyFile(log, join(evidence, `${diagnostic}-postgres.log`)).catch(error => {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     });
   };
@@ -100,6 +100,9 @@ export async function openCatalogGuardTestCluster(binaryDirectory: string) {
       }
     }
     return { connect, systemIdentifier: systemIdentifier!,
+      connectionString(database: FixtureDatabase = "postgres") {
+        return `postgresql://${h04Roles.administrator}@127.0.0.1:${port}/${database}`;
+      },
       async close() { await verifyOwner(); await stop(); await diagnostics(); await rm(directory, { recursive: true, force: true }); } };
   } catch (error) {
     await diagnostics(); await stop(); await rm(directory, { recursive: true, force: true }); throw error;
