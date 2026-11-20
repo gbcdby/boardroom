@@ -25,18 +25,25 @@ HERE = Path(__file__).resolve().parent
 NEW_INPUT_KIND = "FIXED_F3_INPUT_CLOSURE_NOT_BOOTED"
 PRIVATE_CATALOG_SHA256 = None
 DM_PROFILE = "whole-brd-f3-dm-linear-v1"
+F4_PROFILE = "whole-brd-f4-cfp2-clean-regular-v1"
 DM_SOURCE_NAMES = ("f3-dm.py", "f3-dm-guest.c", "f3-dm-uapi.h", "F3-DM.md", "../../../tests/whole-brd-f3-dm.test.py")
+F4_SOURCE_NAMES = ("f4-cfp2.py", "f4-cfp2-guest.c", "f4-cfp2-target.c", "f4-cfp2-worker.c", "f4-cfp2-worker.h",
+    "f4-cfp2-observe.h", "F4-CFP2.md", "../../../tests/whole-brd-f4-cfp2.test.py",
+    "../../../native/maintenance-source-files.c", "../../../native/node-api/v24.22.1/node_api.h",
+    "../../../native/node-api/v24.22.1/node_api_types.h", "../../../native/node-api/v24.22.1/js_native_api.h",
+    "../../../native/node-api/v24.22.1/js_native_api_types.h", "../../../native/node-api/v24.22.1/LICENSE",
+    "../../../native/node-api/v24.22.1/SOURCES.json")
 SOURCE_NAMES = ('f0.py', 'f0b.py', 'build.py', 'guest.c', 'host-gate.c', 'supervise.py', 'transport.py', 'inputs.json', 'f2.py', 'f2-build.py', 'f2-run.py', 'f2-guest.c', 'mke2fs-f2.conf', 'f3.py', 'f3-build.py', 'f3-run.py', 'f3-inputs.json', 'f3-guest.c', 'F3.md', '../../../tests/whole-brd-f3.test.py', '../fs-source-preservation/uapi.h', '../fs-source-preservation/native.py', '../fs-source-preservation/diagnostics.py', '../fs-source-preservation/window.py', '../fs-source-preservation/probe.c')
 
 
 def profile_module(request):
     if type(request) is not dict: raise ValueError("F3 request object required")
     if "profile" not in request: return f3
-    if request["profile"] != DM_PROFILE or request.get("input_kind") != NEW_INPUT_KIND:
-        raise ValueError("explicit DM profile requires the fixed new input family")
-    name = "fixed_f3_dm_profile"
+    if request["profile"] not in (DM_PROFILE, F4_PROFILE) or request.get("input_kind") != NEW_INPUT_KIND:
+        raise ValueError("explicit profile requires the fixed new input family")
+    name, filename = ("fixed_f3_dm_profile", "f3-dm.py") if request["profile"] == DM_PROFILE else ("fixed_f4_cfp2_profile", "f4-cfp2.py")
     if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(name, HERE / "f3-dm.py")
+        spec = importlib.util.spec_from_file_location(name, HERE / filename)
         module = importlib.util.module_from_spec(spec); sys.modules[name] = module
         try: spec.loader.exec_module(module)
         except BaseException:
@@ -46,12 +53,14 @@ def profile_module(request):
 
 
 def observed_state(request):
-    return "F3_SOURCE_PRESERVATION_OBSERVED" if profile_module(request) is f3 else "F3_DM_SOURCE_PRESERVATION_OBSERVED"
+    module = profile_module(request)
+    if module is f3: return "F3_SOURCE_PRESERVATION_OBSERVED"
+    return "F3_DM_SOURCE_PRESERVATION_OBSERVED" if module.PROFILE == DM_PROFILE else module.STATE
 
 
 def source_bindings(profile=None):
-    if profile not in (None, DM_PROFILE): raise ValueError("unknown F3 source profile")
-    names = SOURCE_NAMES + (DM_SOURCE_NAMES if profile == DM_PROFILE else ())
+    if profile not in (None, DM_PROFILE, F4_PROFILE): raise ValueError("unknown F3 source profile")
+    names = SOURCE_NAMES + (DM_SOURCE_NAMES if profile is not None else ()) + (F4_SOURCE_NAMES if profile == F4_PROFILE else ())
     return {name: build.file_binding((HERE / name).resolve(), f2.MIB)[0] for name in names}
 
 
@@ -65,8 +74,9 @@ def input_profile(request):
 
 
 def compile_commands(compiler, header, out, request):
-    helper = "f3-guest.c" if profile_module(request) is f3 else "f3-dm-guest.c"
-    return [
+    module = profile_module(request)
+    helper = "f3-guest.c" if module is f3 else "f3-dm-guest.c"
+    commands = [
         [compiler, "-std=c11", "-Os", "-Wall", "-Wextra", "-Werror", "-static", "-fno-ident", "-Wl,--build-id=sha1",
          "-o", str(out / "host-gate"), str(HERE / "host-gate.c")],
         [compiler, "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror", "-fno-ident",
@@ -74,6 +84,12 @@ def compile_commands(compiler, header, out, request):
         [compiler, "-std=c11", "-Os", "-Wall", "-Wextra", "-Werror", "-static", "-fno-ident", "-Wl,--build-id=sha1",
          "-include", str(header), "-o", str(out / "brd-f2"), str(HERE / helper), str(out / "sp-probe.o")],
     ]
+    if module is not f3 and module.PROFILE == F4_PROFILE:
+        commands[2] = [compiler, "-std=c11", "-Os", "-Wall", "-Wextra", "-Werror", "-static", "-fno-ident", "-Wl,--build-id=sha1",
+            "-ffunction-sections", "-fdata-sections", "-DNAPI_VERSION=8", "-Wl,--gc-sections",
+            "-I", str((HERE / "../../../native/node-api/v24.22.1").resolve()), "-include", str(header), "-o", str(out / "brd-f2"),
+            *(str(HERE / name) for name in ("f4-cfp2-guest.c", "f4-cfp2-target.c", "f4-cfp2-worker.c")), str(out / "sp-probe.o")]
+    return commands
 
 
 def require_private_source():
@@ -439,7 +455,7 @@ def prepare_input_closure(request, output):
               "inputs": {}, "e2fs": {}, "commands": []}
     original_error = None
     try:
-        record["source"] = source_bindings(DM_PROFILE) if "profile" in request else source_bindings()
+        record["source"] = source_bindings(request["profile"]) if "profile" in request else source_bindings()
         closure, data, files = verify_input_closure(request)
         record["input_closure"] = closure; record["inputs"] = dict(closure["core"])
         record["e2fs"] = closure["payload"]
@@ -473,7 +489,7 @@ def prepare_input_closure(request, output):
         record["mkfs_environment"] = dict(f2.MKFS_ENV)
         if verify_input_closure(request)[0] != closure: raise ValueError("inputs changed during offline build")
         if runtime_cwd(cwd) != record["runtime_cwd"]: raise ValueError("runtime cwd changed during offline build")
-        if (source_bindings(DM_PROFILE) if "profile" in request else source_bindings()) != record["source"]: raise ValueError("source changed during offline build")
+        if (source_bindings(request["profile"]) if "profile" in request else source_bindings()) != record["source"]: raise ValueError("source changed during offline build")
         if time.monotonic() - started > 60: raise TimeoutError("offline preparation stage deadline")
         record["state"] = "FIXED_F3_BUNDLE_NOT_BOOTED"
     except BaseException as error:

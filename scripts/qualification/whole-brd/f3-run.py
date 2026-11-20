@@ -31,7 +31,7 @@ def validate(bundle_path, digest):
     run_id = bundle["request"]["run_id"]
     module = builder.profile_module(bundle["request"])
     if bundle["proposal"] != module.plan(json.dumps({"run_id": run_id}).encode()): raise ValueError("F3 proposal changed")
-    if bundle["source"] != (builder.source_bindings(builder.DM_PROFILE) if "profile" in bundle["request"] else builder.source_bindings()): raise ValueError("execution sources differ from frozen bundle")
+    if bundle["source"] != (builder.source_bindings(bundle["request"]["profile"]) if "profile" in bundle["request"] else builder.source_bindings()): raise ValueError("execution sources differ from frozen bundle")
     if bundle["mkfs_argv"] != (f2 if module is f3 else module).mkfs_argv(run_id) or bundle["mkfs_environment"] != f2.MKFS_ENV:
         raise ValueError("fixed mkfs contract changed")
     keys = {"qemu", "kernel", "bios", "busybox", "notes", "gate", "helper", "brd", "config", "initramfs"}
@@ -85,7 +85,7 @@ def runtime_preflight(bundle_path, bundle, output, argv=None, owned=None):
     builder.require_private_source()
     if bundle.get("kind") != builder.NEW_INPUT_KIND: raise ValueError("unknown runtime input family")
     builder.profile_module(bundle["request"])
-    if bundle["source"] != (builder.source_bindings(builder.DM_PROFILE) if "profile" in bundle["request"] else builder.source_bindings()): raise ValueError("private source identity changed")
+    if bundle["source"] != (builder.source_bindings(bundle["request"]["profile"]) if "profile" in bundle["request"] else builder.source_bindings()): raise ValueError("private source identity changed")
     closure, _, _ = builder.verify_input_closure(bundle["request"])
     if closure != bundle["input_closure"] or closure["runtime_inputs"]["status"] != "FIXED_PRECONDITIONS_NOT_RUNTIME_EVIDENCE":
         raise ValueError("runtime_use_NOT_ESTABLISHED")
@@ -126,7 +126,9 @@ def execute(bundle_path, digest, output):
               "original_error": None, "secondary_errors": [], "cleanup": {"verified": False}, "normal_poweroff_observed": False,
               "host": {"uname": list(os.uname()), "uid": os.getuid(), "gid": os.getgid()}}
     if new_inputs: result.update(runtime_preflight=runtime, runtime_checks=["before-claim"])
-    if module is not f3: result.update(kind="private-f3-dm-source-preservation-run", profile=builder.DM_PROFILE)
+    if module is not f3:
+        result.update(kind="private-f3-dm-source-preservation-run" if module.PROFILE == builder.DM_PROFILE else
+                      "private-f4-cfp2-clean-regular-run", profile=module.PROFILE)
     owned = None; pump = None; qmp = None; capture = None; tail = b""; finished = False
     stage_started = None; stage = "boot"; boot_started = None; complete_seen_at = None
 
@@ -229,11 +231,17 @@ def execute(bundle_path, digest, output):
     return result
 
 
+def expected_result_state(result):
+    # profile 来自 execute 实际选择的 module；未知标签不得回落旧成功状态。
+    request = {} if "profile" not in result else {"profile": result["profile"], "input_kind": builder.NEW_INPUT_KIND}
+    return builder.observed_state(request)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="One separately reviewed/released F3 guest; standard CI must never invoke execute.")
     parser.add_argument("--bundle", required=True); parser.add_argument("--bundle-sha256", required=True); parser.add_argument("--output", required=True)
     args = parser.parse_args()
     result = execute(args.bundle, args.bundle_sha256, args.output)
     print(json.dumps({key: result[key] for key in ("state", "qualification", "original_error", "secondary_errors", "final_artifact_errors")}))
-    expected_state = "F3_DM_SOURCE_PRESERVATION_OBSERVED" if result.get("profile") == builder.DM_PROFILE else "F3_SOURCE_PRESERVATION_OBSERVED"
+    expected_state = expected_result_state(result)
     raise SystemExit(0 if result["state"] == expected_state else 1)
