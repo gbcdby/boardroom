@@ -6,6 +6,7 @@ import { parseDocument } from "yaml";
 
 type Step = {
   id?: string;
+  name?: string;
   uses?: string;
   run?: string;
   env?: Record<string, string>;
@@ -23,6 +24,7 @@ const document = parseDocument(readFileSync(new URL("../.github/workflows/databa
 assert.deepEqual(document.errors, [], "CI workflow must remain valid YAML");
 const jobs = (document.toJS() as { jobs: Record<string, Job> }).jobs;
 const artifactOutput = "${{ needs.browser-dependencies.outputs.browser_dependencies_id }}";
+const fullMatrixBrowserCheckIf = "${{ !cancelled() && ((github.event_name == 'workflow_dispatch' && inputs.full_matrix) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))) }}";
 
 function ancestors(jobId: string, found = new Set<string>()): Set<string> {
   const job = jobs[jobId];
@@ -62,19 +64,30 @@ test("every browser dependency consumer uses the producer's artifact ID, includi
   for (const consumer of consumers) assert.equal(consumer.env?.RESOURCE_BROWSER_ARTIFACT_ID, artifactOutput);
 });
 
-test("the existing Chromium check fails when preparation fails or produces no usable artifact ID", () => {
+test("the Chromium check stays eligible under the full-matrix condition and fails when preparation fails or produces no usable artifact ID", () => {
   const browser = jobs["managed-web-browser"]!;
-  assert.equal(browser.if, "${{ !cancelled() }}", "failed preparation must not skip the required Chromium check");
+  assert.equal(browser.if, fullMatrixBrowserCheckIf, "full-matrix Chromium check must not be skipped when preparation fails");
+  assert.ok(browser.if?.startsWith("${{ !cancelled() && "), "only cancellation may skip the triggered check");
+  assert.match(browser.if!, /github\.event_name == 'workflow_dispatch' && inputs\.full_matrix/);
+  assert.match(browser.if!, /github\.event_name == 'pull_request' && contains\(github\.event\.pull_request\.labels\.\*\.name, 'ci-full'\)/);
+  assert.doesNotMatch(browser.if!, /success\(\)|needs\.browser-dependencies\.result/, "preparation outcome must not gate the check");
   const gate = browser.steps[0];
   assert.ok(gate?.run, "check the dependency outcome before browser setup");
+  assert.equal(gate.name, "核对依赖准备成功且产物身份存在");
   assert.equal(gate.env?.DEPENDENCIES_RESULT, "${{ needs.browser-dependencies.result }}");
   assert.equal(gate.env?.BROWSER_DEPENDENCIES_ID, artifactOutput);
   for (const [result, artifactId, succeeds] of [
     ["success", "800001", true],
     ["failure", "800001", false],
+    ["failure", "", false],
     ["skipped", "", false],
+    ["cancelled", "800001", false],
     ["success", "", false],
     ["success", "0", false],
+    ["success", "-1", false],
+    ["success", "01", false],
+    ["success", " 800001", false],
+    ["success", "1e3", false],
     ["success", "not-an-id", false],
   ] as const) {
     const actual: SpawnSyncReturns<string> = spawnSync("bash", ["-e", "-c", gate.run], {
