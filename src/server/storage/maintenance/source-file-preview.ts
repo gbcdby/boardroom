@@ -5,7 +5,7 @@ import { canonicalJson, digestJson } from "./canonical.ts";
 import { MaintenanceFailure } from "./error.ts";
 import { withNativeSourceRoot, withNativeSourcePreviewFile } from "./source-file-native.ts";
 import type { SourceFileExtendedMetadata, SourceFileHandle } from "./source-file-native.ts";
-import { matchSourceFileProfile, SOURCE_PREPARE_PROFILE } from "./source-file-profile.ts";
+import { matchSourceFileProfile, SOURCE_PREPARE_PROFILE, sourceFileInodePermitted } from "./source-file-profile.ts";
 import type { SourceFileRootObservation } from "./source-file-profile.ts";
 import { SourceFilesFailure } from "./source-files.ts";
 
@@ -32,6 +32,28 @@ async function currentPath(file: string, before: SourceFileExtendedMetadata): Pr
   const actual = await lstat(file, { bigint: true });
   requireValue(actual.isFile() && fields.every(field => actual[field] === before[field]) && await realpath(file) === file);
 }
+/** Read the existing parent owner, keeping raw getter diagnostics separate
+ * from the values compared across the preview. No new owner or profile. */
+function observeParent(parent: SourceFileHandle) {
+  const raw = parent.observeExtended(), legacy = parent.observeStatx(), unique = parent.observeStatxUnique();
+  requireValue(parent.kind === "directory" && raw.before.kind === "directory" && same(raw.before, raw.after));
+  const dev = (unique.devMinor & 0xffn) | ((unique.devMajor & 0xfffn) << 8n)
+    | ((unique.devMinor & ~0xffn) << 12n) | ((unique.devMajor & ~0xfffn) << 32n);
+  requireValue(dev === raw.before.dev && [legacy, unique].every(value => value.kind === "directory"
+    && value.ino === raw.before.ino && value.devMajor === unique.devMajor && value.devMinor === unique.devMinor)
+    && legacy.birthtimeNs === unique.birthtimeNs && legacy.attributes === unique.attributes && legacy.attributesMask === unique.attributesMask);
+  if ((legacy.mask & 0x17ffn) !== 0x17ffn || legacy.mountId === null || legacy.mountId <= 0n
+    || (unique.mask & 0x47ffn) !== 0x47ffn || unique.uniqueMountId === null || unique.uniqueMountId <= 0n
+    || raw.uuid.status !== "observed" || raw.fid.status !== "observed" || raw.inodeFlags.status !== "observed" || raw.xattrs.status !== "observed")
+    throw new MaintenanceFailure("backup_capability_unavailable", "source-config-preview-parent-facts");
+  if (raw.before.fsType !== 0xef53n || raw.uuid.value.length !== 16n || raw.uuid.value.bytes.length !== 16
+    || !raw.uuid.value.bytes.some(value => value !== 0) || raw.fid.value.handleType !== 1n
+    || raw.fid.value.handleBytes !== 8n || raw.fid.value.bytes.length !== 8)
+    throw new MaintenanceFailure("backup_capability_unavailable", "source-config-preview-parent-shape");
+  requireValue(raw.fid.value.mountId === unique.uniqueMountId);
+  return { raw, material: { metadata: raw.before, legacy, unique, uuid: raw.uuid.value,
+    fid: raw.fid.value, flags: raw.inodeFlags.value, xattrs: raw.xattrs.value } };
+}
 
 /** Fixed planning diagnostic. It creates no V, source sync, attempt, artifact,
  * client registration or restore authority. The ordinary R is opened only
@@ -48,8 +70,10 @@ export async function readSourceConfigPreview(file: string | null): Promise<stri
   try {
     requireValue(path.isAbsolute(file) && path.resolve(file) === file && !file.includes("\0") && Buffer.byteLength(file) <= 4096);
     return await withNativeSourceRoot(path.dirname(file), async parent => {
-      check(); const parentBefore = parent.observeExtended();
-      requireValue(parent.kind === "directory" && same(parentBefore.before, parentBefore.after));
+      check(); const parentBefore = observeParent(parent), initialParent = parentBefore.material;
+      if (!sourceFileInodePermitted("directory", initialParent.flags, initialParent.unique.attributes, initialParent.unique.attributesMask))
+        throw new MaintenanceFailure("backup_capability_unavailable", "source-file-inode-attributes");
+      check();
       phase = "profile";
       const result = await withNativeSourcePreviewFile(file, async owner => {
         check(); const profile = matchSourceFileProfile(owner);
@@ -57,7 +81,9 @@ export async function readSourceConfigPreview(file: string | null): Promise<stri
         const before = profile.beforeContent(), metadata = before.root.before;
         requireValue(metadata.kind === "file" && metadata.nlink === 1n && metadata.size >= 0n
           && metadata.size <= MAX_CONFIG_BYTES, "source-config-preview-size");
-        requireValue(metadata.dev === parentBefore.before.dev && metadata.fsType === parentBefore.before.fsType);
+        requireValue(metadata.dev === initialParent.metadata.dev && metadata.fsType === initialParent.metadata.fsType
+          && initialParent.legacy.mountId === before.mount.legacyMountId && initialParent.unique.uniqueMountId === before.mount.uniqueMountId
+          && before.root.uuid.status === "observed" && same(initialParent.uuid, before.root.uuid.value));
         await currentPath(file, metadata);
         const tail = profile.retainMetadata();
         const close = async (handle: SourceFileHandle) => {
@@ -85,8 +111,8 @@ export async function readSourceConfigPreview(file: string | null): Promise<stri
         if (failed) throw first;
         phase = "health"; requireValue(same(material(before), material(profile.afterContent())));
         await currentPath(file, metadata);
-        const parentAfter = parent.observeExtended();
-        requireValue(same(parentBefore.before, parentAfter.before) && same(parentBefore.before, parentAfter.after));
+        check(); const parentAfter = observeParent(parent);
+        requireValue(same(initialParent, parentAfter.material));
         await close(owner);
         tail.transferCarrier(parent); // Unique Dp -> A; no additional open/dup.
         phase = "health"; const after = profile.afterSourceClosed(tail);

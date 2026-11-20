@@ -1,10 +1,45 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 import { readdir } from "node:fs/promises";
 import { isolatedSourceFiles, sourceFilesFixture, SOURCE_PREPARE_PROFILE } from "./fixtures/maintenance-source-files.ts";
 import { inspectSourceFileWriters, withSourceFileObservationWindow } from "../src/server/storage/maintenance/source-file-writers.ts";
 
 const linuxTest = process.platform === "linux" ? test : test.skip;
+
+linuxTest("#152 IG1 same-source parent keeps its first flags through prepare, legacy and readonly", async t => {
+  for (const mode of ["prepare", "legacy", "readonly"]) await t.test(mode, async () => {
+    const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: false, prepare: mode !== "legacy" });
+    try {
+      const captured = mode === "readonly" ? await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference) : undefined;
+      const start = f.state.events.length;
+      f.state.hook = (operation, file) => {
+        if (operation === "read" && file === path.join(f.sessions, "nested", "binary")) f.state.flags.set(f.directory, 0x40n);
+      };
+      const action = captured ? copy.module.verifyLiveSourceFilesReadOnly(f.store, f.lock, f.mutex, f.reference, captured.ref)
+        : copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+      await assert.rejects(action, { code: "source_changed" });
+      const events = f.state.events.slice(start);
+      assert(!events.includes("synchronize:")); assert(!events.includes("transfer-carrier:"));
+      if (mode !== "prepare") assert(!events.some(event => event.startsWith("synchronize:")));
+      assert.equal(f.state.handles.size, 0);
+    } finally { await f.close(); await copy.close(); }
+  });
+});
+
+linuxTest("#152 IG1 D0 can expire before the newly earlier same-source parent observation", async t => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: false, prepare: true });
+  let now = 0, snapshots = 0;
+  try {
+    t.mock.method(performance, "now", () => now);
+    f.state.hook = (operation, file) => {
+      if (file === f.sessions && operation === "statx-unique-result" && ++snapshots === 2) now = 120_001;
+    };
+    await assert.rejects(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference), { code: "backup_capability_unavailable" });
+    assert.equal(snapshots, 2); assert(!f.state.events.includes("extended:"));
+    assert(!f.state.events.some(event => /^(read|enumerate|synchronize):/.test(event))); assert.equal(f.state.handles.size, 0);
+  } finally { t.mock.restoreAll(); await f.close(); await copy.close(); }
+});
 
 linuxTest("WR1 actual local inventory composes with existing CFP2 readers, prepare and readonly close order", async () => {
   const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ prepare: true });

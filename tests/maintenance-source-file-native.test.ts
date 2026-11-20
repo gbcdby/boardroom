@@ -73,7 +73,7 @@ function profileParserFixture(): any {
   function statx(unique: boolean): Buffer {
     const raw = Buffer.alloc(256);
     raw.writeUInt32LE(0xfff | (unique ? 0x4000 : 0x1000), 0);
-    raw.writeBigUInt64LE(0x200000n, 56); raw.writeUInt32LE(1, 16);
+    raw.writeBigUInt64LE(0x200800n, 56); raw.writeUInt32LE(1, 16);
     raw.writeUInt32LE(1001, 20); raw.writeUInt32LE(1001, 24); raw.writeUInt16LE(Number(metadata.mode), 28);
     raw.writeBigUInt64LE(metadata.ino, 32); raw.writeBigUInt64LE(metadata.size, 40);
     for (const [offset, value] of [[64, metadata.atimeNs], [80, 1n], [96, metadata.ctimeNs], [112, metadata.mtimeNs]] as const) {
@@ -133,6 +133,49 @@ function profileParserFixture(): any {
     uniqueStatx: { uniqueMountId: 9007199254740995n, ino: metadata.ino }, legacyStatx: { mountId: 17n, ino: metadata.ino } };
   return { metadata, legacyBytes, uniqueBytes, request, result, mountinfo, environment, context };
 }
+
+test("#152 IG1 metadata-only bootstrap rejects DAX before readable promotion", async () => {
+  await withProfileParsers(parse => {
+    const fixture = profileParserFixture();
+    for (const raw of [fixture.legacyBytes, fixture.uniqueBytes]) raw.writeBigUInt64LE(0x200000n, 8);
+    const context = { info: { ...fixture.context.info, stage: "metadata-only" }, environment: fixture.environment };
+    assert.throws(() => parse.analyzeEnvironment(context), { code: "backup_capability_unavailable" });
+  });
+});
+
+test("#152 IG1 actual analysis requires known clear encrypted and DAX facts in every context", async () => {
+  await withProfileParsers(parse => {
+    for (const stage of ["readable", "bootstrap", "tail"]) {
+      const make = () => {
+        const value = profileParserFixture();
+        const context = stage === "readable" ? value.context
+          : { info: { ...value.context.info, stage: "metadata-only" }, environment: { ...value.environment, abiVersion: stage === "tail" ? 3 : 2 } };
+        return { ...value, context };
+      };
+      assert.equal(parse.analyzeEnvironment(make().context).unresolved.length, 4);
+      for (const bit of [0x800n, 0x200000n]) for (const change of ["set", "missing-mask", "mismatch"]) {
+        const value = make();
+        const raws = change === "mismatch" ? [value.uniqueBytes] : [value.legacyBytes, value.uniqueBytes];
+        for (const raw of raws) {
+          if (change === "missing-mask") raw.writeBigUInt64LE(raw.readBigUInt64LE(56) & ~bit, 56);
+          else raw.writeBigUInt64LE(bit, 8);
+        }
+        assert.throws(() => parse.analyzeEnvironment(value.context),
+          { code: change === "mismatch" ? "source_changed" : "backup_capability_unavailable" }, `${stage}/${bit}/${change}`);
+      }
+    }
+    for (const kind of ["file", "directory"]) for (const flags of [0x80000n, 0x81000n, 0n, 0x40n, 0x80800n, 0x180000n, 0x2080000n, 0x40080000n, 1n << 42n]) {
+      const value = profileParserFixture(); value.context.root.inodeFlags.value = flags;
+      if (kind === "directory") {
+        value.metadata.kind = "directory"; value.metadata.mode = 0o40700n; value.metadata.nlink = 2n; value.context.info.kind = "directory";
+        for (const raw of [value.legacyBytes, value.uniqueBytes]) { raw.writeUInt32LE(2, 16); raw.writeUInt16LE(0o40700, 28); }
+      }
+      if (flags === 0x80000n || kind === "directory" && flags === 0x81000n)
+        assert.equal(parse.analyzeEnvironment(value.context).unresolved.length, 4);
+      else assert.throws(() => parse.analyzeEnvironment(value.context), { code: "backup_capability_unavailable" }, `${kind}/${flags}`);
+    }
+  });
+});
 
 test("#152 P3 pure statx and mount parsers bind separate IDs, exact ABI and complete mountinfo", async () => {
   await withProfileParsers(parse => {
