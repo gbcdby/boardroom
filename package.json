@@ -46,7 +46,10 @@
     "test:ci:linux:14of16": "node scripts/ci/run-linux-partition.mjs 14/16",
     "test:ci:linux:15of16": "node scripts/ci/run-linux-partition.mjs 15/16",
     "test:ci:linux:16of16": "node scripts/ci/run-linux-partition.mjs 16/16",
-    "typecheck": "tsc --noEmit -p tsconfig.json && vue-tsc --noEmit -p src/web/tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json && vue-tsc --noEmit -p src/web/tsconfig.json",
+    "ci:local": "node scripts/ci/local-ci.mjs",
+    "ci:local:full": "node scripts/ci/local-ci.mjs --full",
+    "ci:local:shard": "node scripts/ci/local-ci.mjs --shard"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",

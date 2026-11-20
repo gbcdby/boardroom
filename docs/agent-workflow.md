@@ -29,7 +29,7 @@
 
 | 项目约定 | 当前入口与规则 |
 | --- | --- |
-| 本地检查／CI | 命令见 `package.json`；[数据库与 SDK 集成验证](../.github/workflows/database-ci.yml) 在 PR、main 推送和手动触发时运行。Linux 数据库／SDK、Chromium 与 macOS arm64 全量测试三项任务均须按候选通过；macOS 保存系统、Node 与完整测试日志，PostgreSQL 门控检查仍在 Linux 执行。命令及环境以配置为准。 |
+| 本地检查／CI | `npm run ci:local` 是本地优先入口（见 [local-ci.md](local-ci.md)），先跑 typecheck、构建、纯控制与可本机执行的定向回归；Linux-only 控制与全矩阵不在 macOS 本地冒充通过。[数据库与 SDK 集成验证](../.github/workflows/database-ci.yml) 默认在 PR、main 推送只跑轻量 smoke；完整 8+16 分片与 Chromium 全矩阵改为 `workflow_dispatch` 勾选 `full_matrix` 或 PR 打 `ci-full` 标签时运行。Linux 数据库／SDK、Chromium 与 macOS arm64 全量任务仍须按候选通过；本地结果不替代云端准确 checkout/tree 与 artifact 证据。命令及环境以配置为准。 |
 | 产物与发布 | 当前仓库流水线提供构建和测试报告，未配置产品发布／部署；发布目标需要另有明确任务与环境约定。 |
 | 自动推进范围 | 沿用当前任务的 PR、合并等有效授权与终点；若后续配置让推送、tag 或合并触发发布，触发前核对这些效果的授权范围。 |
 | 发布后检查与恢复 | 发布任务按真实产物、目标位置和验收决定检查与恢复办法；不从 CI 通过推断已经上线。 |

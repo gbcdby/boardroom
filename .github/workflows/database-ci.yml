@@ -5,6 +5,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      full_matrix:
+        description: '运行完整 8+16 分片与 Chromium 全矩阵（本地 preflight 通过后再手动触发）'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -14,8 +20,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  smoke:
+    name: 本地优先 · PR smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: 检出本次验证候选
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: 准备 Node.js 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.22.3'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: 按锁文件安装依赖
+        run: npm ci
+
+      - name: 本地优先入口的通用检查
+        run: npm run ci:local -- --no-web --no-native
+
+      - name: 构建 WebUI
+        run: npm run build
+
   macos-partitions:
     name: macOS 全量 · ${{ matrix.partition }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.full_matrix) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full')) }}
     runs-on: macos-26
     strategy:
       fail-fast: false
@@ -99,7 +132,7 @@ jobs:
   macos-tests:
     name: Node 24 · macOS arm64 / SQLite
     needs: macos-partitions
-    if: ${{ always() }}
+    if: ${{ always() && ((github.event_name == 'workflow_dispatch' && inputs.full_matrix) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -110,6 +143,7 @@ jobs:
 
   browser-dependencies:
     name: 浏览器同候选依赖准备
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.full_matrix) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 8
     outputs:
@@ -184,6 +218,7 @@ jobs:
 
   database-partitions:
     name: Linux 全量 · ${{ matrix.partition }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.full_matrix) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -476,7 +511,7 @@ jobs:
   database-tests:
     name: Node 24 · SQLite / PostgreSQL
     needs: database-partitions
-    if: ${{ always() }}
+    if: ${{ always() && ((github.event_name == 'workflow_dispatch' && inputs.full_matrix) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -488,8 +523,7 @@ jobs:
   managed-web-browser:
     name: Chromium · 工作台与托管 Agent 页面
     needs: browser-dependencies
-    # 准备失败时仍进入原 Chromium 检查，由首步明确失败；取消仍停止。
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && ((github.event_name == 'workflow_dispatch' && inputs.full_matrix) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # 与下方 Python 包版本一致；资源隐藏验收另在本 job 安装固定 Openbox。

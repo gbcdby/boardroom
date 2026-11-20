@@ -24,6 +24,12 @@ spec = importlib.util.spec_from_file_location('linux_isolation', Path(__file__).
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
 
+FULL_MATRIX = "github.event_name == 'workflow_dispatch' && inputs.full_matrix"
+FULL_MATRIX_LABEL = "github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full')"
+FULL_MATRIX_IF = f"${{{{ ({FULL_MATRIX}) || ({FULL_MATRIX_LABEL}) }}}}"
+FULL_MATRIX_AGGREGATE_IF = f"${{{{ always() && (({FULL_MATRIX}) || ({FULL_MATRIX_LABEL})) }}}}"
+FULL_MATRIX_BROWSER_IF = f"${{{{ !cancelled() && (({FULL_MATRIX}) || ({FULL_MATRIX_LABEL})) }}}}"
+
 
 class WholeSuiteBudgetContracts(unittest.TestCase):
     def configured(self, owner, entry):
@@ -511,9 +517,12 @@ class WholeSuitePartitionContracts(unittest.TestCase):
         partitions = workflow['jobs']['database-partitions']
         aggregate = workflow['jobs']['database-tests']
         self.assertEqual(partitions['strategy'], {'fail-fast': False, 'matrix': {'partition': [f'{index}/16' for index in range(1, 17)]}})
+        self.assertEqual(partitions['if'], FULL_MATRIX_IF)
+        self.assertEqual(workflow['jobs']['browser-dependencies']['if'], FULL_MATRIX_IF)
+        self.assertEqual(workflow['jobs']['managed-web-browser']['if'], FULL_MATRIX_BROWSER_IF)
         self.assertEqual(aggregate['name'], 'Node 24 · SQLite / PostgreSQL')
         self.assertEqual(aggregate['needs'], 'database-partitions')
-        self.assertEqual(aggregate['if'], '${{ always() }}')
+        self.assertEqual(aggregate['if'], FULL_MATRIX_AGGREGATE_IF)
         gate = aggregate['steps'][0]
         self.assertEqual(gate['env']['PARTITIONS_RESULT'], '${{ needs.database-partitions.result }}')
         for state in ('success', 'failure', 'cancelled', 'skipped', ''):
