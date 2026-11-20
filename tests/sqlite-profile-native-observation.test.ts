@@ -9,6 +9,7 @@ import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import { SQLITE_PROFILE_READ_TABLES as tables } from "../src/server/storage/internal/sqlite-profile-read-source.ts";
 import { F_MIGRATIONS } from "../src/server/identity/internal/m2-p0-artifacts-catalog.ts";
+import { p1 } from "./helpers/sqlite-profile-observation-fixture.ts";
 
 const linux = process.platform === "linux", root = path.resolve(import.meta.dirname, "..");
 let project: string;
@@ -161,3 +162,30 @@ test("SQ-D02 I02：预算失败加close未知仍保留原失败和真实资源ow
   assert.deepEqual(output.state[0].failures, ["resource_limit", "database-close"]);
   assert.ok(output.state[0].files.every((phase: string) => phase === "open")); assert.ok(output.sourcePins >= 1); assert.equal(output.binaryPins, 1);
 }));
+test("SQ-D02 I02+I03：原生有限P1元数据fixture从raw读取到terminal只使用一个请求预算，仍不授予closure/native资格", { skip: !linux }, () => {
+  for (const terminal of [false, true]) fixture((directory, source) => {
+    const input = p1("UTF-16be", terminal), db = new Database(source);
+    try {
+      db.exec("BEGIN");
+      for (const table of tables) {
+        db.exec(`DELETE FROM main."${table.table}"`);
+        const insert = db.prepare(`INSERT INTO main."${table.table}"(rowid,${table.columns.map(c => `"${c.name}"`).join(",")}) VALUES (${Array(table.columns.length + 1).fill("?").join(",")})`);
+        for (const row of input[table.inputKey].rows) insert.run(BigInt(row.rowid), ...row.cells.map(cell => {
+          if (cell[0] === "null") return null;
+          if (cell[0] === "integer") return BigInt(cell[1]);
+          assert.equal(cell[0], "text");
+          return new TextDecoder("UTF-16be", { fatal: true, ignoreBOM: true }).decode(Buffer.from(cell[1], "hex"));
+        }));
+      }
+      db.exec("COMMIT");
+    } finally { db.close(); }
+    const boundary = pathToFileURL(path.join(project, "src/server/identity/internal/m2-audit-boundary.ts")).href;
+    const probe = `import{AuditRequest}from ${JSON.stringify(boundary)};const requests=new Set(),units=AuditRequest.prototype.units;
+      globalThis.__probe={requestCount:0};AuditRequest.prototype.units=function(n){requests.add(this);globalThis.__probe.requestCount=requests.size;return units.call(this,n)};`;
+    const result = observe(directory, probe); assert.equal(result.status, 0, result.stderr + result.stdout);
+    const output = JSON.parse(result.stdout); assert.equal(output.probe.requestCount, 1);
+    assert.equal(output.value.observation.phase, terminal ? "terminal-present" : "sealed-awaiting-b");
+    assert.equal(output.value.observation.terminalClosure, "not_run"); assert.equal(output.value.sourceFileDescriptorQualification, "not_qualified");
+    assert.deepEqual(output.value.observation.raw, input);
+  }, "UTF-16be");
+});

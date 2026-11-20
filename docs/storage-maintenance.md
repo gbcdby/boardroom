@@ -228,7 +228,9 @@ DTO 的根键精确为 `contract`、`sourceKind`、`textEncoding`、`columns`、
 
 P1 元数据观察要求 protocol 2、唯一 authority singleton、local source binding、对应 receipt 的完整 17 格及 canonical payload/digest 冗余、当前 guard digest 与 receipt writer pair、精确受控迁移 22，以及原 control counter/anchor 组合。client17 保留原 storage type、NULL、rowid、日期和编码字节，并检查源 UUID、基础 counter 与格式配对。真实 host/process/session 归属、完整 CF 生命周期和引用的 physical/capture/upgrade 产物内容仍未执行。
 
-当前独立片允许 sealed P1 加 terminal NULL 返回 `phase: "sealed-awaiting-b"`；这仍拒绝业务准入。open P1 加 NULL、错 authority/receipt/source、混合格式会失败；没有 P0/fresh 回退。terminal-present 的分支等待 I03 同请求解码核接入，在此独立片返回 `unsupported_shape`。输出明确保留 `terminalClosure`、`finalSchemaAndGuards`、`clientLifecycle` 为 `not_run`。
+sealed P1 加 terminal NULL 返回 `phase: "sealed-awaiting-b"`；这仍拒绝业务准入。open P1 加 NULL、错 authority/receipt/source、混合格式会失败；没有 P0/fresh 回退。terminal-present 使用 [I03 的原八键解码核](profile-terminal-values.md)，沿同一个 `AuditRequest` 检查原 canonical 文本、安全 epoch+1、activation/receipt、takeoverPlan，以及当前 q/ref/digest 与 terminal 锚、open 和 epochAfter 的关联。当前锚恰为 terminal 时可以返回 `phase: "terminal-present"`；后来窗口需要完整 current-window replay，在本有限 reader 中仍为 `unsupported_shape`，不能仅靠 E/q 单调接受。
+
+上述结果没有读取 durable terminal 图，也没有核对引用的 physical source/capture/upgrade 等实际产物内容。输出明确保留 `terminalClosure`、`finalSchemaAndGuards`、`clientLifecycle` 为 `not_run`。原生有限 P1 fixture 另验证了 raw 读取、组件 JSON 和 terminal 解码始终只有一个真实请求预算；该 fixture 不被标记为完整合法 P1/S1/G1 或 native 资格正例。
 
 ### 固定查询与生产前计费
 

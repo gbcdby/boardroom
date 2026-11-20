@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { assertEnvironmentSelected, assertSqliteSourceUnchanged, resolveBoardroomEnvironment,
   type SqliteDatabaseDescriptor } from "../../environment.ts";
-import { AUDIT_LIMITS, AuditRequest, observeDisplaySyntax, type AuditCode } from "../../identity/internal/m2-audit-boundary.ts";
+import { AUDIT_LIMITS, AuditRequest, parseAuditJsonText, type AuditCode } from "../../identity/internal/m2-audit-boundary.ts";
 import { observeSqliteProfileAdmissionRaw, type SqliteProfileAdmissionObservation, type SqliteProfileRawCell,
   type SqliteProfileRawRow } from "../../identity/internal/sqlite-profile-admission-values.ts";
 import { SQLITE_PROFILE_READ_TABLES, SQLITE_PROFILE_FIXED_QUERIES, SQLITE_PROFILE_COLUMN_QUERIES,
@@ -105,10 +105,9 @@ function read(s: Owner, file: string, maximum: number, mode?: number): { bytes: 
   return { bytes, owner };
 }
 function parsedJson(bytes: Buffer, request: AuditRequest | null): unknown {
-  request?.text(bytes.length, 2); // Decode and JSON.parse, each on the original component read size.
+  request?.text(bytes.length, 3); // UTF-8 input read and at most 2n UTF-16 result allocation, before decoding.
   const text = bytes.toString("utf8");
-  if (request && observeDisplaySyntax(text, request) === null) request.fail("invalid_value");
-  return JSON.parse(text) as unknown;
+  return request ? parseAuditJsonText(text, request) : JSON.parse(text) as unknown;
 }
 function json(bytes: Buffer, request: AuditRequest | null): unknown {
   const parsed: unknown = parsedJson(bytes, request);

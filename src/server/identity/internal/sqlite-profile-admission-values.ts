@@ -5,6 +5,7 @@ import { AUDIT_LIMITS, AuditRequest, observeDisplaySyntax, record } from "./m2-a
 import { F_MIGRATIONS } from "./m2-p0-artifacts-catalog.ts";
 import { CONTROLLED_M22 } from "./m2-controlled-migration-contract.ts";
 import { M2_PROFILE_WRITER_CONTRACT } from "./m2-profile-writer-contract.ts";
+import { parseProfileCompletionBindingText } from "./profile-terminal-values.ts";
 import { SQLITE_PROFILE_READ_TABLES, type SqliteProfileObservationPart,
   type SqliteProfileObservationTable } from "../../storage/internal/sqlite-profile-read-source.ts";
 
@@ -347,16 +348,27 @@ export function observeSqliteProfileAdmissionRaw(value: unknown, r: AuditRequest
       "semantic_invariant_failed");
   } else {
     localRoot(state, r);
-    authority(observed.tables.authority, receipts(observed.tables.activationReceipts, r), state, r);
-    // The separately owned I03 same-request decoder supplies terminal-present observation.
-    r.require(state.terminal === null, "unsupported_shape");
-    r.require(state.admission === "sealed", "semantic_invariant_failed");
-    phase = "sealed-awaiting-b";
+    const selected = authority(observed.tables.authority, receipts(observed.tables.activationReceipts, r), state, r);
+    if (state.terminal === null) {
+      r.require(state.admission === "sealed", "semantic_invariant_failed");
+      phase = "sealed-awaiting-b";
+    } else {
+      const terminal = parseProfileCompletionBindingText(state.terminal, r);
+      equal(terminal.activation.activationId, selected.row.id, r); equal(terminal.activation.digest, selected.row.payload_digest, r);
+      equal(terminal.takeoverPlan.planId, selected.plan.planId, r); equal(terminal.takeoverPlan.digest, selected.plan.digest, r);
+      r.require(state.journalSequence >= terminal.terminal.sequence, "semantic_invariant_failed");
+      // A later cursor needs the complete current-window replay, not merely monotonic E/q.
+      r.require(state.journalSequence === terminal.terminal.sequence, "unsupported_shape");
+      equal(state.journalRecordRef, terminal.terminal.record.artifactId, r); equal(state.journalDigest, terminal.terminal.record.digest, r);
+      r.require(state.admission === "open" && state.activeMigrationId === null && state.planDigest === null
+        && state.fenceEpoch === terminal.epochAfter, "semantic_invariant_failed");
+      phase = "terminal-present";
+    }
   }
   migrations(observed.tables.migrations, profile, r);
   clients(observed.tables.clients, state, r);
   r.allocateNodes(12);
   return { contract: "sqlite-profile-admission-value/r1" as const, scope: "raw-and-metadata-links" as const,
     qualification: "observation-only" as const, profile, phase, terminalClosure: "not_run" as const, nativeSource: "not_run" as const,
-    finalSchemaAndGuards: "not_run" as const, clientLifecycle: "not_run" as const, raw: observed.input };
+    finalSchemaAndGuards: "not_run" as const, clientLifecycle: "not_run" as const, raw: observed.input } as const;
 }
