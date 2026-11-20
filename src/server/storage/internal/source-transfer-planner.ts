@@ -1,5 +1,5 @@
 /** SRC-I1a：完整 SQLite typed frame 的有界纯值规划。不能执行、准入或发布许可。 */
-import { boundary, record, encoding, AuditRequest, AUDIT_LIMITS } from "../../identity/internal/m2-audit-boundary.ts";
+import { sourceTransferBoundary, record, encoding, AuditRequest, AUDIT_LIMITS } from "../../identity/internal/m2-audit-boundary.ts";
 import type { AuditResult } from "../../identity/internal/m2-audit-boundary.ts";
 import { M2_HISTORY_TABLES } from "../../identity/m2-history-contracts.ts";
 import type { RawCell } from "../../identity/m2-history-contracts.ts";
@@ -78,8 +78,8 @@ for (const f of SOURCE_TRANSFER_FOREIGN_KEYS) {
   if (child < 0 && parent >= 0) throw new Error("SRC preserved child references replaced parent");
 }
 
-/** All work below is additional to, and consumes, the SAME original C2 ledger.
- * Its boundary parse/freeze/serialization and hex/decode costs remain charged by C2;
+/** All work below consumes the SAME request as the fixed SRC boundary. Its
+ * cumulative byte cap applies to boundary parsing, shared decoders and output too;
  * the public receipt deliberately does not claim to expose its private counters. */
 class Meter {
   readonly r: AuditRequest;
@@ -100,11 +100,15 @@ class Meter {
     this.output(value); this.r.reserveOutput(1); this.charges.outputBytesReserved++; // Array delimiter, before push.
   }
   key(value: unknown): string { return this.r.stringify(value, AUDIT_LIMITS.input); }
-  compare(a: string, b: string): number { this.work(1); this.text(a.length + b.length); return a < b ? -1 : a > b ? 1 : 0; }
+  // All planner index keys are fixed ASCII names or validated decimal/hex-derived
+  // ASCII strings. Charge each lookup separately, including repeated use of keys
+  // created earlier in this request; string sharing does not waive reading work.
+  read(key: string): string { this.text(key.length, 2); return key; }
+  compare(a: string, b: string): number { this.work(1); this.text(a.length + b.length, 2); return a < b ? -1 : a > b ? 1 : 0; }
 }
 function array(value: unknown, m: Meter): unknown[] { m.r.require(Array.isArray(value), "unsupported_shape"); return value; }
 function decimal(value: unknown, m: Meter): string {
-  m.r.require(typeof value === "string" && value.length <= 20); m.text(value.length);
+  m.r.require(typeof value === "string" && value.length <= 20); m.text(value.length, 2); // regexp and BigInt read
   m.r.require(/^(0|-?[1-9][0-9]*)$/.test(value)); m.work(2);
   const n = BigInt(value); m.r.require(n >= MIN64 && n <= MAX64); return value;
 }
@@ -114,6 +118,7 @@ function digest(value: unknown, length: number, m: Meter): string {
 }
 function cell(value: unknown, m: Meter): RawCell {
   const v = array(value, m);
+  m.text(48); // Fixed discriminators; no unbounded text is read by these comparisons.
   if (v[0] === "null") m.r.require(v.length === 1);
   else {
     m.r.require(v.length === 2);
@@ -121,7 +126,7 @@ function cell(value: unknown, m: Meter): RawCell {
     else if (v[0] === "text") m.r.decodeText(m.r.hex(v[1]));
     else if (v[0] === "blob") m.r.hex(v[1]);
     else if (v[0] === "real64be") {
-      const hex = m.r.hex(v[1], 8); m.work(1); m.text(8, 2);
+      const hex = m.r.hex(v[1], 8); m.work(1); m.text(8, 4); // hex read/copy, then binary read
       m.r.require(Number.isFinite(Buffer.from(hex, "hex").readDoubleBE()), "unsupported_shape");
     } else m.r.fail("unsupported_shape");
   }
@@ -132,7 +137,7 @@ function rawText(c: RawCell, m: Meter): string {
   m.r.require(c[0] === "text", "unsupported_shape"); return m.r.decodeText(c[1]);
 }
 function integer(c: RawCell, m: Meter): bigint {
-  m.r.require(c[0] === "integer", "unsupported_shape"); m.work(1); return BigInt(c[1]);
+  m.r.require(c[0] === "integer", "unsupported_shape"); m.work(1); m.text(c[1].length); return BigInt(c[1]);
 }
 function sameCells(a: readonly RawCell[], b: readonly RawCell[], m: Meter): boolean {
   m.work(a.length + b.length); if (a.length !== b.length) return false;
@@ -160,12 +165,12 @@ function sqlKey(row: PlannedRow, table: string, names: readonly string[], m: Met
   for (const name of names) {
     m.work(1); const c = col(row, table, name), declared = rules.get(table)!.columns[columns.get(table)!.get(name)!]!.type;
     if (c[0] === "null") return null;
-    if (c[0] === "blob") { m.text(c[1].length); parts.push("b:" + c[1]); }
+    if (c[0] === "blob") { m.text(c[1].length + 2, 2); parts.push("b:" + c[1]); }
     else if (declared === "TEXT") {
-      m.r.require(c[0] === "text", "unsupported_shape"); m.text(c[1].length); parts.push("t:" + c[1]);
-    } else if (c[0] === "integer") { m.text(c[1].length); parts.push("n:" + c[1]); }
+      m.r.require(c[0] === "text", "unsupported_shape"); m.text(c[1].length + 2, 2); parts.push("t:" + c[1]);
+    } else if (c[0] === "integer") { m.text(c[1].length + 2, 2); parts.push("n:" + c[1]); }
     else if (c[0] === "real64be") {
-      m.text(320, 2); m.work(2); const n = Buffer.from(c[1], "hex").readDoubleBE();
+      m.text(320, 3); m.work(2); const n = Buffer.from(c[1], "hex").readDoubleBE();
       parts.push(Number.isInteger(n) ? "n:" + BigInt(n).toString() : "r:" + n.toString());
     } else m.r.fail("unsupported_shape");
   }
@@ -177,7 +182,8 @@ function qualifies(row: TransferRow, unique: TransferUnique, m: Meter): boolean 
   if (p.kind === "null") return c[0] === "null";
   if (p.kind === "not-null") return c[0] !== "null";
   if (c[0] === "null" || c[0] === "blob") return false;
-  return rawText(c, m) === p.value;
+  const value = rawText(c, m); m.text(value.length * 3 + (p.value?.length ?? 0));
+  return value === p.value;
 }
 function ordered(rows: readonly TransferRow[], table: string, m: Meter): TransferRow[] {
   m.nodes(rows.length * 5 + 3); m.work(rows.length);
@@ -191,18 +197,18 @@ function validateTable(t: TransferTable, m: Meter): void {
   m.nodes(t.rows.length * (4 + uniqueCount * 2) + uniqueCount + 3);
   const ids = new Set<string>(), keys = new Set<string>();
   for (const row of t.rows) {
-    m.work(2); m.text(row.rowid.length);
-    m.r.require(!ids.has(row.rowid), "semantic_invariant_failed", "duplicate-key"); ids.add(row.rowid);
+    m.work(2);
+    m.r.require(!ids.has(m.read(row.rowid)), "semantic_invariant_failed", "duplicate-key"); ids.add(m.read(row.rowid));
     const key = sqlKey(row, t.name, pk, m);
     m.r.require(key !== null, "unsupported_shape");
-    m.r.require(!keys.has(key), "semantic_invariant_failed", "duplicate-key"); keys.add(key);
+    m.r.require(!keys.has(m.read(key)), "semantic_invariant_failed", "duplicate-key"); keys.add(m.read(key));
   }
   for (const u of uniques.get(t.name)!) {
     const seen = new Set<string>();
     for (const row of t.rows) {
       m.work(1); if (!qualifies(row, u, m)) continue;
       const key = sqlKey(row, t.name, u.columns, m); if (key === null) continue;
-      m.r.require(!seen.has(key), "semantic_invariant_failed", "duplicate-key"); seen.add(key);
+      m.r.require(!seen.has(m.read(key)), "semantic_invariant_failed", "duplicate-key"); seen.add(m.read(key));
     }
   }
 }
@@ -216,9 +222,12 @@ function parseFrame(value: unknown, role: "source" | "target", m: Meter): Transf
   m.nodes(values.length * 3 + 1); const tables: TransferTable[] = [];
   for (const [i, v] of values.entries()) {
     const d = M2_HISTORY_TABLES[i]!, t = record(v, ["name", "columns", "count", "rows"], m.r);
-    m.r.require(t.name === d.name, "source_contract_mismatch"); const cs = array(t.columns, m);
-    m.work(cs.length); m.r.require(cs.length === d.columnsP1.length && cs.every((c, j) => c === d.columnsP1[j]!.name), "source_contract_mismatch");
+    m.text(d.name.length, 2); m.r.require(t.name === d.name, "source_contract_mismatch"); const cs = array(t.columns, m);
+    m.work(cs.length); m.r.require(cs.length === d.columnsP1.length && cs.every((c, j) => {
+      m.text(d.columnsP1[j]!.name.length, 2); return c === d.columnsP1[j]!.name;
+    }), "source_contract_mismatch");
     const inputRows = array(t.rows, m); m.r.rowCount(inputRows.length);
+    m.text(24); // Bounded count regexp, count formatting and equality.
     m.r.require(typeof t.count === "string" && /^(0|[1-9][0-9]{0,5})$/.test(t.count));
     m.r.require(t.count === String(inputRows.length), "semantic_invariant_failed", "count-mismatch");
     m.charges[role === "source" ? "sourceRows" : "targetRows"] += inputRows.length;
@@ -233,7 +242,7 @@ function parseFrame(value: unknown, role: "source" | "target", m: Meter): Transf
       const parsed: TransferRow = { rowid: id, cells: cells as RawCell[] };
       if (d.sqliteRowidAlias !== null) {
         const alias = col(parsed, d.name, d.sqliteRowidAlias);
-        m.r.require(alias[0] === "integer" && alias[1] === id, "semantic_invariant_failed");
+        m.text(id.length, 2); m.r.require(alias[0] === "integer" && alias[1] === id, "semantic_invariant_failed");
       }
       rows.push(parsed);
     }
@@ -244,21 +253,23 @@ function parseFrame(value: unknown, role: "source" | "target", m: Meter): Transf
 }
 function tableMap(frame: TransferFrame, m: Meter): Map<string, TransferTable> {
   m.nodes(frame.tables.length * 3 + 2); m.work(frame.tables.length);
-  return new Map(frame.tables.map(t => [t.name, t]));
+  return new Map(frame.tables.map(t => [m.read(t.name), t]));
 }
 function validateForeignKeys(frame: TransferFrame, m: Meter): void {
   m.nodes(SOURCE_TRANSFER_FOREIGN_KEYS.length * 2 + 1); const tables = tableMap(frame, m), indexes = new Map<string, Set<string>>();
   for (const f of SOURCE_TRANSFER_FOREIGN_KEYS) {
+    const cacheBytes = f.targetTable.length + 1 + f.targetColumns.reduce((n, c) => n + c.length + 1, 0);
+    m.text(cacheBytes, 4); // join and concatenation, including their result copies.
     const cacheKey = f.targetTable + ":" + f.targetColumns.join(","); m.work(1);
-    let parent = indexes.get(cacheKey);
+    let parent = indexes.get(m.read(cacheKey));
     if (!parent) {
       const rows = tables.get(f.targetTable)!.rows; m.nodes(rows.length + 1); parent = new Set<string>();
-      for (const row of rows) { const key = sqlKey(row, f.targetTable, f.targetColumns, m); if (key !== null) parent.add(key); }
-      indexes.set(cacheKey, parent);
+      for (const row of rows) { const key = sqlKey(row, f.targetTable, f.targetColumns, m); if (key !== null) parent.add(m.read(key)); }
+      indexes.set(m.read(cacheKey), parent);
     }
     for (const row of tables.get(f.sourceTable)!.rows) {
       const key = sqlKey(row, f.sourceTable, f.columns, m); m.work(1);
-      m.r.require(key === null || parent.has(key), "semantic_invariant_failed", "identity-mismatch");
+      m.r.require(key === null || parent.has(m.read(key)), "semantic_invariant_failed", "identity-mismatch");
     }
   }
 }
@@ -267,10 +278,10 @@ function rowOrder(t: TransferTable, m: Meter, reverse = false): TransferRow[] {
   if (!self) { if (reverse) { m.work(sorted.length); sorted.reverse(); } return sorted; }
   m.nodes(sorted.length * 12 + 10);
   const byKey = new Map<string, TransferRow>(), parents = new Map<TransferRow, TransferRow | null>();
-  for (const row of sorted) byKey.set(sqlKey(row, t.name, self.targetColumns, m)!, row);
+  for (const row of sorted) byKey.set(m.read(sqlKey(row, t.name, self.targetColumns, m)!), row);
   for (const row of sorted) {
     const key = sqlKey(row, t.name, self.columns, m);
-    const parent = key === null ? null : byKey.get(key);
+    const parent = key === null ? null : byKey.get(m.read(key));
     m.r.require(parent !== undefined, "semantic_invariant_failed"); parents.set(row, parent);
   }
   const done = new Set<TransferRow>(), visiting = new Set<TransferRow>(), result: TransferRow[] = [];
@@ -291,17 +302,17 @@ function resulting(source: TransferFrame | null, target: TransferFrame, m: Meter
       tables.push(source ? from!.get(before.name)! : { name: before.name, columns: before.columns, count: "0", rows: [] }); continue;
     }
     m.nodes(before.rows.length * 6 + from!.get(before.name)!.rows.length * 3 + 8);
-    const old = new Map(before.rows.map(row => [sqlKey(row, before.name, contracts.get(before.name)!.primaryKey, m)!, row]));
-    const used = new Set(before.rows.map(row => row.rowid)), rows = [...before.rows]; let next = 1n;
+    const old = new Map(before.rows.map(row => [m.read(sqlKey(row, before.name, contracts.get(before.name)!.primaryKey, m)!), row]));
+    const used = new Set(before.rows.map(row => m.read(row.rowid))), rows = [...before.rows]; let next = 1n;
     for (const row of ordered(from!.get(before.name)!.rows, before.name, m)) {
-      const existing = old.get(sqlKey(row, before.name, contracts.get(before.name)!.primaryKey, m)!);
+      const existing = old.get(m.read(sqlKey(row, before.name, contracts.get(before.name)!.primaryKey, m)!));
       if (existing) { m.r.require(sameCells(existing.cells, row.cells, m), "semantic_invariant_failed"); continue; }
       m.text(20); m.work(2); let rowid = next.toString();
-      while (used.has(rowid)) { m.text(20); m.work(2); next++; rowid = next.toString(); }
+      while (used.has(m.read(rowid))) { m.text(20); m.work(2); next++; rowid = next.toString(); }
       m.r.require(next <= MAX64, "resource_limit"); m.work(2); m.nodes(3);
-      rows.push({ rowid, cells: row.cells }); used.add(rowid); next++;
+      rows.push({ rowid, cells: row.cells }); used.add(m.read(rowid)); next++;
     }
-    const after = { name: before.name, columns: before.columns, count: String(rows.length), rows };
+    m.text(6); const after = { name: before.name, columns: before.columns, count: String(rows.length), rows };
     validateTable(after, m); tables.push(after);
   }
   return { source: target.source, textEncoding: target.textEncoding, tables };
@@ -318,20 +329,23 @@ function facts(frame: TransferFrame, m: Meter): Map<string, PlannedRow> {
   m.nodes(rows.length * 2 + members.length + 2); const result = new Map<string, PlannedRow>();
   for (const row of rows) {
     const kind = rawText(row.cells[1]!, m), revision = integer(row.cells[2]!, m);
+    m.text(kind.length * 3 * KINDS.length);
     m.r.require(KINDS.includes(kind) && revision >= 1n && revision <= MAX_FACT, "semantic_invariant_failed");
-    result.set(typedKey(row, "member_fact_revisions", m), row);
+    result.set(m.read(typedKey(row, "member_fact_revisions", m)), row);
   }
   m.r.require(rows.length === members.length * 6, "semantic_invariant_failed");
   for (const member of members) for (const kind of KINDS) {
     m.nodes(2); const key = m.key([col(member, "members", "id"), kindCells.get(kind)!]);
-    m.r.require(result.has(key), "semantic_invariant_failed");
+    m.r.require(result.has(m.read(key)), "semantic_invariant_failed");
   }
   return result;
 }
 function memberGuard(row: TransferRow, m: Meter): void {
   const removed = col(row, "members", "removed_at"); if (removed[0] === "null") return;
-  m.r.require(rawText(col(row, "members", "status"), m) === "disabled" && col(row, "members", "node_id")[0] === "null"
-    && rawText(col(row, "members", "role"), m) === "normal", "semantic_invariant_failed");
+  const status = rawText(col(row, "members", "status"), m); m.text(status.length * 3 + 8);
+  m.r.require(status === "disabled" && col(row, "members", "node_id")[0] === "null", "semantic_invariant_failed");
+  const role = rawText(col(row, "members", "role"), m); m.text(role.length * 3 + 6);
+  m.r.require(role === "normal", "semantic_invariant_failed");
 }
 function compileSteps(source: TransferFrame | null, target: TransferFrame, after: TransferFrame, m: Meter): { steps: Step[]; counts: Map<string, number> } {
   const beforeTables = tableMap(target, m), afterTables = tableMap(after, m);
@@ -343,11 +357,11 @@ function compileSteps(source: TransferFrame | null, target: TransferFrame, after
   const memberId = (row: PlannedRow) => m.key(col(row, "members", "id"));
   const scopeKey = (row: PlannedRow, table: string) => m.key(tuple(row, table, ["project_id", "agent_id"], m));
   const addMember = (row: TransferRow) => {
-    m.nodes(8); const id = memberId(row); members.set(id, row); const key = scopeKey(row, "members");
-    let group = memberScopes.get(key); if (!group) { group = new Set(); memberScopes.set(key, group); } group.add(id);
+    m.nodes(8); const id = memberId(row); members.set(m.read(id), row); const key = scopeKey(row, "members");
+    let group = memberScopes.get(m.read(key)); if (!group) { group = new Set(); memberScopes.set(m.read(key), group); } group.add(m.read(id));
   };
   for (const row of beforeTables.get("members")!.rows) addMember(row);
-  const count = (name: string) => { m.work(1); counts.set(name, (counts.get(name) ?? 0) + 1); };
+  const count = (name: string) => { m.work(1); m.text(name.length, 2); counts.set(name, (counts.get(name) ?? 0) + 1); };
   const emit = (phase: Phase, table: string, event: "insert" | "delete", row: PlannedRow): void => {
     m.work(1); m.nodes(10); const effects: Effect[] = [];
     if (table === "members") {
@@ -357,11 +371,11 @@ function compileSteps(source: TransferFrame | null, target: TransferFrame, after
         for (const kind of KINDS) {
           m.text(kind.length, 3); m.nodes(24); const id = col(row, "members", "id"), factKind = kindCells.get(kind)!;
           const provisional: PlannedRow = { rowid: { kind: "native-rowid-readback", memberId: id, factKind }, cells: [id, factKind, ["integer", "1"]] };
-          const key = typedKey(provisional, "member_fact_revisions", m); m.r.require(!currentFacts.has(key), "semantic_invariant_failed");
-          currentFacts.set(key, provisional); effects.push({ trigger: "member_facts_initialize", table: "member_fact_revisions", event: "insert", before: null, after: provisional });
+          const key = typedKey(provisional, "member_fact_revisions", m); m.r.require(!currentFacts.has(m.read(key)), "semantic_invariant_failed");
+          currentFacts.set(m.read(key), provisional); effects.push({ trigger: "member_facts_initialize", table: "member_fact_revisions", event: "insert", before: null, after: provisional });
         }
       } else {
-        const id = memberId(row); members.delete(id); memberScopes.get(scopeKey(row, "members"))!.delete(id);
+        const id = memberId(row); members.delete(m.read(id)); memberScopes.get(m.read(scopeKey(row, "members")))!.delete(m.read(id));
       }
     }
     if (table === "work_event_delivery_invalidations" && event === "insert") {
@@ -369,16 +383,16 @@ function compileSteps(source: TransferFrame | null, target: TransferFrame, after
     }
     const fact = FACT_EVENTS[table];
     if (fact) {
-      const trigger = "fact_" + table + "_" + event; count(trigger);
+      m.text(table.length + event.length + 6, 2); const trigger = "fact_" + table + "_" + event; count(trigger);
       m.nodes(2); const direct = fact.member === null ? null : m.key(col(row, table, fact.member));
-      const affected = direct === null ? memberScopes.get(scopeKey(row, table)) ?? new Set<string>() : members.has(direct) ? [direct] : [];
+      const affected = direct === null ? memberScopes.get(m.read(scopeKey(row, table))) ?? new Set<string>() : members.has(m.read(direct)) ? [direct] : [];
       for (const id of affected) {
         m.work(4); m.nodes(20); m.text(fact.kind.length, 3); m.text(20, 2);
-        const member = members.get(id)!, key = m.key([col(member, "members", "id"), kindCells.get(fact.kind)!]);
-        const before = currentFacts.get(key); m.r.require(before !== undefined, "semantic_invariant_failed");
+        const member = members.get(m.read(id))!, key = m.key([col(member, "members", "id"), kindCells.get(fact.kind)!]);
+        const before = currentFacts.get(m.read(key)); m.r.require(before !== undefined, "semantic_invariant_failed");
         const revision = integer(before.cells[2]!, m); m.r.require(revision < MAX_FACT, "semantic_invariant_failed");
         const changed: PlannedRow = { rowid: before.rowid, cells: [before.cells[0]!, before.cells[1]!, ["integer", (revision + 1n).toString()]] };
-        currentFacts.set(key, changed); effects.push({ trigger, table: "member_fact_revisions", event: "update", before, after: changed });
+        currentFacts.set(m.read(key), changed); effects.push({ trigger, table: "member_fact_revisions", event: "update", before, after: changed });
       }
     }
     const step: Step = { ordinal: steps.length + 1, phase, table, event, before: event === "delete" ? row : null,
@@ -388,21 +402,21 @@ function compileSteps(source: TransferFrame | null, target: TransferFrame, after
   };
   for (const name of SOURCE_TRANSFER_HISTORY) {
     m.nodes(beforeTables.get(name)!.rows.length * 2 + 2);
-    const retained = new Set(beforeTables.get(name)!.rows.map(row => row.rowid));
-    for (const row of ordered(afterTables.get(name)!.rows, name, m)) if (!retained.has(row.rowid)) emit("append-history", name, "insert", row);
+    const retained = new Set(beforeTables.get(name)!.rows.map(row => m.read(row.rowid)));
+    for (const row of ordered(afterTables.get(name)!.rows, name, m)) if (!retained.has(m.read(row.rowid))) emit("append-history", name, "insert", row);
   }
   for (const name of SOURCE_TRANSFER_DELETE_ORDER) for (const original of rowOrder(beforeTables.get(name)!, m, true)) {
     const key = name === "member_fact_revisions" ? typedKey(original, name, m) : null;
-    const row = key === null ? original : currentFacts.get(key)!;
+    const row = key === null ? original : currentFacts.get(m.read(key))!;
     m.r.require(row !== undefined, "semantic_invariant_failed"); emit("delete-replaced", name, "delete", row);
-    if (key !== null) currentFacts.delete(key);
+    if (key !== null) currentFacts.delete(m.read(key));
   }
   m.r.require(currentFacts.size === 0 && members.size === 0, "semantic_invariant_failed");
   if (source) for (const name of SOURCE_TRANSFER_INSERT_ORDER) {
     if (name === "member_fact_revisions") {
       m.nodes(currentFacts.size * 2 + 1);
       const provisional = [...currentFacts].sort((a, b) => m.compare(b[0], a[0]));
-      for (const [key, row] of provisional) { emit("delete-provisional-facts", name, "delete", row); currentFacts.delete(key); }
+      for (const [key, row] of provisional) { emit("delete-provisional-facts", name, "delete", row); currentFacts.delete(m.read(key)); }
     }
     for (const row of rowOrder(afterTables.get(name)!, m)) emit(name === "member_fact_revisions" ? "restore-source-facts" : "insert-replaced", name, "insert", row);
   }
@@ -438,7 +452,7 @@ function requirements(source: TransferFrame | null, target: TransferFrame, m: Me
 /** Primitive JSON text only. The returned data is never accepted by a native O.
  * An eventual owner must collect current frames itself and close every remaining check. */
 export function planSourceTransferValues(input: unknown): AuditResult<Plan> {
-  return boundary(input, (value, r: AuditRequest) => {
+  return sourceTransferBoundary(input, (value, r: AuditRequest) => {
     const m = new Meter(r), v = record(value, ["contract", "operation", "source", "target"], r);
     r.require(v.contract === "m2-src-transfer-values/v1" && (v.operation === "replace" || v.operation === "clear"), "unsupported_shape");
     r.require(v.operation === "clear" ? v.source === null : v.source !== null, "unsupported_shape");

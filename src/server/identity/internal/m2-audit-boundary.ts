@@ -93,13 +93,14 @@ export class AuditRequest {
     }
     return bytes;
   }
+  protected numberBytes(value: number): number { return String(value).length; }
   measure(value: unknown, maximum: number): { bytes: number; nodes: number } {
     let bytes = 0, nodes = 0;
     const add = (n: number) => { if ((bytes += n) > maximum) this.fail("resource_limit"); };
     const visit = (v: unknown): void => {
       this.units(1); nodes++;
       if (typeof v === "string") { add(this.quotedBytes(v)); return; }
-      if (v === null || typeof v === "boolean" || typeof v === "number") { add(v === null ? 4 : typeof v === "boolean" ? v ? 4 : 5 : String(v).length); return; }
+      if (v === null || typeof v === "boolean" || typeof v === "number") { add(v === null ? 4 : typeof v === "boolean" ? v ? 4 : 5 : this.numberBytes(v)); return; }
       if (Array.isArray(v)) { add(2 + Math.max(0, v.length - 1)); for (const child of v) visit(child); return; }
       const obj = v as Record<string, unknown>, keys = Object.keys(obj);
       this.units(keys.length); add(2 + Math.max(0, keys.length - 1));
@@ -234,15 +235,41 @@ export function encoding(value: unknown, backend: "sqlite" | "postgres", r: Audi
   const v = record(value, ["backend", "name"], r);
   r.require(v.backend === backend && v.name === (backend === "sqlite" ? "UTF-8" : "UTF8"), "source_contract_mismatch");
 }
-export function boundary<T>(input: unknown, body: (value: unknown, r: AuditRequest) => T): AuditResult<T> {
-  const r: AuditRequest = new AuditRequest();
+// SRC has an additional, smaller cumulative byte contract. Keep its fixed policy
+// private: ordinary C2/P0 callers retain the original limits and cannot select a
+// budget, supply a request, or turn this policy off. Inherited decoding, measuring
+// and serialization all dispatch through this same request's text method.
+class SourceTransferRequest extends AuditRequest {
+  private transferBytes = 2048; // The same finite failure-output reservation as C2.
+  override text(bytes: number, passes = 1): void {
+    const cost = bytes * passes;
+    if (!Number.isSafeInteger(cost) || cost < 0 || cost > 16 * 1024 * 1024 - this.transferBytes) this.fail("resource_limit");
+    this.transferBytes += cost;
+    super.text(bytes, passes);
+  }
+  override decodeText(hex: string): string {
+    // Together with C2's six passes: hex read/copy (3), UTF-8 validation (1),
+    // decode read/copy (2), re-encode read/copy (2), comparison of both buffers (2).
+    this.text(hex.length / 2, 4);
+    return super.decodeText(hex);
+  }
+  protected override numberBytes(value: number): number {
+    this.text(32, 2); // Decimal/exponent rendering and its result, before String.
+    return super.numberBytes(value);
+  }
+}
+function runBoundary<T>(input: unknown, body: (value: unknown, r: AuditRequest) => T,
+  r: AuditRequest, sourceTransfer: boolean): AuditResult<T> {
   try {
     r.require(typeof input === "string", "unsupported_shape");
     if (input.length > AUDIT_LIMITS.input) r.fail("resource_limit");
     const bytes = r.utf8Bytes(input);
     if (bytes > AUDIT_LIMITS.input) r.fail("resource_limit");
-    // token scan, decoded strings/key checks, final JSON.parse. Reserve before these operations.
-    r.text(bytes, 4);
+    // SRC prepays lexical scan, token slices, token parse/read/copy, decoded
+    // well-formedness, and the final parse/read/copy (seven complete upper-bound
+    // passes). UTF-8 measurement and key/number checks have their own charges.
+    // Preserve the original four-pass C2 policy for every existing caller.
+    r.text(bytes, sourceTransfer ? 7 : 4);
     if (scan(input, true, 0, r) === null) r.fail();
     const value = body(JSON.parse(input), r), result = { ok: true as const, value };
     const cost = r.measure(result, AUDIT_LIMITS.output);
@@ -252,4 +279,10 @@ export function boundary<T>(input: unknown, body: (value: unknown, r: AuditReque
     const known = error !== null && (typeof error === "object" || typeof error === "function") ? r.failures.get(error) : undefined;
     return known ?? rejected("invalid_value", null); // Never read an unknown throw's properties/prototype.
   }
+}
+export function boundary<T>(input: unknown, body: (value: unknown, r: AuditRequest) => T): AuditResult<T> {
+  return runBoundary(input, body, new AuditRequest(), false);
+}
+export function sourceTransferBoundary<T>(input: unknown, body: (value: unknown, r: AuditRequest) => T): AuditResult<T> {
+  return runBoundary(input, body, new SourceTransferRequest(), true);
 }

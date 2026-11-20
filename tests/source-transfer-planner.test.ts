@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { planSourceTransferValues } from "../src/server/storage/internal/source-transfer-planner.ts";
 import type { SourceTransferInput, TransferFrame } from "../src/server/storage/internal/source-transfer-planner.ts";
 import type { RawCell } from "../src/server/identity/m2-history-contracts.ts";
+import { AuditRequest, boundary, AUDIT_LIMITS } from "../src/server/identity/internal/m2-audit-boundary.ts";
 import fixture from "./fixtures/source-transfer-structural.json" with { type: "json" };
 
 // Complete raw-width values, using frozen original SQL defaults. The JSON payloads
@@ -260,4 +261,78 @@ test("original member and work-event INSERT guards are modeled, not waived as re
   assert.equal(success(v).triggers.find(t => t.name === "work_event_invalidation_integer_guard")!.invocations, 1);
   set(v.source!, "work_event_delivery_invalidations", "cause_from_revision", real(1));
   rejected(v, "unsupported_shape");
+});
+
+
+test("SRC cumulative read/copy budget rejects the reviewed padded input before full parsing", () => {
+  const compact = JSON.stringify(input()), padded = " ".repeat(8.25 * 1024 * 1024) + compact;
+  assert.equal(Buffer.byteLength(padded), 8_696_083);
+  assert.ok(Buffer.byteLength(padded) * 2 > 16 * 1024 * 1024);
+  assert.ok(planSourceTransferValues(compact).ok);
+  let fullParses = 0;
+  const parse = JSON.parse;
+  JSON.parse = function(value, reviver) { if (value === padded) fullParses++; return parse(value, reviver); };
+  try { failure(padded, "resource_limit"); }
+  finally { JSON.parse = parse; }
+  assert.equal(fullParses, 0, "reject the accumulated cost before performing the full parse");
+  const originalC2 = boundary(padded, () => null);
+  assert.ok(originalC2.ok, "the original C2 boundary retains its existing policy");
+  assert.equal(AUDIT_LIMITS.characters, 64 * 1024 * 1024);
+});
+
+test("outer reads and later raw decoding/output share the SRC budget in replace and clear", () => {
+  for (const operation of ["replace", "clear"] as const) {
+    const base = input();
+    if (operation === "clear") { base.operation = operation; base.source = null; }
+    const changed = structuredClone(base);
+    set(changed.source ?? changed.target, "messages", "body", text("a".repeat(60_000)));
+    const paddedBase = " ".repeat(1.25 * 1024 * 1024) + JSON.stringify(base);
+    const compactChanged = JSON.stringify(changed), combined = " ".repeat(1.25 * 1024 * 1024) + compactChanged;
+    assert.ok(planSourceTransferValues(paddedBase).ok, operation + " outer-read positive control");
+    const rawOnly = planSourceTransferValues(compactChanged);
+    assert.ok(rawOnly.ok, operation + " raw/output positive control");
+    assert.ok(Buffer.byteLength(JSON.stringify(rawOnly)) < 1024 * 1024);
+    assert.ok(Buffer.byteLength(combined) < 16 * 1024 * 1024);
+    failure(combined, "resource_limit");
+  }
+});
+
+test("SRC has a complete-request success/refusal edge after parsing and through final output", (t) => {
+  const compact = JSON.stringify(input()), base = planSourceTransferValues(compact);
+  assert.ok(base.ok);
+  const probe = (padding: number) => planSourceTransferValues(" ".repeat(padding) + compact);
+  let low = 0, high = 2 * 1024 * 1024;
+  assert.equal(probe(high).ok, false);
+  while (low + 1 < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (probe(mid).ok) low = mid; else high = mid;
+  }
+  const observed = (padding: number) => {
+    const wire = " ".repeat(padding) + compact;
+    const text = AuditRequest.prototype.text, parse = JSON.parse;
+    const paid = new Map<AuditRequest, number>(); let fullParses = 0;
+    AuditRequest.prototype.text = function(bytes, passes = 1) {
+      const result = text.call(this, bytes, passes);
+      paid.set(this, (paid.get(this) ?? 2048) + bytes * passes);
+      return result;
+    };
+    JSON.parse = function(value, reviver) { if (value === wire) fullParses++; return parse(value, reviver); };
+    let result;
+    try { result = planSourceTransferValues(wire); }
+    finally { AuditRequest.prototype.text = text; JSON.parse = parse; }
+    assert.equal(paid.size, 1, "parse, decoders, keys, projections, effects and output retain one request");
+    assert.equal(fullParses, 1, "both neighbours reach full parsing; refusal is cumulative later work");
+    assert.ok([...paid.values()][0]! <= 16 * 1024 * 1024);
+    return { result, prepaidBytes: [...paid.values()][0]!, fullParses };
+  };
+  const accepted = observed(low), refused = observed(high), last = accepted.result, next = refused.result;
+  assert.equal(high, low + 1);
+  assert.deepEqual(last, base, "whitespace cannot change the accepted plan or mint a second budget");
+  assert.equal(next.ok, false);
+  if (next.ok) throw new Error("expected cumulative resource refusal");
+  assert.equal(next.error.code, "resource_limit");
+  t.diagnostic(JSON.stringify({ scope: "SRC same-request cumulative byte boundary", limit: 16 * 1024 * 1024,
+    accepted: { padding: low, inputBytes: low + Buffer.byteLength(compact), prepaidBytes: accepted.prepaidBytes, fullParses: accepted.fullParses },
+    refused: { padding: high, inputBytes: high + Buffer.byteLength(compact), prepaidBytesBeforeRejection: refused.prepaidBytes,
+      fullParses: refused.fullParses, code: next.error.code } }));
 });

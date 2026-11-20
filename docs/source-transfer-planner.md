@@ -22,9 +22,13 @@ TEXT-affinity 键上的数值 storage class、INTEGER-affinity 键上的 TEXT st
 
 ## 同一请求预算
 
-入口复用原 C2 `boundary` 和同一个 `AuditRequest`，不是按 frame、表或 decoder 创建新额度。它保留原较小上限：输入 16 MiB、250,000 nodes、深度 64、100,000 rows、单 raw 4 MiB / 累计 raw 8 MiB、4,000,000 work units、64 MiB character passes、输出 1 MiB，并把直接原件/strict row 要求限制为 2,048 项。原件传递闭包未解析，因此该上限不能代替后继完整闭包账本。
+入口使用固定内部 `sourceTransferBoundary`，从第一次输入长度/编码检查到最终输出测量与冻结始终使用同一个 `AuditRequest`。SRC 在原 C2 限制之上施加**同一完整请求累计编码、读取和复制字节 16 MiB** 的较小上限；输入文本本身小于 16 MiB 不等于请求符合预算。source、target、after、重复引用、步骤、trigger effects 和输出不能各自重开额度，也不能把原 C2 的 64 MiB character passes 当作 SRC 上限。
 
-读取、比较、key 复制、排序 comparator、结果构造和 trigger 副作用均消费同一 ledger；费用在相应工作前收取。输入和输出端还有原 C2 的扫描、序列化及 freeze 费用。返回的 `charges` **仅是 planner 追加收费收据**；它不冒称可读取 C2 的私有计数。没有 caller-selected limits 或预算 hook。
+原 C2 的其他限制继续生效：输入 16 MiB、250,000 nodes、深度 64、100,000 rows、单 raw 4 MiB / 累计 raw 8 MiB、4,000,000 work units、输出 1 MiB。直接原件/strict row 要求仍限制为 2,048 项。原件传递闭包未解析，因此该上限不能代替后继完整闭包账本。普通 C2 和原 A/P0 使用原入口及原策略，不受 SRC 附加限制影响；没有调用者传 limits 或 budget hook 的入口。
+
+费用以 UTF-8/typed 原件字节的保守上界预付，并预留 2,048 字节有限失败输出；它不是堆内存或耗时测量。外层先付 UTF-8 测量，再预付 lexical scan、token 切片、token parse 的读/复制、decoded string 检查及最终 parse 的读/复制，共七遍完整输入上界；键与数值检查另外收费。每次 TEXT hex 解码、UTF-8 检查、解码、重编码和原 bytes 比较共预付十遍 raw bytes。整数转换、key 拼接、索引的重复读取、排序的两次比较、完整投影、每个 step/effect 和结果测量/序列化/冻结都继续消费同一账本，超过预算前停止相应操作。不可变引用共享只省去真实未发生的复制，不能免除后续读取和比较。
+
+返回的 `charges` **仅是 planner 显式追加收费收据**，不包含边界和共享 decoder 的私有收费，也不是完整请求的剩余额度。完整预算由同一请求内部强制执行；输出之前仍有最终完整测量和冻结费用，不能据中间收据提前放行。
 
 ## 后继接点和限制
 
