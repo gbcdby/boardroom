@@ -367,14 +367,14 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: 独立私有 cluster 真实重启与旧句柄失效验证
+      - name: 独立私有 cluster 真实重启与 H04 固定 helper 验证
         shell: bash
         env:
           AGENT_STUDIO_PG_RESTART_BIN: ${{ steps.pg_restart_tools.outputs.bin }}
         run: |
           test -n "$AGENT_STUDIO_PG_RESTART_BIN"
           mkdir -p .agent-output/maintenance-pg-restart
-          node --test tests/maintenance-postgres-restart.test.ts 2>&1 | tee .agent-output/maintenance-pg-restart/native-restart.log
+          node --test tests/maintenance-postgres-restart.test.ts tests/maintenance-postgres-catalog-guard-native.test.ts 2>&1 | tee .agent-output/maintenance-pg-restart/native-restart.log
 
       - name: 保存独立 PostgreSQL 重启验证证据
         if: always()

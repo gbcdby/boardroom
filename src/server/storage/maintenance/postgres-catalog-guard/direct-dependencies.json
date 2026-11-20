@@ -1,0 +1,502 @@
+{
+  "contract": "boardroom-pg16-catalog-guard-direct-dependencies/v1",
+  "status": "STATIC_DESIGN_NOT_QUALIFICATION",
+  "serverVersionNum": "160015",
+  "nativeEngine": {
+    "required": "original exact accepted native PG16.15 binary/library/runtime profile",
+    "releaseStatus": "UNRELEASED",
+    "suppliedBinaryDigest": null,
+    "closure": [
+      "parser",
+      "ACL/LOCK manager",
+      "fmgr",
+      "SPI/PLpgSQL executor",
+      "builtin/type I-O implementation",
+      "actual resolved plpgsql shared library",
+      "startup/auth/config/approved native workers"
+    ],
+    "catalogRowsAloneAreProof": false
+  },
+  "directFunctions": [
+    {
+      "oid": "2077",
+      "namespace": "pg_catalog",
+      "name": "current_setting",
+      "arguments": [
+        "25"
+      ],
+      "returnType": "25",
+      "languageOid": "12",
+      "owner": "qualified-local-bootstrap-administrator",
+      "prosrc": "show_config_by_name",
+      "probin": null,
+      "prokind": "f",
+      "prosecdef": false,
+      "proleakproof": false,
+      "proisstrict": true,
+      "proretset": false,
+      "provolatile": "s",
+      "proparallel": "s",
+      "prosupport": "0",
+      "provariadic": "0",
+      "pronargdefaults": 0,
+      "proconfig": null,
+      "procost": "1",
+      "prorows": "0",
+      "effectiveAcl": [
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "PUBLIC",
+          "privilege": "EXECUTE",
+          "grantable": false
+        },
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "qualified-local-bootstrap-administrator",
+          "privilege": "EXECUTE",
+          "grantable": false
+        }
+      ],
+      "sourceDeclaration": "{ oid => '2077', descr => 'SHOW X as a function',\n  proname => 'current_setting', provolatile => 's', prorettype => 'text',\n  proargtypes => 'text', prosrc => 'show_config_by_name' },"
+    },
+    {
+      "oid": "3810",
+      "namespace": "pg_catalog",
+      "name": "pg_is_in_recovery",
+      "arguments": [],
+      "returnType": "16",
+      "languageOid": "12",
+      "owner": "qualified-local-bootstrap-administrator",
+      "prosrc": "pg_is_in_recovery",
+      "probin": null,
+      "prokind": "f",
+      "prosecdef": false,
+      "proleakproof": false,
+      "proisstrict": true,
+      "proretset": false,
+      "provolatile": "v",
+      "proparallel": "s",
+      "prosupport": "0",
+      "provariadic": "0",
+      "pronargdefaults": 0,
+      "proconfig": null,
+      "procost": "1",
+      "prorows": "0",
+      "effectiveAcl": [
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "PUBLIC",
+          "privilege": "EXECUTE",
+          "grantable": false
+        },
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "qualified-local-bootstrap-administrator",
+          "privilege": "EXECUTE",
+          "grantable": false
+        }
+      ],
+      "sourceDeclaration": "{ oid => '3810', descr => 'true if server is in recovery',\n  proname => 'pg_is_in_recovery', provolatile => 'v', prorettype => 'bool',\n  proargtypes => '', prosrc => 'pg_is_in_recovery' },"
+    },
+    {
+      "oid": "67",
+      "namespace": "pg_catalog",
+      "name": "texteq",
+      "arguments": [
+        "25",
+        "25"
+      ],
+      "returnType": "16",
+      "languageOid": "12",
+      "owner": "qualified-local-bootstrap-administrator",
+      "prosrc": "texteq",
+      "probin": null,
+      "prokind": "f",
+      "prosecdef": false,
+      "proleakproof": true,
+      "proisstrict": true,
+      "proretset": false,
+      "provolatile": "i",
+      "proparallel": "s",
+      "prosupport": "0",
+      "provariadic": "0",
+      "pronargdefaults": 0,
+      "proconfig": null,
+      "procost": "1",
+      "prorows": "0",
+      "effectiveAcl": [
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "PUBLIC",
+          "privilege": "EXECUTE",
+          "grantable": false
+        },
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "qualified-local-bootstrap-administrator",
+          "privilege": "EXECUTE",
+          "grantable": false
+        }
+      ],
+      "sourceDeclaration": "{ oid => '67',\n  proname => 'texteq', proleakproof => 't', prorettype => 'bool',\n  proargtypes => 'text text', prosrc => 'texteq' },"
+    }
+  ],
+  "types": [
+    {
+      "oid": "16",
+      "namespace": "pg_catalog",
+      "name": "bool",
+      "sourceDeclaration": "{ oid => '16', array_type_oid => '1000',\n  descr => 'boolean, \\'true\\'/\\'false\\'',\n  typname => 'bool', typlen => '1', typbyval => 't', typcategory => 'B',\n  typispreferred => 't', typinput => 'boolin', typoutput => 'boolout',\n  typreceive => 'boolrecv', typsend => 'boolsend', typalign => 'c' },",
+      "owner": "qualified-local-bootstrap-administrator",
+      "effectiveAcl": [
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "PUBLIC",
+          "privilege": "USAGE",
+          "grantable": false
+        },
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "qualified-local-bootstrap-administrator",
+          "privilege": "USAGE",
+          "grantable": false
+        }
+      ],
+      "implementationClosure": "exact native engine including type input/output/send/receive"
+    },
+    {
+      "oid": "25",
+      "namespace": "pg_catalog",
+      "name": "text",
+      "sourceDeclaration": "{ oid => '25', array_type_oid => '1009',\n  descr => 'variable-length string, no limit specified',\n  typname => 'text', typlen => '-1', typbyval => 'f', typcategory => 'S',\n  typispreferred => 't', typinput => 'textin', typoutput => 'textout',\n  typreceive => 'textrecv', typsend => 'textsend', typalign => 'i',\n  typstorage => 'x', typcollation => 'default' },",
+      "owner": "qualified-local-bootstrap-administrator",
+      "effectiveAcl": [
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "PUBLIC",
+          "privilege": "USAGE",
+          "grantable": false
+        },
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "qualified-local-bootstrap-administrator",
+          "privilege": "USAGE",
+          "grantable": false
+        }
+      ],
+      "implementationClosure": "exact native engine including type input/output/send/receive"
+    },
+    {
+      "oid": "26",
+      "namespace": "pg_catalog",
+      "name": "oid",
+      "sourceDeclaration": "{ oid => '26', array_type_oid => '1028',\n  descr => 'object identifier(oid), maximum 4 billion',\n  typname => 'oid', typlen => '4', typbyval => 't', typcategory => 'N',\n  typispreferred => 't', typinput => 'oidin', typoutput => 'oidout',\n  typreceive => 'oidrecv', typsend => 'oidsend', typalign => 'i' },",
+      "owner": "qualified-local-bootstrap-administrator",
+      "effectiveAcl": [
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "PUBLIC",
+          "privilege": "USAGE",
+          "grantable": false
+        },
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "qualified-local-bootstrap-administrator",
+          "privilege": "USAGE",
+          "grantable": false
+        }
+      ],
+      "implementationClosure": "exact native engine including type input/output/send/receive"
+    },
+    {
+      "oid": "2278",
+      "namespace": "pg_catalog",
+      "name": "void",
+      "sourceDeclaration": "{ oid => '2278',\n  descr => 'pseudo-type for the result of a function with no real result',\n  typname => 'void', typlen => '4', typbyval => 't', typtype => 'p',\n  typcategory => 'P', typinput => 'void_in', typoutput => 'void_out',\n  typreceive => 'void_recv', typsend => 'void_send', typalign => 'i' },",
+      "owner": "qualified-local-bootstrap-administrator",
+      "effectiveAcl": [
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "PUBLIC",
+          "privilege": "USAGE",
+          "grantable": false
+        },
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "qualified-local-bootstrap-administrator",
+          "privilege": "USAGE",
+          "grantable": false
+        }
+      ],
+      "implementationClosure": "exact native engine including type input/output/send/receive"
+    },
+    {
+      "oid": "2280",
+      "namespace": "pg_catalog",
+      "name": "language_handler",
+      "sourceDeclaration": "{ oid => '2280',\n  descr => 'pseudo-type for the result of a language handler function',\n  typname => 'language_handler', typlen => '4', typbyval => 't', typtype => 'p',\n  typcategory => 'P', typinput => 'language_handler_in',\n  typoutput => 'language_handler_out', typreceive => '-', typsend => '-',\n  typalign => 'i' },",
+      "owner": "qualified-local-bootstrap-administrator",
+      "effectiveAcl": [
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "PUBLIC",
+          "privilege": "USAGE",
+          "grantable": false
+        },
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "qualified-local-bootstrap-administrator",
+          "privilege": "USAGE",
+          "grantable": false
+        }
+      ],
+      "implementationClosure": "exact native engine including type input/output/send/receive"
+    },
+    {
+      "oid": "2281",
+      "namespace": "pg_catalog",
+      "name": "internal",
+      "sourceDeclaration": "{ oid => '2281',\n  descr => 'pseudo-type representing an internal data structure',\n  typname => 'internal', typlen => 'SIZEOF_POINTER', typbyval => 't',\n  typtype => 'p', typcategory => 'P', typinput => 'internal_in',\n  typoutput => 'internal_out', typreceive => '-', typsend => '-',\n  typalign => 'ALIGNOF_POINTER' },",
+      "owner": "qualified-local-bootstrap-administrator",
+      "effectiveAcl": [
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "PUBLIC",
+          "privilege": "USAGE",
+          "grantable": false
+        },
+        {
+          "grantor": "qualified-local-bootstrap-administrator",
+          "grantee": "qualified-local-bootstrap-administrator",
+          "privilege": "USAGE",
+          "grantable": false
+        }
+      ],
+      "implementationClosure": "exact native engine including type input/output/send/receive"
+    }
+  ],
+  "textEqualityOperator": {
+    "oid": "98",
+    "namespace": "pg_catalog",
+    "name": "=",
+    "leftType": "25",
+    "rightType": "25",
+    "resultType": "16",
+    "functionOid": "67",
+    "sourceDeclaration": "{ oid => '98', oid_symbol => 'TextEqualOperator', descr => 'equal',\n  oprname => '=', oprcanmerge => 't', oprcanhash => 't', oprleft => 'text',\n  oprright => 'text', oprresult => 'bool', oprcom => '=(text,text)',\n  oprnegate => '<>(text,text)', oprcode => 'texteq', oprrest => 'eqsel',\n  oprjoin => 'eqjoinsel' },",
+    "plannerSupportClosure": "exact native engine includes eqsel/eqjoinsel; not caller replaceable"
+  },
+  "collation": {
+    "oid": "950",
+    "namespace": "pg_catalog",
+    "name": "C",
+    "provider": "c",
+    "encoding": -1,
+    "collate": "C",
+    "ctype": "C",
+    "deterministic": true,
+    "icuLocale": null,
+    "icuRules": null,
+    "version": null,
+    "sourceDeclaration": "{ oid => '950', oid_symbol => 'C_COLLATION_OID',\n  descr => 'standard C collation',\n  collname => 'C', collprovider => 'c', collencoding => '-1',\n  collcollate => 'C', collctype => 'C' },"
+  },
+  "plpgsql": {
+    "extension": "plpgsql",
+    "version": "1.0",
+    "extensionSchema": "pg_catalog",
+    "relocatable": false,
+    "languageName": "plpgsql",
+    "languageOid": "local-observed-positive-OID",
+    "lanispl": true,
+    "lanpltrusted": true,
+    "owner": "qualified-local-bootstrap-administrator",
+    "handlers": [
+      {
+        "name": "plpgsql_call_handler",
+        "namespace": "pg_catalog",
+        "oid": "local-observed-positive-OID",
+        "arguments": [],
+        "returnType": "2280",
+        "languageOid": "13",
+        "probin": "$libdir/plpgsql",
+        "prosrc": "plpgsql_call_handler",
+        "owner": "qualified-local-bootstrap-administrator",
+        "prokind": "f",
+        "prosecdef": false,
+        "proleakproof": false,
+        "proisstrict": false,
+        "proretset": false,
+        "provolatile": "v",
+        "proparallel": "u",
+        "prosupport": "0",
+        "provariadic": "0",
+        "pronargdefaults": 0,
+        "proconfig": null,
+        "procost": "1",
+        "prorows": "0",
+        "effectiveAcl": [
+          {
+            "grantor": "qualified-local-bootstrap-administrator",
+            "grantee": "PUBLIC",
+            "privilege": "EXECUTE",
+            "grantable": false
+          },
+          {
+            "grantor": "qualified-local-bootstrap-administrator",
+            "grantee": "qualified-local-bootstrap-administrator",
+            "privilege": "EXECUTE",
+            "grantable": false
+          }
+        ]
+      },
+      {
+        "name": "plpgsql_inline_handler",
+        "namespace": "pg_catalog",
+        "oid": "local-observed-positive-OID",
+        "arguments": [
+          "2281"
+        ],
+        "returnType": "2278",
+        "languageOid": "13",
+        "probin": "$libdir/plpgsql",
+        "prosrc": "plpgsql_inline_handler",
+        "owner": "qualified-local-bootstrap-administrator",
+        "prokind": "f",
+        "prosecdef": false,
+        "proleakproof": false,
+        "proisstrict": true,
+        "proretset": false,
+        "provolatile": "v",
+        "proparallel": "u",
+        "prosupport": "0",
+        "provariadic": "0",
+        "pronargdefaults": 0,
+        "proconfig": null,
+        "procost": "1",
+        "prorows": "0",
+        "effectiveAcl": [
+          {
+            "grantor": "qualified-local-bootstrap-administrator",
+            "grantee": "PUBLIC",
+            "privilege": "EXECUTE",
+            "grantable": false
+          },
+          {
+            "grantor": "qualified-local-bootstrap-administrator",
+            "grantee": "qualified-local-bootstrap-administrator",
+            "privilege": "EXECUTE",
+            "grantable": false
+          }
+        ]
+      },
+      {
+        "name": "plpgsql_validator",
+        "namespace": "pg_catalog",
+        "oid": "local-observed-positive-OID",
+        "arguments": [
+          "26"
+        ],
+        "returnType": "2278",
+        "languageOid": "13",
+        "probin": "$libdir/plpgsql",
+        "prosrc": "plpgsql_validator",
+        "owner": "qualified-local-bootstrap-administrator",
+        "prokind": "f",
+        "prosecdef": false,
+        "proleakproof": false,
+        "proisstrict": true,
+        "proretset": false,
+        "provolatile": "v",
+        "proparallel": "u",
+        "prosupport": "0",
+        "provariadic": "0",
+        "pronargdefaults": 0,
+        "proconfig": null,
+        "procost": "1",
+        "prorows": "0",
+        "effectiveAcl": [
+          {
+            "grantor": "qualified-local-bootstrap-administrator",
+            "grantee": "PUBLIC",
+            "privilege": "EXECUTE",
+            "grantable": false
+          },
+          {
+            "grantor": "qualified-local-bootstrap-administrator",
+            "grantee": "qualified-local-bootstrap-administrator",
+            "privilege": "EXECUTE",
+            "grantable": false
+          }
+        ]
+      }
+    ],
+    "languageEffectiveAcl": [
+      {
+        "grantor": "qualified-local-bootstrap-administrator",
+        "grantee": "PUBLIC",
+        "privilege": "USAGE",
+        "grantable": false
+      },
+      {
+        "grantor": "qualified-local-bootstrap-administrator",
+        "grantee": "qualified-local-bootstrap-administrator",
+        "privilege": "USAGE",
+        "grantable": false
+      }
+    ],
+    "aclMeaning": "fixed v1 expected baseline, not a claim about any unobserved server; owner implicit authority checked separately; language USAGE is not helper EXECUTE",
+    "binaryPathResolution": "actual libdir file and native dependency identities qualified before epoch admission"
+  },
+  "sourceIdentities": [
+    {
+      "path": "sources/PG16_15-gram.y",
+      "bytes": 484337,
+      "sha256": "35d957e230167ecbd19b8c7f08b43ba070a3189c1d9de6c360b7fcebfbfd714f"
+    },
+    {
+      "path": "sources/PG16_15-pg_collation.dat",
+      "bytes": 1342,
+      "sha256": "a52b39beebcda801d25fa70e586a7ffb86476f83dffc460f047870bafe9ef34b"
+    },
+    {
+      "path": "sources/PG16_15-pg_language.dat",
+      "bytes": 878,
+      "sha256": "823cc005b56d590e4ce747189ea0afea1ea327f3b0611f3bca8e967308b2d7bf"
+    },
+    {
+      "path": "sources/PG16_15-pg_language.h",
+      "bytes": 2056,
+      "sha256": "8280da656d3b7f94bd12ff763b97d9c6ee9114216dc12b65e4dd9033768c8b63"
+    },
+    {
+      "path": "sources/PG16_15-pg_operator.dat",
+      "bytes": 190444,
+      "sha256": "db122ca15c4dfc37da246760bced25b4c70df5e667b8892b98516b461c4f7e72"
+    },
+    {
+      "path": "sources/PG16_15-pg_proc.dat",
+      "bytes": 625727,
+      "sha256": "18399cd7414c40469e4e1786f69d70d75c4ffbe1bcf915825b24659f3231e5fd"
+    },
+    {
+      "path": "sources/PG16_15-pg_proc.h",
+      "bytes": 6659,
+      "sha256": "deb57a6965ed698dc4528de7252757d4fa11b646c3a7e84bea4222a3c5c5fbbe"
+    },
+    {
+      "path": "sources/PG16_15-pg_type.dat",
+      "bytes": 39017,
+      "sha256": "209dc20843c2e0220dfc55950ec841796eec9c3839e08eaf67f78b2f47919217"
+    },
+    {
+      "path": "sources/PG16_15-plpgsql--1.0.sql",
+      "bytes": 658,
+      "sha256": "f4e7e05438808ac0da0b3801397d16e36102969af7e2ffc982def5b7524fb557"
+    },
+    {
+      "path": "sources/PG16_15-plpgsql.control",
+      "bytes": 193,
+      "sha256": "9457c3f51d6bdfab93f13080d177795a9274c025e378fb613218342e3a3c7b45"
+    }
+  ]
+}

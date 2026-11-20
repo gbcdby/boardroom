@@ -1,0 +1,588 @@
+{
+  "contract": "boardroom-pg16-catalog-guard-module/v1",
+  "candidate": "BR-COLLAB-S2-T2-M2-PG-H04-20261120-R1",
+  "status": "PROPOSED_DESIGN_NOT_INSTALLED",
+  "serverVersionNum": "160015",
+  "namespace": "boardroom_catalog_guard_v1",
+  "namespaceAcl": [
+    {
+      "grantor": "administrator",
+      "grantee": "administrator",
+      "privileges": [
+        "CREATE",
+        "USAGE"
+      ],
+      "grantable": false
+    },
+    {
+      "grantor": "administrator",
+      "grantee": "catalog-caller",
+      "privileges": [
+        "USAGE"
+      ],
+      "grantable": false
+    }
+  ],
+  "helpers": [
+    {
+      "key": "boardroom_catalog_guard_v1.acquire_share()",
+      "mode": "SHARE",
+      "arguments": [],
+      "returns": "pg_catalog.void",
+      "bodyFile": "sql/acquire_share.body",
+      "bodyBytes": 3689,
+      "bodySha256": "38bbc707d07eab9ae0bc96cfb51e08ae47e91cfd63f88dd5723dee955d5a1910",
+      "createFile": "sql/acquire_share.sql",
+      "createBytes": 3968,
+      "createSha256": "f5f0c3d4f0bb52ed9cde77ffed6df13746cac13e72cad43fd5072f9944de4bd1",
+      "pgProc": {
+        "prokind": "f",
+        "prosecdef": true,
+        "proleakproof": false,
+        "proisstrict": false,
+        "proretset": false,
+        "provolatile": "v",
+        "proparallel": "u",
+        "pronargs": 0,
+        "pronargdefaults": 0,
+        "provariadic": "0",
+        "prosupport": "0",
+        "prorettype": "2278",
+        "proargtypes": [],
+        "proallargtypes": null,
+        "proargmodes": null,
+        "proargnames": null,
+        "proargdefaults": null,
+        "protrftypes": null,
+        "probin": null,
+        "prosqlbody": null,
+        "procost": "100",
+        "prorows": "0",
+        "proconfig": [
+          "search_path=pg_catalog, pg_temp"
+        ]
+      },
+      "language": "exact-local-plpgsql-binding",
+      "owner": "exact-local-installed-administrator",
+      "aclByPurpose": {
+        "source-control": [
+          {
+            "grantor": "administrator",
+            "grantee": "administrator",
+            "privilege": "EXECUTE",
+            "grantable": false
+          },
+          {
+            "grantor": "administrator",
+            "grantee": "catalog-caller",
+            "privilege": "EXECUTE",
+            "grantable": false
+          }
+        ],
+        "verification-only": [
+          {
+            "grantor": "administrator",
+            "grantee": "administrator",
+            "privilege": "EXECUTE",
+            "grantable": false
+          },
+          {
+            "grantor": "administrator",
+            "grantee": "catalog-caller",
+            "privilege": "EXECUTE",
+            "grantable": false
+          }
+        ]
+      },
+      "costUpperBound": {
+        "wireCalls": 1,
+        "fixedModePredicates": 3,
+        "modePrimitiveCalls": 6,
+        "utilityStatements": 1,
+        "relationLockRequests": 64,
+        "sqlPrechargeIncludingWireAndPredicates": 5,
+        "wireRowsUpperBound": 1,
+        "voidValueUtf8Bytes": 0,
+        "fixedGuardRowUtf8Bytes": 12
+      },
+      "actualPg": "NOT_RUN"
+    },
+    {
+      "key": "boardroom_catalog_guard_v1.acquire_sre()",
+      "mode": "SHARE ROW EXCLUSIVE",
+      "arguments": [],
+      "returns": "pg_catalog.void",
+      "bodyFile": "sql/acquire_sre.body",
+      "bodyBytes": 3401,
+      "bodySha256": "0e04cc94d8ff5beb23cc6bb5184ae66b88a0a6e96232341593346439ebd104ae",
+      "createFile": "sql/acquire_sre.sql",
+      "createBytes": 3678,
+      "createSha256": "076d8dfc5e267dc743261fd13e4db9f5941fe86472aab684403ee504c66d7b70",
+      "pgProc": {
+        "prokind": "f",
+        "prosecdef": true,
+        "proleakproof": false,
+        "proisstrict": false,
+        "proretset": false,
+        "provolatile": "v",
+        "proparallel": "u",
+        "pronargs": 0,
+        "pronargdefaults": 0,
+        "provariadic": "0",
+        "prosupport": "0",
+        "prorettype": "2278",
+        "proargtypes": [],
+        "proallargtypes": null,
+        "proargmodes": null,
+        "proargnames": null,
+        "proargdefaults": null,
+        "protrftypes": null,
+        "probin": null,
+        "prosqlbody": null,
+        "procost": "100",
+        "prorows": "0",
+        "proconfig": [
+          "search_path=pg_catalog, pg_temp"
+        ]
+      },
+      "language": "exact-local-plpgsql-binding",
+      "owner": "exact-local-installed-administrator",
+      "aclByPurpose": {
+        "source-control": [
+          {
+            "grantor": "administrator",
+            "grantee": "administrator",
+            "privilege": "EXECUTE",
+            "grantable": false
+          },
+          {
+            "grantor": "administrator",
+            "grantee": "catalog-caller",
+            "privilege": "EXECUTE",
+            "grantable": false
+          }
+        ],
+        "verification-only": [
+          {
+            "grantor": "administrator",
+            "grantee": "administrator",
+            "privilege": "EXECUTE",
+            "grantable": false
+          }
+        ]
+      },
+      "costUpperBound": {
+        "wireCalls": 1,
+        "fixedModePredicates": 3,
+        "modePrimitiveCalls": 4,
+        "utilityStatements": 1,
+        "relationLockRequests": 64,
+        "sqlPrechargeIncludingWireAndPredicates": 5,
+        "wireRowsUpperBound": 1,
+        "voidValueUtf8Bytes": 0,
+        "fixedGuardRowUtf8Bytes": 12
+      },
+      "actualPg": "NOT_RUN"
+    }
+  ],
+  "catalogPlanSha256": "7202933267163d879f31209fe63429e4aeafc8c4e44d84b892258a11e5481b61",
+  "catalogRelations": [
+    {
+      "relname": "pg_aggregate",
+      "oid": "2600",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_am",
+      "oid": "2601",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_amop",
+      "oid": "2602",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_amproc",
+      "oid": "2603",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_attrdef",
+      "oid": "2604",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_attribute",
+      "oid": "1249",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_auth_members",
+      "oid": "1261",
+      "relisshared": true,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_authid",
+      "oid": "1260",
+      "relisshared": true,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_cast",
+      "oid": "2605",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_class",
+      "oid": "1259",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_collation",
+      "oid": "3456",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_constraint",
+      "oid": "2606",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_conversion",
+      "oid": "2607",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_database",
+      "oid": "1262",
+      "relisshared": true,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_db_role_setting",
+      "oid": "2964",
+      "relisshared": true,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_default_acl",
+      "oid": "826",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_depend",
+      "oid": "2608",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_description",
+      "oid": "2609",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_enum",
+      "oid": "3501",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_event_trigger",
+      "oid": "3466",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_extension",
+      "oid": "3079",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_foreign_data_wrapper",
+      "oid": "2328",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_foreign_server",
+      "oid": "1417",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_foreign_table",
+      "oid": "3118",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_index",
+      "oid": "2610",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_inherits",
+      "oid": "2611",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_init_privs",
+      "oid": "3394",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_language",
+      "oid": "2612",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_largeobject",
+      "oid": "2613",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_largeobject_metadata",
+      "oid": "2995",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_namespace",
+      "oid": "2615",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_opclass",
+      "oid": "2616",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_operator",
+      "oid": "2617",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_opfamily",
+      "oid": "2753",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_parameter_acl",
+      "oid": "6243",
+      "relisshared": true,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_partitioned_table",
+      "oid": "3350",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_policy",
+      "oid": "3256",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_proc",
+      "oid": "1255",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_publication",
+      "oid": "6104",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_publication_namespace",
+      "oid": "6237",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_publication_rel",
+      "oid": "6106",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_range",
+      "oid": "3541",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_replication_origin",
+      "oid": "6000",
+      "relisshared": true,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_rewrite",
+      "oid": "2618",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_seclabel",
+      "oid": "3596",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_sequence",
+      "oid": "2224",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_shdepend",
+      "oid": "1214",
+      "relisshared": true,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_shdescription",
+      "oid": "2396",
+      "relisshared": true,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_shseclabel",
+      "oid": "3592",
+      "relisshared": true,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_statistic",
+      "oid": "2619",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_statistic_ext",
+      "oid": "3381",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_statistic_ext_data",
+      "oid": "3429",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_subscription",
+      "oid": "6100",
+      "relisshared": true,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_subscription_rel",
+      "oid": "6102",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_tablespace",
+      "oid": "1213",
+      "relisshared": true,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_transform",
+      "oid": "3576",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_trigger",
+      "oid": "2620",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_ts_config",
+      "oid": "3602",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_ts_config_map",
+      "oid": "3603",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_ts_dict",
+      "oid": "3600",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_ts_parser",
+      "oid": "3601",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_ts_template",
+      "oid": "3764",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_type",
+      "oid": "1247",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    },
+    {
+      "relname": "pg_user_mapping",
+      "oid": "1418",
+      "relisshared": false,
+      "mode": "SHARE ROW EXCLUSIVE"
+    }
+  ],
+  "sharedCatalogCount": 11,
+  "roleBindingPurposes": [
+    "source-control",
+    "verification-only"
+  ],
+  "sourceCaller": "original-D01-C",
+  "verificationCaller": "original-target-verification-V",
+  "businessDirectExecute": false,
+  "publicDirectExecute": false,
+  "dynamicOidCrossClusterEquality": false,
+  "sameClusterReuseAsVerificationTarget": false,
+  "nativeEngineProfile": "required original exact PG16.15/native binary qualification; no invented release hash",
+  "productionRegistryEntries": []
+}
