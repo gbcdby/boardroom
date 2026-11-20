@@ -1,0 +1,4066 @@
+{
+  "contract": "m2-src-transfer-values/v1",
+  "operation": "replace",
+  "source": {
+    "source": {
+      "kind": "sqlite",
+      "databaseInstanceId": "11111111111111111111111111111111",
+      "identityDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "textEncoding": {
+      "backend": "sqlite",
+      "name": "UTF-8"
+    },
+    "tables": [
+      {
+        "name": "agent_legacy_aliases",
+        "columns": [
+          "display_name",
+          "host_type",
+          "agent_id",
+          "created_at",
+          "retired_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_profile_versions",
+        "columns": [
+          "agent_id",
+          "revision",
+          "content_json",
+          "content_digest",
+          "default_role_id",
+          "default_role_revision",
+          "compat_runtime_revision"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "11",
+            "cells": [
+              [
+                "text",
+                "736167656e74"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "text",
+                "7b7d"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "73726f6c65"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "null"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "agent_profiles",
+        "columns": [
+          "agent_id",
+          "current_revision",
+          "legacy_runtime_id",
+          "compat_runtime_revision"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "10",
+            "cells": [
+              [
+                "text",
+                "736167656e74"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "agent_runner_states",
+        "columns": [
+          "binding_id",
+          "state",
+          "phase",
+          "generation",
+          "lease_owner",
+          "lease_expires_at",
+          "applied_json",
+          "harness_session_id",
+          "session_key",
+          "session_state",
+          "pid",
+          "exit_confirmed",
+          "observed_at",
+          "started_at",
+          "attempt_count",
+          "next_retry_at",
+          "last_error_code",
+          "last_exit_code",
+          "last_exit_signal",
+          "permission_observed",
+          "updated_at",
+          "process_identity_json",
+          "applied_config_snapshot_id",
+          "applied_workspace_mapping_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_runtime_bindings",
+        "columns": [
+          "id",
+          "runtime_id",
+          "project_id",
+          "group_id",
+          "member_id",
+          "revision",
+          "overrides_json",
+          "advanced_json",
+          "desired_state",
+          "intent_revision",
+          "requested_snapshot_json",
+          "reset_session_requested",
+          "created_at",
+          "updated_at",
+          "group_binding_id",
+          "attachment_state",
+          "detach_config_snapshot_id",
+          "detached_at",
+          "requested_config_snapshot_id",
+          "requested_workspace_mapping_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_runtime_events",
+        "columns": [
+          "id",
+          "binding_id",
+          "observed_at",
+          "event_name",
+          "payload"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_runtime_members",
+        "columns": [
+          "member_id",
+          "runtime_id",
+          "project_id",
+          "binding_id",
+          "generation",
+          "lease_owner",
+          "lease_expires_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_runtime_observation_meta",
+        "columns": [
+          "id",
+          "storage_failures",
+          "logger_failures",
+          "rejected_records",
+          "dropped_events",
+          "history_truncated"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_runtime_usage_snapshots",
+        "columns": [
+          "id",
+          "binding_id",
+          "source",
+          "harness_version",
+          "metric",
+          "scope",
+          "scope_id",
+          "epoch_id",
+          "sequence",
+          "observed_at",
+          "payload"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_runtimes",
+        "columns": [
+          "id",
+          "agent_id",
+          "config_version",
+          "revision",
+          "defaults_json",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agents",
+        "columns": [
+          "id",
+          "display_name",
+          "host_type",
+          "created_at",
+          "updated_at",
+          "last_seen_at"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "9007199254740993",
+            "cells": [
+              [
+                "text",
+                "736167656e74"
+              ],
+              [
+                "text",
+                "736167656e74"
+              ],
+              [
+                "text",
+                "6c6f63616c"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "null"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "audit_log",
+        "columns": [
+          "id",
+          "scope",
+          "project_id",
+          "actor_kind",
+          "actor_member_id",
+          "actor_name",
+          "action",
+          "target_kind",
+          "target_id",
+          "target_name",
+          "changed",
+          "before",
+          "after",
+          "detail",
+          "reversed_at",
+          "reversed_by_audit_id",
+          "created_at"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "7",
+            "cells": [
+              [
+                "text",
+                "736175646974"
+              ],
+              [
+                "text",
+                "70726f6a656374"
+              ],
+              [
+                "text",
+                "7370726f6a656374"
+              ],
+              [
+                "text",
+                "73797374656d"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "66697874757265"
+              ],
+              [
+                "text",
+                "66697874757265"
+              ],
+              [
+                "text",
+                "70726f6a656374"
+              ],
+              [
+                "text",
+                "7370726f6a656374"
+              ],
+              [
+                "text",
+                "70726f6a656374"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "config_activation_receipts",
+        "columns": [
+          "id",
+          "request_id",
+          "plan_id",
+          "plan_digest",
+          "physical_source_ref",
+          "snapshot_receipt_ref",
+          "capture_id",
+          "capture_source_digest",
+          "capture_artifact_digest",
+          "schema_before_digest",
+          "schema_after_digest",
+          "guard_transition_json",
+          "allowed_delta_ref",
+          "target_rows_digest",
+          "source_to_target_manifest_ref",
+          "payload_json",
+          "payload_digest"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "7",
+            "cells": [
+              [
+                "text",
+                "7361637469766174696f6e"
+              ],
+              [
+                "text",
+                "7372657175657374"
+              ],
+              [
+                "text",
+                "66697874757265"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "666978747572653a733a706879736963616c"
+              ],
+              [
+                "text",
+                "666978747572653a733a736e617073686f74"
+              ],
+              [
+                "text",
+                "7363617074757265"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "7b7d"
+              ],
+              [
+                "text",
+                "666978747572653a733a64656c7461"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "666978747572653a733a6d616e6966657374"
+              ],
+              [
+                "text",
+                "7b7d"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "config_authority",
+        "columns": [
+          "singleton",
+          "format_version",
+          "owner",
+          "activation_id",
+          "source_binding_ref"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "1",
+            "cells": [
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "text",
+                "70726f66696c65"
+              ],
+              [
+                "text",
+                "7361637469766174696f6e"
+              ],
+              [
+                "text",
+                "666978747572653a733a62696e64696e67"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "config_detach_snapshots",
+        "columns": [
+          "id",
+          "execution_binding_id",
+          "group_binding_id",
+          "runtime_id",
+          "profile_agent_id",
+          "profile_revision",
+          "profile_digest",
+          "binding_revision",
+          "binding_digest",
+          "resolution_json",
+          "root_source_json",
+          "current_advanced_view_json",
+          "requested_source_json",
+          "applied_source_json",
+          "observed_at",
+          "content_digest",
+          "requested_snapshot_id",
+          "requested_snapshot_digest",
+          "requested_mapping_id",
+          "requested_mapping_digest",
+          "applied_snapshot_id",
+          "applied_snapshot_digest",
+          "applied_mapping_id",
+          "applied_mapping_digest",
+          "root_workspace_project_id",
+          "root_workspace_revision",
+          "root_mapping_id",
+          "root_mapping_digest"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "config_mutation_receipts",
+        "columns": [
+          "actor_scope",
+          "operation",
+          "target_scope",
+          "mutation_id",
+          "command_digest",
+          "result_json",
+          "result_profile_agent_id",
+          "result_profile_revision",
+          "result_profile_digest",
+          "result_binding_id",
+          "result_binding_revision",
+          "result_binding_digest",
+          "audit_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "config_snapshots",
+        "columns": [
+          "id",
+          "agent_id",
+          "group_binding_id",
+          "execution_binding_id",
+          "project_id",
+          "member_id",
+          "group_id",
+          "origin_kind",
+          "content_json",
+          "content_digest",
+          "semantic_digest",
+          "capture_id",
+          "capture_source_digest",
+          "capture_artifact_digest",
+          "profile_revision",
+          "profile_digest",
+          "binding_revision",
+          "binding_digest"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "config_workspace_mappings",
+        "columns": [
+          "id",
+          "snapshot_id",
+          "snapshot_digest",
+          "project_id",
+          "workspace_revision",
+          "original_workdir",
+          "canonical_root",
+          "root_identity_json",
+          "physical_resource_key",
+          "observed_at",
+          "content_digest"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_action_requests",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "action_json",
+          "candidate_envelope_json",
+          "action_digest",
+          "candidate_digest",
+          "expected_task_revision",
+          "expected_round_revision",
+          "proposed_verdict",
+          "proposal_reason_json",
+          "requested_path",
+          "origin",
+          "created_by_kind",
+          "created_by_id",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_change_heads",
+        "columns": [
+          "project_id",
+          "revision"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_changes",
+        "columns": [
+          "project_id",
+          "revision",
+          "task_id",
+          "decision_id",
+          "decision_revision",
+          "kind",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_command_receipts",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "actor_kind",
+          "actor_id",
+          "operation",
+          "idempotency_key",
+          "request_digest",
+          "input_decision_id",
+          "input_decision_revision",
+          "result_decision_id",
+          "result_decision_revision",
+          "result_action_digest",
+          "head_revision",
+          "result_state",
+          "http_status",
+          "resolution_id",
+          "initiation_id",
+          "response_json",
+          "committed_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_executions",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "decision_id",
+          "resolution_id",
+          "choice_id",
+          "effect_key",
+          "status",
+          "verdict",
+          "before_task_revision",
+          "before_round_revision",
+          "after_task_revision",
+          "after_round_revision",
+          "task_history_id",
+          "work_event_ids_json",
+          "committed_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_legacy_records",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "source_table",
+          "source_id",
+          "raw_text",
+          "raw_digest",
+          "chain_status",
+          "diagnostics_json",
+          "imported_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_local_initiations",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "decision_id",
+          "input_decision_revision",
+          "action_digest",
+          "choice_id",
+          "actor_kind",
+          "actor_id",
+          "request_digest",
+          "user_event_id",
+          "nonce_hash",
+          "source_contract",
+          "authority_basis",
+          "transfer_mode",
+          "consumed_receipt_id",
+          "issued_at",
+          "consumed_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_records",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "action_request_id",
+          "action_digest",
+          "generation",
+          "revision",
+          "status",
+          "required_authority",
+          "assignee_member_id",
+          "blocked_reason_code",
+          "policy_evaluation_json",
+          "predecessor_decision_id",
+          "predecessor_legacy_id",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_resolutions",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "decision_id",
+          "input_decision_revision",
+          "action_digest",
+          "choice_id",
+          "actor_kind",
+          "actor_id",
+          "request_digest",
+          "authority",
+          "reason_json",
+          "actual_execution_path",
+          "initiation_id",
+          "command_receipt_id",
+          "policy_evaluation_json",
+          "permission_snapshot_json",
+          "permission_snapshot_digest",
+          "resolved_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_review_heads",
+        "columns": [
+          "project_id",
+          "task_id",
+          "round_id",
+          "head_revision",
+          "current_decision_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_review_projections",
+        "columns": [
+          "project_id",
+          "task_id",
+          "round_id",
+          "source_kind",
+          "execution_id",
+          "legacy_id",
+          "applied_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_user_events",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "decision_id",
+          "input_decision_revision",
+          "action_digest",
+          "choice_id",
+          "actor_kind",
+          "actor_id",
+          "request_digest",
+          "command_kind",
+          "client_mutation_id",
+          "command_json",
+          "issued_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "group_binding_config_versions",
+        "columns": [
+          "binding_id",
+          "revision",
+          "content_json",
+          "content_digest",
+          "role_id",
+          "role_revision",
+          "compat_execution_binding_id",
+          "compat_binding_revision",
+          "advanced_state",
+          "advanced_profile_agent_id",
+          "advanced_profile_revision",
+          "advanced_profile_digest",
+          "advanced_capture_id",
+          "advanced_capture_source_digest",
+          "advanced_capture_artifact_digest",
+          "advanced_workspace_project_id",
+          "advanced_workspace_revision",
+          "advanced_execution_binding_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "group_bindings",
+        "columns": [
+          "id",
+          "project_id",
+          "group_id",
+          "member_id",
+          "agent_id",
+          "current_revision",
+          "original_legacy_binding_id",
+          "current_attachment_id",
+          "current_attachment_state",
+          "current_compat_binding_revision",
+          "retired_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "group_participants",
+        "columns": [
+          "group_id",
+          "member_id",
+          "joined_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "groups",
+        "columns": [
+          "id",
+          "project_id",
+          "name",
+          "created_at",
+          "updated_at",
+          "archived_at"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "14",
+            "cells": [
+              [
+                "text",
+                "7367726f7570"
+              ],
+              [
+                "text",
+                "7370726f6a656374"
+              ],
+              [
+                "text",
+                "67726f7570"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "null"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "legacy_config_captures",
+        "columns": [
+          "id",
+          "physical_source_ref",
+          "source_digest",
+          "artifact_digest",
+          "capture_json",
+          "snapshot_receipt_ref"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "7",
+            "cells": [
+              [
+                "text",
+                "7363617074757265"
+              ],
+              [
+                "text",
+                "666978747572653a733a706879736963616c"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "7b7d"
+              ],
+              [
+                "text",
+                "666978747572653a733a736e617073686f74"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "mcp_catalog_heads",
+        "columns": [
+          "connection_id",
+          "connection_revision",
+          "snapshot_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "mcp_catalog_snapshots",
+        "columns": [
+          "id",
+          "connection_id",
+          "connection_revision",
+          "snapshot_json",
+          "observed_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "mcp_connection_mutations",
+        "columns": [
+          "request_id",
+          "input_digest",
+          "connection_id",
+          "result_json",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "mcp_connection_versions",
+        "columns": [
+          "connection_id",
+          "revision",
+          "name",
+          "configuration_json",
+          "configuration_digest",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "mcp_connections",
+        "columns": [
+          "id",
+          "revision",
+          "discovery_sequence",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "mcp_discovery_attempts",
+        "columns": [
+          "id",
+          "request_id",
+          "input_digest",
+          "connection_id",
+          "connection_revision",
+          "sequence",
+          "owner_id",
+          "status",
+          "error_code",
+          "snapshot_id",
+          "cleanup",
+          "protocol_version",
+          "page_count",
+          "created_at",
+          "finished_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "mcp_sessions",
+        "columns": [
+          "id",
+          "agent_id",
+          "project_id",
+          "group_id",
+          "member_id",
+          "display_name",
+          "host_type",
+          "state",
+          "connected_at",
+          "last_heartbeat_at",
+          "disconnected_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "member_fact_revisions",
+        "columns": [
+          "member_id",
+          "kind",
+          "revision"
+        ],
+        "count": "6",
+        "rows": [
+          {
+            "rowid": "31",
+            "cells": [
+              [
+                "text",
+                "736d656d626572"
+              ],
+              [
+                "text",
+                "617574686f7265642d6d65737361676573"
+              ],
+              [
+                "integer",
+                "9007199254740990"
+              ]
+            ]
+          },
+          {
+            "rowid": "32",
+            "cells": [
+              [
+                "text",
+                "736d656d626572"
+              ],
+              [
+                "text",
+                "64656c69766572696573"
+              ],
+              [
+                "integer",
+                "9007199254740990"
+              ]
+            ]
+          },
+          {
+            "rowid": "33",
+            "cells": [
+              [
+                "text",
+                "736d656d626572"
+              ],
+              [
+                "text",
+                "6d656d6f72792d7265717565737473"
+              ],
+              [
+                "integer",
+                "9007199254740990"
+              ]
+            ]
+          },
+          {
+            "rowid": "34",
+            "cells": [
+              [
+                "text",
+                "736d656d626572"
+              ],
+              [
+                "text",
+                "6d656d6f72792d7265636569707473"
+              ],
+              [
+                "integer",
+                "9007199254740990"
+              ]
+            ]
+          },
+          {
+            "rowid": "35",
+            "cells": [
+              [
+                "text",
+                "736d656d626572"
+              ],
+              [
+                "text",
+                "6d656d6f72792d636f756e74657273"
+              ],
+              [
+                "integer",
+                "9007199254740990"
+              ]
+            ]
+          },
+          {
+            "rowid": "36",
+            "cells": [
+              [
+                "text",
+                "736d656d626572"
+              ],
+              [
+                "text",
+                "6d656d6f72792d636865636b706f696e7473"
+              ],
+              [
+                "integer",
+                "9007199254740990"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "member_statuses",
+        "columns": [
+          "project_id",
+          "member_id",
+          "state",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "members",
+        "columns": [
+          "id",
+          "project_id",
+          "agent_id",
+          "kind",
+          "display_name",
+          "role",
+          "created_at",
+          "updated_at",
+          "node_id",
+          "status",
+          "removed_at",
+          "membership_revision"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "13",
+            "cells": [
+              [
+                "text",
+                "736d656d626572"
+              ],
+              [
+                "text",
+                "7370726f6a656374"
+              ],
+              [
+                "text",
+                "736167656e74"
+              ],
+              [
+                "text",
+                "6167656e74"
+              ],
+              [
+                "text",
+                "6d656d626572"
+              ],
+              [
+                "text",
+                "6e6f726d616c"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "616374697665"
+              ],
+              [
+                "null"
+              ],
+              [
+                "integer",
+                "1"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "memory_documents",
+        "columns": [
+          "id",
+          "scope",
+          "project_id",
+          "agent_id",
+          "version",
+          "markdown",
+          "byte_length",
+          "updated_at",
+          "updated_by",
+          "source"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "memory_message_receipts",
+        "columns": [
+          "project_id",
+          "agent_id",
+          "group_id",
+          "message_id",
+          "first_observed_at",
+          "counter_value"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "memory_scan_checkpoints",
+        "columns": [
+          "id",
+          "kind",
+          "project_id",
+          "agent_id",
+          "group_id",
+          "after_cursor",
+          "through_cursor",
+          "sweep",
+          "revision",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "memory_summary_requests",
+        "columns": [
+          "id",
+          "project_id",
+          "agent_id",
+          "recipient_member_id",
+          "context_group_id",
+          "document_id",
+          "base_version",
+          "revision",
+          "state",
+          "trigger",
+          "trigger_key",
+          "task_id",
+          "completed_task_revision",
+          "message_ids",
+          "source_work_event_id",
+          "retry_of_request_id",
+          "attempt_id",
+          "begin_mutation_id",
+          "result_version",
+          "result_sha256",
+          "error",
+          "evidence",
+          "created_at",
+          "started_at",
+          "finished_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "memory_trigger_counters",
+        "columns": [
+          "project_id",
+          "agent_id",
+          "group_id",
+          "lifetime_count",
+          "next_threshold",
+          "configured_n",
+          "threshold_sequence",
+          "revision"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "memory_versions",
+        "columns": [
+          "id",
+          "document_id",
+          "version",
+          "parent_version",
+          "markdown",
+          "byte_length",
+          "content_sha256",
+          "author",
+          "actor_id",
+          "source",
+          "client_mutation_id",
+          "summary_request_id",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "message_deliveries",
+        "columns": [
+          "id",
+          "message_id",
+          "member_id",
+          "project_id",
+          "status",
+          "attempt_count",
+          "first_delivered_at",
+          "last_delivered_at",
+          "acked_at",
+          "created_at",
+          "updated_at",
+          "wake_decision",
+          "wake_suppressed_reason",
+          "first_mcp_delivered_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "messages",
+        "columns": [
+          "id",
+          "group_id",
+          "sender_member_id",
+          "seq",
+          "body",
+          "mentions",
+          "created_at",
+          "client_message_id"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "15",
+            "cells": [
+              [
+                "text",
+                "736d657373616765"
+              ],
+              [
+                "text",
+                "7367726f7570"
+              ],
+              [
+                "text",
+                "736d656d626572"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "text",
+                "7374727563747572616c2066697874757265"
+              ],
+              [
+                "text",
+                "5b5d"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "null"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "org_nodes",
+        "columns": [
+          "id",
+          "project_id",
+          "parent_id",
+          "name",
+          "role",
+          "sort_order",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "policy_document_versions",
+        "columns": [
+          "document_id",
+          "revision",
+          "schema_version",
+          "document_json",
+          "content_digest",
+          "based_on_global_revision",
+          "default_revision",
+          "created_by_kind",
+          "created_by_id",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "policy_documents",
+        "columns": [
+          "scope_key",
+          "scope",
+          "project_id",
+          "revision",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "project_task_settings",
+        "columns": [
+          "project_id",
+          "default_reviewer_member_id",
+          "revision"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "project_workspace_versions",
+        "columns": [
+          "project_id",
+          "workspace_revision",
+          "project_revision",
+          "root_path",
+          "canonical_root",
+          "mode",
+          "root_identity_json",
+          "physical_resource_key",
+          "repository_info_json",
+          "observed_at",
+          "mutation_id",
+          "input_digest",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "projects",
+        "columns": [
+          "id",
+          "name",
+          "created_at",
+          "updated_at",
+          "archived_at",
+          "project_revision",
+          "workspace_revision"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "12",
+            "cells": [
+              [
+                "text",
+                "7370726f6a656374"
+              ],
+              [
+                "text",
+                "70726f6a656374"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "null"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "integer",
+                "0"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "role_template_versions",
+        "columns": [
+          "role_template_id",
+          "revision",
+          "name",
+          "purpose",
+          "instructions",
+          "recommended_skill_refs_json",
+          "archived_at",
+          "copied_from_role_template_id",
+          "copied_from_revision",
+          "created_at"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "6",
+            "cells": [
+              [
+                "text",
+                "73726f6c65"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "text",
+                "726f6c65"
+              ],
+              [
+                "text",
+                ""
+              ],
+              [
+                "text",
+                ""
+              ],
+              [
+                "text",
+                "5b5d"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "role_templates",
+        "columns": [
+          "id",
+          "revision",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "5",
+            "cells": [
+              [
+                "text",
+                "73726f6c65"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "schema_migrations",
+        "columns": [
+          "version",
+          "name",
+          "checksum",
+          "applied_at"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "22",
+            "cells": [
+              [
+                "integer",
+                "22"
+              ],
+              [
+                "text",
+                "66697874757265"
+              ],
+              [
+                "text",
+                "66697874757265"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "storage_maintenance",
+        "columns": [
+          "singleton",
+          "database_instance_id",
+          "control_root_json",
+          "mutex_identity_json",
+          "fence_epoch",
+          "admission",
+          "active_migration_id",
+          "plan_digest",
+          "owner_generation",
+          "journal_record_ref",
+          "journal_digest",
+          "journal_sequence",
+          "protocol_version",
+          "guard_manifest_digest",
+          "profile_takeover_terminal_json"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "1",
+            "cells": [
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "text",
+                "3131313131313131313131313131313131313131313131313131313131313131"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "integer",
+                "0"
+              ],
+              [
+                "text",
+                "6f70656e"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "integer",
+                "0"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "integer",
+                "0"
+              ],
+              [
+                "integer",
+                "2"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "7b7d"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "storage_source_clients",
+        "columns": [
+          "client_id",
+          "database_instance_id",
+          "entrypoint",
+          "build_id",
+          "protocol_version",
+          "host_identity_json",
+          "process_identity_json",
+          "db_sessions_json",
+          "registered_epoch",
+          "observed_epoch",
+          "drain_epoch",
+          "drain_state",
+          "drain_receipt_digest",
+          "registered_at",
+          "last_observed_at",
+          "ended_at",
+          "writer_format_digest"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "1",
+            "cells": [
+              [
+                "text",
+                "73636c69656e74"
+              ],
+              [
+                "text",
+                "3131313131313131313131313131313131313131313131313131313131313131"
+              ],
+              [
+                "text",
+                "6c6f63616c2d6d616e6167656d656e74"
+              ],
+              [
+                "text",
+                "73796e746865746963"
+              ],
+              [
+                "integer",
+                "2"
+              ],
+              [
+                "text",
+                "7b7d"
+              ],
+              [
+                "text",
+                "7b7d"
+              ],
+              [
+                "text",
+                "5b5d"
+              ],
+              [
+                "integer",
+                "0"
+              ],
+              [
+                "integer",
+                "0"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "6e6f6e65"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "task_comments",
+        "columns": [
+          "id",
+          "task_id",
+          "project_id",
+          "kind",
+          "author",
+          "author_actor_id",
+          "body",
+          "created_at",
+          "review_report_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "task_history",
+        "columns": [
+          "id",
+          "task_id",
+          "project_id",
+          "action",
+          "actor",
+          "task_revision",
+          "detail",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "task_message_links",
+        "columns": [
+          "task_id",
+          "message_id",
+          "project_id",
+          "group_id",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "task_review_reports",
+        "columns": [
+          "id",
+          "round_id",
+          "task_id",
+          "project_id",
+          "axis",
+          "verdict",
+          "body",
+          "sources",
+          "evidence",
+          "content_sha256",
+          "author",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "task_review_rounds",
+        "columns": [
+          "id",
+          "task_id",
+          "project_id",
+          "revision",
+          "task_revision",
+          "state",
+          "reviewer_member_id",
+          "spec_snapshot",
+          "candidate",
+          "failure",
+          "decision",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "tasks",
+        "columns": [
+          "id",
+          "project_id",
+          "title",
+          "body",
+          "labels",
+          "state",
+          "assignee_member_id",
+          "reviewer_member_id",
+          "repo_path",
+          "fixed_point",
+          "revision",
+          "current_review_round_id",
+          "blocked_reason",
+          "author",
+          "created_at",
+          "updated_at",
+          "delivery_kind",
+          "acceptance_text",
+          "acceptance_source"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "work_event_delivery_invalidations",
+        "columns": [
+          "work_event_id",
+          "project_id",
+          "cause_member_id",
+          "cause_from_revision",
+          "cause_to_revision",
+          "cause_action",
+          "cause_audit_id",
+          "invalidated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "work_events",
+        "columns": [
+          "id",
+          "project_id",
+          "recipient_member_id",
+          "task_id",
+          "kind",
+          "event_key",
+          "payload",
+          "delivery_state",
+          "attempts",
+          "created_at",
+          "first_delivered_at",
+          "last_delivered_at",
+          "acked_at",
+          "context_group_id"
+        ],
+        "count": "0",
+        "rows": []
+      }
+    ]
+  },
+  "target": {
+    "source": {
+      "kind": "sqlite",
+      "databaseInstanceId": "22222222222222222222222222222222",
+      "identityDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "textEncoding": {
+      "backend": "sqlite",
+      "name": "UTF-8"
+    },
+    "tables": [
+      {
+        "name": "agent_legacy_aliases",
+        "columns": [
+          "display_name",
+          "host_type",
+          "agent_id",
+          "created_at",
+          "retired_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_profile_versions",
+        "columns": [
+          "agent_id",
+          "revision",
+          "content_json",
+          "content_digest",
+          "default_role_id",
+          "default_role_revision",
+          "compat_runtime_revision"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "11",
+            "cells": [
+              [
+                "text",
+                "746167656e74"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "text",
+                "7b7d"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "74726f6c65"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "null"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "agent_profiles",
+        "columns": [
+          "agent_id",
+          "current_revision",
+          "legacy_runtime_id",
+          "compat_runtime_revision"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "10",
+            "cells": [
+              [
+                "text",
+                "746167656e74"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "agent_runner_states",
+        "columns": [
+          "binding_id",
+          "state",
+          "phase",
+          "generation",
+          "lease_owner",
+          "lease_expires_at",
+          "applied_json",
+          "harness_session_id",
+          "session_key",
+          "session_state",
+          "pid",
+          "exit_confirmed",
+          "observed_at",
+          "started_at",
+          "attempt_count",
+          "next_retry_at",
+          "last_error_code",
+          "last_exit_code",
+          "last_exit_signal",
+          "permission_observed",
+          "updated_at",
+          "process_identity_json",
+          "applied_config_snapshot_id",
+          "applied_workspace_mapping_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_runtime_bindings",
+        "columns": [
+          "id",
+          "runtime_id",
+          "project_id",
+          "group_id",
+          "member_id",
+          "revision",
+          "overrides_json",
+          "advanced_json",
+          "desired_state",
+          "intent_revision",
+          "requested_snapshot_json",
+          "reset_session_requested",
+          "created_at",
+          "updated_at",
+          "group_binding_id",
+          "attachment_state",
+          "detach_config_snapshot_id",
+          "detached_at",
+          "requested_config_snapshot_id",
+          "requested_workspace_mapping_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_runtime_events",
+        "columns": [
+          "id",
+          "binding_id",
+          "observed_at",
+          "event_name",
+          "payload"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_runtime_members",
+        "columns": [
+          "member_id",
+          "runtime_id",
+          "project_id",
+          "binding_id",
+          "generation",
+          "lease_owner",
+          "lease_expires_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_runtime_observation_meta",
+        "columns": [
+          "id",
+          "storage_failures",
+          "logger_failures",
+          "rejected_records",
+          "dropped_events",
+          "history_truncated"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_runtime_usage_snapshots",
+        "columns": [
+          "id",
+          "binding_id",
+          "source",
+          "harness_version",
+          "metric",
+          "scope",
+          "scope_id",
+          "epoch_id",
+          "sequence",
+          "observed_at",
+          "payload"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agent_runtimes",
+        "columns": [
+          "id",
+          "agent_id",
+          "config_version",
+          "revision",
+          "defaults_json",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "agents",
+        "columns": [
+          "id",
+          "display_name",
+          "host_type",
+          "created_at",
+          "updated_at",
+          "last_seen_at"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "3",
+            "cells": [
+              [
+                "text",
+                "746167656e74"
+              ],
+              [
+                "text",
+                "746167656e74"
+              ],
+              [
+                "text",
+                "6c6f63616c"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "null"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "audit_log",
+        "columns": [
+          "id",
+          "scope",
+          "project_id",
+          "actor_kind",
+          "actor_member_id",
+          "actor_name",
+          "action",
+          "target_kind",
+          "target_id",
+          "target_name",
+          "changed",
+          "before",
+          "after",
+          "detail",
+          "reversed_at",
+          "reversed_by_audit_id",
+          "created_at"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "7",
+            "cells": [
+              [
+                "text",
+                "746175646974"
+              ],
+              [
+                "text",
+                "70726f6a656374"
+              ],
+              [
+                "text",
+                "7470726f6a656374"
+              ],
+              [
+                "text",
+                "73797374656d"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "66697874757265"
+              ],
+              [
+                "text",
+                "66697874757265"
+              ],
+              [
+                "text",
+                "70726f6a656374"
+              ],
+              [
+                "text",
+                "7470726f6a656374"
+              ],
+              [
+                "text",
+                "70726f6a656374"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "config_activation_receipts",
+        "columns": [
+          "id",
+          "request_id",
+          "plan_id",
+          "plan_digest",
+          "physical_source_ref",
+          "snapshot_receipt_ref",
+          "capture_id",
+          "capture_source_digest",
+          "capture_artifact_digest",
+          "schema_before_digest",
+          "schema_after_digest",
+          "guard_transition_json",
+          "allowed_delta_ref",
+          "target_rows_digest",
+          "source_to_target_manifest_ref",
+          "payload_json",
+          "payload_digest"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "7",
+            "cells": [
+              [
+                "text",
+                "7461637469766174696f6e"
+              ],
+              [
+                "text",
+                "7472657175657374"
+              ],
+              [
+                "text",
+                "66697874757265"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "666978747572653a743a706879736963616c"
+              ],
+              [
+                "text",
+                "666978747572653a743a736e617073686f74"
+              ],
+              [
+                "text",
+                "7463617074757265"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "7b7d"
+              ],
+              [
+                "text",
+                "666978747572653a743a64656c7461"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "666978747572653a743a6d616e6966657374"
+              ],
+              [
+                "text",
+                "7b7d"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "config_authority",
+        "columns": [
+          "singleton",
+          "format_version",
+          "owner",
+          "activation_id",
+          "source_binding_ref"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "1",
+            "cells": [
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "text",
+                "70726f66696c65"
+              ],
+              [
+                "text",
+                "7461637469766174696f6e"
+              ],
+              [
+                "text",
+                "666978747572653a743a62696e64696e67"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "config_detach_snapshots",
+        "columns": [
+          "id",
+          "execution_binding_id",
+          "group_binding_id",
+          "runtime_id",
+          "profile_agent_id",
+          "profile_revision",
+          "profile_digest",
+          "binding_revision",
+          "binding_digest",
+          "resolution_json",
+          "root_source_json",
+          "current_advanced_view_json",
+          "requested_source_json",
+          "applied_source_json",
+          "observed_at",
+          "content_digest",
+          "requested_snapshot_id",
+          "requested_snapshot_digest",
+          "requested_mapping_id",
+          "requested_mapping_digest",
+          "applied_snapshot_id",
+          "applied_snapshot_digest",
+          "applied_mapping_id",
+          "applied_mapping_digest",
+          "root_workspace_project_id",
+          "root_workspace_revision",
+          "root_mapping_id",
+          "root_mapping_digest"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "config_mutation_receipts",
+        "columns": [
+          "actor_scope",
+          "operation",
+          "target_scope",
+          "mutation_id",
+          "command_digest",
+          "result_json",
+          "result_profile_agent_id",
+          "result_profile_revision",
+          "result_profile_digest",
+          "result_binding_id",
+          "result_binding_revision",
+          "result_binding_digest",
+          "audit_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "config_snapshots",
+        "columns": [
+          "id",
+          "agent_id",
+          "group_binding_id",
+          "execution_binding_id",
+          "project_id",
+          "member_id",
+          "group_id",
+          "origin_kind",
+          "content_json",
+          "content_digest",
+          "semantic_digest",
+          "capture_id",
+          "capture_source_digest",
+          "capture_artifact_digest",
+          "profile_revision",
+          "profile_digest",
+          "binding_revision",
+          "binding_digest"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "config_workspace_mappings",
+        "columns": [
+          "id",
+          "snapshot_id",
+          "snapshot_digest",
+          "project_id",
+          "workspace_revision",
+          "original_workdir",
+          "canonical_root",
+          "root_identity_json",
+          "physical_resource_key",
+          "observed_at",
+          "content_digest"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_action_requests",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "action_json",
+          "candidate_envelope_json",
+          "action_digest",
+          "candidate_digest",
+          "expected_task_revision",
+          "expected_round_revision",
+          "proposed_verdict",
+          "proposal_reason_json",
+          "requested_path",
+          "origin",
+          "created_by_kind",
+          "created_by_id",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_change_heads",
+        "columns": [
+          "project_id",
+          "revision"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_changes",
+        "columns": [
+          "project_id",
+          "revision",
+          "task_id",
+          "decision_id",
+          "decision_revision",
+          "kind",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_command_receipts",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "actor_kind",
+          "actor_id",
+          "operation",
+          "idempotency_key",
+          "request_digest",
+          "input_decision_id",
+          "input_decision_revision",
+          "result_decision_id",
+          "result_decision_revision",
+          "result_action_digest",
+          "head_revision",
+          "result_state",
+          "http_status",
+          "resolution_id",
+          "initiation_id",
+          "response_json",
+          "committed_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_executions",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "decision_id",
+          "resolution_id",
+          "choice_id",
+          "effect_key",
+          "status",
+          "verdict",
+          "before_task_revision",
+          "before_round_revision",
+          "after_task_revision",
+          "after_round_revision",
+          "task_history_id",
+          "work_event_ids_json",
+          "committed_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_legacy_records",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "source_table",
+          "source_id",
+          "raw_text",
+          "raw_digest",
+          "chain_status",
+          "diagnostics_json",
+          "imported_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_local_initiations",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "decision_id",
+          "input_decision_revision",
+          "action_digest",
+          "choice_id",
+          "actor_kind",
+          "actor_id",
+          "request_digest",
+          "user_event_id",
+          "nonce_hash",
+          "source_contract",
+          "authority_basis",
+          "transfer_mode",
+          "consumed_receipt_id",
+          "issued_at",
+          "consumed_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_records",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "action_request_id",
+          "action_digest",
+          "generation",
+          "revision",
+          "status",
+          "required_authority",
+          "assignee_member_id",
+          "blocked_reason_code",
+          "policy_evaluation_json",
+          "predecessor_decision_id",
+          "predecessor_legacy_id",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_resolutions",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "decision_id",
+          "input_decision_revision",
+          "action_digest",
+          "choice_id",
+          "actor_kind",
+          "actor_id",
+          "request_digest",
+          "authority",
+          "reason_json",
+          "actual_execution_path",
+          "initiation_id",
+          "command_receipt_id",
+          "policy_evaluation_json",
+          "permission_snapshot_json",
+          "permission_snapshot_digest",
+          "resolved_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_review_heads",
+        "columns": [
+          "project_id",
+          "task_id",
+          "round_id",
+          "head_revision",
+          "current_decision_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_review_projections",
+        "columns": [
+          "project_id",
+          "task_id",
+          "round_id",
+          "source_kind",
+          "execution_id",
+          "legacy_id",
+          "applied_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "decision_user_events",
+        "columns": [
+          "id",
+          "project_id",
+          "task_id",
+          "round_id",
+          "decision_id",
+          "input_decision_revision",
+          "action_digest",
+          "choice_id",
+          "actor_kind",
+          "actor_id",
+          "request_digest",
+          "command_kind",
+          "client_mutation_id",
+          "command_json",
+          "issued_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "group_binding_config_versions",
+        "columns": [
+          "binding_id",
+          "revision",
+          "content_json",
+          "content_digest",
+          "role_id",
+          "role_revision",
+          "compat_execution_binding_id",
+          "compat_binding_revision",
+          "advanced_state",
+          "advanced_profile_agent_id",
+          "advanced_profile_revision",
+          "advanced_profile_digest",
+          "advanced_capture_id",
+          "advanced_capture_source_digest",
+          "advanced_capture_artifact_digest",
+          "advanced_workspace_project_id",
+          "advanced_workspace_revision",
+          "advanced_execution_binding_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "group_bindings",
+        "columns": [
+          "id",
+          "project_id",
+          "group_id",
+          "member_id",
+          "agent_id",
+          "current_revision",
+          "original_legacy_binding_id",
+          "current_attachment_id",
+          "current_attachment_state",
+          "current_compat_binding_revision",
+          "retired_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "group_participants",
+        "columns": [
+          "group_id",
+          "member_id",
+          "joined_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "groups",
+        "columns": [
+          "id",
+          "project_id",
+          "name",
+          "created_at",
+          "updated_at",
+          "archived_at"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "14",
+            "cells": [
+              [
+                "text",
+                "7467726f7570"
+              ],
+              [
+                "text",
+                "7470726f6a656374"
+              ],
+              [
+                "text",
+                "67726f7570"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "null"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "legacy_config_captures",
+        "columns": [
+          "id",
+          "physical_source_ref",
+          "source_digest",
+          "artifact_digest",
+          "capture_json",
+          "snapshot_receipt_ref"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "7",
+            "cells": [
+              [
+                "text",
+                "7463617074757265"
+              ],
+              [
+                "text",
+                "666978747572653a743a706879736963616c"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "7b7d"
+              ],
+              [
+                "text",
+                "666978747572653a743a736e617073686f74"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "mcp_catalog_heads",
+        "columns": [
+          "connection_id",
+          "connection_revision",
+          "snapshot_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "mcp_catalog_snapshots",
+        "columns": [
+          "id",
+          "connection_id",
+          "connection_revision",
+          "snapshot_json",
+          "observed_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "mcp_connection_mutations",
+        "columns": [
+          "request_id",
+          "input_digest",
+          "connection_id",
+          "result_json",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "mcp_connection_versions",
+        "columns": [
+          "connection_id",
+          "revision",
+          "name",
+          "configuration_json",
+          "configuration_digest",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "mcp_connections",
+        "columns": [
+          "id",
+          "revision",
+          "discovery_sequence",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "mcp_discovery_attempts",
+        "columns": [
+          "id",
+          "request_id",
+          "input_digest",
+          "connection_id",
+          "connection_revision",
+          "sequence",
+          "owner_id",
+          "status",
+          "error_code",
+          "snapshot_id",
+          "cleanup",
+          "protocol_version",
+          "page_count",
+          "created_at",
+          "finished_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "mcp_sessions",
+        "columns": [
+          "id",
+          "agent_id",
+          "project_id",
+          "group_id",
+          "member_id",
+          "display_name",
+          "host_type",
+          "state",
+          "connected_at",
+          "last_heartbeat_at",
+          "disconnected_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "member_fact_revisions",
+        "columns": [
+          "member_id",
+          "kind",
+          "revision"
+        ],
+        "count": "6",
+        "rows": [
+          {
+            "rowid": "31",
+            "cells": [
+              [
+                "text",
+                "746d656d626572"
+              ],
+              [
+                "text",
+                "617574686f7265642d6d65737361676573"
+              ],
+              [
+                "integer",
+                "9007199254740990"
+              ]
+            ]
+          },
+          {
+            "rowid": "32",
+            "cells": [
+              [
+                "text",
+                "746d656d626572"
+              ],
+              [
+                "text",
+                "64656c69766572696573"
+              ],
+              [
+                "integer",
+                "9007199254740990"
+              ]
+            ]
+          },
+          {
+            "rowid": "33",
+            "cells": [
+              [
+                "text",
+                "746d656d626572"
+              ],
+              [
+                "text",
+                "6d656d6f72792d7265717565737473"
+              ],
+              [
+                "integer",
+                "9007199254740990"
+              ]
+            ]
+          },
+          {
+            "rowid": "34",
+            "cells": [
+              [
+                "text",
+                "746d656d626572"
+              ],
+              [
+                "text",
+                "6d656d6f72792d7265636569707473"
+              ],
+              [
+                "integer",
+                "9007199254740990"
+              ]
+            ]
+          },
+          {
+            "rowid": "35",
+            "cells": [
+              [
+                "text",
+                "746d656d626572"
+              ],
+              [
+                "text",
+                "6d656d6f72792d636f756e74657273"
+              ],
+              [
+                "integer",
+                "9007199254740990"
+              ]
+            ]
+          },
+          {
+            "rowid": "36",
+            "cells": [
+              [
+                "text",
+                "746d656d626572"
+              ],
+              [
+                "text",
+                "6d656d6f72792d636865636b706f696e7473"
+              ],
+              [
+                "integer",
+                "9007199254740990"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "member_statuses",
+        "columns": [
+          "project_id",
+          "member_id",
+          "state",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "members",
+        "columns": [
+          "id",
+          "project_id",
+          "agent_id",
+          "kind",
+          "display_name",
+          "role",
+          "created_at",
+          "updated_at",
+          "node_id",
+          "status",
+          "removed_at",
+          "membership_revision"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "13",
+            "cells": [
+              [
+                "text",
+                "746d656d626572"
+              ],
+              [
+                "text",
+                "7470726f6a656374"
+              ],
+              [
+                "text",
+                "746167656e74"
+              ],
+              [
+                "text",
+                "6167656e74"
+              ],
+              [
+                "text",
+                "6d656d626572"
+              ],
+              [
+                "text",
+                "6e6f726d616c"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "616374697665"
+              ],
+              [
+                "null"
+              ],
+              [
+                "integer",
+                "1"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "memory_documents",
+        "columns": [
+          "id",
+          "scope",
+          "project_id",
+          "agent_id",
+          "version",
+          "markdown",
+          "byte_length",
+          "updated_at",
+          "updated_by",
+          "source"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "memory_message_receipts",
+        "columns": [
+          "project_id",
+          "agent_id",
+          "group_id",
+          "message_id",
+          "first_observed_at",
+          "counter_value"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "memory_scan_checkpoints",
+        "columns": [
+          "id",
+          "kind",
+          "project_id",
+          "agent_id",
+          "group_id",
+          "after_cursor",
+          "through_cursor",
+          "sweep",
+          "revision",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "memory_summary_requests",
+        "columns": [
+          "id",
+          "project_id",
+          "agent_id",
+          "recipient_member_id",
+          "context_group_id",
+          "document_id",
+          "base_version",
+          "revision",
+          "state",
+          "trigger",
+          "trigger_key",
+          "task_id",
+          "completed_task_revision",
+          "message_ids",
+          "source_work_event_id",
+          "retry_of_request_id",
+          "attempt_id",
+          "begin_mutation_id",
+          "result_version",
+          "result_sha256",
+          "error",
+          "evidence",
+          "created_at",
+          "started_at",
+          "finished_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "memory_trigger_counters",
+        "columns": [
+          "project_id",
+          "agent_id",
+          "group_id",
+          "lifetime_count",
+          "next_threshold",
+          "configured_n",
+          "threshold_sequence",
+          "revision"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "memory_versions",
+        "columns": [
+          "id",
+          "document_id",
+          "version",
+          "parent_version",
+          "markdown",
+          "byte_length",
+          "content_sha256",
+          "author",
+          "actor_id",
+          "source",
+          "client_mutation_id",
+          "summary_request_id",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "message_deliveries",
+        "columns": [
+          "id",
+          "message_id",
+          "member_id",
+          "project_id",
+          "status",
+          "attempt_count",
+          "first_delivered_at",
+          "last_delivered_at",
+          "acked_at",
+          "created_at",
+          "updated_at",
+          "wake_decision",
+          "wake_suppressed_reason",
+          "first_mcp_delivered_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "messages",
+        "columns": [
+          "id",
+          "group_id",
+          "sender_member_id",
+          "seq",
+          "body",
+          "mentions",
+          "created_at",
+          "client_message_id"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "15",
+            "cells": [
+              [
+                "text",
+                "746d657373616765"
+              ],
+              [
+                "text",
+                "7467726f7570"
+              ],
+              [
+                "text",
+                "746d656d626572"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "text",
+                "7374727563747572616c2066697874757265"
+              ],
+              [
+                "text",
+                "5b5d"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "null"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "org_nodes",
+        "columns": [
+          "id",
+          "project_id",
+          "parent_id",
+          "name",
+          "role",
+          "sort_order",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "policy_document_versions",
+        "columns": [
+          "document_id",
+          "revision",
+          "schema_version",
+          "document_json",
+          "content_digest",
+          "based_on_global_revision",
+          "default_revision",
+          "created_by_kind",
+          "created_by_id",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "policy_documents",
+        "columns": [
+          "scope_key",
+          "scope",
+          "project_id",
+          "revision",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "project_task_settings",
+        "columns": [
+          "project_id",
+          "default_reviewer_member_id",
+          "revision"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "project_workspace_versions",
+        "columns": [
+          "project_id",
+          "workspace_revision",
+          "project_revision",
+          "root_path",
+          "canonical_root",
+          "mode",
+          "root_identity_json",
+          "physical_resource_key",
+          "repository_info_json",
+          "observed_at",
+          "mutation_id",
+          "input_digest",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "projects",
+        "columns": [
+          "id",
+          "name",
+          "created_at",
+          "updated_at",
+          "archived_at",
+          "project_revision",
+          "workspace_revision"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "12",
+            "cells": [
+              [
+                "text",
+                "7470726f6a656374"
+              ],
+              [
+                "text",
+                "70726f6a656374"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "null"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "integer",
+                "0"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "role_template_versions",
+        "columns": [
+          "role_template_id",
+          "revision",
+          "name",
+          "purpose",
+          "instructions",
+          "recommended_skill_refs_json",
+          "archived_at",
+          "copied_from_role_template_id",
+          "copied_from_revision",
+          "created_at"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "6",
+            "cells": [
+              [
+                "text",
+                "74726f6c65"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "text",
+                "726f6c65"
+              ],
+              [
+                "text",
+                ""
+              ],
+              [
+                "text",
+                ""
+              ],
+              [
+                "text",
+                "5b5d"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "role_templates",
+        "columns": [
+          "id",
+          "revision",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "5",
+            "cells": [
+              [
+                "text",
+                "74726f6c65"
+              ],
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "schema_migrations",
+        "columns": [
+          "version",
+          "name",
+          "checksum",
+          "applied_at"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "22",
+            "cells": [
+              [
+                "integer",
+                "22"
+              ],
+              [
+                "text",
+                "66697874757265"
+              ],
+              [
+                "text",
+                "66697874757265"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "storage_maintenance",
+        "columns": [
+          "singleton",
+          "database_instance_id",
+          "control_root_json",
+          "mutex_identity_json",
+          "fence_epoch",
+          "admission",
+          "active_migration_id",
+          "plan_digest",
+          "owner_generation",
+          "journal_record_ref",
+          "journal_digest",
+          "journal_sequence",
+          "protocol_version",
+          "guard_manifest_digest",
+          "profile_takeover_terminal_json"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "1",
+            "cells": [
+              [
+                "integer",
+                "1"
+              ],
+              [
+                "text",
+                "3232323232323232323232323232323232323232323232323232323232323232"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "integer",
+                "0"
+              ],
+              [
+                "text",
+                "6f70656e"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "integer",
+                "0"
+              ],
+              [
+                "null"
+              ],
+              [
+                "null"
+              ],
+              [
+                "integer",
+                "0"
+              ],
+              [
+                "integer",
+                "2"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ],
+              [
+                "text",
+                "7b7d"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "storage_source_clients",
+        "columns": [
+          "client_id",
+          "database_instance_id",
+          "entrypoint",
+          "build_id",
+          "protocol_version",
+          "host_identity_json",
+          "process_identity_json",
+          "db_sessions_json",
+          "registered_epoch",
+          "observed_epoch",
+          "drain_epoch",
+          "drain_state",
+          "drain_receipt_digest",
+          "registered_at",
+          "last_observed_at",
+          "ended_at",
+          "writer_format_digest"
+        ],
+        "count": "1",
+        "rows": [
+          {
+            "rowid": "1",
+            "cells": [
+              [
+                "text",
+                "74636c69656e74"
+              ],
+              [
+                "text",
+                "3232323232323232323232323232323232323232323232323232323232323232"
+              ],
+              [
+                "text",
+                "6c6f63616c2d6d616e6167656d656e74"
+              ],
+              [
+                "text",
+                "73796e746865746963"
+              ],
+              [
+                "integer",
+                "2"
+              ],
+              [
+                "text",
+                "7b7d"
+              ],
+              [
+                "text",
+                "7b7d"
+              ],
+              [
+                "text",
+                "5b5d"
+              ],
+              [
+                "integer",
+                "0"
+              ],
+              [
+                "integer",
+                "0"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "6e6f6e65"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "text",
+                "323032362d31312d32305430303a30303a30302e3030305a"
+              ],
+              [
+                "null"
+              ],
+              [
+                "text",
+                "61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "name": "task_comments",
+        "columns": [
+          "id",
+          "task_id",
+          "project_id",
+          "kind",
+          "author",
+          "author_actor_id",
+          "body",
+          "created_at",
+          "review_report_id"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "task_history",
+        "columns": [
+          "id",
+          "task_id",
+          "project_id",
+          "action",
+          "actor",
+          "task_revision",
+          "detail",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "task_message_links",
+        "columns": [
+          "task_id",
+          "message_id",
+          "project_id",
+          "group_id",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "task_review_reports",
+        "columns": [
+          "id",
+          "round_id",
+          "task_id",
+          "project_id",
+          "axis",
+          "verdict",
+          "body",
+          "sources",
+          "evidence",
+          "content_sha256",
+          "author",
+          "created_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "task_review_rounds",
+        "columns": [
+          "id",
+          "task_id",
+          "project_id",
+          "revision",
+          "task_revision",
+          "state",
+          "reviewer_member_id",
+          "spec_snapshot",
+          "candidate",
+          "failure",
+          "decision",
+          "created_at",
+          "updated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "tasks",
+        "columns": [
+          "id",
+          "project_id",
+          "title",
+          "body",
+          "labels",
+          "state",
+          "assignee_member_id",
+          "reviewer_member_id",
+          "repo_path",
+          "fixed_point",
+          "revision",
+          "current_review_round_id",
+          "blocked_reason",
+          "author",
+          "created_at",
+          "updated_at",
+          "delivery_kind",
+          "acceptance_text",
+          "acceptance_source"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "work_event_delivery_invalidations",
+        "columns": [
+          "work_event_id",
+          "project_id",
+          "cause_member_id",
+          "cause_from_revision",
+          "cause_to_revision",
+          "cause_action",
+          "cause_audit_id",
+          "invalidated_at"
+        ],
+        "count": "0",
+        "rows": []
+      },
+      {
+        "name": "work_events",
+        "columns": [
+          "id",
+          "project_id",
+          "recipient_member_id",
+          "task_id",
+          "kind",
+          "event_key",
+          "payload",
+          "delivery_state",
+          "attempts",
+          "created_at",
+          "first_delivered_at",
+          "last_delivered_at",
+          "acked_at",
+          "context_group_id"
+        ],
+        "count": "0",
+        "rows": []
+      }
+    ]
+  }
+}
