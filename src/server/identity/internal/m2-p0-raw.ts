@@ -2,20 +2,21 @@ import { M2_HISTORY_TABLES } from "../m2-history-contracts.ts";
 import { assertRow, assertView, chargeState, makeP0Site, p0State, P0_LIMITS, siteData, throwP0 } from "./m2-p0-budget.ts";
 import type { P0State } from "./m2-p0-budget.ts";
 import { parseP0Json } from "./m2-p0-lexical.ts";
-import { P0_TABLE_NAMES } from "./m2-p0-types.ts";
+import { M2_ALL_TABLE_NAMES } from "./m2-p0-types.ts";
 import type { P0JsonPolicy, P0Path, P0Request, P0Row, P0Site, P0Table, P0View } from "./m2-p0-types.ts";
 
-const contracts = new Map(M2_HISTORY_TABLES.filter(t => t.columnsP0.length).map(t => [t.name, t]));
+const contracts = new Map(M2_HISTORY_TABLES.map(t => [t.name, t]));
 const columns = new Map([...contracts].map(([name, table]) => [name, new Map(table.columnsP0.map((c, i) => [c.name, i]))]));
+const p1Columns = new Map([...contracts].map(([name, table]) => [name, new Map(table.columnsP1.map((c, i) => [c.name, i]))]));
 export function columnP0(state: P0State, row: P0Row, column: string): number {
   assertRow(state, row); chargeState(state, { work: 1, bytes: column.length * 2 });
-  const index = columns.get(row.table)?.get(column);
+  const index = (row.stage === "p1" ? p1Columns : columns).get(row.table)?.get(column);
   if (index === undefined) throwP0(state, { code: "unsupported_shape", rule: "PC1B-RAW01" });
   return index;
 }
 export function buildP0View(state: P0State, rows: readonly P0Row[], phase: P0View["phase"]): P0View {
-  chargeState(state, { work: rows.length + P0_TABLE_NAMES.length, tuples: rows.length + P0_TABLE_NAMES.length });
-  const byTable = new Map<P0Table, P0Row[]>(P0_TABLE_NAMES.map(table => [table, []]));
+  chargeState(state, { work: rows.length + M2_ALL_TABLE_NAMES.length, tuples: rows.length + M2_ALL_TABLE_NAMES.length });
+  const byTable = new Map<P0Table, P0Row[]>(M2_ALL_TABLE_NAMES.map(table => [table, []]));
   const membership = new Set<P0Row>();
   for (const row of rows) {
     assertRow(state, row);

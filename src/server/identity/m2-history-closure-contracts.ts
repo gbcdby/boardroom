@@ -9,20 +9,20 @@ export type ClosureAvailability = {
 export type ClosureNativeCheck = "physical_source_authenticity" | "native_snapshot_window" | "actual_catalog_identity"
   | "strict_p1_native_outer_join" | "g1_exclusion" | "sequence_exclusion" | "current_authorization"
   | "native_commit" | "lossless_native_writer" | "full_ab_budget" | "fs_profile" | "production_tuple";
-// This implementation issues only the complete legacy P0 branch. Known later
-// branches keep their fixed unsupported result until their own checks exist.
+// The M2 P1 inline branch binds the exact original A/post-A or B projection.
+// New source windows and layout branches require their own complete consumers.
 export type ClosureValue = ReadonlyDeep<{
   classification: "observation";
   coverage: "complete-history-value-closure";
   graphKind: "m2-observation";
-  phase: "p0";
+  phase: "p0" | "p1";
   source: SourceRef;
-  catalog: "legacy-p0";
+  catalog: "legacy-p0" | "m2-p1";
   inputDigest: string;
   completeHistoryDigest: string;
   tables: { table: P0Table; rows: string; rowMultisetDigest: string }[];
   selectedArtifacts: { kind: string; artifactOrdinal: number; byteDigest: string; bytes: string }[];
-  checks: { legacySemanticGraph: "verified"; m2SemanticGraph: "not-applicable";
+  checks: { legacySemanticGraph: "verified"; m2SemanticGraph: "not-applicable" | "verified";
     layoutSemanticGraph: "not-applicable"; artifactBytes: "verified"; artifactSemantics: "verified";
     sourceProvenance: "verified-values"; retainedReferenceClosure: "verified" | "not-requested" };
   deletion: null | { requestedCount: string; retainedHistoryDigest: string;

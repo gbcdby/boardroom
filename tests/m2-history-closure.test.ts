@@ -161,9 +161,8 @@ function p1Observation(): HistoryObservationInput {
     count: table.name === "config_authority" ? "1" : "0", rows: table.name === "config_authority"
       ? [{ rowid: "1", cells: table.columnsP1.map(column => column.name === "singleton" ? ["integer", "1"] : ["null"]) }] : [] })) };
 }
-test("known unimplemented branches use one scanner and the fixed semantic_unsupported result", () => {
+test("remaining unimplemented branches use the owned scanner and the fixed semantic_unsupported result", () => {
   const graphs = [
-    { kind: "m2-observation", observation: p1Observation(), origin: branchOrigin },
     { kind: "p1-source-cut", cut: branchRef, origin: branchOrigin },
     { kind: "p1-source-history", observation: p1Observation(), snapshotLink: branchRef, origin: branchOrigin },
     { kind: "layout-history", history: branchRef, origin: branchOrigin },
@@ -176,12 +175,16 @@ test("known unimplemented branches use one scanner and the fixed semantic_unsupp
       result = validateM2HistoryClosure(wire);
     } finally { JSON.parse = native; }
     const error = failure(result!, "semantic_unsupported");
-    assert.equal(fullParses, 1); assert.equal(error.phase, "input"); assert.equal(error.rule, "PC1B-RAW01");
+    assert.equal(fullParses, 0); assert.equal(error.phase, "input"); assert.equal(error.rule, "PC1B-RAW01");
     assert.equal(error.conflicts[0]!.condition, "undefined-grammar"); assert.equal(error.conflicts[0]!.target, null);
     assert.equal(error.location!.rowOrdinal, null);
     failure(validateM2HistoryClosure(JSON.stringify({ ...p0Fixture(), graph: { ...graph, extra: 1 } })), "unsupported_shape");
     failure(validateM2HistoryClosure(JSON.stringify({ ...p0Fixture(), graph, artifacts: null })), "unsupported_shape");
   }
+});
+test("the implemented P1 origin branch requires its actual selected source history",()=>{
+  const graph={kind:'m2-observation',observation:p1Observation(),origin:branchOrigin};
+  failure(validateM2HistoryClosure(JSON.stringify({...p0Fixture(),graph})),'artifact_missing');
 });
 
 test("unknown, malformed and new-facade bootstrap roots stay unsupported_shape", () => {

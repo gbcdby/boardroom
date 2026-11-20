@@ -121,10 +121,16 @@ export function checkP0Runtime(ctx: EContext): readonly RuntimeUsability[] {
     ctx.equal(ctx.nullableText(member, "agent_id", RT), ctx.text(runtime, "agent_id", RT), row, RT, "member_id", "identity-mismatch", member);
     ctx.equal(ctx.text(member, "project_id", RT), projectId, row, RT, "project_id", "scope-mismatch", member);
     ctx.equal(ctx.text(group, "project_id", RT), projectId, row, RT, "group_id", "scope-mismatch", group);
-    ctx.target(participants, [groupId, memberId], row, RT, "member_id");
-    const reservation = ctx.target(reservations, [memberId], row, RT, "member_id");
-    ctx.equal(ctx.text(reservation, "runtime_id", RT), runtimeId, row, RT, "runtime_id", "scope-mismatch", reservation);
-    ctx.equal(ctx.text(reservation, "project_id", RT), projectId, row, RT, "project_id", "scope-mismatch", reservation);
+    // A retained detached P1 shell has its own exact snapshot/head relations in
+    // M202. It does not occupy the current participant/reservation joins.
+    // The row stage is authenticated by the owned raw view, never a caller flag.
+    const detached=row.stage==='p1'&&ctx.oneOf(row,'attachment_state',RT,['attached','detached'])==='detached';
+    if(!detached){
+      ctx.target(participants, [groupId, memberId], row, RT, "member_id");
+      const reservation = ctx.target(reservations, [memberId], row, RT, "member_id");
+      ctx.equal(ctx.text(reservation, "runtime_id", RT), runtimeId, row, RT, "runtime_id", "scope-mismatch", reservation);
+      ctx.equal(ctx.text(reservation, "project_id", RT), projectId, row, RT, "project_id", "scope-mismatch", reservation);
+    }
     const revision = ctx.integer(row, "revision", RT, 1); ctx.integer(row, "intent_revision", RT); ctx.bool(row, "reset_session_requested", RT);
     ctx.oneOf(row, "desired_state", RT, ["running", "stopped"]); ctx.text(row, "created_at", RT); ctx.text(row, "updated_at", RT);
     const overrides = inspect(ctx, row, "overrides_json", configSchema.partial(), false), advanced = inspect(ctx, row, "advanced_json", advancedSchema, true);

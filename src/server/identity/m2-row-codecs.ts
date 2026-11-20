@@ -1,3 +1,7 @@
+import { reserveP0FIsolatedCopy, reserveP0FNativeClone, reserveP0FNativeWork,
+  reserveP0FNativeMetadata, reserveP0FNativeKeyList, reserveP0FNativeCanonical,
+  reserveP0FNativeText, parseP0FNativeJson, encodeP0FM2CodecProduced, reuseP0FM2CodecR3,
+  reuseP0FNativeEquality,isP0FM2CodecOwned,reserveP0FM2CodecRead } from "./internal/m2-p0-artifacts-frame.ts";
 import { createHash } from "node:crypto";
 import { M2_COLUMN_CONTRACT, M2_FORMAT_REGISTRATION } from "./m2-value-contracts.ts";
 import { parseM2Value, m2ValueDigest } from "./m2-value-codecs.ts";
@@ -14,6 +18,9 @@ const failures = new WeakMap<object, M2ValueErrorCode>();
 function fail(code: M2ValueErrorCode = "invalid_value"): never { const error = Object.create(null) as object; failures.set(error, code); throw error; }
 function requireValue(condition: unknown, code: M2ValueErrorCode = "invalid_value"): asserts condition { if (!condition) fail(code); }
 function freeze<T>(value: T): T {
+  reserveP0FNativeWork(1);
+  if(isP0FM2CodecOwned(value))return value;
+  if (value !== null && typeof value === "object") reserveP0FNativeKeyList(value);
   if (value !== null && typeof value === "object") { for (const item of Object.values(value)) freeze(item); Object.freeze(value); }
   return value;
 }
@@ -29,6 +36,7 @@ function ownData(descriptor: PropertyDescriptor | undefined): descriptor is Prop
     && !Object.hasOwn(descriptor, "get") && !Object.hasOwn(descriptor, "set");
 }
 function prototypeState(previous?: PrototypeState): PrototypeState {
+  reserveP0FNativeMetadata(600); reserveP0FNativeWork(1200);
   const state: PrototypeState = new Map();
   const require = (condition: unknown): void => { if (!condition) fail("invalid_value"); };
   require(Object.getPrototypeOf(Object.prototype) === null && Object.getPrototypeOf(Array.prototype) === Object.prototype);
@@ -102,7 +110,21 @@ class Budget {
       else this.charge(code >= 0xd800 && code <= 0xdfff ? 6 : 3);
     }
   }
+  private owned(value:unknown,depth:number):Data {
+    this.node(depth);
+    if(value===null){this.charge(4);return null;}
+    if(typeof value==='string'){this.string(value);return value;}
+    if(typeof value==='boolean'){this.charge(value?4:5);return value;}
+    if(typeof value==='number'){requireValue(Number.isSafeInteger(value)&&!Object.is(value,-0));this.charge(String(value).length);return value;}
+    requireValue(value!==null&&typeof value==='object');
+    if(Array.isArray(value)){this.charge(2+Math.max(0,value.length-1));for(const item of value)this.owned(item,depth+1);}
+    else {let fields=0;for(const key in value)if(Object.hasOwn(value,key)){fields++;this.string(key);this.charge(1);this.owned((value as Obj)[key],depth+1);}
+      this.charge(2+Math.max(0,fields-1));}
+    return value as Data;
+  }
   copy(value: unknown, depth = 0): Data {
+    if(depth===0&&isP0FM2CodecOwned(value)){reserveP0FM2CodecRead(value);return this.owned(value,depth);}
+    if (depth === 0) reserveP0FIsolatedCopy(value);
     this.node(depth);
     if (value === null) { this.charge(4); return null; }
     if (typeof value === "string") { this.string(value); return value; }
@@ -144,6 +166,7 @@ class Budget {
     } finally { this.path.delete(value); }
   }
   json(value: string, depth = 4): unknown {
+    const shared = parseP0FNativeJson(value, depth); if (shared) return shared.value;
     let offset = 0;
     const space = () => { while (/[\x20\t\r\n]/.test(value[offset] ?? "x")) offset++; };
     const string = () => {
@@ -181,8 +204,8 @@ class Budget {
 }
 function result<T>(input: unknown, body: (value: Data, budget: Budget) => T): M2ValueResult<T> {
   try {
-    const environment = prototypeState(), budget = new Budget(), copy = budget.copy(input);
-    prototypeState(environment); // No caller object reaches JSON, value codecs or row projection.
+    const owned=isP0FM2CodecOwned(input),environment = prototypeState(), budget = new Budget(), copy = budget.copy(input);
+    if(!owned)prototypeState(environment); // Borrowed data performs no caller reflection window.
     const value = body(copy, budget); prototypeState(environment);
     return freeze({ ok: true, classification: "value-consistent", value }) as M2ValueResult<T>;
   }
@@ -201,12 +224,21 @@ function id(value: unknown): string { requireValue(typeof value === "string" && 
 function revision(value: unknown): number { requireValue(typeof value === "number" && Number.isSafeInteger(value) && value > 0); return value; }
 function digest(value: unknown): string { requireValue(typeof value === "string" && /^[0-9a-f]{64}$/.test(value)); return value; }
 function nullable<T>(value: unknown, parse: (value: unknown) => T): T | null { return value === null ? null : parse(value); }
-function equal(left: unknown, right: unknown): boolean { return canonicalJson(left) === canonicalJson(right); }
+function equal(left: unknown, right: unknown): boolean {
+  encodeP0FM2CodecProduced(left);encodeP0FM2CodecProduced(right);
+  return reuseP0FNativeEquality(left,right)??canonicalJson(left) === canonicalJson(right);
+}
 function pair(...values: unknown[]): void { requireValue(values.every(v => v === null) || values.every(v => v !== null), "value_conflict"); }
 function portable(value: string): void { requireValue(!value.includes("\0") && Buffer.from(value, "utf8").toString("utf8") === value, "unsupported_shape"); }
 function r3(value: unknown): string {
+  encodeP0FM2CodecProduced(value);
+  const shared=reuseP0FM2CodecR3(value);if(shared!==undefined)return shared;
+  reserveP0FNativeCanonical(value); reserveP0FNativeCanonical(value);
+  return r3Core(value);
+}
+function r3Core(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(r3).join(",")}]`;
+  if (Array.isArray(value)) return `[${value.map(r3Core).join(",")}]`;
   const compare = (left: string, right: string) => {
     const a = Array.from(left), b = Array.from(right);
     for (let i = 0; i < Math.min(a.length, b.length); i++) { const difference = a[i]!.codePointAt(0)! - b[i]!.codePointAt(0)!; if (difference) return difference; }
@@ -215,7 +247,7 @@ function r3(value: unknown): string {
   return `{${Object.keys(value).sort(compare).map(key => `${JSON.stringify(key)}:${r3((value as Obj)[key])}`).join(",")}}`;
 }
 function parsed<K extends keyof M2ValueTypes>(kind: K, value: unknown): M2ValueTypes[K] {
-  const result = parseM2Value({ kind, value }); if (!result.ok) fail(result.error.code);
+  const result = parseM2Value(encodeP0FM2CodecProduced({ kind, value })); if (!result.ok) fail(result.error.code);
   requireValue(result.value.kind === kind); return result.value.value as M2ValueTypes[K];
 }
 function bindingRef(value: unknown): { groupBindingId: string; bindingConfigRevision: number; contentDigest: string } {
@@ -269,7 +301,7 @@ function build(table: Table, input: unknown, budget: Budget, parsedDepth = 1): {
   }
   if (table === "group_binding_config_versions") {
     const v = object(input, "ref content compatibility"), ref = bindingRef(v.ref), content = parsed("binding-content", v.content);
-    const checkedDigest = m2ValueDigest({ kind: "binding-content", body: content }); if (!checkedDigest.ok) fail(checkedDigest.error.code);
+    const checkedDigest = m2ValueDigest(encodeP0FM2CodecProduced({ kind: "binding-content", body: content })); if (!checkedDigest.ok) fail(checkedDigest.error.code);
     const compatibility = v.compatibility === null ? null : object(v.compatibility, "executionBindingId bindingRevision");
     const compat = compatibility === null ? null : { executionBindingId: id(compatibility.executionBindingId), bindingRevision: revision(compatibility.bindingRevision) };
     requireValue(ref.contentDigest === checkedDigest.value.digest, "value_conflict");
@@ -294,7 +326,7 @@ function build(table: Table, input: unknown, budget: Budget, parsedDepth = 1): {
     const v = object(input, "ref physicalSourceRef snapshotReceiptRef capture"), r = object(v.ref, "captureId sourceDigest artifactDigest");
     const ref = { captureId: id(r.captureId), sourceDigest: digest(r.sourceDigest), artifactDigest: digest(r.artifactDigest) };
     const physicalSourceRef = evidenceRef(v.physicalSourceRef), snapshotReceiptRef = evidenceRef(v.snapshotReceiptRef), capture = parsed("legacy-capture", v.capture);
-    const checkedDigest = m2ValueDigest({ kind: "legacy-capture", body: capture }); if (!checkedDigest.ok) fail(checkedDigest.error.code);
+    const checkedDigest = m2ValueDigest(encodeP0FM2CodecProduced({ kind: "legacy-capture", body: capture })); if (!checkedDigest.ok) fail(checkedDigest.error.code);
     requireValue(ref.captureId === capture.captureId && ref.sourceDigest === capture.legacySourceDigest && ref.artifactDigest === checkedDigest.value.digest
       && equal(physicalSourceRef, capture.physicalSourceRef) && equal(snapshotReceiptRef, capture.snapshotReceiptRef), "value_conflict");
     return { value: { ref, physicalSourceRef, snapshotReceiptRef, capture }, projection: project(table, { id: ref.captureId,
@@ -593,8 +625,9 @@ export function decodeM2RowValue(input: unknown): M2ValueResult<M2DecodedRow> {
     if (["group_bindings", "config_detach_snapshots", "execution-binding-references"].includes(table)) remainingSourceChecks.push("attachment_bijection");
     const artifactRefs = artifacts(table, built.value);
     if (artifactRefs.length || ["group_binding_config_versions", "config_snapshots"].includes(table)) remainingSourceChecks.push("artifact_bytes");
+    const canonical = canonicalJson(built.projection); reserveP0FNativeText(canonical, true);
     return { table, value: built.value, projection: built.projection,
-      projectionDigest: createHash("sha256").update(canonicalJson(built.projection)).digest("hex"),
+      projectionDigest: createHash("sha256").update(canonical).digest("hex"),
       foreignKeys: references(table, built.projection), artifactRefs, remainingSourceChecks } as M2DecodedRow;
   });
 }
