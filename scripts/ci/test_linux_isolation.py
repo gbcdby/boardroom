@@ -526,12 +526,173 @@ class WholeSuitePartitionContracts(unittest.TestCase):
         runs = [step.get('run', '') for step in partitions['steps']]
         for command in ('npm run e2e', 'npm run e2e:tasks', 'npm run e2e:memory', 'node scripts/e2e-install.mjs'):
             self.assertEqual(runs.count(command), 2, command)
-        self.assertTrue(any('tests/maintenance-postgres-restart.test.ts' in run for run in runs))
+        self.assertIn('python3 scripts/ci/linux_isolation.py pg-native', runs)
+        self.assertIn('tests/maintenance-postgres-restart.test.ts', ci.command_for('pg-native'))
+        self.assertIn('tests/maintenance-postgres-catalog-guard-native.test.ts', ci.command_for('pg-native'))
         self.assertIn('node --test --test-concurrency=1 tests/lifecycle-load.acceptance.ts', runs)
         self.assertEqual(next(step for step in partitions['steps'] if step.get('run') == 'python3 scripts/ci/linux_isolation.py cleanup')['if'], 'always()')
         for step in partitions['steps']:
             if step.get('uses', '').startswith('actions/upload-artifact@'):
                 self.assertIn('${{ strategy.job-index }}', step['with']['name'])
+
+
+class PgNativeEntryContracts(unittest.TestCase):
+    def fixture(self, root):
+        binary = root / 'usr/lib/postgresql/16/bin'
+        binary.mkdir(parents=True)
+        for name in ('postgres', 'initdb', 'pg_ctl', 'pg_dump', 'pg_restore', 'psql'):
+            file = binary / name
+            file.write_text(f'#!/bin/sh\nprintf "{name} (PostgreSQL) 16.15\\n"\n')
+            file.chmod(0o755)
+        share = root / 'usr/share/postgresql/16'
+        share.mkdir(parents=True)
+        (share / 'postgres.bki').write_bytes(b'owned fixture schema\n')
+        library = root / 'usr/lib/postgresql/16/lib'
+        library.mkdir()
+        (library / 'fixture.so').write_bytes(b'owned fixture library\n')
+        (share / 'fixture-link').symlink_to('postgres.bki')
+        return binary
+
+    def test_exact_original_files_are_serial_in_the_owned_entry(self):
+        self.assertIn('pg-native', ci.ENTRIES)
+        self.assertEqual(ci.command_for('pg-native'),
+            'mkdir -p .agent-output/maintenance-pg-restart\n'
+            'node --test --test-concurrency=1 tests/maintenance-postgres-restart.test.ts '
+            'tests/maintenance-postgres-catalog-guard-native.test.ts '
+            '2>&1 | tee .agent-output/maintenance-pg-restart/native-restart.log')
+        request = LauncherContracts().request('pg-native')
+        env = ci.child_environment(request, Path('/owned/stage'))
+        binary = '/owned/stage/work/workspace/ci-pg16-tools/usr/lib/postgresql/16/bin'
+        self.assertEqual(env['AGENT_STUDIO_PG_RESTART_BIN'], binary)
+        self.assertEqual(env['PATH'].split(':')[:2], ['/opt/node/bin', binary])
+        self.assertNotIn('AGENT_STUDIO_PG_TEST_URL', env)
+        self.assertNotIn('NODE_OPTIONS', env)
+        for wrong in ({'pg_url': ci.PG_URL}, {'partition': '1/16'}):
+            with self.assertRaises(ci.IsolationError):
+                ci.child_environment(request | wrong, Path('/owned/stage'))
+        budgets = WholeSuiteBudgetContracts()
+        self.assertEqual(budgets.configured('supervise', 'pg-native'), {'timeout': 900, 'grace': 5})
+        self.assertEqual(budgets.configured('frontend', 'pg-native'), {'timeout': 900, 'grace': 35})
+
+    def test_exact_private_tool_tree_is_copied_not_referenced_through_runner_ancestors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            temporary = base / 'runner'; temporary.mkdir(mode=0o700)
+            root = temporary / 'boardroom-pg16-restart-tools.fixture'
+            binary = self.fixture(root)
+            archive = base / 'pg-tools.tar'
+            receipt = ci.archive_pg_tools(binary, temporary, archive)
+            destination = base / 'workspace'; destination.mkdir()
+            ci.extract_pg_tools(archive, destination, receipt)
+            copied = destination / 'ci-pg16-tools'
+            self.assertEqual(ci.pg_tools_snapshot(root), ci.pg_tools_snapshot(copied))
+            self.assertEqual(receipt['tools']['postgres'], ci.digest(binary / 'postgres'))
+            self.assertEqual(os.readlink(copied / 'usr/share/postgresql/16/fixture-link'), 'postgres.bki')
+            self.assertNotEqual((copied / 'usr/share/postgresql/16/postgres.bki').stat().st_ino,
+                                (root / 'usr/share/postgresql/16/postgres.bki').stat().st_ino)
+            (copied / 'usr/share/postgresql/16/postgres.bki').write_text('changed')
+            with self.assertRaises(ci.IsolationError):
+                ci.verify_pg_tools(copied, receipt)
+            self.assertEqual((root / 'usr/share/postgresql/16/postgres.bki').read_bytes(), b'owned fixture schema\n')
+
+    def test_transport_rejects_unowned_location_external_link_special_file_and_version_substitution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            temporary = base / 'runner'; temporary.mkdir()
+            root = temporary / 'boardroom-pg16-restart-tools.fixture'
+            binary = self.fixture(root)
+            archive = base / 'tools.tar'
+            (base / 'other').mkdir()
+            with self.assertRaises(ci.IsolationError):
+                ci.archive_pg_tools(binary, base / 'other', archive)
+            link = root / 'usr/share/postgresql/16/external'
+            link.symlink_to('/etc/passwd')
+            with self.assertRaises(ci.IsolationError):
+                ci.archive_pg_tools(binary, temporary, archive)
+            link.unlink()
+            os.mkfifo(link)
+            with self.assertRaises(ci.IsolationError):
+                ci.archive_pg_tools(binary, temporary, archive)
+            link.unlink()
+            (binary / 'postgres').write_text('#!/bin/sh\nprintf "postgres (PostgreSQL) 16.16\\n"\n')
+            with self.assertRaises(ci.IsolationError):
+                ci.archive_pg_tools(binary, temporary, archive)
+
+    def test_expired_transport_cannot_start_tools_or_get_a_fresh_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); root = base / 'boardroom-pg16-restart-tools.fixture'
+            binary = self.fixture(root)
+            with mock.patch.object(ci, 'tool') as command:
+                with self.assertRaises(ci.IsolationError):
+                    ci.archive_pg_tools(binary, base, base / 'tools.tar', time.monotonic() - 1)
+                command.assert_not_called()
+
+    def test_actual_local_bootstrap_uses_only_staged_programs_and_checks_versions(self):
+        # Real ordinary-UID execution of six small control programs. This is not
+        # a PostgreSQL or hosted account qualification.
+        import shutil
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory).resolve(); workspace = stage / ci.WORKSPACE
+            binary = self.fixture(workspace / ci.PG_TOOLS)
+            for name in ('home', 'tmp', 'npm-cache'):
+                (stage / name).mkdir(mode=0o700)
+            (stage / 'launcher.py').write_text('# local bootstrap control\n')
+            (stage / 'child.json').write_text('{}\n')
+            source = Path(ci.__file__).resolve().parents[2]
+            (workspace / 'node_modules').symlink_to((source / 'node_modules').resolve(), target_is_directory=True)
+            node = Path(shutil.which('node')).resolve()
+            request = LauncherContracts().request('pg-native') | {'node': str(node), 'node_dir': str(node.parent),
+                'node_sha256': ci.digest(node), 'pg_tools': ci.pg_tools_receipt(workspace / ci.PG_TOOLS)}
+            report = ci.verify_child_bootstrap(request, stage)
+            self.assertEqual(report['status'], 'PASS', report['errors'])
+            observed = [item for item in report['probes'] if item['label'] in ci.PG_PROGRAMS]
+            self.assertEqual([item['label'] for item in observed], list(ci.PG_PROGRAMS))
+            self.assertTrue(all(Path(item['argv'][0]).parent == binary and item['exit_code'] == 0 for item in observed))
+            (binary / 'postgres').write_text('#!/bin/sh\nprintf "postgres (PostgreSQL) 16.16\\n"\n')
+            unchanged = ci.verify_child_bootstrap(request, stage)
+            self.assertEqual(unchanged['status'], 'BLOCKED'); self.assertEqual(unchanged['probes'], [])
+            request['pg_tools'] = ci.pg_tools_receipt(workspace / ci.PG_TOOLS)
+            substituted = ci.verify_child_bootstrap(request, stage)
+            self.assertEqual(substituted['status'], 'BLOCKED')
+            self.assertIn('private_pg_version_changed:postgres', substituted['errors'])
+
+    def test_tools_archive_cannot_overwrite_candidate_or_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); root = base / 'tools'; self.fixture(root)
+            receipt = ci.pg_tools_receipt(root)
+            for name in ('package.json', 'node_modules/pg/index.js', 'ci-pg16-tools/../package.json'):
+                with self.subTest(name=name):
+                    archive = base / 'bad.tar'
+                    with tarfile.open(archive, 'w') as tar:
+                        member = tarfile.TarInfo(name); member.size = 3
+                        tar.addfile(member, io.BytesIO(b'bad'))
+                    destination = base / 'workspace'; destination.mkdir(exist_ok=True)
+                    with self.assertRaises(ci.IsolationError):
+                        ci.extract_pg_tools(archive, destination, receipt)
+                    self.assertEqual(list(destination.iterdir()), [])
+            with tarfile.open(base / 'link.tar', 'w') as tar:
+                member = tarfile.TarInfo('ci-pg16-tools/escape'); member.type = tarfile.SYMTYPE; member.linkname = '../src'
+                tar.addfile(member)
+                member = tarfile.TarInfo('ci-pg16-tools/escape/product.ts'); member.size = 3
+                tar.addfile(member, io.BytesIO(b'bad'))
+            with self.assertRaises(ci.IsolationError):
+                ci.extract_pg_tools(base / 'link.tar', destination, receipt)
+            self.assertEqual(list(destination.iterdir()), [])
+
+    def test_workflow_runs_pg_before_final_cleanup_and_publishes_its_identity_evidence(self):
+        workflow = WholeSuitePartitionContracts().workflow()
+        steps = workflow['jobs']['database-partitions']['steps']
+        pg = next(index for index, step in enumerate(steps) if step.get('run') == 'python3 scripts/ci/linux_isolation.py pg-native')
+        cleanup = next(index for index, step in enumerate(steps) if step.get('run') == 'python3 scripts/ci/linux_isolation.py cleanup')
+        evidence = next(index for index, step in enumerate(steps) if step.get('with', {}).get('path') == '.agent-output/linux-ci-isolation/')
+        native = next(index for index, step in enumerate(steps) if step.get('with', {}).get('path') == '.agent-output/maintenance-native-diagnostics/')
+        self.assertLess(pg, cleanup); self.assertLess(cleanup, evidence); self.assertLess(pg, native)
+        self.assertEqual(steps[cleanup]['if'], 'always()')
+        self.assertEqual(steps[evidence]['if'], 'always()')
+        self.assertEqual(steps[pg]['env'], {'AGENT_STUDIO_PG_RESTART_BIN': '${{ steps.pg_restart_tools.outputs.bin }}'})
+        controls = next(index for index, step in enumerate(steps) if 'PgNativeEntryContracts' in step.get('run', ''))
+        install = next(index for index, step in enumerate(steps) if step.get('run') == 'npm ci')
+        self.assertLess(install, controls, 'Actual bootstrap/YAML controls require the original prepared Node dependencies')
 
 
 class LauncherContracts(unittest.TestCase):

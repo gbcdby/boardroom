@@ -6,8 +6,108 @@ import { syncBuiltinESMExports } from "node:module";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { MaintenanceFailure } from "../src/server/storage/maintenance/error.ts";
 import { withSqliteSourceCloseDiagnostics } from "./fixtures/maintenance-source-close-diagnostic.ts";
-import { withSqliteSourceInventoryDiagnostics } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
+import { sourceWriterFailureSubjects, withSourceFactsInventoryDiagnostics, withSqliteSourceInventoryDiagnostics,
+  type SourceFactsInventoryEvidence } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
+
+test("WR1 facts diagnostics preserve the thrown cause and capture the original pinned failure without retry", { skip: process.platform !== "linux" }, async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "br-facts-diagnostic-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const denied = Object.assign(new Error("private argv/env/DSN sentinel"), { code: "EACCES", errno: -13, syscall: "scandir" });
+  const inner = new MaintenanceFailure("source_writer_unknown", `unreadable-process:${process.pid}`);
+  const original = new MaintenanceFailure("source_writer_unknown", "source-file-writers");
+  Object.defineProperty(original, "cause", { value: inner });
+  const output = path.join(directory, "output"); let calls = 0;
+  const saved = promises.readdir;
+  t.mock.method(promises, "readdir", ((value: unknown, ...args: unknown[]) => {
+    if (typeof value === "string" && /^\/proc\/self\/fd\/[0-9]+\/fd$/.test(value)) { calls++; return Promise.reject(denied); }
+    return Reflect.apply(saved, promises, [value, ...args]);
+  }) as typeof promises.readdir);
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(withSourceFactsInventoryDiagnostics(async () => {
+      const pin = fs.openSync(`/proc/${process.pid}`, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+      try {
+        fs.fstatSync(pin);
+        const stat = fs.openSync(`/proc/self/fd/${pin}/stat`, fs.constants.O_RDONLY), buffer = Buffer.alloc(8192);
+        try { while (fs.readSync(stat, buffer, 0, buffer.length, null) > 0) {} } finally { fs.closeSync(stat); }
+        await assert.rejects(promises.readdir(`/proc/self/fd/${pin}/fd`), error => error === denied);
+        throw original;
+      } finally { fs.closeSync(pin); }
+    }, { outputRoot: output }), error => error === original);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+  assert.equal(calls, 1);
+  const names = await readdir(output); assert.equal(names.length, 1);
+  const bytes = await readFile(path.join(output, names[0]!, "report.json"), "utf8"), report = JSON.parse(bytes);
+  assert.equal(report.originalOperationThrew, true); assert.equal(report.failures.length, 1);
+  const frame = report.failures[0].frame;
+  assert.equal(frame.stats[0].identity.pid, String(process.pid));
+  assert.equal(frame.errors[0].error.code, "EACCES"); assert.equal(frame.errors[0].error.syscall, "scandir");
+  assert.equal(frame.errors[0].error.errno, -13);
+  assert.equal(frame.supplementalStatus.binding, "original-pinned-process-directory");
+  assert.equal(frame.supplementalStatus.fields.Pid, String(process.pid));
+  assert.deepEqual(frame.supplementalStatus.fields.Uid, [process.getuid!(), process.getuid!(), process.getuid!(), process.getuid!()].map(String));
+  assert.equal(frame.supplementalStatus.eof, true); assert.equal(frame.supplementalStatus.closed, true);
+  assert.ok(!bytes.includes("private argv/env/DSN sentinel"));
+});
+
+test("WR1 facts diagnostics link only the original exact selected FD stat to its returned readlink", { skip: process.platform !== "linux" }, async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "br-facts-fd-evidence-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const file = path.join(directory, "config.json"); await writeFile(file, "{}\n");
+  const owner = await promises.open(file, "r+");
+  const identity = await owner.stat({ bigint: true });
+  const evidence: SourceFactsInventoryEvidence = { selected: { label: "config", file, fd: owner.fd,
+    dev: String(identity.dev), ino: String(identity.ino) }, matches: [] };
+  const original = new MaintenanceFailure("source_writer_unknown", `os-process:${process.pid}`);
+  try {
+    await assert.rejects(withSourceFactsInventoryDiagnostics(async () => {
+      const pin = fs.openSync(`/proc/${process.pid}`, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+      try {
+        const name = `/proc/self/fd/${pin}/fd/${owner.fd}`;
+        await promises.readlink(name); await promises.stat(name, { bigint: true });
+        throw original;
+      } finally { fs.closeSync(pin); }
+    }, { outputRoot: path.join(directory, "output"), evidence }), error => error === original);
+  } finally { await owner.close(); }
+  assert.equal(evidence.matches.length, 1);
+  assert.deepEqual({ ...evidence.matches[0], event: 0 }, { label: "config", pid: process.pid, fd: evidence.selected!.fd,
+    dev: String(identity.dev), ino: String(identity.ino), event: 0 });
+  assert.deepEqual(sourceWriterFailureSubjects(original), [`os-process:${process.pid}`]);
+  let traps = 0;
+  const proxy = new Proxy({}, { getOwnPropertyDescriptor() { traps++; throw new Error("secret"); }, get() { traps++; throw new Error("secret"); } });
+  assert.deepEqual(sourceWriterFailureSubjects(proxy), []); assert.equal(traps, 0);
+  const accessor = Object.defineProperty({}, "cause", { get() { traps++; throw new Error("secret"); } });
+  assert.deepEqual(sourceWriterFailureSubjects(accessor), []); assert.equal(traps, 0);
+});
+
+test("WR1 additional status diagnostics do not follow a reused original proc FD into a source directory", { skip: process.platform !== "linux" }, async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "br-status-pin-reuse-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(path.join(directory, "status"), "private source payload sentinel\n");
+  const rawOpen = fs.openSync, rawClose = fs.closeSync;
+  const original = new MaintenanceFailure("source_writer_unknown", `unreadable-process:${process.pid}`);
+  const output = path.join(directory, "output");
+  await assert.rejects(withSourceFactsInventoryDiagnostics(async () => {
+    const pin = fs.openSync(`/proc/${process.pid}`, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    fs.fstatSync(pin);
+    rawClose(pin); // Model an unknown external close, outside the passive wrapper.
+    const replacement = rawOpen(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    try {
+      assert.equal(replacement, pin, "the real native allocator must actually reuse this descriptor");
+      await assert.rejects(promises.readdir(`/proc/self/fd/${pin}/fd`), { code: "ENOENT" });
+      throw original;
+    } finally { rawClose(replacement); }
+  }, { outputRoot: output }), error => error === original);
+  const names = await readdir(output); assert.equal(names.length, 1);
+  const bytes = await readFile(path.join(output, names[0]!, "report.json"), "utf8"), report = JSON.parse(bytes);
+  const status = report.failures[0].frame.supplementalStatus;
+  assert.equal(status.binding, "numeric-pid-after-original-error");
+  assert.equal(status.fields.Pid, String(process.pid));
+  assert.equal(status.eof, true); assert.equal(status.closed, true);
+  assert.ok(!bytes.includes("private source payload sentinel"));
+});
 
 for (const kind of ["inventory", "source-close"] as const) {
   test(`#152 ${kind} diagnostic output cannot change the original operation`, async t => {

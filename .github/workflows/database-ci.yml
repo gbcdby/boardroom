@@ -299,7 +299,7 @@ jobs:
       - name: 核对测试分片覆盖与聚合失败门
         run: |
           node --test scripts/ci/test-linux-partition-plan.mjs
-          python3 -B scripts/ci/test_linux_isolation.py WholeSuitePartitionContracts -v
+          python3 -B scripts/ci/test_linux_isolation.py WholeSuitePartitionContracts PgNativeEntryContracts -v
           python3 -B scripts/ci/test_macos_partitions.py -v
 
       - name: 类型检查
@@ -343,6 +343,12 @@ jobs:
           BOARDROOM_CI_TEST_PARTITION: ${{ matrix.partition }}
         run: python3 scripts/ci/linux_isolation.py full-suite
 
+      - name: 专属 UID 私有 PG16.15 重启、H04 与 WR1 验证
+        shell: bash
+        env:
+          AGENT_STUDIO_PG_RESTART_BIN: ${{ steps.pg_restart_tools.outputs.bin }}
+        run: python3 scripts/ci/linux_isolation.py pg-native
+
       - name: 核对 Linux 专属测试身份、进程与工件收尾
         if: always()
         run: python3 scripts/ci/linux_isolation.py cleanup
@@ -366,15 +372,6 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
-
-      - name: 独立私有 cluster 真实重启与 H04 固定 helper 验证
-        shell: bash
-        env:
-          AGENT_STUDIO_PG_RESTART_BIN: ${{ steps.pg_restart_tools.outputs.bin }}
-        run: |
-          test -n "$AGENT_STUDIO_PG_RESTART_BIN"
-          mkdir -p .agent-output/maintenance-pg-restart
-          node --test tests/maintenance-postgres-restart.test.ts tests/maintenance-postgres-catalog-guard-native.test.ts 2>&1 | tee .agent-output/maintenance-pg-restart/native-restart.log
 
       - name: 保存独立 PostgreSQL 重启验证证据
         if: always()

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, open, realpath, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -15,6 +16,8 @@ import { PG_CATALOG_GUARD_MODULE, PG_CATALOG_GUARD_SQL } from "../src/server/sto
 import { parsePgCatalogGuardModuleObservation } from "../src/server/storage/maintenance/postgres-catalog-guard/observation-values.ts";
 import { h04Roles, openCatalogGuardTestCluster } from "./fixtures/postgres-catalog-guard-cluster.ts";
 import { readFixtureCatalogGuardModule } from "./fixtures/postgres-catalog-guard-observation.ts";
+import { sourceWriterFailureSubjects, withSourceFactsInventoryDiagnostics,
+  type SourceFactsInventoryEvidence } from "./fixtures/maintenance-source-inventory-diagnostic.ts";
 
 const toolsDirectory = process.env["AGENT_STUDIO_PG_RESTART_BIN"];
 const share = 'SELECT "boardroom_catalog_guard_v1"."acquire_share"() AS guard';
@@ -188,27 +191,62 @@ test("WR1 native PG16.15 actual facts combine local fileRoots with unchanged dat
           activeMigrationId: plan.migrationId, planDigest: reference.planDigest, controlRootIdentity: store.identity as never,
           mutexIdentity: mutex!.identity, journal, journalSequence: 1 });
       });
-      const read = (consume: () => Promise<void>) => adapter!.withSourceLock("control",
-        lock => lock.withSourceClientFacts(reference, async facts => { await facts.assertCurrent(); await consume(); }));
+      const read = (consume: () => Promise<void>, evidence?: SourceFactsInventoryEvidence) => withSourceFactsInventoryDiagnostics(
+        () => adapter!.withSourceLock("control",
+          lock => lock.withSourceClientFacts(reference, async facts => { await facts.assertCurrent(); await consume(); })),
+        { outputRoot: path.resolve(".agent-output/maintenance-native-diagnostics/source-inventory/wr1-pg"),
+          ...(evidence ? { evidence } : {}) });
+      const rejectsSubject = (subject: string) => (error: unknown) => {
+        assert.equal((error as { code?: unknown })?.code, "source_writer_unknown");
+        assert.deepEqual(sourceWriterFailureSubjects(error), [subject],
+          "the actual selected resource must reject; an earlier unreadable process is not this negative control");
+        return true;
+      };
+      const selectDescriptor = async (label: NonNullable<SourceFactsInventoryEvidence["selected"]>["label"], file: string,
+        owner: FileHandle, evidence: SourceFactsInventoryEvidence) => {
+        const identity = await owner.stat({ bigint: true });
+        evidence.selected = { label, file, fd: owner.fd, dev: String(identity.dev), ino: String(identity.ino) };
+      };
+      const assertDescriptorObserved = (evidence: SourceFactsInventoryEvidence) => {
+        const expected = evidence.selected!;
+        assert.ok(evidence.matches.some(row => row.pid === process.pid && row.fd === expected.fd
+          && row.dev === expected.dev && row.ino === expected.ino && row.label === expected.label),
+        "the original inventory must actually readlink and stat this exact owned-fixture descriptor");
+        t.diagnostic(JSON.stringify({ scope: "WR1 selected native source descriptor rejection", ...expected, file: undefined,
+          process: process.pid, originalInventoryMatches: evidence.matches.length }));
+      };
       await t.test("WR1-PG closed config and nested session reach the actual callback", async () => {
         let entered = false; await read(async () => { entered = true; }); assert.equal(entered, true);
       });
       for (const [label, file] of [["config", configFile], ["nested-session", sessionFile]] as const)
         await t.test(`WR1-PG ${label} unowned FD rejects before callback with no external database backend`, async () => {
-          let entered = false; fileOwner = await open(file, "r+");
-          try { await assert.rejects(read(async () => { entered = true; }), { code: "source_writer_unknown" }); assert.equal(entered, false); }
+          let entered = false; const evidence: SourceFactsInventoryEvidence = { matches: [] }; fileOwner = await open(file, "r+");
+          try {
+            await selectDescriptor(label, file, fileOwner, evidence);
+            await assert.rejects(read(async () => { entered = true; }, evidence), rejectsSubject(`os-process:${process.pid}`));
+            assert.equal(entered, false); assertDescriptorObserved(evidence);
+          }
           finally { await fileOwner.close(); fileOwner = undefined; }
         });
       await t.test("WR1-PG database-only external backend still rejects independently of fileRoots", async () => {
         external = await cluster.connect("h04_source"); let entered = false;
-        try { await assert.rejects(read(async () => { entered = true; }), { code: "source_writer_unknown" }); assert.equal(entered, false); }
+        try {
+          await external.query("SET TimeZone='UTC'");
+          const backend = (await external.query("SELECT pid,backend_start::text FROM pg_catalog.pg_stat_activity WHERE pid=pg_backend_pid()")).rows[0];
+          const subject = `postgres-backend:${createHash("sha256").update(`${backend.pid}:${backend.backend_start}`).digest("hex").slice(0, 24)}`;
+          await assert.rejects(read(async () => { entered = true; }), rejectsSubject(subject)); assert.equal(entered, false);
+          t.diagnostic(JSON.stringify({ scope: "WR1 independent actual PostgreSQL backend rejection", subject }));
+        }
         finally { await external.end(); external = undefined; }
       });
       await t.test("WR1-PG a session FD created by the actual callback is rejected at fresh exit", async () => {
-        let entered = false;
+        let entered = false; const evidence: SourceFactsInventoryEvidence = { matches: [] };
         try {
-          await assert.rejects(read(async () => { entered = true; fileOwner = await open(sessionFile, "r"); }), { code: "source_writer_unknown" });
-          assert.equal(entered, true);
+          await assert.rejects(read(async () => {
+            entered = true; fileOwner = await open(sessionFile, "r");
+            await selectDescriptor("callback-session", sessionFile, fileOwner, evidence);
+          }, evidence), rejectsSubject(`os-process:${process.pid}`));
+          assert.equal(entered, true); assertDescriptorObserved(evidence);
         } finally { await fileOwner?.close(); fileOwner = undefined; }
       });
       await t.test("WR1-PG closed descriptors permit a fresh actual facts window", async () => {

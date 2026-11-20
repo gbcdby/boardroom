@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the two Linux inventory test entries as an owned, short-lived CI UID.
+"""Run the fixed Linux inventory test entries as an owned, short-lived CI UID.
 
 The runner creates exact-source/dependency archives. Root only creates and
 removes the marked account/directories and supervises a capability-free child.
@@ -24,7 +24,7 @@ import tarfile
 import tempfile
 import time
 
-ENTRIES = ('sqlite', 'full-suite')
+ENTRIES = ('sqlite', 'full-suite', 'pg-native')
 FULL_SUITE_PARTITIONS = tuple(f'{index}/16' for index in range(1, 17))
 # CI231 reached 2041 passing top-level tests before the old outer 900s limit.
 # Keep the full-suite budget separate from supervisor setup and final receipts.
@@ -36,6 +36,9 @@ SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 STAGE_PARENT = Path('/tmp')
 MAX_ARCHIVE = 2 * 1024 * 1024 * 1024
 WORKSPACE = Path('work/workspace')  # Existing plan fixtures create siblings of cwd.
+PG_TOOLS = Path('ci-pg16-tools')
+PG_BIN = Path('usr/lib/postgresql/16/bin')
+PG_PROGRAMS = ('postgres', 'initdb', 'pg_ctl', 'pg_dump', 'pg_restore', 'psql')
 PROTECTED = ('package.json', 'package-lock.json', 'src/server/storage/maintenance/sqlite.ts',
              'tests/maintenance-sqlite.test.ts', 'tests/fixtures/maintenance-linux-inventory-diagnostic.ts',
              'scripts/ci/linux_isolation.py')
@@ -67,6 +70,13 @@ def command_for(entry, partition=None):
         return ("mkdir -p .agent-output/linux-ci-isolation/full-suite\n"
                 "node scripts/ci/test-discovery.mjs\n"
                 f"npm run {script} 2>&1 | tee .agent-output/linux-ci-isolation/full-suite/full-suite.tap")
+    if entry == 'pg-native':
+        # Complete /proc stays visible. Only this new UID owns these tests and
+        # their private PG children; serial files avoid an unrelated fixture exit.
+        return ("mkdir -p .agent-output/maintenance-pg-restart\n"
+                "node --test --test-concurrency=1 tests/maintenance-postgres-restart.test.ts "
+                "tests/maintenance-postgres-catalog-guard-native.test.ts "
+                "2>&1 | tee .agent-output/maintenance-pg-restart/native-restart.log")
     raise IsolationError('Unknown fixed CI entry')
 
 
@@ -91,7 +101,11 @@ def child_environment(request, stage):
             f'--test-reporter={observer / "test-execution-reporter.mjs"} --test-reporter-destination=stdout '
             f'--import={observer / "test-process-observer.mjs"}')
     elif request.get('pg_url') is not None:
-        raise IsolationError('SQLite diagnostic must not acquire a PostgreSQL environment')
+        raise IsolationError('Only the full suite may acquire the temporary CI PostgreSQL service URL')
+    if request['entry'] == 'pg-native':
+        binary = str(stage / WORKSPACE / PG_TOOLS / PG_BIN)
+        env['AGENT_STUDIO_PG_RESTART_BIN'] = binary
+        env['PATH'] = request['node_dir'] + ':' + binary + ':' + SYSTEM_PATH
     return env
 
 
@@ -133,6 +147,114 @@ def real_directory(path):
     return path
 
 
+def pg_tools_snapshot(root, owner=None, deadline=None):
+    """Bounded identity of the whole extracted pair, including share/ and private lib/."""
+    real_directory(root)
+    rows, total = [], 0
+    pending = [root]
+    while pending:
+        path = pending.pop()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise IsolationError('Private PG transport exhausted the existing dependency-archive budget')
+        info = path.lstat()
+        if (owner is not None and info.st_uid != owner) or info.st_mode & (stat.S_ISUID | stat.S_ISGID):
+            raise IsolationError('Private PG tree has an unowned or privileged member')
+        row = {'path': path.relative_to(root).as_posix(), 'mode': stat.S_IMODE(info.st_mode)}
+        if stat.S_ISDIR(info.st_mode):
+            row['kind'] = 'directory'
+            pending.extend(sorted(path.iterdir(), reverse=True))
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            total += info.st_size
+            if total > MAX_ARCHIVE:
+                raise IsolationError('Private PG tree exceeds the original transport bound')
+            row.update(kind='file', bytes=info.st_size, sha256=digest(path))
+        elif stat.S_ISLNK(info.st_mode):
+            target = os.readlink(path)
+            if Path(target).is_absolute() or not path.resolve(strict=True).is_relative_to(root):
+                raise IsolationError('Private PG tree has an external symbolic link')
+            row.update(kind='symlink', target=target)
+        else:
+            raise IsolationError('Private PG tree contains a special or shared file')
+        rows.append(row)
+        if len(rows) + len(pending) > 200000:
+            raise IsolationError('Private PG tree exceeds the original member bound')
+    return sorted(rows, key=lambda item: item['path'])
+
+
+def pg_tools_receipt(root, owner=None, deadline=None):
+    rows = pg_tools_snapshot(root, owner, deadline)
+    tools = {}
+    for name in PG_PROGRAMS:
+        executable = root / PG_BIN / name
+        if executable.resolve(strict=True) != executable or not executable.is_file() or not os.access(executable, os.X_OK):
+            raise IsolationError('Private PG program is not the exact ordinary executable')
+        tools[name] = digest(executable)
+    if not (root / 'usr/share/postgresql/16/postgres.bki').is_file() or not (root / PG_BIN.parent / 'lib').is_dir():
+        raise IsolationError('Private PG share/library closure is missing')
+    return {'members': len(rows), 'bytes': sum(row.get('bytes', 0) for row in rows), 'tools': tools,
+            'manifest_sha256': hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+
+
+def verify_pg_tools(root, expected, owner=None):
+    actual = pg_tools_receipt(root, owner)
+    if actual != expected:
+        raise IsolationError('Private PG staged bytes, modes, links or complete membership changed')
+    return actual
+
+
+def archive_pg_tools(binary, temporary, archive, deadline=None):
+    binary, temporary = real_directory(binary), real_directory(temporary)
+    root = binary.parents[4]
+    if binary != root / PG_BIN or root.parent != temporary or not root.name.startswith('boardroom-pg16-restart-tools.'):
+        raise IsolationError('Private PG input must be the exact prepared tools directory in RUNNER_TEMP')
+    deadline = time.monotonic() + 90 if deadline is None else deadline
+    receipt = pg_tools_receipt(root, os.getuid(), deadline)
+    for name in PG_PROGRAMS:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise IsolationError('Private PG transport exhausted the existing dependency-archive budget')
+        version = tool([str(binary / name), '--version'], timeout=min(5, remaining))
+        if not re.search(r'\(PostgreSQL\) 16\.15(?:\s|$)', version):
+            raise IsolationError('Private PG executable is not PostgreSQL 16.15')
+    with tarfile.open(archive, 'x', dereference=False) as tar:
+        for row in pg_tools_snapshot(root, os.getuid(), deadline):
+            if time.monotonic() >= deadline:
+                raise IsolationError('Private PG transport exhausted the existing dependency-archive budget')
+            relative = Path(row['path'])
+            tar.add(root / relative, arcname=str(PG_TOOLS / relative), recursive=False)
+    if archive.stat().st_size > MAX_ARCHIVE or pg_tools_receipt(root, os.getuid(), deadline) != receipt:
+        raise IsolationError('Private PG transport changed or exceeded the original archive bound')
+    return receipt
+
+
+def extract_pg_tools(archive, workspace, expected):
+    root = workspace / PG_TOOLS
+    if root.exists() or root.is_symlink():
+        raise IsolationError('Private PG destination already exists in source/dependencies')
+    with tarfile.open(archive, 'r') as tar:
+        members = tar.getmembers()
+        names = set()
+        for member in members:
+            path = Path(member.name)
+            if not path.parts or path.parts[0] != str(PG_TOOLS) or '..' in path.parts or path.is_absolute() \
+               or path in names or not (member.isfile() or member.isdir() or member.issym()):
+                raise IsolationError('Private PG archive may only populate its new owned directory')
+            names.add(path)
+            if member.issym():
+                target = Path(os.path.normpath(path.parent / member.linkname))
+                if Path(member.linkname).is_absolute() or not target.is_relative_to(PG_TOOLS):
+                    raise IsolationError('Private PG archive symbolic link escapes its owned directory')
+    safe_extract(archive, workspace)
+    # data_filter deliberately discards directory modes. Restore only validated
+    # ordinary directory modes so the prepared private root identity stays exact.
+    for member in members:
+        if member.isdir():
+            path = workspace / member.name
+            real_directory(path)
+            os.chmod(path, member.mode & 0o777)
+    verify_pg_tools(root, expected)
+
+
 def stage_directory(run_id, attempt, entry):
     # RUNNER_TEMP may have runner-private ancestors. Never chmod those ancestors.
     return STAGE_PARENT / stage_name(run_id, attempt, entry)
@@ -164,6 +286,12 @@ def bootstrap_targets(request, stage):
         targets['npm'] = (Path(request['node_dir']) / 'npm', os.R_OK | os.X_OK)
         for name in ('pg_dump', 'pg_restore', 'psql'):
             targets[name] = (Path('/usr/lib/postgresql/16/bin') / name, os.R_OK | os.X_OK)
+    if request['entry'] == 'pg-native':
+        root = stage / WORKSPACE / PG_TOOLS
+        for name in PG_PROGRAMS:
+            targets[name] = (root / PG_BIN / name, os.R_OK | os.X_OK)
+        targets['pg-share'] = (root / 'usr/share/postgresql/16/postgres.bki', os.R_OK)
+        targets['pg-library'] = (root / PG_BIN.parent / 'lib', os.R_OK | os.X_OK)
     return targets
 
 
@@ -214,12 +342,19 @@ def verify_child_bootstrap(request, stage):
         selected = shutil.which('node', path=environment['PATH'])
         if not selected or Path(selected).resolve() != node or digest(node) != request['node_sha256']:
             errors.append('prepared_node_identity_changed')
+    if not errors and request['entry'] == 'pg-native':
+        try:
+            report['private_pg_tools'] = verify_pg_tools(stage / WORKSPACE / PG_TOOLS, request['pg_tools'], os.getuid())
+        except (OSError, IsolationError) as error:
+            errors.append('private_pg_tools_identity_changed:' + str(error))
     if not errors:
         # Exercise loaders and npm's env-node shebang under the real child identity.
         native = "const D=require('better-sqlite3');const db=new D(':memory:');db.close();console.log('native dependency loaded')"
         probes = [('node-version', [str(node), '--version']), ('native-dependency', [str(node), '-e', native])]
         if request['entry'] == 'full-suite':
             probes += [(name, [report['paths'][name]['path'], '--version']) for name in ('npm', 'pg_dump', 'pg_restore', 'psql')]
+        if request['entry'] == 'pg-native':
+            probes += [(name, [report['paths'][name]['path'], '--version']) for name in PG_PROGRAMS]
         for label, argv in probes:
             item = {'label': label, 'argv': argv}
             try:
@@ -228,6 +363,8 @@ def verify_child_bootstrap(request, stage):
                 item.update(exit_code=completed.returncode, stdout=completed.stdout[-2048:], stderr=completed.stderr[-2048:])
                 if completed.returncode:
                     errors.append('probe_failed:' + label)
+                if request['entry'] == 'pg-native' and label in PG_PROGRAMS and not re.search(r'\(PostgreSQL\) 16\.15(?:\s|$)', completed.stdout):
+                    errors.append('private_pg_version_changed:' + label)
             except (OSError, subprocess.TimeoutExpired) as error:
                 item.update(error=type(error).__name__, errno=getattr(error, 'errno', None))
                 errors.append('probe_failed:' + label)
@@ -678,12 +815,14 @@ def supervise(stage, cleanup_only=False):
               'command': command_for(request['entry'], request.get('partition')), 'command_exit': None, 'errors': [],
               'archives': request['archives'], 'protected_sha256': request['protected_sha256'],
               'source_snapshot': request.get('source_snapshot'),
+              'private_pg_tools': request.get('pg_tools'),
               'cleanup_only': cleanup_only, 'setup_complete': False, 'product_entry_status': 'NOT_RUN'}
     if (stage / 'result.json').exists():
         report = read_json(stage / 'result.json')
     try:
         if not cleanup_only:
-            if set(request['archives']) != {'source.tar', 'dependencies.tar'} or \
+            expected_archives = {'source.tar', 'dependencies.tar'} | ({'pg-tools.tar'} if request['entry'] == 'pg-native' else set())
+            if set(request['archives']) != expected_archives or \
                set(request['protected_sha256']) != set(PROTECTED):
                 raise IsolationError('Only the exact source/dependency archives and candidate fingerprints are allowed')
             if 'uid' in state or account_record(state['name']) or group_record(state['name']):
@@ -727,7 +866,10 @@ def supervise(stage, cleanup_only=False):
                 archive = stage / name
                 if digest(archive) != expected:
                     raise IsolationError('Source/dependency transport hash changed')
-                safe_extract(archive, workspace)
+                if name == 'pg-tools.tar':
+                    extract_pg_tools(archive, workspace, request['pg_tools'])
+                else:
+                    safe_extract(archive, workspace)
             for directory, dirs, files in os.walk(workspace, followlinks=False):
                 for name in dirs + files:
                     os.chown(Path(directory) / name, uid, uid, follow_symlinks=False)
@@ -888,8 +1030,14 @@ def frontend(entry):
         if not (source / 'node_modules').is_dir() or (source / 'node_modules').is_symlink():
             raise IsolationError('Use this job\'s real npm ci dependency tree, not a shared symlink')
         extras = ['node_modules'] + [name for name in ('dist', 'build') if (source / name).is_dir()]
+        transport_deadline = time.monotonic() + 90
         tool(['tar', '-cf', str(stage / 'dependencies.tar'), '-C', str(source), *extras], timeout=90)
-        request['archives'] = {name: digest(stage / name) for name in ('source.tar', 'dependencies.tar')}
+        archives = ['source.tar', 'dependencies.tar']
+        if entry == 'pg-native':
+            request['pg_tools'] = archive_pg_tools(Path(os.environ.get('AGENT_STUDIO_PG_RESTART_BIN', '')), temporary,
+                                                   stage / 'pg-tools.tar', transport_deadline)
+            archives.append('pg-tools.tar')
+        request['archives'] = {name: digest(stage / name) for name in archives}
         request['protected_sha256'] = {name: digest(source / name) for name in PROTECTED}
         write_json(stage / 'request.json', request)
         completed = run_command(['sudo', '-n', '--', '/usr/bin/python3', '-I', str(Path(__file__).resolve()),
