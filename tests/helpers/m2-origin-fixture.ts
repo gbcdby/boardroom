@@ -12,14 +12,14 @@ import { originP1Tables, originHistorySelection, originSelectionDependencies, or
 import { ORIGIN_TIME, originAnchor, originCanonical, originDigest, originEvidence, originRow, originSet, originSha } from "./m2-origin-fixture-store.ts";
 import type { OriginChange } from "./m2-origin-fixture-store.ts";
 
-export type OriginFixtureOptions = { change?: OriginChange; pageSize?: 512 | 1024 | 4096; ownerCount?: 0 | 1 | 2 };
+export type OriginFixtureOptions = { change?: OriginChange; pageSize?: 512 | 1024 | 4096; ownerCount?: 0 | 1 | 2; advancedWorkspace?: boolean };
 /** Real nonempty captured SQLite rows and a complete pure-value M2 origin graph.
  * No native migration, restore, publication, registration or admission is claimed.
  * The default branch preserves the original zero-owner bytes. Optional owner
  * successors replay from the captured original v1 history through A and B. */
 export async function m2OriginFixture(options: OriginFixtureOptions = {}) {
   const ownerCount = options.ownerCount ?? 0; assert([0, 1, 2].includes(ownerCount));
-  const p0 = await m2OriginP0Fixture(options.change, { pageSize: options.pageSize ?? 512, includeHistoricalClient: ownerCount > 0 }),
+  const p0 = await m2OriginP0Fixture(options.change, { pageSize: options.pageSize ?? 512, includeHistoricalClient: ownerCount > 0, advancedWorkspace: options.advancedWorkspace ?? false }),
     { store, before, preA } = p0, source = before.source;
   const sources = originContractSources(), sourceRefs: Record<string, ArtifactRef> = {};
   for (const item of sources) sourceRefs[item.name] = store.raw("contract:" + item.name, item.kind,
@@ -33,10 +33,11 @@ export async function m2OriginFixture(options: OriginFixtureOptions = {}) {
     before: beforeSelection, createdAt: ORIGIN_TIME, actor: { kind: "human", name: "Origin fixture", memberId: null },
     agents: [{ agentId: "a", profileRevision: 1, auditId: "origin-takeover-audit" }],
     bindings: [{ memberId: "m", groupId: "g", groupBindingId: "b", bindingRevision: 1, legacyExecutionId: "b",
-      effective: { snapshotId: "origin-effective", mappingId: null }, requested: { snapshotId: "origin-requested", mappingId: null },
-      applied: { snapshotId: "origin-applied", mappingId: null } }] };
+      effective: { snapshotId: "origin-effective", mappingId: options.advancedWorkspace ? "origin-mapping-effective" : null },
+      requested: { snapshotId: "origin-requested", mappingId: options.advancedWorkspace ? "origin-mapping-requested" : null },
+      applied: { snapshotId: "origin-applied", mappingId: options.advancedWorkspace ? "origin-mapping-applied" : null } }] };
   const seedArtifact = store.add("seed", "m2-takeover-seed", seed, [p0.refs.plan, ...originSelectionDependencies(beforeSelection)]);
-  const business = originBusiness(p0, seed);
+  const business = originBusiness(p0, seed, options.advancedWorkspace);
   const migrationResult = buildM2Migration22ProfileValues(JSON.stringify({ backend: "sqlite", seed,
     profileFormatPair: M2_PROFILE_WRITER_CONTRACT.profileFormatPair }));
   assert(migrationResult.ok, JSON.stringify(migrationResult));
