@@ -130,6 +130,8 @@ function observation(input: unknown, g: Grammar): HistoryObservationInput {
   const encoding = g.object(v.textEncoding, ["backend", "name"], "textEncoding");
   g.need(encoding.backend === v.backend, "textEncoding"); g.string(encoding.name, "textEncoding");
   g.reserve(M2_HISTORY_TABLES.length);
+  // Prepay the filter result and its fixed maximum slots before allocation.
+  if (g.state) chargeState(g.state, { tuples: 1 + M2_HISTORY_TABLES.length }, g.site);
   const contracts = M2_HISTORY_TABLES.filter(t => v.phase !== "p0" || t.columnsP0.length > 0);
   g.need(Array.isArray(v.tables) && v.tables.length === contracts.length, "tables", "incomplete_universe");
   for (let t = 0; t < contracts.length; t++) {
