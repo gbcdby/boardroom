@@ -121,3 +121,19 @@ for (const name of ["group_participants", "agent_runtime_members"] as const) tes
   const result = checkP0ConfigurationFamily(admitted.value); assert(!result.ok, JSON.stringify(result));
   assert.equal(result.error.rule, "PC1B-RT01"); assert.notEqual(result.error.code, "resource_limit");
 });
+
+test("M2 current: two attached executions still conflict in the fixed partial uniqueness domain", async () => {
+  const fixture = await m2DurableCurrentFixture("mixed"), shells = currentTable(fixture.observation, "agent_runtime_bindings");
+  const extra = shells.rows.findIndex((_, index) => originRow(shells, index).id === "b-history-1"); assert(extra >= 0);
+  originSet(shells, "attachment_state", "attached", extra); originSet(shells, "detach_config_snapshot_id", null, extra);
+  originSet(shells, "detached_at", null, extra); removeCurrentRows(fixture.observation, "config_detach_snapshots");
+  const error = rejected(inspectM2DurableCurrent(fixture), "current");
+  assert.equal(error.code, "semantic_invariant_failed"); assert.equal(error.conflicts[0]!.condition, "duplicate-key");
+});
+
+for (const name of ["agent_runtime_bindings", "agent_runner_states"] as const) test(`M2 current: the original primary key still rejects duplicate ${name} rows`, async () => {
+  const fixture = await m2DurableCurrentFixture(), table = currentTable(fixture.observation, name);
+  const duplicate = structuredClone(table.rows[0]!); duplicate.rowid = "999"; table.rows.push(duplicate); table.count = "2";
+  const error = rejected(inspectM2DurableCurrent(fixture), "configuration", "PC1B-RT01");
+  assert.equal(error.conflicts[0]!.condition, "duplicate-key");
+});

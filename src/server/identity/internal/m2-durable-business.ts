@@ -66,7 +66,10 @@ export class M2Business {
     const f:FState=this.g.f;
     for(const info of catalog.keys){
       if(info.table==='storage_maintenance'||info.table==='storage_source_clients')continue;
-      const table=this.g.tableOf(this.history,info.table);this.index(info.table,info.primaryKey);
+      const table=this.g.tableOf(this.history,info.table);
+      // Added-column projections inherit their table's original primary key;
+      // the empty projection declaration is not a unique zero-column tuple.
+      this.index(info.table,info.primaryKey.length?info.primaryKey:contracts.get(info.table)!.primaryKey);
       for(const key of info.uniqueKeys)if(!key.partial)this.index(info.table,key.columns);
       const ids=new Set<string>();f.charge(table.rows.length,0,table.rows.length+1);
       for(const row of table.rows){if(row.rowid!==null){f.require(!ids.has(row.rowid),'semantic_invariant_failed','duplicate-key');ids.add(row.rowid);}
