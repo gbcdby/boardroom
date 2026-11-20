@@ -60,7 +60,9 @@ class MacosPartitionContracts(unittest.TestCase):
         aggregate = self.workflow['jobs']['macos-tests']
         self.assertEqual(aggregate['name'], 'Node 24 · macOS arm64 / SQLite')
         self.assertEqual(aggregate['needs'], 'macos-partitions')
-        self.assertEqual(aggregate['if'], '${{ always() }}')
+        self.assertIn('always()', aggregate['if'])
+        self.assertIn('inputs.full_matrix', aggregate['if'])
+        self.assertIn("contains(github.event.pull_request.labels.*.name, 'ci-full')", aggregate['if'])
         gate, = aggregate['steps']
         self.assertEqual(gate['env']['PARTITIONS_RESULT'], '${{ needs.macos-partitions.result }}')
         for result in ('success', 'failure', 'cancelled', 'skipped', '', 'unknown'):

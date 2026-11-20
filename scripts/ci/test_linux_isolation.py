@@ -513,7 +513,9 @@ class WholeSuitePartitionContracts(unittest.TestCase):
         self.assertEqual(partitions['strategy'], {'fail-fast': False, 'matrix': {'partition': [f'{index}/16' for index in range(1, 17)]}})
         self.assertEqual(aggregate['name'], 'Node 24 · SQLite / PostgreSQL')
         self.assertEqual(aggregate['needs'], 'database-partitions')
-        self.assertEqual(aggregate['if'], '${{ always() }}')
+        self.assertIn('always()', aggregate['if'])
+        self.assertIn('inputs.full_matrix', aggregate['if'])
+        self.assertIn("contains(github.event.pull_request.labels.*.name, 'ci-full')", aggregate['if'])
         gate = aggregate['steps'][0]
         self.assertEqual(gate['env']['PARTITIONS_RESULT'], '${{ needs.database-partitions.result }}')
         for state in ('success', 'failure', 'cancelled', 'skipped', ''):
