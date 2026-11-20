@@ -28,8 +28,11 @@ const expectedTests = 24; // Eight original parents + twelve ACL and four native
 const pattern = selected.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
 const digest = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 
+// Retain the original maintenance-postgres CI batch limit of 300 s. The
+// enclosing 600 s includes the owned cluster startup, identity checks and actual
+// shutdown; the unchanged pg-native launcher still bounds the whole entry at 900 s.
 test("R05 owned PG16.15 reuses nonempty native restore, catalog/ACL and actual failure-retirement cases",
-  { skip: toolsDirectory === undefined, timeout: 180_000 }, async t => {
+  { skip: toolsDirectory === undefined, timeout: 600_000 }, async t => {
     assert.equal(process.env["AGENT_STUDIO_PG_TEST_URL"], undefined,
       "the owned entry must not accept a supplied shared database URL");
     assert.equal(await realpath(process.cwd()), await realpath(workspace));
@@ -65,7 +68,7 @@ test("R05 owned PG16.15 reuses nonempty native restore, catalog/ACL and actual f
       // programs in PATH. No driver, Fs or source-preservation profile is replaced.
       const operation = execute(process.execPath, ["--test", "--test-reporter=tap", "--test-concurrency=1",
         "--test-name-pattern=" + pattern, sourceFile], {
-        cwd: workspace, env, timeout: 120_000, killSignal: "SIGTERM", maxBuffer: 512_000, signal: t.signal,
+        cwd: workspace, env, timeout: 300_000, killSignal: "SIGTERM", maxBuffer: 512_000, signal: t.signal,
       });
       pid = operation.child.pid;
       const closed = new Promise<void>(resolve => operation.child.once("close", (code, signal) => {
