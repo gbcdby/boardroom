@@ -29,6 +29,9 @@ type Observation = Readonly<{
 const root = realpathSync(fileURLToPath(new URL("../../../../", import.meta.url)));
 const component = path.join(root, "build", "maintenance-platform", "sqlite-path-check-linux-" + process.arch);
 const flags = ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-shared", "-fPIC"] as const;
+// Linux O_PATH is not exposed by Node fs.constants. External ancestors are
+// metadata pins only; traversable directories need not permit directory reads.
+const O_PATH = 0x200000;
 // Unknown native close keeps its actual database/fd owner, even if a JS flag subsequently says closed.
 // There is no caller acknowledgement, setter, retry-by-fd-number or exported assembly.
 const pendingOwners = new Set<Owner>();
@@ -50,13 +53,14 @@ function identity(value: unknown, maximum: number): Identity {
     || typeof r.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(r.sha256)) fail("component_invalid");
   return { bytes: r.bytes, sha256: r.sha256 };
 }
-function ownedFile(s: Owner, file: string, directory: boolean, mode?: number, mutableSource = false): OwnedFile {
+function ownedFile(s: Owner, file: string, directory: boolean, mode?: number, mutableSource = false, searchOnly = false): OwnedFile {
   if (file.length > 4096 || s.files.length >= 64) fail("component_invalid");
   const before = lstatSync(file, { bigint: true });
   if ((directory ? !before.isDirectory() || before.nlink < 2n : !before.isFile() || before.nlink !== 1n)
     || mode !== undefined && (before.uid !== BigInt(process.getuid!()) || (before.mode & 0o7777n) !== BigInt(mode)))
     fail("component_invalid");
-  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | (directory ? constants.O_DIRECTORY : 0));
+  const fd = openSync(file, (directory && searchOnly ? O_PATH : constants.O_RDONLY)
+    | constants.O_NOFOLLOW | (directory ? constants.O_DIRECTORY : 0));
   const owner: OwnedFile = { fd, path: file, stat: before, mutableSource, phase: "open" };
   s.files.push(owner);
   const opened = fstatSync(fd, { bigint: true });
@@ -88,9 +92,9 @@ function json(bytes: Buffer): unknown {
 function expected(bytes: Buffer, id: Identity): void {
   if (bytes.length !== id.bytes || hash(bytes) !== id.sha256) fail("component_changed");
 }
-function pinDirectory(s: Owner, directory: string, mode?: number): OwnedFile {
+function pinDirectory(s: Owner, directory: string, mode?: number, searchOnly = false): OwnedFile {
   if (realpathSync(directory) !== directory) fail("component_changed");
-  return ownedFile(s, directory, true, mode);
+  return ownedFile(s, directory, true, mode, false, searchOnly);
 }
 function componentInput(s: Owner): { binary: OwnedFile; binaryId: Identity; manifestId: Identity } {
   for (const directory of [path.join(root, "build"), path.join(root, "build", "maintenance-platform")]) {
@@ -202,9 +206,10 @@ export async function inspectSelectedSqlitePathBinding(): Promise<Observation> {
   let output: Observation | undefined, failure: unknown, failed = false;
   try {
     const built = componentInput(s);
-    let directory = path.dirname(source.sqlitePath);
+    const sourceDirectory = path.dirname(source.sqlitePath);
+    let directory = sourceDirectory;
     for (;;) {
-      pinDirectory(s, directory);
+      pinDirectory(s, directory, undefined, directory !== sourceDirectory);
       const parent = path.dirname(directory); if (parent === directory) break;
       directory = parent;
     }
