@@ -17,6 +17,8 @@
 #include <stdio.h>
 
 long __real_syscall(long number, ...);
+int __real_close(int fd);
+ssize_t __real_read(int fd, void *buffer, size_t size);
 #if defined(P3_TEST_CONTENT_OPEN_FAILURE) || defined(P3_TEST_CONTENT_CLOSE_FAILURE) || \
     defined(P3_TEST_PSEUDO_CLOSE_FAILURE) || defined(P3_TEST_SHORT_READS) || \
     defined(P3_TEST_NO_EOF) || defined(P3_TEST_SOURCE_CHANGE) || defined(P3_TEST_BYTE_BUDGET) || \
@@ -87,7 +89,6 @@ static void block_forget(int fd) {
     block_owned[i] = block_owned[--block_owned_count]; return;
   }
 }
-int __real_close(int fd);
 #if defined(P3_TEST_BLOCK_RAW_CHANGE) || defined(P3_TEST_BLOCK_IDENTITY_CHANGE) || defined(P3_TEST_BLOCK_APPEAR) || defined(P3_TEST_BLOCK_BAD_CHANGE)
 static int block_write(const char *name, const char *bytes) {
   char target[4096]; snprintf(target, sizeof(target), "%s/devices/m04-test-node/%s", P3_TEST_BLOCK_ROOT, name);
@@ -131,7 +132,6 @@ ssize_t __wrap_readlinkat(int fd, const char *name, char *buffer, size_t size) {
   }
   return __real_readlinkat(fd, name, buffer, size);
 }
-ssize_t __real_read(int fd, void *buffer, size_t size);
 ssize_t __wrap_read(int fd, void *buffer, size_t size) {
 #ifdef P3_TEST_MB_READERS
   if (block_kind(fd) == 9 && size) {
