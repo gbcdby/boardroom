@@ -14,6 +14,7 @@ import type { HistoryObservationInput, RawCell, RawTable } from "../../src/serve
 import type { SourceClientRawRow } from "../../src/server/storage/maintenance/types.ts";
 import { OriginStore, ORIGIN_TIME, originCell, originRawValue, originSet } from "./m2-origin-fixture-store.ts";
 import type { OriginChange } from "./m2-origin-fixture-store.ts";
+import { seedOriginAdvancedWorkspace } from "./m2-origin-fixture-advanced.ts";
 
 const quote = (value: string) => '"' + value.replaceAll('"', '""') + '"';
 const exitedProcess = { version: 1, launcherProtocol: "linux-private-net-v1", pid: 456, kernelBootId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", pidNamespace: "pid:[4026531836]", startTicks: "200" };
@@ -59,7 +60,7 @@ function captureTables(db: Database.Database, template: HistoryObservationInput)
 
 /** Real native SQLite old rows and original strict value artifacts. Native source/process,
  * Fs/capability and backup verification fields are explicit value fixtures, never qualification. */
-export async function m2OriginP0Fixture(change?: OriginChange, options: { pageSize?: 512 | 1024 | 4096; includeHistoricalClient?: boolean } = {}) {
+export async function m2OriginP0Fixture(change?: OriginChange, options: { pageSize?: 512 | 1024 | 4096; includeHistoricalClient?: boolean; advancedWorkspace?: boolean } = {}) {
   const db = new Database(":memory:"), store = new OriginStore(change);
   try {
     const pageSize = options.pageSize ?? 4096; assert([512, 1024, 4096].includes(pageSize));
@@ -69,6 +70,7 @@ export async function m2OriginP0Fixture(change?: OriginChange, options: { pageSi
     // and the initial random marker. No byte editing or rowid-changing VACUUM.
     db.pragma("secure_delete=ON");
     runMigrations(db, migrations); seed(db);
+    if (options.advancedWorkspace) seedOriginAdvancedWorkspace(db);
     const template = p0ArtifactFixture({ journalVersion: 2 }), initial = readSqliteManifests(db);
     const f = controlVector({ initialVersion: 2, mechanism: {
       sourceIdentity: { kind: "sqlite", sourcePath: "/a12/source-alias.sqlite", sqlitePath: "/a12/source.sqlite", device: "1", inode: "2" },
