@@ -1095,6 +1095,61 @@ static void p3_kernel_after_reader(p3_context *c, p3_read *first, int base, cons
 static void p3_kernel_after(p3_context *c, p3_read *first, int base, const char *path, size_t limit, long magic) {
   p3_kernel_after_reader(c, first, base, path, limit, magic, P3_KERNEL_GENERIC);
 }
+static bool p3_mb_literal(const unsigned char **cursor, const unsigned char *end, const char *literal) {
+  const size_t length = strlen(literal);
+  if ((size_t)(end - *cursor) < length || memcmp(*cursor, literal, length)) return false;
+  *cursor += length; return true;
+}
+static bool p3_mb_decimal(const unsigned char **cursor, const unsigned char *end) {
+  if (*cursor >= end) return false;
+  uint32_t value = 0;
+  if (**cursor == '0') (*cursor)++;
+  else {
+    if (**cursor < '1' || **cursor > '9') return false;
+    do {
+      const unsigned digit = *(*cursor)++ - '0';
+      if (value > (UINT32_MAX - digit) / 10) return false;
+      value = value * 10 + digit;
+    } while (*cursor < end && **cursor >= '0' && **cursor <= '9');
+  }
+  if (*cursor >= end || **cursor != '\n') return false;
+  (*cursor)++; return true;
+}
+static bool p3_mb_summary_bit(const p3_read *read, unsigned *bit) {
+  if (!read->ok || !read->length || read->length > 16384 || read->bytes[read->length - 1] != '\n') return false;
+  const unsigned char *cursor = read->bytes, *end = read->bytes + read->length;
+  if (!p3_mb_literal(&cursor, end, "optimize_scan: ") || cursor >= end || (*cursor != '0' && *cursor != '1')) return false;
+  *bit = *cursor++ - '0';
+  if (!p3_mb_literal(&cursor, end, "\n")) return false;
+  for (unsigned section = 0; section < 2; section++) {
+    if (!p3_mb_literal(&cursor, end, section ? "avg_fragment_size_lists:\n" : "max_free_order_lists:\n")) return false;
+    for (unsigned order = 0; order < 14; order++) {
+      char label[64]; snprintf(label, sizeof(label), "\tlist_order_%u_groups: ", order);
+      if (!p3_mb_literal(&cursor, end, label) || !p3_mb_decimal(&cursor, end)) return false;
+    }
+  }
+  return cursor == end;
+}
+static void p3_mb_summary_after(p3_context *c, p3_read *first, int base) {
+  p3_read second = p3_kernel_read_phase(c, base, "mb_structs_summary", 16384, PROC_SUPER_MAGIC, true,
+    first->read_count, P3_KERNEL_GENERIC);
+  p3_extend_calls(c, first->calls, second.calls);
+  if ((first->ok && second.ok && (!p3_same_identity(&first->st, &second.st) || first->fs.f_type != second.fs.f_type)) ||
+      (first->ok && second.open_error == ENOENT) || (first->open_error == ENOENT && second.ok)) {
+    p3_changed(c); first->reason = "binding";
+  }
+  if (first->ok && second.ok && !first->reason) {
+    unsigned before_bit = 0, after_bit = 0;
+    const bool before_valid = p3_mb_summary_bit(first, &before_bit), after_valid = p3_mb_summary_bit(&second, &after_bit);
+    if (before_valid != after_valid || (before_valid && before_bit != after_bit)) {
+      p3_changed(c); first->reason = "binding";
+    } else if (!before_valid) first->reason = "format";
+  }
+  if (!first->reason) first->reason = second.reason;
+  first->ok = !first->reason; first->read_count = second.read_count;
+  if (first->open_error != ENOENT || second.open_error != ENOENT) first->open_error = 0;
+  first->result = p3_fact(c, first->calls, first->ok ? first->value : NULL, first->reason);
+}
 /* No caller-selected path, descriptor, node, read limit or magic enters these
  * readers. The supplied base is the original source-derived node zero FD. */
 static const char *p3_block_leaf(p3_reader reader) {
@@ -1909,7 +1964,7 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
   napi_value tune_value = p3_sample_join(&c, &tune, &tune_after);
   p3_kernel_after(&c, &options, proc_fd, "options", 16384, PROC_SUPER_MAGIC);
   p3_kernel_after(&c, &mb_groups, proc_fd, "mb_groups", 16384, PROC_SUPER_MAGIC);
-  p3_kernel_after(&c, &mb_structs_summary, proc_fd, "mb_structs_summary", 16384, PROC_SUPER_MAGIC);
+  p3_mb_summary_after(&c, &mb_structs_summary, proc_fd);
   p3_sample legacy_after = p3_statx_fact(&c, owner->fd, &before, false, &legacy_after_raw, &legacy_after_available, true);
   p3_sample unique_after = p3_statx_fact(&c, owner->fd, &before, true, &unique_after_raw, &unique_after_available, true);
   p3_sample mount_after = p3_statmount_fact(&c, &unique_after_raw, unique_after_available, true);
