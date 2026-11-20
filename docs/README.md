@@ -7,6 +7,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [agent-workflow.md](agent-workflow.md) | 可调整的 Agent 工作流程 |
+| [local-ci.md](local-ci.md) | 本地快速 CI 入口、执行范围与不能替代云端的边界 |
 | [architecture/agent-studio.md](architecture/agent-studio.md) | 产品宏观架构、范围与验收基线 |
 | [architecture/data-model.md](architecture/data-model.md) | 持久化数据模型、v13 事实版本、v14 角色/别名、v15 项目工作区与共同事务边界 |
 | [prototypes/br-collab-20261112-v2/](prototypes/br-collab-20261112-v2/README.md) | 协作界面 v2 静态视觉基准：五类页面的浅色／深色原图与文件清单 |
