@@ -71,6 +71,17 @@ function requireValue(value: unknown, subject = "source-file-profile-material"):
   if (!value) throw unavailable(subject);
 }
 function requireSame(value: unknown): asserts value { if (!value) throw changed(); }
+function sourceFileStatxPermitted(attributes: bigint, attributesMask: bigint): boolean {
+  const required = 0x200800n; // STATX_ATTR_ENCRYPTED | STATX_ATTR_DAX, both known and clear.
+  return (attributesMask & required) === required && (attributes & required) === 0n;
+}
+/** A value predicate only. It cannot issue a profile or authenticate an owner;
+ * callers must first bind these facts to their genuine current source FD. */
+export function sourceFileInodePermitted(kind: "file" | "directory", flags: bigint,
+  attributes: bigint, attributesMask: bigint): boolean {
+  return sourceFileStatxPermitted(attributes, attributesMask)
+    && (kind === "file" ? flags === 0x80000n : kind === "directory" && (flags === 0x80000n || flags === 0x81000n));
+}
 function observed<T>(fact: SourceFileContextFact<T>): T {
   if (fact.status !== "observed") {
     if (fact.reason === "identity") throw changed();
@@ -330,6 +341,9 @@ function analyzeEnvironment(context: SourceFileRootContext | SourceFileBootstrap
   const legacy = parseStatx(observed(environment.mount.legacyStatx), false, metadata);
   const unique = parseStatx(observed(environment.mount.uniqueStatx), true, metadata);
   requireSame(legacy.birthtimeNs === unique.birthtimeNs && legacy.attributes === unique.attributes && legacy.attributesMask === unique.attributesMask);
+  // Metadata-only bootstrap and tail have real source statx, but no readable
+  // GETFLAGS. In bootstrap this analysis precedes the first ordinary R open.
+  requireValue(sourceFileStatxPermitted(unique.attributes, unique.attributesMask), "source-file-inode-attributes");
   const mount = parseMount(observed(environment.mount.statmount), legacy, unique);
   const mountinfo = selectedMountinfo(observed(environment.mount.mountinfo).bytes, mount);
   const tune = observed(environment.configuration.tune); requireValue(tune.length === 232);
@@ -361,8 +375,7 @@ function analyzeEnvironment(context: SourceFileRootContext | SourceFileBootstrap
     requireSame(root.fid.value.mountId === unique.id && context.uniqueStatx.uniqueMountId === unique.id
       && context.legacyStatx.mountId === legacy.id && context.uniqueStatx.ino === metadata.ino
       && context.legacyStatx.ino === metadata.ino);
-    requireValue((unique.attributesMask & 0x200000n) !== 0n && (unique.attributes & 0x200000n) === 0n
-      && (metadata.kind === "directory" ? root.inodeFlags.value === 0x80000n || root.inodeFlags.value === 0x81000n : root.inodeFlags.value === 0x80000n),
+    requireValue(sourceFileInodePermitted(metadata.kind, root.inodeFlags.value, unique.attributes, unique.attributesMask),
     "source-file-inode-attributes");
     anchor = { metadata, uuid: root.uuid.value, fid: root.fid.value, flags: root.inodeFlags.value, xattrs: root.xattrs.value,
       birthtimeNs: unique.birthtimeNs, attributes: unique.attributes, attributesMask: unique.attributesMask };

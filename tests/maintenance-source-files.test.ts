@@ -20,6 +20,127 @@ async function rejected(work: Promise<unknown>) {
   try { await work; } catch (error) { return { rejected: true, error: error as { code: string; cause: unknown; closeErrors: unknown[]; tcutReached: boolean } }; }
   assert.fail("operation unexpectedly succeeded");
 }
+
+linuxTest("#152 IG1 capture rejects a non-narrow child before its payload", async () => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: false, prepare: true });
+  try {
+    f.state.flags.set(path.join(f.sessions, "nested", "binary"), 0x40n);
+    const result = await rejected(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference));
+    assert.equal(result.error.code, "backup_capability_unavailable");
+    assert(!f.state.events.includes("read:sessions/nested/binary"));
+    assert.equal(result.error.tcutReached, false); assert.equal(f.state.handles.size, 0);
+  } finally { await f.close(); await copy.close(); }
+});
+
+linuxTest("#152 IG1 same-source parent is admitted before child enumeration or payload", async () => {
+  const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: false, prepare: true });
+  try {
+    f.state.flags.set(f.directory, 0x40n);
+    const result = await rejected(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference));
+    assert.equal(result.error.code, "backup_capability_unavailable");
+    assert(!f.state.events.some(event => /^(read|enumerate|synchronize):/.test(event)));
+    assert.equal(result.error.tcutReached, false); assert.equal(f.state.handles.size, 0);
+  } finally { await f.close(); await copy.close(); }
+});
+
+linuxTest("#152 IG1 every first selected object rejects unsupported inode attributes before use", async t => {
+  const cases = [
+    ["config", "flags"], ["root", "flags"], ["directory", "flags"], ["absent", "flags"],
+    ["file", "encrypted"], ["file", "DAX"], ["file", "encrypted-mask"], ["file", "DAX-mask"],
+    ["directory", "encrypted"], ["directory", "DAX-mask"], ["parent", "encrypted"], ["parent", "DAX-mask"],
+  ] as const;
+  for (const [target, change] of cases) await t.test(`${target}/${change}`, async () => {
+    const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: target === "config", prepare: true,
+      sessions: target === "absent" ? "absent" : "present" });
+    const file = target === "config" ? f.config : target === "root" ? f.sessions : target === "directory"
+      ? path.join(f.sessions, "nested") : target === "parent" || target === "absent" ? f.directory
+        : path.join(f.sessions, "nested", "binary");
+    try {
+      if (change === "flags") f.state.flags.set(file, 0n);
+      else f.state.hook = (operation, current, value: any) => {
+        if (current !== file || !["statx-legacy-result", "statx-unique-result"].includes(operation)) return;
+        const bit = change.startsWith("encrypted") ? 0x800n : 0x200000n;
+        if (change.endsWith("mask")) value.attributesMask &= ~bit; else value.attributes |= bit;
+      };
+      const result = await rejected(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference));
+      assert.equal(result.error.code, "backup_capability_unavailable");
+      const relative = path.relative(f.directory, file);
+      assert(!f.state.events.some(event => ["read:", "enumerate:", "synchronize:"].some(prefix => event === prefix + relative)));
+      if (target === "parent") assert(!f.state.events.some(event => /^(read|enumerate|synchronize):/.test(event)));
+      assert.equal(result.error.tcutReached, false); assert.equal(f.state.handles.size, 0);
+    } finally { await f.close(); await copy.close(); }
+  });
+});
+
+linuxTest("#152 IG1 preserves the first snapshot across visit and independent V or F", async t => {
+  for (const scenario of ["visit", "root-visit", "V", "F"]) await t.test(scenario, async () => {
+    const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: false, prepare: true });
+    const file = scenario === "root-visit" ? f.sessions : path.join(f.sessions, "nested", "binary");
+    let extended = 0, reopened = 0, armed = false;
+    try {
+      f.state.hook = (operation, current) => {
+        if (current !== file) return;
+        if (operation === "profile:metadata-tail-result") armed = true;
+        if (scenario === "root-visit" && armed && operation === "extended"
+          || scenario === "visit" && operation === "extended" && ++extended === 2
+          || ["V", "F"].includes(scenario) && operation === "reopen-file" && ++reopened === (scenario === "V" ? 1 : 2))
+          f.state.flags.set(file, 0x40n);
+      };
+      const result = await rejected(copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference));
+      assert.equal(result.error.code, "source_changed");
+      const relative = path.relative(f.directory, file);
+      if (scenario !== "F") assert(!f.state.events.includes("read:" + relative));
+      if (scenario === "root-visit") assert(!f.state.events.includes("enumerate:" + relative));
+      assert.equal(f.state.events.filter(event => event === "synchronize:" + relative).length, scenario === "F" ? 1 : 0);
+      assert.equal(result.error.tcutReached, false); assert.equal(f.state.handles.size, 0);
+    } finally { await f.close(); await copy.close(); }
+  });
+});
+
+linuxTest("#152 IG1 preserves foreign parent eligibility and explicit directory mount boundaries", async t => {
+  for (const scenario of ["different-device", "different-filesystem", "different-mount"]) await t.test(scenario, async () => {
+    const copy = await isolatedSourceFiles(), f = await sourceFilesFixture({ config: false, prepare: true });
+    const originalLstat = promises.lstat;
+    let parentLookup = false, parentLookups = 0;
+    try {
+      // These are explicit inert boundary observations over the same owned
+      // ordinary FDs. No actual mount/device or production profile is created.
+      if (scenario === "different-device") {
+        t.mock.method(promises, "lstat", async (...args: any[]) => {
+          // Scope this inert device to the original parent's immediate path
+          // binding. ArtifactStore's independent real ancestors stay real.
+          const selected = parentLookup && String(args[0]) === f.directory;
+          if (selected) { parentLookup = false; parentLookups++; }
+          const value = await Reflect.apply(originalLstat, promises, args);
+          if (selected && typeof value.dev === "bigint") value.dev += 1n;
+          return value;
+        });
+        syncBuiltinESMExports();
+      }
+      f.state.flags.set(f.directory, 0x40n); // Must not run the source narrow predicate here.
+      f.state.hook = (operation, file, value: any) => {
+        if (file !== f.directory) return;
+        if (operation === "observe-result") {
+          if (scenario === "different-device") {
+            value.dev += 1n; parentLookup = true; queueMicrotask(() => { parentLookup = false; });
+          }
+          if (scenario === "different-filesystem") value.fsType = 0x794c7630n;
+        }
+        if (scenario !== "different-mount" && operation === "extended") assert.fail("foreign prefix entered full ext4 snapshot");
+        if (scenario === "different-mount") {
+          if (operation === "statx-legacy-result") value.mountId += 1n;
+          if (operation === "statx-unique-result") value.uniqueMountId += 1n;
+          if (operation === "extended-result") value.fid.value.mountId += 1n;
+        }
+      };
+      await copy.module.captureSourceFiles(f.store, f.lock, f.mutex, f.reference);
+      assert(!f.state.events.includes("synchronize:")); assert(!f.state.events.includes("transfer-carrier:"));
+      assert(f.state.events.includes("transfer-carrier:sessions")); assert.equal(f.state.handles.size, 0);
+      assert.equal(f.state.events.includes("extended:"), scenario === "different-mount");
+      if (scenario === "different-device") assert(parentLookups >= 2, "before and after original parent pathname checks");
+    } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); await copy.close(); }
+  });
+});
 async function manifests(store: ArtifactStore): Promise<string[]> {
   const names: string[] = [];
   try {
