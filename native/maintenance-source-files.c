@@ -1889,6 +1889,7 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
   const int health_fd = health_dir.valid ? health_dir.fd : -1, proc_fd = ext4_proc.valid ? ext4_proc.fd : -1;
   p3_read options = p3_kernel_read(&c, proc_fd, "options", 16384, PROC_SUPER_MAGIC);
   p3_read mb_groups = p3_kernel_read(&c, proc_fd, "mb_groups", 16384, PROC_SUPER_MAGIC);
+  p3_read mb_structs_summary = p3_kernel_read(&c, proc_fd, "mb_structs_summary", 16384, PROC_SUPER_MAGIC);
   p3_read journal_before = p3_kernel_read(&c, health_fd, "journal_task", 4096, SYSFS_MAGIC);
   p3_sample ioprio = p3_ioprio_fact(&c, &journal_before, false);
   static const char *health_names[] = {"errors_count", "first_error_errcode", "last_error_errcode", "first_error_ino",
@@ -1908,6 +1909,7 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
   napi_value tune_value = p3_sample_join(&c, &tune, &tune_after);
   p3_kernel_after(&c, &options, proc_fd, "options", 16384, PROC_SUPER_MAGIC);
   p3_kernel_after(&c, &mb_groups, proc_fd, "mb_groups", 16384, PROC_SUPER_MAGIC);
+  p3_kernel_after(&c, &mb_structs_summary, proc_fd, "mb_structs_summary", 16384, PROC_SUPER_MAGIC);
   p3_sample legacy_after = p3_statx_fact(&c, owner->fd, &before, false, &legacy_after_raw, &legacy_after_available, true);
   p3_sample unique_after = p3_statx_fact(&c, owner->fd, &before, true, &unique_after_raw, &unique_after_available, true);
   p3_sample mount_after = p3_statmount_fact(&c, &unique_after_raw, unique_after_available, true);
@@ -1924,7 +1926,10 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
   p3_block_format(&c, &block_diskseq, P3_M04_DISKSEQ);
   if (graph) { p3_graph_after(&c, graph); p3_finish_nodes(&c, graph); }
   p3_directory_after(&c, &health_dir); p3_directory_after(&c, &ext4_proc);
-  if (!ext4_proc.post_valid) { p3_read_reject(&c, &options, "binding"); p3_read_reject(&c, &mb_groups, "binding"); }
+  if (!ext4_proc.post_valid) {
+    p3_read_reject(&c, &options, "binding"); p3_read_reject(&c, &mb_groups, "binding");
+    p3_read_reject(&c, &mb_structs_summary, "binding");
+  }
   if (!health_dir.post_valid) {
     p3_read_reject(&c, &journal_before, "binding"); p3_read_reject(&c, &journal_after, "binding");
     for (unsigned i = 0; i < 13; i++) p3_read_reject(&c, &health_reads[i], "binding");
@@ -1986,6 +1991,7 @@ static napi_value observe_environment(napi_env env, napi_callback_info info) {
   (void)p3_property(&c, mount_group, "statmount", mount_value); (void)p3_property(&c, mount_group, "mountinfo", mountinfo.result);
   (void)p3_property(&c, configuration, "tune", tune_value); (void)p3_property(&c, configuration, "options", options.result);
   (void)p3_property(&c, configuration, "mbGroups", mb_groups.result); (void)p3_property(&c, configuration, "journalTaskBefore", journal_before.result);
+  (void)p3_property(&c, configuration, "mbStructsSummary", mb_structs_summary.result);
   (void)p3_property(&c, configuration, "journalTaskAfter", journal_after.result); (void)p3_property(&c, configuration, "journalIoprio", ioprio_value);
   const bool device_stable = device_bound && device_node->post_valid;
   if (!device_stable) {

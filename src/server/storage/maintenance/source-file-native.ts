@@ -160,6 +160,7 @@ export interface SourceFileRootEnvironment {
     readonly mountinfo: SourceFileContextFact<SourceFileKernelReadValue> };
   readonly configuration: { readonly tune: SourceFileContextFact<Buffer>;
     readonly options: SourceFileContextFact<SourceFileKernelReadValue>; readonly mbGroups: SourceFileContextFact<SourceFileKernelReadValue>;
+    readonly mbStructsSummary: SourceFileContextFact<SourceFileKernelReadValue>;
     readonly journalTaskBefore: SourceFileContextFact<SourceFileKernelReadValue>;
     readonly journalIoprio: SourceFileContextFact<{ readonly which: bigint; readonly who: bigint; readonly rawValue: bigint }>;
     readonly journalTaskAfter: SourceFileContextFact<SourceFileKernelReadValue> };
@@ -874,7 +875,7 @@ function checkedEnvironment(value: unknown, info: SourceFileRootInfo, tail = fal
   const process = exactObject(item.process, ["identity", "threadStatus", "processStat", "namespaces"]);
   const kernel = exactObject(item.kernel, ["uname", "notes", "config"]);
   const mount = exactObject(item.mount, ["legacyStatx", "uniqueStatx", "statmount", "mountinfo"]);
-  const configuration = exactObject(item.configuration, ["tune", "options", "mbGroups", "journalTaskBefore", "journalIoprio", "journalTaskAfter"]);
+  const configuration = exactObject(item.configuration, ["tune", "options", "mbGroups", "mbStructsSummary", "journalTaskBefore", "journalIoprio", "journalTaskAfter"]);
   const device = exactObject(item.device, ["binding", "dev", "uevent", "topology", "blockAttributes"]);
   const health = exactObject(item.health, ["binding", "fields"]);
   function read(raw: unknown, limit: number, magic: bigint, samples: 1 | 2 = 1): SourceFileContextFact<SourceFileKernelReadValue> {
@@ -934,6 +935,7 @@ function checkedEnvironment(value: unknown, info: SourceFileRootInfo, tail = fal
       statmount, mountinfo: read(mount.mountinfo, 1048576, 0x9fa0n) }),
     configuration: Object.freeze({ tune: abi(configuration.tune, "ioctl-get-tune", 232, 2), options: read(configuration.options, 16384, 0x9fa0n, 2),
       mbGroups: read(configuration.mbGroups, 16384, 0x9fa0n, 2), journalTaskBefore: read(configuration.journalTaskBefore, 4096, 0x62656572n),
+      mbStructsSummary: read(configuration.mbStructsSummary, 16384, 0x9fa0n, 2),
       journalIoprio: ioprio, journalTaskAfter: read(configuration.journalTaskAfter, 4096, 0x62656572n) }),
     device: Object.freeze({ binding, dev, uevent: read(device.uevent, 4096, 0x62656572n, 2), topology, blockAttributes }),
     health: Object.freeze({ binding: checkedHealthBinding(health.binding), fields: Object.freeze(fields) }),

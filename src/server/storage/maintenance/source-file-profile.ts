@@ -252,6 +252,32 @@ function parseOptions(raw: Buffer): Readonly<Record<string, string | true>> {
   }
   return Object.freeze(result);
 }
+/** Exact proc output for the fixed 4 KiB domain (14 allocator orders).
+ * The first line is the observed bit; group counts never supply a default. */
+function parseMbAllocation(raw: Buffer, optionsRaw: Buffer) {
+  requireValue(raw.length <= 16384 && raw.every(byte => byte < 128) && raw.at(-1) === 10
+    && !raw.includes(0) && !raw.includes(13), "source-file-mb-summary");
+  const lines = text(raw).split("\n");
+  requireValue(lines.length === 32 && lines[31] === "" && /^optimize_scan: [01]$/.test(lines[0]!)
+    && lines[1] === "max_free_order_lists:" && lines[16] === "avg_fragment_size_lists:", "source-file-mb-summary");
+  function groups(start: number): readonly bigint[] {
+    return Object.freeze(Array.from({ length: 14 }, (_, order) => {
+      const prefix = `\tlist_order_${order}_groups: `, line = lines[start + order]!;
+      requireValue(line.startsWith(prefix), "source-file-mb-summary");
+      return decimal(line.slice(prefix.length), 0xffffffffn);
+    }));
+  }
+  const mbOptimizeScan = BigInt(lines[0]!.at(-1)!);
+  const allocation = Object.freeze({ mbOptimizeScan, maxFreeOrderGroups: groups(2), avgFragmentSizeGroups: groups(17) });
+  // This endpoint is one LF-terminated token per line, unlike the general
+  // mechanical option parser. An explicit bit must agree with the actual leaf.
+  requireValue(optionsRaw.at(-1) === 10 && !optionsRaw.includes(44) && !optionsRaw.includes(13)
+    && !optionsRaw.includes(0), "source-file-effective-options");
+  const options = parseOptions(optionsRaw), explicit = options.mb_optimize_scan;
+  requireValue(explicit === undefined || (explicit === "0" || explicit === "1") && BigInt(explicit) === mbOptimizeScan,
+    "source-file-mb-options");
+  return { options, allocation };
+}
 function kernelMaterial(environment: SourceFileRootEnvironment): unknown {
   const raw = observed(environment.kernel.uname); requireValue(raw.length === 390);
   const names = ["sysname", "nodename", "release", "version", "machine", "domainname"] as const;
@@ -309,7 +335,8 @@ function analyzeEnvironment(context: SourceFileRootContext | SourceFileBootstrap
   const tune = observed(environment.configuration.tune); requireValue(tune.length === 232);
   // SET capabilities/default_mnt_opts remain raw. They are not GET-valid bits
   // or a substitute for the complete current effective configuration.
-  const options = parseOptions(observed(environment.configuration.options).bytes);
+  const mbStructsSummary = observed(environment.configuration.mbStructsSummary).bytes;
+  const { options, allocation: mbAllocation } = parseMbAllocation(mbStructsSummary, observed(environment.configuration.options).bytes);
   const before = text(observed(environment.configuration.journalTaskBefore).bytes);
   const after = text(observed(environment.configuration.journalTaskAfter).bytes);
   requireValue(/^[1-9][0-9]*\n$/.test(before) && /^[1-9][0-9]*\n$/.test(after), "source-file-journal-task");
@@ -340,7 +367,7 @@ function analyzeEnvironment(context: SourceFileRootContext | SourceFileBootstrap
     anchor = { metadata, uuid: root.uuid.value, fid: root.fid.value, flags: root.inodeFlags.value, xattrs: root.xattrs.value,
       birthtimeNs: unique.birthtimeNs, attributes: unique.attributes, attributesMask: unique.attributesMask };
   }
-  const configuration = { kernel, tune, options, mbGroups, journalIoprio: journal.rawValue,
+  const configuration = { kernel, tune, options, mbGroups, mbStructsSummary, mbAllocation, journalIoprio: journal.rawValue,
     mount: { filesystemType: mount.filesystemType, root: mount.root, attributes: mount.attributes,
       superblockFlags: mount.superblockFlags, propagation: mount.propagation },
     unresolved: UNPROVEN };

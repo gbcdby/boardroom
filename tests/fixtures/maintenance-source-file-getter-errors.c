@@ -35,6 +35,24 @@ static struct { int fd, kind; } block_owned[64];
 static size_t block_owned_count;
 static unsigned block_size_opens, block_disk_opens;
 static bool block_fault_applied;
+#ifdef P3_TEST_MB_READERS
+/* Additional fixed test-only mapping: the actual /proc anchor retains real
+ * process observations; only its exact ext4 directory is mapped to owned
+ * ordinary files. Source filesystem and that mapped directory's magic are
+ * modeled. No value here is an actual ext4 qualification observation. */
+static bool mb_fault_applied;
+static unsigned mb_summary_opens;
+static bool mb_source_fd(int fd) {
+  char link[64], target[4096];
+  snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+  ssize_t size = readlink(link, target, sizeof(target) - 1);
+  if (size < 0) return false;
+  target[size] = 0;
+  const size_t root_size = strlen(P3_TEST_MB_SOURCE_ROOT);
+  return !strncmp(target, P3_TEST_MB_SOURCE_ROOT, root_size) &&
+    (target[root_size] == 0 || target[root_size] == '/');
+}
+#endif
 static int block_kind(int fd) {
   for (size_t i = 0; i < block_owned_count; i++) if (block_owned[i].fd == fd) return block_owned[i].kind;
   return 0;
@@ -64,8 +82,25 @@ int __real_fstatfs(int fd, struct statfs *value);
 int __wrap_fstatfs(int fd, struct statfs *value) {
   const int rc = __real_fstatfs(fd, value);
   if (!rc && block_kind(fd)) value->f_type = SYSFS_MAGIC;
+#ifdef P3_TEST_MB_READERS
+  if (!rc && block_kind(fd) >= 7) value->f_type = PROC_SUPER_MAGIC;
+  if (!rc && mb_source_fd(fd)) value->f_type = EXT4_SUPER_MAGIC;
+#endif
   return rc;
 }
+#ifdef P3_TEST_MB_READERS
+int __real_fstatat(int fd, const char *name, struct stat *value, int flags);
+int __wrap_fstatat(int fd, const char *name, struct stat *value, int flags) {
+  if (block_kind(fd) == 7 && !strcmp(name, "fs/ext4/m04-test-node")) {
+#ifdef P3_TEST_MB_PROC_UNAVAILABLE
+    errno = EACCES; return -1;
+#else
+    return __real_fstatat(AT_FDCWD, P3_TEST_MB_PROC_ROOT, value, flags);
+#endif
+  }
+  return __real_fstatat(fd, name, value, flags);
+}
+#endif
 ssize_t __real_readlinkat(int fd, const char *name, char *buffer, size_t size);
 ssize_t __wrap_readlinkat(int fd, const char *name, char *buffer, size_t size) {
   int target = -1; char extra;
@@ -78,6 +113,16 @@ ssize_t __wrap_readlinkat(int fd, const char *name, char *buffer, size_t size) {
 }
 ssize_t __real_read(int fd, void *buffer, size_t size);
 ssize_t __wrap_read(int fd, void *buffer, size_t size) {
+#ifdef P3_TEST_MB_READERS
+  if (block_kind(fd) == 9 && size) {
+#ifdef P3_TEST_MB_BUDGET
+    size = 1;
+#elif !defined(P3_TEST_MB_LIMIT) && !defined(P3_TEST_MB_OVERSIZED)
+    if (size > 17) size = 17;
+#endif
+    return __real_read(fd, buffer, size);
+  }
+#endif
   // Short reads are real reads of the same original leaf, never invented bytes.
   return __real_read(fd, buffer, block_kind(fd) == 3 && size ? 1 : size);
 }
@@ -92,6 +137,44 @@ int __wrap_close(int fd) {
   const int kind = block_kind(fd), rc = __real_close(fd);
   if (rc) return rc;
   block_forget(fd);
+#ifdef P3_TEST_MB_READERS
+  if (kind == 9 && !mb_fault_applied) {
+#if defined(P3_TEST_MB_CLOSE_FAILURE)
+    mb_fault_applied = true; errno = EIO; return -1;
+#elif defined(P3_TEST_MB_RAW_CHANGE) || defined(P3_TEST_MB_BAD_CHANGE)
+    mb_fault_applied = true;
+    int output = open(P3_TEST_MB_PROC_ROOT "/mb_structs_summary", O_WRONLY | O_CLOEXEC);
+    if (output < 0) return -1;
+    ssize_t wrote = pwrite(output,
+#ifdef P3_TEST_MB_BAD_CHANGE
+      "2",
+#else
+      "1",
+#endif
+      1, 15);
+    int closed = __real_close(output);
+    if (wrote != 1 || closed) { errno = EIO; return -1; }
+#elif defined(P3_TEST_MB_IDENTITY_CHANGE)
+    mb_fault_applied = true;
+    if (rename(P3_TEST_MB_PROC_ROOT "/mb_structs_summary", P3_TEST_MB_PROC_ROOT "/retained-summary")) return -1;
+    int input = open(P3_TEST_MB_PROC_ROOT "/retained-summary", O_RDONLY | O_CLOEXEC);
+    if (input < 0) return -1;
+    char bytes[16385]; ssize_t size = __real_read(input, bytes, sizeof(bytes)); int closed = __real_close(input);
+    if (size < 0 || closed) { errno = EIO; return -1; }
+    int output = open(P3_TEST_MB_PROC_ROOT "/mb_structs_summary", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (output < 0) return -1;
+    ssize_t wrote = write(output, bytes, (size_t)size); closed = __real_close(output);
+    if (wrote != size || closed) { errno = EIO; return -1; }
+#elif defined(P3_TEST_MB_DISAPPEAR)
+    mb_fault_applied = true;
+    return unlink(P3_TEST_MB_PROC_ROOT "/mb_structs_summary");
+#elif defined(P3_TEST_MB_PROC_CHANGE)
+    mb_fault_applied = true;
+    if (rename(P3_TEST_MB_PROC_ROOT, P3_TEST_MB_PROC_ROOT "-retained")) return -1;
+    return mkdir(P3_TEST_MB_PROC_ROOT, 0700);
+#endif
+  }
+#endif
   if (block_fault_applied) return rc;
 #if defined(P3_TEST_BLOCK_CLOSE_FAILURE)
   if (kind == 3) { block_fault_applied = true; errno = EIO; return -1; }
@@ -126,6 +209,30 @@ static int block_open(long number, int base, const char *name, const struct open
   if (base == AT_FDCWD && !strcmp(name, "/sys"))
     return block_track((int)__real_syscall(number, base, P3_TEST_BLOCK_ROOT, how, size), 1);
   const int parent = block_kind(base);
+#ifdef P3_TEST_MB_READERS
+  if (base == AT_FDCWD && !strcmp(name, "/proc"))
+    return block_track((int)__real_syscall(number, base, name, how, size), 7);
+  if (parent == 7) {
+    if (!strcmp(name, "fs/ext4/m04-test-node")) {
+      struct open_how fixed = *how;
+      fixed.resolve &= ~(RESOLVE_BENEATH | RESOLVE_NO_XDEV);
+      return block_track((int)__real_syscall(number, AT_FDCWD, P3_TEST_MB_PROC_ROOT, &fixed, size), 8);
+    }
+    return (int)__real_syscall(number, base, name, how, size);
+  }
+  if (parent == 8) {
+    const bool summary = !strcmp(name, "mb_structs_summary");
+    if (summary) mb_summary_opens++;
+    int fd = (int)__real_syscall(number, base, name, how, size), error = errno;
+#ifdef P3_TEST_MB_APPEAR
+    if (summary && mb_summary_opens == 1 && fd < 0 && error == ENOENT) {
+      if (rename(P3_TEST_MB_PROC_ROOT "/available-summary", P3_TEST_MB_PROC_ROOT "/mb_structs_summary")) return -1;
+    }
+#endif
+    errno = error;
+    return block_track(fd, summary ? 9 : 10);
+  }
+#endif
   int kind = 6;
   if (parent == 1 && !strncmp(name, "dev/block/", 10)) kind = 2;
   if (parent == 2 && !strcmp(name, "size")) { kind = 3; block_size_opens++; }
