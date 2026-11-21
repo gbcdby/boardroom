@@ -82,7 +82,12 @@ function uptime(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
   return minutes < 1 ? "不到 1 分钟" : minutes < 60 ? `${minutes} 分钟` : `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
 }
-watch(context.currentProjectId, (id) => { if (id && !disposed) void collabGraph.load(); });
+watch(context.currentProjectId, () => {
+  if (disposed) return;
+  selectedGroupId.value = null;
+  expandedEdge.value = null;
+  void collabGraph.load();
+});
 onMounted(() => { void refresh(); connect(); healthTimer = setInterval(() => void refreshHealth(), 15000); });
 onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInterval(healthTimer); if (reconnectTimer) clearTimeout(reconnectTimer); });
 </script>
@@ -95,7 +100,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
       <div><h1>协作总览</h1><p class="page-description">{{ collabGraph.graph.value.groups.length }} 个群组 · {{ collabGraph.graph.value.memberCount }} 位成员 · {{ collabGraph.graph.value.messageCount }} 条消息</p></div>
       <div class="collab-header-meta">
         <button type="button" class="toolbar-control scope-control" aria-disabled="true" title="范围切换尚未接通" data-testid="p01-scope" @click="explainUnavailable('范围切换')">范围：{{ context.currentProject.value?.name ?? '全部项目' }}<AppIcon name="chevron" :size="14" /></button>
-        <span class="connected-state" :class="healthError || health?.status === 'degraded' ? 'bad' : health ? 'ok' : 'muted'" data-testid="p01-connected"><span class="connected-dot" aria-hidden="true"></span>{{ connectedLabel }} · 刚刚更新</span>
+        <span class="connected-state" :class="healthError || health?.status === 'degraded' ? 'bad' : health ? 'ok' : 'muted'" data-testid="p01-connected"><span class="connected-dot" aria-hidden="true"></span>{{ connectedLabel }}</span>
       </div>
     </header>
     <div v-if="projectError" class="error" role="alert">项目暂时无法加载：{{ projectError }} <button type="button" class="text-button" :disabled="refreshing" @click="refresh">重新加载</button></div>
@@ -121,13 +126,13 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
           <div class="graph-canvas" data-testid="p01-graph-canvas">
             <div v-if="collabGraph.loading.value" class="graph-loading muted small" role="status">正在读取协作关系…</div>
             <p v-else-if="collabGraph.error.value" class="error" role="alert">关系图读取失败：{{ collabGraph.error.value }}</p>
-            <div v-else-if="!collabGraph.graph.value.groups.length && !collabGraph.graph.value.root" class="graph-empty" data-testid="p01-graph-empty">
+            <div v-else-if="!collabGraph.graph.value.groups.length && !collabGraph.graph.value.root && !collabGraph.graph.value.lead" class="graph-empty" data-testid="p01-graph-empty">
               <AppIcon name="layers" :size="30" />
               <strong>当前项目还没有可展示的协作关系</strong>
               <p>为项目添加成员、创建群组并产生消息后，这里会按真实数据生成关系图。此处不注入示例节点。</p>
               <RouterLink v-if="context.currentProjectId" :to="projectPath(context.currentProjectId.value!, 'overview')" class="secondary">管理这个项目<AppIcon name="arrow" :size="15" /></RouterLink>
             </div>
-            <div v-else class="demo-tree" role="img" :aria-label="`真实协作关系图：${collabGraph.graph.value.groups.length} 个群组，${collabGraph.graph.value.memberCount} 位成员，${collabGraph.graph.value.messageCount} 条消息。节点来自真实成员与群，消息方向来自真实发送者。`">
+            <div v-else class="demo-tree" role="group" :aria-label="`按项目真实数据组织的归属层级：${collabGraph.graph.value.groups.length} 个群组，${collabGraph.graph.value.memberCount} 位成员，${collabGraph.graph.value.messageCount} 条消息。节点来自真实成员与群，连线表示群成员归属，消息方向见下方由真实发送者生成的箭头。`">
               <div v-if="collabGraph.graph.value.root" class="tree-node root-node">
                 <span class="avatar avatar-0"><AppIcon name="message" :size="17" /></span>
                 <strong>{{ collabGraph.graph.value.root.name }}</strong><small>{{ collabGraph.graph.value.root.role }}</small>
@@ -141,7 +146,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
               <div v-if="collabGraph.graph.value.lead && collabGraph.graph.value.groups.length" class="tree-stem" aria-hidden="true"></div>
               <div class="tree-groups">
                 <div v-for="group in collabGraph.graph.value.groups" :key="group.id" class="tree-group">
-                  <button type="button" class="tree-group-head group-open-btn" :aria-expanded="selectedGroupId === group.id" :title="`查看「${group.name}」的真实会话`" @click="openInspector(group.id)"><span class="group-icon"><AppIcon :name="group.icon" :size="16" /></span><strong>{{ group.name }}</strong><span class="group-count">{{ group.members.length }} 人</span><AppIcon name="chevron" :size="14" /></button>
+                  <button type="button" class="tree-group-head group-open-btn" :aria-pressed="selectedGroupId === group.id" aria-controls="p01-inspector" :title="`查看「${group.name}」的真实会话`" @click="openInspector(group.id)"><span class="group-icon"><AppIcon :name="group.icon" :size="16" /></span><strong>{{ group.name }}</strong><span class="group-count">{{ group.members.length }} 人</span><AppIcon name="chevron" :size="14" /></button>
                   <div class="group-body">
                     <template v-for="(member, index) in group.members" :key="member.id">
                       <div v-if="index > 0" class="member-connector" aria-hidden="true"></div>
@@ -173,7 +178,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
               </ul>
               <p class="message-arrow-note muted small">箭头方向来自真实消息发送者 → 所属群，最多显示 6 条；历史/补发不伪装为实时。</p>
             </div>
-            <div v-if="selectedConversation" class="inspector" role="region" :aria-label="`${selectedConversation.groupName} 的真实会话`" data-testid="p01-inspector">
+            <div v-if="selectedConversation" id="p01-inspector" class="inspector" role="region" :aria-label="`${selectedConversation.groupName} 的真实会话`" data-testid="p01-inspector">
               <div class="inspector-head"><h3><AppIcon name="message" :size="16" />{{ selectedConversation.groupName }}<span class="side-demo-tag real-tag">真实会话</span></h3><button type="button" class="inspector-close" aria-label="关闭会话检查器" @click="closeInspector"><AppIcon name="close" :size="16" /></button></div>
               <p class="inspector-note muted small">严格对应本群的真实记录，按来源时间显示；无 transcript 不编造工具或思考，切换节点即取消旧选择。</p>
               <ul v-if="selectedConversation.messages.length" class="inspector-messages">
@@ -186,7 +191,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
             </div>
           </div>
           <div class="graph-footer">
-            <ul class="graph-legend" aria-label="关系图图例"><li><span class="legend-line" aria-hidden="true"></span>协作关系</li><li><span class="legend-line legend-arrow" aria-hidden="true"></span>消息方向</li><li><span class="legend-dot ok" aria-hidden="true"></span>连接正常</li></ul>
+            <ul class="graph-legend" aria-label="关系图图例"><li><span class="legend-line" aria-hidden="true"></span>群成员归属</li><li><span class="legend-line legend-arrow" aria-hidden="true"></span>消息方向</li><li><span class="legend-dot ok" aria-hidden="true"></span>连接正常</li><li class="legend-note">协作/依赖边尚未接入读模型</li></ul>
             <div class="graph-controls" role="group" aria-label="画布操作，静态演示">
               <button type="button" aria-label="缩小画布，静态演示" aria-disabled="true" title="静态演示控件" @click="explainUnavailable('缩小画布')">−</button>
               <span class="zoom-value">100%</span>
@@ -228,7 +233,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
           <div v-if="collabGraph.graph.value.roles.length" class="role-table">
             <div v-for="role in collabGraph.graph.value.roles" :key="role.role" class="role-row">
               <strong class="role-name">{{ role.role }}</strong>
-              <span class="role-caps"><span v-for="cap in role.capabilities" :key="cap" class="cap-chip">{{ cap }}</span></span>
+              <span class="role-caps" tabindex="0" :aria-label="`${role.role} 的能力点，可滚动`"><span v-for="cap in role.capabilities" :key="cap" class="cap-chip">{{ cap }}</span></span>
               <span class="role-node muted small">{{ role.nodeRole ? '岗位角色' : '内建主体' }}</span>
             </div>
           </div>
@@ -256,7 +261,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
           <section class="panel project-overview" aria-labelledby="projects-title">
             <div class="section-heading"><h2 id="projects-title">你的项目</h2><button type="button" class="text-button" :disabled="refreshing" @click="refresh">{{ refreshing ? '刷新中…' : '刷新' }}</button></div>
             <p v-if="loading" class="muted loading-state" role="status">正在读取项目…</p>
-            <div v-else-if="!projectError && projects.length === 0" class="empty-state"><h3>当前没有未归档项目</h3><p>上方关系图是静态演示，不会因这里为空而变化。</p></div>
+            <div v-else-if="!projectError && projects.length === 0" class="empty-state"><h3>当前没有未归档项目</h3><p>上方关系图按所选项目的真实数据显示；当前没有可展示的项目数据。</p></div>
             <ul v-else class="home-projects"><li v-for="project in projects" :key="project.id"><RouterLink :to="projectPath(project.id)" class="home-project-link"><span class="project-monogram">{{ project.name.slice(0, 1) }}</span><span class="project-copy"><strong>{{ project.name }}</strong><span>{{ project.memberCount ?? 0 }} 位成员 · {{ project.groupCount ?? 0 }} 个群组</span></span><span class="project-activity"><span class="badge" :class="{ ok: project.status === 'active' }">{{ project.status === 'active' ? '活跃' : '空闲' }}</span><small>{{ recentActivity(project.lastActivityAt) }}</small></span><AppIcon name="chevron" :size="16" /></RouterLink></li></ul>
           </section>
         </details>

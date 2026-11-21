@@ -10,13 +10,11 @@
  *   - 成员状态 = member-statuses 的 state/connection
  *   - 消息方向 = 群内真实 messages 的 sender（只统计真实发送者）
  */
-import { computed, ref, type Ref } from "vue";
+import { ref, type Ref } from "vue";
 import {
   api,
-  type GroupDto,
   type MemberDto,
   type MemberStatusDto,
-  type MessageDto,
   type OrgNodeDto,
   type ProjectDto,
 } from "../api/client.ts";
@@ -156,8 +154,8 @@ function statusLabel(status: MemberStatusDto | undefined, lifecycle: MemberDto["
   if (!status) return "未连接";
   if (status.state === "working") return "执行中";
   if (status.state === "waiting") return "等待中";
-  if (status.state === "online") return "在线";
-  if (status.connection === "connected") return "已连接";
+  if (status.state === "online") return "在线(未工作)";
+  if (status.connection === "connected") return "连接正常(未工作)";
   return "离线";
 }
 
@@ -192,8 +190,12 @@ export function useCollabGraph(projectId: Ref<string | null>) {
     const version = ++generation;
     if (!id) {
       graph.value = { ...EMPTY };
+      loading.value = false;
+      error.value = null;
       return;
     }
+    // 立即清空上一项目数据，避免加载失败/切换期间展示陈旧内容并冒充当前项目真实数据。
+    graph.value = { ...EMPTY };
     loading.value = true;
     error.value = null;
     try {
@@ -211,10 +213,12 @@ export function useCollabGraph(projectId: Ref<string | null>) {
       const statusMap = new Map(statusesResult.memberStatuses.map((s) => [s.memberId, s]));
       const memberMap = new Map(membersResult.members.map((m) => [m.id, m]));
 
-      const root = project?.manager ? memberNode(project.manager, statusMap, "manager", "总管") : null;
+      // 身份按真实 DTO 语义标注，不把项目负责人冒充"总管"：
+      // project.manager = 项目负责人；org 的 top_manager = 顶级主管岗位（真实组织树占据者）。
+      const root = project?.manager ? memberNode(project.manager, statusMap, "manager", "项目负责人") : null;
       const leadNode = orgResult.nodes.find((node: OrgNodeDto) => node.role === "top_manager" && node.memberId);
       const leadMember = leadNode?.memberId ? memberMap.get(leadNode.memberId) : null;
-      const lead = leadMember ? memberNode(leadMember, statusMap, "lead", "项目负责人") : null;
+      const lead = leadMember ? memberNode(leadMember, statusMap, "lead", "顶级主管岗位") : null;
 
       const groups: GraphGroup[] = [];
       const recent: RecentActivity[] = [];
@@ -222,9 +226,9 @@ export function useCollabGraph(projectId: Ref<string | null>) {
       const conversations: GroupConversation[] = [];
       let totalMessages = 0;
       const seenMembers = new Set<string>();
-      for (const group of groupsResult.groups as GroupDto[]) {
+      for (const group of groupsResult.groups) {
         const participants = (await api.listParticipants(group.id)).participants;
-        const messages = (await api.listMessages(group.id)).messages as MessageDto[];
+        const messages = (await api.listMessages(group.id)).messages;
         if (version !== generation) return;
         totalMessages += messages.length;
         for (const message of messages) {
@@ -334,7 +338,7 @@ export function useCollabGraph(projectId: Ref<string | null>) {
     }
   }
 
-  return { graph: computed(() => graph.value), loading, error, load };
+  return { graph, loading, error, load };
 }
 
 function groupIcon(name: string): string {
