@@ -16,7 +16,7 @@ type FixtureDatabase = "postgres" | "h04_source" | "h04_verification";
 
 /** Test-only adaptation of the existing restart fixture. This owns a fresh child/datadir, never a supplied database URL.
  * Trust authentication is deliberate fixture behavior, not evidence of the H04 production server epoch or HBA profile. */
-export async function openCatalogGuardTestCluster(binaryDirectory: string, diagnostic: "h04" | "wr1" = "h04") {
+export async function openCatalogGuardTestCluster(binaryDirectory: string, diagnostic: "h04" | "wr1" | "r05" = "h04") {
   assert.ok(isAbsolute(binaryDirectory), "private PostgreSQL tools require an explicit absolute directory");
   assert.equal(process.platform, "linux"); assert.notEqual(process.getuid?.(), 0);
   const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PG")));
