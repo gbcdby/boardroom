@@ -15,6 +15,7 @@ import MemoryView from "./views/MemoryView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import McpCatalogView from "./views/McpCatalogView.vue";
 import PrototypeView from "./views/PrototypeView.vue";
+import CapabilityDemoView from "./views/CapabilityDemoView.vue";
 import { useCurrentProject } from "./composables/useCurrentProject.ts";
 import { createTaskListScrollBehavior } from "./composables/useTaskListViewState.ts";
 
@@ -29,6 +30,7 @@ export const router = createRouter({
   routes: [
     { path: "/", name: "home", component: HomeView, meta: { title: "协作总览" } },
     { path: "/demo/p04", name: "demo-p04", component: PrototypeView, meta: { title: "群组聊天（设计演示）" } },
+    { path: "/demo/p05", name: "demo-p05", component: CapabilityDemoView, meta: { title: "角色与能力（设计演示）" } },
     { path: "/projects", name: "projects", component: ProjectsView, meta: { title: "所有项目" } },
     { path: "/projects/:projectId/overview", name: "project-overview", component: ProjectsView, meta: { projectSection: "overview", title: "项目概览" } },
     { path: "/projects/:projectId/members", name: "project-members", component: ProjectMembersView, meta: { projectSection: "members", title: "成员" } },
