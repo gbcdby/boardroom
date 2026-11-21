@@ -62,6 +62,20 @@ const demoTaskDetail = {
 };
 function switchView(view: "members" | "tasks"): void { activeView.value = view; unavailableReason.value = null; }
 
+// P02 成员会话面板示例数据（静态视觉演示）
+const selectedMemberId = ref<string | null>(null);
+const demoConversation = {
+  name: "前端工程师", initials: "前", avatar: 2, online: true, state: "执行中", group: "界面升级小组", instance: "当前实例",
+  task: "协作总览升级", synced: "仅 Boardroom 消息 · 已同步",
+  messages: [
+    { who: "项目负责人", initials: "负", avatar: 6, tag: "任务指令", text: "实现成员会话侧栏，保留关系图。", mine: false },
+    { who: "产品设计师", initials: "产", avatar: 1, tag: "定向消息", text: "点击成员后，右侧直接展开他的会话。", mine: false },
+    { who: "前端工程师", initials: "前", avatar: 2, tag: "回复", text: "已接手，正在实现成员选中与会话联动。", mine: true },
+  ],
+};
+function openConversation(memberId: string): void { selectedMemberId.value = memberId; }
+function closeConversation(): void { selectedMemberId.value = null; }
+
 const health = ref<HealthReport | null>(null);
 const healthError = ref<string | null>(null);
 const context = useCurrentProject();
@@ -174,17 +188,17 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
                 <div v-for="group in demoGroups" :key="group.name" class="tree-group">
                   <div class="tree-group-head"><span class="group-icon"><AppIcon :name="group.icon" :size="16" /></span><strong>{{ group.name }}</strong></div>
                   <div class="group-body">
-                    <div class="member-row">
+                    <button type="button" class="member-row member-open-btn" :class="{ 'is-selected': selectedMemberId === group.coordinator.name }" :aria-label="`查看${group.coordinator.name}的成员会话`" @click="openConversation(group.coordinator.name)">
                       <span class="avatar" :class="`avatar-${group.coordinator.avatar}`">{{ group.coordinator.initials }}</span>
                       <span class="member-copy"><strong>{{ group.coordinator.name }}</strong><small>{{ group.coordinator.role }}</small></span>
                       <span class="status-badge" :class="group.coordinator.tone">{{ group.coordinator.status }}</span>
-                    </div>
+                    </button>
                     <div v-if="group.members.length" class="member-connector" aria-hidden="true"><span class="flow-label">{{ group.flows[0] }}</span></div>
-                    <div v-for="member in group.members" :key="member.name" class="member-row">
+                    <button v-for="member in group.members" :key="member.name" type="button" class="member-row member-open-btn" :class="{ 'is-selected': selectedMemberId === member.name }" :aria-label="`查看${member.name}的成员会话`" @click="openConversation(member.name)">
                       <span class="avatar" :class="`avatar-${member.avatar}`">{{ member.initials }}</span>
                       <span class="member-copy"><strong>{{ member.name }}</strong><small>{{ member.role }}</small></span>
                       <span class="status-badge" :class="member.tone">{{ member.status }}</span>
-                    </div>
+                    </button>
                   </div>
                   <div class="group-flow"><span class="flow-arrow" aria-hidden="true">→</span>{{ group.flows[group.flows.length - 1] }}</div>
                 </div>
@@ -253,6 +267,30 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
           </section>
         </template>
         <template v-else>
+          <section v-if="selectedMemberId" class="panel side-panel conversation-panel" aria-labelledby="conversation-title" data-testid="p02-conversation">
+            <div class="side-heading"><h2 id="conversation-title">成员会话</h2><button type="button" class="inspector-close" aria-label="关闭成员会话" @click="closeConversation"><AppIcon name="close" :size="16" /></button></div>
+            <div class="conv-person"><span class="avatar conv-avatar" :class="`avatar-${demoConversation.avatar}`">{{ demoConversation.initials }}</span><span class="conv-person-copy"><strong>{{ selectedMemberId }}</strong><small>{{ demoConversation.group }} · {{ demoConversation.instance }}</small></span><span v-if="demoConversation.online" class="conv-online"><span class="connected-dot ok" aria-hidden="true"></span>在线</span><span class="status-badge active">{{ demoConversation.state }}</span></div>
+            <button type="button" class="conv-task" aria-disabled="true" title="静态演示控件" @click="explainUnavailable('当前任务')"><span class="conv-task-icon"><AppIcon name="layers" :size="16" /></span><span>当前任务：<strong>{{ demoConversation.task }}</strong></span><AppIcon name="chevron" :size="14" /></button>
+            <p class="conv-sync muted small">{{ demoConversation.synced }}</p>
+            <div class="conv-tabs" role="tablist" aria-label="成员会话内容"><button type="button" role="tab" aria-selected="true">会话</button><button type="button" role="tab" aria-selected="false" aria-disabled="true" @click="explainUnavailable('活动')">活动</button><button type="button" role="tab" aria-selected="false" aria-disabled="true" @click="explainUnavailable('产物')">产物</button></div>
+            <div class="conv-day"><span>今天 14:32</span></div>
+            <div class="conv-messages">
+              <div v-for="(msg, index) in demoConversation.messages" :key="index" class="conv-msg" :class="{ mine: msg.mine }">
+                <template v-if="!msg.mine">
+                  <span class="avatar avatar-sm" :class="`avatar-${msg.avatar}`">{{ msg.initials }}</span>
+                  <div class="conv-msg-body"><div class="conv-msg-meta"><strong>{{ msg.who }}</strong><span class="conv-tag">{{ msg.tag }}</span></div><p class="conv-bubble">{{ msg.text }}</p></div>
+                </template>
+                <template v-else>
+                  <div class="conv-msg-body"><div class="conv-msg-meta right"><span class="conv-tag">{{ msg.tag }}</span><strong>{{ msg.who }}</strong></div><p class="conv-bubble mine">{{ msg.text }}</p></div>
+                  <span class="avatar avatar-sm" :class="`avatar-${msg.avatar}`">{{ msg.initials }}</span>
+                </template>
+              </div>
+              <div class="conv-locate"><AppIcon name="layers" :size="14" />定位消息</div>
+            </div>
+            <button type="button" class="conv-new" aria-disabled="true" @click="explainUnavailable('新消息跳转')">2 条新消息 ↓</button>
+            <div class="conv-footer"><span><span class="connected-dot ok" aria-hidden="true"></span>实时更新</span><button type="button" aria-disabled="true" @click="explainUnavailable('展开完整会话')">展开完整会话</button></div>
+          </section>
+          <template v-else>
           <section class="panel side-panel" aria-labelledby="activity-title">
             <div class="side-heading"><h2 id="activity-title">实时动态</h2><span class="side-demo-tag">示例数据</span></div>
             <ul class="activity-list"><li v-for="(item, index) in demoActivity" :key="item.when"><span class="activity-rail" aria-hidden="true"><span class="rail-dot" :class="{ first: index === 0 }"></span></span><span class="activity-copy"><small>{{ item.when }}</small><span class="activity-bubble"><span class="avatar avatar-sm" :class="`avatar-${index + 1}`">{{ item.who.slice(0, 1) }}</span>{{ item.who }}{{ item.text }}</span></span></li></ul>
@@ -262,6 +300,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
             <div class="pending-list"><div v-for="item in demoPending" :key="item.title" class="pending-card"><span class="pending-icon"><AppIcon name="check" :size="18" /></span><span class="pending-copy"><strong>{{ item.title }}</strong><small>{{ item.detail }}</small></span><span class="pending-link">查看事项<AppIcon name="arrow" :size="14" /></span></div></div>
           </section>
           <section class="quick-access" aria-labelledby="quick-access-title"><h2 id="quick-access-title">继续工作</h2><RouterLink to="/chat" class="shortcut"><span class="shortcut-icon"><AppIcon name="message" :size="21" /></span><span><strong>进入群聊</strong><small>与成员交流，让工作继续</small></span><AppIcon name="chevron" :size="16" /></RouterLink><RouterLink to="/status" class="shortcut"><span class="shortcut-icon"><AppIcon name="activity" :size="21" /></span><span><strong>查看成员状态</strong><small>了解谁在线、谁正在工作</small></span><AppIcon name="chevron" :size="16" /></RouterLink><p class="quick-note">每个项目都有自己的成员、群组和协作记录。</p></section>
+          </template>
         </template>
       </aside>
     </div>
@@ -300,6 +339,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .tree-group-head { display: flex; align-items: center; gap: 8px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }.tree-group-head strong { font-size: .86rem; font-weight: 600; }.group-icon { color: var(--accent); display: inline-flex; }
 .group-body { padding-top: 10px; }
 .member-row { display: flex; align-items: center; gap: 8px; padding: 7px; border: 1px solid var(--border); border-radius: 9px; background: var(--card-bg); }
+.member-open-btn { width: 100%; text-align: left; color: var(--fg); cursor: pointer; }.member-open-btn:hover { background: var(--surface-subtle); }.member-open-btn.is-selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: var(--accent-soft); }
 .member-copy { flex: 1; min-width: 0; }.member-copy strong { display: block; font-size: .8rem; font-weight: 600; }.member-copy small { display: block; font-size: .7rem; color: var(--muted); margin-top: 1px; }
 .avatar { flex: none; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; color: #1d1d1f; font-size: .78rem; font-weight: 600; background: #dfe3ea; position: relative; }
 .avatar:not(.avatar-0)::after { content: ""; position: absolute; right: -1px; bottom: -1px; width: 9px; height: 9px; border-radius: 50%; background: var(--ok); border: 2px solid var(--card-bg); }
@@ -339,6 +379,12 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .task-detail-title { display: flex; align-items: center; gap: 10px; margin: 16px 0; padding-bottom: 14px; border-bottom: 1px solid var(--border); }.task-detail-title strong { flex: 1; font-size: .96rem; }.task-detail-icon { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 9px; }
 .task-facts { margin: 0; }.task-facts > div { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: .82rem; }.task-facts dt { display: flex; align-items: center; gap: 7px; width: 96px; flex: none; color: var(--muted); }.task-facts dd { margin: 0; font-weight: 500; }
 .task-section { margin-top: 18px; }.task-section h3 { margin: 0 0 10px; font-size: .88rem; }.checklist { list-style: none; margin: 0; padding: 0; }.checklist li { display: flex; align-items: center; gap: 9px; padding: 6px 0; font-size: .82rem; }.checkbox { width: 15px; height: 15px; border: 1px solid var(--control-border); border-radius: 4px; flex: none; }.task-discussion { display: flex; align-items: center; justify-content: space-between; padding-top: 14px; border-top: 1px solid var(--border); font-size: .84rem; }.task-discussion > span:first-child { display: inline-flex; align-items: center; gap: 8px; }.discussion-link { color: var(--accent); }.recent-activity { display: flex; align-items: center; gap: 8px; margin: 0; font-size: .82rem; color: var(--muted); }
+.conv-person { display: flex; align-items: center; gap: 9px; margin: 16px 0 12px; flex-wrap: wrap; }.conv-avatar { width: 40px; height: 40px; font-size: 1rem; }.conv-person-copy { flex: 1; min-width: 0; }.conv-person-copy strong { display: block; font-size: .96rem; }.conv-person-copy small { display: block; font-size: .74rem; color: var(--muted); margin-top: 3px; }.conv-online { display: inline-flex; align-items: center; gap: 5px; font-size: .74rem; color: var(--ok); }
+.conv-task { width: 100%; display: flex; align-items: center; gap: 9px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--card-bg); color: var(--fg); font-size: .8rem; text-align: left; }.conv-task-icon { color: var(--muted); }.conv-task > span:nth-child(2) { flex: 1; }.conv-sync { margin: 8px 0 0; }
+.conv-tabs { display: flex; gap: 22px; margin-top: 14px; border-bottom: 1px solid var(--border); }.conv-tabs button { border: 0; border-radius: 0; background: transparent; padding: 8px 0; font-size: .84rem; color: var(--muted); min-height: 0; }.conv-tabs button[aria-selected="true"] { color: var(--fg); font-weight: 600; box-shadow: inset 0 -2px var(--accent); }
+.conv-day { text-align: center; font-size: .72rem; color: var(--muted); margin: 16px 0; position: relative; }.conv-day::before, .conv-day::after { content: ""; position: absolute; top: 50%; width: 28%; height: 1px; background: var(--border); }.conv-day::before { left: 0; }.conv-day::after { right: 0; }
+.conv-messages { display: flex; flex-direction: column; gap: 16px; }.conv-msg { display: flex; align-items: flex-start; gap: 9px; }.conv-msg.mine { justify-content: flex-end; }.conv-msg-body { flex: 1; min-width: 0; max-width: 85%; }.conv-msg.mine .conv-msg-body { flex: none; }.conv-msg-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; font-size: .8rem; }.conv-msg-meta.right { justify-content: flex-end; }.conv-tag { font-size: .68rem; color: var(--muted); background: var(--surface-subtle); padding: 1px 6px; border-radius: 4px; }.conv-bubble { display: inline-block; margin: 0; padding: 9px 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-bg); font-size: .82rem; line-height: 1.5; overflow-wrap: anywhere; }.conv-bubble.mine { background: var(--accent-soft); border-color: transparent; }.conv-locate { align-self: flex-start; display: inline-flex; align-items: center; gap: 5px; font-size: .76rem; color: var(--accent); }
+.conv-new { align-self: center; margin: 6px auto 0; padding: 6px 14px; font-size: .78rem; color: var(--accent); background: var(--accent-soft); border-color: transparent; border-radius: 20px; }.conv-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); font-size: .78rem; }.conv-footer > span { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }.conv-footer button { border: 0; background: transparent; color: var(--accent); font-size: .78rem; min-height: 0; padding: 0; }
 @media (max-width: 1100px) { .collab-workspace { grid-template-columns: 1fr; gap: 20px; }.collab-side { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); align-items: start; gap: 16px; }.collab-side .quick-access { grid-column: 1 / -1; } }
 @media (max-width: 760px) {
   .collab-workspace { gap: 16px; }.collab-main, .collab-side { gap: 16px; }.collab-side { display: flex; flex-direction: column; }
