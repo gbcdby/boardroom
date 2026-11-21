@@ -208,8 +208,13 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
                   </div>
                   <div class="group-flow"><span class="flow-arrow" aria-hidden="true">→</span>{{ group.flows[group.flows.length - 1] }}</div>
                 </div>
+                <svg class="cross-flow-lines" viewBox="0 0 300 200" preserveAspectRatio="none" aria-hidden="true">
+                  <path class="cross-path" d="M 60 150 C 110 145, 120 90, 150 78" />
+                  <path class="cross-path" d="M 60 175 C 130 225, 210 225, 250 172" />
+                </svg>
+                <span class="cross-flow-label label-api">接口协作</span>
+                <span class="cross-flow-label label-verify">验证协作</span>
               </div>
-              <div class="tree-cross-flow" aria-hidden="true"><span>接口协作</span><span>验证协作</span></div>
             </div>
           </div>
           <div class="graph-footer">
@@ -340,7 +345,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .tree-stem { width: 2px; height: 26px; background: var(--relation); flex: none; }
 .tree-groups { width: 100%; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; position: relative; }
 .tree-groups::before { content: ""; position: absolute; top: -13px; left: 16.66%; right: 16.66%; height: 2px; background: var(--relation); }
-.tree-group { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); padding: 12px; position: relative; }
+.tree-group { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); padding: 12px; position: relative; z-index: 1; }
 .tree-group::before { content: ""; position: absolute; top: -13px; left: 50%; width: 2px; height: 13px; background: var(--relation); }
 .tree-group-head { display: flex; align-items: center; gap: 8px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }.tree-group-head strong { font-size: .86rem; font-weight: 600; }.group-icon { color: var(--accent); display: inline-flex; }
 .group-body { padding-top: 10px; }
@@ -356,7 +361,10 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .member-connector { position: relative; height: 30px; display: flex; align-items: center; justify-content: flex-start; padding-left: 18px; }.member-connector::before { content: ""; position: absolute; left: 21px; top: 0; bottom: 0; width: 2px; background: var(--relation); }.member-connector::after { content: ""; position: absolute; left: 21px; top: 50%; width: 8px; height: 2px; background: var(--relation); }
 .flow-label { position: relative; font-size: .66rem; color: var(--muted); background: var(--card-bg); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; margin-left: 10px; }
 .group-flow { margin-top: 10px; font-size: .7rem; color: var(--accent); display: flex; align-items: center; gap: 6px; }.flow-arrow { font-size: .9rem; }
-.tree-cross-flow { width: 100%; display: flex; justify-content: space-between; padding: 10px 30px 0; font-size: .66rem; color: var(--muted); }
+.cross-flow-lines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; overflow: visible; }
+.cross-path { fill: none; stroke: var(--relation); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.cross-flow-label { position: absolute; z-index: 2; font-size: .66rem; color: var(--muted); background: var(--card-bg); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; white-space: nowrap; pointer-events: none; }
+.cross-flow-label.label-api { left: 33%; top: 30%; }.cross-flow-label.label-verify { left: 60%; bottom: -2%; }
 .graph-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; margin-top: 14px; }
 .graph-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; list-style: none; margin: 0; padding: 0; font-size: .8rem; color: var(--muted); }.graph-legend li { display: inline-flex; align-items: center; gap: 6px; }
 .legend-line { width: 22px; height: 0; border-top: 2px solid var(--relation); }.legend-arrow { position: relative; }.legend-arrow::after { content: "›"; position: absolute; right: -4px; top: -11px; font-size: 1rem; color: var(--relation); }.legend-dot { width: 8px; height: 8px; border-radius: 50%; }.legend-dot.ok { background: var(--ok); }
