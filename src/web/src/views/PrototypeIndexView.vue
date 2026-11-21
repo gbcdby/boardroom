@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, onMounted, onUnmounted, watch, nextTick } from "vue";
 import AppIcon from "../components/AppIcon.vue";
 import { useTheme } from "../composables/useTheme.ts";
 
@@ -22,6 +22,27 @@ const activeId = ref("p01");
 const active = () => pages.find((p) => p.id === activeId.value) ?? pages[0]!;
 function select(id: string): void { activeId.value = id; }
 function openInNewTab(): void { window.open(active().src, "_blank", "noopener"); }
+
+// 让 iframe 按面板宽度等比缩放（基准 1440×900），与右侧原型图尺度一致，便于并排对照。
+const implViewport = ref<HTMLElement | null>(null);
+const implScale = ref(1);
+const BASE_W = 1440, BASE_H = 900;
+let resizeObserver: ResizeObserver | null = null;
+function measure(): void {
+  const el = implViewport.value;
+  if (el) implScale.value = Math.min(1, el.clientWidth / BASE_W);
+}
+function bindViewport(): void {
+  resizeObserver?.disconnect();
+  if (implViewport.value && typeof ResizeObserver !== "undefined") {
+    resizeObserver = new ResizeObserver(() => measure());
+    resizeObserver.observe(implViewport.value);
+    measure();
+  }
+}
+onMounted(bindViewport);
+onUnmounted(() => resizeObserver?.disconnect());
+watch([activeId, compareMode], async () => { await nextTick(); bindViewport(); });
 </script>
 
 <template>
@@ -52,7 +73,9 @@ function openInNewTab(): void { window.open(active().src, "_blank", "noopener");
         <div class="proto-compare" :class="`mode-${compareMode}`">
           <div v-if="compareMode !== 'prototype'" class="proto-pane">
             <span class="proto-pane-label">实现</span>
-            <iframe :key="activeId" :src="active().src" class="proto-frame" :title="`${active().no} ${active().title} 实现预览`" loading="lazy"></iframe>
+            <div ref="implViewport" class="proto-frame-viewport">
+              <iframe :key="activeId" :src="active().src" class="proto-frame" :style="{ transform: `scale(${implScale})`, width: `${BASE_W}px`, height: `${BASE_H}px` }" :title="`${active().no} ${active().title} 实现预览`" loading="lazy"></iframe>
+            </div>
           </div>
           <div v-if="compareMode !== 'impl'" class="proto-pane">
             <span class="proto-pane-label">原型图 · {{ theme.snapshot.value.appearance === 'dark' ? 'dark' : 'light' }}</span>
@@ -79,7 +102,8 @@ function openInNewTab(): void { window.open(active().src, "_blank", "noopener");
 .proto-mode-switch { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; padding: 2px; background: var(--surface-subtle); gap: 2px; }.proto-mode-switch button { border: 0; background: transparent; color: var(--muted); font-size: .76rem; min-height: 26px; padding: 2px 10px; border-radius: 6px; }.proto-mode-switch button[aria-pressed="true"] { color: var(--fg); background: var(--card-bg); font-weight: 600; box-shadow: var(--shadow); }
 .proto-compare { flex: 1; display: grid; gap: 1px; min-height: 0; background: var(--border); }.proto-compare.mode-split { grid-template-columns: 1fr 1fr; }.proto-compare.mode-impl, .proto-compare.mode-prototype { grid-template-columns: 1fr; }
 .proto-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--card-bg); position: relative; }.proto-pane-label { position: absolute; top: 8px; left: 8px; z-index: 1; font-size: .68rem; color: var(--muted); background: var(--card-bg); border: 1px solid var(--border); border-radius: 5px; padding: 2px 7px; }
-.proto-frame { flex: 1; width: 100%; border: 0; background: var(--card-bg); min-height: 0; }
+.proto-frame-viewport { flex: 1; overflow: hidden; position: relative; background: var(--surface-subtle); }
+.proto-frame { position: absolute; top: 0; left: 0; border: 0; background: var(--card-bg); transform-origin: top left; box-shadow: var(--shadow); }
 .proto-image-wrap { flex: 1; overflow: auto; display: flex; justify-content: center; padding: 8px; background: var(--surface-subtle); }.proto-image-wrap img { max-width: 100%; height: auto; box-shadow: var(--shadow); border-radius: 4px; }
 @media (max-width: 760px) { .proto-split { grid-template-columns: 1fr; height: auto; }.proto-nav { flex-direction: row; flex-wrap: wrap; max-height: none; }.proto-nav-item { flex: 1 1 140px; }.proto-nav-note { flex-basis: 100%; margin: 4px; }.proto-compare { grid-template-columns: 1fr !important; }.proto-frame { min-height: 460px; } }
 </style>
