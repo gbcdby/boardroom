@@ -1,9 +1,14 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import AppIcon from "../components/AppIcon.vue";
+import { useTheme } from "../composables/useTheme.ts";
 
 // 原型 v2 五页的统一 split view：左侧页面列表，右侧实时预览对应页面。
 // 每页都是静态视觉演示，与真实功能隔离。
+const theme = useTheme();
+function toggleTheme(): void {
+  theme.setPreference(theme.snapshot.value.appearance === "dark" ? "light" : "dark");
+}
 const pages = [
   { id: "p01", no: "P01", title: "协作总览", desc: "群架构、成员关系、消息方向", src: "/", icon: "layers" },
   { id: "p02", no: "P02", title: "图内成员会话", desc: "点成员节点展开会话面板", src: "/?view=conversation", icon: "message" },
@@ -21,7 +26,7 @@ function openInNewTab(): void { window.open(active().src, "_blank", "noopener");
   <section class="page prototype-index">
     <header class="page-header proto-header">
       <div><h1>原型浏览 <span class="proto-badge">split view</span></h1><p class="page-description">BR-COLLAB-PROTOTYPE-20261112-v2 · 左侧选页，右侧实时预览。全部为静态演示数据。</p></div>
-      <button type="button" class="toolbar-control" title="在新标签页打开当前页" @click="openInNewTab"><AppIcon name="arrow" :size="15" />新标签打开</button>
+      <div class="proto-header-actions"><button type="button" class="toolbar-control" :title="theme.snapshot.value.appearance === 'dark' ? '切换到浅色（对照原型 light 版）' : '切换到深色（对照原型 dark 版）'" @click="toggleTheme"><AppIcon :name="theme.snapshot.value.appearance === 'dark' ? 'check' : 'layers'" :size="15" />{{ theme.snapshot.value.appearance === 'dark' ? '浅色' : '深色' }}</button><button type="button" class="toolbar-control" title="在新标签页打开当前页" @click="openInNewTab"><AppIcon name="arrow" :size="15" />新标签打开</button></div>
     </header>
 
     <div class="proto-split">
@@ -42,7 +47,7 @@ function openInNewTab(): void { window.open(active().src, "_blank", "noopener");
 </template>
 
 <style scoped>
-.proto-header { align-items: center; }.proto-badge { font-size: .7rem; font-weight: 600; color: var(--accent); background: var(--accent-soft); border-radius: 5px; padding: 2px 8px; vertical-align: middle; margin-left: 6px; }
+.proto-header { align-items: center; }.proto-header-actions { display: flex; gap: 8px; flex-wrap: wrap; }.proto-badge { font-size: .7rem; font-weight: 600; color: var(--accent); background: var(--accent-soft); border-radius: 5px; padding: 2px 8px; vertical-align: middle; margin-left: 6px; }
 .proto-split { display: grid; grid-template-columns: 262px minmax(0, 1fr); gap: 16px; height: calc(100vh - 210px); min-height: 520px; }
 .proto-nav { display: flex; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--card-bg); overflow-y: auto; }
 .proto-nav-item { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 11px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--fg); min-height: 0; }
