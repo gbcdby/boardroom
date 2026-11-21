@@ -43,6 +43,25 @@ const demoActivity = [
 ];
 const demoPending = [{ title: "扩大工具使用范围", detail: "项目策略要求确认" }];
 
+// P03 任务流转视图示例数据（静态视觉演示）
+const activeView = ref<"members" | "tasks">("members");
+const demoTasks = [
+  { id: "assigned", title: "任务已分配", icon: "check", tone: "ok", person: "项目负责人", initials: "负", avatar: 6,
+    desc: "明确需求与分工，完成任务分派。", foot: "已完成分派", active: false },
+  { id: "doing", title: "执行中", icon: "arrow", tone: "active", person: "前端工程师", initials: "前", avatar: 2,
+    desc: "正在实现选中与会话联动。", foot: "成员会话侧栏 · 查看成员会话", active: true },
+  { id: "done", title: "完成", icon: "history", tone: "idle", person: "", initials: "", avatar: 0,
+    desc: "尚未开始", sub: "通过验证与评审后，标记任务完成。", active: false },
+  { id: "verify", title: "验证与评审", icon: "check", tone: "wait", person: "验证工程师", initials: "验", avatar: 5,
+    desc: "尚未开始", sub: "验证功能效果与关键验收点。", active: false },
+];
+const demoTaskDetail = {
+  title: "协作总览升级", state: "执行中", owner: "前端工程师", group: "界面升级小组", phase: "实现", next: "提交候选后进入评审",
+  acceptance: ["图中查看成员会话", "消息与节点双向定位", "断线恢复不串会话"],
+  discussion: "打开群聊", recent: "前端工程师已接手",
+};
+function switchView(view: "members" | "tasks"): void { activeView.value = view; unavailableReason.value = null; }
+
 const health = ref<HealthReport | null>(null);
 const healthError = ref<string | null>(null);
 const context = useCurrentProject();
@@ -116,21 +135,27 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
     <div v-if="projectError" class="error" role="alert">项目暂时无法加载：{{ projectError }} <button type="button" class="text-button" :disabled="refreshing" @click="refresh">重新加载</button></div>
 
     <section class="collab-toolbar" aria-label="协作总览工具条">
-      <div class="toolbar-views" role="group" aria-label="视图切换，静态演示">
-        <button type="button" class="view-tab" aria-pressed="true" aria-disabled="true" title="静态演示控件，尚未接通真实数据" @click="explainUnavailable('成员关系视图')">成员关系</button>
-        <button type="button" class="view-tab" aria-pressed="false" aria-disabled="true" title="静态演示控件，尚未接通真实数据" @click="explainUnavailable('任务流转视图')">任务流转</button>
+      <div class="toolbar-views" role="group" aria-label="视图切换">
+        <button type="button" class="view-tab" :aria-pressed="activeView === 'members'" @click="switchView('members')">成员关系</button>
+        <button type="button" class="view-tab" :aria-pressed="activeView === 'tasks'" @click="switchView('tasks')">任务流转</button>
       </div>
-      <div class="toolbar-layers" role="group" aria-label="关系图层，静态演示">
-        <label class="layer-option"><input type="checkbox" checked aria-disabled="true" @click.prevent="explainUnavailable('协作关系图层')" />协作关系</label>
-        <label class="layer-option"><input type="checkbox" checked aria-disabled="true" @click.prevent="explainUnavailable('消息方向图层')" />消息方向</label>
-      </div>
-      <button type="button" class="toolbar-control filter-control" aria-disabled="true" title="成员筛选是静态演示控件" @click="explainUnavailable('成员筛选')">全部成员<AppIcon name="chevron" :size="14" /></button>
+      <template v-if="activeView === 'tasks'">
+        <span class="task-select-label">任务：</span>
+        <button type="button" class="toolbar-control task-select" aria-disabled="true" title="任务选择是静态演示控件" @click="explainUnavailable('任务选择')">{{ demoTaskDetail.title }}<AppIcon name="chevron" :size="14" /></button>
+      </template>
+      <template v-else>
+        <div class="toolbar-layers" role="group" aria-label="关系图层，静态演示">
+          <label class="layer-option"><input type="checkbox" checked aria-disabled="true" @click.prevent="explainUnavailable('协作关系图层')" />协作关系</label>
+          <label class="layer-option"><input type="checkbox" checked aria-disabled="true" @click.prevent="explainUnavailable('消息方向图层')" />消息方向</label>
+        </div>
+        <button type="button" class="toolbar-control filter-control" aria-disabled="true" title="成员筛选是静态演示控件" @click="explainUnavailable('成员筛选')">全部成员<AppIcon name="chevron" :size="14" /></button>
+      </template>
     </section>
     <p v-if="unavailableReason" class="collab-status muted small" role="status" data-testid="p01-unconnected-status">{{ unavailableReason }}</p>
 
     <div class="collab-workspace">
       <div class="collab-main">
-        <section class="panel graph-panel" aria-labelledby="graph-title">
+        <section v-if="activeView === 'members'" class="panel graph-panel" aria-labelledby="graph-title">
           <div class="section-heading"><div><h2 id="graph-title">协作关系图<span class="demo-chip">示例数据</span></h2></div></div>
           <div class="graph-canvas" data-testid="p01-graph-canvas">
             <div class="demo-tree" role="img" aria-label="示例协作关系图：总管连接项目负责人，项目负责人连接界面升级小组、MCP 能力接入、质量保障三个群，各群包含成员卡片与协作、消息方向箭头。全部为示例数据。">
@@ -177,6 +202,25 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
             </div>
           </div>
         </section>
+        <section v-else class="panel taskflow-panel" aria-labelledby="taskflow-title" data-testid="p03-taskflow">
+          <div class="section-heading"><div><h2 id="taskflow-title">任务流转<span class="demo-chip">示例数据</span></h2></div></div>
+          <div class="taskflow-board">
+            <div v-for="(task, index) in demoTasks" :key="task.id" class="taskflow-stage" :class="{ active: task.active }">
+              <div class="stage-head"><span class="stage-icon" :class="task.tone"><AppIcon :name="task.icon" :size="16" /></span><strong>{{ task.title }}</strong></div>
+              <div class="stage-body">
+                <div v-if="task.person" class="stage-person"><span class="avatar" :class="`avatar-${task.avatar}`">{{ task.initials }}</span><strong>{{ task.person }}</strong></div>
+                <p class="stage-desc">{{ task.desc }}</p>
+                <p v-if="task.sub" class="stage-sub">{{ task.sub }}</p>
+                <div v-if="task.id === 'doing'" class="stage-link"><span class="link-icon"><AppIcon name="message" :size="16" /></span><span><strong>成员会话侧栏</strong><small>正在实现选中与会话联动。</small></span><span class="link-cta">查看成员会话 ›</span></div>
+                <div class="stage-foot"><span class="foot-icon" :class="task.tone"><AppIcon name="check" :size="14" /></span>{{ task.foot }}</div>
+              </div>
+              <span v-if="index === 0" class="stage-arrow" aria-hidden="true">→</span>
+              <span v-if="index === 1" class="stage-arrow down" aria-hidden="true">↓</span>
+              <span v-if="index === 3" class="stage-arrow left" aria-hidden="true">←</span>
+            </div>
+          </div>
+          <div class="taskflow-handoff"><AppIcon name="arrow" :size="16" /><strong>最近交接</strong><span class="avatar avatar-1">产</span><span>产品设计师</span><span class="handoff-arrow">→</span><span class="avatar avatar-2">前</span><span>前端工程师</span><span class="handoff-note">· 已接手</span></div>
+        </section>
         <details class="real-data-fold" data-testid="p01-real-data-fold">
           <summary>真实数据（当前环境）：{{ loading ? '读取中…' : `${projects.length} 个项目 · ${activeCount} 个活跃 · ${groupCount} 个群组` }}</summary>
           <dl class="overview-metrics" :aria-busy="loading">
@@ -192,16 +236,33 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
           </section>
         </details>
       </div>
-      <aside class="collab-side" aria-label="动态与待我处理">
-        <section class="panel side-panel" aria-labelledby="activity-title">
-          <div class="side-heading"><h2 id="activity-title">实时动态</h2><span class="side-demo-tag">示例数据</span></div>
-          <ul class="activity-list"><li v-for="(item, index) in demoActivity" :key="item.when"><span class="activity-rail" aria-hidden="true"><span class="rail-dot" :class="{ first: index === 0 }"></span></span><span class="activity-copy"><small>{{ item.when }}</small><span class="activity-bubble"><span class="avatar avatar-sm" :class="`avatar-${index + 1}`">{{ item.who.slice(0, 1) }}</span>{{ item.who }}{{ item.text }}</span></span></li></ul>
-        </section>
-        <section class="panel side-panel" aria-labelledby="pending-title">
-          <div class="side-heading"><h2 id="pending-title">待我处理</h2><span class="side-demo-tag">示例数据</span></div>
-          <div class="pending-list"><div v-for="item in demoPending" :key="item.title" class="pending-card"><span class="pending-icon"><AppIcon name="check" :size="18" /></span><span class="pending-copy"><strong>{{ item.title }}</strong><small>{{ item.detail }}</small></span><span class="pending-link">查看事项<AppIcon name="arrow" :size="14" /></span></div></div>
-        </section>
-        <section class="quick-access" aria-labelledby="quick-access-title"><h2 id="quick-access-title">继续工作</h2><RouterLink to="/chat" class="shortcut"><span class="shortcut-icon"><AppIcon name="message" :size="21" /></span><span><strong>进入群聊</strong><small>与成员交流，让工作继续</small></span><AppIcon name="chevron" :size="16" /></RouterLink><RouterLink to="/status" class="shortcut"><span class="shortcut-icon"><AppIcon name="activity" :size="21" /></span><span><strong>查看成员状态</strong><small>了解谁在线、谁正在工作</small></span><AppIcon name="chevron" :size="16" /></RouterLink><p class="quick-note">每个项目都有自己的成员、群组和协作记录。</p></section>
+      <aside class="collab-side" :aria-label="activeView === 'tasks' ? '任务详情' : '动态与待我处理'">
+        <template v-if="activeView === 'tasks'">
+          <section class="panel side-panel task-detail" aria-labelledby="task-detail-title">
+            <div class="side-heading"><h2 id="task-detail-title">任务详情</h2><button type="button" class="inspector-close" aria-label="关闭任务详情" aria-disabled="true" title="静态演示控件" @click="explainUnavailable('关闭任务详情')"><AppIcon name="close" :size="16" /></button></div>
+            <div class="task-detail-title"><span class="task-detail-icon"><AppIcon name="layers" :size="20" /></span><strong>{{ demoTaskDetail.title }}</strong><span class="status-badge active">{{ demoTaskDetail.state }}</span></div>
+            <dl class="task-facts">
+              <div><dt><AppIcon name="people" :size="15" />负责人</dt><dd>{{ demoTaskDetail.owner }}</dd></div>
+              <div><dt><AppIcon name="message" :size="15" />所在群组</dt><dd>{{ demoTaskDetail.group }}</dd></div>
+              <div><dt><AppIcon name="layers" :size="15" />当前阶段</dt><dd>{{ demoTaskDetail.phase }}</dd></div>
+              <div><dt><AppIcon name="arrow" :size="15" />下一步</dt><dd>{{ demoTaskDetail.next }}</dd></div>
+            </dl>
+            <div class="task-section"><h3>验收重点</h3><ul class="checklist"><li v-for="item in demoTaskDetail.acceptance" :key="item"><span class="checkbox" aria-hidden="true"></span>{{ item }}</li></ul></div>
+            <div class="task-section task-discussion"><span><AppIcon name="message" :size="16" />相关讨论</span><span class="discussion-link">打开群聊 ›</span></div>
+            <div class="task-section"><h3>最近活动</h3><p class="recent-activity"><span class="rail-dot first" aria-hidden="true"></span>{{ demoTaskDetail.recent }}</p></div>
+          </section>
+        </template>
+        <template v-else>
+          <section class="panel side-panel" aria-labelledby="activity-title">
+            <div class="side-heading"><h2 id="activity-title">实时动态</h2><span class="side-demo-tag">示例数据</span></div>
+            <ul class="activity-list"><li v-for="(item, index) in demoActivity" :key="item.when"><span class="activity-rail" aria-hidden="true"><span class="rail-dot" :class="{ first: index === 0 }"></span></span><span class="activity-copy"><small>{{ item.when }}</small><span class="activity-bubble"><span class="avatar avatar-sm" :class="`avatar-${index + 1}`">{{ item.who.slice(0, 1) }}</span>{{ item.who }}{{ item.text }}</span></span></li></ul>
+          </section>
+          <section class="panel side-panel" aria-labelledby="pending-title">
+            <div class="side-heading"><h2 id="pending-title">待我处理</h2><span class="side-demo-tag">示例数据</span></div>
+            <div class="pending-list"><div v-for="item in demoPending" :key="item.title" class="pending-card"><span class="pending-icon"><AppIcon name="check" :size="18" /></span><span class="pending-copy"><strong>{{ item.title }}</strong><small>{{ item.detail }}</small></span><span class="pending-link">查看事项<AppIcon name="arrow" :size="14" /></span></div></div>
+          </section>
+          <section class="quick-access" aria-labelledby="quick-access-title"><h2 id="quick-access-title">继续工作</h2><RouterLink to="/chat" class="shortcut"><span class="shortcut-icon"><AppIcon name="message" :size="21" /></span><span><strong>进入群聊</strong><small>与成员交流，让工作继续</small></span><AppIcon name="chevron" :size="16" /></RouterLink><RouterLink to="/status" class="shortcut"><span class="shortcut-icon"><AppIcon name="activity" :size="21" /></span><span><strong>查看成员状态</strong><small>了解谁在线、谁正在工作</small></span><AppIcon name="chevron" :size="16" /></RouterLink><p class="quick-note">每个项目都有自己的成员、群组和协作记录。</p></section>
+        </template>
       </aside>
     </div>
     <details class="service-details"><summary><span class="service-title"><AppIcon name="server" :size="18" />本地服务</span><span class="service-state" :class="healthError || health?.status === 'degraded' ? 'bad' : health ? 'ok' : 'muted'">{{ serviceLabel }}</span></summary><div class="service-body"><p class="muted small">{{ wsLabel }}。此处显示服务连接情况，成员的工作状态请查看状态看板。</p><p v-if="healthError" class="error" role="alert">健康检查失败：{{ healthError }}</p><dl class="service-grid"><div><dt>数据库</dt><dd>{{ healthError ? '连接未知' : !health ? '正在检查…' : health.database.writable ? '可读写' : '需要检查' }}</dd></div><div><dt>运行时长</dt><dd>{{ health ? uptime(health.uptimeSeconds) : '—' }}</dd></div><div><dt>数据库版本</dt><dd>{{ health?.migrations.version ?? '—' }}</dd></div><div><dt>心跳间隔 / 超时</dt><dd>{{ health ? `${health.heartbeat.intervalMs / 1000}s / ${health.heartbeat.timeoutMs / 1000}s` : '—' }}</dd></div></dl><details v-if="lastEvent" class="event-details"><summary>最近连接事件</summary><pre>{{ lastEvent }}</pre></details></div></details>
@@ -262,12 +323,29 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .pending-list { margin-top: 14px; }.pending-card { display: flex; align-items: center; gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-bg); }.pending-icon { color: var(--ok); display: inline-flex; }.pending-copy { flex: 1; min-width: 0; }.pending-copy strong { display: block; font-size: .82rem; }.pending-copy small { display: block; font-size: .72rem; color: var(--muted); margin-top: 2px; }.pending-link { font-size: .72rem; color: var(--accent); display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .quick-access { padding: 6px 0; }.quick-access h2 { font-size: 1.02rem; margin-bottom: 10px; }.shortcut { display: flex; align-items: center; gap: 13px; padding: 14px 0; color: var(--fg); border-bottom: 1px solid var(--border); }.shortcut:hover { color: var(--accent); text-decoration: none; }.shortcut-icon { color: var(--muted); }.shortcut > span:nth-child(2) { flex: 1; min-width: 0; }.shortcut strong { display: block; font-weight: 500; font-size: .9rem; }.shortcut small { display: block; color: var(--muted); font-size: .78rem; margin-top: 3px; }.shortcut > .app-icon { color: var(--muted); }.quick-note { color: var(--muted); font-size: .78rem; margin-top: 16px; }
 .service-details { margin-top: 30px; border: 1px solid var(--border); border-radius: 11px; background: var(--card-bg); }.service-details > summary { padding: 16px 20px; font-size: .85rem; }.service-title { display: inline-flex; align-items: center; gap: 10px; margin-left: 6px; }.service-state { float: right; font-size: .8rem; font-weight: 400; }.service-body { border-top: 1px solid var(--border); padding: 18px 24px; }.service-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 16px; margin: 20px 0 0; }.service-grid dt { font-size: .8rem; color: var(--muted); }.service-grid dd { margin: 6px 0 0; font-size: .9rem; }.event-details { margin-top: 20px; font-size: .8rem; }.event-details pre { max-height: 150px; overflow: auto; }
+.task-select-label { font-size: .84rem; color: var(--muted); }.task-select { min-height: 32px; }
+.taskflow-panel .section-heading { margin-bottom: 16px; }
+.taskflow-board { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 44px; }
+.taskflow-stage { position: relative; border: 1px solid var(--border); border-radius: 12px; background: var(--card-bg); box-shadow: var(--shadow); }
+.taskflow-stage.active { border: 2px solid var(--accent); background: var(--accent-soft); }
+.stage-head { display: flex; align-items: center; gap: 9px; padding: 13px 16px; border-bottom: 1px solid var(--border); font-size: .95rem; }
+.stage-icon { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; color: #fff; background: var(--ok); flex: none; }.stage-icon.active { background: var(--accent-fill); }.stage-icon.wait { background: transparent; color: var(--muted); border: 1px solid var(--control-border); }.stage-icon.idle { background: transparent; color: var(--muted); border: 1px solid var(--control-border); }
+.stage-body { padding: 16px; }.stage-person { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }.stage-person strong { font-size: .9rem; }
+.stage-desc { font-size: .84rem; color: var(--fg); margin: 0 0 6px; line-height: 1.5; }.stage-sub { font-size: .8rem; color: var(--muted); margin: 0 0 6px; }
+.stage-link { display: flex; align-items: center; gap: 9px; margin: 14px 0; padding: 10px 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--card-bg); }.link-icon { color: var(--muted); }.stage-link > span:nth-child(2) { flex: 1; min-width: 0; }.stage-link strong { display: block; font-size: .8rem; }.stage-link small { display: block; font-size: .72rem; color: var(--muted); margin-top: 2px; }.link-cta { font-size: .74rem; color: var(--accent); white-space: nowrap; }
+.stage-foot { display: flex; align-items: center; gap: 7px; margin-top: 14px; font-size: .78rem; color: var(--muted); }.foot-icon { color: var(--ok); display: inline-flex; }.foot-icon.active { color: var(--accent); }.foot-icon.wait, .foot-icon.idle { color: var(--muted); }
+.stage-arrow { position: absolute; right: -32px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 1.2rem; }.stage-arrow.down { right: auto; left: 50%; top: auto; bottom: -28px; transform: translateX(-50%); }.stage-arrow.left { right: auto; left: -32px; }
+.taskflow-handoff { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 20px; padding: 13px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-bg); font-size: .82rem; }.taskflow-handoff > .app-icon { color: var(--muted); }.taskflow-handoff strong { margin-right: 4px; }.handoff-arrow { color: var(--muted); }.handoff-note { color: var(--accent); }
+.task-detail-title { display: flex; align-items: center; gap: 10px; margin: 16px 0; padding-bottom: 14px; border-bottom: 1px solid var(--border); }.task-detail-title strong { flex: 1; font-size: .96rem; }.task-detail-icon { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 9px; }
+.task-facts { margin: 0; }.task-facts > div { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: .82rem; }.task-facts dt { display: flex; align-items: center; gap: 7px; width: 96px; flex: none; color: var(--muted); }.task-facts dd { margin: 0; font-weight: 500; }
+.task-section { margin-top: 18px; }.task-section h3 { margin: 0 0 10px; font-size: .88rem; }.checklist { list-style: none; margin: 0; padding: 0; }.checklist li { display: flex; align-items: center; gap: 9px; padding: 6px 0; font-size: .82rem; }.checkbox { width: 15px; height: 15px; border: 1px solid var(--control-border); border-radius: 4px; flex: none; }.task-discussion { display: flex; align-items: center; justify-content: space-between; padding-top: 14px; border-top: 1px solid var(--border); font-size: .84rem; }.task-discussion > span:first-child { display: inline-flex; align-items: center; gap: 8px; }.discussion-link { color: var(--accent); }.recent-activity { display: flex; align-items: center; gap: 8px; margin: 0; font-size: .82rem; color: var(--muted); }
 @media (max-width: 1100px) { .collab-workspace { grid-template-columns: 1fr; gap: 20px; }.collab-side { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); align-items: start; gap: 16px; }.collab-side .quick-access { grid-column: 1 / -1; } }
 @media (max-width: 760px) {
   .collab-workspace { gap: 16px; }.collab-main, .collab-side { gap: 16px; }.collab-side { display: flex; flex-direction: column; }
   .collab-toolbar { padding: 10px 12px; gap: 8px 10px; }.toolbar-views, .toolbar-layers { flex-wrap: wrap; }
   .collab-header-meta { justify-content: flex-start; }
   .graph-canvas { padding: 16px 12px; }.graph-footer { align-items: flex-start; }
+  .taskflow-board { grid-template-columns: 1fr; gap: 22px; }.stage-arrow { display: none; }
   .overview-metrics { padding: 18px 0; }.overview-metrics > div { padding: 0 14px; }.overview-metrics dd { font-size: 1.7rem; }.overview-metrics span { display: none; }.overview-metrics dt { font-size: .78rem; }
   .service-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }.project-activity small { display: none; }
   .service-details > summary { padding: 14px; }.service-body { padding: 16px; }
