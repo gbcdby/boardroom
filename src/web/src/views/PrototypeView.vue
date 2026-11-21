@@ -35,7 +35,7 @@ const draft = ref("");
     <nav class="demo-breadcrumb" aria-label="当前位置"><RouterLink to="/">Boardroom</RouterLink><span aria-hidden="true"> / </span><span>界面升级小组</span></nav>
     <header class="page-header chat-demo-header">
       <div><h1>界面升级小组<span class="header-avatars"><span class="avatar avatar-sm avatar-1">产</span><span class="avatar avatar-sm avatar-2">前</span></span></h1><p class="page-description">协作总览升级 · 2 个群内实例</p></div>
-      <RouterLink to="/" class="toolbar-control"><AppIcon name="arrow" :size="15" />返回协作总览</RouterLink>
+      <RouterLink to="/" class="toolbar-control back-to-graph"><AppIcon name="arrow" :size="15" />返回关系图</RouterLink>
     </header>
 
     <div class="chat-demo-shell panel">
@@ -80,6 +80,7 @@ const draft = ref("");
 <style scoped>
 .demo-banner { display: flex; align-items: center; gap: 8px; margin: 0 0 14px; padding: 9px 14px; border: 1px dashed var(--warn); border-radius: 9px; background: color-mix(in srgb, var(--warn) 8%, transparent); color: var(--warn); font-size: .8rem; }
 .demo-breadcrumb { font-size: .78rem; color: var(--muted); margin-bottom: 8px; }.demo-breadcrumb a { color: var(--muted); text-decoration: none; }
+.back-to-graph > .app-icon { transform: rotate(180deg); }
 .chat-demo-header { align-items: center; }.chat-demo-header h1 { display: flex; align-items: center; gap: 10px; }.header-avatars { display: inline-flex; }.header-avatars .avatar { margin-left: -6px; border: 2px solid var(--card-bg); }
 .chat-demo-shell { display: grid; grid-template-columns: minmax(0,1fr) 320px; min-height: 620px; overflow: hidden; padding: 0; }
 .chat-demo-main { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--border); }
