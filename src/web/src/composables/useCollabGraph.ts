@@ -226,10 +226,14 @@ export function useCollabGraph(projectId: Ref<string | null>) {
       const conversations: GroupConversation[] = [];
       let totalMessages = 0;
       const seenMembers = new Set<string>();
-      for (const group of groupsResult.groups) {
-        const participants = (await api.listParticipants(group.id)).participants;
-        const messages = (await api.listMessages(group.id)).messages;
-        if (version !== generation) return;
+      // 并行拉取所有群的成员与消息，群数多时避免串行线性等待；取回后校验版本再聚合。
+      const groupData = await Promise.all(groupsResult.groups.map(async (group) => ({
+        group,
+        participants: (await api.listParticipants(group.id)).participants,
+        messages: (await api.listMessages(group.id)).messages,
+      })));
+      if (version !== generation) return;
+      for (const { group, participants, messages } of groupData) {
         totalMessages += messages.length;
         for (const message of messages) {
           recent.push({
