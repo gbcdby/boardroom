@@ -131,7 +131,13 @@ function uptime(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
   return minutes < 1 ? "不到 1 分钟" : minutes < 60 ? `${minutes} 分钟` : `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
 }
-onMounted(() => { void refresh(); connect(); healthTimer = setInterval(() => void refreshHealth(), 15000); });
+onMounted(() => {
+  void refresh(); connect(); healthTimer = setInterval(() => void refreshHealth(), 15000);
+  // 原型浏览 split view 可经 query 直达 P02（成员会话）/P03（任务流转）。
+  const view = new URLSearchParams(location.search).get("view");
+  if (view === "tasks") activeView.value = "tasks";
+  else if (view === "conversation") selectedMemberId.value = demoConversation.name;
+});
 onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInterval(healthTimer); if (reconnectTimer) clearTimeout(reconnectTimer); });
 </script>
 
