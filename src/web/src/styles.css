@@ -115,3 +115,15 @@ th { color: var(--muted); font-size: .85rem; font-weight: 500; } td { font-size:
   .nav-link.selected, button[aria-pressed="true"] { outline: 2px solid Highlight; outline-offset: -2px; }
   :focus-visible { outline-color: Highlight; }
 }
+
+/* 静态演示页的圆形头像（示例人像，见 docs/prototypes 原型定位）。 */
+.avatar { flex: none; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; color: #1d1d1f; font-size: .78rem; font-weight: 600; background: #dfe3ea; position: relative; overflow: visible; }
+.avatar-0 { background: #d8dee9; }
+.avatar-1, .avatar-2, .avatar-3, .avatar-4, .avatar-5, .avatar-6 { background-size: cover; background-position: center; color: transparent; font-size: 0; }
+.avatar-1 { background-image: url("/avatars/avatar-1.png"); }
+.avatar-2 { background-image: url("/avatars/avatar-2.png"); }
+.avatar-3 { background-image: url("/avatars/avatar-3.png"); }
+.avatar-4 { background-image: url("/avatars/avatar-4.png"); }
+.avatar-5 { background-image: url("/avatars/avatar-5.png"); }
+.avatar-6 { background-image: url("/avatars/avatar-6.png"); }
+.avatar-sm { width: 24px; height: 24px; }
