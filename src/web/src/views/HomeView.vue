@@ -319,7 +319,13 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .role-row { display: flex; align-items: center; gap: 12px; padding: 10px 14px; }.role-row + .role-row { border-top: 1px solid var(--border); }.role-name { font-size: .82rem; text-transform: capitalize; flex: 0 0 110px; }.role-caps { display: flex; flex-wrap: wrap; gap: 5px; flex: 1; min-width: 0; }.cap-chip { font-size: .68rem; padding: 2px 7px; border-radius: 5px; background: var(--accent-soft); color: var(--accent); overflow-wrap: anywhere; }.role-node { flex: none; }
 .runtime-row { display: grid; grid-template-columns: minmax(0,1.4fr) 64px 84px 68px minmax(0,1fr); align-items: center; gap: 10px; padding: 10px 14px; }.runtime-row + .runtime-row { border-top: 1px solid var(--border); }.runtime-name strong { display: block; font-size: .82rem; }.runtime-name small { display: block; font-size: .7rem; margin-top: 2px; }.runtime-support { font-size: .74rem; font-weight: 600; }.runtime-support.yes { color: var(--ok); }.runtime-support.no { color: var(--bad); }.runtime-isolation { font-size: .7rem; padding: 2px 6px; border-radius: 5px; text-align: center; background: var(--surface-subtle); }.runtime-isolation.verified { color: var(--ok); }.runtime-isolation.unverified { color: var(--warn); }.runtime-reason { font-size: .72rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .capability-empty { padding: 14px; border: 1px dashed var(--border); border-radius: 9px; }.capability-note { margin: 16px 0 0; line-height: 1.6; }
-@media (max-width: 760px) { .runtime-row { grid-template-columns: minmax(0,1fr) 60px; }.runtime-isolation, .runtime-state, .runtime-reason { grid-column: 1 / -1; } }
+@media (max-width: 760px) {
+  .runtime-row { grid-template-columns: minmax(0,1fr) 60px; }.runtime-isolation, .runtime-state, .runtime-reason { grid-column: 1 / -1; }
+  .role-row { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .role-name { flex: none; }
+  .role-caps { width: 100%; max-height: 132px; overflow-y: auto; }
+  .role-node { align-self: flex-end; }
+}
 .taskflow-panel .section-heading p { margin: 6px 0 0; }
 .taskflow-board { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; align-items: start; }
 .taskflow-column { min-width: 0; background: var(--surface-subtle); border-radius: 10px; padding: 10px; }
