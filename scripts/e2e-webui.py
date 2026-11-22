@@ -591,6 +591,72 @@ def purge_runtime_impact_flows(page, origin, workdir, output, report):
         "preservedRuntimeId": runtime["runtime"]["id"], "preservedBindingId": retained["id"], "preservedMemberId": retained["memberId"]}
     report["checks"].append("R-S6-CONFIRM-REQ-001 / S6-AC03/05: 实际托管绑定与状态非零，跨群关系变化仅使预留关系0→1；旧确认409且作废，新预览明确展示1并等待再次确认；项目分支显示1/1/1，390/1440长清单与动作可达，全局配置/项目成员/其他群与其他项目关系按政策保留")
 
+def exercise_taskflow(page, origin, records, report, output):
+    """#180 阶段 1：P03 只读看板的切 tab、空态、失败态、键盘与响应式显式断言。"""
+    project_id = records[0]["project"]["id"]
+    task_path = f"/api/projects/{project_id}/tasks"
+
+    page.goto(origin + "/?view=tasks")
+    board = page.get_by_test_id("p03-taskflow")
+    expect(board).to_be_visible()
+    tab = page.get_by_test_id("p03-tasks-tab")
+    expect(tab).to_have_attribute("aria-pressed", "true")
+    title = board.locator("#taskflow-title")
+    expect(title).to_contain_text("真实数据")
+    expect(title).not_to_contain_text("示例数据")
+    detail_title = page.get_by_test_id("p03-task-detail").locator("#task-detail-title")
+    expect(detail_title).to_contain_text("真实数据")
+    expect(detail_title).not_to_contain_text("示例数据")
+    expect(page.get_by_test_id("p03-task-column")).to_have_count(5)
+    assert [request(page, origin, "GET", task_path)["tasks"]] == [[]], "种子项目不应预置任务"
+    expect(page.get_by_test_id("p03-board-empty")).to_be_visible()
+    assert page.get_by_test_id("p03-task-card").count() == 0
+    assert not any(label in board.inner_text() for label in ["前端工程师", "协作总览升级", "成员会话侧栏"])
+    report["checks"].append("P03-01: 切 tab/深链显示真实看板五列；空任务列表为空看板，无示例任务注入")
+
+    def fail_tasks(route):
+        route.fulfill(status=503, content_type="application/json", body=json.dumps({"error": {"code": "ui_test_unavailable", "message": "任务来源暂不可用"}}))
+
+    page.route(f"**{task_path}", fail_tasks)
+    page.goto(origin + "/?view=tasks")
+    expect(page.get_by_test_id("p03-board-error")).to_be_visible()
+    expect(page.get_by_test_id("p03-board-error")).to_contain_text("任务来源读取失败")
+    expect(page.get_by_test_id("p03-task-refresh")).to_be_visible()
+    assert page.get_by_test_id("p03-task-card").count() == 0
+    refresh = page.get_by_test_id("p03-task-refresh")
+    refresh.focus()
+    expect(refresh).to_be_focused()
+    page.unroute(f"**{task_path}", fail_tasks)
+    page.keyboard.press("Enter")
+    expect(page.get_by_test_id("p03-board-empty")).to_be_visible()
+    expect(tab).to_be_focused()
+    report["checks"].append("P03-02: 任务读取失败显示来源与重试入口，无示例回填；键盘 Enter 重试后焦点返回 tab")
+
+    members_tab = page.get_by_role("button", name="成员关系", exact=True)
+    members_tab.focus()
+    page.keyboard.press("Enter")
+    expect(page.get_by_test_id("p03-taskflow")).to_have_count(0)
+    expect(members_tab).to_have_attribute("aria-pressed", "true")
+    tab.focus()
+    page.keyboard.press("Enter")
+    expect(page.get_by_test_id("p03-taskflow")).to_be_visible()
+    report["checks"].append("P03-03: 分段切换可键盘完成，任务详情与看板同步显示当前项目真实范围")
+
+    for width, height, theme in [(1440, 1000, "light"), (390, 844, "light"), (1440, 1000, "dark"), (390, 844, "dark")]:
+        page.set_viewport_size({"width": width, "height": height})
+        page.emulate_media(color_scheme=theme, reduced_motion="reduce")
+        page.goto(origin + "/?view=tasks")
+        page.wait_for_timeout(450)
+        expect(page.get_by_test_id("p03-taskflow")).to_be_visible()
+        expect(page.get_by_test_id("p03-task-column")).to_have_count(5)
+        key = f"taskflow-{width}-{theme}"
+        report["layouts"].append(layout(page, key, strict=True))
+        page.screenshot(path=str(output / f"{key}.png"), full_page=True, animations="disabled")
+        report["screenshots"].append(f"{key}.png")
+    report["checks"].append("P03-04: 390/1440 × 浅/深 + reduce 下五列看板无横向溢出并留截图")
+    page.emulate_media(color_scheme="light", reduced_motion="no-preference")
+    page.set_viewport_size({"width": 1440, "height": 1000})
+
 def exercise(page, origin, records, output, report, capture_only, workdir):
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
@@ -778,6 +844,7 @@ def exercise(page, origin, records, output, report, capture_only, workdir):
     nodes = request(page, origin, "GET", f"/api/projects/{project_id}/org")["nodes"]
     assert any(node["name"] == "项目统筹" and node["parentId"] is None for node in nodes), "岗位改名没有被真正撤销"
     report["checks"].append("UI-05: 组织按需编辑、实际改名与审计撤销")
+    exercise_taskflow(page, origin, records, report, output)
     confirmation_flows(page, origin, created_project_id, project_id, output, report)
     purge_snapshot_flows(page, origin, output, report)
     purge_runtime_impact_flows(page, origin, workdir, output, report)

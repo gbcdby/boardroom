@@ -110,17 +110,21 @@ test("空数据/无权限给出可解释空态，不显示假消息、不跨群�
   assert.match(failed.error.value ?? "", /无权读取/);
 });
 
-test("P02 接入真实检查器后不再标示例，P03/P04/P05 示例标注保留且不渲染伪造记录", async () => {
+test("P02 接入真实检查器、P03 接真实看板后示例标注按范围更新，P04/P05 示例保留且不渲染伪造记录", async () => {
   const home = await readFile(new URL("../src/web/src/views/HomeView.vue", import.meta.url), "utf8");
   const conversationHeading = home.match(/<h2 id="conversation-title"[^>]*>([\s\S]*?)<\/h2>/);
   assert.ok(conversationHeading, "缺少 P02 标题");
   assert.match(conversationHeading![1]!, /仅 Boardroom 消息/);
   assert.doesNotMatch(conversationHeading![1]!, /示例数据/);
-  for (const heading of ["taskflow-title", "pending-title", "task-detail-title"]) {
+  for (const heading of ["taskflow-title", "task-detail-title"]) {
     const match = home.match(new RegExp(`<h2 id="${heading}"[^>]*>([\\s\\S]*?)</h2>`));
     assert.ok(match, `缺少 ${heading} 标题`);
-    assert.match(match![1]!, /示例数据/, `${heading} 的示例标注不得移除`);
+    assert.match(match![1]!, /真实数据/, `${heading} 应标注真实数据`);
+    assert.doesNotMatch(match![1]!, /示例数据/, `${heading} 不得再标示例数据`);
   }
+  const pending = home.match(/<h2 id="pending-title"[^>]*>([\s\S]*?)<\/h2>/);
+  assert.ok(pending, "缺少待我处理标题");
+  assert.match(pending![1]!, /示例数据/, "待我处理仍是示例数据");
   for (const path of ["src/web/src/views/CapabilityDemoView.vue", "src/web/src/views/PrototypeView.vue"]) {
     const source = await readFile(new URL(`../${path}`, import.meta.url), "utf8");
     assert.match(source, /示例数据/, `${path} 的示例标注不得移除`);

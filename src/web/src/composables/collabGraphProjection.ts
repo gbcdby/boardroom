@@ -1,7 +1,8 @@
 /** #177 阶段 1：真实只读 API → 协作关系图的可测试纯投影，不写业务状态、不注入示例事实。 */
 import type { GroupDto, MemberDto, MemberStatusDto, MessageDto, OrgNodeDto, ProjectDto, RoleCatalogEntry } from "../api/client.ts";
 import type { RuntimeViewDto } from "../api/runtimes.ts";
-import { taskStateLabel, type Task } from "../api/tasks.ts";
+import { taskStateLabel, taskStates, type Task, type TaskState } from "../api/tasks.ts";
+import type { TaskMaterialIssue } from "../../../shared/tasks.ts";
 import type { GraphCanvasData } from "../components/collabGraphLayout.ts";
 import {
   buildMessageDirectionLayer, type MessageDirectionLayer,
@@ -56,17 +57,56 @@ export interface GroupConversation {
   messages: ConversationMessage[];
 }
 
+export interface TaskFlowReadinessIssue extends TaskMaterialIssue {
+  /** 服务端写入该缺口的阶段；不表示缺口已解决。 */
+  stage: "startExecution" | "submitReview" | "complete";
+  /** 仅文字提示；不含链接、按钮或领域动作承诺。 */
+  hint: string;
+}
+
 export interface TaskFlowItem {
   id: string;
   title: string;
   state: string;
   stateLabel: string;
   assignee: string | null;
+  assigneeMemberId: string | null;
+  reviewer: string | null;
+  reviewerMemberId: string | null;
   blockedReason: string | null;
-  /** 资料 readiness 原因码（executionAdmission 始终 not-issued，不冒充执行放行）。 */
+  /** 资料 readiness 原因码的聚合视图；字段级信息见 readinessIssues。 */
   readinessCodes: string[];
+  /** 服务端 issues 原样保留（含同码不同字段），不去重、不补造下一步。 */
+  readinessIssues: TaskFlowReadinessIssue[];
+  /** 恒为 not-issued：只说明资料观察，不代表执行放行。 */
+  executionAdmission: "not-issued";
+  deliveryKind: string | null;
+  repoPath: string | null;
+  fixedPoint: string | null;
   revision: number;
   updatedAt: string;
+}
+
+export interface TaskFlowColumn {
+  state: string;
+  label: string;
+  tasks: TaskFlowItem[];
+}
+
+const FIELD_HINTS: Record<string, string> = {
+  assigneeMemberId: "核对服务端指出的负责人字段（assigneeMemberId）；具体人选需查领域权威",
+  body: "补齐服务端指出的任务目标字段（body）",
+  acceptanceText: "补齐服务端指出的验收说明字段（acceptanceText）",
+  deliveryKind: "确认服务端指出的交付类型字段（deliveryKind）",
+  reviewerMemberId: "指定服务端指出的评审人字段（reviewerMemberId）；具体人选需查领域权威",
+  repoPath: "补齐服务端指出的评审来源字段（repoPath）",
+  fixedPoint: "补齐服务端指出的评审来源字段（fixedPoint）",
+};
+
+/** 只对已持久的 code/field 给出保守文字提示，不生成链接、按钮或领域决定。 */
+export function nextStepForIssue(issue: TaskMaterialIssue): string {
+  if (issue.code === "candidate_type_requires_v2") return "需查领域权威";
+  return FIELD_HINTS[issue.field] ?? "需查领域权威";
 }
 
 export interface RoleCapability {
@@ -264,21 +304,38 @@ export function buildCollabGraphSnapshot(input: CollabGraphInput): CollabGraph {
   messageEdges.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
   recent.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
 
-  const tasks: TaskFlowItem[] = input.tasks.map((task: Task) => ({
-    id: task.id,
-    title: task.title,
-    state: task.state,
-    stateLabel: taskStateLabel(task.state),
-    assignee: task.assigneeMemberId ? memberMap.get(task.assigneeMemberId)?.displayName ?? "已移除成员" : null,
-    blockedReason: task.blockedReason,
-    readinessCodes: [...new Set([
-      ...task.materialStatus.startExecution.reasonCodes,
-      ...task.materialStatus.submitReview.reasonCodes,
-      ...task.materialStatus.complete.reasonCodes,
-    ])],
-    revision: task.revision,
-    updatedAt: task.updatedAt,
-  }));
+  const tasks: TaskFlowItem[] = input.tasks.map((task: Task) => {
+    const readinessIssues: TaskFlowReadinessIssue[] = ([
+      ["startExecution", task.materialStatus.startExecution],
+      ["submitReview", task.materialStatus.submitReview],
+      ["complete", task.materialStatus.complete],
+    ] as const).flatMap(([stage, phase]) => phase.issues.map((issue) => ({
+      ...issue, stage, hint: nextStepForIssue(issue),
+    })));
+    return {
+      id: task.id,
+      title: task.title,
+      state: task.state,
+      stateLabel: taskStateLabel(task.state),
+      assignee: task.assigneeMemberId ? memberMap.get(task.assigneeMemberId)?.displayName ?? "已移除成员" : null,
+      assigneeMemberId: task.assigneeMemberId,
+      reviewer: task.reviewerMemberId ? memberMap.get(task.reviewerMemberId)?.displayName ?? "已移除成员" : null,
+      reviewerMemberId: task.reviewerMemberId,
+      blockedReason: task.blockedReason,
+      readinessCodes: [...new Set([
+        ...task.materialStatus.startExecution.reasonCodes,
+        ...task.materialStatus.submitReview.reasonCodes,
+        ...task.materialStatus.complete.reasonCodes,
+      ])],
+      readinessIssues,
+      executionAdmission: task.materialStatus.executionAdmission,
+      deliveryKind: task.deliveryKind,
+      repoPath: task.repoPath,
+      fixedPoint: task.fixedPoint,
+      revision: task.revision,
+      updatedAt: task.updatedAt,
+    };
+  });
   const roles: RoleCapability[] = input.org.roles.map((role) => ({
     role: role.role,
     capabilities: [...role.capabilities],
@@ -309,6 +366,23 @@ export function buildCollabGraphSnapshot(input: CollabGraphInput): CollabGraph {
     recent: recent.slice(0, 5), messageDirection, messageEdges: messageDirection.markers,
     conversations, tasks, roles, runtimeCapabilities,
   };
+}
+
+/** 真实 state → 固定五列；未知 state 按服务端原值另列，不丢弃任务也不硬造统一关卡。 */
+export function buildTaskFlowBoard(tasks: readonly TaskFlowItem[]): TaskFlowColumn[] {
+  const columns: TaskFlowColumn[] = taskStates.map((state) => ({
+    state: state.value as TaskState, label: state.label, tasks: [],
+  }));
+  const extras = new Map<string, TaskFlowColumn>();
+  for (const item of tasks) {
+    let column = columns.find((candidate) => candidate.state === item.state);
+    if (!column) {
+      column = extras.get(item.state) ?? { state: item.state, label: item.state, tasks: [] };
+      extras.set(item.state, column);
+    }
+    column.tasks.push(item);
+  }
+  return [...columns, ...extras.values()];
 }
 
 function clip(text: string, max: number): string {

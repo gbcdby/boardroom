@@ -56,15 +56,19 @@ test("重读后选中成员已不存在时清空；仍在当前图时保持选�
   );
 });
 
-test("P02 已接为真实检查器，P03 与待我处理仍显式标注示例数据", async () => {
+test("P02 与 P03 已接真实数据，待我处理仍显式标注示例数据", async () => {
   const source = await readFile(new URL("../src/web/src/views/HomeView.vue", import.meta.url), "utf8");
   const conversation = source.match(/<h2 id="conversation-title"[^>]*>([\s\S]*?)<\/h2>/);
   assert.ok(conversation, "缺少 conversation-title 标题");
   assert.match(conversation![1]!, /仅 Boardroom 消息/);
   assert.doesNotMatch(conversation![1]!, /示例数据/);
-  for (const heading of ["taskflow-title", "pending-title", "task-detail-title"]) {
+  for (const heading of ["taskflow-title", "task-detail-title"]) {
     const match = source.match(new RegExp(`<h2 id="${heading}"[^>]*>([\\s\\S]*?)</h2>`));
     assert.ok(match, `缺少 ${heading} 标题`);
-    assert.match(match![1]!, /示例数据/, `${heading} 缺少示例数据标注`);
+    assert.match(match![1]!, /真实数据/, `${heading} 应标注真实数据`);
+    assert.doesNotMatch(match![1]!, /示例数据/, `${heading} 不得再标示例数据`);
   }
+  const pending = source.match(/<h2 id="pending-title"[^>]*>([\s\S]*?)<\/h2>/);
+  assert.ok(pending, "缺少 pending-title 标题");
+  assert.match(pending![1]!, /示例数据/, "待我处理仍是示例数据");
 });
