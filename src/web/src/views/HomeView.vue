@@ -1,9 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import AppIcon from "../components/AppIcon.vue";
 import CollabGraphCanvas from "../components/CollabGraphCanvas.vue";
 import type { GraphCanvasData } from "../components/collabGraphLayout.ts";
+import { useCollabGraph } from "../composables/useCollabGraph.ts";
+import { toGraphCanvasData } from "../composables/collabGraphProjection.ts";
+import { initialConversationSelection, isProjectSwitch, reconcileConversationSelection } from "../composables/collabGraphSelection.ts";
 import { projectPath, useCurrentProject } from "../composables/useCurrentProject.ts";
 interface HealthReport {
   status: "ok" | "degraded"; uptimeSeconds: number; serverTime: string;
@@ -12,55 +15,30 @@ interface HealthReport {
   heartbeat: { intervalMs: number; timeoutMs: number }; webui: { built: boolean };
 }
 
-// 本页中央关系图为静态视觉演示，节点/头像/状态/动态均为示例数据，不代表真实运行数据。
-// 唯一真实数据是顶部“已连接”与底部“本地服务”，来自 /api/health 与 /ws。
-interface DemoMember { name: string; initials: string; role: string; status: string; tone: "ok" | "active" | "wait"; avatar: number }
-interface DemoGroup { name: string; icon: string; coordinator: DemoMember; members: DemoMember[]; flows: string[] }
-const demoGroups: DemoGroup[] = [
-  {
-    name: "界面升级小组", icon: "grid",
-    coordinator: { name: "产品设计师", initials: "产", role: "设计", status: "方案已提交", tone: "active", avatar: 1 },
-    members: [{ name: "前端工程师", initials: "前", role: "实现", status: "执行中", tone: "active", avatar: 2 }],
-    flows: ["设计协作", "方案 · 已送达"],
+// P01 中央图、顶部计数与右侧动态均来自当前项目真实只读 API；空数据就是空图。
+const context = useCurrentProject();
+const graphProjectId = computed(() => context.currentProjectId.value);
+const { graph, loading: graphLoading, error: graphError, load: loadGraph } = useCollabGraph(graphProjectId);
+const graphCanvasData = computed<GraphCanvasData>(() => toGraphCanvasData(graph.value));
+const graphScopeName = computed(() => context.projects.value.find((project) => project.id === graphProjectId.value)?.name ?? "");
+const selectedMemberId = ref<string | null>(null);
+const pendingConversationIntent = ref(initialConversationSelection(new URLSearchParams(location.search).get("view")).pendingDeepLink);
+watch([graphProjectId, () => context.generation.value], () => { void loadGraph(); }, { immediate: true });
+watch(
+  [graphProjectId, graphCanvasData, graphLoading, graphError] as const,
+  ([projectId, data, loading, error], previous) => {
+    const result = reconcileConversationSelection(
+      { selectedId: selectedMemberId.value, pendingDeepLink: pendingConversationIntent.value },
+      data.groups.flatMap(group => group.members).map(member => member.id),
+      { loading, failed: error !== null, projectChanged: isProjectSwitch(previous?.[0], projectId) },
+    );
+    selectedMemberId.value = result.selectedId;
+    pendingConversationIntent.value = result.pendingDeepLink;
   },
-  {
-    name: "MCP 能力接入", icon: "layers",
-    coordinator: { name: "后端工程师", initials: "后", role: "接入", status: "执行中", tone: "active", avatar: 3 },
-    members: [{ name: "安全审查员", initials: "安", role: "审查", status: "等待材料", tone: "wait", avatar: 4 }],
-    flows: ["接口协作", "权限复核"],
-  },
-  {
-    name: "质量保障", icon: "check",
-    coordinator: { name: "验证工程师", initials: "验", role: "验证", status: "等待版本", tone: "wait", avatar: 5 },
-    members: [],
-    flows: ["验证协作"],
-  },
-];
-const demoRoot: DemoMember = { name: "总管", initials: "总", role: "协调中枢", status: "在线", tone: "ok", avatar: 0 };
-const demoLead: DemoMember = { name: "项目负责人", initials: "负", role: "协调中", status: "协调中", tone: "active", avatar: 6 };
-const demoActivity = [
-  { when: "刚刚", who: "前端工程师", text: "已接手协作总览升级。" },
-  { when: "12 秒前", who: "产品设计师", text: "发送方案。" },
-  { when: "38 秒前", who: "后端工程师", text: "请求权限复核。" },
-];
-const demoPending = [{ title: "扩大工具使用范围", detail: "项目策略要求确认" }];
-const graphCanvasData = computed<GraphCanvasData>(() => ({
-  root: { name: demoRoot.name, role: demoRoot.role, avatar: 0, initials: demoRoot.initials },
-  lead: { id: demoLead.name, name: demoLead.name, initials: demoLead.initials, status: demoLead.status, tone: demoLead.tone, avatar: demoLead.avatar, role: demoLead.role },
-  groups: demoGroups.map((group, index) => ({
-    name: group.name,
-    icon: group.icon,
-    flowLabel: group.flows[0] ?? "协作",
-    flowMessage: group.flows.length > 1 ? group.flows[group.flows.length - 1] : undefined,
-    flowEmphasis: index === 0,
-    members: [group.coordinator, ...group.members].map(member => ({
-      id: member.name, name: member.name, initials: member.initials,
-      status: member.status, tone: member.tone, avatar: member.avatar,
-    })),
-  })),
-}));
+  { immediate: true },
+);
 
-// P03 任务流转视图示例数据（静态视觉演示）
+// P03 任务流转视图示例数据（静态视觉演示，非真实任务状态）
 const activeView = ref<"members" | "tasks">("members");
 const demoTasks = [
   { id: "assigned", title: "任务已分配", icon: "check", tone: "ok", person: "项目负责人", initials: "负", avatar: 6,
@@ -79,8 +57,9 @@ const demoTaskDetail = {
 };
 function switchView(view: "members" | "tasks"): void { activeView.value = view; unavailableReason.value = null; }
 
-// P02 成员会话面板示例数据（静态视觉演示）
-const selectedMemberId = ref<string | null>(null);
+// P02 成员会话面板：选中节点来自真实图，会话正文仍是静态示例数据。
+const selectedNode = computed(() => graphCanvasData.value.groups.flatMap(group => group.members).find(member => member.id === selectedMemberId.value) ?? null);
+const selectedGroupName = computed(() => graphCanvasData.value.groups.find(group => group.members.some(member => member.id === selectedMemberId.value))?.name ?? "");
 const demoConversation = {
   name: "前端工程师", initials: "前", avatar: 2, online: true, state: "执行中", group: "界面升级小组", instance: "当前实例",
   task: "协作总览升级", synced: "仅 Boardroom 消息 · 已同步",
@@ -92,10 +71,10 @@ const demoConversation = {
 };
 function openConversation(memberId: string): void { selectedMemberId.value = memberId; }
 function closeConversation(): void { selectedMemberId.value = null; }
+const demoPending = [{ title: "扩大工具使用范围", detail: "项目策略要求确认" }];
 
 const health = ref<HealthReport | null>(null);
 const healthError = ref<string | null>(null);
-const context = useCurrentProject();
 const projects = computed(() => context.projects.value.filter((project) => project.archivedAt === null));
 const projectError = context.error;
 const loading = ref(true);
@@ -113,7 +92,7 @@ const serviceLabel = computed(() => healthError.value ? "暂时无法连接" : !
 const wsLabel = computed(() => connection.value === "connected" ? "实时连接正常" : connection.value === "connecting" ? "实时连接中" : "连接中断，正在重连");
 const unavailableReason = ref<string | null>(null);
 function explainUnavailable(label: string): void {
-  unavailableReason.value = `「${label}」是静态演示控件；真实交互需等协作关系读模型接入。`;
+  unavailableReason.value = `「${label}」是静态演示控件，本批未接入真实交互。`;
 }
 async function refreshHealth(): Promise<void> {
   try {
@@ -127,6 +106,7 @@ async function refresh(): Promise<void> {
   if (refreshing.value) return;
   refreshing.value = true;
   await Promise.allSettled([refreshHealth(), context.refreshProjects()]);
+  void loadGraph();
   if (!disposed) { loading.value = false; refreshing.value = false; }
 }
 function connect(): void {
@@ -153,7 +133,6 @@ onMounted(() => {
   // 原型浏览 split view 可经 query 直达 P02（成员会话）/P03（任务流转）。
   const view = new URLSearchParams(location.search).get("view");
   if (view === "tasks") activeView.value = "tasks";
-  else if (view === "conversation") selectedMemberId.value = demoConversation.name;
 });
 onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInterval(healthTimer); if (reconnectTimer) clearTimeout(reconnectTimer); });
 </script>
@@ -161,9 +140,9 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 <template>
   <section class="page home-page">
     <header class="page-header collab-header">
-      <div class="header-title"><span class="page-icon"><AppIcon name="layers" :size="24" /></span><div><h1>协作总览</h1><p class="page-description">3 个群组 · 5 个群内实例</p></div></div>
+      <div class="header-title"><span class="page-icon"><AppIcon name="layers" :size="24" /></span><div><h1>协作总览</h1><p class="page-description" data-testid="p01-counts">{{ graph.groups.length }} 个群组 · {{ graph.memberCount }} 位成员 · {{ graph.messageCount }} 条消息</p></div></div>
       <div class="collab-header-meta">
-        <button type="button" class="toolbar-control scope-control" aria-disabled="true" title="范围切换是静态演示控件" data-testid="p01-scope" @click="explainUnavailable('范围切换')">范围：Boardroom<AppIcon name="chevron" :size="14" /></button>
+        <button type="button" class="toolbar-control scope-control" aria-disabled="true" title="范围切换是静态演示控件" data-testid="p01-scope" @click="explainUnavailable('范围切换')">范围：{{ graphScopeName || '未选择项目' }}<AppIcon name="chevron" :size="14" /></button>
         <span class="connected-state" :class="healthError || health?.status === 'degraded' ? 'bad' : health ? 'ok' : 'muted'" data-testid="p01-connected"><span class="connected-dot" aria-hidden="true"></span>{{ connectedLabel }} · 刚刚更新</span>
       </div>
     </header>
@@ -190,9 +169,12 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 
     <div class="collab-workspace">
       <div class="collab-main">
-        <section v-if="activeView === 'members'" class="panel graph-panel" aria-label="协作关系图（示例数据）">
+        <section v-if="activeView === 'members'" class="panel graph-panel" aria-label="协作关系图（当前项目真实数据）">
           <div class="graph-canvas" data-testid="p01-graph-canvas">
-            <CollabGraphCanvas :data="graphCanvasData" :selected-id="selectedMemberId" @select="openConversation" />
+            <p v-if="graphError" class="graph-empty error" role="alert" data-testid="p01-graph-error">关系图读取失败：{{ graphError }} <button type="button" class="text-button" @click="loadGraph()">重试</button></p>
+            <p v-else-if="graphLoading" class="graph-empty muted" role="status" data-testid="p01-graph-loading">正在读取当前项目的真实成员与群…</p>
+            <p v-else-if="graph.groups.length === 0" class="graph-empty" data-testid="p01-graph-empty">当前范围没有可读取的群与成员，关系图为空。<RouterLink to="/projects">选择或创建项目</RouterLink></p>
+            <CollabGraphCanvas v-else :data="graphCanvasData" :selected-id="selectedMemberId" @select="openConversation" />
           </div>
           <div class="graph-footer">
             <ul class="graph-legend" aria-label="关系图图例"><li><span class="legend-line" aria-hidden="true"></span>协作关系</li><li><span class="legend-line legend-arrow" aria-hidden="true"></span>消息方向</li><li><span class="legend-dot ok" aria-hidden="true"></span>连接正常</li></ul>
@@ -233,7 +215,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
           <section class="panel project-overview" aria-labelledby="projects-title">
             <div class="section-heading"><h2 id="projects-title">你的项目</h2><button type="button" class="text-button" :disabled="refreshing" @click="refresh">{{ refreshing ? '刷新中…' : '刷新' }}</button></div>
             <p v-if="loading" class="muted loading-state" role="status">正在读取项目…</p>
-            <div v-else-if="!projectError && projects.length === 0" class="empty-state"><h3>当前没有未归档项目</h3><p>上方关系图是静态演示，不会因这里为空而变化。</p></div>
+            <div v-else-if="!projectError && projects.length === 0" class="empty-state"><h3>当前没有未归档项目</h3><p>上方关系图只展示当前项目的真实数据；无数据时不会显示示例节点。</p></div>
             <ul v-else class="home-projects"><li v-for="project in projects" :key="project.id"><RouterLink :to="projectPath(project.id)" class="home-project-link"><span class="project-monogram">{{ project.name.slice(0, 1) }}</span><span class="project-copy"><strong>{{ project.name }}</strong><span>{{ project.memberCount ?? 0 }} 位成员 · {{ project.groupCount ?? 0 }} 个群组</span></span><span class="project-activity"><span class="badge" :class="{ ok: project.status === 'active' }">{{ project.status === 'active' ? '活跃' : '空闲' }}</span><small>{{ recentActivity(project.lastActivityAt) }}</small></span><AppIcon name="chevron" :size="16" /></RouterLink></li></ul>
           </section>
         </details>
@@ -241,7 +223,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
       <aside class="collab-side" :aria-label="activeView === 'tasks' ? '任务详情' : '动态与待我处理'">
         <template v-if="activeView === 'tasks'">
           <section class="panel side-panel task-detail" aria-labelledby="task-detail-title">
-            <div class="side-heading"><h2 id="task-detail-title">任务详情</h2><button type="button" class="inspector-close" aria-label="关闭任务详情" aria-disabled="true" title="静态演示控件" @click="explainUnavailable('关闭任务详情')"><AppIcon name="close" :size="16" /></button></div>
+            <div class="side-heading"><h2 id="task-detail-title">任务详情<span class="demo-chip">示例数据</span></h2><button type="button" class="inspector-close" aria-label="关闭任务详情" aria-disabled="true" title="静态演示控件" @click="explainUnavailable('关闭任务详情')"><AppIcon name="close" :size="16" /></button></div>
             <div class="task-detail-title"><span class="task-detail-icon"><AppIcon name="layers" :size="20" /></span><strong>{{ demoTaskDetail.title }}</strong><span class="status-badge active">{{ demoTaskDetail.state }}</span></div>
             <dl class="task-facts">
               <div><dt><AppIcon name="people" :size="15" />负责人</dt><dd>{{ demoTaskDetail.owner }}</dd></div>
@@ -256,10 +238,10 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
         </template>
         <template v-else>
           <section v-if="selectedMemberId" class="panel side-panel conversation-panel" aria-labelledby="conversation-title" data-testid="p02-conversation">
-            <div class="side-heading"><h2 id="conversation-title">成员会话</h2><button type="button" class="inspector-close" aria-label="关闭成员会话" @click="closeConversation"><AppIcon name="close" :size="16" /></button></div>
-            <div class="conv-person"><span class="avatar conv-avatar" :class="`avatar-${demoConversation.avatar}`">{{ demoConversation.initials }}</span><span class="conv-person-copy"><strong>{{ selectedMemberId }}</strong><small>{{ demoConversation.group }} · {{ demoConversation.instance }}</small></span><span v-if="demoConversation.online" class="conv-online"><span class="connected-dot ok" aria-hidden="true"></span>在线</span><span class="status-badge active">{{ demoConversation.state }}</span></div>
+            <div class="side-heading"><h2 id="conversation-title">成员会话<span class="demo-chip">示例数据</span></h2><button type="button" class="inspector-close" aria-label="关闭成员会话" @click="closeConversation"><AppIcon name="close" :size="16" /></button></div>
+            <div class="conv-person"><span class="avatar conv-avatar" :class="`avatar-${selectedNode?.avatar ?? 0}`">{{ selectedNode?.initials ?? "?" }}</span><span class="conv-person-copy"><strong>{{ selectedNode?.name ?? selectedMemberId }}</strong><small>{{ selectedGroupName }} · 实例会话尚未接通</small></span><span class="status-badge" :class="selectedNode?.tone === 'active' ? 'active' : selectedNode?.tone === 'wait' ? 'wait' : 'ok'">{{ selectedNode?.status ?? "状态未知" }}</span></div>
             <button type="button" class="conv-task" aria-disabled="true" title="静态演示控件" @click="explainUnavailable('当前任务')"><span class="conv-task-icon"><AppIcon name="layers" :size="16" /></span><span>当前任务：<strong>{{ demoConversation.task }}</strong></span><AppIcon name="chevron" :size="14" /></button>
-            <p class="conv-sync muted small">{{ demoConversation.synced }}</p>
+            <p class="conv-sync muted small">正文为静态示例数据，真实会话内容尚未接通。</p>
             <div class="conv-tabs" role="tablist" aria-label="成员会话内容"><button type="button" role="tab" aria-selected="true">会话</button><button type="button" role="tab" aria-selected="false" aria-disabled="true" @click="explainUnavailable('活动')">活动</button><button type="button" role="tab" aria-selected="false" aria-disabled="true" @click="explainUnavailable('产物')">产物</button></div>
             <div class="conv-day"><span>今天 14:32</span></div>
             <div class="conv-messages">
@@ -280,11 +262,12 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
           </section>
           <template v-else>
           <section class="panel side-panel" aria-labelledby="activity-title">
-            <div class="side-heading"><h2 id="activity-title">实时动态</h2><button type="button" class="follow-toggle" aria-pressed="true" @click="explainUnavailable('自动跟随')"><span aria-hidden="true"></span>自动跟随</button></div>
-            <ul class="activity-list"><li v-for="(item, index) in demoActivity" :key="item.when"><span class="activity-rail" aria-hidden="true"><span class="rail-dot" :class="{ first: index === 0 }"></span></span><span class="activity-copy"><small>{{ item.when }}</small><span class="activity-bubble"><span class="avatar avatar-sm" :class="`avatar-${index + 1}`">{{ item.who.slice(0, 1) }}</span>{{ item.who }}{{ item.text }}</span></span></li></ul>
+            <div class="side-heading"><h2 id="activity-title">实时动态<span class="real-chip">真实消息</span></h2><button type="button" class="follow-toggle" aria-pressed="true" @click="explainUnavailable('自动跟随')"><span aria-hidden="true"></span>自动跟随</button></div>
+            <p v-if="graph.recent.length === 0" class="muted small" data-testid="p01-activity-empty">当前项目暂无真实消息。</p>
+            <ul v-else class="activity-list" data-testid="p01-activity-list"><li v-for="(item, index) in graph.recent" :key="item.id" :data-message-id="item.id" :title="`消息 ID ${item.id} · ${item.createdAt}`"><span class="activity-rail" aria-hidden="true"><span class="rail-dot" :class="{ first: index === 0 }"></span></span><span class="activity-copy"><small>{{ recentActivity(item.createdAt) }} · {{ item.groupName }}</small><span class="activity-bubble"><span class="avatar avatar-sm" :class="`avatar-${item.avatarSeed}`">{{ item.sender.slice(0, 1) }}</span>{{ item.sender }}：{{ item.text }}</span></span></li></ul>
           </section>
           <section class="panel side-panel" aria-labelledby="pending-title">
-            <div class="side-heading"><h2 id="pending-title">待我处理</h2></div>
+            <div class="side-heading"><h2 id="pending-title">待我处理<span class="demo-chip">示例数据</span></h2></div>
             <div class="pending-list"><div v-for="item in demoPending" :key="item.title" class="pending-card"><span class="pending-icon"><AppIcon name="check" :size="18" /></span><span class="pending-copy"><strong>{{ item.title }}</strong><small>{{ item.detail }}</small></span><span class="pending-link">查看事项<AppIcon name="arrow" :size="14" /></span></div></div>
           </section>
           <section class="quick-access" aria-labelledby="quick-access-title"><h2 id="quick-access-title">继续工作</h2><RouterLink to="/chat" class="shortcut"><span class="shortcut-icon"><AppIcon name="message" :size="21" /></span><span><strong>进入群聊</strong><small>与成员交流，让工作继续</small></span><AppIcon name="chevron" :size="16" /></RouterLink><RouterLink to="/status" class="shortcut"><span class="shortcut-icon"><AppIcon name="activity" :size="21" /></span><span><strong>查看成员状态</strong><small>了解谁在线、谁正在工作</small></span><AppIcon name="chevron" :size="16" /></RouterLink></section>
@@ -314,6 +297,8 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .collab-main, .collab-side { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
 .graph-panel { min-height: 0; display: flex; flex-direction: column; padding: 16px; border-radius: 12px; }.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }.section-heading h2 { margin: 0; font-size: 1.02rem; }
 .demo-chip { display: inline-block; margin-left: 8px; padding: 2px 7px; border-radius: 5px; background: var(--accent-soft); color: var(--accent); font-size: .68rem; font-weight: 600; vertical-align: middle; }
+.real-chip { display: inline-block; margin-left: 8px; padding: 2px 7px; border-radius: 5px; background: color-mix(in srgb, var(--ok) 12%, transparent); color: var(--ok); font-size: .68rem; font-weight: 600; vertical-align: middle; }
+.graph-empty { margin: 0; padding: 30px 16px; border: 1px dashed var(--border); border-radius: 10px; font-size: .86rem; line-height: 1.7; text-align: center; overflow-wrap: anywhere; }.graph-empty a { color: var(--accent); }
 .graph-canvas { flex: none; display: block; height: auto; min-height: 0; border: 0; border-radius: 0; background: transparent; padding: 0; overflow: visible; }
 .avatar:not(.avatar-0)::after { content: ""; position: absolute; right: -1px; bottom: -1px; width: 9px; height: 9px; border-radius: 50%; background: var(--ok); border: 2px solid var(--card-bg); }
 .status-badge { flex: none; font-size: .7rem; padding: 2px 7px; border-radius: 20px; white-space: nowrap; font-weight: 600; }

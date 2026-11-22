@@ -30,8 +30,11 @@ const data: GraphCanvasData = {
 };
 
 function assertInside(layout: ReturnType<typeof layoutGraph>): void {
-  assert.ok(layout.root.x >= 0 && layout.root.x + layout.root.w <= layout.width);
-  assert.ok(layout.lead.x >= 0 && layout.lead.x + layout.lead.w <= layout.width);
+  for (const header of [layout.root, layout.lead]) {
+    if (!header) continue;
+    assert.ok(header.x >= 0 && header.x + header.w <= layout.width);
+    assert.ok(header.y >= 0 && header.y + header.h <= layout.height);
+  }
   for (const group of layout.groups) {
     assert.ok(group.x >= 0 && group.x + group.w <= layout.width);
     assert.ok(group.y >= 0 && group.y + group.h <= layout.height);
@@ -78,4 +81,39 @@ test("命中使用 CSS 像素坐标，成员行与空白均正确", () => {
     assert.equal(hitTestMember(layout, first.x + first.w / 2, first.y + first.h / 2), first.member.id);
     assert.equal(hitTestMember(layout, 2, 2), null);
   }
+});
+
+test("无负责人岗位时不画占位节点，群组仍从顶部排列且不溢出", () => {
+  const headerless: GraphCanvasData = { root: null, lead: null, groups: data.groups };
+  const layout = layoutGraph(headerless, 390);
+  assert.equal(layout.root, null);
+  assert.equal(layout.lead, null);
+  assert.equal(layout.groupsTop, 16);
+  assert.equal(layout.groups[0]!.y, 16);
+  assert.equal(layout.columns, 1);
+  assertInside(layout);
+});
+
+test("空图高度有限且没有成员命中区域", () => {
+  const empty = layoutGraph({ root: null, lead: null, groups: [] }, 390);
+  assert.deepEqual(empty.groups, []);
+  assert.ok(empty.height < 100);
+  assert.equal(hitTestMember(empty, 10, 10), null);
+});
+
+test("多成员群组卡片随成员数长高，最后一名成员仍在容器内", () => {
+  const three: GraphCanvasData = {
+    root: null, lead: null,
+    groups: [{
+      name: "三人真实群", icon: "grid", flowLabel: "群消息 1",
+      members: ["a", "b", "c"].map(id => ({ id, name: id, initials: id, status: "在线", tone: "ok" as const, avatar: 0 })),
+    }],
+  };
+  const layout = layoutGraph(three, 760);
+  const group = layout.groups[0]!;
+  assert.equal(group.members.length, 3);
+  assert.ok(group.h > 230);
+  const last = group.members[2]!;
+  assert.ok(last.y + last.h <= group.y + group.h);
+  assertInside(layout);
 });
