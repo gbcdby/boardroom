@@ -6,6 +6,7 @@ import CollabGraphCanvas from "../components/CollabGraphCanvas.vue";
 import type { GraphCanvasData } from "../components/collabGraphLayout.ts";
 import { useCollabGraph } from "../composables/useCollabGraph.ts";
 import { toGraphCanvasData } from "../composables/collabGraphProjection.ts";
+import { initialConversationSelection, isProjectSwitch, reconcileConversationSelection } from "../composables/collabGraphSelection.ts";
 import { projectPath, useCurrentProject } from "../composables/useCurrentProject.ts";
 interface HealthReport {
   status: "ok" | "degraded"; uptimeSeconds: number; serverTime: string;
@@ -20,7 +21,22 @@ const graphProjectId = computed(() => context.currentProjectId.value);
 const { graph, loading: graphLoading, error: graphError, load: loadGraph } = useCollabGraph(graphProjectId);
 const graphCanvasData = computed<GraphCanvasData>(() => toGraphCanvasData(graph.value));
 const graphScopeName = computed(() => context.projects.value.find((project) => project.id === graphProjectId.value)?.name ?? "");
+const selectedMemberId = ref<string | null>(null);
+const pendingConversationIntent = ref(initialConversationSelection(new URLSearchParams(location.search).get("view")).pendingDeepLink);
 watch([graphProjectId, () => context.generation.value], () => { void loadGraph(); }, { immediate: true });
+watch(
+  [graphProjectId, graphCanvasData, graphLoading, graphError] as const,
+  ([projectId, data, loading, error], previous) => {
+    const result = reconcileConversationSelection(
+      { selectedId: selectedMemberId.value, pendingDeepLink: pendingConversationIntent.value },
+      data.groups.flatMap(group => group.members).map(member => member.id),
+      { loading, failed: error !== null, projectChanged: isProjectSwitch(previous?.[0], projectId) },
+    );
+    selectedMemberId.value = result.selectedId;
+    pendingConversationIntent.value = result.pendingDeepLink;
+  },
+  { immediate: true },
+);
 
 // P03 任务流转视图示例数据（静态视觉演示，非真实任务状态）
 const activeView = ref<"members" | "tasks">("members");
@@ -42,7 +58,6 @@ const demoTaskDetail = {
 function switchView(view: "members" | "tasks"): void { activeView.value = view; unavailableReason.value = null; }
 
 // P02 成员会话面板：选中节点来自真实图，会话正文仍是静态示例数据。
-const selectedMemberId = ref<string | null>(null);
 const selectedNode = computed(() => graphCanvasData.value.groups.flatMap(group => group.members).find(member => member.id === selectedMemberId.value) ?? null);
 const selectedGroupName = computed(() => graphCanvasData.value.groups.find(group => group.members.some(member => member.id === selectedMemberId.value))?.name ?? "");
 const demoConversation = {
@@ -118,7 +133,6 @@ onMounted(() => {
   // 原型浏览 split view 可经 query 直达 P02（成员会话）/P03（任务流转）。
   const view = new URLSearchParams(location.search).get("view");
   if (view === "tasks") activeView.value = "tasks";
-  else if (view === "conversation") selectedMemberId.value = graphCanvasData.value.groups[0]?.members[0]?.id ?? null;
 });
 onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInterval(healthTimer); if (reconnectTimer) clearTimeout(reconnectTimer); });
 </script>
@@ -209,7 +223,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
       <aside class="collab-side" :aria-label="activeView === 'tasks' ? '任务详情' : '动态与待我处理'">
         <template v-if="activeView === 'tasks'">
           <section class="panel side-panel task-detail" aria-labelledby="task-detail-title">
-            <div class="side-heading"><h2 id="task-detail-title">任务详情</h2><button type="button" class="inspector-close" aria-label="关闭任务详情" aria-disabled="true" title="静态演示控件" @click="explainUnavailable('关闭任务详情')"><AppIcon name="close" :size="16" /></button></div>
+            <div class="side-heading"><h2 id="task-detail-title">任务详情<span class="demo-chip">示例数据</span></h2><button type="button" class="inspector-close" aria-label="关闭任务详情" aria-disabled="true" title="静态演示控件" @click="explainUnavailable('关闭任务详情')"><AppIcon name="close" :size="16" /></button></div>
             <div class="task-detail-title"><span class="task-detail-icon"><AppIcon name="layers" :size="20" /></span><strong>{{ demoTaskDetail.title }}</strong><span class="status-badge active">{{ demoTaskDetail.state }}</span></div>
             <dl class="task-facts">
               <div><dt><AppIcon name="people" :size="15" />负责人</dt><dd>{{ demoTaskDetail.owner }}</dd></div>
