@@ -490,7 +490,13 @@ function onClick(event: MouseEvent): void {
   if (groupId) emit("selectGroup", groupId);
 }
 function onMove(event: MouseEvent): void {
-  if (canvas.value) canvas.value.style.cursor = pointerId(event) ? "pointer" : "default";
+  const element = canvas.value;
+  if (!element) return;
+  const rect = element.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const hit = hitTestMember(layout.value, x, y) ?? hitTestGroup(layout.value, x, y);
+  element.style.cursor = hit ? "pointer" : "default";
 }
 function measure(): void {
   const element = shell.value;
