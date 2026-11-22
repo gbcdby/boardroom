@@ -20,6 +20,12 @@ const context = useCurrentProject();
 const graphProjectId = computed(() => context.currentProjectId.value);
 const { graph, loading: graphLoading, error: graphError, load: loadGraph } = useCollabGraph(graphProjectId);
 const graphCanvasData = computed<GraphCanvasData>(() => toGraphCanvasData(graph.value));
+const messageLayerStatus = computed(() => {
+  const layer = graph.value.messageDirection;
+  if (!messageLayerVisible.value) return `消息层已关闭，${layer.totalCount} 条真实消息仍照常更新`;
+  const overflow = layer.overflowCount ? ` · 聚合 ${layer.overflowCount} 条` : "";
+  return `消息层：${layer.markers.length} 条标记${overflow} · 共 ${layer.totalCount} 条`;
+});
 const graphScopeName = computed(() => context.projects.value.find((project) => project.id === graphProjectId.value)?.name ?? "");
 const selectedMemberId = ref<string | null>(null);
 const pendingConversationIntent = ref(initialConversationSelection(new URLSearchParams(location.search).get("view")).pendingDeepLink);
@@ -40,6 +46,10 @@ watch(
 
 // P03 任务流转视图示例数据（静态视觉演示，非真实任务状态）
 const activeView = ref<"members" | "tasks">("members");
+// 图层开关与暂停只改变画布表现；图投影与消息事实仍照常更新。
+const relationLayerVisible = ref(true);
+const messageLayerVisible = ref(true);
+const animationPaused = ref(false);
 const demoTasks = [
   { id: "assigned", title: "任务已分配", icon: "check", tone: "ok", person: "项目负责人", initials: "负", avatar: 6,
     desc: "明确需求与分工，完成任务分派。", foot: "已完成分派", active: false },
@@ -158,9 +168,17 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
         <button type="button" class="toolbar-control task-select" aria-disabled="true" title="任务选择是静态演示控件" @click="explainUnavailable('任务选择')">{{ demoTaskDetail.title }}<AppIcon name="chevron" :size="14" /></button>
       </template>
       <template v-else>
-        <div class="toolbar-layers" role="group" aria-label="关系图层，静态演示">
-          <label class="layer-option"><input type="checkbox" checked aria-disabled="true" @click.prevent="explainUnavailable('协作关系图层')" />协作关系</label>
-          <label class="layer-option"><input type="checkbox" checked aria-disabled="true" @click.prevent="explainUnavailable('消息方向图层')" />消息方向</label>
+        <div class="toolbar-layers" role="group" aria-label="关系图层">
+          <label class="layer-option"><input type="checkbox" v-model="relationLayerVisible" data-testid="p01-relation-layer-toggle" />协作关系</label>
+          <label class="layer-option"><input type="checkbox" v-model="messageLayerVisible" data-testid="p01-message-layer-toggle" />消息方向</label>
+          <button
+            type="button"
+            class="toolbar-control pause-control"
+            :aria-pressed="animationPaused"
+            :disabled="!messageLayerVisible"
+            data-testid="p01-message-pause-toggle"
+            @click="animationPaused = !animationPaused"
+          >{{ animationPaused ? "继续动态" : "暂停动态" }}</button>
         </div>
         <button type="button" class="toolbar-control filter-control" aria-disabled="true" title="成员筛选是静态演示控件" @click="explainUnavailable('成员筛选')">全部成员<AppIcon name="chevron" :size="14" /></button>
       </template>
@@ -174,10 +192,22 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
             <p v-if="graphError" class="graph-empty error" role="alert" data-testid="p01-graph-error">关系图读取失败：{{ graphError }} <button type="button" class="text-button" @click="loadGraph()">重试</button></p>
             <p v-else-if="graphLoading" class="graph-empty muted" role="status" data-testid="p01-graph-loading">正在读取当前项目的真实成员与群…</p>
             <p v-else-if="graph.groups.length === 0" class="graph-empty" data-testid="p01-graph-empty">当前范围没有可读取的群与成员，关系图为空。<RouterLink to="/projects">选择或创建项目</RouterLink></p>
-            <CollabGraphCanvas v-else :data="graphCanvasData" :selected-id="selectedMemberId" @select="openConversation" />
+            <!-- 保持画布实例跨刷新存活：新逻辑 ID 才能触发一次流动标记，历史重载不重放。 -->
+            <CollabGraphCanvas
+              v-show="!graphError && !graphLoading && graph.groups.length > 0"
+              :data="graphCanvasData"
+              :selected-id="selectedMemberId"
+              :message-direction="graph.messageDirection"
+              :relation-layer="relationLayerVisible"
+              :message-layer="messageLayerVisible"
+              :paused="animationPaused"
+              :scope-key="graphProjectId"
+              @select="openConversation"
+            />
           </div>
           <div class="graph-footer">
             <ul class="graph-legend" aria-label="关系图图例"><li><span class="legend-line" aria-hidden="true"></span>协作关系</li><li><span class="legend-line legend-arrow" aria-hidden="true"></span>消息方向</li><li><span class="legend-dot ok" aria-hidden="true"></span>连接正常</li></ul>
+            <p class="graph-layer-status small muted" data-testid="p01-message-layer-status">{{ messageLayerStatus }}</p>
             <div class="graph-controls" role="group" aria-label="画布操作，静态演示">
               <button type="button" aria-label="缩小画布，静态演示" aria-disabled="true" title="静态演示控件" @click="explainUnavailable('缩小画布')">−</button>
               <span class="zoom-value">100%</span>
@@ -305,6 +335,8 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .status-badge.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }.status-badge.active { color: var(--accent); background: var(--accent-soft); }.status-badge.wait { color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
 .graph-canvas :deep(.graph-canvas-shell) { min-height: 0; }
 .graph-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; margin-top: 14px; }
+.graph-layer-status { margin: 0; font-size: .78rem; overflow-wrap: anywhere; }
+.pause-control { min-height: 30px; padding: .15rem .65rem; font-size: .8rem; }
 .graph-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; list-style: none; margin: 0; padding: 0; font-size: .8rem; color: var(--muted); }.graph-legend li { display: inline-flex; align-items: center; gap: 6px; }
 .legend-line { width: 22px; height: 0; border-top: 2px solid var(--relation); }.legend-arrow { position: relative; }.legend-arrow::after { content: "›"; position: absolute; right: -4px; top: -11px; font-size: 1rem; color: var(--relation); }.legend-dot { width: 8px; height: 8px; border-radius: 50%; }.legend-dot.ok { background: var(--ok); }
 .graph-controls { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }.graph-controls button { min-height: 34px; padding: .25rem .65rem; font-size: .84rem; }.zoom-value { color: var(--muted); font-size: .82rem; font-variant-numeric: tabular-nums; }
