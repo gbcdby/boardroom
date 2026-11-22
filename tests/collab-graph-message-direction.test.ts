@@ -96,6 +96,20 @@ test("历史加载/重复 DTO 不增加消息事实，只保留唯一逻辑 ID",
   assert.deepEqual(graph.recent.map((item) => item.id), ["msg-b", "msg-a"]);
 });
 
+test("同 messageId 后到内容/时间不同也不覆盖原文，首次到达保留", () => {
+  const original = message("msg-same", "g1", "m1", "服务端首次保存的原文", 1000);
+  const replay = message("msg-same", "g1", "m1", "后到补发的改写正文", 9000);
+  const { graph } = snapshotWith([original, replay]);
+  assert.equal(graph.messageCount, 1);
+  assert.equal(graph.messageEdges.length, 1);
+  assert.deepEqual(graph.messageDirection.traceable.map((item) => item.id), ["msg-same"]);
+  assert.equal(graph.messageEdges[0]?.text, "服务端首次保存的原文");
+  assert.equal(graph.messageEdges[0]?.createdAt, original.createdAt);
+  assert.equal(graph.recent[0]?.text, "服务端首次保存的原文");
+  assert.equal(graph.conversations[0]?.messages[0]?.text, "服务端首次保存的原文");
+  assert.deepEqual(graph.messageDirection.aggregates, []);
+});
+
 test("时间倒序最多 6 条可见标记，其余按同方向/时间窗聚合并可逐条追溯", () => {
   const messages = [
     message("older-window", "g1", "m1", "上一分钟", -120_000),

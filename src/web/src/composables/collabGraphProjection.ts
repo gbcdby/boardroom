@@ -210,10 +210,14 @@ export function buildCollabGraphSnapshot(input: CollabGraphInput): CollabGraph {
   const seenMembers = new Set<string>();
 
   for (const group of input.groups) {
-    // 同一逻辑消息 ID 的重复/补发只保留首次事实，历史加载不会新增消息。
-    const messages = [...new Map(
-      (input.messagesByGroup.get(group.id) ?? []).map((item) => [item.id, item]),
-    ).values()];
+    // 同一逻辑消息 ID 的重复/补发只保留首次到达：后到内容或时间不同也不覆盖原文。
+    const seenGroupMessageIds = new Set<string>();
+    const messages: MessageDto[] = [];
+    for (const item of input.messagesByGroup.get(group.id) ?? []) {
+      if (seenGroupMessageIds.has(item.id)) continue;
+      seenGroupMessageIds.add(item.id);
+      messages.push(item);
+    }
     for (const item of messages) {
       const activity: RecentActivity = {
         id: item.id,
