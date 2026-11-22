@@ -634,7 +634,7 @@ def exercise(page, origin, records, output, report, capture_only, workdir):
     expect(toggle).to_be_focused()
     expect(page.get_by_role("navigation", name="主导航")).not_to_be_visible()
     toggle.click()
-    page.get_by_role("navigation", name="主导航").get_by_role("link", name="所有项目", exact=True).click()
+    page.get_by_role("navigation", name="主导航").get_by_role("link", name="查看所有项目", exact=True).click()
     expect(page).to_have_url(origin + "/projects")
     expect(page.locator("h1")).to_be_focused()
     expect(page.get_by_role("navigation", name="主导航")).not_to_be_visible()
