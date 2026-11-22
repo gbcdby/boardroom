@@ -646,6 +646,7 @@ def exercise_taskflow(page, origin, records, report, output):
         page.set_viewport_size({"width": width, "height": height})
         page.emulate_media(color_scheme=theme, reduced_motion="reduce")
         page.goto(origin + "/?view=tasks")
+        page.wait_for_timeout(450)
         expect(page.get_by_test_id("p03-taskflow")).to_be_visible()
         expect(page.get_by_test_id("p03-task-column")).to_have_count(5)
         key = f"taskflow-{width}-{theme}"

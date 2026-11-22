@@ -148,3 +148,21 @@ test("P03 只读看板不含任何写端点、拖动或示例任务常量", asyn
   assert.match(board, /issue\.message/);
   assert.match(board, /issue\.hint/);
 });
+
+test("任务卡内容模型、可访问名与选中态非颜色标记有静态回归断言", async () => {
+  const board = await readFile(new URL("../src/web/src/components/TaskFlowBoard.vue", import.meta.url), "utf8");
+  const home = await readFile(new URL("../src/web/src/views/HomeView.vue", import.meta.url), "utf8");
+  assert.doesNotMatch(board, /<ul\b/);
+  assert.doesNotMatch(board, /<li\b/);
+  assert.match(board, /aria-labelledby/);
+  assert.match(board, /aria-describedby/);
+  assert.match(board, /data-testid="p03-task-card"/);
+  assert.match(board, /data-testid="p03-task-issue"/);
+  assert.match(board, /data-testid="p03-task-selected-marker">已选</);
+  for (const testId of ["p03-board-error", "p03-board-loading", "p03-task-refresh"]) {
+    assert.match(board, new RegExp(`data-testid="${testId}"`), `${testId} 模板入口不得移除`);
+  }
+  assert.match(home, /\.board-scope \{[^}]*min-width: 0[^}]*overflow-wrap: anywhere/);
+  assert.match(home, /@media \(max-width: 1200px\) \{ \.board-scope \{ white-space: normal; \} \}/);
+  assert.doesNotMatch(board, /\.board-scope/);
+});

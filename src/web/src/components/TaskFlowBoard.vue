@@ -32,19 +32,21 @@ const emit = defineEmits<{ select: [id: string]; refresh: [] }>();
             :data-readiness-codes="item.readinessCodes.join(' ')"
             :data-execution-admission="item.executionAdmission"
             :aria-pressed="props.selectedId === item.id"
+            :aria-labelledby="`task-title-${item.id}`"
+            :aria-describedby="`task-meta-${item.id}`"
             @click="emit('select', item.id)"
           >
-            <strong class="card-title">{{ item.title }}</strong>
-            <span class="card-meta">ID {{ item.id }} · 版本 v{{ item.revision }}</span>
-            <span class="card-meta">负责人：{{ item.assignee ?? '未指派' }}<template v-if="item.assigneeMemberId">（{{ item.assigneeMemberId }}）</template></span>
+            <strong class="card-title" :id="`task-title-${item.id}`">{{ item.title }}</strong>
+            <span v-if="props.selectedId === item.id" class="card-selected-marker" data-testid="p03-task-selected-marker">已选</span>
+            <span class="card-meta" :id="`task-meta-${item.id}`">ID {{ item.id }} · 版本 v{{ item.revision }} · 负责人：{{ item.assignee ?? '未指派' }}<template v-if="item.assigneeMemberId">（{{ item.assigneeMemberId }}）</template></span>
             <span v-if="item.blockedReason" class="card-blocked">受阻原因：{{ item.blockedReason }}</span>
             <span class="card-readiness">原因码：{{ item.readinessCodes.length ? item.readinessCodes.join('、') : '无' }}</span>
-            <ul v-if="item.readinessIssues.length" class="card-issues">
-              <li v-for="(issue, index) in item.readinessIssues" :key="`${issue.stage}:${issue.field}:${issue.code}:${index}`" data-testid="p03-task-issue" :data-field="issue.field" :data-code="issue.code" :data-stage="issue.stage">
-                {{ issue.stage }} · {{ issue.field }} · {{ issue.code }}：{{ issue.message }}
+            <span v-if="item.readinessIssues.length" class="card-issues">
+              <span v-for="(issue, index) in item.readinessIssues" :key="`${issue.stage}:${issue.field}:${issue.code}:${index}`" class="card-issue" data-testid="p03-task-issue" :data-field="issue.field" :data-code="issue.code" :data-stage="issue.stage">
+                · {{ issue.stage }} · {{ issue.field }} · {{ issue.code }}：{{ issue.message }}
                 <small class="issue-hint">下一步：{{ issue.hint }}</small>
-              </li>
-            </ul>
+              </span>
+            </span>
             <span v-else class="card-meta">服务端未报告资料缺口</span>
             <span class="card-admission" data-testid="p03-execution-admission">执行接入：{{ item.executionAdmission }}（非执行放行）</span>
           </button>
@@ -69,13 +71,14 @@ const emit = defineEmits<{ select: [id: string]; refresh: [] }>();
 .task-card { display: flex; flex-direction: column; align-items: stretch; gap: 5px; width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--card-bg); color: var(--fg); font-size: .78rem; line-height: 1.55; text-align: left; overflow-wrap: anywhere; }
 .task-card[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
 .card-title { font-size: .86rem; }
+.card-selected-marker { align-self: flex-start; padding: 1px 6px; border: 1px solid var(--accent); border-radius: 4px; color: var(--accent); font-weight: 600; }
 .card-meta, .card-readiness, .card-admission { color: var(--muted); }
 .card-blocked { color: var(--bad); }
-.card-issues { margin: 2px 0; padding-left: 16px; color: var(--muted); }
-.card-issues li { margin-bottom: 3px; }.issue-hint { display: block; color: var(--fg); }
+.card-issues { display: block; margin: 2px 0; color: var(--muted); }
+.card-issue { display: block; margin-bottom: 3px; }.issue-hint { display: block; color: var(--fg); }
 .board-note { margin: 12px 0 0; overflow-wrap: anywhere; }
 .card-admission { margin-top: 4px; padding-top: 5px; border-top: 1px solid var(--border); }
 @media (max-width: 1200px) { .taskflow-board { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 900px) { .taskflow-board { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 760px) { .board-scope { white-space: normal; } .taskflow-board { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { .taskflow-board { grid-template-columns: 1fr; } }
 </style>
