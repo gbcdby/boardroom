@@ -176,34 +176,25 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
         <section v-if="activeView === 'members'" class="panel graph-panel" aria-label="协作关系图（示例数据）">
           <div class="graph-canvas" data-testid="p01-graph-canvas">
             <div class="demo-tree" role="img" aria-label="示例协作关系图：总管连接项目负责人，项目负责人连接界面升级小组、MCP 能力接入、质量保障三个群，各群包含成员卡片与协作、消息方向箭头。全部为示例数据。">
-              <div class="tree-node root-node">
-                <span class="avatar avatar-0"><AppIcon name="message" :size="17" /></span>
-                <strong>{{ demoRoot.name }}</strong><small>{{ demoRoot.role }}</small>
-              </div>
+              <div class="tree-node root-node"><span class="root-node-icon"><AppIcon name="message" :size="20" /></span><strong>{{ demoRoot.name }}</strong></div>
               <div class="tree-stem" aria-hidden="true"></div>
-              <div class="tree-node lead-node">
-                <span class="avatar avatar-6">{{ demoLead.initials }}</span>
-                <span><strong>{{ demoLead.name }}</strong><small>{{ demoLead.role }}</small></span>
-                <span class="status-badge active">{{ demoLead.status }}</span>
-              </div>
+              <div class="tree-node lead-node"><span class="avatar avatar-6">{{ demoLead.initials }}</span><span><strong>{{ demoLead.name }}</strong><small>{{ demoLead.role }}</small></span></div>
               <div class="tree-stem" aria-hidden="true"></div>
               <div class="tree-groups">
-                <div v-for="group in demoGroups" :key="group.name" class="tree-group">
-                  <div class="tree-group-head"><span class="group-icon"><AppIcon :name="group.icon" :size="16" /></span><strong>{{ group.name }}</strong></div>
+                <div v-for="(group, index) in demoGroups" :key="group.name" class="tree-group">
+                  <div class="tree-group-head"><span class="group-icon"><AppIcon :name="group.icon" :size="17" /></span><strong>{{ group.name }}</strong></div>
                   <div class="group-body">
                     <button type="button" class="member-row member-open-btn" :class="{ 'is-selected': selectedMemberId === group.coordinator.name }" :aria-label="`查看${group.coordinator.name}的成员会话`" @click="openConversation(group.coordinator.name)">
                       <span class="avatar" :class="`avatar-${group.coordinator.avatar}`">{{ group.coordinator.initials }}</span>
-                      <span class="member-copy"><strong>{{ group.coordinator.name }}</strong><small>{{ group.coordinator.role }}</small></span>
-                      <span class="status-badge" :class="group.coordinator.tone">{{ group.coordinator.status }}</span>
+                      <span class="member-copy"><strong>{{ group.coordinator.name }}</strong><span class="status-badge" :class="group.coordinator.tone">{{ group.coordinator.status }}</span></span>
                     </button>
-                    <div v-if="group.members.length" class="member-connector" aria-hidden="true"><span class="flow-label">{{ group.flows[0] }}</span></div>
+                    <div v-if="group.members.length" class="member-connector" aria-hidden="true"><span class="flow-label">{{ index === 0 ? '设计协作' : '接口协作' }}</span><span v-if="index === 0" class="flow-message">方案 · 已送达</span></div>
                     <button v-for="member in group.members" :key="member.name" type="button" class="member-row member-open-btn" :class="{ 'is-selected': selectedMemberId === member.name }" :aria-label="`查看${member.name}的成员会话`" @click="openConversation(member.name)">
                       <span class="avatar" :class="`avatar-${member.avatar}`">{{ member.initials }}</span>
-                      <span class="member-copy"><strong>{{ member.name }}</strong><small>{{ member.role }}</small></span>
-                      <span class="status-badge" :class="member.tone">{{ member.status }}</span>
+                      <span class="member-copy"><strong>{{ member.name }}</strong><span class="status-badge" :class="member.tone">{{ member.status }}</span></span>
                     </button>
+                    <div v-if="index === 2" class="group-stem" aria-hidden="true"></div>
                   </div>
-                  <div class="group-flow"><span class="flow-arrow" aria-hidden="true">→</span>{{ group.flows[group.flows.length - 1] }}</div>
                 </div>
                 <svg class="cross-flow-lines" viewBox="0 0 300 200" preserveAspectRatio="none" aria-hidden="true">
                   <path class="cross-path" d="M 60 150 C 110 145, 120 90, 150 78" />
@@ -336,30 +327,31 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .demo-chip { display: inline-block; margin-left: 8px; padding: 2px 7px; border-radius: 5px; background: var(--accent-soft); color: var(--accent); font-size: .68rem; font-weight: 600; vertical-align: middle; }
 .graph-canvas { flex: 1; display: flex; align-items: center; justify-content: center; border: 0; border-radius: 0; background: transparent; padding: 0; overflow-x: auto; }
 .demo-tree { width: 100%; min-width: 620px; display: flex; flex-direction: column; align-items: center; }
-.tree-node { display: flex; align-items: center; gap: 10px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); padding: 9px 13px; }
-.tree-node strong { font-size: .9rem; font-weight: 600; }.tree-node small { display: block; font-size: .74rem; color: var(--muted); margin-top: 2px; }
-.root-node { flex-direction: column; gap: 6px; padding: 10px 18px; }.root-node strong { font-size: .92rem; }
-.lead-node { min-width: 210px; }
-.tree-stem { width: 2px; height: 26px; background: var(--relation); flex: none; }
-.tree-groups { width: 100%; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; position: relative; }
-.tree-groups::before { content: ""; position: absolute; top: -13px; left: 16.66%; right: 16.66%; height: 2px; background: var(--relation); }
-.tree-group { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); padding: 12px; position: relative; z-index: 1; }
-.tree-group::before { content: ""; position: absolute; top: -13px; left: 50%; width: 2px; height: 13px; background: var(--relation); }
-.tree-group-head { display: flex; align-items: center; gap: 8px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }.tree-group-head strong { font-size: .86rem; font-weight: 600; }.group-icon { color: var(--accent); display: inline-flex; }
-.group-body { padding-top: 10px; }
-.member-row { display: flex; align-items: center; gap: 8px; padding: 7px; border: 1px solid var(--border); border-radius: 9px; background: var(--card-bg); }
+.tree-node { display: flex; align-items: center; gap: 10px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); padding: 10px 16px; }
+.tree-node strong { font-size: 1rem; font-weight: 600; }.tree-node small { display: block; font-size: .74rem; color: var(--muted); margin-top: 2px; }
+.root-node { flex-direction: row; gap: 10px; padding: 10px 18px; }.root-node-icon { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; background: var(--surface-subtle); color: var(--fg); }.root-node strong { font-size: 1rem; }
+.lead-node { min-width: 230px; }
+.tree-stem { width: 2px; height: 30px; background: var(--relation); flex: none; }
+.tree-groups { width: 100%; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; position: relative; }
+.tree-groups::before { content: ""; position: absolute; top: -15px; left: 16.66%; right: 16.66%; height: 2px; background: var(--relation); }
+.tree-group { min-height: 320px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); padding: 14px; position: relative; z-index: 1; }
+.tree-group::before { content: ""; position: absolute; top: -15px; left: 50%; width: 2px; height: 15px; background: var(--relation); }
+.tree-group-head { display: flex; align-items: center; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }.tree-group-head strong { font-size: .95rem; font-weight: 600; }.group-icon { color: var(--accent); display: inline-flex; }
+.group-body { padding-top: 12px; }
+.member-row { display: flex; align-items: center; gap: 10px; min-height: 58px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-bg); }
 .member-open-btn { width: 100%; text-align: left; color: var(--fg); cursor: pointer; }.member-open-btn:hover { background: var(--surface-subtle); }.member-open-btn.is-selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: var(--accent-soft); }
-.member-copy { flex: 1; min-width: 0; }.member-copy strong { display: block; font-size: .8rem; font-weight: 600; }.member-copy small { display: block; font-size: .7rem; color: var(--muted); margin-top: 1px; }
+.member-copy { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; flex: 1; min-width: 0; }.member-copy strong { font-size: .9rem; font-weight: 600; }.member-copy .status-badge { align-self: flex-start; }
 .avatar:not(.avatar-0)::after { content: ""; position: absolute; right: -1px; bottom: -1px; width: 9px; height: 9px; border-radius: 50%; background: var(--ok); border: 2px solid var(--card-bg); }
-.status-badge { flex: none; font-size: .68rem; padding: 2px 7px; border-radius: 20px; white-space: nowrap; font-weight: 600; }
+.status-badge { flex: none; font-size: .7rem; padding: 2px 7px; border-radius: 20px; white-space: nowrap; font-weight: 600; }
 .status-badge.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }.status-badge.active { color: var(--accent); background: var(--accent-soft); }.status-badge.wait { color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
-.member-connector { position: relative; height: 30px; display: flex; align-items: center; justify-content: flex-start; padding-left: 18px; }.member-connector::before { content: ""; position: absolute; left: 21px; top: 0; bottom: 0; width: 2px; background: var(--relation); }.member-connector::after { content: ""; position: absolute; left: 21px; top: 50%; width: 8px; height: 2px; background: var(--relation); }
-.flow-label { position: relative; font-size: .66rem; color: var(--muted); background: var(--card-bg); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; margin-left: 10px; }
-.group-flow { margin-top: 10px; font-size: .7rem; color: var(--accent); display: flex; align-items: center; gap: 6px; }.flow-arrow { font-size: .9rem; }
+.member-connector { position: relative; height: 44px; display: flex; align-items: center; justify-content: center; }.member-connector::before { content: "↓"; position: absolute; left: 50%; top: 4px; transform: translateX(-50%); color: var(--accent); font-size: 1.1rem; line-height: 1; }
+.flow-label { position: absolute; left: 8px; top: 50%; transform: translateY(-50%); font-size: .66rem; color: var(--muted); background: var(--card-bg); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; }
+.flow-message { position: absolute; left: 50%; top: 52%; transform: translate(-50%, -50%); background: var(--accent-fill); color: var(--on-accent); border-radius: 6px; padding: 2px 8px; font-size: .68rem; font-weight: 600; white-space: nowrap; }
+.group-stem { position: absolute; left: 50%; top: 50px; width: 2px; height: 34px; background: var(--relation); }.group-stem::after { content: "↓"; position: absolute; left: 50%; bottom: -12px; transform: translateX(-50%); color: var(--relation); font-size: .9rem; line-height: 1; }
 .cross-flow-lines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; overflow: visible; }
 .cross-path { fill: none; stroke: var(--relation); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 .cross-flow-label { position: absolute; z-index: 2; font-size: .66rem; color: var(--muted); background: var(--card-bg); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; white-space: nowrap; pointer-events: none; }
-.cross-flow-label.label-api { left: 33%; top: 30%; }.cross-flow-label.label-verify { left: 60%; bottom: -2%; }
+.cross-flow-label.label-api { left: 33%; top: 35%; }.cross-flow-label.label-verify { left: 60%; bottom: -2%; }
 .graph-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; margin-top: 14px; }
 .graph-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; list-style: none; margin: 0; padding: 0; font-size: .8rem; color: var(--muted); }.graph-legend li { display: inline-flex; align-items: center; gap: 6px; }
 .legend-line { width: 22px; height: 0; border-top: 2px solid var(--relation); }.legend-arrow { position: relative; }.legend-arrow::after { content: "›"; position: absolute; right: -4px; top: -11px; font-size: 1rem; color: var(--relation); }.legend-dot { width: 8px; height: 8px; border-radius: 50%; }.legend-dot.ok { background: var(--ok); }

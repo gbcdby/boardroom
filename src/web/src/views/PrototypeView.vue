@@ -36,7 +36,7 @@ const draft = ref("");
       <RouterLink to="/" class="toolbar-control back-to-graph"><span class="back-arrow" aria-hidden="true">←</span>返回关系图</RouterLink>
     </header>
 
-    <div class="chat-demo-shell panel">
+    <div class="chat-demo-shell">
       <div class="chat-demo-main">
         <div class="chat-demo-topbar">
           <div class="chat-tabs" role="tablist" aria-label="群聊内容"><button v-for="tab in tabs" :key="tab" type="button" role="tab" :aria-selected="activeTab === tab" @click="activeTab = tab">{{ tab }}</button></div>
@@ -83,7 +83,7 @@ const draft = ref("");
 .back-arrow { font-size: 1rem; line-height: 1; color: var(--muted); }
 .back-to-graph { display: inline-flex; align-items: center; gap: 6px; min-height: 38px; padding: 7px 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--card-bg); color: var(--fg); font-size: .9rem; font-weight: 500; box-shadow: var(--shadow); }.back-to-graph:hover { color: var(--fg); text-decoration: none; }
 .chat-demo-header { align-items: center; margin-bottom: 18px; }
-.chat-demo-shell { display: grid; grid-template-columns: minmax(0,1fr) 290px; min-height: 620px; overflow: hidden; padding: 0; }
+.chat-demo-shell { display: grid; grid-template-columns: minmax(0,1fr) 290px; min-height: 620px; border: 0; border-radius: 0; background: var(--card-bg); box-shadow: none; overflow: hidden; padding: 0; }
 .chat-demo-main { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--border); }
 .chat-demo-topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
 .chat-tabs { display: flex; gap: 22px; }.chat-tabs button { border: 0; border-radius: 0; background: transparent; color: var(--muted); font-size: .88rem; min-height: 0; padding: 8px 0; }.chat-tabs button[aria-selected="true"] { color: var(--fg); font-weight: 600; box-shadow: inset 0 -2px var(--accent); }
