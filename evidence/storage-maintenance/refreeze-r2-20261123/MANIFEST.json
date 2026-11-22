@@ -1,0 +1,33 @@
+{
+  "baseline": {
+    "commit": "0834f9e56001745d6cfff38f06654a44e944d911",
+    "tree": "9b500b69cc8af7e8116443c8469f181205173d6f"
+  },
+  "candidate_id": "BR-S4-T2-REFREEZE-20261123-R2",
+  "excluded_items": [
+    "validation-matrix.md (RECONSTRUCTED_NOT_ORIGINAL, stays in .agent-output/)",
+    "raw results batch1/batch2 (RECONSTRUCTED_NOT_ORIGINAL, stays in .agent-output/)",
+    "prototype inventory (RECONSTRUCTED_NOT_ORIGINAL, stays in .agent-output/)",
+    "isolated prototypes and raw stdout/stderr (RECONSTRUCTED_NOT_ORIGINAL, stay in .agent-output/)",
+    "lost 41-file frozen package (UNRECOVERED)"
+  ],
+  "generated_rules_version": "canonical-json-v1-utf16-lexical",
+  "members": [
+    {
+      "bytes": 5766,
+      "origin": "RECONSTRUCTED_NOT_ORIGINAL",
+      "original_digest_match": false,
+      "path": "README.md",
+      "role": "candidate-identity-pointer",
+      "sha256": "7afb0e03d1a2aa8a582bda0cd36efab33c0454d5ec9d1a7f479c4578c6b50641"
+    }
+  ],
+  "notes": [
+    "manifest SHA is computed over members only; this file is not a member",
+    "all members are RECONSTRUCTED_NOT_ORIGINAL; no member claims original_digest_match=true",
+    "no product artifact released",
+    "CAP01 excluded by user decision 2026-11-23",
+    "evidence/ placement follows existing evidence/storage-maintenance/model precedent"
+  ],
+  "status": "DRAFT_ARCHIVE_PENDING_INDEPENDENT_DOC_REVIEW"
+}
