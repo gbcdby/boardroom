@@ -143,10 +143,8 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 
 <template>
   <section class="page home-page">
-    <p class="demo-banner" role="note" data-testid="p01-demo-banner"><AppIcon name="layers" :size="15" />静态视觉演示：中央关系图、头像、状态与动态均为示例数据，非真实运行数据。</p>
-    <nav class="collab-breadcrumb" aria-label="当前位置"><RouterLink to="/">工作台</RouterLink><span aria-hidden="true"> / </span><span>Boardroom</span></nav>
     <header class="page-header collab-header">
-      <div><h1>协作总览</h1><p class="page-description">3 个群组 · 5 个群内实例<span class="demo-inline">（示例数据）</span></p></div>
+      <div class="header-title"><span class="page-icon"><AppIcon name="layers" :size="24" /></span><div><h1>协作总览</h1><p class="page-description">3 个群组 · 5 个群内实例</p></div></div>
       <div class="collab-header-meta">
         <button type="button" class="toolbar-control scope-control" aria-disabled="true" title="范围切换是静态演示控件" data-testid="p01-scope" @click="explainUnavailable('范围切换')">范围：Boardroom<AppIcon name="chevron" :size="14" /></button>
         <span class="connected-state" :class="healthError || health?.status === 'degraded' ? 'bad' : health ? 'ok' : 'muted'" data-testid="p01-connected"><span class="connected-dot" aria-hidden="true"></span>{{ connectedLabel }} · 刚刚更新</span>
@@ -175,8 +173,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 
     <div class="collab-workspace">
       <div class="collab-main">
-        <section v-if="activeView === 'members'" class="panel graph-panel" aria-labelledby="graph-title">
-          <div class="section-heading"><div><h2 id="graph-title">协作关系图<span class="demo-chip">示例数据</span></h2></div></div>
+        <section v-if="activeView === 'members'" class="panel graph-panel" aria-label="协作关系图（示例数据）">
           <div class="graph-canvas" data-testid="p01-graph-canvas">
             <div class="demo-tree" role="img" aria-label="示例协作关系图：总管连接项目负责人，项目负责人连接界面升级小组、MCP 能力接入、质量保障三个群，各群包含成员卡片与协作、消息方向箭头。全部为示例数据。">
               <div class="tree-node root-node">
@@ -303,14 +300,14 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
           </section>
           <template v-else>
           <section class="panel side-panel" aria-labelledby="activity-title">
-            <div class="side-heading"><h2 id="activity-title">实时动态</h2><span class="side-demo-tag">示例数据</span></div>
+            <div class="side-heading"><h2 id="activity-title">实时动态</h2><button type="button" class="follow-toggle" aria-pressed="true" @click="explainUnavailable('自动跟随')"><span aria-hidden="true"></span>自动跟随</button></div>
             <ul class="activity-list"><li v-for="(item, index) in demoActivity" :key="item.when"><span class="activity-rail" aria-hidden="true"><span class="rail-dot" :class="{ first: index === 0 }"></span></span><span class="activity-copy"><small>{{ item.when }}</small><span class="activity-bubble"><span class="avatar avatar-sm" :class="`avatar-${index + 1}`">{{ item.who.slice(0, 1) }}</span>{{ item.who }}{{ item.text }}</span></span></li></ul>
           </section>
           <section class="panel side-panel" aria-labelledby="pending-title">
-            <div class="side-heading"><h2 id="pending-title">待我处理</h2><span class="side-demo-tag">示例数据</span></div>
+            <div class="side-heading"><h2 id="pending-title">待我处理</h2></div>
             <div class="pending-list"><div v-for="item in demoPending" :key="item.title" class="pending-card"><span class="pending-icon"><AppIcon name="check" :size="18" /></span><span class="pending-copy"><strong>{{ item.title }}</strong><small>{{ item.detail }}</small></span><span class="pending-link">查看事项<AppIcon name="arrow" :size="14" /></span></div></div>
           </section>
-          <section class="quick-access" aria-labelledby="quick-access-title"><h2 id="quick-access-title">继续工作</h2><RouterLink to="/chat" class="shortcut"><span class="shortcut-icon"><AppIcon name="message" :size="21" /></span><span><strong>进入群聊</strong><small>与成员交流，让工作继续</small></span><AppIcon name="chevron" :size="16" /></RouterLink><RouterLink to="/status" class="shortcut"><span class="shortcut-icon"><AppIcon name="activity" :size="21" /></span><span><strong>查看成员状态</strong><small>了解谁在线、谁正在工作</small></span><AppIcon name="chevron" :size="16" /></RouterLink><p class="quick-note">每个项目都有自己的成员、群组和协作记录。</p></section>
+          <section class="quick-access" aria-labelledby="quick-access-title"><h2 id="quick-access-title">继续工作</h2><RouterLink to="/chat" class="shortcut"><span class="shortcut-icon"><AppIcon name="message" :size="21" /></span><span><strong>进入群聊</strong><small>与成员交流，让工作继续</small></span><AppIcon name="chevron" :size="16" /></RouterLink><RouterLink to="/status" class="shortcut"><span class="shortcut-icon"><AppIcon name="activity" :size="21" /></span><span><strong>查看成员状态</strong><small>了解谁在线、谁正在工作</small></span><AppIcon name="chevron" :size="16" /></RouterLink></section>
           </template>
         </template>
       </aside>
@@ -320,13 +317,14 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 </template>
 
 <style scoped>
-.demo-banner { display: flex; align-items: center; gap: 8px; margin: 0 0 14px; padding: 9px 14px; border: 1px dashed var(--warn); border-radius: 9px; background: color-mix(in srgb, var(--warn) 8%, transparent); color: var(--warn); font-size: .8rem; overflow-wrap: anywhere; }
-.collab-breadcrumb { font-size: .78rem; color: var(--muted); margin-bottom: 8px; }.collab-breadcrumb a { color: var(--muted); text-decoration: none; }.collab-breadcrumb a:hover { color: var(--accent); }
-.collab-header { align-items: flex-end; }.demo-inline { color: var(--muted); font-size: .78rem; font-weight: 400; }
+.header-title { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.page-icon { width: 50px; height: 50px; flex: none; display: grid; place-items: center; border-radius: 12px; background: var(--surface-subtle); color: var(--fg); }
+.header-title h1 { margin: 0; font-size: 2rem; line-height: 1.25; }
+.collab-header { align-items: flex-end; margin-bottom: 18px; }
 .collab-header-meta { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; justify-content: flex-end; }
 .scope-control { min-height: 36px; padding: .3rem .7rem; }
 .connected-state { display: inline-flex; align-items: center; gap: 7px; font-size: .82rem; color: var(--muted); white-space: nowrap; }.connected-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--relation); }.connected-state.ok .connected-dot { background: var(--ok); }.connected-state.bad .connected-dot { background: var(--bad); }.connected-state.muted .connected-dot { background: var(--muted); }
-.collab-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; margin: 18px 0 16px; box-shadow: var(--shadow); }
+.collab-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; background: transparent; border: 0; border-radius: 0; padding: 0; margin: 0 0 18px; box-shadow: none; }
 .toolbar-control[aria-disabled="true"], .view-tab[aria-disabled="true"], .graph-controls button[aria-disabled="true"] { cursor: not-allowed; color: var(--muted); }
 .toolbar-views, .toolbar-layers { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 9px; padding: 3px; background: var(--surface-subtle); }
 .view-tab { min-height: 30px; padding: .2rem .8rem; font-size: .85rem; border-color: transparent; background: transparent; }.view-tab[aria-pressed="true"] { color: var(--fg); background: var(--card-bg); border-color: var(--border); }
@@ -334,10 +332,10 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .collab-status { margin: 0 0 16px; overflow-wrap: anywhere; }
 .collab-workspace { display: grid; grid-template-columns: minmax(0,1fr) minmax(260px,320px); gap: 24px; align-items: start; }
 .collab-main, .collab-side { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
-.graph-panel .section-heading { margin-bottom: 16px; }.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }.section-heading h2 { margin: 0; font-size: 1.02rem; }
+.graph-panel { min-height: 590px; display: flex; flex-direction: column; padding: 16px; border-radius: 12px; }.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }.section-heading h2 { margin: 0; font-size: 1.02rem; }
 .demo-chip { display: inline-block; margin-left: 8px; padding: 2px 7px; border-radius: 5px; background: var(--accent-soft); color: var(--accent); font-size: .68rem; font-weight: 600; vertical-align: middle; }
-.graph-canvas { border: 1px solid var(--border); border-radius: 10px; background: var(--surface-subtle); padding: 22px 18px; overflow-x: auto; }
-.demo-tree { min-width: 620px; display: flex; flex-direction: column; align-items: center; }
+.graph-canvas { flex: 1; display: flex; align-items: center; justify-content: center; border: 0; border-radius: 0; background: transparent; padding: 0; overflow-x: auto; }
+.demo-tree { width: 100%; min-width: 620px; display: flex; flex-direction: column; align-items: center; }
 .tree-node { display: flex; align-items: center; gap: 10px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); padding: 9px 13px; }
 .tree-node strong { font-size: .9rem; font-weight: 600; }.tree-node small { display: block; font-size: .74rem; color: var(--muted); margin-top: 2px; }
 .root-node { flex-direction: column; gap: 6px; padding: 10px 18px; }.root-node strong { font-size: .92rem; }
@@ -369,7 +367,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .real-data-fold { border: 1px solid var(--border); border-radius: 11px; background: var(--card-bg); overflow: hidden; }.real-data-fold > summary { padding: 13px 16px; font-size: .82rem; color: var(--muted); cursor: pointer; }.real-data-fold > summary:hover { color: var(--fg); }.real-data-fold .overview-metrics, .real-data-fold .project-overview { margin: 0; border-radius: 0; border: 0; box-shadow: none; border-top: 1px solid var(--border); }
 .overview-metrics { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); padding: 20px 0; }.overview-metrics > div { padding: 0 24px; }.overview-metrics > div + div { border-left: 1px solid var(--border); }.overview-metrics dt { font-size: .85rem; color: var(--muted); }.overview-metrics dd { margin: 5px 0 3px; font-size: 2rem; font-weight: 600; line-height: 1.3; font-variant-numeric: tabular-nums; }.overview-metrics span { font-size: .76rem; color: var(--muted); }
 .project-overview { padding: 16px; }.home-projects { list-style: none; margin: 0; padding: 0; }.home-projects li + li { border-top: 1px solid var(--border); }.home-project-link { display: flex; gap: 12px; align-items: center; padding: 14px 8px; border-radius: 8px; color: var(--fg); }.home-project-link:hover { background: var(--surface-subtle); text-decoration: none; }.project-monogram { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 9px; color: var(--accent); background: var(--accent-soft); font-weight: 600; flex: none; }.project-copy { flex: 1; min-width: 0; }.project-copy strong { display: block; font-size: .9rem; }.project-copy > span { display: block; color: var(--muted); font-size: .78rem; margin-top: 3px; }.project-activity { text-align: right; flex: none; }.project-activity small { display: block; margin-top: 4px; color: var(--muted); font-size: .72rem; }.badge { font-size: .7rem; padding: 2px 8px; border-radius: 20px; background: var(--surface-subtle); color: var(--muted); }.badge.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }.loading-state, .empty-state { padding: 30px 8px; }.empty-state h3 { font-size: .95rem; margin: 0 0 6px; }.empty-state p { font-size: .82rem; color: var(--muted); margin: 0; }
-.side-panel h2 { font-size: 1.02rem; margin: 0; }.side-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }.side-demo-tag { font-size: .68rem; color: var(--muted); padding: 2px 7px; border: 1px solid var(--border); border-radius: 5px; }
+.side-panel h2 { font-size: 1.02rem; margin: 0; }.side-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }.follow-toggle { display: inline-flex; align-items: center; gap: 7px; border: 0; background: transparent; color: var(--muted); font-size: .72rem; min-height: 0; padding: 2px 0; }.follow-toggle > span { width: 28px; height: 16px; border-radius: 20px; background: var(--accent-fill); position: relative; }.follow-toggle > span::after { content: ""; position: absolute; top: 2px; right: 2px; width: 12px; height: 12px; border-radius: 50%; background: #fff; }
 .activity-list { list-style: none; margin: 14px 0 0; padding: 0; }.activity-list li { display: flex; gap: 10px; padding-bottom: 14px; }.activity-rail { flex: none; position: relative; width: 10px; display: flex; justify-content: center; }.activity-rail::before { content: ""; position: absolute; top: 4px; bottom: -14px; width: 2px; background: var(--border); }.activity-list li:last-child .activity-rail::before { display: none; }.rail-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); position: relative; z-index: 1; }.rail-dot.first { background: var(--accent); }.activity-copy { flex: 1; min-width: 0; }.activity-copy > small { font-size: .7rem; color: var(--muted); }.activity-bubble { display: flex; align-items: center; gap: 7px; margin-top: 5px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--card-bg); font-size: .78rem; overflow-wrap: anywhere; }
 .pending-list { margin-top: 14px; }.pending-card { display: flex; align-items: center; gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-bg); }.pending-icon { color: var(--ok); display: inline-flex; }.pending-copy { flex: 1; min-width: 0; }.pending-copy strong { display: block; font-size: .82rem; }.pending-copy small { display: block; font-size: .72rem; color: var(--muted); margin-top: 2px; }.pending-link { font-size: .72rem; color: var(--accent); display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .quick-access { padding: 6px 0; }.quick-access h2 { font-size: 1.02rem; margin-bottom: 10px; }.shortcut { display: flex; align-items: center; gap: 13px; padding: 14px 0; color: var(--fg); border-bottom: 1px solid var(--border); }.shortcut:hover { color: var(--accent); text-decoration: none; }.shortcut-icon { color: var(--muted); }.shortcut > span:nth-child(2) { flex: 1; min-width: 0; }.shortcut strong { display: block; font-weight: 500; font-size: .9rem; }.shortcut small { display: block; color: var(--muted); font-size: .78rem; margin-top: 3px; }.shortcut > .app-icon { color: var(--muted); }.quick-note { color: var(--muted); font-size: .78rem; margin-top: 16px; }

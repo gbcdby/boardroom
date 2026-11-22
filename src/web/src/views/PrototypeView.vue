@@ -31,11 +31,9 @@ const draft = ref("");
 
 <template>
   <section class="page chat-demo-page">
-    <p class="demo-banner" role="note"><AppIcon name="layers" :size="15" />静态视觉演示：本页消息、任务、成员均为示例数据，非真实运行数据。</p>
-    <nav class="demo-breadcrumb" aria-label="当前位置"><RouterLink to="/">Boardroom</RouterLink><span aria-hidden="true"> / </span><span>界面升级小组</span></nav>
     <header class="page-header chat-demo-header">
-      <div><h1>界面升级小组<span class="header-avatars"><span class="avatar avatar-sm avatar-1">产</span><span class="avatar avatar-sm avatar-2">前</span></span></h1><p class="page-description">协作总览升级 · 2 个群内实例</p></div>
-      <RouterLink to="/" class="toolbar-control back-to-graph"><AppIcon name="arrow" :size="15" />返回关系图</RouterLink>
+      <div class="header-title"><span class="page-icon"><AppIcon name="monitor" :size="24" /></span><div><h1>界面升级小组<span class="header-avatars"><span class="avatar avatar-sm avatar-1">产</span><span class="avatar avatar-sm avatar-2">前</span></span></h1><p class="page-description">协作总览升级 · 2 个群内实例</p></div></div>
+      <RouterLink to="/" class="toolbar-control back-to-graph"><span class="back-arrow" aria-hidden="true">←</span>返回关系图</RouterLink>
     </header>
 
     <div class="chat-demo-shell panel">
@@ -78,11 +76,14 @@ const draft = ref("");
 </template>
 
 <style scoped>
-.demo-banner { display: flex; align-items: center; gap: 8px; margin: 0 0 14px; padding: 9px 14px; border: 1px dashed var(--warn); border-radius: 9px; background: color-mix(in srgb, var(--warn) 8%, transparent); color: var(--warn); font-size: .8rem; }
-.demo-breadcrumb { font-size: .78rem; color: var(--muted); margin-bottom: 8px; }.demo-breadcrumb a { color: var(--muted); text-decoration: none; }
-.back-to-graph > .app-icon { transform: rotate(180deg); }
-.chat-demo-header { align-items: center; }.chat-demo-header h1 { display: flex; align-items: center; gap: 10px; }.header-avatars { display: inline-flex; }.header-avatars .avatar { margin-left: -6px; border: 2px solid var(--card-bg); }
-.chat-demo-shell { display: grid; grid-template-columns: minmax(0,1fr) 320px; min-height: 620px; overflow: hidden; padding: 0; }
+.header-title { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.page-icon { width: 50px; height: 50px; flex: none; display: grid; place-items: center; border-radius: 12px; background: var(--surface-subtle); color: var(--fg); }
+.header-title h1 { margin: 0; display: flex; align-items: center; gap: 10px; font-size: 2rem; line-height: 1.25; }
+.header-avatars { display: inline-flex; }.header-avatars .avatar { margin-left: -6px; border: 2px solid var(--card-bg); }
+.back-arrow { font-size: 1rem; line-height: 1; color: var(--muted); }
+.back-to-graph { display: inline-flex; align-items: center; gap: 6px; min-height: 38px; padding: 7px 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--card-bg); color: var(--fg); font-size: .9rem; font-weight: 500; box-shadow: var(--shadow); }.back-to-graph:hover { color: var(--fg); text-decoration: none; }
+.chat-demo-header { align-items: center; margin-bottom: 18px; }
+.chat-demo-shell { display: grid; grid-template-columns: minmax(0,1fr) 290px; min-height: 620px; overflow: hidden; padding: 0; }
 .chat-demo-main { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--border); }
 .chat-demo-topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
 .chat-tabs { display: flex; gap: 22px; }.chat-tabs button { border: 0; border-radius: 0; background: transparent; color: var(--muted); font-size: .88rem; min-height: 0; padding: 8px 0; }.chat-tabs button[aria-selected="true"] { color: var(--fg); font-weight: 600; box-shadow: inset 0 -2px var(--accent); }

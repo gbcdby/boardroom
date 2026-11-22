@@ -25,11 +25,8 @@ function selectCap(name: string): void { selectedCap.value = name; }
 
 <template>
   <section class="page cap-demo-page">
-    <p class="demo-banner" role="note"><AppIcon name="layers" :size="15" />静态视觉演示：本页能力、授权与加载状态均为示例数据，非真实运行数据。</p>
-    <nav class="demo-breadcrumb" aria-label="当前位置"><RouterLink to="/">协作配置</RouterLink><span aria-hidden="true"> / </span><span>MCP</span></nav>
     <header class="page-header cap-demo-header">
-      <div><h1>角色与能力</h1><p class="page-description">查看角色的能力、授权范围与实际加载状态。</p></div>
-      <RouterLink to="/" class="toolbar-control"><AppIcon name="arrow" :size="15" />返回协作总览</RouterLink>
+      <div class="header-title"><span class="page-icon"><AppIcon name="layers" :size="24" /></span><div><h1>角色与能力</h1><p class="page-description">查看角色的能力、授权范围与实际加载状态。</p></div></div>
     </header>
 
     <section class="panel cap-demo-panel">
@@ -69,14 +66,15 @@ function selectCap(name: string): void { selectedCap.value = name; }
 </template>
 
 <style scoped>
-.demo-banner { display: flex; align-items: center; gap: 8px; margin: 0 0 14px; padding: 9px 14px; border: 1px dashed var(--warn); border-radius: 9px; background: color-mix(in srgb, var(--warn) 8%, transparent); color: var(--warn); font-size: .8rem; }
-.demo-breadcrumb { font-size: .78rem; color: var(--muted); margin-bottom: 8px; }.demo-breadcrumb a { color: var(--muted); text-decoration: none; }
-.cap-demo-header { align-items: center; }
+.header-title { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.page-icon { width: 50px; height: 50px; flex: none; display: grid; place-items: center; border-radius: 12px; background: var(--surface-subtle); color: var(--fg); }
+.header-title h1 { margin: 0; font-size: 2rem; line-height: 1.25; }
+.cap-demo-header { align-items: center; margin-bottom: 18px; }
 .cap-demo-panel { padding: 0; overflow: hidden; }
 .cap-tabs { display: flex; gap: 24px; padding: 14px 18px 0; border-bottom: 1px solid var(--border); }.cap-tabs button { border: 0; border-radius: 0; background: transparent; color: var(--muted); font-size: .9rem; min-height: 0; padding: 8px 0; }.cap-tabs button[aria-selected="true"] { color: var(--fg); font-weight: 600; box-shadow: inset 0 -2px var(--accent); }
 .cap-toolbar { display: flex; flex-wrap: wrap; gap: 10px; padding: 16px 18px 0; }.cap-select { display: inline-flex; align-items: center; gap: 7px; }.manage-mcp { margin-left: auto; }
 .cap-summary { padding: 12px 18px 0; margin: 0; }
-.cap-layout { display: grid; grid-template-columns: minmax(0,1fr) 340px; gap: 0; margin-top: 14px; }
+.cap-layout { display: grid; grid-template-columns: minmax(0,1fr) 310px; gap: 0; margin-top: 14px; }
 .cap-table-wrap { overflow-x: auto; padding: 0 18px 18px; }
 .cap-table { width: 100%; border-collapse: collapse; font-size: .85rem; }.cap-table th { text-align: left; font-weight: 600; color: var(--muted); font-size: .8rem; padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--surface-subtle); }.cap-table th:first-child { border-radius: 8px 0 0 0; }.cap-table th:last-child { border-radius: 0 8px 0 0; }.cap-table td { padding: 14px; border-bottom: 1px solid var(--border); }.cap-table tbody tr { cursor: pointer; }.cap-table tbody tr:hover { background: var(--surface-subtle); }.cap-table tbody tr.selected { background: var(--accent-soft); }.cap-table tbody tr.selected td:first-child { box-shadow: inset 3px 0 var(--accent); }
 .cap-name { display: inline-flex; align-items: center; gap: 10px; font-weight: 500; }.cap-icon { color: var(--accent); display: inline-flex; width: 26px; height: 26px; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 7px; }
