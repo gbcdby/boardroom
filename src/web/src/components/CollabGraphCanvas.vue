@@ -5,20 +5,50 @@ import {
   hitTestMember, layoutGraph,
   type GraphCanvasData, type GraphLayout, type GraphMemberVM, type GraphTone, type Rect,
 } from "./collabGraphLayout.ts";
+import {
+  MESSAGE_ANIMATION_MS, buildMessageDirectionLayer, messageAggregateLabel, messageMarkerLabel,
+  resolveMessagePresentation, type MessageDirectionLayer,
+} from "../composables/messageDirectionLayer.ts";
 
-const props = defineProps<{ data: GraphCanvasData; selectedId?: string | null }>();
+const props = defineProps<{
+  data: GraphCanvasData;
+  selectedId?: string | null;
+  messageDirection?: MessageDirectionLayer;
+  relationLayer?: boolean;
+  messageLayer?: boolean;
+  paused?: boolean;
+  scopeKey?: string | null;
+}>();
 const emit = defineEmits<{ select: [id: string] }>();
 const theme = useTheme();
 const shell = ref<HTMLDivElement | null>(null);
 const canvas = ref<HTMLCanvasElement | null>(null);
 const focusedId = ref<string | null>(null);
+const focusedMessageId = ref<string | null>(null);
+const focusedAggregateKey = ref<string | null>(null);
 const width = ref(760);
 const layout = computed(() => layoutGraph(props.data, width.value));
+const direction = computed(() => props.messageDirection ?? buildMessageDirectionLayer([]));
+const relationLayer = computed(() => props.relationLayer ?? true);
+const messageLayer = computed(() => props.messageLayer ?? true);
+const markers = computed(() => messageLayer.value ? direction.value.markers : []);
+const aggregates = computed(() => messageLayer.value ? direction.value.aggregates : []);
 const accessibleMembers = computed(() => props.data.groups.flatMap(group => group.members.map(member => ({ member, groupName: group.name }))));
+const reducedMotion = ref(typeof window !== "undefined" && typeof window.matchMedia === "function"
+  && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+const presentation = computed(() => resolveMessagePresentation(reducedMotion.value, props.paused === true));
+const animationStart = ref<Record<string, number>>({});
+const seenMessageIds = new Set<string>();
+const initializedScopes = new Set<string>();
+let lastScopeKey: string | null | undefined;
+let motionQuery: MediaQueryList | null = null;
 const ariaLabel = computed(() => {
   const groups = props.data.groups.map(group => group.name).join("、");
   const lead = props.data.root?.name ? `项目负责人${props.data.root.name}` : "未配置项目负责人";
-  return `协作关系图：${lead}；${groups ? `群组：${groups}` : "当前没有可读取的群组"}。节点来自真实只读数据；点击成员查看会话。`;
+  const layer = messageLayer.value
+    ? `真实消息 ${direction.value.totalCount} 条，可见标记 ${markers.value.length} 条${direction.value.overflowCount ? `，聚合 ${direction.value.overflowCount} 条` : ""}`
+    : `消息层已关闭，真实消息 ${direction.value.totalCount} 条仍照常更新`;
+  return `协作关系图：${lead}；${groups ? `群组：${groups}` : "当前没有可读取的群组"}。${layer}${presentation.value.animate ? "" : "；动态已暂停，静态箭头与计数仍可读"}。节点来自真实只读数据；点击成员查看会话。`;
 });
 const avatarCache = new Map<number, HTMLImageElement>();
 let observer: ResizeObserver | null = null;
@@ -180,6 +210,7 @@ function drawGroupIcon(ctx: CanvasRenderingContext2D, icon: string, x: number, y
   ctx.restore();
 }
 function drawEdges(ctx: CanvasRenderingContext2D, p: Palette, graph: GraphLayout): void {
+  if (!relationLayer.value) return;
   const lastTrunk = graph.rowTrunkYs[graph.rowTrunkYs.length - 1] ?? graph.trunkY;
   ctx.strokeStyle = p.relation;
   ctx.lineWidth = 1.4;
@@ -304,6 +335,110 @@ function drawNodes(ctx: CanvasRenderingContext2D, p: Palette, graph: GraphLayout
     drawPill(ctx, link.label, centerX, centerY, p);
   }
 }
+interface MessageGeometry { fromX: number; fromY: number; controlX: number; controlY: number; toX: number; toY: number }
+
+/** 消息箭头只落在真实发送者成员与所属群之间；发送者已移除时从群左侧入边，不补造节点。 */
+function messageGeometry(graph: GraphLayout, groupId: string, senderMemberId: string, lane: number): MessageGeometry | null {
+  const groupLayout = graph.groups.find(group => group.group.id === groupId);
+  if (!groupLayout) return null;
+  const offset = (lane % 3) - 1;
+  const toX = groupLayout.x + 28;
+  const toY = groupLayout.y + 27 + offset * 4;
+  const sender = groupLayout.members.find(member => member.member.memberId === senderMemberId);
+  const fromX = sender ? sender.x - 2 : groupLayout.x - 10;
+  const fromY = sender ? sender.y + sender.h / 2 + offset * 6 : groupLayout.y + 62 + offset * 6;
+  return { fromX, fromY, controlX: (fromX + toX) / 2, controlY: Math.min(fromY, toY) - 18, toX, toY };
+}
+function curvePoint(geometry: MessageGeometry, t: number): { x: number; y: number } {
+  const remaining = 1 - t;
+  return {
+    x: remaining * remaining * geometry.fromX + 2 * remaining * t * geometry.controlX + t * t * geometry.toX,
+    y: remaining * remaining * geometry.fromY + 2 * remaining * t * geometry.controlY + t * t * geometry.toY,
+  };
+}
+function drawDirectionArrow(ctx: CanvasRenderingContext2D, geometry: MessageGeometry, p: Palette, focus: boolean): void {
+  ctx.save();
+  ctx.strokeStyle = p.accent;
+  ctx.lineWidth = focus ? 2.6 : 1.8;
+  ctx.globalAlpha = focus ? 1 : 0.82;
+  ctx.beginPath();
+  ctx.moveTo(geometry.fromX, geometry.fromY);
+  ctx.quadraticCurveTo(geometry.controlX, geometry.controlY, geometry.toX, geometry.toY);
+  ctx.stroke();
+  const angle = Math.atan2(geometry.toY - geometry.controlY, geometry.toX - geometry.controlX);
+  drawArrowHead(ctx, geometry.toX, geometry.toY, angle, p.accent);
+  if (focus) {
+    ctx.beginPath();
+    ctx.arc(geometry.toX, geometry.toY, 8, 0, Math.PI * 2);
+    ctx.setLineDash([3, 2]);
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawFlowDot(ctx: CanvasRenderingContext2D, geometry: MessageGeometry, t: number, p: Palette): void {
+  const point = curvePoint(geometry, t);
+  ctx.save();
+  ctx.globalAlpha = t > 0.75 ? Math.max(0, (1 - t) / 0.25) : 1;
+  ctx.beginPath();
+  ctx.arc(point.x, point.y, 4.5, 0, Math.PI * 2);
+  ctx.fillStyle = p.accentFill;
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = p.onAccent;
+  ctx.stroke();
+  ctx.restore();
+}
+function drawMessageDirection(ctx: CanvasRenderingContext2D, p: Palette, graph: GraphLayout, now: number): void {
+  if (!messageLayer.value) return;
+  for (const [index, marker] of markers.value.entries()) {
+    const geometry = messageGeometry(graph, marker.groupId, marker.senderMemberId, index);
+    if (!geometry) continue;
+    drawDirectionArrow(ctx, geometry, p, focusedMessageId.value === marker.id);
+    const started = presentation.value.animate ? animationStart.value[marker.id] : undefined;
+    if (started === undefined) continue;
+    const progress = (now - started) / MESSAGE_ANIMATION_MS;
+    if (progress >= 0 && progress < 1) drawFlowDot(ctx, geometry, progress, p);
+  }
+  for (const [index, aggregate] of aggregates.value.entries()) {
+    const geometry = messageGeometry(graph, aggregate.groupId, aggregate.senderMemberId, index);
+    if (!geometry) continue;
+    drawDirectionArrow(ctx, geometry, p, focusedAggregateKey.value === aggregate.key);
+    drawPill(ctx, `+${aggregate.count}`, geometry.toX + 34, geometry.toY + 12, p, true);
+  }
+}
+function hasActiveAnimation(now: number): boolean {
+  return presentation.value.animate && messageLayer.value
+    && Object.values(animationStart.value).some(start => now - start >= 0 && now - start < MESSAGE_ANIMATION_MS);
+}
+/** 首帧与历史重载只登记已见 ID，不把旧消息当作新事件重放；仅新逻辑 ID 触发一次流动标记。 */
+function syncMessageSeen(): void {
+  const scopeId = props.scopeKey ?? "__default__";
+  const scopeChanged = scopeId !== lastScopeKey;
+  if (scopeChanged) {
+    seenMessageIds.clear();
+    animationStart.value = {};
+    lastScopeKey = scopeId;
+  }
+  // 首次加载与项目切回都属于历史快照，不把既有消息当作新事件重放。
+  const initial = scopeChanged || !initializedScopes.has(scopeId);
+  const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+  const next: Record<string, number> = {};
+  const canAnimate = presentation.value.animate && messageLayer.value;
+  for (const marker of direction.value.traceable) {
+    if (!seenMessageIds.has(marker.id)) {
+      seenMessageIds.add(marker.id);
+      if (!initial && canAnimate) next[marker.id] = now;
+    } else if (canAnimate && animationStart.value[marker.id] !== undefined) {
+      next[marker.id] = animationStart.value[marker.id]!;
+    }
+  }
+  initializedScopes.add(scopeId);
+  animationStart.value = next;
+}
+function onMotionChange(event: Event): void {
+  reducedMotion.value = (event as MediaQueryListEvent).matches;
+}
 function draw(): void {
   frame = 0;
   const shellElement = shell.value;
@@ -329,6 +464,9 @@ function draw(): void {
   const palette = readPalette();
   drawEdges(ctx, palette, graph);
   drawNodes(ctx, palette, graph);
+  const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+  drawMessageDirection(ctx, palette, graph, now);
+  if (hasActiveAnimation(now)) scheduleDraw();
 }
 function scheduleDraw(): void {
   if (frame || disposed) return;
@@ -355,20 +493,34 @@ function measure(): void {
   scheduleDraw();
 }
 onMounted(() => {
+  if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+    motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    reducedMotion.value = motionQuery.matches;
+    motionQuery.addEventListener?.("change", onMotionChange);
+  }
   for (let seed = 1; seed <= 6; seed += 1) avatarImage(seed);
   const element = shell.value;
   if (element && typeof ResizeObserver !== "undefined") {
     observer = new ResizeObserver(measure);
     observer.observe(element);
   }
+  syncMessageSeen();
   measure();
 });
 onBeforeUnmount(() => {
   disposed = true;
   observer?.disconnect();
+  motionQuery?.removeEventListener?.("change", onMotionChange);
   if (frame) cancelAnimationFrame(frame);
 });
-watch(() => [props.data, props.selectedId, focusedId.value, theme.snapshot.value.appearance, width.value] as const, scheduleDraw, { deep: true });
+watch(() => [
+  props.data, props.selectedId, props.messageDirection, props.messageLayer, props.relationLayer,
+  props.paused, focusedId.value, focusedMessageId.value, focusedAggregateKey.value,
+  theme.snapshot.value.appearance, width.value, reducedMotion.value,
+] as const, () => {
+  syncMessageSeen();
+  scheduleDraw();
+}, { deep: true });
 </script>
 
 <template>
@@ -394,6 +546,30 @@ watch(() => [props.data, props.selectedId, focusedId.value, theme.snapshot.value
         @focus="focusedId = item.member.id"
         @blur="focusedId = null"
       >查看{{ item.member.name }}（{{ item.groupName }}）的成员会话</button>
+      <div role="group" aria-label="真实消息方向标记">
+        <button
+          v-for="item in direction.traceable"
+          :key="`message-${item.id}`"
+          type="button"
+          :data-message-id="item.id"
+          data-testid="p01-message-accessible"
+          :aria-label="messageMarkerLabel(item)"
+          @focus="focusedMessageId = item.id"
+          @blur="focusedMessageId = null"
+        >{{ messageMarkerLabel(item) }}</button>
+      </div>
+      <div role="group" aria-label="同方向聚合消息计数">
+        <button
+          v-for="item in direction.aggregates"
+          :key="`aggregate-${item.key}`"
+          type="button"
+          :data-aggregate-key="item.key"
+          data-testid="p01-message-aggregate-accessible"
+          :aria-label="messageAggregateLabel(item)"
+          @focus="focusedAggregateKey = item.key"
+          @blur="focusedAggregateKey = null"
+        >{{ messageAggregateLabel(item) }}</button>
+      </div>
     </div>
   </div>
 </template>

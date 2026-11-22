@@ -3,6 +3,9 @@ import type { GroupDto, MemberDto, MemberStatusDto, MessageDto, OrgNodeDto, Proj
 import type { RuntimeViewDto } from "../api/runtimes.ts";
 import { taskStateLabel, type Task } from "../api/tasks.ts";
 import type { GraphCanvasData } from "../components/collabGraphLayout.ts";
+import {
+  buildMessageDirectionLayer, type MessageDirectionLayer,
+} from "./messageDirectionLayer.ts";
 
 export interface GraphNode {
   id: string;
@@ -101,7 +104,9 @@ export interface CollabGraph {
   memberCount: number;
   messageCount: number;
   recent: RecentActivity[];
-  /** 真实消息方向边：sender → 所属群，按时间倒序，最多 6 条用于画布标记。 */
+  /** 真实消息方向层：全部可追溯消息、最多 6 条标记与同向/时间窗聚合。 */
+  messageDirection: MessageDirectionLayer;
+  /** 兼容既有画布消费方的可见标记（等于 messageDirection.markers）。 */
   messageEdges: MessageEdge[];
   /** 按群聚合的完整真实会话，供图内检查器显示（不编造 transcript/工具/思考）。 */
   conversations: GroupConversation[];
@@ -125,7 +130,8 @@ export interface CollabGraphInput {
 export function emptyCollabGraph(): CollabGraph {
   return {
     root: null, lead: null, groups: [], memberCount: 0, messageCount: 0,
-    recent: [], messageEdges: [], conversations: [], tasks: [], roles: [], runtimeCapabilities: [],
+    recent: [], messageDirection: buildMessageDirectionLayer([]), messageEdges: [],
+    conversations: [], tasks: [], roles: [], runtimeCapabilities: [],
   };
 }
 
@@ -202,11 +208,12 @@ export function buildCollabGraphSnapshot(input: CollabGraphInput): CollabGraph {
   const messageEdges: MessageEdge[] = [];
   const conversations: GroupConversation[] = [];
   const seenMembers = new Set<string>();
-  let messageCount = 0;
 
   for (const group of input.groups) {
-    const messages = input.messagesByGroup.get(group.id) ?? [];
-    messageCount += messages.length;
+    // 同一逻辑消息 ID 的重复/补发只保留首次事实，历史加载不会新增消息。
+    const messages = [...new Map(
+      (input.messagesByGroup.get(group.id) ?? []).map((item) => [item.id, item]),
+    ).values()];
     for (const item of messages) {
       const activity: RecentActivity = {
         id: item.id,
@@ -292,9 +299,11 @@ export function buildCollabGraphSnapshot(input: CollabGraphInput): CollabGraph {
     }
   }
 
+  const messageDirection = buildMessageDirectionLayer(messageEdges);
   return {
-    root, lead, groups, memberCount: seenMembers.size, messageCount,
-    recent: recent.slice(0, 5), messageEdges: messageEdges.slice(0, 6), conversations, tasks, roles, runtimeCapabilities,
+    root, lead, groups, memberCount: seenMembers.size, messageCount: messageDirection.totalCount,
+    recent: recent.slice(0, 5), messageDirection, messageEdges: messageDirection.markers,
+    conversations, tasks, roles, runtimeCapabilities,
   };
 }
 
