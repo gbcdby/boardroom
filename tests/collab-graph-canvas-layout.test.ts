@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { hitTestMember, layoutGraph, type GraphCanvasData } from "../src/web/src/components/collabGraphLayout.ts";
+import { hitTestMember, hitTestGroup, layoutGraph, type GraphCanvasData } from "../src/web/src/components/collabGraphLayout.ts";
 
 const data: GraphCanvasData = {
   root: { name: "总管", role: "协调中枢", avatar: 0, initials: "总" },
@@ -116,4 +116,20 @@ test("多成员群组卡片随成员数长高，最后一名成员仍在容器�
   const last = group.members[2]!;
   assert.ok(last.y + last.h <= group.y + group.h);
   assertInside(layout);
+});
+
+test("群入口命中真实群 ID，成员区域仍由成员命中优先，不返回合成 ID", () => {
+  const withIds: GraphCanvasData = {
+    root: null, lead: null,
+    groups: [{
+      id: "g-real", name: "真实群", icon: "grid", flowLabel: "群消息 1",
+      members: [{ id: "g-real:m-1", memberId: "m-1", groupId: "g-real", name: "成员", initials: "成", status: "在线", tone: "ok", avatar: 1 }],
+    }],
+  };
+  const layout = layoutGraph(withIds, 760);
+  const group = layout.groups[0]!;
+  assert.equal(hitTestGroup(layout, group.x + 20, group.y + 20), "g-real");
+  assert.equal(hitTestGroup(layout, group.x + 20, group.y + group.h + 20), null);
+  assert.equal(hitTestMember(layout, group.x + 20, group.y + 20), null);
+  assert.equal(hitTestGroup(layout, 5, 5), null);
 });
