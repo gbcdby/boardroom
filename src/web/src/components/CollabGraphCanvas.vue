@@ -14,7 +14,12 @@ const canvas = ref<HTMLCanvasElement | null>(null);
 const focusedId = ref<string | null>(null);
 const width = ref(760);
 const layout = computed(() => layoutGraph(props.data, width.value));
-const members = computed(() => props.data.groups.flatMap(group => group.members));
+const accessibleMembers = computed(() => props.data.groups.flatMap(group => group.members.map(member => ({ member, groupName: group.name }))));
+const ariaLabel = computed(() => {
+  const groups = props.data.groups.map(group => group.name).join("、");
+  const lead = props.data.root?.name ? `项目负责人${props.data.root.name}` : "未配置项目负责人";
+  return `协作关系图：${lead}；${groups ? `群组：${groups}` : "当前没有可读取的群组"}。节点来自真实只读数据；点击成员查看会话。`;
+});
 const avatarCache = new Map<number, HTMLImageElement>();
 let observer: ResizeObserver | null = null;
 let frame = 0;
@@ -175,18 +180,24 @@ function drawGroupIcon(ctx: CanvasRenderingContext2D, icon: string, x: number, y
   ctx.restore();
 }
 function drawEdges(ctx: CanvasRenderingContext2D, p: Palette, graph: GraphLayout): void {
-  const leadCenter = graph.lead.x + graph.lead.w / 2;
   const lastTrunk = graph.rowTrunkYs[graph.rowTrunkYs.length - 1] ?? graph.trunkY;
   ctx.strokeStyle = p.relation;
   ctx.lineWidth = 1.4;
   ctx.beginPath();
-  ctx.moveTo(graph.root.x + graph.root.w / 2, graph.root.y + graph.root.h);
-  ctx.lineTo(graph.root.x + graph.root.w / 2, graph.lead.y);
-  ctx.moveTo(leadCenter, graph.lead.y + graph.lead.h);
-  ctx.lineTo(leadCenter, lastTrunk);
+  if (graph.root && graph.lead) {
+    ctx.moveTo(graph.root.x + graph.root.w / 2, graph.root.y + graph.root.h);
+    ctx.lineTo(graph.root.x + graph.root.w / 2, graph.lead.y);
+  }
+  if (graph.lead) {
+    ctx.moveTo(graph.lead.x + graph.lead.w / 2, graph.lead.y + graph.lead.h);
+    ctx.lineTo(graph.lead.x + graph.lead.w / 2, lastTrunk);
+  } else if (graph.root) {
+    ctx.moveTo(graph.root.x + graph.root.w / 2, graph.root.y + graph.root.h);
+    ctx.lineTo(graph.root.x + graph.root.w / 2, lastTrunk);
+  }
   for (let row = 0; row < graph.rowTrunkYs.length; row += 1) {
     const trunkY = graph.rowTrunkYs[row];
-    if (trunkY === undefined) continue;
+    if (trunkY === undefined || trunkY < 0) continue;
     const rowGroups = graph.groups.filter(group => group.row === row);
     if (!rowGroups.length) continue;
     const centers = rowGroups.map(group => group.x + group.w / 2);
@@ -206,41 +217,14 @@ function drawEdges(ctx: CanvasRenderingContext2D, p: Palette, graph: GraphLayout
     drawArrowHead(ctx, center, group.y - 1, Math.PI / 2, p.relation);
   }
 
-  for (const group of graph.groups) {
-    if (group.members.length > 1) {
-      const first = group.members[0]!;
-      const second = group.members[1]!;
-      const x = first.x + first.w / 2;
-      const connectorColor = group.group.flowEmphasis ? p.accentFill : p.relation;
-      ctx.strokeStyle = connectorColor;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(x, first.y + first.h);
-      ctx.lineTo(x, second.y);
-      ctx.stroke();
-      drawArrowHead(ctx, x, second.y - 1, Math.PI / 2, connectorColor);
-    } else if (group.members.length === 1) {
-      const member = group.members[0]!;
-      const x = group.x + group.w / 2;
-      ctx.strokeStyle = p.relation;
-      ctx.lineWidth = 1.4;
-      ctx.beginPath();
-      ctx.moveTo(x, group.y + 45);
-      ctx.lineTo(x, member.y);
-      ctx.stroke();
-      drawArrowHead(ctx, x, member.y - 1, Math.PI / 2, p.relation);
-    }
-  }
-
-  const first = graph.groups[0];
-  const second = graph.groups[1];
-  const third = graph.groups[2];
-  if (first && second && first.members[1] && second.members[0]) {
-    const from = first.members[1]!;
-    const to = second.members[0]!;
-    const startX = first.x + first.w;
+  const members = graph.groups.flatMap(group => group.members);
+  for (const link of props.data.collaborations ?? []) {
+    const from = members.find(item => item.member.id === link.fromId);
+    const to = members.find(item => item.member.id === link.toId);
+    if (!from || !to) continue;
+    const startX = from.x + from.w / 2;
     const startY = from.y + from.h / 2;
-    const endX = second.x;
+    const endX = to.x + to.w / 2;
     const endY = to.y + to.h / 2;
     ctx.strokeStyle = p.relation;
     ctx.lineWidth = 1.4;
@@ -250,42 +234,34 @@ function drawEdges(ctx: CanvasRenderingContext2D, p: Palette, graph: GraphLayout
     ctx.stroke();
     drawArrowHead(ctx, endX + 1, endY, 0, p.relation);
   }
-  if (first && third && first.members[1] && third.members[0]) {
-    const from = first.members[1]!;
-    const to = third.members[0]!;
-    const startX = first.x + first.w / 2;
-    const startY = from.y + from.h;
-    const endX = third.x;
-    const endY = to.y + to.h;
-    ctx.strokeStyle = p.relation;
-    ctx.lineWidth = 1.4;
-    ctx.beginPath();
-    ctx.moveTo(startX, startY);
-    ctx.bezierCurveTo(startX + 120, graph.height - 20, endX - 120, graph.height - 20, endX, endY);
-    ctx.stroke();
-    drawArrowHead(ctx, endX + 1, endY, 0, p.relation);
-  }
 }
 function drawNodes(ctx: CanvasRenderingContext2D, p: Palette, graph: GraphLayout): void {
-  fillCard(ctx, graph.root, p, 10);
-  const rootIconX = graph.root.x + 26;
-  const rootIconY = graph.root.y + graph.root.h / 2;
-  ctx.strokeStyle = p.fg;
-  ctx.lineWidth = 1.6;
-  ctx.beginPath();
-  ctx.ellipse(rootIconX, rootIconY - 2, 12, 9, 0, 0, Math.PI * 2);
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.moveTo(rootIconX - 6, rootIconY + 6);
-  ctx.lineTo(rootIconX - 10, rootIconY + 12);
-  ctx.lineTo(rootIconX - 1, rootIconY + 7);
-  ctx.stroke();
-  drawText(ctx, props.data.root.name, graph.root.x + 52, rootIconY, "600 16px -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif", p.fg);
+  if (graph.root) {
+    fillCard(ctx, graph.root, p, 10);
+    const rootIconX = graph.root.x + 26;
+    const rootIconY = graph.root.y + graph.root.h / 2;
+    ctx.strokeStyle = p.fg;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.ellipse(rootIconX, rootIconY - 2, 12, 9, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(rootIconX - 6, rootIconY + 6);
+    ctx.lineTo(rootIconX - 10, rootIconY + 12);
+    ctx.lineTo(rootIconX - 1, rootIconY + 7);
+    ctx.stroke();
+    drawText(ctx, props.data.root!.name, graph.root.x + 52, rootIconY - 7, "600 16px -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif", p.fg);
+    if (props.data.root!.role) {
+      drawText(ctx, props.data.root!.role, graph.root.x + 52, rootIconY + 12, "11px -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif", p.muted);
+    }
+  }
 
-  fillCard(ctx, graph.lead, p, 10);
-  drawAvatar(ctx, props.data.lead.avatar, props.data.lead.initials, graph.lead.x + 28, graph.lead.y + graph.lead.h / 2, p, 18);
-  drawText(ctx, props.data.lead.name, graph.lead.x + 58, graph.lead.y + 24, "600 15px -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif", p.fg);
-  drawText(ctx, props.data.lead.role ?? "协调中", graph.lead.x + 58, graph.lead.y + 43, "12px -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif", p.muted);
+  if (graph.lead && props.data.lead) {
+    fillCard(ctx, graph.lead, p, 10);
+    drawAvatar(ctx, props.data.lead.avatar, props.data.lead.initials, graph.lead.x + 28, graph.lead.y + graph.lead.h / 2, p, 18);
+    drawText(ctx, props.data.lead.name, graph.lead.x + 58, graph.lead.y + 24, "600 15px -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif", p.fg);
+    drawText(ctx, props.data.lead.role ?? "协调中", graph.lead.x + 58, graph.lead.y + 43, "12px -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif", p.muted);
+  }
 
   for (const group of graph.groups) {
     fillCard(ctx, group, p, 12);
@@ -311,24 +287,21 @@ function drawNodes(ctx: CanvasRenderingContext2D, p: Palette, graph: GraphLayout
       const centerY = (first.y + first.h + second.y) / 2;
       drawPill(ctx, group.group.flowLabel, group.x + 52, centerY, p);
       if (group.group.flowMessage) {
-        drawPill(ctx, group.group.flowMessage, group.x + group.w / 2 + 20, centerY, p, group.group.flowEmphasis === true);
+        drawPill(ctx, group.group.flowMessage, group.x + group.w / 2, centerY, p, group.group.flowEmphasis === true);
       }
     } else {
       drawPill(ctx, group.group.flowLabel, group.x + group.w / 2, group.y + group.h - 24, p);
     }
   }
 
-  const first = graph.groups[0];
-  const second = graph.groups[1];
-  const third = graph.groups[2];
-  if (first && second) {
-    const centerX = (first.x + first.w + second.x) / 2;
-    const centerY = (first.y + first.h / 2 + second.y + second.h / 2) / 2;
-    drawPill(ctx, "接口协作", centerX, centerY, p);
-  }
-  if (first && third) {
-    const centerX = (first.x + first.w / 2 + third.x + third.w / 2) / 2;
-    drawPill(ctx, "验证协作", centerX, graph.height - 28, p);
+  const members = graph.groups.flatMap(group => group.members);
+  for (const link of props.data.collaborations ?? []) {
+    const from = members.find(item => item.member.id === link.fromId);
+    const to = members.find(item => item.member.id === link.toId);
+    if (!from || !to) continue;
+    const centerX = (from.x + from.w + to.x) / 2;
+    const centerY = (from.y + from.h / 2 + to.y + to.h / 2) / 2;
+    drawPill(ctx, link.label, centerX, centerY, p);
   }
 }
 function draw(): void {
@@ -406,21 +379,21 @@ watch(() => [props.data, props.selectedId, focusedId.value, theme.snapshot.value
       :style="{ height: `${layout.height}px` }"
       data-testid="p01-graph-canvas-element"
       role="img"
-      aria-label="示例协作关系图：总管连接项目负责人，项目负责人连接界面升级小组、MCP 能力接入、质量保障三个群；点击成员查看会话。全部为示例数据。"
+      :aria-label="ariaLabel"
       @click="onClick"
       @mousemove="onMove"
     />
     <div class="visually-hidden graph-accessible-controls">
       <button
-        v-for="member in members"
-        :key="member.id"
+        v-for="item in accessibleMembers"
+        :key="item.member.id"
         type="button"
-        :aria-pressed="selectedId === member.id"
-        :aria-label="`查看${member.name}的成员会话`"
-        @click="emit('select', member.id)"
-        @focus="focusedId = member.id"
+        :aria-pressed="selectedId === item.member.id"
+        :aria-label="`查看${item.member.name}（${item.groupName}）的成员会话`"
+        @click="emit('select', item.member.id)"
+        @focus="focusedId = item.member.id"
         @blur="focusedId = null"
-      >查看{{ member.name }}的成员会话</button>
+      >查看{{ item.member.name }}（{{ item.groupName }}）的成员会话</button>
     </div>
   </div>
 </template>

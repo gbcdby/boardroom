@@ -8,9 +8,13 @@ export interface GraphMemberVM {
   tone: GraphTone;
   avatar: number;
   role?: string | undefined;
+  /** 真实成员 ID；画布 id 为「群 ID:成员 ID」，跨群同名不合并。 */
+  memberId?: string | undefined;
+  groupId?: string | undefined;
 }
 
 export interface GraphGroupVM {
+  id?: string | undefined;
   name: string;
   icon: string;
   flowLabel: string;
@@ -19,10 +23,19 @@ export interface GraphGroupVM {
   members: GraphMemberVM[];
 }
 
+/** 只有具备真实来源的关系才能进入画布；阶段 1 的真实快照不提供跨群协作边。 */
+export interface GraphCollaboration {
+  id: string;
+  fromId: string;
+  toId: string;
+  label: string;
+}
+
 export interface GraphCanvasData {
-  root: { name: string; role: string; avatar: number; initials: string };
-  lead: GraphMemberVM;
+  root: { name: string; role: string; avatar: number; initials: string } | null;
+  lead: GraphMemberVM | null;
   groups: GraphGroupVM[];
+  collaborations?: GraphCollaboration[];
 }
 
 export interface Rect { x: number; y: number; w: number; h: number }
@@ -37,8 +50,9 @@ export interface GraphLayout {
   width: number;
   height: number;
   columns: number;
-  root: Rect;
-  lead: Rect;
+  root: Rect | null;
+  lead: Rect | null;
+  groupsTop: number;
   trunkY: number;
   rowTrunkYs: number[];
   groups: LayoutGroup[];
@@ -60,30 +74,56 @@ export function layoutGraph(data: GraphCanvasData, requestedWidth: number): Grap
   const groupWidth = (available - GAP * (columns - 1)) / columns;
   const rootWidth = Math.min(200, available);
   const leadWidth = Math.min(240, available);
-  const root: Rect = { x: (width - rootWidth) / 2, y: 8, w: rootWidth, h: 48 };
-  const lead: Rect = { x: (width - leadWidth) / 2, y: 82, w: leadWidth, h: 62 };
+  const hasRoot = data.root !== null;
+  const hasLead = data.lead !== null;
+  // 无负责人岗位时不画占位卡片，群直接上移，避免任何合成节点。
+  const groupsTop = hasLead ? (hasRoot ? GROUP_TOP : 110) : hasRoot ? 100 : 16;
+  const trunkY = hasRoot && hasLead ? 178 : hasLead ? 84 : hasRoot ? 74 : 0;
+  const root: Rect | null = hasRoot
+    ? { x: (width - rootWidth) / 2, y: 8, w: rootWidth, h: 48 }
+    : null;
+  const lead: Rect | null = hasLead
+    ? { x: (width - leadWidth) / 2, y: hasRoot ? 82 : 8, w: leadWidth, h: 62 }
+    : null;
   const rows = Math.ceil(data.groups.length / columns);
-  const rowTrunkYs = Array.from({ length: rows }, (_, row) => GROUP_TOP + row * (GROUP_HEIGHT + ROW_GAP) - 20);
-  const height = GROUP_TOP + rows * GROUP_HEIGHT + Math.max(0, rows - 1) * ROW_GAP + 56;
+  // 实际参与者可能多于原型 v2 的两人，群卡片按成员数长高，不把成员画到容器外。
+  const groupHeightOf = (group: GraphGroupVM): number => {
+    const count = group.members.length;
+    return Math.max(GROUP_HEIGHT, 57 + count * 58 + Math.max(0, count - 1) * 32 + 16);
+  };
+  const positioned = data.groups.map((group, index) => ({
+    group,
+    row: Math.floor(index / columns),
+    column: index % columns,
+    h: groupHeightOf(group),
+  }));
+  const rowHeights = Array.from({ length: rows }, (_, row) =>
+    positioned.filter(item => item.row === row).reduce((max, item) => Math.max(max, item.h), 0));
+  const rowTops: number[] = [];
+  let cursor = groupsTop;
+  for (let row = 0; row < rows; row += 1) {
+    rowTops[row] = cursor;
+    cursor += rowHeights[row]! + ROW_GAP;
+  }
+  const height = Math.max(groupsTop, cursor - ROW_GAP) + 56;
+  const rowTrunkYs = rowTops.map(top => top - 20);
 
-  const groups: LayoutGroup[] = data.groups.map((group, index) => {
-    const row = Math.floor(index / columns);
-    const column = index % columns;
+  const groups: LayoutGroup[] = positioned.map(({ group, row, column, h }) => {
     const x = PADDING + column * (groupWidth + GAP);
-    const y = GROUP_TOP + row * (GROUP_HEIGHT + ROW_GAP);
+    const y = rowTops[row]!;
     const members: LayoutMember[] = group.members.map((member, memberIndex) => ({
       member,
       x: x + 12,
       y: group.members.length > 1
         ? y + 57 + memberIndex * 90
-        : y + 45 + (GROUP_HEIGHT - 45 - 58) / 2,
+        : y + 45 + (h - 45 - 58) / 2,
       w: groupWidth - 24,
       h: 58,
     }));
-    return { group, row, column, x, y, w: groupWidth, h: GROUP_HEIGHT, members };
+    return { group, row, column, x, y, w: groupWidth, h, members };
   });
 
-  return { width, height, columns, root, lead, trunkY: 178, rowTrunkYs, groups };
+  return { width, height, columns, root, lead, groupsTop, trunkY, rowTrunkYs, groups };
 }
 
 export function hitTestMember(layout: GraphLayout, x: number, y: number): string | null {

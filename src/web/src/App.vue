@@ -18,13 +18,13 @@ const sections = [
   { key: "knowledge", label: "知识", icon: "layers" }, { key: "settings", label: "设置", icon: "settings" },
 ];
 const currentPage = computed(() => typeof route.meta["title"] === "string" ? route.meta["title"] : "协作总览");
-const designChrome = computed<{ trail: [string, string]; marker: string } | null>(() => {
+const designChrome = computed<{ trail: [string, string]; marker: string; markerShort: string } | null>(() => {
   const marker = "原型 v2 · 示例数据";
   switch (String(route.name ?? "")) {
-    case "home": return { trail: ["工作台", "Boardroom"], marker };
-    case "demo-p04": return { trail: ["Boardroom", "界面升级小组"], marker };
-    case "demo-p05": return { trail: ["协作配置", "MCP"], marker };
-    case "prototype-index": return { trail: ["工作台", "原型浏览"], marker };
+    case "home": return { trail: ["工作台", "Boardroom"], marker: "真实数据 · 当前项目", markerShort: "真实数据" };
+    case "demo-p04": return { trail: ["Boardroom", "界面升级小组"], marker, markerShort: "示例数据" };
+    case "demo-p05": return { trail: ["协作配置", "MCP"], marker, markerShort: "示例数据" };
+    case "prototype-index": return { trail: ["工作台", "原型浏览"], marker, markerShort: "示例数据" };
     default: return null;
   }
 });
@@ -54,7 +54,7 @@ watch(() => route.path, async () => {
 <template>
   <a class="skip-link" href="#main-content">跳到主要内容</a>
   <div class="layout collab-layout" :class="{ 'design-demo': designChrome }" @keydown.esc="closeMenu">
-    <header class="workspace-topbar" :class="{ 'global-page': !projectContextVisible, 'design-topbar': designChrome }"><button ref="menuButton" type="button" class="menu-toggle" :aria-expanded="menuOpen" aria-controls="main-navigation" :aria-label="menuOpen ? '收起导航' : '展开导航'" @click="menuOpen = !menuOpen"><AppIcon :name="menuOpen ? 'close' : 'menu'" :size="21" /></button><nav v-if="designChrome" class="demo-breadcrumb" aria-label="当前位置"><span>{{ designChrome.trail[0] }}</span><span aria-hidden="true"> / </span><strong>{{ designChrome.trail[1] }}</strong></nav><span v-else class="current-page">{{ currentPage }}</span><label v-if="projectContextVisible" class="workspace-project"><span>当前项目</span><select :value="currentProjectId ?? ''" :disabled="projectsLoading || projects.length === 0" data-testid="current-project" @change="selectProject"><option v-if="currentProjectId === null" value="" disabled>{{ projectsLoading ? '正在加载…' : '选择项目' }}</option><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}{{ project.archivedAt ? ' · 已归档' : '' }}</option></select></label><span v-if="designChrome" class="demo-marker">{{ designChrome.marker }}</span><span v-if="designChrome" class="demo-marker-short">示例数据</span><span v-else class="local-label"><AppIcon name="server" :size="15" />本地运行</span></header>
+    <header class="workspace-topbar" :class="{ 'global-page': !projectContextVisible, 'design-topbar': designChrome }"><button ref="menuButton" type="button" class="menu-toggle" :aria-expanded="menuOpen" aria-controls="main-navigation" :aria-label="menuOpen ? '收起导航' : '展开导航'" @click="menuOpen = !menuOpen"><AppIcon :name="menuOpen ? 'close' : 'menu'" :size="21" /></button><nav v-if="designChrome" class="demo-breadcrumb" aria-label="当前位置"><span>{{ designChrome.trail[0] }}</span><span aria-hidden="true"> / </span><strong>{{ designChrome.trail[1] }}</strong></nav><span v-else class="current-page">{{ currentPage }}</span><label v-if="projectContextVisible" class="workspace-project"><span>当前项目</span><select :value="currentProjectId ?? ''" :disabled="projectsLoading || projects.length === 0" data-testid="current-project" @change="selectProject"><option v-if="currentProjectId === null" value="" disabled>{{ projectsLoading ? '正在加载…' : '选择项目' }}</option><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}{{ project.archivedAt ? ' · 已归档' : '' }}</option></select></label><span v-if="designChrome" class="demo-marker">{{ designChrome.marker }}</span><span v-if="designChrome" class="demo-marker-short">{{ designChrome.markerShort }}</span><span v-else class="local-label"><AppIcon name="server" :size="15" />本地运行</span></header>
     <aside class="sidebar" :class="{ 'is-open': menuOpen }" aria-label="工作空间导航"><SidebarNavigation /></aside>
     <div class="workspace">
       <main id="main-content" class="content" tabindex="-1"><div v-if="projectContextVisible && projectError" class="error" role="alert">{{ projectError }} <button type="button" class="text-button" :disabled="projectsLoading" @click="retryProjects">重新加载项目</button></div><div v-if="projectContextVisible && projectNotice" class="notice" role="status" data-testid="context-notice">{{ projectNotice }} <button type="button" class="text-button" @click="context.dismissNotice">知道了</button></div><p v-if="projectContextVisible && !projectsLoading && !projectError && !currentProject" class="muted small">暂无当前项目。可在顶栏选择项目，或<RouterLink to="/projects?archived=1">查看归档项目</RouterLink>。</p><nav v-if="projectContextVisible && currentProjectId" class="project-section-nav" aria-label="项目功能"><RouterLink v-for="section in sections" :key="section.key" :to="projectPath(currentProjectId, section.key)" :class="{ selected: route.meta['projectSection'] === section.key }" :aria-current="route.meta['projectSection'] === section.key ? 'page' : undefined">{{ section.label }}</RouterLink><RouterLink class="activity-link" :to="projectPath(currentProjectId, 'activity')" :class="{ selected: route.meta['projectSection'] === 'activity' }">活动与审计</RouterLink></nav><RouterView /></main>

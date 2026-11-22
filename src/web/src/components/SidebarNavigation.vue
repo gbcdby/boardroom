@@ -20,16 +20,18 @@ let disposed = false;
 let demoExpanded = false;
 
 const isPrototypeDemo = computed(() => ["home", "demo-p04", "demo-p05", "prototype-index"].includes(String(route.name ?? "")));
+// 首页中央图已接入真实数据：左栏项目/群名称同步显示真实内容，只有演示路由沿用原型示例名称。
+const usesPrototypeData = computed(() => ["demo-p04", "demo-p05", "prototype-index"].includes(String(route.name ?? "")));
 const roleSelected = computed(() => route.path.startsWith("/collaboration/") || route.path === "/demo/p05");
 function displayProjectName(project: ProjectDto): string {
-  return isPrototypeDemo.value ? "Boardroom" : project.name;
+  return usesPrototypeData.value ? "Boardroom" : project.name;
 }
 const searchTerm = computed(() => search.value.trim().toLocaleLowerCase());
 const projects = computed(() => context.projects.value.filter(project => {
   if (project.archivedAt && project.id !== route.params["projectId"]) return false;
   if (!searchTerm.value) return true;
   const candidates = [project.name, displayProjectName(project), ...(groups.value[project.id] ?? []).map(group => group.name)];
-  if (isPrototypeDemo.value) candidates.push(...prototypeGroupNames);
+  if (usesPrototypeData.value) candidates.push(...prototypeGroupNames);
   return candidates.some(name => name.toLocaleLowerCase().includes(searchTerm.value));
 }));
 
@@ -57,7 +59,7 @@ function expandFirstProject(): void {
 function visualGroups(projectId: string): Array<{ key: string; name: string; to: string; selected: boolean }> {
   const stored = groups.value[projectId] ?? [];
   let items: Array<{ key: string; name: string; to: string; selected: boolean }>;
-  if (!isPrototypeDemo.value) items = stored.map(group => ({
+  if (!usesPrototypeData.value) items = stored.map(group => ({
     key: group.id, name: group.name, to: projectPath(projectId, "chat", group.id),
     selected: route.params["projectId"] === projectId && route.params["groupId"] === group.id,
   }));
