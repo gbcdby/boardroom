@@ -3,10 +3,11 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import AppIcon from "../components/AppIcon.vue";
 import CollabGraphCanvas from "../components/CollabGraphCanvas.vue";
+import TaskFlowBoard from "../components/TaskFlowBoard.vue";
 import type { GraphCanvasData } from "../components/collabGraphLayout.ts";
 import { api } from "../api/client.ts";
 import { useCollabGraph } from "../composables/useCollabGraph.ts";
-import { toGraphCanvasData } from "../composables/collabGraphProjection.ts";
+import { buildTaskFlowBoard, toGraphCanvasData } from "../composables/collabGraphProjection.ts";
 import {
   toInspectorMessage, useGroupConversationInspector, type InspectorScope,
 } from "../composables/groupConversationInspector.ts";
@@ -48,27 +49,22 @@ watch(
   { immediate: true },
 );
 
-// P03 任务流转视图示例数据（静态视觉演示，非真实任务状态）
+// P03 只读看板：任务、负责人与资料缺口都来自 useCollabGraph 的当前项目真实快照。
 const activeView = ref<"members" | "tasks">("members");
+const tasksTab = ref<HTMLButtonElement | null>(null);
+const selectedTaskId = ref<string | null>(null);
+const taskColumns = computed(() => buildTaskFlowBoard(graph.value.tasks));
+const selectedTask = computed(() => graph.value.tasks.find((task) => task.id === selectedTaskId.value) ?? null);
+watch([graphProjectId, graphLoading, graphError] as const, ([projectId, loading, error], previous) => {
+  if (previous && projectId === previous[0] && !loading && !error) return;
+  selectedTaskId.value = null;
+});
+function selectTask(id: string): void { selectedTaskId.value = id; }
+function refreshTaskFlow(): void { void loadGraph().finally(() => tasksTab.value?.focus()); }
 // 图层开关与暂停只改变画布表现；图投影与消息事实仍照常更新。
 const relationLayerVisible = ref(true);
 const messageLayerVisible = ref(true);
 const animationPaused = ref(false);
-const demoTasks = [
-  { id: "assigned", title: "任务已分配", icon: "check", tone: "ok", person: "项目负责人", initials: "负", avatar: 6,
-    desc: "明确需求与分工，完成任务分派。", foot: "已完成分派", active: false },
-  { id: "doing", title: "执行中", icon: "arrow", tone: "active", person: "前端工程师", initials: "前", avatar: 2,
-    desc: "正在实现选中与会话联动。", foot: "成员会话侧栏 · 查看成员会话", active: true },
-  { id: "done", title: "完成", icon: "history", tone: "idle", person: "", initials: "", avatar: 0,
-    desc: "尚未开始", sub: "通过验证与评审后，标记任务完成。", active: false },
-  { id: "verify", title: "验证与评审", icon: "check", tone: "wait", person: "验证工程师", initials: "验", avatar: 5,
-    desc: "尚未开始", sub: "验证功能效果与关键验收点。", active: false },
-];
-const demoTaskDetail = {
-  title: "协作总览升级", state: "执行中", owner: "前端工程师", group: "界面升级小组", phase: "实现", next: "提交候选后进入评审",
-  acceptance: ["图中查看成员会话", "消息与节点双向定位", "断线恢复不串会话"],
-  discussion: "打开群聊", recent: "前端工程师已接手",
-};
 function switchView(view: "members" | "tasks"): void { activeView.value = view; unavailableReason.value = null; }
 
 // P02 已接为图内真实检查器：节点/群入口只决定 scope，正文按该群绑定读取真实 Boardroom 消息。
@@ -200,11 +196,10 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
     <section class="collab-toolbar" aria-label="协作总览工具条">
       <div class="toolbar-views" role="group" aria-label="视图切换">
         <button type="button" class="view-tab" :aria-pressed="activeView === 'members'" @click="switchView('members')">成员关系</button>
-        <button type="button" class="view-tab" :aria-pressed="activeView === 'tasks'" @click="switchView('tasks')">任务流转</button>
+        <button type="button" ref="tasksTab" class="view-tab" :aria-pressed="activeView === 'tasks'" data-testid="p03-tasks-tab" @click="switchView('tasks')">任务流转</button>
       </div>
       <template v-if="activeView === 'tasks'">
-        <span class="task-select-label">任务：</span>
-        <button type="button" class="toolbar-control task-select" aria-disabled="true" title="任务选择是静态演示控件" @click="explainUnavailable('任务选择')">{{ demoTaskDetail.title }}<AppIcon name="chevron" :size="14" /></button>
+        <span class="task-select-label" data-testid="p03-task-count">任务：{{ graph.tasks.length }} 项 · 当前项目真实数据（只读）</span>
       </template>
       <template v-else>
         <div class="toolbar-layers" role="group" aria-label="关系图层">
@@ -257,23 +252,19 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
           </div>
         </section>
         <section v-else class="panel taskflow-panel" aria-labelledby="taskflow-title" data-testid="p03-taskflow">
-          <div class="section-heading"><div><h2 id="taskflow-title">任务流转<span class="demo-chip">示例数据</span></h2></div></div>
-          <div class="taskflow-board">
-            <div v-for="(task, index) in demoTasks" :key="task.id" class="taskflow-stage" :class="{ active: task.active }">
-              <div class="stage-head"><span class="stage-icon" :class="task.tone"><AppIcon :name="task.icon" :size="16" /></span><strong>{{ task.title }}</strong></div>
-              <div class="stage-body">
-                <div v-if="task.person" class="stage-person"><span class="avatar" :class="`avatar-${task.avatar}`">{{ task.initials }}</span><strong>{{ task.person }}</strong></div>
-                <p class="stage-desc">{{ task.desc }}</p>
-                <p v-if="task.sub" class="stage-sub">{{ task.sub }}</p>
-                <div v-if="task.id === 'doing'" class="stage-link"><span class="link-icon"><AppIcon name="message" :size="16" /></span><span><strong>成员会话侧栏</strong><small>正在实现选中与会话联动。</small></span><span class="link-cta">查看成员会话 ›</span></div>
-                <div class="stage-foot"><span class="foot-icon" :class="task.tone"><AppIcon name="check" :size="14" /></span>{{ task.foot }}</div>
-              </div>
-              <span v-if="index === 0" class="stage-arrow" aria-hidden="true">→</span>
-              <span v-if="index === 1" class="stage-arrow down" aria-hidden="true">↓</span>
-              <span v-if="index === 3" class="stage-arrow left" aria-hidden="true">←</span>
-            </div>
+          <div class="section-heading">
+            <h2 id="taskflow-title">任务流转<span class="real-chip">真实数据</span></h2>
+            <span class="board-scope small muted" data-testid="p03-board-source">来源：当前项目「{{ graphScopeName || '未选择项目' }}」的只读任务 API</span>
           </div>
-          <div class="taskflow-handoff"><AppIcon name="arrow" :size="16" /><strong>最近交接</strong><span class="avatar avatar-1">产</span><span>产品设计师</span><span class="handoff-arrow">→</span><span class="avatar avatar-2">前</span><span>前端工程师</span><span class="handoff-note">· 已接手</span></div>
+          <TaskFlowBoard
+            :columns="taskColumns"
+            :tasks="graph.tasks"
+            :loading="graphLoading"
+            :error="graphError"
+            :selected-id="selectedTaskId"
+            @select="selectTask"
+            @refresh="refreshTaskFlow"
+          />
         </section>
         <details class="real-data-fold" data-testid="p01-real-data-fold">
           <summary>真实数据（当前环境）：{{ loading ? '读取中…' : `${projects.length} 个项目 · ${activeCount} 个活跃 · ${groupCount} 个群组` }}</summary>
@@ -292,18 +283,41 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
       </div>
       <aside class="collab-side" :aria-label="activeView === 'tasks' ? '任务详情' : '动态与待我处理'">
         <template v-if="activeView === 'tasks'">
-          <section class="panel side-panel task-detail" aria-labelledby="task-detail-title">
-            <div class="side-heading"><h2 id="task-detail-title">任务详情<span class="demo-chip">示例数据</span></h2><button type="button" class="inspector-close" aria-label="关闭任务详情" aria-disabled="true" title="静态演示控件" @click="explainUnavailable('关闭任务详情')"><AppIcon name="close" :size="16" /></button></div>
-            <div class="task-detail-title"><span class="task-detail-icon"><AppIcon name="layers" :size="20" /></span><strong>{{ demoTaskDetail.title }}</strong><span class="status-badge active">{{ demoTaskDetail.state }}</span></div>
-            <dl class="task-facts">
-              <div><dt><AppIcon name="people" :size="15" />负责人</dt><dd>{{ demoTaskDetail.owner }}</dd></div>
-              <div><dt><AppIcon name="message" :size="15" />所在群组</dt><dd>{{ demoTaskDetail.group }}</dd></div>
-              <div><dt><AppIcon name="layers" :size="15" />当前阶段</dt><dd>{{ demoTaskDetail.phase }}</dd></div>
-              <div><dt><AppIcon name="arrow" :size="15" />下一步</dt><dd>{{ demoTaskDetail.next }}</dd></div>
-            </dl>
-            <div class="task-section"><h3>验收重点</h3><ul class="checklist"><li v-for="item in demoTaskDetail.acceptance" :key="item"><span class="checkbox" aria-hidden="true"></span>{{ item }}</li></ul></div>
-            <div class="task-section task-discussion"><span><AppIcon name="message" :size="16" />相关讨论</span><span class="discussion-link">打开群聊 ›</span></div>
-            <div class="task-section"><h3>最近活动</h3><p class="recent-activity"><span class="rail-dot first" aria-hidden="true"></span>{{ demoTaskDetail.recent }}</p></div>
+          <section class="panel side-panel task-detail" aria-labelledby="task-detail-title" data-testid="p03-task-detail">
+            <div class="side-heading"><h2 id="task-detail-title">任务详情<span class="real-chip">真实数据</span></h2></div>
+            <template v-if="selectedTask">
+              <div class="task-detail-title">
+                <strong data-testid="p03-detail-title">{{ selectedTask.title }}</strong>
+                <span class="status-badge" :class="selectedTask.state === 'blocked' ? 'wait' : selectedTask.state === 'done' ? 'ok' : 'active'">{{ selectedTask.stateLabel }}</span>
+              </div>
+              <dl class="task-facts">
+                <div><dt>任务 ID</dt><dd data-testid="p03-detail-id">{{ selectedTask.id }}</dd></div>
+                <div><dt>版本</dt><dd data-testid="p03-detail-revision">v{{ selectedTask.revision }}</dd></div>
+                <div><dt>负责人</dt><dd data-testid="p03-detail-assignee">{{ selectedTask.assignee ?? '未指派' }}<small v-if="selectedTask.assigneeMemberId"> · {{ selectedTask.assigneeMemberId }}</small></dd></div>
+                <div><dt>评审人</dt><dd>{{ selectedTask.reviewer ?? '未指派' }}<small v-if="selectedTask.reviewerMemberId"> · {{ selectedTask.reviewerMemberId }}</small></dd></div>
+                <div><dt>受阻原因</dt><dd data-testid="p03-detail-blocked">{{ selectedTask.blockedReason ?? '无' }}</dd></div>
+                <div><dt>评审来源</dt><dd>repoPath：{{ selectedTask.repoPath ?? '未填' }} · fixedPoint：{{ selectedTask.fixedPoint ?? '未填' }}</dd></div>
+                <div><dt>更新时间</dt><dd>{{ selectedTask.updatedAt }}</dd></div>
+                <div><dt>执行接入</dt><dd data-testid="p03-detail-admission">{{ selectedTask.executionAdmission }}（非执行放行）</dd></div>
+              </dl>
+              <div class="task-section">
+                <h3>资料缺口（服务端字段级）</h3>
+                <ul v-if="selectedTask.readinessIssues.length" class="checklist">
+                  <li v-for="(issue, index) in selectedTask.readinessIssues" :key="`${issue.stage}:${issue.field}:${issue.code}:${index}`" data-testid="p03-detail-issue" :data-field="issue.field" :data-code="issue.code">
+                    <span class="rail-dot first" aria-hidden="true"></span>{{ issue.stage }} · {{ issue.field }} · {{ issue.code }}：{{ issue.message }}
+                  </li>
+                </ul>
+                <p v-else class="muted small">服务端未报告资料缺口。</p>
+              </div>
+              <div class="task-section">
+                <h3>下一步（仅文字提示）</h3>
+                <ul v-if="selectedTask.readinessIssues.length" class="checklist">
+                  <li v-for="(issue, index) in selectedTask.readinessIssues" :key="`hint:${issue.stage}:${issue.field}:${index}`">{{ issue.hint }}</li>
+                </ul>
+                <p v-else class="muted small">当前无可回溯的下一步，需查领域权威。</p>
+              </div>
+            </template>
+            <p v-else class="muted small" data-testid="p03-detail-empty">未选择任务；详情只展示当前项目真实任务，不填充示例。</p>
           </section>
         </template>
         <template v-else>
@@ -387,22 +401,11 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .pending-list { margin-top: 14px; }.pending-card { display: flex; align-items: center; gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-bg); }.pending-icon { color: var(--ok); display: inline-flex; }.pending-copy { flex: 1; min-width: 0; }.pending-copy strong { display: block; font-size: .82rem; }.pending-copy small { display: block; font-size: .72rem; color: var(--muted); margin-top: 2px; }.pending-link { font-size: .72rem; color: var(--accent); display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .quick-access { padding: 6px 0; }.quick-access h2 { font-size: 1.02rem; margin-bottom: 10px; }.shortcut { display: flex; align-items: center; gap: 13px; padding: 14px 0; color: var(--fg); border-bottom: 1px solid var(--border); }.shortcut:hover { color: var(--accent); text-decoration: none; }.shortcut-icon { color: var(--muted); }.shortcut > span:nth-child(2) { flex: 1; min-width: 0; }.shortcut strong { display: block; font-weight: 500; font-size: .9rem; }.shortcut small { display: block; color: var(--muted); font-size: .78rem; margin-top: 3px; }.shortcut > .app-icon { color: var(--muted); }.quick-note { color: var(--muted); font-size: .78rem; margin-top: 16px; }
 .service-details { margin-top: 30px; border: 1px solid var(--border); border-radius: 11px; background: var(--card-bg); }.service-details > summary { padding: 16px 20px; font-size: .85rem; }.service-title { display: inline-flex; align-items: center; gap: 10px; margin-left: 6px; }.service-state { float: right; font-size: .8rem; font-weight: 400; }.service-body { border-top: 1px solid var(--border); padding: 18px 24px; }.service-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 16px; margin: 20px 0 0; }.service-grid dt { font-size: .8rem; color: var(--muted); }.service-grid dd { margin: 6px 0 0; font-size: .9rem; }.event-details { margin-top: 20px; font-size: .8rem; }.event-details pre { max-height: 150px; overflow: auto; }
-.task-select-label { font-size: .84rem; color: var(--muted); }.task-select { min-height: 32px; }
-.taskflow-panel .section-heading { margin-bottom: 16px; }
-.taskflow-board { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 44px; }
-.taskflow-stage { position: relative; border: 1px solid var(--border); border-radius: 12px; background: var(--card-bg); box-shadow: var(--shadow); }
-.taskflow-stage.active { border: 2px solid var(--accent); background: var(--accent-soft); }
-.stage-head { display: flex; align-items: center; gap: 9px; padding: 13px 16px; border-bottom: 1px solid var(--border); font-size: .95rem; }
-.stage-icon { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; color: #fff; background: var(--ok); flex: none; }.stage-icon.active { background: var(--accent-fill); }.stage-icon.wait { background: transparent; color: var(--muted); border: 1px solid var(--control-border); }.stage-icon.idle { background: transparent; color: var(--muted); border: 1px solid var(--control-border); }
-.stage-body { padding: 16px; }.stage-person { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }.stage-person strong { font-size: .9rem; }
-.stage-desc { font-size: .84rem; color: var(--fg); margin: 0 0 6px; line-height: 1.5; }.stage-sub { font-size: .8rem; color: var(--muted); margin: 0 0 6px; }
-.stage-link { display: flex; align-items: center; gap: 9px; margin: 14px 0; padding: 10px 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--card-bg); }.link-icon { color: var(--muted); }.stage-link > span:nth-child(2) { flex: 1; min-width: 0; }.stage-link strong { display: block; font-size: .8rem; }.stage-link small { display: block; font-size: .72rem; color: var(--muted); margin-top: 2px; }.link-cta { font-size: .74rem; color: var(--accent); white-space: nowrap; }
-.stage-foot { display: flex; align-items: center; gap: 7px; margin-top: 14px; font-size: .78rem; color: var(--muted); }.foot-icon { color: var(--ok); display: inline-flex; }.foot-icon.active { color: var(--accent); }.foot-icon.wait, .foot-icon.idle { color: var(--muted); }
-.stage-arrow { position: absolute; right: -32px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 1.2rem; }.stage-arrow.down { right: auto; left: 50%; top: auto; bottom: -28px; transform: translateX(-50%); }.stage-arrow.left { right: auto; left: -32px; }
-.taskflow-handoff { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 20px; padding: 13px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-bg); font-size: .82rem; }.taskflow-handoff > .app-icon { color: var(--muted); }.taskflow-handoff strong { margin-right: 4px; }.handoff-arrow { color: var(--muted); }.handoff-note { color: var(--accent); }
-.task-detail-title { display: flex; align-items: center; gap: 10px; margin: 16px 0; padding-bottom: 14px; border-bottom: 1px solid var(--border); }.task-detail-title strong { flex: 1; font-size: .96rem; }.task-detail-icon { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 9px; }
+.task-select-label { font-size: .84rem; color: var(--muted); }
+.taskflow-panel { padding: 16px; }.board-scope { white-space: nowrap; }
+.task-detail-title { display: flex; align-items: center; gap: 10px; margin: 16px 0; padding-bottom: 14px; border-bottom: 1px solid var(--border); }.task-detail-title strong { flex: 1; font-size: .96rem; overflow-wrap: anywhere; }
 .task-facts { margin: 0; }.task-facts > div { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: .82rem; }.task-facts dt { display: flex; align-items: center; gap: 7px; width: 96px; flex: none; color: var(--muted); }.task-facts dd { margin: 0; font-weight: 500; }
-.task-section { margin-top: 18px; }.task-section h3 { margin: 0 0 10px; font-size: .88rem; }.checklist { list-style: none; margin: 0; padding: 0; }.checklist li { display: flex; align-items: center; gap: 9px; padding: 6px 0; font-size: .82rem; }.checkbox { width: 15px; height: 15px; border: 1px solid var(--control-border); border-radius: 4px; flex: none; }.task-discussion { display: flex; align-items: center; justify-content: space-between; padding-top: 14px; border-top: 1px solid var(--border); font-size: .84rem; }.task-discussion > span:first-child { display: inline-flex; align-items: center; gap: 8px; }.discussion-link { color: var(--accent); }.recent-activity { display: flex; align-items: center; gap: 8px; margin: 0; font-size: .82rem; color: var(--muted); }
+.task-section { margin-top: 18px; }.task-section h3 { margin: 0 0 10px; font-size: .88rem; }.checklist { list-style: none; margin: 0; padding: 0; }.checklist li { display: flex; align-items: flex-start; gap: 9px; padding: 6px 0; font-size: .82rem; overflow-wrap: anywhere; }.checkbox { width: 15px; height: 15px; border: 1px solid var(--control-border); border-radius: 4px; flex: none; }
 .conv-person { display: flex; align-items: center; gap: 9px; margin: 16px 0 12px; flex-wrap: wrap; }.conv-avatar { width: 40px; height: 40px; font-size: 1rem; }.conv-person-copy { flex: 1; min-width: 0; }.conv-person-copy strong { display: block; font-size: .96rem; }.conv-person-copy small { display: block; font-size: .74rem; color: var(--muted); margin-top: 3px; }.conv-online { display: inline-flex; align-items: center; gap: 5px; font-size: .74rem; color: var(--ok); }
 .conv-task { width: 100%; display: flex; align-items: center; gap: 9px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--card-bg); color: var(--fg); font-size: .8rem; text-align: left; }.conv-task-icon { color: var(--muted); }.conv-task > span:nth-child(2) { flex: 1; }.conv-sync { margin: 8px 0 0; }
 .conv-tabs { display: flex; gap: 22px; margin-top: 14px; border-bottom: 1px solid var(--border); }.conv-tabs button { border: 0; border-radius: 0; background: transparent; padding: 8px 0; font-size: .84rem; color: var(--muted); min-height: 0; }.conv-tabs button[aria-selected="true"] { color: var(--fg); font-weight: 600; box-shadow: inset 0 -2px var(--accent); }
@@ -412,10 +415,10 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 @media (max-width: 1100px) { .collab-workspace { grid-template-columns: 1fr; gap: 20px; }.collab-side { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); align-items: start; gap: 16px; }.collab-side .quick-access { grid-column: 1 / -1; } }
 @media (max-width: 760px) {
   .collab-workspace { gap: 16px; }.collab-main, .collab-side { gap: 16px; }.collab-side { display: flex; flex-direction: column; }
+  .board-scope { white-space: normal; }
   .collab-toolbar { padding: 10px 12px; gap: 8px 10px; }.toolbar-views, .toolbar-layers { flex-wrap: wrap; }
   .collab-header-meta { justify-content: flex-start; }
   .graph-canvas { height: auto; min-height: 0; padding: 0; }.graph-footer { align-items: flex-start; }
-  .taskflow-board { grid-template-columns: 1fr; gap: 22px; }.stage-arrow { display: none; }
   .overview-metrics { padding: 18px 0; }.overview-metrics > div { padding: 0 14px; }.overview-metrics dd { font-size: 1.7rem; }.overview-metrics span { display: none; }.overview-metrics dt { font-size: .78rem; }
   .service-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }.project-activity small { display: none; }
   .service-details > summary { padding: 14px; }.service-body { padding: 16px; }
