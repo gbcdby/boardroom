@@ -68,7 +68,7 @@ th { color: var(--muted); font-size: .85rem; font-weight: 500; } td { font-size:
 .brand-caption { display: block; color: var(--muted); font-size: .72rem; font-weight: 400; letter-spacing: 0; margin-top: 4px; }
 .nav { display: flex; flex-direction: column; gap: 25px; } .nav-group-title { color: var(--muted); font-size: .75rem; margin: 0 12px 7px; }
 .nav-link { display: flex; align-items: center; gap: 11px; min-height: 43px; padding: 10px 12px; margin: 3px 0; border-radius: 8px; color: var(--muted); font-size: .9rem; font-weight: 500; }
-.nav-link:hover { color: var(--fg); background: var(--surface-subtle); text-decoration: none; } .nav-link.selected { color: var(--accent); background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+.nav-link:hover { color: var(--fg); background: var(--surface-subtle); text-decoration: none; } .nav-link.selected { color: var(--fg); background: var(--surface-subtle); box-shadow: none; }
 .sidebar-footer { margin-top: auto; padding: 30px 12px 0; display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: .82rem; } .sidebar-footer small { display: block; font-size: .72rem; margin-top: 2px; }
 .workspace { grid-column: 2; grid-row: 2; display: flex; flex-direction: column; min-width: 0; }
 .workspace-topbar { grid-column: 2; grid-row: 1; min-height: 65px; padding: 12px 32px; display: flex; align-items: center; gap: 13px; border-bottom: 1px solid var(--border); background: var(--card-bg); font-size: .85rem; }
@@ -115,3 +115,15 @@ th { color: var(--muted); font-size: .85rem; font-weight: 500; } td { font-size:
   .nav-link.selected, button[aria-pressed="true"] { outline: 2px solid Highlight; outline-offset: -2px; }
   :focus-visible { outline-color: Highlight; }
 }
+
+/* 静态演示页的圆形头像（示例人像，见 docs/prototypes 原型定位）。 */
+.avatar { flex: none; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; color: #1d1d1f; font-size: .78rem; font-weight: 600; background: #dfe3ea; position: relative; overflow: visible; }
+.avatar-0 { background: #d8dee9; }
+.avatar-1, .avatar-2, .avatar-3, .avatar-4, .avatar-5, .avatar-6 { background-size: cover; background-position: center; color: transparent; font-size: 0; }
+.avatar-1 { background-image: url("/avatars/avatar-1.png"); }
+.avatar-2 { background-image: url("/avatars/avatar-2.png"); }
+.avatar-3 { background-image: url("/avatars/avatar-3.png"); }
+.avatar-4 { background-image: url("/avatars/avatar-4.png"); }
+.avatar-5 { background-image: url("/avatars/avatar-5.png"); }
+.avatar-6 { background-image: url("/avatars/avatar-6.png"); }
+.avatar-sm { width: 24px; height: 24px; }
