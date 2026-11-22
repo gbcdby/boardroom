@@ -4,8 +4,12 @@ import { RouterLink } from "vue-router";
 import AppIcon from "../components/AppIcon.vue";
 import CollabGraphCanvas from "../components/CollabGraphCanvas.vue";
 import type { GraphCanvasData } from "../components/collabGraphLayout.ts";
+import { api } from "../api/client.ts";
 import { useCollabGraph } from "../composables/useCollabGraph.ts";
 import { toGraphCanvasData } from "../composables/collabGraphProjection.ts";
+import {
+  toInspectorMessage, useGroupConversationInspector, type InspectorScope,
+} from "../composables/groupConversationInspector.ts";
 import { initialConversationSelection, isProjectSwitch, reconcileConversationSelection } from "../composables/collabGraphSelection.ts";
 import { projectPath, useCurrentProject } from "../composables/useCurrentProject.ts";
 interface HealthReport {
@@ -67,20 +71,55 @@ const demoTaskDetail = {
 };
 function switchView(view: "members" | "tasks"): void { activeView.value = view; unavailableReason.value = null; }
 
-// P02 成员会话面板：选中节点来自真实图，会话正文仍是静态示例数据。
+// P02 已接为图内真实检查器：节点/群入口只决定 scope，正文按该群绑定读取真实 Boardroom 消息。
 const selectedNode = computed(() => graphCanvasData.value.groups.flatMap(group => group.members).find(member => member.id === selectedMemberId.value) ?? null);
-const selectedGroupName = computed(() => graphCanvasData.value.groups.find(group => group.members.some(member => member.id === selectedMemberId.value))?.name ?? "");
-const demoConversation = {
-  name: "前端工程师", initials: "前", avatar: 2, online: true, state: "执行中", group: "界面升级小组", instance: "当前实例",
-  task: "协作总览升级", synced: "仅 Boardroom 消息 · 已同步",
-  messages: [
-    { who: "项目负责人", initials: "负", avatar: 6, tag: "任务指令", text: "实现成员会话侧栏，保留关系图。", mine: false },
-    { who: "产品设计师", initials: "产", avatar: 1, tag: "定向消息", text: "点击成员后，右侧直接展开他的会话。", mine: false },
-    { who: "前端工程师", initials: "前", avatar: 2, tag: "回复", text: "已接手，正在实现成员选中与会话联动。", mine: true },
-  ],
-};
-function openConversation(memberId: string): void { selectedMemberId.value = memberId; }
-function closeConversation(): void { selectedMemberId.value = null; }
+const selectedGroupId = ref<string | null>(null);
+const {
+  scope: inspectorState, messages: inspectorMessages,
+  loading: inspectorLoading, error: inspectorError,
+  select: selectInspector, clear: clearInspector,
+} = useGroupConversationInspector(async (scope) => {
+  const { messages } = await api.listMessages(scope.groupId);
+  return messages.map(toInspectorMessage);
+});
+const selectedGroup = computed(() => graphCanvasData.value.groups.find(group =>
+  (selectedGroupId.value !== null && group.id === selectedGroupId.value)
+  || group.members.some(member => member.id === selectedMemberId.value)) ?? null);
+const activeInspectorScope = computed<InspectorScope | null>(() => {
+  const group = selectedGroup.value;
+  if (!group?.id) return null;
+  const member = selectedMemberId.value
+    ? group.members.find(item => item.id === selectedMemberId.value) ?? null
+    : null;
+  if (selectedMemberId.value && !member) return null;
+  return {
+    groupId: group.id,
+    groupName: group.name,
+    memberId: member?.memberId ?? null,
+    memberName: member?.name ?? null,
+  };
+});
+watch(activeInspectorScope, (next) => { void selectInspector(next); }, { immediate: true });
+watch(graphCanvasData, (data) => {
+  if (selectedGroupId.value && !data.groups.some(group => group.id === selectedGroupId.value)) selectedGroupId.value = null;
+});
+function openConversation(memberId: string): void {
+  selectedMemberId.value = memberId;
+  selectedGroupId.value = null;
+}
+function openGroupConversation(groupId: string): void {
+  selectedGroupId.value = groupId;
+  selectedMemberId.value = null;
+}
+function closeConversation(): void {
+  selectedMemberId.value = null;
+  selectedGroupId.value = null;
+  clearInspector();
+}
+function messageTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
 const demoPending = [{ title: "扩大工具使用范围", detail: "项目策略要求确认" }];
 
 const health = ref<HealthReport | null>(null);
@@ -203,6 +242,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
               :paused="animationPaused"
               :scope-key="graphProjectId"
               @select="openConversation"
+              @select-group="openGroupConversation"
             />
           </div>
           <div class="graph-footer">
@@ -267,28 +307,27 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
           </section>
         </template>
         <template v-else>
-          <section v-if="selectedMemberId" class="panel side-panel conversation-panel" aria-labelledby="conversation-title" data-testid="p02-conversation">
-            <div class="side-heading"><h2 id="conversation-title">成员会话<span class="demo-chip">示例数据</span></h2><button type="button" class="inspector-close" aria-label="关闭成员会话" @click="closeConversation"><AppIcon name="close" :size="16" /></button></div>
-            <div class="conv-person"><span class="avatar conv-avatar" :class="`avatar-${selectedNode?.avatar ?? 0}`">{{ selectedNode?.initials ?? "?" }}</span><span class="conv-person-copy"><strong>{{ selectedNode?.name ?? selectedMemberId }}</strong><small>{{ selectedGroupName }} · 实例会话尚未接通</small></span><span class="status-badge" :class="selectedNode?.tone === 'active' ? 'active' : selectedNode?.tone === 'wait' ? 'wait' : 'ok'">{{ selectedNode?.status ?? "状态未知" }}</span></div>
-            <button type="button" class="conv-task" aria-disabled="true" title="静态演示控件" @click="explainUnavailable('当前任务')"><span class="conv-task-icon"><AppIcon name="layers" :size="16" /></span><span>当前任务：<strong>{{ demoConversation.task }}</strong></span><AppIcon name="chevron" :size="14" /></button>
-            <p class="conv-sync muted small">正文为静态示例数据，真实会话内容尚未接通。</p>
-            <div class="conv-tabs" role="tablist" aria-label="成员会话内容"><button type="button" role="tab" aria-selected="true">会话</button><button type="button" role="tab" aria-selected="false" aria-disabled="true" @click="explainUnavailable('活动')">活动</button><button type="button" role="tab" aria-selected="false" aria-disabled="true" @click="explainUnavailable('产物')">产物</button></div>
-            <div class="conv-day"><span>今天 14:32</span></div>
-            <div class="conv-messages">
-              <div v-for="(msg, index) in demoConversation.messages" :key="index" class="conv-msg" :class="{ mine: msg.mine }">
-                <template v-if="!msg.mine">
-                  <span class="avatar avatar-sm" :class="`avatar-${msg.avatar}`">{{ msg.initials }}</span>
-                  <div class="conv-msg-body"><div class="conv-msg-meta"><strong>{{ msg.who }}</strong><span class="conv-tag">{{ msg.tag }}</span></div><p class="conv-bubble">{{ msg.text }}</p></div>
-                </template>
-                <template v-else>
-                  <div class="conv-msg-body"><div class="conv-msg-meta right"><span class="conv-tag">{{ msg.tag }}</span><strong>{{ msg.who }}</strong></div><p class="conv-bubble mine">{{ msg.text }}</p></div>
-                  <span class="avatar avatar-sm" :class="`avatar-${msg.avatar}`">{{ msg.initials }}</span>
-                </template>
+          <section v-if="selectedMemberId || selectedGroupId" class="panel side-panel conversation-panel" aria-labelledby="conversation-title" data-testid="p02-conversation">
+            <div class="side-heading"><h2 id="conversation-title">群内检查器<span class="real-chip">仅 Boardroom 消息</span></h2><button type="button" class="inspector-close" aria-label="关闭会话检查器" @click="closeConversation"><AppIcon name="close" :size="16" /></button></div>
+            <div class="conv-person"><span class="avatar conv-avatar" :class="`avatar-${selectedNode?.avatar ?? 0}`">{{ selectedNode?.initials ?? '群' }}</span><span class="conv-person-copy"><strong>{{ inspectorState?.memberName ?? inspectorState?.groupName ?? '未选择' }}</strong><small>{{ inspectorState?.memberName ? `${inspectorState?.groupName} · ` : '' }}真实群绑定 · 未接入宿主完整会话</small></span><span v-if="selectedNode" class="status-badge" :class="selectedNode.tone === 'active' ? 'active' : selectedNode.tone === 'wait' ? 'wait' : 'ok'">{{ selectedNode.status }}</span></div>
+            <button type="button" class="conv-task" aria-disabled="true" title="阶段 2 未接通" @click="explainUnavailable('当前任务')"><span class="conv-task-icon"><AppIcon name="layers" :size="16" /></span><span>当前任务：未接入（阶段 2）</span><AppIcon name="chevron" :size="14" /></button>
+            <p class="conv-sync muted small">仅展示已持久保存且允许读取的 Boardroom 群消息：发送者、正文、来源消息 ID 与时间。UI 阅读标记不代表业务送达、领取或完成。</p>
+            <div class="conv-tabs" role="tablist" aria-label="群内检查器内容"><button type="button" role="tab" aria-selected="true">会话</button><button type="button" role="tab" aria-selected="false" aria-disabled="true" @click="explainUnavailable('活动')">活动（未接通）</button><button type="button" role="tab" aria-selected="false" aria-disabled="true" @click="explainUnavailable('产物')">产物（未接通）</button></div>
+            <p v-if="inspectorLoading" class="muted small" role="status" data-testid="p02-inspector-loading">正在读取该群已保存的 Boardroom 消息…</p>
+            <p v-else-if="inspectorError" class="error small" role="alert" data-testid="p02-inspector-error">该群消息暂不可读：{{ inspectorError }}（不跨群取用其他内容）</p>
+            <p v-else-if="inspectorMessages.length === 0" class="muted small" data-testid="p02-inspector-empty">该群暂无已保存且可读取的 Boardroom 消息。</p>
+            <div v-else class="conv-messages" data-testid="p02-inspector-messages">
+              <div v-for="msg in inspectorMessages" :key="msg.id" class="conv-msg" :data-message-id="msg.id">
+                <span class="avatar avatar-sm" :class="`avatar-${(msg.senderMemberId.charCodeAt(0) % 6) + 1}`">{{ msg.sender.slice(0, 1) }}</span>
+                <div class="conv-msg-body">
+                  <div class="conv-msg-meta"><strong>{{ msg.sender }}</strong><span class="conv-tag">{{ messageTime(msg.createdAt) }}</span></div>
+                  <p class="conv-bubble">{{ msg.text }}</p>
+                  <small class="conv-source">来源消息 ID：{{ msg.id }} · 发送者 ID：{{ msg.senderMemberId }} · 群 {{ inspectorState?.groupName }}</small>
+                </div>
               </div>
-              <div class="conv-locate"><AppIcon name="layers" :size="14" />定位消息</div>
             </div>
-            <button type="button" class="conv-new" aria-disabled="true" @click="explainUnavailable('新消息跳转')">2 条新消息 ↓</button>
-            <div class="conv-footer"><span><span class="connected-dot ok" aria-hidden="true"></span>实时更新</span><button type="button" aria-disabled="true" @click="explainUnavailable('展开完整会话')">展开完整会话</button></div>
+            <button type="button" class="conv-locate" aria-disabled="true" title="阶段 2 未接通" @click="explainUnavailable('定位消息')">定位消息（阶段 2 未接通）</button>
+            <div class="conv-footer"><span>仅 Boardroom 消息 · 不含宿主完整会话</span><button type="button" aria-disabled="true" title="阶段 2 未接通" @click="explainUnavailable('展开完整会话')">展开完整会话（未接通）</button></div>
           </section>
           <template v-else>
           <section class="panel side-panel" aria-labelledby="activity-title">
@@ -368,7 +407,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .conv-task { width: 100%; display: flex; align-items: center; gap: 9px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--card-bg); color: var(--fg); font-size: .8rem; text-align: left; }.conv-task-icon { color: var(--muted); }.conv-task > span:nth-child(2) { flex: 1; }.conv-sync { margin: 8px 0 0; }
 .conv-tabs { display: flex; gap: 22px; margin-top: 14px; border-bottom: 1px solid var(--border); }.conv-tabs button { border: 0; border-radius: 0; background: transparent; padding: 8px 0; font-size: .84rem; color: var(--muted); min-height: 0; }.conv-tabs button[aria-selected="true"] { color: var(--fg); font-weight: 600; box-shadow: inset 0 -2px var(--accent); }
 .conv-day { text-align: center; font-size: .72rem; color: var(--muted); margin: 16px 0; position: relative; }.conv-day::before, .conv-day::after { content: ""; position: absolute; top: 50%; width: 28%; height: 1px; background: var(--border); }.conv-day::before { left: 0; }.conv-day::after { right: 0; }
-.conv-messages { display: flex; flex-direction: column; gap: 16px; }.conv-msg { display: flex; align-items: flex-start; gap: 9px; }.conv-msg.mine { justify-content: flex-end; }.conv-msg-body { flex: 1; min-width: 0; max-width: 85%; }.conv-msg.mine .conv-msg-body { flex: none; }.conv-msg-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; font-size: .8rem; }.conv-msg-meta.right { justify-content: flex-end; }.conv-tag { font-size: .68rem; color: var(--muted); background: var(--surface-subtle); padding: 1px 6px; border-radius: 4px; }.conv-bubble { display: inline-block; margin: 0; padding: 9px 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-bg); font-size: .82rem; line-height: 1.5; overflow-wrap: anywhere; }.conv-bubble.mine { background: var(--accent-soft); border-color: transparent; }.conv-locate { align-self: flex-start; display: inline-flex; align-items: center; gap: 5px; font-size: .76rem; color: var(--accent); }
+.conv-messages { display: flex; flex-direction: column; gap: 16px; }.conv-msg { display: flex; align-items: flex-start; gap: 9px; }.conv-msg.mine { justify-content: flex-end; }.conv-msg-body { flex: 1; min-width: 0; max-width: 85%; }.conv-msg.mine .conv-msg-body { flex: none; }.conv-msg-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; font-size: .8rem; }.conv-msg-meta.right { justify-content: flex-end; }.conv-tag { font-size: .68rem; color: var(--muted); background: var(--surface-subtle); padding: 1px 6px; border-radius: 4px; }.conv-bubble { display: inline-block; margin: 0; padding: 9px 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--card-bg); font-size: .82rem; line-height: 1.5; overflow-wrap: anywhere; }.conv-bubble.mine { background: var(--accent-soft); border-color: transparent; }.conv-source { display: block; margin-top: 6px; font-size: .7rem; color: var(--muted); overflow-wrap: anywhere; }.conv-locate { border: 0; background: transparent; padding: 0; cursor: pointer; }.conv-locate[aria-disabled="true"] { color: var(--muted); cursor: not-allowed; }
 .conv-new { align-self: center; margin: 6px auto 0; padding: 6px 14px; font-size: .78rem; color: var(--accent); background: var(--accent-soft); border-color: transparent; border-radius: 20px; }.conv-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); font-size: .78rem; }.conv-footer > span { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }.conv-footer button { border: 0; background: transparent; color: var(--accent); font-size: .78rem; min-height: 0; padding: 0; }
 @media (max-width: 1100px) { .collab-workspace { grid-template-columns: 1fr; gap: 20px; }.collab-side { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); align-items: start; gap: 16px; }.collab-side .quick-access { grid-column: 1 / -1; } }
 @media (max-width: 760px) {

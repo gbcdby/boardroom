@@ -56,9 +56,13 @@ test("重读后选中成员已不存在时清空；仍在当前图时保持选�
   );
 });
 
-test("P02/P03/待我处理与 P03 右侧任务详情均显式标注示例数据", async () => {
+test("P02 已接为真实检查器，P03 与待我处理仍显式标注示例数据", async () => {
   const source = await readFile(new URL("../src/web/src/views/HomeView.vue", import.meta.url), "utf8");
-  for (const heading of ["conversation-title", "taskflow-title", "pending-title", "task-detail-title"]) {
+  const conversation = source.match(/<h2 id="conversation-title"[^>]*>([\s\S]*?)<\/h2>/);
+  assert.ok(conversation, "缺少 conversation-title 标题");
+  assert.match(conversation![1]!, /仅 Boardroom 消息/);
+  assert.doesNotMatch(conversation![1]!, /示例数据/);
+  for (const heading of ["taskflow-title", "pending-title", "task-detail-title"]) {
     const match = source.match(new RegExp(`<h2 id="${heading}"[^>]*>([\\s\\S]*?)</h2>`));
     assert.ok(match, `缺少 ${heading} 标题`);
     assert.match(match![1]!, /示例数据/, `${heading} 缺少示例数据标注`);

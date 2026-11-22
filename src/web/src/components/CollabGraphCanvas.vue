@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useTheme } from "../composables/useTheme.ts";
 import {
-  hitTestMember, layoutGraph,
+  hitTestMember, hitTestGroup, layoutGraph,
   type GraphCanvasData, type GraphLayout, type GraphMemberVM, type GraphTone, type Rect,
 } from "./collabGraphLayout.ts";
 import {
@@ -19,7 +19,7 @@ const props = defineProps<{
   paused?: boolean;
   scopeKey?: string | null;
 }>();
-const emit = defineEmits<{ select: [id: string] }>();
+const emit = defineEmits<{ select: [id: string]; selectGroup: [groupId: string] }>();
 const theme = useTheme();
 const shell = ref<HTMLDivElement | null>(null);
 const canvas = ref<HTMLCanvasElement | null>(null);
@@ -48,7 +48,7 @@ const ariaLabel = computed(() => {
   const layer = messageLayer.value
     ? `真实消息 ${direction.value.totalCount} 条，可见标记 ${markers.value.length} 条${direction.value.overflowCount ? `，聚合 ${direction.value.overflowCount} 条` : ""}`
     : `消息层已关闭，真实消息 ${direction.value.totalCount} 条仍照常更新`;
-  return `协作关系图：${lead}；${groups ? `群组：${groups}` : "当前没有可读取的群组"}。${layer}${presentation.value.animate ? "" : "；动态已暂停，静态箭头与计数仍可读"}。节点来自真实只读数据；点击成员查看会话。`;
+  return `协作关系图：${lead}；${groups ? `群组：${groups}` : "当前没有可读取的群组"}。${layer}${presentation.value.animate ? "" : "；动态已暂停，静态箭头与计数仍可读"}。节点来自真实只读数据；点击成员或群入口查看该群已保存的 Boardroom 消息。`;
 });
 const avatarCache = new Map<number, HTMLImageElement>();
 let observer: ResizeObserver | null = null;
@@ -479,8 +479,15 @@ function pointerId(event: MouseEvent): string | null {
   return hitTestMember(layout.value, event.clientX - rect.left, event.clientY - rect.top);
 }
 function onClick(event: MouseEvent): void {
-  const id = pointerId(event);
-  if (id) emit("select", id);
+  const element = canvas.value;
+  if (!element) return;
+  const rect = element.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const memberId = hitTestMember(layout.value, x, y);
+  if (memberId) { emit("select", memberId); return; }
+  const groupId = hitTestGroup(layout.value, x, y);
+  if (groupId) emit("selectGroup", groupId);
 }
 function onMove(event: MouseEvent): void {
   if (canvas.value) canvas.value.style.cursor = pointerId(event) ? "pointer" : "default";
@@ -536,6 +543,17 @@ watch(() => [
       @mousemove="onMove"
     />
     <div class="visually-hidden graph-accessible-controls">
+      <div role="group" aria-label="群入口">
+        <button
+          v-for="group in data.groups"
+          :key="`group-${group.id ?? group.name}`"
+          type="button"
+          :data-group-id="group.id ?? ''"
+          data-testid="p01-group-accessible"
+          :aria-label="`查看${group.name}的真实 Boardroom 消息`"
+          @click="group.id && emit('selectGroup', group.id)"
+        >查看{{ group.name }}的真实 Boardroom 消息</button>
+      </div>
       <button
         v-for="item in accessibleMembers"
         :key="item.member.id"

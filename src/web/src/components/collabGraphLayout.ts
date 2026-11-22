@@ -136,3 +136,13 @@ export function hitTestMember(layout: GraphLayout, x: number, y: number): string
   }
   return null;
 }
+
+/** 群入口命中：群标题区可选中群，成员区域仍由 hitTestMember 优先处理。 */
+export function hitTestGroup(layout: GraphLayout, x: number, y: number): string | null {
+  for (const group of layout.groups) {
+    if (!group.group.id) continue;
+    if (x < group.x || x > group.x + group.w || y < group.y || y > group.y + 45) continue;
+    return group.group.id;
+  }
+  return null;
+}
