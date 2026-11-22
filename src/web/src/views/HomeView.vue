@@ -192,8 +192,9 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
             <p v-if="graphError" class="graph-empty error" role="alert" data-testid="p01-graph-error">关系图读取失败：{{ graphError }} <button type="button" class="text-button" @click="loadGraph()">重试</button></p>
             <p v-else-if="graphLoading" class="graph-empty muted" role="status" data-testid="p01-graph-loading">正在读取当前项目的真实成员与群…</p>
             <p v-else-if="graph.groups.length === 0" class="graph-empty" data-testid="p01-graph-empty">当前范围没有可读取的群与成员，关系图为空。<RouterLink to="/projects">选择或创建项目</RouterLink></p>
+            <!-- 保持画布实例跨刷新存活：新逻辑 ID 才能触发一次流动标记，历史重载不重放。 -->
             <CollabGraphCanvas
-              v-else
+              v-show="!graphError && !graphLoading && graph.groups.length > 0"
               :data="graphCanvasData"
               :selected-id="selectedMemberId"
               :message-direction="graph.messageDirection"
