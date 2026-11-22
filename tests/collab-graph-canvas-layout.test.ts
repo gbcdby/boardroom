@@ -1,19 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  canvasViewport,
-  hitTestMember,
-  layoutGraph,
-  type GraphCanvasData,
-  type GraphViewport,
-} from "../src/web/src/components/collabGraphLayout.ts";
+import { hitTestMember, layoutGraph, type GraphCanvasData } from "../src/web/src/components/collabGraphLayout.ts";
 
 const data: GraphCanvasData = {
   root: { name: "总管", role: "协调中枢", avatar: 0, initials: "总" },
   lead: { id: "lead", name: "项目负责人", initials: "负", role: "协调中", status: "协调中", tone: "active", avatar: 6 },
   groups: [
     {
-      name: "界面升级小组", icon: "grid", flowLabel: "设计协作", flowMessage: "方案 · 已送达",
+      name: "界面升级小组", icon: "grid", flowLabel: "设计协作", flowMessage: "方案 · 已送达", flowEmphasis: true,
       members: [
         { id: "product", name: "产品设计师", initials: "产", status: "方案已提交", tone: "active", avatar: 1 },
         { id: "frontend", name: "前端工程师", initials: "前", status: "执行中", tone: "active", avatar: 2 },
@@ -35,14 +29,9 @@ const data: GraphCanvasData = {
   ],
 };
 
-function cssPoint(layout: ReturnType<typeof layoutGraph>, viewport: GraphViewport, x: number, y: number): [number, number] {
-  return [viewport.offsetX + x * viewport.scale, viewport.offsetY + y * viewport.scale];
-}
-
-test("布局固定虚拟画布，三群与成员行都在画布内且互不重叠", () => {
-  const layout = layoutGraph(data);
-  assert.equal(layout.groups.length, 3);
-  assert.equal(layout.groups.reduce((total, group) => total + group.members.length, 0), 5);
+function assertInside(layout: ReturnType<typeof layoutGraph>): void {
+  assert.ok(layout.root.x >= 0 && layout.root.x + layout.root.w <= layout.width);
+  assert.ok(layout.lead.x >= 0 && layout.lead.x + layout.lead.w <= layout.width);
   for (const group of layout.groups) {
     assert.ok(group.x >= 0 && group.x + group.w <= layout.width);
     assert.ok(group.y >= 0 && group.y + group.h <= layout.height);
@@ -51,30 +40,42 @@ test("布局固定虚拟画布，三群与成员行都在画布内且互不重�
       assert.ok(member.y >= group.y && member.y + member.h <= group.y + group.h);
     }
   }
-  for (let i = 1; i < layout.groups.length; i += 1) {
-    const previous = layout.groups[i - 1]!;
-    const current = layout.groups[i]!;
-    assert.ok(previous.x + previous.w <= current.x);
+}
+
+test("宽屏三列，布局宽度等于容器宽度且所有节点在画布内", () => {
+  const layout = layoutGraph(data, 760);
+  assert.equal(layout.width, 760);
+  assert.equal(layout.columns, 3);
+  assert.equal(layout.groups.length, 3);
+  assert.ok(layout.groups.every(group => group.row === 0));
+  assertInside(layout);
+});
+
+test("中屏两列，第三群换行且画布高度随内容增长", () => {
+  const wide = layoutGraph(data, 760);
+  const medium = layoutGraph(data, 600);
+  assert.equal(medium.width, 600);
+  assert.equal(medium.columns, 2);
+  assert.equal(medium.groups[2]!.row, 1);
+  assert.ok(medium.height > wide.height);
+  assertInside(medium);
+});
+
+test("窄屏单列，三群纵向排列且无横向溢出", () => {
+  const narrow = layoutGraph(data, 390);
+  assert.equal(narrow.width, 390);
+  assert.equal(narrow.columns, 1);
+  assert.deepEqual(narrow.groups.map(group => group.row), [0, 1, 2]);
+  assert.ok(narrow.groups.every(group => group.x >= 0 && group.x + group.w <= 390));
+  assert.ok(narrow.height > 900);
+  assertInside(narrow);
+});
+
+test("命中使用 CSS 像素坐标，成员行与空白均正确", () => {
+  for (const width of [760, 600, 390]) {
+    const layout = layoutGraph(data, width);
+    const first = layout.groups[0]!.members[0]!;
+    assert.equal(hitTestMember(layout, first.x + first.w / 2, first.y + first.h / 2), first.member.id);
+    assert.equal(hitTestMember(layout, 2, 2), null);
   }
-});
-
-test("命中测试按等比缩放返回成员 ID，画布空白处返回 null", () => {
-  const layout = layoutGraph(data);
-  const viewport = canvasViewport(760, 470, layout);
-  const first = layout.groups[0]!.members[0]!;
-  const [x, y] = cssPoint(layout, viewport, first.x + first.w / 2, first.y + first.h / 2);
-  assert.equal(hitTestMember(layout, viewport, x, y), first.member.id);
-  assert.equal(hitTestMember(layout, viewport, 2, 2), null);
-});
-
-test("视口按较小比例等比缩放并居中留白，不拉伸图形", () => {
-  const layout = layoutGraph(data);
-  const viewport = canvasViewport(380, 235, layout);
-  assert.equal(viewport.scale, 0.5);
-  assert.equal(viewport.offsetX, 0);
-  assert.equal(viewport.offsetY, 0);
-  const tall = canvasViewport(760, 940, layout);
-  assert.equal(tall.scale, 1);
-  assert.equal(tall.offsetX, 0);
-  assert.equal(tall.offsetY, 235);
 });

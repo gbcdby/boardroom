@@ -312,9 +312,9 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
 .collab-status { margin: 0 0 16px; overflow-wrap: anywhere; }
 .collab-workspace { display: grid; grid-template-columns: minmax(0,1fr) minmax(260px,320px); gap: 24px; align-items: start; }
 .collab-main, .collab-side { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
-.graph-panel { min-height: 560px; display: flex; flex-direction: column; padding: 16px; border-radius: 12px; }.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }.section-heading h2 { margin: 0; font-size: 1.02rem; }
+.graph-panel { min-height: 0; display: flex; flex-direction: column; padding: 16px; border-radius: 12px; }.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }.section-heading h2 { margin: 0; font-size: 1.02rem; }
 .demo-chip { display: inline-block; margin-left: 8px; padding: 2px 7px; border-radius: 5px; background: var(--accent-soft); color: var(--accent); font-size: .68rem; font-weight: 600; vertical-align: middle; }
-.graph-canvas { flex: none; display: block; height: 470px; min-height: 470px; border: 0; border-radius: 0; background: transparent; padding: 0; overflow: hidden; }
+.graph-canvas { flex: none; display: block; height: auto; min-height: 0; border: 0; border-radius: 0; background: transparent; padding: 0; overflow: visible; }
 .avatar:not(.avatar-0)::after { content: ""; position: absolute; right: -1px; bottom: -1px; width: 9px; height: 9px; border-radius: 50%; background: var(--ok); border: 2px solid var(--card-bg); }
 .status-badge { flex: none; font-size: .7rem; padding: 2px 7px; border-radius: 20px; white-space: nowrap; font-weight: 600; }
 .status-badge.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }.status-badge.active { color: var(--accent); background: var(--accent-soft); }.status-badge.wait { color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
@@ -358,7 +358,7 @@ onUnmounted(() => { disposed = true; socket?.close(); if (healthTimer) clearInte
   .collab-workspace { gap: 16px; }.collab-main, .collab-side { gap: 16px; }.collab-side { display: flex; flex-direction: column; }
   .collab-toolbar { padding: 10px 12px; gap: 8px 10px; }.toolbar-views, .toolbar-layers { flex-wrap: wrap; }
   .collab-header-meta { justify-content: flex-start; }
-  .graph-canvas { height: 420px; min-height: 420px; padding: 0; }.graph-footer { align-items: flex-start; }
+  .graph-canvas { height: auto; min-height: 0; padding: 0; }.graph-footer { align-items: flex-start; }
   .taskflow-board { grid-template-columns: 1fr; gap: 22px; }.stage-arrow { display: none; }
   .overview-metrics { padding: 18px 0; }.overview-metrics > div { padding: 0 14px; }.overview-metrics dd { font-size: 1.7rem; }.overview-metrics span { display: none; }.overview-metrics dt { font-size: .78rem; }
   .service-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }.project-activity small { display: none; }

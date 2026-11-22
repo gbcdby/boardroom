@@ -27,57 +27,71 @@ export interface GraphCanvasData {
 
 export interface Rect { x: number; y: number; w: number; h: number }
 export interface LayoutMember extends Rect { member: GraphMemberVM }
-export interface LayoutGroup extends Rect { group: GraphGroupVM; members: LayoutMember[] }
+export interface LayoutGroup extends Rect {
+  group: GraphGroupVM;
+  row: number;
+  column: number;
+  members: LayoutMember[];
+}
 export interface GraphLayout {
   width: number;
   height: number;
+  columns: number;
   root: Rect;
   lead: Rect;
+  trunkY: number;
+  rowTrunkYs: number[];
   groups: LayoutGroup[];
 }
-export interface GraphViewport { scale: number; offsetX: number; offsetY: number }
 
-export const GRAPH_WIDTH = 760;
-export const GRAPH_HEIGHT = 470;
+const PADDING = 16;
+const GAP = 16;
+const MIN_GROUP_WIDTH = 180;
+const GROUP_HEIGHT = 230;
+const ROW_GAP = 24;
+const GROUP_TOP = 205;
 
-export function layoutGraph(data: GraphCanvasData): GraphLayout {
-  const root: Rect = { x: 280, y: 8, w: 200, h: 48 };
-  const lead: Rect = { x: 260, y: 82, w: 240, h: 62 };
-  const groupY = 205;
-  const groupH = 245;
-  const groupW = 230;
-  const groupXs = [15, 265, 515];
+export function layoutGraph(data: GraphCanvasData, requestedWidth: number): GraphLayout {
+  const width = Math.max(280, Math.round(requestedWidth));
+  const available = width - PADDING * 2;
+  let columns = 1;
+  if (available >= MIN_GROUP_WIDTH * 3 + GAP * 2) columns = 3;
+  else if (available >= MIN_GROUP_WIDTH * 2 + GAP) columns = 2;
+  const groupWidth = (available - GAP * (columns - 1)) / columns;
+  const rootWidth = Math.min(200, available);
+  const leadWidth = Math.min(240, available);
+  const root: Rect = { x: (width - rootWidth) / 2, y: 8, w: rootWidth, h: 48 };
+  const lead: Rect = { x: (width - leadWidth) / 2, y: 82, w: leadWidth, h: 62 };
+  const rows = Math.ceil(data.groups.length / columns);
+  const rowTrunkYs = Array.from({ length: rows }, (_, row) => GROUP_TOP + row * (GROUP_HEIGHT + ROW_GAP) - 20);
+  const height = GROUP_TOP + rows * GROUP_HEIGHT + Math.max(0, rows - 1) * ROW_GAP + 56;
+
   const groups: LayoutGroup[] = data.groups.map((group, index) => {
-    const x = groupXs[index] ?? 15 + index * 250;
-    const memberRows: LayoutMember[] = group.members.map((member, memberIndex) => ({
+    const row = Math.floor(index / columns);
+    const column = index % columns;
+    const x = PADDING + column * (groupWidth + GAP);
+    const y = GROUP_TOP + row * (GROUP_HEIGHT + ROW_GAP);
+    const members: LayoutMember[] = group.members.map((member, memberIndex) => ({
       member,
       x: x + 12,
-      y: group.members.length > 1 ? groupY + 60 + memberIndex * 90 : groupY + 110,
-      w: groupW - 24,
+      y: group.members.length > 1
+        ? y + 57 + memberIndex * 90
+        : y + 45 + (GROUP_HEIGHT - 45 - 58) / 2,
+      w: groupWidth - 24,
       h: 58,
     }));
-    return { group, x, y: groupY, w: groupW, h: groupH, members: memberRows };
+    return { group, row, column, x, y, w: groupWidth, h: GROUP_HEIGHT, members };
   });
-  return { width: GRAPH_WIDTH, height: GRAPH_HEIGHT, root, lead, groups };
+
+  return { width, height, columns, root, lead, trunkY: 178, rowTrunkYs, groups };
 }
 
-export function canvasViewport(cssWidth: number, cssHeight: number, layout: GraphLayout): GraphViewport {
-  const scale = Math.min(1, cssWidth / layout.width, cssHeight / layout.height);
-  return {
-    scale,
-    offsetX: (cssWidth - layout.width * scale) / 2,
-    offsetY: (cssHeight - layout.height * scale) / 2,
-  };
-}
-
-export function hitTestMember(layout: GraphLayout, viewport: GraphViewport, x: number, y: number): string | null {
-  if (viewport.scale <= 0) return null;
-  const virtualX = (x - viewport.offsetX) / viewport.scale;
-  const virtualY = (y - viewport.offsetY) / viewport.scale;
+export function hitTestMember(layout: GraphLayout, x: number, y: number): string | null {
   for (const group of layout.groups) {
     for (const member of group.members) {
-      if (virtualX >= member.x && virtualX <= member.x + member.w
-        && virtualY >= member.y && virtualY <= member.y + member.h) return member.member.id;
+      if (x >= member.x && x <= member.x + member.w && y >= member.y && y <= member.y + member.h) {
+        return member.member.id;
+      }
     }
   }
   return null;

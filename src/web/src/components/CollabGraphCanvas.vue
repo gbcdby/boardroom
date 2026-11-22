@@ -2,17 +2,18 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useTheme } from "../composables/useTheme.ts";
 import {
-  canvasViewport, hitTestMember, layoutGraph,
-  type GraphCanvasData, type GraphLayout, type GraphMemberVM, type GraphTone, type GraphViewport, type Rect,
+  hitTestMember, layoutGraph,
+  type GraphCanvasData, type GraphLayout, type GraphMemberVM, type GraphTone, type Rect,
 } from "./collabGraphLayout.ts";
 
 const props = defineProps<{ data: GraphCanvasData; selectedId?: string | null }>();
 const emit = defineEmits<{ select: [id: string] }>();
 const theme = useTheme();
+const shell = ref<HTMLDivElement | null>(null);
 const canvas = ref<HTMLCanvasElement | null>(null);
 const focusedId = ref<string | null>(null);
-const layout = computed(() => layoutGraph(props.data));
-const viewport = ref<GraphViewport>({ scale: 1, offsetX: 0, offsetY: 0 });
+const width = ref(760);
+const layout = computed(() => layoutGraph(props.data, width.value));
 const members = computed(() => props.data.groups.flatMap(group => group.members));
 const avatarCache = new Map<number, HTMLImageElement>();
 let observer: ResizeObserver | null = null;
@@ -174,31 +175,43 @@ function drawGroupIcon(ctx: CanvasRenderingContext2D, icon: string, x: number, y
   ctx.restore();
 }
 function drawEdges(ctx: CanvasRenderingContext2D, p: Palette, graph: GraphLayout): void {
-  const rootCenter = graph.root.x + graph.root.w / 2;
   const leadCenter = graph.lead.x + graph.lead.w / 2;
+  const lastTrunk = graph.rowTrunkYs[graph.rowTrunkYs.length - 1] ?? graph.trunkY;
   ctx.strokeStyle = p.relation;
   ctx.lineWidth = 1.4;
   ctx.beginPath();
-  ctx.moveTo(rootCenter, graph.root.y + graph.root.h);
-  ctx.lineTo(rootCenter, graph.lead.y);
+  ctx.moveTo(graph.root.x + graph.root.w / 2, graph.root.y + graph.root.h);
+  ctx.lineTo(graph.root.x + graph.root.w / 2, graph.lead.y);
   ctx.moveTo(leadCenter, graph.lead.y + graph.lead.h);
-  ctx.lineTo(leadCenter, 178);
-  const centers = graph.groups.map(group => group.x + group.w / 2);
-  ctx.moveTo(centers[0]!, 178);
-  ctx.lineTo(centers[centers.length - 1]!, 178);
-  for (const center of centers) {
-    ctx.moveTo(center, 178);
-    ctx.lineTo(center, graph.groups[0]!.y);
+  ctx.lineTo(leadCenter, lastTrunk);
+  for (let row = 0; row < graph.rowTrunkYs.length; row += 1) {
+    const trunkY = graph.rowTrunkYs[row];
+    if (trunkY === undefined) continue;
+    const rowGroups = graph.groups.filter(group => group.row === row);
+    if (!rowGroups.length) continue;
+    const centers = rowGroups.map(group => group.x + group.w / 2);
+    const left = centers[0]!;
+    const right = centers[centers.length - 1]!;
+    ctx.moveTo(left, trunkY);
+    ctx.lineTo(right, trunkY);
   }
   ctx.stroke();
-  for (const center of centers) drawArrowHead(ctx, center, graph.groups[0]!.y - 1, Math.PI / 2, p.relation);
+  for (const group of graph.groups) {
+    const center = group.x + group.w / 2;
+    const trunkY = graph.rowTrunkYs[group.row] ?? graph.trunkY;
+    ctx.beginPath();
+    ctx.moveTo(center, trunkY);
+    ctx.lineTo(center, group.y);
+    ctx.stroke();
+    drawArrowHead(ctx, center, group.y - 1, Math.PI / 2, p.relation);
+  }
 
   for (const group of graph.groups) {
     if (group.members.length > 1) {
       const first = group.members[0]!;
       const second = group.members[1]!;
       const x = first.x + first.w / 2;
-      const connectorColor = group.group.flowMessage ? p.accentFill : p.relation;
+      const connectorColor = group.group.flowEmphasis ? p.accentFill : p.relation;
       ctx.strokeStyle = connectorColor;
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -225,24 +238,32 @@ function drawEdges(ctx: CanvasRenderingContext2D, p: Palette, graph: GraphLayout
   if (first && second && first.members[1] && second.members[0]) {
     const from = first.members[1]!;
     const to = second.members[0]!;
+    const startX = first.x + first.w;
+    const startY = from.y + from.h / 2;
+    const endX = second.x;
+    const endY = to.y + to.h / 2;
     ctx.strokeStyle = p.relation;
     ctx.lineWidth = 1.4;
     ctx.beginPath();
-    ctx.moveTo(first.x + first.w, from.y + from.h / 2);
-    ctx.bezierCurveTo(first.x + first.w + 25, from.y + 10, second.x - 25, to.y + 40, second.x, to.y + to.h / 2);
+    ctx.moveTo(startX, startY);
+    ctx.bezierCurveTo(startX + 30, startY - 20, endX - 30, endY + 40, endX, endY);
     ctx.stroke();
-    drawArrowHead(ctx, second.x + 1, to.y + to.h / 2, 0, p.relation);
+    drawArrowHead(ctx, endX + 1, endY, 0, p.relation);
   }
   if (first && third && first.members[1] && third.members[0]) {
     const from = first.members[1]!;
     const to = third.members[0]!;
+    const startX = first.x + first.w / 2;
+    const startY = from.y + from.h;
+    const endX = third.x;
+    const endY = to.y + to.h;
     ctx.strokeStyle = p.relation;
     ctx.lineWidth = 1.4;
     ctx.beginPath();
-    ctx.moveTo(first.x + first.w / 2, from.y + from.h);
-    ctx.bezierCurveTo(first.x + 180, graph.height - 10, third.x - 80, graph.height - 10, third.x, to.y + to.h);
+    ctx.moveTo(startX, startY);
+    ctx.bezierCurveTo(startX + 120, graph.height - 20, endX - 120, graph.height - 20, endX, endY);
     ctx.stroke();
-    drawArrowHead(ctx, third.x + 1, to.y + to.h, 0, p.relation);
+    drawArrowHead(ctx, endX + 1, endY, 0, p.relation);
   }
 }
 function drawNodes(ctx: CanvasRenderingContext2D, p: Palette, graph: GraphLayout): void {
@@ -289,37 +310,49 @@ function drawNodes(ctx: CanvasRenderingContext2D, p: Palette, graph: GraphLayout
       const second = group.members[1]!;
       const centerY = (first.y + first.h + second.y) / 2;
       drawPill(ctx, group.group.flowLabel, group.x + 52, centerY, p);
-      if (group.group.flowMessage) drawPill(ctx, group.group.flowMessage, group.x + group.w / 2 + 20, centerY, p, group.group.flowEmphasis === true);
-    } else if (group.members.length === 1) {
-      drawPill(ctx, group.group.flowLabel, group.x + group.w / 2, graph.height - 28, p);
+      if (group.group.flowMessage) {
+        drawPill(ctx, group.group.flowMessage, group.x + group.w / 2 + 20, centerY, p, group.group.flowEmphasis === true);
+      }
+    } else {
+      drawPill(ctx, group.group.flowLabel, group.x + group.w / 2, group.y + group.h - 24, p);
     }
   }
-  drawPill(ctx, "接口协作", 255, 338, p);
-  drawPill(ctx, "验证协作", 380, 438, p);
+
+  const first = graph.groups[0];
+  const second = graph.groups[1];
+  const third = graph.groups[2];
+  if (first && second) {
+    const centerX = (first.x + first.w + second.x) / 2;
+    const centerY = (first.y + first.h / 2 + second.y + second.h / 2) / 2;
+    drawPill(ctx, "接口协作", centerX, centerY, p);
+  }
+  if (first && third) {
+    const centerX = (first.x + first.w / 2 + third.x + third.w / 2) / 2;
+    drawPill(ctx, "验证协作", centerX, graph.height - 28, p);
+  }
 }
 function draw(): void {
   frame = 0;
+  const shellElement = shell.value;
   const element = canvas.value;
-  if (!element || disposed) return;
-  const rect = element.getBoundingClientRect();
-  const cssWidth = rect.width;
-  const cssHeight = rect.height;
-  if (cssWidth <= 0 || cssHeight <= 0) return;
+  if (!shellElement || !element || disposed) return;
+  const cssWidth = Math.max(280, Math.round(shellElement.clientWidth));
+  if (width.value !== cssWidth) width.value = cssWidth;
+  const graph = layout.value;
+  const cssHeight = graph.height;
   const dpr = Math.max(1, window.devicePixelRatio || 1);
   const pixelWidth = Math.round(cssWidth * dpr);
   const pixelHeight = Math.round(cssHeight * dpr);
+  element.style.height = `${cssHeight}px`;
   if (element.width !== pixelWidth || element.height !== pixelHeight) {
     element.width = pixelWidth;
     element.height = pixelHeight;
   }
-  const graph = layout.value;
-  const vp = canvasViewport(cssWidth, cssHeight, graph);
-  viewport.value = vp;
   const ctx = element.getContext("2d");
   if (!ctx) return;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, pixelWidth, pixelHeight);
-  ctx.setTransform(dpr * vp.scale, 0, 0, dpr * vp.scale, dpr * vp.offsetX, dpr * vp.offsetY);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const palette = readPalette();
   drawEdges(ctx, palette, graph);
   drawNodes(ctx, palette, graph);
@@ -332,7 +365,7 @@ function pointerId(event: MouseEvent): string | null {
   const element = canvas.value;
   if (!element) return null;
   const rect = element.getBoundingClientRect();
-  return hitTestMember(layout.value, viewport.value, event.clientX - rect.left, event.clientY - rect.top);
+  return hitTestMember(layout.value, event.clientX - rect.left, event.clientY - rect.top);
 }
 function onClick(event: MouseEvent): void {
   const id = pointerId(event);
@@ -341,28 +374,36 @@ function onClick(event: MouseEvent): void {
 function onMove(event: MouseEvent): void {
   if (canvas.value) canvas.value.style.cursor = pointerId(event) ? "pointer" : "default";
 }
+function measure(): void {
+  const element = shell.value;
+  if (!element) return;
+  const next = Math.max(280, Math.round(element.clientWidth));
+  if (width.value !== next) width.value = next;
+  scheduleDraw();
+}
 onMounted(() => {
   for (let seed = 1; seed <= 6; seed += 1) avatarImage(seed);
-  const element = canvas.value;
+  const element = shell.value;
   if (element && typeof ResizeObserver !== "undefined") {
-    observer = new ResizeObserver(scheduleDraw);
+    observer = new ResizeObserver(measure);
     observer.observe(element);
   }
-  scheduleDraw();
+  measure();
 });
 onBeforeUnmount(() => {
   disposed = true;
   observer?.disconnect();
   if (frame) cancelAnimationFrame(frame);
 });
-watch(() => [props.data, props.selectedId, focusedId.value, theme.snapshot.value.appearance] as const, scheduleDraw, { deep: true });
+watch(() => [props.data, props.selectedId, focusedId.value, theme.snapshot.value.appearance, width.value] as const, scheduleDraw, { deep: true });
 </script>
 
 <template>
-  <div class="graph-canvas-shell">
+  <div ref="shell" class="graph-canvas-shell">
     <canvas
       ref="canvas"
       class="graph-canvas-element"
+      :style="{ height: `${layout.height}px` }"
       data-testid="p01-graph-canvas-element"
       role="img"
       aria-label="示例协作关系图：总管连接项目负责人，项目负责人连接界面升级小组、MCP 能力接入、质量保障三个群；点击成员查看会话。全部为示例数据。"
@@ -385,6 +426,6 @@ watch(() => [props.data, props.selectedId, focusedId.value, theme.snapshot.value
 </template>
 
 <style scoped>
-.graph-canvas-shell { position: relative; width: 100%; height: 100%; min-height: 0; }
-.graph-canvas-element { display: block; width: 100%; height: 100%; }
+.graph-canvas-shell { position: relative; width: 100%; height: auto; min-height: 0; }
+.graph-canvas-element { display: block; width: 100%; }
 </style>
