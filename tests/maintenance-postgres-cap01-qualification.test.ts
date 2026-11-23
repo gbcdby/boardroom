@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -266,7 +266,7 @@ test("CAP01 owned PG16.15 qualification gaps: cross-cluster restore, lifecycle, 
           const waiting = (await admin.query(`SELECT state, wait_event_type FROM pg_stat_activity WHERE pid=$1`, [writerPid])).rows[0];
           assert.equal(text(waiting, "state"), "active");
           assert.equal(text(waiting, "wait_event_type"), "Lock", "the writer must wait on a real lock, not an instantaneous sample");
-          const epochDuring = await serverIdentity(guard);
+          const epochDuring = await serverIdentity(admin);
           assert.deepEqual(epochDuring, epochBefore, "server identity must stay bound during writer exclusion");
           const complete = (await guard.query(`SELECT json_agg(json_build_object('id', id, 'label', label) ORDER BY id) AS rows
             FROM "cap01_app"."records"`)).rows[0];
@@ -289,12 +289,42 @@ test("CAP01 owned PG16.15 qualification gaps: cross-cluster restore, lifecycle, 
             toolChildren: transport, guardLocks: lockRows.length, sharedCatalogLocks: 11,
             writerBlock: { pid: writerPid, waitEventType: "Lock", releasedAfterCommit: true },
             restoreBackendExited: true, h04Order: "SHARE first, catalog precheck, AX/sequence, T_complete, COMMIT" };
-          details.serverEpochBinding = { before: publicIdentity(epochBefore), duringWriterExclusion: publicIdentity(epochDuring),
-            after: publicIdentity(epochAfter), recovery: false,
-            scope: "owned PG16.15 native identity bound to the real cluster/database and stable across actual writer exclusion",
-            productionEpochRegistry: "NOT_RUN" };
-          statuses.serverEpochBinding = "PASS";
         } finally { await writer.end(); await guard.end(); }
+      });
+
+      await run("serverEpochBinding", "CAP01-R2-3: real server identity stays bound across a continuously blocked writer", async () => {
+        const admin = await connect(target!, "h04_verification");
+        const writer = await connect(target!, "h04_verification", h04Roles.verification);
+        const before = await serverIdentity(admin);
+        try {
+          await admin.query("BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE");
+          await admin.query('LOCK TABLE ONLY "cap01_app"."records" IN ACCESS EXCLUSIVE MODE NOWAIT');
+          const writerPid = text((await writer.query("SELECT pg_backend_pid()::text AS pid")).rows[0], "pid");
+          await writer.query("BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE");
+          let finished = false;
+          const work = writer.query('UPDATE "cap01_app"."records" SET label=label || \'-epoch\' WHERE id=1')
+            .then(() => { finished = true; });
+          void work.catch(() => undefined);
+          await delay(250);
+          assert.equal(finished, false, "the writer must still be blocked when the in-flight identity is read");
+          const waiting = (await admin.query("SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1", [writerPid])).rows[0];
+          assert.equal(text(waiting, "wait_event_type"), "Lock", "the writer must wait on a real lock");
+          const during = await serverIdentity(admin);
+          assert.deepEqual(during, before, "server identity must stay bound while the writer is blocked");
+          await admin.query("COMMIT");
+          await work;
+          await writer.query("COMMIT");
+          assert.equal(finished, true);
+          const after = await serverIdentity(admin);
+          assert.deepEqual(after, before, "server identity must stay bound after commit and writer release");
+          details.serverEpochBinding = { scope: "owned PG16.15 native identity bound to the real cluster/database and stable across actual writer exclusion",
+            source: "administrator/superuser fixture connection reads version, system_identifier, postmaster start, database OID and data_directory",
+            before: publicIdentity(before), duringWriterExclusion: publicIdentity(during), after: publicIdentity(after),
+            recovery: false, writerWaitEvent: "Lock", productionEpochRegistry: "NOT_RUN" };
+        } finally {
+          await admin.query("ROLLBACK").catch(() => undefined);
+          await writer.query("ROLLBACK").catch(() => undefined);
+        }
       });
 
       await run("lifecycleCleanupUpgrade", "CAP01-R2-2: cleanup and upgrade keep old bytes, application facts and prior receipt", async () => {
@@ -363,36 +393,56 @@ test("CAP01 owned PG16.15 qualification gaps: cross-cluster restore, lifecycle, 
           applicationOwnerRowsAclOidsUnchanged: true, priorReceiptDigestUnchanged: true };
       });
 
-      statuses.qualificationReceipt = "PASS";
     } catch (error) {
       errors.push({ gap: "setup", ...errorInfo(error) });
     } finally {
       for (const client of clients.reverse()) await client.end().catch(() => undefined);
       if (target) await target.close().catch(error => errors.push({ gap: "target-close", ...errorInfo(error) }));
       if (source) await source.close().catch(error => errors.push({ gap: "source-close", ...errorInfo(error) }));
-      const receipt = {
-        scope: "CAP01 owned PG16.15 fixture gap coverage; not the production registry or a signed qualification",
-        status: errors.length || Object.values(statuses).some(status => status !== "PASS") ? "FAIL" : "PASS",
-        serverVersionNum: "160015",
-        serverEpochQualification: statuses.serverEpochBinding,
-        fullRestoreR2: statuses.crossClusterRestore,
-        lifecycleCleanupUpgrade: statuses.lifecycleCleanupUpgrade,
-        completeCap01PdO04: "NOT_RUN",
-        productionRegistry: "UNCHANGED_EMPTY",
-        qualificationSigned: false,
-        items: statuses, details,
-        fixedSourceDigests: PG_CATALOG_GUARD_SOURCE_DIGESTS,
-        toolDigests,
-        candidate: /^[0-9a-f]{40}$/.test(process.env["GITHUB_SHA"] ?? "") ? process.env["GITHUB_SHA"] : null,
-        credentialFieldsWritten: false,
-        errors,
+      const tempPath = receiptPath + ".tmp";
+      const buildReceipt = () => {
+        const receipt = {
+          scope: "CAP01 owned PG16.15 fixture gap coverage; not the production registry or a signed qualification",
+          status: errors.length || Object.values(statuses).some(status => status !== "PASS") ? "FAIL" : "PASS",
+          serverVersionNum: "160015",
+          serverEpochQualification: statuses.serverEpochBinding,
+          fullRestoreR2: statuses.crossClusterRestore,
+          lifecycleCleanupUpgrade: statuses.lifecycleCleanupUpgrade,
+          completeCap01PdO04: "NOT_RUN",
+          productionRegistry: "UNCHANGED_EMPTY",
+          qualificationSigned: false,
+          items: statuses, details,
+          fixedSourceDigests: PG_CATALOG_GUARD_SOURCE_DIGESTS,
+          toolDigests,
+          candidate: /^[0-9a-f]{40}$/.test(process.env["GITHUB_SHA"] ?? "") ? process.env["GITHUB_SHA"] : null,
+          credentialFieldsWritten: false,
+          errors,
+        };
+        details.qualificationReceipt = { toolDigests, receiptSha256: "" };
+        details.qualificationReceipt.receiptSha256 = digest(JSON.stringify(receipt));
+        return receipt;
       };
-      details.qualificationReceipt = { toolDigests, receiptSha256: "" };
-      details.qualificationReceipt.receiptSha256 = digest(JSON.stringify(receipt));
       try {
         await mkdir(path.dirname(receiptPath), { recursive: true, mode: 0o700 });
-        await writeFile(receiptPath, JSON.stringify(receipt, null, 2) + "\n", { mode: 0o600 });
-      } catch (error) { errors.push({ gap: "receipt-write", ...errorInfo(error) }); }
+        const draft = buildReceipt();
+        await writeFile(tempPath, JSON.stringify(draft, null, 2) + "\n", { mode: 0o600 });
+        assert.deepEqual(JSON.parse(await readFile(tempPath, "utf8")), draft,
+          "receipt draft must round-trip through JSON before the item can pass");
+        const gapsPassed = Object.entries(statuses).every(([gap, status]) =>
+          gap === "qualificationReceipt" || status === "PASS");
+        statuses.qualificationReceipt = gapsPassed && errors.length === 0 ? "PASS" : "FAIL";
+        const finalReceipt = buildReceipt();
+        await writeFile(tempPath, JSON.stringify(finalReceipt, null, 2) + "\n", { mode: 0o600 });
+        assert.deepEqual(JSON.parse(await readFile(tempPath, "utf8")), finalReceipt,
+          "final receipt must round-trip through JSON before publication");
+        await rename(tempPath, receiptPath);
+      } catch (error) {
+        errors.push({ gap: "receipt-write", ...errorInfo(error) });
+        statuses.qualificationReceipt = "FAIL";
+      } finally {
+        await rm(tempPath, { force: true }).catch(() => undefined);
+      }
+      const receipt = buildReceipt();
       const finalStatus = errors.length ? "FAIL" : receipt.status;
       t.diagnostic(JSON.stringify({ scope: receipt.scope, status: finalStatus,
         items: statuses, serverVersionNum: receipt.serverVersionNum, qualificationSigned: false,
