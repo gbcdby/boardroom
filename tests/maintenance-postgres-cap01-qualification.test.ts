@@ -252,7 +252,7 @@ test("CAP01 owned PG16.15 qualification gaps: cross-cluster restore, lifecycle, 
           assert.equal(lockRows.filter(row => row.relisshared).length, 11);
           assert.ok(number((await guard.query("SELECT count(*)::integer AS n FROM pg_catalog.pg_class")).rows[0], "n") > 0,
             "fresh catalog precheck must follow the shared lock");
-          await guard.query('LOCK TABLE ONLY "cap01_app"."counter", ONLY "cap01_app"."records" IN ACCESS EXCLUSIVE MODE NOWAIT');
+          await guard.query('LOCK TABLE ONLY "cap01_app"."records" IN ACCESS EXCLUSIVE MODE NOWAIT');
 
           const writerPid = text((await writer.query("SELECT pg_backend_pid()::text AS pid")).rows[0], "pid");
           await writer.query("BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE");
@@ -288,7 +288,7 @@ test("CAP01 owned PG16.15 qualification gaps: cross-cluster restore, lifecycle, 
             preservedOids: { source: sourceFactsBefore.tableOid, target: targetFactsBefore.tableOid },
             toolChildren: transport, guardLocks: lockRows.length, sharedCatalogLocks: 11,
             writerBlock: { pid: writerPid, waitEventType: "Lock", releasedAfterCommit: true },
-            restoreBackendExited: true, h04Order: "SHARE first, catalog precheck, AX/sequence, T_complete, COMMIT" };
+            restoreBackendExited: true, h04Order: "SHARE first, catalog precheck, AX/records, T_complete, COMMIT" };
         } finally { await writer.end(); await guard.end(); }
       });
 
