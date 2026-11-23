@@ -101,7 +101,7 @@ async function applicationFacts(client: Client) {
   const relations = (await client.query(`SELECT c.relname, c.oid::text AS oid, c.relowner::regrole::text AS owner,
     (SELECT json_agg(json_build_object('grantor', a.grantor::text, 'grantee', a.grantee::text,
        'privilege', a.privilege_type, 'grantable', a.is_grantable) ORDER BY a.grantor::text, a.grantee::text, a.privilege_type)
-     FROM aclexplode(coalesce(c.relacl, acldefault(CASE WHEN c.relkind = 's' THEN 's'::"char" ELSE 'r'::"char" END, c.relowner))) a) AS acl
+     FROM aclexplode(coalesce(c.relacl, acldefault(CASE WHEN c.relkind = 'S' THEN 's'::"char" ELSE 'r'::"char" END, c.relowner))) a) AS acl
     FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
     WHERE n.nspname='cap01_app' AND c.relname IN ('records','counter') ORDER BY c.relname`)).rows;
   const records = (await client.query(`SELECT json_agg(json_build_object('id', id, 'label', label) ORDER BY id) AS rows
