@@ -56,7 +56,7 @@ python <skill>/scripts/fetch_tlc.py --dest <absolute-tool-path>/tla2tools.jar
 ## 执行命令
 
 ```text
-python <skill>/scripts/run_tlc.py --manifest <feature>/verification.json --profile small --jar <absolute-tool-path>/tla2tools.jar --out <feature>/runs/<new-run-id>
+python <skill>/scripts/run_tlc.py --manifest <feature>/verification.json --profile small --jar <absolute-tool-path>/tla2tools.jar --out <temporary-evidence-dir>/<new-run-id>
 ```
 
 可加 `--java <executable-or-path>` 指定已有 Java。`--jar` 必须是绝对文件路径；`--out` 必须不存在且位于 `model.root` 外。输出目录已存在时拒绝覆盖，保留旧证据。
@@ -78,7 +78,7 @@ python <skill>/scripts/run_tlc.py --manifest <feature>/verification.json --profi
 
 `NOT_RUN` 是未调用工具时的工作流状态，runner 不会将它当成成功。配置错误会尽量在新目录写入结果；若目录已存在或无法创建，读取命令输出，并明确没有生成新结果。
 
-每次运行保留：
+以下文件由 runner 在本次临时输出目录生成，供核查与交接。长期归档使用模型、配置和清单重新运行。比较同一配置对业务性质的判断时，允许耗时、状态访问顺序及首先报告的反例轨迹有差异。超时或中断须按当次状态解释。
 
 - `result.json`：状态、原因、开始／结束时间、实际命令、原始退出状态、资源中断信息、统计、检查清单与版本。
 - `manifest.json`、`input/`：清单与模型／配置快照；结果包含文件 SHA-256 和 runner 本身的摘要。

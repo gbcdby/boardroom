@@ -1,6 +1,6 @@
 {
   "schema_version": "work-suite/v1",
-  "suite_version": "0.6.1",
+  "suite_version": "0.6.2",
   "result_contract": "work-result/v1",
   "independent_formal_skill": "worker-tla",
   "runtime_guarantees": "Defined by actual project tools, not this registry.",
@@ -74,7 +74,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "f514093717fbe7025a7a231ae5232ffb93451dd80bc2c2c9649c00c38245ba63"
+          "sha256": "bc14f8ac9a6915f47aa4d9acb978ee289d603f15528bb761f27bffd90bd740f0"
         },
         {
           "path": "agents/openai.yaml",
@@ -82,7 +82,7 @@
         },
         {
           "path": "assets/design.template.md",
-          "sha256": "f619d719d62fefe1b215fb6dfdc09ce5759d0986ddb4152a7e44ab5b970b2f6d"
+          "sha256": "cfbf43e8ff779f0b64aaa95563205816f577c411df308020fd2ce2433b01c2f5"
         },
         {
           "path": "assets/icon.svg",
@@ -101,7 +101,7 @@
       "files": [
         {
           "path": "SKILL.md",
-          "sha256": "3d2629ecbc2ed060e7c3bf37d388065f8613f7d5a61b602ccaa4cabe117c0bdb"
+          "sha256": "5f41181f95365e7e7851cd2711439bcfef2cd562f2d82b47f9f0a11588024965"
         },
         {
           "path": "agents/openai.yaml",
@@ -173,11 +173,11 @@
         },
         {
           "path": "references/execution.md",
-          "sha256": "80e236842739b3f6e4862acb7ddc8e421d7b50c82584c40b607d3265abe5b881"
+          "sha256": "eacab0e0b05a6a3e93e741cb1cfb9c7f9e0bb20aec4aae7a5af8b77d0719dc4f"
         },
         {
           "path": "references/handoff.md",
-          "sha256": "e015f59886d0ed5a3399b892b35833ca56ac3a1b44f8080ee34d86b57832a078"
+          "sha256": "e83f95d09b0b6bd54a5dd7031ab096221e4ad552f71a5eb61013ceecdad1122f"
         },
         {
           "path": "references/modeling.md",
