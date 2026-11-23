@@ -569,6 +569,7 @@ class PgNativeEntryContracts(unittest.TestCase):
             'node --test --test-concurrency=1 tests/maintenance-postgres-restart.test.ts '
             'tests/maintenance-postgres-catalog-guard-native.test.ts '
             'tests/maintenance-postgres-r05-native.test.ts '
+            'tests/maintenance-postgres-cap01-qualification.test.ts '
             '2>&1 | tee .agent-output/maintenance-pg-restart/native-restart.log')
         request = LauncherContracts().request('pg-native')
         env = ci.child_environment(request, Path('/owned/stage'))
