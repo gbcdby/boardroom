@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { runMigrations } from "../../src/server/db/migrate.ts";
 import { migrations } from "../../src/server/db/migrations/index.ts";
-import { readSqliteManifests } from "../../src/server/storage/maintenance/sqlite-manifests.ts";
+import { readLegacySqliteManifests } from "./m2-p0-f-fixture.ts";
 import { canonicalJson, digestJson } from "../../src/server/storage/maintenance/canonical.ts";
 import { readLegacyConfigCapture } from "../../src/server/identity/legacy-config-capture.ts";
 import { snapshotRuntimeConfig } from "../../src/server/runtime/config.ts";
@@ -15,6 +15,9 @@ import type { SourceClientRawRow } from "../../src/server/storage/maintenance/ty
 import { OriginStore, ORIGIN_TIME, originCell, originRawValue, originSet } from "./m2-origin-fixture-store.ts";
 import type { OriginChange } from "./m2-origin-fixture-store.ts";
 import { seedOriginAdvancedWorkspace } from "./m2-origin-fixture-advanced.ts";
+
+/** P0 旧源夹具必须停在 v21：v22 属于迁移后的配置权威，不进入旧库观察。 */
+const legacyMigrations = migrations.filter(m => m.version <= 21);
 
 const quote = (value: string) => '"' + value.replaceAll('"', '""') + '"';
 const exitedProcess = { version: 1, launcherProtocol: "linux-private-net-v1", pid: 456, kernelBootId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", pidNamespace: "pid:[4026531836]", startTicks: "200" };
@@ -69,9 +72,9 @@ export async function m2OriginP0Fixture(change?: OriginChange, options: { pageSi
     // Native updates erase freed cell payloads, including migration creation times
     // and the initial random marker. No byte editing or rowid-changing VACUUM.
     db.pragma("secure_delete=ON");
-    runMigrations(db, migrations); seed(db);
+    runMigrations(db, legacyMigrations); seed(db);
     if (options.advancedWorkspace) seedOriginAdvancedWorkspace(db);
-    const template = p0ArtifactFixture({ journalVersion: 2 }), initial = readSqliteManifests(db);
+    const template = p0ArtifactFixture({ journalVersion: 2 }), initial = readLegacySqliteManifests(db);
     const f = controlVector({ initialVersion: 2, mechanism: {
       sourceIdentity: { kind: "sqlite", sourcePath: "/a12/source-alias.sqlite", sqlitePath: "/a12/source.sqlite", device: "1", inode: "2" },
       databaseInstanceId: "1".repeat(32), root: { path: "/a12/control", device: "1", inode: "3", hostIdentityDigest: "b".repeat(64) },
@@ -99,7 +102,7 @@ export async function m2OriginP0Fixture(change?: OriginChange, options: { pageSi
     const captureRef = store.add("capture", "journal", captured, [plan, enter, files], "legacy");
     db.prepare("UPDATE storage_maintenance SET database_instance_id=?,control_root_json=?,mutex_identity_json=?,fence_epoch=2,owner_generation=7,admission='sealed',active_migration_id='a12',plan_digest=?,journal_record_ref=?,journal_digest=?,journal_sequence=2")
       .run(f.source.databaseInstanceId, canonicalJson(f.root), canonicalJson(f.mutex), plan.sha256, captureRef.ref, captureRef.sha256);
-    const manifests = readSqliteManifests(db), md = store.add("manifests", "database-manifests", manifests, [], "legacy");
+    const manifests = readLegacySqliteManifests(db), md = store.add("manifests", "database-manifests", manifests, [], "legacy");
     const database = store.add("database", "database-snapshot", db.serialize(), [], "binary");
     const capability = store.add("capability", "capability", { formatVersion: 1, kind: "capability", node: "fixture", rootIdentity: f.root,
       powerLossTested: false, probeDigest: "a".repeat(64), platform: "linux", filesystemType: "61267", guarantee: "observed-file-fsync-rename-directory-fsync" }, [], "legacy");

@@ -109,7 +109,7 @@ test("PC08/09: non-key, storage type, rowid, raw JSON and multiplicity differenc
 test("PC01/28: catalog matches independently executed schema1–21 and registered P-A target names", () => {
   const db = new Database(":memory:");
   try {
-    runMigrations(db, migrations);
+    runMigrations(db, migrations.filter(m => m.version <= 21));
     const names = (db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as { name: string }[]).map(t => t.name);
     const old = M2_HISTORY_TABLES.filter(t => t.columnsP0.length > 0);
     assert.deepEqual(old.map(t => t.name), names); assert.equal(names.length, 61);
