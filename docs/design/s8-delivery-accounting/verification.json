@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "feature": "s8-delivery-accounting",
+  "tool": {
+    "version": "v1.7.4 / TLC 2.19",
+    "sha256": "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  },
+  "model": {"root": "tla", "entry": "DeliveryLedger.tla"},
+  "requirements": [
+    {"id": "R1", "statement": "同一 WorkItem 至多一个有效领取/owner", "properties": ["NoDoubleClaim"]},
+    {"id": "R2", "statement": "同一 WorkItem 至多一个幂等 Reply", "properties": ["AtMostOneReply", "ReplyMatchesDisposition"]},
+    {"id": "R3", "statement": "outcome_unknown 后状态保持 assigned", "properties": ["UnknownStaysAssigned"]},
+    {"id": "R4", "statement": "旧代际观察不能改写当前状态或产生 Reply", "properties": ["NoStaleHandled"]}
+  ],
+  "profiles": {
+    "small": {
+      "config": "fixed.cfg",
+      "timeout_seconds": 120,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": ["TypeOK", "NoDoubleClaim", "AtMostOneReply", "ReplyMatchesDisposition", "UnknownStaysAssigned", "NoStaleHandled"],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "parameters": "W={w1,w2}, C={acp,mcp}, E={0,1}, G={0,1}, DuplicateAllowed=FALSE",
+        "covered_interleavings_and_faults": ["duplicate claim attempt", "unknown outcome", "stale arrival", "mode switch with fence"],
+        "excluded_behaviors": ["liveness/fairness", "crash/recovery", "external side effects", "real DB/FS semantics"],
+        "liveness": "NOT_CHECKED"
+      },
+      "assumptions": [
+        "本协议是 S8 #314 设计拟议；实现状态 NOT_ASSESSED",
+        "Claim 的互斥检查为设计义务，非真实源码证据",
+        "StaleArrival 对状态变量不产生效果是设计要求"
+      ]
+    },
+    "bug-double-claim": {
+      "config": "bug-double-claim.cfg",
+      "timeout_seconds": 120,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": ["TypeOK", "NoDoubleClaim"],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "parameters": "同 small，但 DuplicateAllowed=TRUE（隔离错误变体）",
+        "covered_interleavings_and_faults": ["duplicate claim without mutual exclusion"],
+        "excluded_behaviors": ["不作为交付通过证据"],
+        "liveness": "NOT_CHECKED"
+      },
+      "assumptions": ["错误变体只用于确认 NoDoubleClaim 能捕获重复领取"]
+    }
+  }
+}
