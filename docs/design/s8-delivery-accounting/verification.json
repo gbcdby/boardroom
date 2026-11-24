@@ -10,7 +10,7 @@
     {"id": "R1", "statement": "同一 WorkItem 至多一个有效领取/owner", "properties": ["NoDoubleClaim"]},
     {"id": "R2", "statement": "同一 WorkItem 至多一个幂等 Reply", "properties": ["AtMostOneReply", "ReplyMatchesDisposition"]},
     {"id": "R3", "statement": "outcome_unknown 后状态保持 assigned", "properties": ["UnknownStaysAssigned"]},
-    {"id": "R4", "statement": "旧代际观察不能改写当前状态或产生 Reply", "properties": ["NoStaleHandled"]}
+    {"id": "R4", "statement": "旧代际观察/迟到响应不能改写当前状态或产生 Reply", "properties": ["NoStaleHandled", "NoStaleEffect"]}
   ],
   "profiles": {
     "small": {
@@ -18,19 +18,19 @@
       "timeout_seconds": 120,
       "workers": 1,
       "heap_mb": 512,
-      "expected_invariants": ["TypeOK", "NoDoubleClaim", "AtMostOneReply", "ReplyMatchesDisposition", "UnknownStaysAssigned", "NoStaleHandled"],
+      "expected_invariants": ["TypeOK", "NoDoubleClaim", "AtMostOneReply", "ReplyMatchesDisposition", "UnknownStaysAssigned", "NoStaleHandled", "NoStaleEffect"],
       "expected_properties": [],
       "checks_deadlock": true,
       "scope": {
-        "parameters": "W={w1,w2}, C={acp,mcp}, E={0,1}, G={0,1}, DuplicateAllowed=FALSE, ReplyGuardEnabled=TRUE, UnknownGuardEnabled=TRUE",
-        "covered_interleavings_and_faults": ["duplicate claim attempt", "unknown outcome", "stale arrival", "mode switch with fence"],
+        "parameters": "W={w1,w2}, C={acp,mcp}, E={0,1}, G={0,1}, DuplicateAllowed=FALSE, ReplyGuardEnabled=TRUE, UnknownGuardEnabled=TRUE, StaleGuardEnabled=TRUE",
+        "covered_interleavings_and_faults": ["duplicate claim attempt", "unknown outcome", "stale arrival without effect", "mode switch with fence"],
         "excluded_behaviors": ["liveness/fairness", "crash/recovery", "external side effects", "real DB/FS semantics"],
         "liveness": "NOT_CHECKED"
       },
       "assumptions": [
         "本协议是 S8 #314 设计拟议；实现状态 NOT_ASSESSED",
         "Claim 的互斥检查为设计义务，非真实源码证据",
-        "StaleArrival 对状态变量不产生效果是设计要求"
+        "StaleArrival 对状态变量不产生效果是设计要求；staleEffect 为 R4 诊断位，fixed 所有动作保持 FALSE"
       ]
     },
     "bug-double-claim": {
@@ -38,27 +38,27 @@
       "timeout_seconds": 120,
       "workers": 1,
       "heap_mb": 512,
-      "expected_invariants": ["TypeOK", "NoDoubleClaim"],
+      "expected_invariants": ["TypeOK", "NoDoubleClaim", "NoStaleEffect"],
       "expected_properties": [],
       "checks_deadlock": true,
       "scope": {
-        "parameters": "同 small，但 DuplicateAllowed=TRUE（隔离错误变体）；ReplyGuardEnabled/UnknownGuardEnabled 保持 TRUE",
+        "parameters": "同 small，但 DuplicateAllowed=TRUE（隔离错误变体）；ReplyGuardEnabled/UnknownGuardEnabled/StaleGuardEnabled 保持 TRUE",
         "covered_interleavings_and_faults": ["duplicate claim without mutual exclusion"],
         "excluded_behaviors": ["不作为交付通过证据"],
         "liveness": "NOT_CHECKED"
       },
-      "assumptions": ["错误变体只用于确认 NoDoubleClaim 能捕获重复领取"]
+      "assumptions": ["错误变体只用于确认 NoDoubleClaim 能捕获重复领取；StaleGuardEnabled=TRUE 保持 R4 语义不变"]
     },
     "bug-double-reply": {
       "config": "bug-double-reply.cfg",
       "timeout_seconds": 120,
       "workers": 1,
       "heap_mb": 512,
-      "expected_invariants": ["TypeOK", "AtMostOneReply", "ReplyMatchesDisposition"],
+      "expected_invariants": ["TypeOK", "AtMostOneReply", "ReplyMatchesDisposition", "NoStaleEffect"],
       "expected_properties": [],
       "checks_deadlock": true,
       "scope": {
-        "parameters": "同 small，但 ReplyGuardEnabled=FALSE（隔离 R2 错误变体）；DuplicateAllowed=FALSE、UnknownGuardEnabled=TRUE 不变",
+        "parameters": "同 small，但 ReplyGuardEnabled=FALSE（隔离 R2 错误变体）；DuplicateAllowed=FALSE、UnknownGuardEnabled/StaleGuardEnabled=TRUE 不变",
         "covered_interleavings_and_faults": ["handled 项两次 PublishReply", "replyCount 域 0..2"],
         "excluded_behaviors": ["不作为交付通过证据"],
         "liveness": "NOT_CHECKED"
@@ -70,16 +70,32 @@
       "timeout_seconds": 120,
       "workers": 1,
       "heap_mb": 512,
-      "expected_invariants": ["TypeOK", "UnknownStaysAssigned"],
+      "expected_invariants": ["TypeOK", "UnknownStaysAssigned", "NoStaleEffect"],
       "expected_properties": [],
       "checks_deadlock": true,
       "scope": {
-        "parameters": "同 small，但 UnknownGuardEnabled=FALSE（隔离 R3 错误变体）；DuplicateAllowed=FALSE、ReplyGuardEnabled=TRUE 不变",
+        "parameters": "同 small，但 UnknownGuardEnabled=FALSE（隔离 R3 错误变体）；DuplicateAllowed=FALSE、ReplyGuardEnabled/StaleGuardEnabled=TRUE 不变",
         "covered_interleavings_and_faults": ["unknown 观察将状态改为 needs_attention"],
         "excluded_behaviors": ["不作为交付通过证据"],
         "liveness": "NOT_CHECKED"
       },
       "assumptions": ["错误变体只用于确认 UnknownStaysAssigned 能捕获 unknown 后的非 assigned 状态；fixed 语义仍为保持 status 不变"]
+    },
+    "bug-stale-arrival": {
+      "config": "bug-stale-arrival.cfg",
+      "timeout_seconds": 120,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": ["TypeOK", "NoStaleEffect"],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "parameters": "同 small，但 StaleGuardEnabled=FALSE（隔离 R4 错误变体）；DuplicateAllowed=FALSE、ReplyGuardEnabled/UnknownGuardEnabled=TRUE 不变",
+        "covered_interleavings_and_faults": ["旧 epoch claim 在 mode 切换后返回迟到结果，直接写状态/Reply 并置 staleEffect=TRUE"],
+        "excluded_behaviors": ["不作为交付通过证据"],
+        "liveness": "NOT_CHECKED"
+      },
+      "assumptions": ["错误变体只用于确认 NoStaleEffect 能捕获旧代际状态/Reply 效果；fixed 语义仍由 StaleGuardEnabled=TRUE 保证旧代际为空动作"]
     }
   }
 }
