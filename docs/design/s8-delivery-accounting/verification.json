@@ -22,7 +22,7 @@
       "expected_properties": [],
       "checks_deadlock": true,
       "scope": {
-        "parameters": "W={w1,w2}, C={acp,mcp}, E={0,1}, G={0,1}, DuplicateAllowed=FALSE",
+        "parameters": "W={w1,w2}, C={acp,mcp}, E={0,1}, G={0,1}, DuplicateAllowed=FALSE, ReplyGuardEnabled=TRUE, UnknownGuardEnabled=TRUE",
         "covered_interleavings_and_faults": ["duplicate claim attempt", "unknown outcome", "stale arrival", "mode switch with fence"],
         "excluded_behaviors": ["liveness/fairness", "crash/recovery", "external side effects", "real DB/FS semantics"],
         "liveness": "NOT_CHECKED"
@@ -42,12 +42,44 @@
       "expected_properties": [],
       "checks_deadlock": true,
       "scope": {
-        "parameters": "同 small，但 DuplicateAllowed=TRUE（隔离错误变体）",
+        "parameters": "同 small，但 DuplicateAllowed=TRUE（隔离错误变体）；ReplyGuardEnabled/UnknownGuardEnabled 保持 TRUE",
         "covered_interleavings_and_faults": ["duplicate claim without mutual exclusion"],
         "excluded_behaviors": ["不作为交付通过证据"],
         "liveness": "NOT_CHECKED"
       },
       "assumptions": ["错误变体只用于确认 NoDoubleClaim 能捕获重复领取"]
+    },
+    "bug-double-reply": {
+      "config": "bug-double-reply.cfg",
+      "timeout_seconds": 120,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": ["TypeOK", "AtMostOneReply", "ReplyMatchesDisposition"],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "parameters": "同 small，但 ReplyGuardEnabled=FALSE（隔离 R2 错误变体）；DuplicateAllowed=FALSE、UnknownGuardEnabled=TRUE 不变",
+        "covered_interleavings_and_faults": ["handled 项两次 PublishReply", "replyCount 域 0..2"],
+        "excluded_behaviors": ["不作为交付通过证据"],
+        "liveness": "NOT_CHECKED"
+      },
+      "assumptions": ["错误变体只用于确认 AtMostOneReply 能捕获重复 Reply；fixed 语义仍由 ReplyGuardEnabled=TRUE 保证至多一次"]
+    },
+    "bug-unknown-changes-state": {
+      "config": "bug-unknown-changes-state.cfg",
+      "timeout_seconds": 120,
+      "workers": 1,
+      "heap_mb": 512,
+      "expected_invariants": ["TypeOK", "UnknownStaysAssigned"],
+      "expected_properties": [],
+      "checks_deadlock": true,
+      "scope": {
+        "parameters": "同 small，但 UnknownGuardEnabled=FALSE（隔离 R3 错误变体）；DuplicateAllowed=FALSE、ReplyGuardEnabled=TRUE 不变",
+        "covered_interleavings_and_faults": ["unknown 观察将状态改为 needs_attention"],
+        "excluded_behaviors": ["不作为交付通过证据"],
+        "liveness": "NOT_CHECKED"
+      },
+      "assumptions": ["错误变体只用于确认 UnknownStaysAssigned 能捕获 unknown 后的非 assigned 状态；fixed 语义仍为保持 status 不变"]
     }
   }
 }

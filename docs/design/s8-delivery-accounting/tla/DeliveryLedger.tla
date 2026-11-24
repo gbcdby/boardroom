@@ -6,19 +6,24 @@ EXTENDS FiniteSets, Naturals
 \* Claim 携带当前 modeEpoch；已 assigned 的 WorkItem 仍可能收到重复领取尝试，
 \* 互斥由 DuplicateAllowed=FALSE 一侧的 claims 守卫表达，是待落实的实现义务。
 \* Observe 只接受当前 epoch 且属于当前 owner 的 claim，旧代际由 StaleArrival 空动作表达。
+\* ReplyGuardEnabled / UnknownGuardEnabled 是配置级隔离开关：fixed 与 R1 变体保持 TRUE，
+\* 各自错误变体只关闭其中一个；性质名和死锁检查在所有配置中不变。
 
-CONSTANTS W, C, E, G, DuplicateAllowed
+CONSTANTS W, C, E, G, DuplicateAllowed, ReplyGuardEnabled, UnknownGuardEnabled
 
 VARIABLES status, outcome, owner, claims, replyCount, modeEpoch, fenced
 
 vars == <<status, outcome, owner, claims, replyCount, modeEpoch, fenced>>
+
+\* fixed 语义下该上界由 PublishReply 守卫保证不可到达；放宽为 2 只为隔离错误变体提供有限反例。
+ReplyLimit == IF ReplyGuardEnabled THEN 1 ELSE 2
 
 TypeOK ==
   /\ status \in [W -> {"none", "pending", "assigned", "handled", "needs_attention"}]
   /\ outcome \in [W -> {"none", "success", "failure", "unknown"}]
   /\ owner \in [W -> {"none"} \cup C]
   /\ claims \subseteq {r \in [wi: W, ch: C, ep: E, gen: G] : TRUE}
-  /\ replyCount \in [W -> {0, 1}]
+  /\ replyCount \in [W -> 0..2]
   /\ modeEpoch \in E
   /\ fenced \in [C -> BOOLEAN]
 
@@ -60,14 +65,14 @@ Observe(w, c, e, g, res) ==
           /\ status' = [status EXCEPT ![w] = "needs_attention"]
           /\ outcome' = [outcome EXCEPT ![w] = "failure"]
        [] res = "unknown" ->
-          /\ status' = status
+          /\ status' = IF UnknownGuardEnabled THEN status ELSE [status EXCEPT ![w] = "needs_attention"]
           /\ outcome' = [outcome EXCEPT ![w] = "unknown"]
   /\ UNCHANGED <<owner, claims, replyCount, modeEpoch, fenced>>
 
 PublishReply(w) ==
   /\ status[w] = "handled"
-  /\ replyCount[w] = 0
-  /\ replyCount' = [replyCount EXCEPT ![w] = 1]
+  /\ replyCount[w] < ReplyLimit
+  /\ replyCount' = [replyCount EXCEPT ![w] = @ + 1]
   /\ UNCHANGED <<status, outcome, owner, claims, modeEpoch, fenced>>
 
 StaleArrival(w, c, e, g, res) ==
