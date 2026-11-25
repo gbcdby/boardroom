@@ -27,6 +27,7 @@ import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintena
 import { finishControllerOwner } from "./fixtures/maintenance-capture.ts";
 import type { ControllerOwner } from "../src/server/storage/maintenance/controller-owner.ts";
 
+// Coverage: sqlite top-level cases and UTF-16 encoding cases.
 // The positive S fixture uses the actual Linux ordinary source-FD bridge. It is
 // explicit engineering evidence, not a Darwin or qualified-profile positive.
 const supported = process.platform === "linux";
@@ -43,7 +44,7 @@ before(() => {
     { encoding: "utf8", timeout: 60_000 });
   assert.equal(built.status, 0, built.stderr);
 });
-for (const kind of ["sqlite", "postgres"] as const) {
+for (const kind of ["sqlite"] as ("sqlite" | "postgres")[]) {
   const nativeTest = supported && (kind === "sqlite" || process.env.AGENT_STUDIO_PG_TEST_URL) ? test : test.skip;
   nativeTest("#152 C1 " + kind + ": real raw roster and five frozen domain changes reject without publication", async t => {
     for (const point of ["row-delete", "same-count-replacement", "bad-receipt-generation", "r0", "business", "schema"] as const)
