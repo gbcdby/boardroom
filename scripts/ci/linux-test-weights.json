@@ -6,13 +6,15 @@
     "candidate": "dbadfb5a3d5870e0b49b4f7445d1bd200a00b274",
     "tree": "7e350ac75af2588206568a4802ff6205f4271916",
     "url": "https://github.com/gbcdby/boardroom/actions/runs/44254091422",
-    "scope": "303 completed file durations; scheduling estimates only",
+    "scope": "302 completed file durations + split estimates for 3 replay files; scheduling estimates only",
     "rawDurationMapSha256": "806ab386b458d4ddc47165351e83612c7f80c44110bc32d428323eee4e4dfac9",
     "provenanceSha256": "0cf68a0df90624d589ee487956d196bd1941b03802ab52c27b4ef046ef234694"
   },
   "durationMs": {
     "tests/00-maintenance-capture-failures.test.ts": 337652,
-    "tests/00-maintenance-capture-replay.test.ts": 486851,
+    "tests/memory-replay-postgres-core.test.ts": 500000,
+    "tests/memory-replay-postgres-publication.test.ts": 750000,
+    "tests/00-maintenance-capture-replay.test.ts": 300000,
     "tests/00-maintenance-capture.test.ts": 242080,
     "tests/after-commit.test.ts": 6429,
     "tests/agent-alias-integrity.test.ts": 3872,
