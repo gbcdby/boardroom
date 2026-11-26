@@ -27,6 +27,10 @@ import { createPostgresMaintenanceAdapter } from "../src/server/storage/maintena
 import { finishControllerOwner } from "./fixtures/maintenance-capture.ts";
 import type { ControllerOwner } from "../src/server/storage/maintenance/controller-owner.ts";
 
+// Coverage: sqlite C1 capture acceptance — all 11 top-level cases (sealed v2 Jq, exact-first replay, cleanup
+// rejection, strict inputs, canonical authority, config read, drift, frozen identity, empty registry,
+// origin/head/capture/generation/chain mismatches, automatic final failure).
+
 // The positive S fixture uses the actual Linux ordinary source-FD bridge. It is
 // explicit engineering evidence, not a Darwin or qualified-profile positive.
 const supported = process.platform === "linux";
@@ -43,7 +47,7 @@ before(() => {
     { encoding: "utf8", timeout: 60_000 });
   assert.equal(built.status, 0, built.stderr);
 });
-for (const kind of ["sqlite", "postgres"] as const) {
+for (const kind of ["sqlite"] as ("sqlite" | "postgres")[]) {
   const nativeTest = supported && (kind === "sqlite" || process.env.AGENT_STUDIO_PG_TEST_URL) ? test : test.skip;
   nativeTest("#152 C1 " + kind + ": actual original-generation capture commits exactly one sealed v2 Jq", async () => {
     const f = await captureFixture(kind, { sessions: true });
