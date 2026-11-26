@@ -1,19 +1,74 @@
 import Database from 'better-sqlite3';
-import {runMigrations} from '../../src/server/db/migrate.ts';
+import {runMigrations,checksumOf} from '../../src/server/db/migrate.ts';
 import {migrations} from '../../src/server/db/migrations/index.ts';
-import {readSqliteManifests} from '../../src/server/storage/maintenance/sqlite-manifests.ts';
+import {assertSqliteGuardCoverage} from '../../src/server/storage/schema-guards.ts';
+import {MaintenanceFailure} from '../../src/server/storage/maintenance/error.ts';
+import {buildDatabaseManifests,digestRowMultiset} from '../../src/server/storage/maintenance/manifests.ts';
+import {quoteSqliteIdentifier} from '../../src/server/storage/maintenance/sqlite-manifests.ts';
 import {canonicalJson,digestJson,sha256} from '../../src/server/storage/maintenance/canonical.ts';
+import type {DatabaseManifests,Json} from '../../src/server/storage/maintenance/types.ts';
 import {controlVector,historicalClient} from '../fixtures/maintenance-control-candidate.ts';
 import {sourceClientColumns} from '../../src/server/storage/maintenance/source-clients-read.ts';
 import type {ArtifactRef, ObjectKind,SourceClientRawRow} from '../../src/server/storage/maintenance/types.ts';
 import type {HistoryObservationInput,RawCell} from '../../src/server/identity/m2-history-contracts.ts';
+
+/** P0 旧源夹具必须停在 v21：v22 属于迁移后的配置权威，不进入旧库观察。 */
+const legacyMigrations = migrations.filter(m => m.version <= 21);
+
+function legacyJsonCell(value: unknown): Json {
+  if (typeof value === 'bigint') return value.toString();
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return value;
+  if (Buffer.isBuffer(value)) return {type:'blob',hex:value.toString('hex')};
+  throw new MaintenanceFailure('snapshot_invalid');
+}
+function legacyObjectRows(db: Database.Database, sql: string): Readonly<Record<string, Json>>[] {
+  return (db.prepare(sql).safeIntegers(true).all() as Record<string, unknown>[]).map(row =>
+    Object.fromEntries(Object.entries(row).map(([key, value]) => [key, legacyJsonCell(value)])));
+}
+/** Same reader as production, but validates the frozen v1–v21 source catalog instead of the global list. */
+export function readLegacySqliteManifests(db: Database.Database): DatabaseManifests {
+  try { assertSqliteGuardCoverage(db); }
+  catch { throw new MaintenanceFailure('schema_guard_incomplete'); }
+  const applied = legacyObjectRows(db, 'SELECT version,name,checksum,applied_at FROM schema_migrations ORDER BY version');
+  if (applied.length !== legacyMigrations.length || applied.some((row, i) => String(row.version) !== String(legacyMigrations[i]!.version)
+    || row.name !== legacyMigrations[i]!.name || row.checksum !== checksumOf(legacyMigrations[i]!.up)))
+    throw new MaintenanceFailure('schema_guard_incomplete');
+  const catalog = legacyObjectRows(db, 'SELECT type,name,tbl_name,sql FROM main.sqlite_schema ORDER BY type,name,tbl_name');
+  const names = catalog.filter(row => row.type === 'table').map(row => String(row.name)).sort();
+  const tables: DatabaseManifests['tables'][number][] = [];
+  for (const name of names) {
+    const columns = legacyObjectRows(db, `PRAGMA main.table_xinfo(${quoteSqliteIdentifier(name)})`);
+    if (!columns.length) throw new MaintenanceFailure('schema_guard_incomplete');
+    const expressions = columns.flatMap(column => {
+      const quoted = quoteSqliteIdentifier(String(column.name));
+      return [`typeof(${quoted})`, `CASE WHEN typeof(${quoted}) IN ('text','blob') THEN hex(${quoted}) ELSE ${quoted} END`];
+    });
+    const records = db.prepare(`SELECT ${expressions.join(',')} FROM main.${quoteSqliteIdentifier(name)}`).raw(true).safeIntegers(true).all() as unknown[][];
+    const rows: Json[] = records.map(record => columns.map((_, i): Json => {
+      const type = record[i * 2], value = record[i * 2 + 1];
+      if (type === 'null' && value === null) return ['null'];
+      if (type === 'integer' && typeof value === 'bigint') return ['integer', value.toString()];
+      if (type === 'real' && typeof value === 'number' && Number.isFinite(value)) {
+        const bytes = Buffer.alloc(8); bytes.writeDoubleBE(value); return ['real-ieee754', bytes.toString('hex')];
+      }
+      if ((type === 'text' || type === 'blob') && typeof value === 'string') return [type, value.toLowerCase()];
+      throw new MaintenanceFailure('snapshot_invalid');
+    }));
+    tables.push({name, columns, ...digestRowMultiset(rows)});
+  }
+  return buildDatabaseManifests('sqlite', {catalog, migrations: applied}, tables, {
+    storage_maintenance: legacyObjectRows(db, 'SELECT * FROM storage_maintenance ORDER BY singleton'),
+    storage_source_clients: legacyObjectRows(db, 'SELECT * FROM storage_source_clients ORDER BY client_id'),
+  });
+}
 
 /** Full original 61-table native SQLite observation, independent S4 reader/digests.
  * S4 platform/backup facts are explicit value fixtures, never qualification evidence. */
 export function p0ArtifactFixture(options:{sourceClient?:boolean;journalVersion?:2|3;client?:(vector:ReturnType<typeof controlVector>)=>{row:SourceClientRawRow;fact:unknown;runtime?:unknown};change?:(kind:string,value:any)=>void;bytes?:(kind:string,bytes:Buffer)=>Buffer}={}){
   const db=new Database(':memory:');
   try{
-    runMigrations(db,migrations);const initial=readSqliteManifests(db);
+    runMigrations(db,legacyMigrations);const initial=readLegacySqliteManifests(db);
     const f=controlVector({initialVersion:options.journalVersion??3,mechanism:{sourceIdentity:{kind:'sqlite',sourcePath:'/a12/source-alias.sqlite',sqlitePath:'/a12/source.sqlite',device:'1',inode:'2'},databaseInstanceId:'1'.repeat(32),root:{path:'/a12/control',device:'1',inode:'3',hostIdentityDigest:'b'.repeat(64)},mutex:{kind:'fixture-only-mutex'},schemaManifestDigest:initial.schemaManifestDigest,guardManifestDigest:String(initial.controlRows.storage_maintenance[0]!.guard_manifest_digest)}});
     f.captured.frozen.frozenBusinessManifestDigest=initial.frozenBusinessManifestDigest;
     const sourceClientValues:(string|bigint|null)[]=[];
@@ -29,7 +84,7 @@ export function p0ArtifactFixture(options:{sourceClient?:boolean;journalVersion?
     const captureRef=f.pack('journal',f.captured);
     db.prepare(`UPDATE storage_maintenance SET database_instance_id=?,control_root_json=?,mutex_identity_json=?,fence_epoch=2,owner_generation=7,admission='sealed',active_migration_id='a12',plan_digest=?,journal_record_ref=?,journal_digest=?,journal_sequence=2`).run(f.source.databaseInstanceId,canonicalJson(f.root),canonicalJson(f.mutex),f.planRef.sha256,captureRef.ref,captureRef.sha256);
     if(sourceClientValues.length)db.prepare(`INSERT INTO storage_source_clients (${sourceClientColumns.map(c=>c.name).join(',')}) VALUES (${sourceClientValues.map(()=>'?').join(',')})`).run(...sourceClientValues);
-    const manifests=readSqliteManifests(db);
+    const manifests=readLegacySqliteManifests(db);
     const artifacts:{kind:string;artifact:ArtifactRef;bytesHex:string}[]=f.objects.map(item=>({kind:item.reference.ref.startsWith('plans/')?'plan':item.reference.ref.startsWith('journals/')?'journal':'source-files',artifact:item.reference,bytesHex:item.bytes.toString('hex')}));
     const pack=(kind:string,value:any):ArtifactRef=>{
       options.change?.(kind,value);let bytes=kind==='database-snapshot'||kind==='source-file-payload'?Buffer.from(value):Buffer.from(canonicalJson(value));bytes=options.bytes?.(kind,bytes)??bytes;
