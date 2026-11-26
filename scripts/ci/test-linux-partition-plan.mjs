@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { planLinuxPartitions } from './linux-test-partitions.mjs';
+import { linuxTestSelection, planLinuxPartitions } from './linux-test-partitions.mjs';
 
 const names = Array.from({ length: 64 }, (_, i) => `tests/file-${String(i).padStart(2, '0')}.test.ts`);
 
@@ -38,5 +38,37 @@ test('bad or duplicate discovery and invalid scheduling costs fail closed', () =
   }
   for (const cost of [0, -1, NaN, Infinity, '100', 1.5]) {
     assert.throws(() => planLinuxPartitions(names, { [names[0]]: cost }));
+  }
+});
+
+// Weights are a content-addressed sample: a tree hash has no meaningful partial
+// distance, so the only safe threshold is zero drift from the measured candidate.
+// Rebaseline run/tree/candidate together whenever the test set or fixture cost changes.
+const MEASURED_CANDIDATE = 'ddecbccaac981b8a6063fc5295d64659d1d87731';
+const MEASURED_TREE = 'db45f712c0ee340771722cb95e799c4a8f956b89';
+const FULL_SUITE_SECONDS = 1200; // linux_isolation.py; never widened by this guard.
+const HEADROOM = 1.5;
+const SPLIT_FILES = [
+  'tests/00-maintenance-capture.test.ts',
+  'tests/memory-replay-zcapture-postgres-basics.test.ts',
+  'tests/memory-replay-zcapture-postgres-drift.test.ts',
+  'tests/memory-replay-zcapture-postgres-failures.test.ts',
+];
+
+test('real plan stays inside the full-suite budget and weights match the measured v22 candidate', () => {
+  const selection = linuxTestSelection('1/16');
+  assert.equal(selection.estimatesSource.candidate, MEASURED_CANDIDATE, 'weights must be rebaselined on a new candidate');
+  assert.equal(selection.estimatesSource.tree, MEASURED_TREE, 'weights tree drift invalidates duration samples');
+  const selected = selection.plan.flatMap(shard => shard.entries);
+  assert.deepEqual(selected.toSorted(), selection.entries.toSorted());
+  assert.equal(new Set(selected).size, selection.entries.length);
+  // 1200 / 1.5 = 800s (not 700s); 700s is reserved for the split files below.
+  const budgetMs = FULL_SUITE_SECONDS / HEADROOM * 1000;
+  assert.ok(Math.max(...selection.plan.map(shard => shard.estimatedMs)) <= budgetMs,
+    `max shard estimate exceeds ${budgetMs / 1000}s budget`);
+  for (const path of SPLIT_FILES) {
+    const shard = selection.plan.find(entry => entry.entries.includes(path));
+    assert.ok(shard, `${path} missing from real plan`);
+    assert.ok(shard.estimatedMs < 700_000, `${path} shard exceeds 700s budget`);
   }
 });
