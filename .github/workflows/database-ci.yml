@@ -225,9 +225,9 @@ jobs:
         partition: ['1/16', '2/16', '3/16', '4/16', '5/16', '6/16', '7/16', '8/16', '9/16', '10/16', '11/16', '12/16', '13/16', '14/16', '15/16', '16/16']
     runs-on: ubuntu-24.04
     # CI231's outer 900s expired while the full suite still progressed.
-    # Allow the bounded 26-minute suite transport plus preparation and post-suite
+    # Allow the bounded 30-minute suite transport plus preparation and post-suite
     # SDK/restart/cleanup time. Individual tests, diagnostics and guest limits stay fixed.
-    timeout-minutes: 36
+    timeout-minutes: 40
 
     services:
       postgres:
@@ -378,8 +378,10 @@ jobs:
         run: python3 scripts/ci/linux_isolation.py sqlite
 
       - name: 全量测试（启用 PostgreSQL 门控用例）
-        # Archives + outer deadline + both reap waits + final reap: 1515s.
-        timeout-minutes: 26
+        # Archives + 1440s partitioned inner budget + 120s supervisor slack + both reap
+        # waits + final reap: about 1755s; the 30-minute step envelope remains bounded
+        # and below the job timeout.
+        timeout-minutes: 30
         env:
           AGENT_STUDIO_PG_TEST_URL: postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci
           BOARDROOM_CI_TEST_PARTITION: ${{ matrix.partition }}

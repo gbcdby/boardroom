@@ -28,7 +28,11 @@ ENTRIES = ('sqlite', 'full-suite', 'pg-native')
 FULL_SUITE_PARTITIONS = tuple(f'{index}/16' for index in range(1, 17))
 # CI231 reached 2041 passing top-level tests before the old outer 900s limit.
 # Keep the full-suite budget separate from supervisor setup and final receipts.
-FULL_SUITE_SECONDS = 1200
+# A historical reporter summary (run 45917383802, Linux 6/16 job) showed about 1267s,
+# so 1200s was too tight for the partitioned entry. 1440s is bounded and does not
+# change individual test timeouts; the unpartitioned entry keeps its original 1200s.
+FULL_SUITE_SECONDS = 1440
+UNPARTITIONED_FULL_SUITE_SECONDS = 1200
 FULL_SUITE_SUPERVISOR_SECONDS = FULL_SUITE_SECONDS + 120
 CAP_FIELDS = ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')
 PG_URL = 'postgres://boardroom:boardroom-ci-only@127.0.0.1:5432/boardroom_ci'
@@ -908,7 +912,9 @@ def supervise(stage, cleanup_only=False):
                     '--inh-caps=-all', '--ambient-caps=-all', '--bounding-set=-all', '--no-new-privs',
                     '/usr/bin/python3', '-I', str(stage / 'launcher.py'), '--child', str(stage)]
             report['execution'] = run_command(argv, stage, {'PATH': SYSTEM_PATH},
-                                              timeout=FULL_SUITE_SECONDS if request['entry'] == 'full-suite' else 900)
+                                              timeout=((FULL_SUITE_SECONDS if request.get('partition')
+                                                        else UNPARTITIONED_FULL_SUITE_SECONDS)
+                                                       if request['entry'] == 'full-suite' else 900))
             execution = report['execution']
             report['command_exit'] = 124 if execution['timed_out'] else execution['returncode']
             if execution['signal'] and report['command_exit'] == 0:
