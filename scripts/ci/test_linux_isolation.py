@@ -98,6 +98,11 @@ class WholeSuiteBudgetContracts(unittest.TestCase):
         self.assertTrue(result['reaped'])
         self.assertEqual(signals, [signal.SIGTERM])
 
+    def test_partitioned_budget_is_bounded_and_unpartitioned_stays_original(self):
+        self.assertEqual(ci.FULL_SUITE_SECONDS, 1440)
+        self.assertEqual(ci.UNPARTITIONED_FULL_SUITE_SECONDS, 1200)
+        self.assertEqual(ci.FULL_SUITE_SUPERVISOR_SECONDS, 1560)
+
     def test_other_entry_and_existing_reap_graces_are_unchanged(self):
         self.assertEqual(self.configured('supervise', 'sqlite'), {'timeout': 900, 'grace': 5})
         self.assertEqual(self.configured('frontend', 'sqlite'), {'timeout': 900, 'grace': 35})
