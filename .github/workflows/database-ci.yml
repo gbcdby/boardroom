@@ -302,7 +302,13 @@ jobs:
         id: pg_restart_tools
         shell: bash
         run: |
-          sudo apt-get update
+          # apt-get update 可能因 hosted runner 的部分 apt 源返回错误而失败；
+          # 容忍该阶段失败并继续检查，必需 PostgreSQL 16.15 包仍由下游脚本严格校验，缺失时 fail closed。
+          apt_update_status=0
+          sudo apt-get update || apt_update_status=$?
+          if (( apt_update_status != 0 )); then
+            printf '::warning::apt-get update 失败（exit code %s）；继续按必需包校验结果判定。\n' "$apt_update_status"
+          fi
           apt-cache policy postgresql-client-16
           bash scripts/prepare-ci-pg16-tools.sh
 
