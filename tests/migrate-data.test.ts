@@ -195,14 +195,15 @@ const FK_DEPS: Record<string, string[]> = {
   task_message_links: ["projects", "tasks", "messages", "groups"],
   work_events: ["projects", "tasks", "members", "groups"],
   memory_documents: ["projects", "agents"], memory_versions: ["memory_documents"],
+  memory_object_refs: ["memory_documents", "memory_versions", "projects", "agents"],
   memory_summary_requests: ["projects", "agents", "members", "groups", "tasks", "memory_documents"],
   memory_message_receipts: ["projects", "agents", "groups", "messages"],
   memory_trigger_counters: ["projects", "agents", "groups"], memory_scan_checkpoints: ["projects", "agents", "groups"],
 };
 
-test("业务表清单：58 张表含 v19 MCP、v20 Decision 与 v21 WorkEvent 失效边车、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
+test("业务表清单：59 张表含 v19 MCP、v20 Decision、v21 WorkEvent 失效边车与 v23 对象引用、不含 schema_migrations、外键顺序合法且事实版本最后复制", () => {
   const names = BUSINESS_TABLES.map((t) => t.name);
-  assert.equal(names.length, 58);
+  assert.equal(names.length, 59);
   assert.ok(names.includes("work_event_delivery_invalidations"));
   assert.equal(names.at(-1), "member_fact_revisions");
   assert.ok(!names.includes("schema_migrations"));
@@ -230,7 +231,7 @@ test("业务表清单：58 张表含 v19 MCP、v20 Decision 与 v21 WorkEvent �
     "agent_runtime_observation_meta",
     "agent_runtime_usage_snapshots",
     "project_task_settings", "tasks", "task_review_rounds", "task_review_reports", "task_comments", "task_history", "task_message_links", "work_events",
-    "memory_documents", "memory_versions", "memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints",
+    "memory_documents", "memory_versions", "memory_object_refs", "memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints",
   ]) {
     assert.ok(names.includes(expected), `缺少业务表 ${expected}`);
   }
@@ -367,7 +368,7 @@ test("回滚：清空目标业务表，源库不受影响；可重新迁移恢�
       for (const table of MCP_TABLES) assert.ok(migrated.validation.tables.find(row => row.table === table)!.targetCount > 0, `${table} 需实际复制`);
 
       const rb = await rollbackTarget(dstOpts);
-      assert.equal(rb.clearedTables.length, 58);
+      assert.equal(rb.clearedTables.length, 59);
       for (const table of MCP_TABLES) assert.ok(rb.clearedTables.includes(table), `${table} 需参与clear`);
       const emptied = createDbDriver(dstOpts); await emptied.connect();
       try { for (const table of MCP_TABLES) assert.equal((await emptied.query(`SELECT * FROM ${table}`)).length, 0, `${table} 未清空`); }

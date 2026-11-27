@@ -51,7 +51,7 @@ for(const engine of ['sqlite','postgres'] as const)for(const corruption of ['R-1
   });
 }
 
-test("M1 SQLite 58 表每表非空，所有真实列原值保持、源与1–19记录不变、目标有独立维护身份", async () => {
+test("M1 SQLite 59 表每表非空，所有真实列原值保持、源与1–19记录不变、目标有独立维护身份", async () => {
   const source = await m1Sqlite(true), target = await m1Sqlite();
   await withM1Cleanup(async () => {
     const before = await m1Capture(source.db), oracle = await m1ValueOracle(source.db);
@@ -63,7 +63,7 @@ test("M1 SQLite 58 表每表非空，所有真实列原值保持、源与1–19�
     assert.notEqual(targetIdentity, sourceIdentity);
     const report = await migrateData(source.options, target.options);
     assert.equal(report.validation.ok, true);
-    assert.equal(Object.keys(report.perTableCounts).length, 58);
+    assert.equal(Object.keys(report.perTableCounts).length, 59);
     assert.ok(Object.values(report.perTableCounts).every(count => count > 0));
     assert.deepEqual(oracle(await m1Capture(target.db)), oracle(before));
     assert.deepEqual(await m1Capture(source.db), before);
@@ -76,7 +76,7 @@ test("M1 SQLite 58 表每表非空，所有真实列原值保持、源与1–19�
   }, [source.close, target.close]);
 });
 
-test("M1 SQLite↔真实PG 58 表全列原值；完整生产catalog、原M1镜像catalog与省略pgSchema均支持", {
+test("M1 SQLite↔真实PG 59 表全列原值；完整生产catalog、原M1镜像catalog与省略pgSchema均支持", {
   skip: !m1PgUrl ? "真实 PostgreSQL 未配置" : false,
 }, async () => {
   const source = await m1Sqlite(true), production = await m1Postgres(), back = await m1Sqlite();

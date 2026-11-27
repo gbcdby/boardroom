@@ -160,6 +160,7 @@ export interface PurgeCounts {
   readonly workEventInvalidations: number;
   readonly memoryDocuments: number;
   readonly memoryVersions: number;
+  readonly memoryObjectRefs: number;
   readonly memorySummaryRequests: number;
   readonly memoryMessageReceipts: number;
   readonly memoryTriggerCounters: number;
@@ -622,6 +623,7 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
   const managed = await hasRuntimeSchema(ctx);
   const tasks = await hasTasksSchema(ctx);
   const memory = await hasMemorySchema(ctx);
+  const memoryObjectRefs = await hasMemoryObjectRefs(ctx);
   const policies = await hasPolicyConfigurationSchema(ctx);
   const decisions = await hasDecisionSchema(ctx);
   return {
@@ -643,6 +645,7 @@ async function projectPurgeCounts(ctx: RepoCtx, projectId: string): Promise<Purg
     memberFactRevisions: await hasMemberLifecycleSchema(ctx) ? await count('SELECT COUNT(*) AS c FROM member_fact_revisions WHERE member_id IN (SELECT id FROM members WHERE project_id = ?)') : 0,
     memoryDocuments: memory ? await count("SELECT COUNT(*) AS c FROM memory_documents WHERE project_id = ?") : 0,
     memoryVersions: memory ? await count("SELECT COUNT(*) AS c FROM memory_versions WHERE document_id IN (SELECT id FROM memory_documents WHERE project_id = ?)") : 0,
+    memoryObjectRefs: memoryObjectRefs ? await count("SELECT COUNT(*) AS c FROM memory_object_refs WHERE document_id IN (SELECT id FROM memory_documents WHERE project_id = ?)") : 0,
     memorySummaryRequests: memory ? await count("SELECT COUNT(*) AS c FROM memory_summary_requests WHERE project_id = ?") : 0,
     memoryMessageReceipts: memory ? await count("SELECT COUNT(*) AS c FROM memory_message_receipts WHERE project_id = ?") : 0,
     memoryTriggerCounters: memory ? await count("SELECT COUNT(*) AS c FROM memory_trigger_counters WHERE project_id = ?") : 0,
@@ -715,6 +718,10 @@ async function hasTasksSchema(ctx: RepoCtx): Promise<boolean> {
 /** v12 之前的迁移 fixture 没有记忆表与 work_events 群绑定列。 */
 async function hasMemorySchema(ctx: RepoCtx): Promise<boolean> {
   return (await ctx.one("SELECT version FROM schema_migrations WHERE version = 12")) !== undefined;
+}
+
+async function hasMemoryObjectRefs(ctx: RepoCtx): Promise<boolean> {
+  return (await ctx.one("SELECT version FROM schema_migrations WHERE version = 23")) !== undefined;
 }
 
 export async function hasMemberLifecycleSchema(ctx: RepoCtx): Promise<boolean> {
@@ -1079,6 +1086,7 @@ function createProjects(ctx: RepoCtx, mutations: MutationScopeCoordinator, db: D
           for (const table of ["memory_summary_requests", "memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints"]) {
             await ctx.exec(`DELETE FROM ${table} WHERE project_id = ?`, [id]);
           }
+          if (await hasMemoryObjectRefs(ctx)) await ctx.exec("DELETE FROM memory_object_refs WHERE document_id IN (SELECT id FROM memory_documents WHERE project_id = ?)", [id]);
           await ctx.exec("DELETE FROM memory_versions WHERE document_id IN (SELECT id FROM memory_documents WHERE project_id = ?)", [id]);
           await ctx.exec("DELETE FROM memory_documents WHERE project_id = ?", [id]);
         }
