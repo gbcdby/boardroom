@@ -6,12 +6,12 @@ import { identityFixture } from './helpers/identity-fixture.ts';
 import { DECISION_MIGRATION_TABLES, seedDecisionMigrationSource } from './helpers/decisions-migration-fixture.ts';
 import { validateDecisionStorageGraph } from '../src/server/decisions/storage-validation.ts';
 
-test('M1 source fixture contains all 58 historical/current tables without opening an external runtime',async()=>{
+test('M1 source fixture contains all 59 historical/current tables without opening an external runtime',async()=>{
   const f=await identityFixture('sqlite');
   try {
     const result=await seedDecisionMigrationSource(f.db);
-    assert.equal(DECISION_MIGRATION_TABLES.length,58);
-    assert.equal(new Set(DECISION_MIGRATION_TABLES).size,58);
+    assert.equal(DECISION_MIGRATION_TABLES.length,59);
+    assert.equal(new Set(DECISION_MIGRATION_TABLES).size,59);
     assert.ok(Object.values(result.counts).every(n=>n>0));
     assert.equal((await f.db.query('SELECT revision FROM mcp_connections WHERE id=?',['connection-copy']))[0]!.revision,Number.MAX_SAFE_INTEGER);
     const data:Record<string,Record<string,unknown>[]>={};

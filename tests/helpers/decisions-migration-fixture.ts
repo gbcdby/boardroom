@@ -14,9 +14,9 @@ import { canonicalJson } from '../../src/server/policy/canonical.ts';
 import { createOrgMutationService } from '../../src/server/org/mutations.ts';
 import { ownerActor } from '../../src/server/authz/actors.ts';
 
-export const DECISION_MIGRATION_TABLES = ['mcp_connections', 'mcp_connection_versions', 'mcp_catalog_snapshots', 'mcp_catalog_heads', 'mcp_connection_mutations', 'mcp_discovery_attempts', 'agents', 'agent_legacy_aliases', 'role_templates', 'role_template_versions', 'projects', 'policy_documents', 'policy_document_versions', 'project_workspace_versions', 'memory_documents', 'memory_versions', 'org_nodes', 'members', 'project_task_settings', 'tasks', 'task_review_rounds', 'task_review_reports', 'task_comments', 'task_history', 'groups', 'work_events', 'memory_summary_requests', 'memory_trigger_counters', 'memory_scan_checkpoints', 'group_participants', 'messages', 'memory_message_receipts', 'task_message_links', 'message_deliveries', 'member_statuses', 'mcp_sessions', 'audit_log', 'work_event_delivery_invalidations', 'agent_runtimes', 'agent_runtime_bindings', 'agent_runner_states', 'agent_runtime_members', 'agent_runtime_events', 'agent_runtime_observation_meta', 'agent_runtime_usage_snapshots', 'decision_legacy_records', 'decision_action_requests', 'decision_records', 'decision_review_heads', 'decision_user_events', 'decision_local_initiations', 'decision_resolutions', 'decision_executions', 'decision_command_receipts', 'decision_review_projections', 'decision_change_heads', 'decision_changes', 'member_fact_revisions'] as const;
+export const DECISION_MIGRATION_TABLES = ['mcp_connections', 'mcp_connection_versions', 'mcp_catalog_snapshots', 'mcp_catalog_heads', 'mcp_connection_mutations', 'mcp_discovery_attempts', 'agents', 'agent_legacy_aliases', 'role_templates', 'role_template_versions', 'projects', 'policy_documents', 'policy_document_versions', 'project_workspace_versions', 'memory_documents', 'memory_versions', 'memory_object_refs', 'org_nodes', 'members', 'project_task_settings', 'tasks', 'task_review_rounds', 'task_review_reports', 'task_comments', 'task_history', 'groups', 'work_events', 'memory_summary_requests', 'memory_trigger_counters', 'memory_scan_checkpoints', 'group_participants', 'messages', 'memory_message_receipts', 'task_message_links', 'message_deliveries', 'member_statuses', 'mcp_sessions', 'audit_log', 'work_event_delivery_invalidations', 'agent_runtimes', 'agent_runtime_bindings', 'agent_runner_states', 'agent_runtime_members', 'agent_runtime_events', 'agent_runtime_observation_meta', 'agent_runtime_usage_snapshots', 'decision_legacy_records', 'decision_action_requests', 'decision_records', 'decision_review_heads', 'decision_user_events', 'decision_local_initiations', 'decision_resolutions', 'decision_executions', 'decision_command_receipts', 'decision_review_projections', 'decision_change_heads', 'decision_changes', 'member_fact_revisions'] as const;
 
-/** SQLite原始58表非空源；所有runtime/MCP数据是历史fixture，不启动实例或外部发现。 */
+/** SQLite原始59表非空源；所有runtime/MCP数据是历史fixture，不启动实例或外部发现。 */
 export async function seedDecisionMigrationSource(db:DbDriver) {
   assert.equal(db.kind,"sqlite");
     seedSampleData((db as SqliteDriver).handle);
@@ -64,11 +64,18 @@ export async function seedDecisionMigrationSource(db:DbDriver) {
       { scope: "project" as const, projectId: "pr1", agentId: null },
       { scope: "project-agent" as const, projectId: "pr1", agentId: "ag1" }]) {
       const markdown = `# ${key.scope} 记忆 🧠`;
+      const contentSha256 = createHash("sha256").update(markdown).digest("hex");
       const doc: MemoryDocument = { id: `memory-${key.scope}`, key, version: 1, markdown, byteLength: Buffer.byteLength(markdown), updatedAt: at, updatedBy: memoryAuthor, source: "human" };
       await repos.memory.insertHead(doc);
       await repos.memory.insertVersion({ id: `version-${key.scope}`, documentId: doc.id, version: 1, parentVersion: 0, markdown,
-        byteLength: doc.byteLength, contentSha256: createHash("sha256").update(markdown).digest("hex"), author: memoryAuthor, source: "human",
+        byteLength: doc.byteLength, contentSha256, author: memoryAuthor, source: "human",
         clientMutationId: `copy-${key.scope}`, summaryRequestId: null, createdAt: at });
+      await db.exec(`INSERT INTO memory_object_refs
+        (id, document_id, version, scope, project_id, agent_id, document_kind,
+         body_storage_id, body_object_format, body_content_sha256, byte_length, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [`object-ref-${key.scope}`, doc.id, doc.version, key.scope, key.projectId, key.agentId,
+        "note", `body-${key.scope}`, "raw", contentSha256, doc.byteLength, at]);
     }
     await repos.deliveries.markMcpDelivered("msg1", "mb1", at);
     await db.exec("UPDATE message_deliveries SET id = 'md3' WHERE message_id = 'msg1' AND member_id = 'mb1'");

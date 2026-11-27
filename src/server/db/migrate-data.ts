@@ -104,6 +104,9 @@ export const BUSINESS_TABLES: readonly TableSpec[] = [
     "mutation_id", "input_digest", "updated_at"] },
   { name: "memory_documents", keyColumns: ["id"] },
   { name: "memory_versions", keyColumns: ["id"] },
+  { name: "memory_object_refs", keyColumns: ["id"],
+    valueColumns: ["document_id", "version", "scope", "project_id", "agent_id", "document_kind",
+      "body_storage_id", "body_object_format", "body_content_sha256", "byte_length", "created_at"] },
   {
     name: "org_nodes",
     keyColumns: ["id"],

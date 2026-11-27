@@ -85,6 +85,7 @@ export async function purgeImpactDigest(ctx: RepoCtx, kind: "project" | "group",
     if (project) {
       await capture("memory_documents", "project_id = ?");
       await capture("memory_versions", "document_id IN (SELECT id FROM memory_documents WHERE project_id = ?)");
+      if (versions.has(23)) await capture("memory_object_refs", "document_id IN (SELECT id FROM memory_documents WHERE project_id = ?)");
     } else await capture("work_events", "context_group_id = ?");
     await capture("memory_summary_requests", project ? "project_id = ?" : "context_group_id = ?");
     for (const table of ["memory_message_receipts", "memory_trigger_counters", "memory_scan_checkpoints"]) await capture(table, scope);

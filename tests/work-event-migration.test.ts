@@ -50,12 +50,12 @@ for (const engine of identityEngines) test(`${engine}: WL09 failed v21 remains a
   } finally { await f.close(); }
 });
 
-test('WL10/11 SQLite 58-table source validates exact audit closure; sidecar tampering rejects copy; purge and clear preserve other graphs', async () => {
+test('WL10/11 SQLite 59-table source validates exact audit closure; sidecar tampering rejects copy; purge and clear preserve other graphs', async () => {
   const source = await m1Sqlite(), target = await m1Sqlite();
   await withM1Cleanup(async () => {
     await seedDecisionMigrationSource(source.db);
     const before = await m1Capture(source.db); validateWorkEventInvalidations(before);
-    assert.equal(BUSINESS_TABLES.length, 58);
+    assert.equal(BUSINESS_TABLES.length, 59);
     const rows = before.work_event_delivery_invalidations!; assert.equal(rows.length, 3);
     assert.ok(source.db instanceof SqliteDriver);
     const raw=source.db.handle;assertSqliteGuardCoverage(raw);
