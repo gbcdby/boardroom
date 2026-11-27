@@ -15,6 +15,7 @@ import { policyConfigurationMigration } from "./policy-configuration.ts";
 import { storageMaintenanceMigration } from "./storage-maintenance.ts";
 import { mcpConnectionsMigration } from "./mcp-connections.ts";
 import { profileConfigAuthorityV22Migration } from "./profile-config-authority-v22.ts";
+import { memoryObjectRefsV23Migration } from "./memory-object-refs-v23.ts";
 
 /**
  * 生产迁移列表。
@@ -454,4 +455,5 @@ export const migrations: readonly Migration[] = [
   decisionsMigration,
   workEventDeliveryInvalidationsMigration,
   profileConfigAuthorityV22Migration,
+  memoryObjectRefsV23Migration,
 ];

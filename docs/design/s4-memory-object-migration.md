@@ -1,9 +1,9 @@
 # S4-T3 不可变记忆对象：只读兼容迁移设计（候选 A）
 
-状态：草案  
-日期：2026-11-25  
+状态：草案 + 总控裁决已登记（2026-11-27）
+日期：2026-11-25；裁决 2026-11-27
 关联：GitHub Issue #161（S4-T3，产物 `S4/memory-object-authority`）；依赖 #152 命名产物释放；v2 切换归 #162 activation binding  
-适用基线：当前 main 的 21 条生产迁移（v1–v21），迁移号由总控串行分配
+适用基线：裁决时 main `0fee6178…` 的 22 条生产迁移（v1–v22，v22 归 M2）；总控已赋号下一片为 **v23**
 
 ## 0. 本包边界（先读）
 
@@ -157,9 +157,15 @@
 - 当前生产迁移数仍 **21**：`src/server/db/migrations/index.ts:35-455` 含 v1–v21，最大普通号见 `work-event-delivery-invalidations.ts:20`。本包不新增条目，`schema_migrations` 不变。
 - **checksum 机制**：`src/server/db/migrate.ts:24-27` 先按方言解析 `upPostgres`（PG）或回退 `up`；`:182-187` 的 `checksumOf(sql)` 是 `createHash('sha256').update(sql).digest('hex').slice(0, 16)`。两方言独立；旧 checksum 不接受改动（`:79-87` 在迁移前校验已应用行的 checksum）。草案 SQL 尚未注册，故没有也不应生成正式 checksum。
 
-## 5. 与冻结合同的偏差：待总控裁决项
+## 5. 与冻结合同的偏差：总控裁决（2026-11-27，用户选 A）
 
-已从 `src/server/storage/maintenance/layout-publication/fixed-sources.ts:10-11` 解出冻结的 `s4p-allowed-delta-contract/r1`（原文为 inert base64 字节，状态 `PROPOSED`）：
+> **裁决状态：已裁决。** 用户在本轮明确选择方案 A，总控在 #161 评论 `7205987338` 书面登记三项裁决：
+
+1. **赋号 v23**：#161 的 schema 迁移号正式为 v23（v22 归 M2 已落地 main `0fee6178…`）；双库 `up/upPostgres` 各自独立 checksum，旧 checksum 不改。
+2. **合同偏差裁决：采纳方案一（新建独立 `memory_object_refs` 表）**，修订 `s4p-allowed-delta-contract/r1` 的 PROPOSED 形状（原要求 memory_documents +4 列 / memory_versions +2 列）。理由：独立表不改旧列、不回填、旧 markdown 仍唯一权威，满足票面「不改旧 checksum、v1 未激活前旧路径唯一权威」；方案二加列会触及冻结的 collector 列清单与 v22 后 PG 指纹，边界更大。
+3. **#162 边界**：候选 B **只创建结构**（惰性只加表），不回填、不切换默认读写、不激活 v2、不改旧 markdown 权威；所有激活逻辑（格式选择、v1→v2 路由、journal、回退）**全部保留给 #162**。候选 B 不提前实现 #162 activation binding。
+
+以下为裁决前的偏差记录（保留作为依据）：
 
 - `sourceCatalog: M2-P1-72-tables-763-columns`；
 - `targetLogicalCatalog: S4-layout-73-tables-776-columns`；
@@ -262,16 +268,16 @@ ALTER TABLE memory_versions ADD COLUMN body_object_format TEXT;
 
 本片不实现。候选 B 的范围限定为：**总控赋号后**，在双库惰性创建经裁决的新表／新列结构；不回填、不切换默认读写、不激活 v2、不改旧 markdown 权威。
 
-### 7.1 进入判据
+### 7.1 进入判据（三项治理前置已于 2026-11-27 由用户选 A + 总控裁决满足）
 
-- #152 命名产物已释放，#161 迁移号由总控明确分配，v22 仍归属 M2；
-- §5 裁决项有书面结论，`s4p-allowed-delta-contract` 或替代合同的修订已冻结；
-- #162 activation binding 的接口边界已确认，候选 B 的改动不提前实现其激活逻辑；
-- 真实候选固定提交/tree、独立需求轴与标准轴审查完成。
+- #152 命名产物已释放；#161 迁移号由总控赋号 **v23**（#161 评论 `7205987338`），v22 仍归属 M2 并已落地 main；
+- §5 裁决项已书面结论：采纳方案一（新建独立 `memory_object_refs` 表），`s4p-allowed-delta-contract/r1` 的修订以本裁决 + 本文档 §5 记录为准（PROPOSED 合同被本裁决修订，后续以 docs/design 为准）；
+- #162 边界已确认：候选 B 只创建结构、不提前实现激活逻辑，激活（格式选择 / v1→v2 路由 / journal / 回退）全部留 #162；
+- 真实候选固定提交/tree、独立需求轴与标准轴审查完成（实现阶段另行取得）。
 
 ### 7.2 验收判据
 
-1. 迁移只注册于总控分配的单一号码；SQLite/PG catalog 各自 checksum 按 `sha256(sql).hex().slice(0,16)` 独立计算；`schema_migrations` 仅追加该行，v1–v21 旧 checksum 不变，迁移数按赋号递增。
+1. 迁移只注册于总控分配的单一号码 **v23**；SQLite/PG catalog 各自 checksum 按 `sha256(sql).hex().slice(0,16)` 独立计算；`schema_migrations` 仅追加该行，v1–v22 旧 checksum 不变，迁移数从 22 递增到 23。
 2. 旧读写路径与 v1 权威不变；未激活时旧 markdown 仍可完整读写，DB head 不领先耐久正文，新结构没有隐式成为权威；旧 wire global 仍 Agent 私有、不扩权，旧文档按 note 保留，规则与自动摘要写权分离（issue #161）。
 3. M1 `BUSINESS_TABLES` / PG 镜像 / `M1_READ_PLAN`、`REVERSE_TABLE_ORDER` 覆盖新增结构；双库 copy/clear 往返保持非空表真实行与顺序。
 4. `purgeImpactDigest` 的项目/群 capture、`projectPurgeCounts` / `groupPurgeCounts` 与显式 DELETE 顺序一致；`expectedDigest` 变化能阻止删除。

@@ -22,7 +22,7 @@ async function tableExists(db: DbDriver, engine: "sqlite" | "postgres", name: st
 }
 
 for (const engine of ["sqlite", "postgres"] as const) {
-  test(`${engine} v21→v22 非空升级保留旧数据/旧 checksum，并只新增核心配置表`, { skip: skip(engine) }, async () => {
+  test(`${engine} v22 受控夹具回钉 v21，全量升级到 v23：旧数据/旧 checksum 不变，只新增核心配置表`, { skip: skip(engine) }, async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "profile-config-v22-"));
     const schema = `pcfg_v22_${randomUUID().replaceAll("-", "")}`;
     const db = createDbDriver(engine === "sqlite" ? { dbDriver: "sqlite", dataDir: dir }
@@ -45,8 +45,8 @@ for (const engine of ["sqlite", "postgres"] as const) {
       assert.equal((await tableExists(db, engine, "config_authority")), false);
 
       const result = await db.migrate(migrations);
-      assert.equal(result.version, 22);
-      assert.deepEqual(result.applied.map(m => m.version), [22]);
+      assert.equal(result.version, 23);
+      assert.deepEqual(result.applied.map(m => m.version), [22, 23]);
       assert.deepEqual(await db.query("SELECT * FROM agents ORDER BY 1"), before.agents);
       assert.deepEqual(await db.query("SELECT * FROM messages ORDER BY 1"), before.messages);
       const after = (await db.migrationState()).applied;
