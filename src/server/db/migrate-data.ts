@@ -41,6 +41,7 @@ import { mcpConnectionsMigration } from "./migrations/mcp-connections.ts";
 import { decisionsMigration } from "./migrations/decisions.ts";
 import { workEventDeliveryInvalidationsMigration } from "./migrations/work-event-delivery-invalidations.ts";
 import { profileConfigAuthorityV22Migration } from "./migrations/profile-config-authority-v22.ts";
+import { memoryObjectRefsV23Migration } from "./migrations/memory-object-refs-v23.ts";
 import { DECISION_TABLES } from "../decisions/tables.ts";
 import { validateDecisionStorageGraph } from "../decisions/storage-validation.ts";
 import { WORK_EVENT_INVALIDATION_COLUMNS, validateWorkEventInvalidations } from "../tasks/work-event-storage.ts";
@@ -379,6 +380,7 @@ export const PG_BUSINESS_SCHEMA_MIGRATIONS: readonly Migration[] = [
   decisionsMigration,
   workEventDeliveryInvalidationsMigration,
   profileConfigAuthorityV22Migration,
+  memoryObjectRefsV23Migration,
 ];
 
 /** Both complete, already-existing PG catalogs remain legal sources. No mixed checksum catalog. */

@@ -25,7 +25,7 @@ for (const engine of identityEngines) test(`${engine}: WL09 v19→v20→v21 pres
     await f.db.migrate(migrations.filter(m => m.version <= 20));
     const versions = await f.db.migrationState(), members = await f.db.query('SELECT * FROM members');
     assert.equal(versions.version, 20);
-    assert.equal((await f.db.migrate(migrations)).version, 22);
+    assert.equal((await f.db.migrate(migrations)).version, 23);
     assert.deepEqual((await f.db.migrationState()).applied.slice(0,20), versions.applied);
     assert.deepEqual(await f.db.query('SELECT * FROM audit_log ORDER BY id'), before);
     assert.deepEqual(await f.db.query('SELECT * FROM members'), members);
