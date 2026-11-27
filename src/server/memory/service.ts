@@ -17,6 +17,8 @@ import type { TaskAccess } from "../tasks/service.ts";
 import type { MemoryInjectionReader } from "./injection-reader.ts";
 import { assertMemoryMarkdown, truncateGraphemes, unavailableMemory } from "./injection.ts";
 import { MemoryError } from "./errors.ts";
+import { createDurableHeadCommitter, type DurableHeadCommitResult } from "./durable-head-commit.ts";
+import type { MemoryObjectStore } from "./object-store.ts";
 import { reconcileMessageThresholdPage, reconcileTaskCompletionPage } from "./triggers.ts";
 import { discoverDomainMutation, type DomainMutationTargets } from "../mutation-access.ts";
 
@@ -27,6 +29,8 @@ export interface MemoryService {
   history(access: MemoryAccess, key: MemoryKey, beforeVersion?: number): Promise<MemoryVersion[]>;
   readVersion(access: MemoryAccess, key: MemoryKey, version: number): Promise<MemoryVersion | null>;
   write(access: MemoryAccess, key: MemoryKey, input: WriteMemoryInput): Promise<WriteMemoryResult>;
+  /** Explicit seam caller only: ordinary write()/submitSummary() stay on v1. */
+  writeDurable(access: MemoryAccess, key: MemoryKey, input: WriteMemoryInput): Promise<DurableHeadCommitResult>;
   inject(access: MemoryAccess): Promise<MemoryInjection>;
   reconcileTriggers(access: MemoryAccess): Promise<{ scheduled: number }>;
   reportSessionEnd(access: MemoryAccess, clientMutationId: string): Promise<{ summaryScheduled: boolean; requestId: string | null; errorCode?: string }>;
@@ -44,6 +48,7 @@ export interface MemoryServiceOptions {
   injectionReader: MemoryInjectionReader;
   readVisibleMessages: (access: MemoryAccess, ids: readonly string[]) => Promise<MemorySummaryPacket["messages"]>;
   onWorkEvents?: (events: readonly WorkEvent[]) => void | Promise<void>;
+  objectStore?: MemoryObjectStore;
 }
 type Context = { projectId: string; actor: Actor; member: Member | null; author: MemoryAuthor; at: string; events: WorkEvent[] };
 type Outcome<T> = { value: T; error?: never } | { error: MemoryError; value?: never };
@@ -92,6 +97,7 @@ function validateEvidence(evidence: SelfSummaryEvidence, markdown: string): void
 export function createMemoryService(options: MemoryServiceOptions): MemoryService {
   const { repos } = options;
   const config = resolveMemoryConfig(options.config);
+  const committer = options.objectStore ? createDurableHeadCommitter({ repos, store: options.objectStore, config }) : null;
   const now = () => (options.now?.() ?? new Date()).toISOString();
   function projectOf(access: MemoryAccess, key: MemoryKey): string {
     validKey(key);
@@ -322,6 +328,20 @@ export function createMemoryService(options: MemoryServiceOptions): MemoryServic
       const projectId = projectOf(access, key); identifier(input.clientMutationId); integer(input.expectedVersion);
       if (typeof input.markdown !== "string") throw new MemoryError("memory_invalid_input", "记忆正文必须是 Markdown 文本。");
       return mutate(access, projectId, ctx => writeDocument(ctx, key, input), "write", { agentIds: [key.agentId] });
+    },
+    async writeDurable(access, key, input) {
+      if (!committer) throw new MemoryError("memory_durable_write_unavailable", "未配置耐久对象存储。", "write_failed");
+      const projectId = projectOf(access, key); identifier(input.clientMutationId); integer(input.expectedVersion);
+      if (typeof input.markdown !== "string") throw new MemoryError("memory_invalid_input", "记忆正文必须是 Markdown 文本。");
+      const preflight = await actorFor(access, projectId, true);
+      await requireKey(preflight, key, true);
+      const prepared = await committer.prepare(input.markdown);
+      return mutate(access, projectId, async ctx => {
+        await requireKey(ctx, key, true);
+        return committer.commit(prepared, { key, markdown: input.markdown, expectedVersion: input.expectedVersion,
+          clientMutationId: input.clientMutationId, actor: ctx.actor, author: ctx.author, at: ctx.at,
+          source: sourceFor(ctx, key) });
+      }, "write", { agentIds: [key.agentId] });
     },
     async inject(access) {
       const binding = access.connection; const generation = access.injectionBindingGeneration;

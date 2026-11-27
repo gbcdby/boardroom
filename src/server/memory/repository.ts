@@ -7,12 +7,26 @@ export type ScanScope = { kind: 'message_threshold' | 'task_completed'; projectI
 export interface ScanCheckpoint { scope: ScanScope; after: ScanCursor | null; through: ScanCursor | null; sweep: number; revision: number }
 export interface ScanPage<T> { rows: T[]; nextCursor: ScanCursor | null; hasMore: boolean; scannedCount: number }
 export interface TaskCompletionSource { eventId: string; taskId: string; completionRevision: number; assigneeAgentId: string; recipientMemberId: string; triggerKey: string }
+export interface MemoryObjectRefInsert {
+  readonly id: string;
+  readonly documentId: string;
+  readonly version: number;
+  readonly key: MemoryKey;
+  readonly documentKind: "note";
+  readonly storageId: string;
+  readonly objectFormat: string;
+  readonly contentSha256: string;
+  readonly byteLength: number;
+  readonly createdAt: string;
+}
 export interface MemoryRepository {
   get(key: MemoryKey): Promise<MemoryDocument | null>;
   listProject(projectId: string): Promise<MemoryDocument[]>; // 服务仍逐项ACL过滤
   insertHead(document: MemoryDocument): Promise<MemoryDocument>;
   updateHeadCas(documentId: string, expectedVersion: number, next: MemoryDocument): Promise<MemoryDocument>;
   insertVersion(version: MemoryVersion): Promise<MemoryVersion>;
+  /** v23 惰性对象引用；只写 note，document/version 外键与唯一约束由 v23 表保证。 */
+  insertObjectRef(input: MemoryObjectRefInsert): Promise<void>;
   findMutation(documentId: string, actorId: string, clientMutationId: string): Promise<MemoryVersion | null>;
   listVersions(documentId: string, beforeVersion?: number, limit?: number): Promise<MemoryVersion[]>;
   getVersion(documentId: string, version: number): Promise<MemoryVersion | null>;
@@ -182,6 +196,25 @@ export function createMemoryRepository(ctx: RepoCtx): MemoryRepository {
           [version.id, version.documentId, version.version, version.parentVersion, version.markdown, version.byteLength, version.contentSha256,
             json(version.author), version.author.actorId, version.source, version.clientMutationId, version.summaryRequestId, version.createdAt]);
         return (await repo.getVersion(version.documentId, version.version))!;
+      });
+    },
+    async insertObjectRef(input) {
+      return ctx.withTransaction(async () => {
+        validKey(input.key);
+        if (input.key.projectId !== null) await active(input.key.projectId);
+        nonempty(input.id); nonempty(input.documentId); integer(input.version, 1); nonempty(input.createdAt);
+        if (input.documentKind !== 'note') throw new InvalidArgumentError("记忆对象引用只能指向 note 正文。");
+        if (typeof input.storageId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.storageId)
+          || input.objectFormat !== 'utf8-sha256-v1'
+          || typeof input.contentSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(input.contentSha256)
+          || !Number.isSafeInteger(input.byteLength) || input.byteLength < 0 || input.byteLength > 1_048_576) {
+          throw new InvalidArgumentError("记忆对象引用形状无效。");
+        }
+        await ctx.exec(`INSERT INTO memory_object_refs (id, document_id, version, scope, project_id, agent_id,
+          document_kind, body_storage_id, body_object_format, body_content_sha256, byte_length, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [input.id, input.documentId, input.version, input.key.scope, input.key.projectId, input.key.agentId,
+          'note', input.storageId, input.objectFormat, input.contentSha256, input.byteLength, input.createdAt]);
       });
     },
     async findMutation(documentId, actorId, clientMutationId) {
