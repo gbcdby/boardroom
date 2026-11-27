@@ -6,7 +6,7 @@
     "candidate": "10bca94fc25f7a7bff0b2b91ccae47acacc286b7",
     "tree": "85440a2d1631168a83378c55895733b73db8b856",
     "url": "https://github.com/gbcdby/boardroom/actions/runs/45810937726",
-    "scope": "各 durationMs 基于多个 CI run 的 execution reporter（runner-*.jsonl 的 test:complete/scope=runner-or-summary durationMs）实测 ×1.2 保守系数，主要 run：45096195545、45528055545、45623042378、45637285848、45649885959、45752686654、45810937726、45836526557；run/attempt/url/candidate/tree 字段仅为本候选锚点（candidate/tree=10bca94/85440a2d 用于 partition-plan 零漂移校验），不代表权重采样来源；其中 maintenance-source-audit-postgres 94000 来自 run 45096195545 的实测 78203ms×1.2；rawDurationMapSha256/provenanceSha256 保留为原采样证据；含 10 个重采样文件及 service 拆分后两文件；仅供调度估算",
+    "scope": "各 durationMs 基于多个 CI run 的 execution reporter（runner-*.jsonl 的 test:complete/scope=runner-or-summary durationMs）实测 ×1.2 保守系数，主要 run：45096195545、45528055545、45623042378、45637285848、45649885959、45752686654、45810937726、45836526557；run/attempt/url/candidate/tree 字段仅为本候选锚点（candidate/tree=10bca94/85440a2d 用于 partition-plan 零漂移校验），不代表权重采样来源；其中 maintenance-source-audit-postgres 94000 来自 run 45096195545 的实测 78203ms×1.2；含 10 个重采样文件及 service 拆分后两文件。本次仅对 tests/maintenance-capture-recovery-postgres.test.ts 做实测校准：从 322086 调到 795000（保守隔离值），依据 run 45917383802 实测约 475s（00:40:23→00:48:18）与 run 45919671460 attempt 1 实测约 872s（01:08:20→01:22:51），后者在 1200s 分片预算内未完成；rawDurationMapSha256/provenanceSha256 保持不变并沿用 PR #338 口径，它们描述原多 run execution reporter 采样证据，不包含本次校准；仅供调度估算",
     "rawDurationMapSha256": "806ab386b458d4ddc47165351e83612c7f80c44110bc32d428323eee4e4dfac9",
     "provenanceSha256": "0cf68a0df90624d589ee487956d196bd1941b03802ab52c27b4ef046ef234694"
   },
@@ -96,7 +96,7 @@
     "tests/maintenance-c3-protocol.test.ts": 461,
     "tests/maintenance-cancel-postgres.test.ts": 81855,
     "tests/maintenance-cancel-sqlite.test.ts": 13792,
-    "tests/maintenance-capture-recovery-postgres.test.ts": 322086,
+    "tests/maintenance-capture-recovery-postgres.test.ts": 795000,
     "tests/maintenance-capture-recovery-postgres/commit-outcomes.test.ts": 131274,
     "tests/maintenance-capture-recovery.test.ts": 110361,
     "tests/maintenance-control-candidate-context.test.ts": 230,
